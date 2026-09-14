@@ -406,8 +406,21 @@ class TestEndpointBudgetsReachTheMcpLegs:
         budget = 0.05
         monkeypatch.setattr('dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS', budget)
 
+        # 30s, not 5s: the wall clock below is only a backstop now (see the
+        # assertions), and a hang that dwarfs every other cost in the handler
+        # leaves a wide, unambiguous margin under it.
+        cancelled: list[bool] = []
+
         async def _never_returns(*_args, **_kwargs):
-            await asyncio.sleep(5.0)
+            try:
+                await asyncio.sleep(30.0)
+            except asyncio.CancelledError:
+                # asyncio.wait_for cancels the coroutine it caps and awaits
+                # that cancellation before raising TimeoutError, so this runs
+                # before the request returns.  Nothing else in api_curator
+                # cancels this leg.
+                cancelled.append(True)
+                raise
             return {'paused': False}
 
         state = AsyncMock(side_effect=_never_returns)
@@ -424,9 +437,22 @@ class TestEndpointBudgetsReachTheMcpLegs:
             elapsed = time.monotonic() - started
 
         assert resp.status_code == 200, 'a hung leg must degrade, not 500'
-        assert elapsed < 2.0, (
-            f'the curator_state leg must be capped by asyncio.wait_for; the '
-            f'request took {elapsed:.2f}s against a {budget}s budget'
+        # The load-INDEPENDENT statement of the claim. A bare `elapsed < 2.0`
+        # was not one: api_curator gathers two SQLite legs (curator sparks,
+        # cap intervals) CONCURRENTLY with this one, so the wall clock also
+        # carries their host-dependent cost — measured at 3.3s on a contended
+        # host, failing a test whose subject is the MCP leg while that leg was
+        # in fact capped at 0.05s exactly as asserted.
+        assert cancelled, (
+            'the curator_state leg was never cancelled, so asyncio.wait_for '
+            'did not cap it — an uncapped leg returns {"paused": False} after '
+            'its full 30s hang instead'
+        )
+        assert elapsed < 20.0, (
+            f'the request took {elapsed:.2f}s — a backstop against the WHOLE '
+            f'handler hanging, set far above the DB legs\' host-dependent cost '
+            f'and far below the {30.0}s hang the capped leg would otherwise '
+            f'contribute'
         )
         assert state.await_args is not None, 'the leg was never awaited'
         assert state.await_args.kwargs.get('timeout') == budget, (

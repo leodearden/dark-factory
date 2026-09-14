@@ -14,6 +14,7 @@ import aiosqlite
 import httpx
 import pytest
 
+import dashboard.data.burndown as burndown_module
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     _INSERT_SNAPSHOT_SQL,
@@ -2534,6 +2535,221 @@ class TestCollectSnapshotExplicitRollback:
         # (b) rollback must have been called before the re-raise
         assert rollback_calls, (
             'Expected conn.rollback() to be called before re-raising the RuntimeError'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-root whole-operation budget (task 4884 / #4424)
+# ---------------------------------------------------------------------------
+
+
+# The ~209 s paginated worst case measured for ONE root of this repo's size —
+# ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` sequential round trips at ~0.33-0.35 s each.
+# The measurement and its derivation live on ``burndown._SNAPSHOT_PAGE_SIZE``;
+# this is the test's own copy of the FLOOR it enforces, deliberately spelled
+# as a number rather than derived from ``_SNAPSHOT_PER_ROOT_BUDGET`` (deriving
+# the bound from the value under test would assert nothing).
+_MEASURED_PAGINATED_WORST_CASE = 209.0
+
+
+class TestCollectSnapshotPerRootBudget:
+    """``collect_snapshot``'s Phase-2 fan-out is whole-operation bounded per root.
+
+    Before task 4884 this was the LAST unbounded ``fetch_tasks`` caller in the
+    tree: task 4788 gave every route caller a named
+    ``DEFAULT_WHOLE_OPERATION_BUDGET`` wrap and deliberately left the
+    background collector out of scope, so a single hung MCP fan-out could park
+    the collector task forever and silently stop every project's burndown row
+    — the 2026-08-27 19.8h wedge shape, one layer down from the routes.
+
+    The hang stub is ``await asyncio.Event().wait()`` — the 4788 idiom — with
+    NO duration at all, so no choice of budget value can make an unbounded
+    implementation pass these tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hung_root_is_skipped_and_healthy_root_still_snapshots(
+        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """(a) One root hanging forever costs that root's row, not the cycle."""
+        healthy_root = tmp_path / 'healthy'
+        healthy_root.mkdir()
+
+        async with burndown_conn_with_config(known_project_roots=[healthy_root]) as (
+            _db_path, config, conn,
+        ):
+            hung_key = _root_key(config.project_root)
+            healthy_key = _root_key(healthy_root)
+
+            async def fake_load(client, cfg, project_root, **_kwargs):
+                key = _root_key(project_root)
+                if key == hung_key:
+                    # No duration: nothing ever sets this Event, so the only
+                    # thing that can end this await is the caller's bound.
+                    await asyncio.Event().wait()
+                assert key == healthy_key, f'Unmapped project_root: {key}'
+                return _task_rows([{'status': 'pending'}, {'status': 'done'}])
+
+            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+
+            with (
+                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Hard external cap, mirroring test_healthz_deadline._call_healthz:
+                # a regression to the unbounded gather must fail fast here rather
+                # than wedge the whole suite behind pytest-timeout.
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail(
+                        'collect_snapshot did not return within 10s against a root '
+                        'whose fetch hangs forever — the Phase-2 fan-out is still '
+                        'unbounded (expected a per-root _SNAPSHOT_PER_ROOT_BUDGET '
+                        'wrap around _fetch_snapshot_tasks).'
+                    )
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+            project_ids = {row['project_id'] for row in rows}
+            assert str(healthy_root.resolve()) in project_ids, (
+                'the healthy root must still get its snapshot row: one hung root '
+                'may not sink the cycle'
+            )
+            assert str(config.project_root) not in project_ids, (
+                'the hung root must be SKIPPED, not written with fabricated zero '
+                'counts — snapshots is an append-only historical record'
+            )
+            assert len(rows) == 1
+
+            warnings = [
+                r for r in caplog.records
+                if r.levelno >= logging.WARNING and str(config.project_root) in r.getMessage()
+            ]
+            assert warnings, (
+                'expected a WARNING naming the hung root; a root that silently '
+                'vanishes from an append-only chart is exactly the invisible '
+                'failure this bound exists to make visible. Saw: '
+                f'{[r.getMessage() for r in caplog.records]}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_expiry_surfaces_through_the_existing_exception_triage(
+        self, tmp_path, burndown_conn_with_config, dummy_client, caplog, monkeypatch,
+    ):
+        """(b) Task 519's partial-success semantics are preserved verbatim.
+
+        Expiry must arrive at Phase 3 as a per-root ``BaseException`` in the
+        gather's result list — i.e. ``return_exceptions=True`` is still in
+        force — so the EXISTING ``isinstance(result, BaseException)`` branch
+        logs-and-continues.  A bound that instead let the ``TimeoutError``
+        escape the gather would abort the cycle and roll nothing back but
+        write nothing more either.
+        """
+        healthy_root = tmp_path / 'healthy'
+        healthy_root.mkdir()
+        late_root = tmp_path / 'late'
+        late_root.mkdir()
+
+        async with burndown_conn_with_config(
+            known_project_roots=[healthy_root, late_root],
+        ) as (_db_path, config, conn):
+            hung_key = _root_key(healthy_root)
+
+            async def fake_load(client, cfg, project_root, **_kwargs):
+                if _root_key(project_root) == hung_key:
+                    await asyncio.Event().wait()
+                return _task_rows([{'status': 'pending'}])
+
+            monkeypatch.setattr(burndown_module, '_SNAPSHOT_PER_ROOT_BUDGET', 0.05)
+
+            with (
+                patch('dashboard.data.burndown.fetch_tasks', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                try:
+                    await asyncio.wait_for(
+                        collect_snapshot(conn, config, client=dummy_client), timeout=10,
+                    )
+                except TimeoutError:
+                    pytest.fail('collect_snapshot did not return within 10s (see (a))')
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                project_ids = {row['project_id'] for row in await cur.fetchall()}
+
+            # The main project commits FIRST (it is roots_to_snapshot[0]) and a
+            # later root's expiry may not roll it back.  The root AFTER the hung
+            # one is still reached, which is what "isolated, not aborted" means.
+            assert str(config.project_root) in project_ids
+            assert str(late_root.resolve()) in project_ids
+            assert str(healthy_root.resolve()) not in project_ids
+
+            triage = [
+                r for r in caplog.records
+                if r.getMessage().startswith('Failed to fetch tasks for')
+                and str(healthy_root.resolve()) in r.getMessage()
+            ]
+            assert triage, (
+                'the timed-out root must reach the EXISTING '
+                "isinstance(result, BaseException) triage branch ('Failed to "
+                "fetch tasks for %s'), proving return_exceptions=True still "
+                'converts its expiry into a handled per-root result. Saw: '
+                f'{[r.getMessage() for r in caplog.records]}'
+            )
+            assert triage[0].exc_info is not None
+            assert issubclass(triage[0].exc_info[0], TimeoutError), (
+                'the exception carried into triage must be the budget expiry '
+                f'itself, not a substitute; got {triage[0].exc_info[0]!r}'
+            )
+
+    def test_budget_is_sized_between_the_route_default_and_one_collector_cycle(self):
+        """(c) The VALUE is derived from the collector's own cycle, not the routes.
+
+        Wrapping at the route convention's 7.0 would be a REGRESSION, not a
+        fix: ``_fetch_snapshot_tasks`` probes unpaginated and, on transport
+        rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call
+        that internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round
+        trips, MEASURED at ~209 s for one root of this repo's size (the
+        measurement and its derivation live on ``_SNAPSHOT_PAGE_SIZE``).  A
+        7.0 s bound would time out every big root on every cycle, and because
+        ``snapshots`` is APPEND-ONLY and no later cycle backfills, that is a
+        permanent unexplained hole in the chart.
+        """
+        import dashboard.app as app_module
+        from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
+
+        budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
+        one_cycle_half = app_module._SAMPLE_INTERVAL_SECONDS / 2
+
+        # BOTH bounds are the ones the derivation actually names. An earlier
+        # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
+        # and `< _SAMPLE_INTERVAL_SECONDS` (600) — two orders of magnitude
+        # apart from the stated floor at one end and double the stated ceiling
+        # at the other — so a value of 10.0 passed while doing exactly the
+        # permanent-hole damage the docstring describes.
+        assert budget >= _MEASURED_PAGINATED_WORST_CASE, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the MEASURED '
+            f'~{_MEASURED_PAGINATED_WORST_CASE} s paginated worst case for one '
+            "root of this repo's size (see _SNAPSHOT_PAGE_SIZE). Anything below "
+            'it times out every big root on EVERY cycle, and because snapshots '
+            'is APPEND-ONLY and no later cycle backfills, that is a permanent '
+            'unexplained hole in the chart — not a degraded read. The shared '
+            f'route default ({DEFAULT_WHOLE_OPERATION_BUDGET}) is the value '
+            'this must NOT be confused with: a BACKGROUND root that walks '
+            'ceil(N/P) sequential pages is not a request-path one.'
+        )
+        assert budget <= one_cycle_half, (
+            f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
+            f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{app_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
+            'finish inside one cycle can never finish at all, and the halving '
+            'is what guarantees cycle N is done before cycle N+1 starts even '
+            'when a root spends its whole budget.'
         )
 
 

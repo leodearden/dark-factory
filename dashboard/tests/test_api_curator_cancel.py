@@ -209,11 +209,26 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
 
+    async def _only_cancel_ticket_fails(*args, **kwargs):
+        """Fail the tool under test; let every other tool succeed.
+
+        ``mcp_tool_call`` is a module global shared with the lifespan's
+        metrics sampler, whose ``get_status``/``get_queue_stats`` legs run
+        CONCURRENTLY with this request and route their own transport failures
+        through the same ``invalidate_session``.  A blanket side_effect made
+        those legs fail too, so the call count below was a race against the
+        background loop rather than a statement about the handler — observed
+        as three recorded invalidations instead of one on a loaded host.
+        Narrowing the failure to ``cancel_ticket`` leaves the sampler's legs
+        succeeding, so every recorded invalidation is the handler's.
+        """
+        tool_name = args[2] if len(args) > 2 else kwargs.get('tool_name')
+        if tool_name == 'cancel_ticket':
+            raise httpx.ConnectError('refused')
+        return {}
+
     with (
-        patch(
-            _PATCH_TARGET,
-            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
-        ),
+        patch(_PATCH_TARGET, new=AsyncMock(side_effect=_only_cancel_ticket_fails)),
         patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
     ):
         resp = client.post(
