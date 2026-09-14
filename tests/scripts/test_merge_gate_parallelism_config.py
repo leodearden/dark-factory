@@ -7,6 +7,14 @@ This guard pins the four that were brought onto that same footing, and pins
 the exclusions that were left serial DELIBERATELY, so a later reader cannot
 tell a ruled-out module from a forgotten one.
 
+The exclusions are TWO tables, because there are two kinds. Workspace members
+are recorded in ``RULED_SERIAL_MEMBERS`` and read out of their own
+``pyproject.toml``; module-config prefixes that own no pyproject.toml are
+recorded in ``RULED_SERIAL_MODULE_LEGS`` and read out of their
+``test_command``. An entry in either is not automatically a RULING: each states
+what it actually is, and the one open divergence carries the task it is filed
+as.
+
 PLACEMENT IS LOAD-BEARING, and follows the family convention recorded in
 ``test_module_verify_budgets.py`` and ``test_module_type_check_invocation.py``:
 ``tests/scripts/`` carries its OWN registered module config, so a guard living
@@ -464,15 +472,65 @@ SCRIPTS_MODULE_PREFIX = 'scripts'
 # The members left SERIAL on purpose, each with the reason it was ruled out.
 # A table rather than prose, so a later "helpful" widening fails against a
 # message that states the reason instead of merely the expectation.
+#
+# EVERY REASON HERE IS A WALL-CLOCK MEASUREMENT, and that is a rule rather than
+# a coincidence. An xdist-SAFETY worry cannot be a reason in this table, because
+# `-n` does not in fact arrive only from addopts:
+# `verify._with_pytest_numprocesses_str` injects
+# `-n <config.verify_admission_pytest_n>` into every pytest leg at the roles
+# `shared.verify_admission.is_gated_role` names (task, background), and
+# dark-factory-orchestrator.yaml pins that knob to "8". So a member declaring no
+# addopts ALREADY runs 8-way at those roles — and, declaring no `--dist`, under
+# xdist's default `load`, where an @pytest.mark.xdist_group mark is ignored
+# OUTRIGHT. Whatever cross-worker exposure such a suite has is therefore already
+# live, and `-n auto --dist loadgroup` would REDUCE it rather than create it. A
+# reason recorded below must be something the addopts change would actually
+# change.
 RULED_SERIAL_MEMBERS = {
     'shared': (
-        'measured FASTER serial on the task-5408 tree (44.9s serial vs 80.9s at '
-        '-n 8), and three of its suites — tests/test_proc_group.py, '
-        'tests/test_concurrency.py, tests/test_cli_invoke.py — need '
-        '@pytest.mark.xdist_group pins before they can be trusted across '
-        'workers. Parallelising it would cost wall-clock AND risk a flake, '
-        'which is why 5408 declared pytest-xdist for shared (the `scripts` leg '
-        "selects it) WITHOUT touching shared's own addopts"
+        'measured FASTER serial on the task-5408 tree — 44.9s serial against '
+        '80.9s at -n 8 — so workers cost this suite wall-clock instead of '
+        'buying it. That measurement is the WHOLE reason. Task 5408 still '
+        'declared pytest-xdist for shared, because the `scripts` leg selects '
+        "this member's environment, WITHOUT touching shared's own addopts. "
+        '(tests/test_proc_group.py, tests/test_concurrency.py and '
+        'tests/test_cli_invoke.py do want @pytest.mark.xdist_group pins, but '
+        'that is deliberately NOT recorded here as a reason: per the note '
+        'above those suites already run 8-way under the default `load` at task '
+        'role, where the mark would be ignored anyway, so it is an exposure '
+        'this exclusion does not remove)'
+    ),
+    'sampler': (
+        "pyright, not pytest, is this module's LONG POLE — the figures are "
+        'recorded once at PYRIGHT_LONG_POLE_MODULES below (~11s pyright '
+        "against ~4s pytest), and sampler/orchestrator.yaml's own budget block "
+        'carries the contended per-run spread that ~4s is the fastest of. '
+        'Workers on a test leg that short buy nothing measurable, so task 5408 '
+        "spent this module's budget on `pyright --threads 8` instead. NOT an "
+        'oversight: sampler is the one module 5408 touched for its TYPE leg '
+        'and deliberately left alone on its test leg'
+    ),
+}
+
+
+# The module-config LEGS left serial on purpose, keyed by module PREFIX rather
+# than by member. A second table and not a row in the one above, because these
+# are a different kind of thing: a prefix here owns no pyproject.toml, so its
+# flags would live on a test_command and its absence from the parallel set is
+# invisible in every pyproject in the tree — exactly the case
+# RULED_SERIAL_MEMBERS cannot record.
+RULED_SERIAL_MODULE_LEGS = {
+    'tests/scripts': (
+        'NOT ruled out on a measurement, and this entry exists to say so '
+        'rather than let silence read as a ruling. Task 5408 was scoped to '
+        'four named modules and this is not one of them, so '
+        "tests/scripts/orchestrator.yaml was never in that task's lock set. It "
+        'is an acknowledged DIVERGENCE rather than a settled exclusion: this '
+        "leg's test_command runs `tests/scripts/`, a strict SUBSET of the "
+        "`scripts` leg's `tests/scripts/ scripts/tests/` targets, so as of "
+        '5408 the same directory runs parallel on one leg and serial on the '
+        'other at the same gate. Filed as residue 1 of task 5470 — when that '
+        'lands, add the flags and DELETE this entry in the same commit'
     ),
 }
 
@@ -601,6 +659,54 @@ def test_ruled_serial_members_stay_serial(member: str) -> None:
     )
 
 
+@pytest.mark.parametrize('prefix', sorted(RULED_SERIAL_MODULE_LEGS))
+def test_ruled_serial_module_legs_stay_serial(
+    prefix: str,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """A module LEG left serial stays serial, with its reason attached.
+
+    The sibling of :func:`test_ruled_serial_members_stay_serial` for the
+    configs that own no pyproject.toml. Same contract, different place to read:
+    the flags would live on ``test_command``, so that is what is inspected —
+    post-anchor, so uv's own wrapper tokens can never be mistaken for pytest's.
+
+    Read the failure message before deleting this: an entry here is not always
+    a RULING. The ``tests/scripts`` one records an acknowledged divergence with
+    a follow-up task attached, so the correct response to tripping it is to
+    finish that work and remove the entry, not to argue with the assertion.
+    """
+    module_configs = discover_module_configs()
+    assert prefix in module_configs, (
+        f'{prefix}/orchestrator.yaml is not discovered by the production '
+        'config._discover_module_configs walk, so this exclusion is recorded '
+        f'about a leg that no longer exists. Discovered: {sorted(module_configs)}'
+    )
+    command = module_configs[prefix].test_command
+    assert command, (
+        f'{prefix}/orchestrator.yaml declares no test_command, so the '
+        'assertion below would be satisfied for the wrong reason'
+    )
+    label = f'{prefix}/orchestrator.yaml test_command'
+    segment = vci.optional_token_segment(command, vci.PYTEST)
+    assert segment is not None, (
+        f'{label} no longer runs pytest at all, so the parallel flags this '
+        'entry is about have nowhere to go. Re-read '
+        f'RULED_SERIAL_MODULE_LEGS[{prefix!r}] and retire it if it is stale'
+    )
+    _, post = vci.anchor_split(segment, vci.PYTEST, label=label)
+
+    offenders = [token for token in post if token in (WORKERS_FLAG, DIST_FLAG)]
+    assert not offenders, (
+        f'{label} now passes pytest {offenders!r}, but this leg was recorded '
+        f'as staying serial by task 5408: {RULED_SERIAL_MODULE_LEGS[prefix]}. '
+        'If that work has now been done, DELETE this entry in the same commit '
+        'rather than loosening the assertion — the table is the record of '
+        'which legs are deliberately out of the parallel set, and an entry '
+        'that no longer holds is worse than no entry'
+    )
+
+
 @pytest.mark.parametrize('member', TASK_3589_MEMBERS)
 def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
     member: str,
@@ -656,9 +762,21 @@ PYRIGHT_STATS_FLAG = '--stats'
 PYRIGHT_THREADS_STATS_REFUSAL = "'threads' option cannot be used with 'stats' option"
 PYRIGHT_USAGE_ERROR_RC = 4
 
-# Co-locates the two subprocess probes on ONE xdist worker under
-# `--dist loadgroup`, so the pair cannot land on two workers and run two
-# concurrent pyright processes on an already-loaded host.
+# Co-locates the two subprocess probes on ONE xdist worker WHEREVER
+# `--dist loadgroup` is in force, so the pair cannot land on two workers and
+# run two concurrent pyright processes on an already-loaded host.
+#
+# THAT QUALIFIER IS LOAD-BEARING — the guarantee is not universal, because TWO
+# registered module configs collect this file. The `scripts` leg passes
+# `--dist loadgroup`, so the grouping holds there. The `tests/scripts` leg
+# passes no `--dist` at all (RULED_SERIAL_MODULE_LEGS above), so at the roles
+# `shared.verify_admission.is_gated_role` names, where verify injects
+# `-n <config.verify_admission_pytest_n>`, it runs under xdist's default
+# `load` — and there an xdist_group mark is ignored OUTRIGHT, so the two probes
+# can land on different workers. Neither probe mutates shared state and each
+# measured ~1.4s on the 5408 tree, so that case costs a small optimisation
+# rather than correctness; it is stated rather than claimed away. Task 5470
+# residue 1 is where `--dist loadgroup` would reach that leg.
 PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
 
 # Bounds the probe subprocess itself, INSIDE each probe's @pytest.mark.timeout,
@@ -790,7 +908,9 @@ def test_the_configured_pyright_actually_accepts_threads_eight(
 
     Its companion negative control is
     ``test_pyright_refuses_threads_together_with_stats``; the two share an
-    ``xdist_group`` so they never run as two concurrent pyright processes.
+    ``xdist_group`` so they do not run as two concurrent pyright processes on
+    any leg that passes ``--dist loadgroup`` — which is not every leg that
+    collects this file. See ``PYRIGHT_PROBE_GROUP``.
     """
     pre, _ = _pyright_argv(discover_module_configs(), THREADS_PROBE_MODULE)
     result = _run_probe(pre, _write_probe(tmp_path))
