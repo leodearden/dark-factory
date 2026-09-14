@@ -4241,8 +4241,11 @@ def create_mcp_server(
         - ``present`` — the row is there.
         - ``missing`` — the stage ran, the run is within the retention
           window, and no row exists. **This is the only genuine gap.**
-        - ``stage_not_run`` — the run never reached this stage, so there was
-          never anything to write. Not a defect; do not report it as one.
+        - ``stage_not_run`` — the run TERMINATED without reaching this stage,
+          so there was never anything to write. Not a defect; do not report it
+          as one. Only a terminal run can report this: an in-flight run has
+          not yet persisted its ``stage_reports``, so it reports
+          ``run_unknown`` rather than a confident "never ran".
         - ``expired`` — the run is older than the retention window, so the
           row would have been reaped by ``ReconLedgerStore.gc()`` whether or
           not it was ever written. Absence here carries no information.

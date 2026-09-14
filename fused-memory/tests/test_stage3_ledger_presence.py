@@ -315,6 +315,58 @@ class TestTypedAbsenceClassification:
             await journal.close()
 
     @pytest.mark.asyncio
+    async def test_in_flight_run_is_inconclusive_not_stage_not_run(
+        self, mock_config, tmp_path,
+    ):
+        """The current-cycle shape, and the one that matters most: Stage 3
+        verifies the run it is running INSIDE, whose stage_reports the harness
+        has not persisted yet (it writes the blob once, after the stage loop).
+        The column therefore reads '{}' no matter how many stages have run, so
+        reading an absent key as "the stage never ran" would type every
+        in-flight run as a non-gap and silently suppress exactly the
+        current-cycle ledger loss this check exists to catch. Must stay
+        inconclusive so the consumer falls through to its Mem0 fallback."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-in-flight', status='running')
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-in-flight', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_status'] == 'running'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_run_with_present_row_still_reads_present(
+        self, mock_config, tmp_path,
+    ):
+        """The in-flight guard must only widen the ABSENCE verdict: a row the
+        current cycle's Stage 2 already wrote is still authoritative evidence
+        of presence, so the healthy current-cycle case keeps its definitive
+        answer rather than degrading to the fallback."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-in-flight-present', status='running')
+            await self._write_row(store, 'run-in-flight-present')
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-in-flight-present', stage=_STAGE,
+            )
+
+            assert result['present'] is True
+            assert result['reason'] == 'present'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('run_status', ['interrupted', 'failed'])
     async def test_stage_ran_but_row_absent_is_a_real_gap(
         self, mock_config, tmp_path, run_status,

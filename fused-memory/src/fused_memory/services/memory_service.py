@@ -61,6 +61,7 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    RunStatus,
 )
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
@@ -8071,9 +8072,11 @@ class MemoryService:
         present            row found                                 True
         ledger_unavailable no ledger wired                           None
         run_unknown        journal unwired, no runs row, read
-                           raised, or stage_reports unparseable      None
-        stage_not_run      runs row present, stage absent from
-                           stage_reports                             False
+                           raised, stage_reports unparseable, or
+                           the run is still in flight and has not
+                           persisted stage_reports yet               None
+        stage_not_run      TERMINAL runs row present, stage absent
+                           from stage_reports                        False
         expired            run older than the retention window, so
                            any row would have been gc()'d            None
         missing            stage ran, within retention, no row       True
@@ -8082,6 +8085,14 @@ class MemoryService:
         ``stage_not_run`` deliberately outranks ``expired``: it is a positive
         fact from the never-reaped ``runs`` table and stays true regardless of
         TTL, whereas ``expired`` only says the evidence was destroyed.
+
+        ``stage_not_run`` is reachable only for a run in a TERMINAL status (see
+        ``_STAGE_REPORTS_PERSISTED_STATUSES``). An in-flight run's
+        ``stage_reports`` column is still ``'{}'``, so the absence of a stage
+        key there is not evidence — and Stage 3 checks the CURRENT run from
+        inside the still-running stage loop, which is the common case, not an
+        edge one. Such a run reports ``run_unknown``, sending the caller to its
+        existing fallback rather than declaring the stage never ran.
 
         **The consumer rule is: flag a genuine gap ONLY when ``present`` is
         False AND ``expected`` is True.** ``expected=False`` means there was
@@ -8184,6 +8195,33 @@ class MemoryService:
             'run_status': run_status,
         }
 
+    #: Run statuses at which ``runs.stage_reports`` is known to be PERSISTED,
+    #: and so may be read as evidence that a stage did or did not run.
+    #:
+    #: ``reconciliation/harness.py`` mutates ``run.stage_reports`` in memory as
+    #: each stage returns and persists the whole blob ONCE, after the stage
+    #: loop — from the success path, the error handlers, or the terminal
+    #: ``finally`` backstop. Every one of those exits also sets a terminal
+    #: status, so the two are written together. While a run is still in flight
+    #: the column reads ``'{}'`` however many stages have completed, and Stage
+    #: 3 verifies the CURRENT run's cycle summaries from INSIDE that loop
+    #: (``stages/base.py`` hands it the live ``run_id``) — so a membership test
+    #: there would report every in-flight run as "stage never ran" and suppress
+    #: exactly the current-cycle data loss this check exists to catch.
+    #:
+    #: Stated as the statuses that DO persist, not the one that does not, so a
+    #: future non-terminal status degrades to the inconclusive ``run_unknown``
+    #: rather than to a confident wrong answer.
+    _STAGE_REPORTS_PERSISTED_STATUSES = frozenset(
+        {
+            RunStatus.completed.value,
+            RunStatus.failed.value,
+            RunStatus.rolled_back.value,
+            RunStatus.circuit_breaker.value,
+            RunStatus.interrupted.value,
+        }
+    )
+
     async def _classify_summary_absence(
         self,
         journal: ReconciliationJournal | None,
@@ -8229,6 +8267,12 @@ class MemoryService:
         if execution['stage_ran'] is None:
             return 'run_unknown', None, run_status
         if execution['stage_ran'] is False:
+            if run_status not in self._STAGE_REPORTS_PERSISTED_STATUSES:
+                # The run has not reached a terminal state, so the harness has
+                # not yet written its trailing update_run_stage_reports and the
+                # column still reads '{}' no matter which stages have run.
+                # Absence of the key is therefore not evidence of anything.
+                return 'run_unknown', None, run_status
             # Checked BEFORE retention: a positive fact from the never-reaped
             # runs table, true regardless of TTL.
             return 'stage_not_run', False, run_status
