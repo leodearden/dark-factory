@@ -10,11 +10,21 @@ mock service, mirroring test_count_by_metadata_tool.py's split.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+    StageId,
+    StageReport,
+)
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.recon_self_model import MCP_CALL_SIGNATURES
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
 
@@ -330,3 +340,110 @@ class TestGetCycleSummaryPresenceTool:
         assert 'boom' in result.get('error', ''), (
             f'Expected original error message in result: {result!r}'
         )
+
+
+class TestTypedAbsenceCrossesTheMcpBoundary:
+    """The widened payload has to survive the wrapper, and the DOCUMENTED
+    contract has to match it (task 3731).
+
+    A payload change without matching consumer edits is a no-op: the stages
+    read ``MCP_CALL_SIGNATURES`` rendered into their prompts, not the Python
+    return annotation, so a stale entry there silently withholds the new keys
+    from every consumer.
+    """
+
+    @staticmethod
+    async def _server_with(mock_config, tmp_path, *, stage_ran):
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        journal = ReconciliationJournal(tmp_path)
+        await journal.initialize()
+        service.set_recon_ledger(store)
+        service.set_recon_journal(journal)
+
+        now = datetime.now(UTC)
+        run_id = f'run-{"ran" if stage_ran else "never-ran"}'
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=_PROJECT_ID,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        if stage_ran:
+            await journal.update_run_stage_reports(
+                run_id,
+                {
+                    _STAGE: StageReport(
+                        stage=StageId.task_knowledge_sync,
+                        started_at=now,
+                        completed_at=now,
+                    )
+                },
+            )
+        await journal.complete_run(run_id, 'interrupted')
+        return create_mcp_server(service), store, journal, run_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('stage_ran', 'expected_reason', 'expected_gate'),
+        [(False, 'stage_not_run', False), (True, 'missing', True)],
+    )
+    async def test_wrapper_forwards_the_discriminator(
+        self, mock_config, tmp_path, stage_ran, expected_reason, expected_gate,
+    ):
+        server, store, journal, run_id = await self._server_with(
+            mock_config, tmp_path, stage_ran=stage_ran,
+        )
+        try:
+            result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': run_id, 'stage': _STAGE},
+            )
+
+            assert 'error' not in result, f'Unexpected error: {result!r}'
+            assert result['present'] is False
+            assert result['reason'] == expected_reason
+            assert result['expected'] is expected_gate
+            assert result['run_lookup_available'] is True
+            assert result['run_status'] == 'interrupted'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_documented_signature_names_every_returned_key(
+        self, mock_config, tmp_path,
+    ):
+        """DERIVED drift guard — the expectation comes from the live return, so
+        it cannot rot the way a hardcoded list would.
+
+        This already failed BEFORE task 3731's widening: the signature still
+        omitted ``remediation``, which task 2652 added to the payload two
+        cycles ago, so the stages have been reading a stale contract since.
+        """
+        server, store, journal, run_id = await self._server_with(
+            mock_config, tmp_path, stage_ran=True,
+        )
+        try:
+            result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': run_id, 'stage': _STAGE},
+            )
+            documented = MCP_CALL_SIGNATURES['get_cycle_summary_presence']
+
+            undocumented = sorted(k for k in result if k not in documented)
+
+            assert not undocumented, (
+                f'get_cycle_summary_presence returns {undocumented} but '
+                f'MCP_CALL_SIGNATURES does not name them. The stages read the '
+                f'rendered signature, not the Python return, so an unnamed key '
+                f'is invisible to every consumer. Documented: {documented!r}'
+            )
+        finally:
+            await store.close()
+            await journal.close()
