@@ -235,3 +235,89 @@ def test_load_schema_and_metrics_match_sampler() -> None:
         f'Process metric mismatch — sampler emits {sorted(process_keys)}, '
         f'dashboard PROCESS_METRICS has {sorted(PROCESS_METRICS)}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: recency bound (task 3592)
+# ---------------------------------------------------------------------------
+
+
+def test_query_is_bounded_by_recency() -> None:
+    """_QUERY_SQL must carry a ts lower bound.
+
+    Without it the query ranks every retained row before discarding all but 60
+    per metric, so its cost is linear in retention.  At the 30-day steady state
+    that measured 11,955 ms against 28.7 ms bounded, on a 5s-polled endpoint.
+    """
+    from dashboard.data.load import _QUERY_SQL, _RECENCY_SLACK_SECONDS
+
+    assert 'ts >=' in _QUERY_SQL
+    assert 'MAX(ts)' in _QUERY_SQL
+    # Sparkline spans 60 samples x 5s tick = 300s; slack must clear that...
+    assert _RECENCY_SLACK_SECONDS >= 300
+    # ...but stay modest, since cost is linear in the slack (7d measured 2.2s).
+    assert _RECENCY_SLACK_SECONDS <= 86400
+
+
+@pytest.mark.asyncio
+async def test_bound_excludes_ancient_rows_but_keeps_the_live_window(tmp_path: Path) -> None:
+    """Rows far older than the newest sample are excluded from the sparkline.
+
+    Deliberately uses FEWER than 60 live samples: with a full 60 the ancient
+    rows sort to rn 61+ and `rn <= 60` masks them regardless of the bound, so
+    such a test would pass unbounded and guard nothing.  With 10 live samples
+    the unbounded query yields a 12-entry sparkline starting at 1.0, and only
+    the recency bound trims it back to the 10 live ones.
+    """
+    db_path = tmp_path / 'bounded-load.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [(base - 500_000, 'verify_concurrency', 1.0, None, None),
+            (base - 400_000, 'verify_concurrency', 2.0, None, None)]
+    # 10 live samples at the 5s tick, ending at `base`.
+    rows += [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+             for i in range(10)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    sparkline = result['verify_concurrency']['sparkline']
+    assert len(sparkline) == 10, 'ancient rows must not enter the sparkline'
+    assert sparkline[0] == 100.0
+    assert sparkline[-1] == 109.0
+    assert result['verify_concurrency']['current'] == 109.0
+
+
+@pytest.mark.asyncio
+async def test_bound_is_anchored_to_newest_row_not_wall_clock(tmp_path: Path) -> None:
+    """A stale DB (sampler down) still returns its last samples, not placeholders.
+
+    A now()-relative bound would blank the card here; anchoring to MAX(ts)
+    preserves the unbounded query's behaviour across a sampler outage.
+    """
+    db_path = tmp_path / 'stale-load.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    # ts values far in the past relative to any real wall clock.
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
+        [(100, 'occt_queue_depth', 1.0, None, None),
+         (105, 'occt_queue_depth', 2.0, 1.5, 2.0)],
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['occt_queue_depth']['current'] == 2.0
+    assert result['occt_queue_depth']['sparkline'] == [1.0, 2.0]

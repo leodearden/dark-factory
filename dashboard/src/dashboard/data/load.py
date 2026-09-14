@@ -102,6 +102,33 @@ def _default_result() -> dict[str, dict[str, Any]]:
 
 _PLACEHOLDERS_SQL = ','.join('?' * len(KNOWN_METRICS))
 
+# Slack, in seconds, for the recency bound below.  The sparkline is 60 samples
+# at the sampler's 5s tick = 300s, so an hour is 12x headroom: it absorbs
+# sampler restarts and missed ticks without ever truncating a full sparkline.
+_RECENCY_SLACK_SECONDS = 3600
+
+# Why the recency bound exists (task 3592)
+# ---------------------------------------
+# Without `ts >=`, this query's cost is LINEAR IN RETENTION: SQLite does not
+# push `rn <= 60` down into the window function, so it ranks EVERY row of the
+# allowlisted metrics before discarding all but 60 per metric.  When sampler
+# retention widened 24h -> 30d, the 9-metric steady state went 155k -> 4.67M
+# rows.  Measured on a 4,665,600-row probe DB with this exact schema:
+# 11,955 ms unbounded vs 28.7 ms bounded, for byte-identical 540-row output.
+# /api/load is on a 5s frontend poll (tab_overview.jsx::LOAD_POLL_INTERVAL_MS),
+# so the unbounded form took ~2x the poll interval and saturated the aiosqlite
+# pool -- the same unbounded-scan-on-a-polled-endpoint mechanism behind the
+# 2026-07-30 dashboard outage (tasks 3304, 3519).
+#
+# The bound is anchored to the newest sample (MAX(ts)), NOT to wall-clock now().
+# That is load-bearing in two ways.  It keeps the data layer free of any
+# wall-clock dependency, and it preserves behaviour when the sampler is DOWN: a
+# now()-relative bound would blank the card after an outage longer than the
+# slack, whereas anchoring to the data keeps showing the last known samples,
+# exactly as the unbounded query did.
+#
+# Cost is linear in the SLACK, not in retention, so the slack must stay modest:
+# measured on the same probe, 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms.
 _QUERY_SQL = f"""\
 SELECT metric, value, window_mean, window_max, ts
 FROM (
@@ -109,6 +136,9 @@ FROM (
            ROW_NUMBER() OVER (PARTITION BY metric ORDER BY ts DESC) AS rn
     FROM samples
     WHERE metric IN ({_PLACEHOLDERS_SQL})
+      AND ts >= (
+          SELECT MAX(ts) FROM samples WHERE metric IN ({_PLACEHOLDERS_SQL})
+      ) - {_RECENCY_SLACK_SECONDS}
 )
 WHERE rn <= 60
 ORDER BY metric, ts ASC
@@ -144,7 +174,7 @@ async def get_load_metrics(
     async def _query(conn: aiosqlite.Connection) -> dict[str, dict[str, Any]]:
         result = _default_result()
 
-        rows = await conn.execute_fetchall(_QUERY_SQL, KNOWN_METRICS)
+        rows = await conn.execute_fetchall(_QUERY_SQL, KNOWN_METRICS + KNOWN_METRICS)
 
         # Group rows by metric (already ordered by metric, ts ASC from SQL).
         # Rows are always aiosqlite.Row objects — DbPool.get sets
