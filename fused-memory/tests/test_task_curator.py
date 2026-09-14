@@ -2041,6 +2041,106 @@ class TestDegradedStreakBatchReset:
         assert curator._consecutive_degraded == 3
         assert curator._degraded_alarm_fired is True
 
+    @pytest.mark.asyncio
+    async def test_decisionless_success_grows_streak_and_fires_alarm(self):
+        """(5) esc-4448-8: a SUCCESSFUL round-trip whose payload carries no
+        usable decision must not pass for evidence that curation works.
+
+        This is the alarm's chartered case — a novel failure class nobody
+        enumerated — and keying the reset on agent_result.success alone did not
+        merely blind the alarm to it, it made it unreachable: every one of
+        these calls actively cleared the counter while filing every candidate
+        without dedupe. Measured against the pre-fix worktree: 10 such calls
+        produced 20/20 action='create', streak 0, alarm awaited 0 times.
+        """
+        curator, escalator = self._curator_with_escalator()
+        # Seeded just below threshold (5), so a reset that survives anywhere on
+        # this path shows up as an alarm that never fires.
+        curator._consecutive_degraded = 4
+        curator._degraded_alarm_fired = False
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        # Well-formed, prompt, success=True — and structurally unusable.
+        decisionless = AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'wrong': []},
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=decisionless)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert [d.justification for d in decisions] == [
+            'batch-item-missing', 'batch-item-missing',
+        ]
+        assert all(d.degraded for d in decisions)
+        # Both items counted: 4 + 2.
+        assert curator._consecutive_degraded == 6
+        assert curator._degraded_alarm_fired is True
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_partially_degraded_batch_still_resets(self):
+        """(6) The boundary the reset now sits on is 'decided anything at all',
+        not 'decided everything'. One usable decision is a curator doing its
+        job; the other item's degradation is the designed per-item fail-open,
+        and counting it would make a routine partial parse read as an outage."""
+        curator, escalator = self._curator_with_escalator()
+        curator._consecutive_degraded = 4
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        partial = AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'ok'},
+            ]},
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=partial)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert [d.degraded for d in decisions] == [False, True]
+        assert curator._consecutive_degraded == 0
+        escalator.report_consecutive_degraded.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_decisionless_success_on_single_path_grows_streak(self):
+        """(7) The same hole on the single-item path: _parse_decision degrades
+        an unparseable payload to action='create' without raising, so curate()
+        must not treat a returned decision as proof one was made."""
+        curator, escalator = self._curator_with_escalator()
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        unusable = AgentResult(success=True, output='not json at all', cost_usd=0.01)
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=unusable)):
+            for i in range(5):
+                decision = await curator.curate(
+                    CandidateTask(title=f'Unusable{i}'),
+                    project_id='p', project_root='/x',
+                )
+                assert decision.action == 'create'
+                assert decision.degraded is True
+
+        assert curator._consecutive_degraded == 5
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
 
 class TestCurateHappyPath:
     @pytest.mark.asyncio

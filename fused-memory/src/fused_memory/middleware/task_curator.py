@@ -333,6 +333,22 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
+    # True when this is a fail-open create that no dedupe judgement stands
+    # behind — the response carried nothing decidable for this candidate, so
+    # the curation degraded rather than decided.  Carried as a field rather
+    # than inferred from a ``justification`` prefix so that a degraded path
+    # added later is counted by construction instead of by whoever remembers
+    # to extend a list of marker strings; the whole of task 4448 is what an
+    # uncounted degradation costs.
+    #
+    # Deliberately NOT set by _parse_decision_dict's safety vetoes
+    # ('invalid-target', 'unknown-status-target', 'invalid-combine-target',
+    # 'combine-missing-rewrite', …). There the model DID render a decision and
+    # a downstream guard declined to act on it — routine in healthy operation,
+    # e.g. a pool holding no combine-eligible entry. Counting those would make
+    # the consecutive-degraded alarm fire on a working curator, which is the
+    # opposite failure from the one it exists to catch.
+    degraded: bool = False
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -1489,29 +1505,52 @@ class TaskCurator:
             justification=justification,
             pool_sizes=pool_sizes,
             latency_ms=int((time.monotonic() - start) * 1000),
+            degraded=True,
         )
+        await self._count_degraded(
+            justification=justification,
+            project_id=project_id,
+            project_root=project_root,
+            candidate_title=candidate.title,
+        )
+        return decision
 
+    async def _count_degraded(
+        self,
+        *,
+        justification: str,
+        project_id: str,
+        project_root: str,
+        candidate_title: str,
+    ) -> None:
+        """Advance the streak for one degraded curation, firing the alarm once.
+
+        Shared by :meth:`_degraded_create` (single-candidate paths) and by
+        :meth:`_call_llm_batch` (items a successful round-trip nonetheless
+        failed to decide).  The alarm is class-agnostic by construction: it
+        takes only the fact that a curation degraded, never the reason.
+        """
         self._consecutive_degraded += 1
         threshold = self._config.curator.degraded_streak_threshold
-        if self._consecutive_degraded >= threshold and not self._degraded_alarm_fired:
-            self._degraded_alarm_fired = True
-            logger.error(
-                'task_curator: %d consecutive degraded curations for project %s '
-                '(threshold %d) — every candidate in that run was filed without '
-                'dedupe. Last: %s',
-                self._consecutive_degraded, project_id, threshold, justification,
-            )
-            if self._escalator is not None:
-                await self._escalator.report_consecutive_degraded(
-                    project_root=project_root,
-                    project_id=project_id,
-                    streak=self._consecutive_degraded,
-                    threshold=threshold,
-                    last_justification=justification,
-                    candidate_title=candidate.title,
-                )
+        if self._consecutive_degraded < threshold or self._degraded_alarm_fired:
+            return
 
-        return decision
+        self._degraded_alarm_fired = True
+        logger.error(
+            'task_curator: %d consecutive degraded curations for project %s '
+            '(threshold %d) — every candidate in that run was filed without '
+            'dedupe. Last: %s',
+            self._consecutive_degraded, project_id, threshold, justification,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_consecutive_degraded(
+                project_root=project_root,
+                project_id=project_id,
+                streak=self._consecutive_degraded,
+                threshold=threshold,
+                last_justification=justification,
+                candidate_title=candidate_title,
+            )
 
     async def curate(
         self,
@@ -1631,9 +1670,23 @@ class TaskCurator:
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
+            # Keyed on the round-trip completing, which is what that breaker
+            # asserts about — see the matching reset in _call_llm_batch.
             self._reset_zero_output_breaker()
-            # A real decision: the streak is broken and the alarm re-arms.
-            self._reset_degraded_streak()
+            # The streak asserts something narrower: that curation is still
+            # producing dedupe judgements. _parse_decision degrades an
+            # unparseable payload to action='create' without raising, so a
+            # completed call is not by itself evidence of that (esc-4448-8
+            # measured the same hole on the batch path).
+            if decision.degraded:
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+            else:
+                self._reset_degraded_streak()
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -2915,10 +2968,9 @@ class TaskCurator:
         # many healthy BATCH calls in a batch-dominant deployment until
         # threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
-        # Keyed on agent_result.success, not on decision quality:
-        # _parse_batch_decisions degrades unparseable items to
-        # action='create' without raising, and a degraded decision is
-        # still evidence the CLI round-trip completed.
+        # Keyed on agent_result.success, not on decision quality: what this
+        # breaker asserts is a wedged BACKEND, and a completed round-trip
+        # disproves that however unusable its payload turns out to be.
         #
         # This also closes an ALREADY-OPEN breaker/cooldown, not just the
         # counter: _call_llm_batch_with_fallback's two bisect halves run
@@ -2929,30 +2981,47 @@ class TaskCurator:
         # deliberate choice, not an oversight (see this task's plan design
         # decision 3; pinned by
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
-        #
-        # The same evidence breaks the class-agnostic degraded streak and
-        # re-arms its one-shot alarm latch (task 4448): a completed batch
-        # round-trip says the backend is working for the whole service, not
-        # just for the single-item path that resets the streak today. Without
-        # this, size-1 bisect and serial-fallback degradations accumulate
-        # across arbitrarily many healthy BATCH calls in a batch-dominant
-        # deployment, and the alarm's own escalation text ('N consecutive
-        # curations — every candidate in that run was filed without dedupe')
-        # is false of the service it describes. The asymmetry with the
-        # increment side is deliberate: batch items are not counted here
-        # because every batch-originated degradation that reaches the
-        # classification point is already counted through _degraded_create on
-        # the bisect/serial curate() fallback. Pinned by
-        # TestDegradedStreakBatchReset.
         self._reset_zero_output_breaker()
-        self._reset_degraded_streak()
 
-        return _parse_batch_decisions(
+        decisions = _parse_batch_decisions(
             agent_result,
             pools=pools,
             pool_sizes_list=pool_sizes_list,
             latency_ms=latency_ms,
         )
+
+        # The degraded streak asserts something strictly narrower than the
+        # breaker above: not 'the backend answers' but 'curation is still
+        # producing dedupe judgements'. A completed round-trip is NOT evidence
+        # of that. _parse_batch_decisions degrades items to action='create'
+        # ('batch-item-missing', 'batch-item-parse-failed', 'batch-cycle', …)
+        # on a SUCCESSFUL agent_result, raising nothing and so never reaching
+        # the bisect/serial curate() fallback that counts degradations
+        # elsewhere. Resetting on agent_result.success alone therefore made the
+        # alarm unreachable in exactly the case it was chartered for: a model
+        # or schema regression answering promptly with a well-formed response
+        # carrying no usable decision would bypass dedupe indefinitely while
+        # actively clearing the counter that exists to notice (esc-4448-8,
+        # measured 20/20 create at streak 0 over 10 such calls).
+        #
+        # So the evidence is a usable DECISION. One suffices: a batch that
+        # decided anything at all is a curator still doing its job, and the
+        # partially-degraded items are the designed per-item fail-open.
+        if any(not d.degraded for d in decisions):
+            self._reset_degraded_streak()
+        else:
+            # strict=: _parse_batch_decisions returns exactly len(pools)
+            # decisions and pools is per-candidate, so a length mismatch is a
+            # broken invariant worth raising over, not silently truncating.
+            for candidate, decision in zip(candidates, decisions, strict=True):
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+
+        return decisions
 
     async def _call_llm_batch_with_fallback(
         self,
@@ -3454,6 +3523,7 @@ def _parse_decision(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=agent_result.cost_usd,
+                degraded=True,
             )
 
     if not isinstance(raw, dict):
@@ -3463,6 +3533,7 @@ def _parse_decision(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=agent_result.cost_usd,
+            degraded=True,
         )
 
     return _parse_decision_dict(
@@ -3540,6 +3611,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             ))
             continue
         try:
@@ -3557,6 +3629,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             )
         results.append(decision)
 
@@ -3577,6 +3650,7 @@ def _parse_batch_decisions(
                     pool_sizes=d.pool_sizes,
                     latency_ms=d.latency_ms,
                     cost_usd=d.cost_usd,
+                    degraded=True,
                 )
 
     # Build the directed graph for cycle detection (only batch-drop edges).
@@ -3625,6 +3699,7 @@ def _parse_batch_decisions(
             pool_sizes=d.pool_sizes,
             latency_ms=d.latency_ms,
             cost_usd=d.cost_usd,
+            degraded=True,
         )
 
     return results
