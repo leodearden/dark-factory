@@ -270,15 +270,34 @@
     },
     {
       "id": "3031-integration-gap-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and fixed along the exact path the finding itself nominated. `mcp__plan-tools__report_ready_to_merge` IS now a member of `_PLAN_CREATOR_TOOLS` in orchestrator/src/orchestrator/agents/roles.py, carrying its own explanatory comment ('work is complete on THIS BRANCH; only the merge to main is missing'). Three commits did it: 192b88bbcd 'grant report_ready_to_merge to ARCHITECT + SIMPLE_TASK', then d51f11d906 and e344f6f27d which taught the ARCHITECT and SIMPLE_TASK prompts the exit. So both halves the finding separated — the hard reachability blocker in the ALLOWLIST and the softer prompt enumeration — are closed. The rest of the chain the finding called dead code is live: artifacts.py carries write_ready_to_merge / read_ready_to_merge / clear_ready_to_merge, event_store.py documents an event emitted 'once per .task/ready_to_merge.json report by TaskWorkflow._handle_ready_to_merge_report, on BOTH dispositions', and stranded_verified_green.py names the exit as one of its recovery routes. The finding closed by asking to 'confirm leaf zeta is filed and includes the _PLAN_CREATOR_TOOLS entry, or add it here' — so it explicitly allowed for the follow-up resolution, and that is what happened. The self-check it offered also now passes: this task's own architect was told report_ready_to_merge was among its tools, and the allowlist now agrees rather than contradicting the briefing.",
+      "followup_ticket": null,
+      "evidence": {
+        "allowlist_now_contains_it": "roles.py::_PLAN_CREATOR_TOOLS includes 'mcp__plan-tools__report_ready_to_merge'",
+        "fixing_commits": [
+          "192b88bbcd (allowlist)",
+          "d51f11d906 (architect prompt)",
+          "e344f6f27d (simple_task prompt)"
+        ],
+        "handler_chain_live": "artifacts.py write/read/clear_ready_to_merge; event_store.py event per report via TaskWorkflow._handle_ready_to_merge_report; stranded_verified_green.py cites the exit",
+        "findings_own_preferred_path": "'Confirm leaf zeta is filed and includes the _PLAN_CREATOR_TOOLS entry, or add it here' — the former happened"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3031-correctness-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, with both sides of the contradiction quotable verbatim on current main. SIDE A, the enqueue exit in workflow.py: \"'blocked' with no escalation is instead LEAVE-shaped, and the merge callback (or the found_on_main reconciler) flips it done once main actually moves.\" The comment's whole purpose is to justify persisting blocked-with-no-escalation on the grounds that the recovery sweep will leave it alone. SIDE B, harness.py: that shape is upgraded away from LEAVE. The condition is still `action == RecoveryAction.LEAVE and status == 'blocked' and report.live_claimant is None and self._only_merge_remediable(report.open_escalations) and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN` -> `RE_FILE_ESCALATION`, and the surrounding comment confirms the vacuous case the finding relied on: 'an empty list is still True'. So a blocked task with NO escalation whose branch is off main is exactly what gets re-escalated. The two comments cannot both be right, and neither has moved: nothing since 2026-08-01 touched the LEAVE-shaped rationale except a05136c0cb (task 3537 halt-filing), which did not address it. THIS IS THE MILDEST (b) IN THE ROSTER and should be filed as such rather than inflated. The finding said so itself — 'behaviourally this is bounded ... the stranded reaper has the same exposure (pre-existing), so this may be accepted behaviour — but the enqueue-exit comment should say so rather than assert the opposite.' The defect is a load-bearing comment that states the inverse of what the code does, with a real if bounded cost behind it (a burned architect run per sweep, and a second MergeRequest on the same branch once the 30-minute grace lapses). The remedy may legitimately be a comment correction rather than a behaviour change.",
+      "followup_ticket": null,
+      "evidence": {
+        "side_a_still_asserted": "workflow.py enqueue exit: \"'blocked' with no escalation is instead LEAVE-shaped\"",
+        "side_b_still_upgrades": "harness.py: LEAVE + blocked + no live claimant + _only_merge_remediable + EXISTS_OFF_MAIN -> RE_FILE_ESCALATION",
+        "vacuous_case_confirmed_in_comment": "'an empty list is still True' — so no-escalation satisfies _only_merge_remediable",
+        "commits_since_august_touching_it": "a05136c0cb (task 3537 halt-filing) — did not address the rationale",
+        "remedy_may_be_docs_only": "the finding explicitly allows 'the comment should say so rather than assert the opposite'"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3041-correctness-0",
