@@ -238,13 +238,35 @@
       "disposition": null
     }
   ],
-  "gate": null,
+  "gate": {
+    "decision": "continue",
+    "decided_at": "2026-09-14",
+    "rationale": "STOP is not available. The task authorises stopping only if all five priority findings disposition (a) or (c); three of the five are (b) — 3041-correctness-0, 3075-correctness-0 and 3142-correctness-0 are all still live on current main, one of them reproduced at runtime. Two are (a), both confirmed by hunk/commit rather than by claim. A 3-of-5 live rate among the high/major band is also the opposite of the 'low yield' premise the stop path rests on, so the 18 medium findings are triaged rather than deferred.",
+    "priority_tally": {
+      "a": 2,
+      "b": 3,
+      "c": 0
+    },
+    "stop_was_permitted": false
+  },
   "dispositions": [
     {
       "id": "2896-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Already fixed, and the fix is confirmed by the hunk rather than accepted from the task description. b57f8c1402 changed `task_id=''` to `task_id=entity_uuid` in maybe_escalate_suppression_storm, which is exactly the key misalignment the finding named. Notably it is an evil-merge: the line is in NEITHER parent's tree (parent1 c267573b73 still has task_id='' with the entity_uuid lookup; parent2 5b51fa970b has no such function at all), so it exists on main solely through that merge's by-hand conflict resolution — consistent with the description's 'fixed by hand'. `git log -S'task_id=entity_uuid' origin/main` finds nothing without -m, which is why the fix is easy to miss. The dedup mechanism was subsequently reworked by 201c9c018b (task 3522): the fold now keys on `dedupe_fingerprint` rather than has_open_l1, and task_id=entity_uuid survives as an unchanged context line, so the write key and the read key agree on both axes today.",
+      "followup_ticket": null,
+      "evidence": {
+        "filed_with": "flag_dedup.py::maybe_escalate_suppression_storm — task_id=entity_uuid, dedupe_fingerprint=compute_content_fingerprint(...)",
+        "queried_by": "escalation/src/escalation/dedupe.py::content_fingerprint_key returns esc.dedupe_fingerprint; per-entity reads use queue.get_by_task(entity_uuid)",
+        "fixing_hunk": "b57f8c1402: -task_id='' / +task_id=entity_uuid, with a new INVARIANT comment naming the no-op bug",
+        "pins": [
+          "fused-memory/tests/test_flag_dedup.py::TestMaybeEscalateSuppressionStorm::test_over_threshold_files_one_escalation",
+          "fused-memory/tests/test_flag_dedup.py::TestMaybeEscalateSuppressionStorm::test_recurring_storm_folds_into_one_parent",
+          "fused-memory/tests/test_stages.py::TestMemoryConsolidatorEntityStandingDecision::test_storm_escalation_filed_when_one_decision_suppresses_many"
+        ],
+        "incidental_observation": "b57f8c1402's own commit message cites a test name, test_dedup_key_round_trips_through_a_real_queue, that no longer exists on main — 201c9c018b folded it into test_recurring_storm_folds_into_one_parent, which retains the write-key-equals-read-key assertion. The coverage survived; only the name a reader would grep for is gone."
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3031-integration-gap-0",
@@ -260,9 +282,25 @@
     },
     {
       "id": "3041-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, and narrowed to precisely one of its three texts. The CODE measurement reproduces exactly: still 2 of 6 Mem0 delete paths under reconciliation/ wired to record_mem0_deletion_tombstones (wired: _sweep_stale_mem0_pool, enforce_summary_pool_cap; unwired: harness._delete_status_correction_memories, scope_freshness._pool_cap_scope_snapshots, targeted._delete_stale_completion_echoes, task_knowledge_sync._prune_task_count_snapshots). Of the three overclaiming texts, one is FIXED and two are not. TEXT 2 (recon_self_model.py) is now fully bounded — task 4421 (done) replaced the universal claim with an enumerated deleter list, names all four unwired paths explicitly, and points at task 4422 for the widening. TEXT 1 (mem0_tombstone.py module docstring) still says 'consumed by every recon path that deletes a Mem0 record'; that is tracked by task 4472 (deferred, low) which names the exact lines. TEXT 3 (server/tools.py::get_memory_by_id, the LIVE FastMCP tool description) still hedges tombstone absence with the TTL reason ONLY, and is the one piece of residue no open task appears to name: 4472's scope is mem0_tombstone.py + memory_service.py, and 4422/4861 are coverage-widening tasks. THE FINDING IS NOW WORSE THAN WHEN WRITTEN, in a way it could not have predicted: task 4421's fix to Text 2 means the Stage 2 prompt now tells an agent that 'several Mem0 delete paths write no tombstone at all' while the get_memory_by_id tool description that same agent reads says absence only means TTL expiry. The two live agent-facing texts now contradict each other. Also note the finding's own mitigation has expired: it said render_cycle_summary_section was 'not yet imported by any prompt file (task xi cutover pending)'. It IS now imported and interpolated by prompts/stage2.py, so the text is live.",
+      "followup_ticket": null,
+      "evidence": {
+        "wired_call_sites": 2,
+        "unwired_call_sites": 4,
+        "unchanged_since_july": true,
+        "text_1_mem0_tombstone_py": "STILL OVERCLAIMS — 'consumed by every recon path that deletes a Mem0 record'; tracked by task 4472 (deferred)",
+        "text_2_recon_self_model_py": "FIXED by task 4421 (done) — now an enumerated deleter list naming all four unwired paths and task 4422",
+        "text_3_server_tools_py": "STILL OVERCLAIMS — absence hedged on TTL only; NOT named by 4472 (scope: mem0_tombstone.py + memory_service.py) and not by 4422/4861's coverage scope",
+        "new_contradiction": "prompts/stage2.py renders the bounded Text 2 while get_memory_by_id ships the unbounded Text 3 — one agent, two incompatible statements",
+        "mitigation_expired": "render_cycle_summary_section is now imported and rendered by reconciliation/prompts/stage2.py",
+        "related_open_tasks": [
+          "4472 (deferred)",
+          "4422 (deferred)",
+          "4861 (pending)"
+        ]
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3041-architectural-coherence-1",
@@ -278,15 +316,40 @@
     },
     {
       "id": "3075-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, with the word 'permanently' now false for one of its two paths. Every mechanical fact reproduces verbatim: the Pass-1 record gate preserves unconditionally on ASSIGNED reading only LANE_STATE_RAW and LANE_STATE_TASK_ID; lib_lane_state.sh exports no age field at all, so the gate CANNOT see updated_at even though the record carries it; the gate is still positioned before the --disk-pressure rm branch, deliberately and by documented design; the arg parser still has no --force/--ignore-record/--max-record-age; and _note_released_durable still swallows OSError with 'cache updated (FREE), durable record left as-is'. WHAT CHANGED, and it matters: task 2891 landed two harness passes the July reading predates. _reclaim_terminal_lane_records DOES clear stuck records — but keyed on TERMINAL task status, not record age — so a stuck record whose task is done/cancelled now heals within a tick. _stale_lane_assignment_census is the only code applying an age bound (lane_stale_report_days, default 7) and is REPORT-ONLY by explicit design. So an age bound now exists in the tree and terminates in a digest line, never in a reclaim. TWO PATHS REMAIN LIVE. (1) A record stranded while its task is still pending/in-progress/blocked is skipped by the terminal reclaim by design and only printed by the census; reclaim_victim (the steal/preempt path) routes through the same swallowing write and its victim is typically non-terminal, so this is a real producer. (2) The claim's core ENOSPC scenario survives intact, because the healing pass releases through the SAME _note_released_durable and therefore fails identically while the disk is still full — the self-healing path is blocked by the very condition it would heal, during exactly the window the operator is running reclaim --disk-pressure. One genuine mitigation the July reading predates: the swallowed write is no longer silent, firing an L2 operator escalation at warm_lane_drift_l2_threshold (default 3). It still neither clears the record nor unblocks the gate. Test coverage is the telling gap: the analogous pin EXISTS for the sibling gate — test_warm_lane_gc.sh 'K5: --disk-pressure ALSO honours the live-reference gate' — while Block S (the record gate, S1-S23) contains zero --disk-pressure cases and Block K contains zero record-gate cases.",
+      "followup_ticket": null,
+      "evidence": {
+        "gate_reads": "LANE_STATE_RAW, LANE_STATE_TASK_ID only — lib_lane_state.sh exports no age field",
+        "updated_at_exists_on_record": "orchestrator/src/orchestrator/lane_lifecycle.py — stamped on every transition",
+        "gate_still_before_disk_pressure": true,
+        "disk_pressure_override_exists": false,
+        "healed_case": "terminal-task records, by harness._reclaim_terminal_lane_records (task 2891) — so 'permanently' overstates for these",
+        "still_live_1": "non-terminal stuck records (e.g. preempt/steal victims): skipped by the terminal reclaim by design, report-only census",
+        "still_live_2": "the acute ENOSPC window: the healing release uses the same OSError-swallowing write, so it fails while the disk is full",
+        "age_bound_in_tree_but_report_only": "harness._stale_lane_assignment_census, config.lane_stale_report_days default 7.0",
+        "new_mitigation": "drift now escalates to L2 at warm_lane_drift_l2_threshold (default 3); does not clear the record",
+        "missing_pin": "test_warm_lane_gc.sh Block S has no --disk-pressure case; the analogous K5 pin exists for the live-reference gate",
+        "partially_overlapping_open_task": "5341 (pending, low) releases lanes whose task left the runnable set — addresses part of still_live_1, but not the gc gate's age bound nor a --disk-pressure override"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3142-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, reproduced at runtime rather than inferred. Running the shipped code: extract_completion_claims('Filed follow-up task 3200 for the remaining work') yields CompletionClaim(kind='filing_dispatch', subject='task', ref='3200'), and verify_claims with a probe returning 'pending' yields status='mismatch', observed='pending'. build_unverified_flag on that verdict returns a populated flag with tag='unverified_claim' — so the downstream consequence is confirmed end-to-end, which the original finding only inferred. verify_claims still branches solely on claim.subject; claim.kind appears nowhere in verify_claims, _verify_task, _verify_ticket or _verify_commit. The test blind spot is also unchanged: every filing_dispatch case in test_completion_claim_gate.py pairs with a TICKET subject, and the task-side fixture hardcodes kind='applied_work'. Two commits touched the file since 2026-08-10 (both task 3403 clause-boundary work) and neither changed a line of the dispatch. NO NEW FOLLOW-UP FILED, DELIBERATELY: task 4205 (deferred, medium) already tracks this as its CLASS 1 and quotes the same diagnosis, and the repo already carries an independent quantification in docs/unverified-completion-claim-sweep-2026-08-11/investigation.md — 125-128 of ~166-172 production mismatches are this exact class, with not one terminal. Filing a duplicate would be the wrong action; the accounting entry is the existing task.",
+      "followup_ticket": null,
+      "evidence": {
+        "runtime_reproduction": "kind='filing_dispatch' subject='task' ref='3200' -> status='mismatch' observed='pending'",
+        "downstream_confirmed": "build_unverified_flag returns tag='unverified_claim' with status='mismatch'",
+        "dispatch_still_subject_only": "verify_claims branches on claim.subject; claim.kind is never read there",
+        "test_blind_spot_unchanged": "all filing_dispatch cases pair with a ticket subject; _task_claim() hardcodes kind='applied_work'",
+        "commits_since_2026_08_10": "bcbaf27f36, b280f5d480 — both task 3403 clause boundaries; zero changed lines in the kind/subject dispatch",
+        "production_scale": "docs/unverified-completion-claim-sweep-2026-08-11: 125-128 of ~166-172 mismatches are this class; none terminal"
+      },
+      "checked_at": "2026-09-14",
+      "followup_kind": "pre_existing_task",
+      "existing_task": "4205"
     },
     {
       "id": "3142-correctness-1",
@@ -326,9 +389,25 @@
     },
     {
       "id": "3363-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and fixed more thoroughly than the finding suggested. Task 3442 landed the repair (commits aa5ac9c415, 5e0938c58e, 41803f5b7c, e63803cb72, dec8c9f480) and task 3481 moved verdictBadge out of the JSX into dashboard/src/dashboard/static/redux/memory_evals_fmt.js, so the finding's cited consumer path is itself stale now. The producer is UNCHANGED — recovered_open is still narrowed to no_alarm and the *_open states are still emitted — but the consumer is no longer three literals: it is a 9-entry PARITY_REFINEMENT table plus a 4-entry PARITY_PLAIN opt-out, and the producer now exports its vocabulary as a closed PARITY_STATES frozenset of 13. The decisive check is the set difference, and it is empty in BOTH directions: every producer state is handled, and there are no dead consumer branches. The exact row the finding named now renders 'insufficient_data - escalation open' with badge warn, which is precisely the behaviour it asked for. The fix went further than the suggestion in two ways: it is enumerated-exhaustive rather than endsWith('_open'), so an unlisted state fails LOUDLY as 'unrecognised parity' / badge bad instead of degrading to muted; and unknown_verdict now reads 'unreadable verdict' / badge bad, distinct from an absent verdict's 'no verdict' / muted, resolving the finding's second sub-claim. One residue is NOT a defect: _parity's docstring still says the change is 'purely additive for existing consumers'. The finding offered a disjunctive remedy — fix the consumer OR drop the claim — and the consumer was fixed, which makes the sentence true rather than misleading. No follow-up is warranted.",
+      "followup_ticket": null,
+      "evidence": {
+        "producer_unchanged": "recovered_open still narrowed to no_alarm; *_open states still emitted; PARITY_STATES now a 13-member frozenset",
+        "consumer_relocated": "verdictBadge now in dashboard/src/dashboard/static/redux/memory_evals_fmt.js (task 3481), not tab_memory_evals.jsx",
+        "set_difference_both_directions": "empty — 13 producer states = 9 refined + 4 plain, no unhandled value and no dead branch",
+        "named_row_now_renders": "insufficient_data + open escalation -> 'insufficient_data - escalation open', badge warn",
+        "stronger_than_suggested": "enumerated-exhaustive with a loud 'unrecognised parity' fallback, rather than endsWith('_open')",
+        "second_subclaim_resolved": "unknown_verdict -> 'unreadable verdict' / badge bad, distinct from absent 'no verdict' / muted",
+        "pins": [
+          "dashboard/tests/js/memory_evals_fmt.test.mjs::'verdictBadge: an escalation-open parity on a never-measured metric is NOT a recovery'",
+          "dashboard/tests/js/memory_evals_fmt.test.mjs::'verdictBadge: every _open state renders the same escalation-open affordance'",
+          "dashboard/tests/test_tab_memory_evals.py::test_parity_vocabulary_fully_covered",
+          "dashboard/tests/test_tab_memory_evals.py::test_every_open_parity_state_shows_the_escalation_affordance"
+        ],
+        "docstring_claim_now_true": "_parity still says 'purely additive for existing consumers'; the consumer fix makes that accurate"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3363-design-1",
