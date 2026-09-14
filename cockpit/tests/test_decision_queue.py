@@ -58,6 +58,7 @@ def _make_queue_item(**overrides) -> QueueItem:
         'target': None,
         'handling': False,
         'escalation_id': 'esc-1',
+        'session_slug': None,
     }
     fields.update(overrides)
     return QueueItem(**fields)
@@ -315,6 +316,7 @@ class TestFormatCopyPayload:
             kind='session',
             decision_id=None,
             question='Which host?',
+            session_slug='my-slug',
         )
 
         payload = format_copy_payload(item)
@@ -659,21 +661,19 @@ class TestKnownProjectRoots:
 
 
 class TestQueueItemSessionSlug:
-    """QueueItem.session_slug -- the one place the 'session:<slug>' key
-    encoding is decoded, next to _session_key that writes it."""
+    """QueueItem.session_slug -- carried from the SessionRecord order_queue
+    already holds, so it is asserted on order_queue's own output rather than
+    on a hand-built item."""
 
-    def test_session_item_yields_the_slug_from_its_key(self):
-        item = _make_queue_item(key='session:abc-1', kind='session', decision_id=None)
+    def test_order_queue_carries_the_slug_on_a_session_item_and_none_on_a_decision(self):
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
 
-        assert item.session_slug == 'abc-1'
+        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
+        sessions = [_make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)]
 
-    def test_decision_item_has_no_session_slug(self):
-        item = _make_queue_item(key='decision:dec-1', kind='decision')
+        items = order_queue([decision], sessions, Priorities.default(), _NOW)
 
-        assert item.session_slug is None
-
-    def test_malformed_key_without_a_prefix_degrades_to_the_key_itself(self):
-        """Fail-soft (PRD §2), matching the split format_copy_payload already performed."""
-        item = _make_queue_item(key='abc-1', kind='session', decision_id=None)
-
-        assert item.session_slug == 'abc-1'
+        by_kind = {item.kind: item for item in items}
+        assert by_kind['session'].session_slug == 'awaiting-1'
+        assert by_kind['decision'].session_slug is None

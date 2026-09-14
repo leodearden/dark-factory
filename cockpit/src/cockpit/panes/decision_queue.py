@@ -180,6 +180,13 @@ class QueueItem:
     escalation_id: the backing record's escalation_id, or None -- not
         rendered by format_queue_row, but consumed by format_copy_payload
         (the copy affordance, task 2517).
+    session_slug: the backing SessionRecord's slug for a session item, None
+        for a decision item. Carried as its own field rather than decoded
+        back out of *key*: order_queue already holds the record the slug
+        comes from, so encoding it into a string only to write a parser for
+        it would be the meaningful-string shape heuristic 12 rules out --
+        and the parser's fail-soft branch would be dead code, since every
+        session key this codebase builds comes from _session_key.
     """
 
     key: str
@@ -193,19 +200,7 @@ class QueueItem:
     target: DisplayTarget | None
     handling: bool
     escalation_id: str | None
-
-    @property
-    def session_slug(self) -> str | None:
-        """The session slug encoded in *key*, or None for a decision item.
-
-        The sole decoder of the 'session:<slug>' key encoding _session_key
-        writes, so that knowledge lives in exactly one place (SPOT).
-        Fail-soft (PRD §2): a key with no ':' prefix degrades to the key
-        itself rather than raising.
-        """
-        if self.kind != 'session':
-            return None
-        return self.key.split(':', 1)[1] if ':' in self.key else self.key
+    session_slug: str | None
 
 
 
@@ -247,7 +242,7 @@ def format_copy_payload(item: QueueItem) -> str:
     escalation_id degrades to a placeholder, never the literal string
     'None'. The trailing id line is derived from item.kind/item.key --
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
-    session (see QueueItem.session_slug). The question
+    session (QueueItem.session_slug). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
     long question can't silently vanish on a terminal that drops rather
     than truncates an over-long OSC 52 payload. One payload serves both
@@ -388,6 +383,7 @@ def order_queue(
                 target=resolve_target(decision, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=decision.escalation_id,
+                session_slug=None,
             )
         )
 
@@ -414,6 +410,7 @@ def order_queue(
                 target=resolve_target(session, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=session.escalation_id,
+                session_slug=session.session_slug,
             )
         )
 
