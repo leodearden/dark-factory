@@ -573,6 +573,31 @@ say — in byte-identical prose. An operator reading one could not tell which
 had happened, so neither number was actionable.
 """
 
+MEMORY_OUTAGE_STREAK_THRESHOLD = 5
+"""Consecutive dispatches recalling NOTHING before the outage is escalated.
+
+INV-4. The per-query WARNING and the in-block notice report one dispatch;
+neither can say "this has now failed five running", which is the difference
+between one flaky call and a memory service nobody has noticed is down. Five
+is a judgement, not a measurement: low enough that a real outage is named
+within a few minutes of dispatch traffic, high enough that a single restart
+of the memory container does not page anyone.
+
+CODE, not a config knob (D7). The threshold is revisited on evidence like
+the query table beside it; hot-reload buys nothing for a module constant,
+and a per-project knob would let "what counts as an outage" drift between
+projects for no stated reason.
+
+Deliberately NOT ``shared.storm_counter.StormCounter``, which is a rolling
+TIME-WINDOW burst detector: it would fire on N failures inside a window even
+with successes interleaved, and would fall silent on a permanent outage once
+dispatches slowed below the window rate — the exact opposite of what a
+consecutive-failure streak must report. The house precedent for a streak is
+a plain counter attribute (``shared/api_health.py``'s
+``consecutive_successes``, ``usage_gate``'s ``consecutive_cap_hits``), and
+there is no shared streak primitive to reuse.
+"""
+
 MEMORY_SECTION_FAILURE_NOTICE = (
     '_The **{section}** section is missing: the memory query failed ({reason})._'
 )
@@ -705,6 +730,13 @@ class BriefingAssembler:
         self.config = config
         self.memory_url = config.fused_memory.url
         self.project_id = config.fused_memory.project_id
+        self._memory_outage_streak = 0
+        """Consecutive dispatches whose memory recall produced nothing at all.
+
+        Lives on the assembler because the harness holds exactly one for the
+        life of the process and hands it to every workflow, so the count is
+        per-process dispatch history — which is the thing INV-4 asks about.
+        """
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
         agent_id = _caller_agent_id(task_id, role)
@@ -1777,6 +1809,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
         # query among two is a partial recall, already named section by
         # section in `notices` above.
         outage = bool(reasons) and (loop_failure is not None or len(failures) == queries_fired)
+        self._note_memory_outage(outage)
 
         # Compute (and log) the filtered-result summary BEFORE any early
         # return below: an all-foreign result set and a partial failure are
@@ -1841,6 +1874,26 @@ Handle this escalation, then call `resolve_issue` with a summary.
             rendered_sections.append('\n'.join(notices))
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
+
+    def _note_memory_outage(self, outage: bool) -> None:
+        """Track the consecutive-outage streak and escalate once per crossing.
+
+        Re-alarms on every further multiple of the threshold rather than
+        once and then never again: a permanent outage must keep saying so,
+        and an operator who missed the first line still gets another without
+        one line per dispatch.
+        """
+        if not outage:
+            self._memory_outage_streak = 0
+            return
+        self._memory_outage_streak += 1
+        if self._memory_outage_streak % MEMORY_OUTAGE_STREAK_THRESHOLD == 0:
+            logger.error(
+                f'_get_memory_context: {self._memory_outage_streak} consecutive '
+                f'dispatches recalled no memory at all for {self.project_id!r} — '
+                'the memory service looks unavailable, and every briefing since '
+                'the streak began was assembled without it'
+            )
 
     async def _task_entity_block(self, task_id: str) -> str:
         """The knowledge-graph half of D3's dual-channel task context.
