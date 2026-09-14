@@ -23,7 +23,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MOCK_WORKFLOW_PROJECT_ROOT,
+    pydantic_spec,
+    wait_responsive,
+)
 from _recording_event_store import _RecordingEventStore
 from shared.task_statuses import TaskStatus
 
@@ -120,13 +125,17 @@ class _CheckSequence:
         return self.results[idx]
 
 
-async def _await_waiter_count(registry, branch: str, count: int, timeout: float = 30.0):
+async def _await_waiter_count(registry, branch: str, count: int):
     """Wait until *branch*'s in-flight entry has *count* waiters; return the entry.
 
     A fixed number of ``sleep(0)`` yields is only enough while everything the
     submit path awaits is in-process.  Once the tip classification runs a real
     ``git cherry`` subprocess, the number of loop iterations it needs is
-    unbounded, so wait for the state itself and fail loudly on timeout.
+    unbounded, so wait for the state itself and fail loudly on give-up.
+
+    The budget is the shared ``MERGE_GATE_BARRIER_TIMEOUT`` (15s nominal, 30s
+    wall cap) charged in event-loop-responsive time, so a descheduled worker
+    is handed back the time it was denied instead of being billed for it.
     """
     async def _poll():
         while True:
@@ -135,7 +144,11 @@ async def _await_waiter_count(registry, branch: str, count: int, timeout: float 
                 return entry
             await asyncio.sleep(0.01)
 
-    return await asyncio.wait_for(_poll(), timeout)
+    return await wait_responsive(
+        _poll(),
+        timeout=MERGE_GATE_BARRIER_TIMEOUT,
+        label=f'{branch} reaching {count} in-flight waiters',
+    )
 
 
 def _merge_attempt_outcomes(store: _RecordingEventStore) -> list[str]:
@@ -1312,6 +1325,16 @@ class TestSubmitToMergeQueueAttachesAsPeer:
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        # SUBSET and SUPERSET differ by exactly one observable call: the
+        # RESNAPSHOT arm re_snapshots and then falls through into the SAME
+        # attach the containment arm takes.  Without this spy the test passes
+        # even when `resolve_divergent` is forced to return SUPERSET.
+        re_snapshot_calls: list[tuple] = []
+        real_re_snapshot = registry.re_snapshot
+        registry.re_snapshot = lambda branch, tip: (  # type: ignore[method-assign]
+            re_snapshot_calls.append((branch, tip)) or real_re_snapshot(branch, tip)
+        )
+
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
         )
@@ -1320,6 +1343,19 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         # Attached (ATTACH_CONTAINMENT action for SUBSET); no ValueError escaped
         assert real_queue.qsize() == 0
         assert len(entry.waiters) == 2
+
+        # SUBSET attaches WITHOUT re-snapshotting; a SUPERSET classification
+        # would have called re_snapshot before this same attach.
+        assert re_snapshot_calls == [], (
+            'SUBSET must attach without re_snapshot; a non-empty call list '
+            f'means the tip classified as SUPERSET instead: {re_snapshot_calls}'
+        )
+        # The same invariant read a second, independent way: re_snapshot is the
+        # sole writer of snapshot_tip, so an unchanged OLD is public proof it
+        # never ran.
+        post_entry = registry.entry('B')
+        assert post_entry is not None
+        assert post_entry.snapshot_tip == OLD
 
         P.set_result(MergeOutcome(status='done', merge_sha='sha'))
         await submit_task
