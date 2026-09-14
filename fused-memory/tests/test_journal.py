@@ -1009,7 +1009,7 @@ class TestGetRunStageExecution:
 
         assert execution is not None
         assert set(execution) == {
-            'status', 'stage_ran', 'resumed', 'started_at', 'completed_at',
+            'status', 'stage_ran', 'resumed', 'settled', 'started_at', 'completed_at',
         }
         assert execution['stage_ran'] is True
         assert execution['status'] == 'interrupted'
@@ -1091,6 +1091,71 @@ class TestGetRunStageExecution:
         # The resume key is bookkeeping, never stage evidence, in both shapes.
         assert settled_exec['stage_ran'] is False
         assert adopted_exec['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', ['completed', 'failed', 'rolled_back', 'circuit_breaker'],
+    )
+    async def test_every_status_that_flushes_the_blob_reads_as_settled(
+        self, journal, status
+    ):
+        """Statuses spelled out rather than parametrized over the frozenset
+        itself: reading the roster from the code under test would let a
+        narrowing edit silently drop a status while the suite stayed green,
+        which is the regression this pins. ``interrupted`` is covered
+        separately — it alone needs the resume evidence."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.complete_run(run_id, status)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == status
+        assert execution['settled'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_run_still_executing_has_not_settled(self, journal):
+        """The dominant shape: Stage 3 verifies the run it is running inside,
+        whose blob the harness has not flushed yet."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'running'
+        assert execution['stage_ran'] is False
+        assert execution['settled'] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('adopted,settled', [(False, True), (True, False)])
+    async def test_interrupted_settles_only_when_it_was_never_adopted(
+        self, journal, adopted, settled
+    ):
+        """``interrupted`` is the one terminal status a run can leave: the
+        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
+        re-runs the run behind a status column only ``complete_run`` ever
+        writes. So the SAME terminal status means "finished account" or
+        "executing again" depending on that key, and the projection — not its
+        caller — is what knows the difference."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        if adopted:
+            await journal.update_run_stage_reports(
+                run_id, {'_resume': {'count': 1, 'last_stage': 'memory_consolidator'}},
+            )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution['status'] == 'interrupted'
+        assert execution['resumed'] is adopted
+        assert execution['settled'] is settled
 
     @pytest.mark.asyncio
     async def test_unparseable_stage_reports_leaves_resumed_indeterminate(

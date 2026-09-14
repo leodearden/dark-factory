@@ -189,12 +189,18 @@ re-executing this very stage still reads back `interrupted` on disk. That pairin
 is worse than the empty first-attempt case: the stage key is absent precisely
 BECAUSE this attempt has not re-filed it yet, the shape most likely to be a
 genuine lost write. The adopt pass persists its `_resume` bookkeeping before
-adopting, so `get_run_stage_execution` returns that as a `resumed` flag and rung 4
-requires a persisted status AND, for `interrupted`, positive evidence the run was
-never adopted. Everything else falls to rung 3 (`run_unknown`) and the consumer's
-existing fallback. The gate is stated as the set of statuses that DO persist, so a
-future non-terminal status degrades to `run_unknown` rather than to a confident
-wrong answer.
+adopting, so `get_run_stage_execution` reads that key and returns a `settled`
+verdict: a persisted status AND, for `interrupted`, positive evidence the run was
+never adopted. Rung 4 requires that verdict; everything else falls to rung 3
+(`run_unknown`) and the consumer's existing fallback. The gate is stated as the
+set of statuses that DO persist, so a future non-terminal status degrades to
+`run_unknown` rather than to a confident wrong answer.
+
+Settled-ness is decided in `journal.py`, next to the read, **not** in the presence
+reader: which statuses flush the blob and what an adopted run's status column
+means are harness lifecycle facts, and the `runs` table's owner is the one module
+that already holds them. `MemoryService` consumes the single `settled` signal and
+holds no run-lifecycle knowledge.
 
 `run_status` is **DIAGNOSTIC ONLY — never gate on it.** Three measured `failed`
 runs really did execute Stage 2 and lose the ledger write, so a status gate
