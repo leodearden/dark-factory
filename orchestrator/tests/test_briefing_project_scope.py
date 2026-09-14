@@ -1012,6 +1012,131 @@ class TestTaskEntityChannel:
 
 
 @pytest.mark.asyncio
+class TestDegradationIsLoud:
+    """A memory outage is reported, not silently rendered as "nothing known".
+
+    Task 3659 (PRD lane β, D6 / INV-2). ``_mcp_search`` used to swallow every
+    exception at DEBUG and return ``None``, which is indistinguishable from
+    "the corpus holds nothing" — so the honest outage branch below it was
+    unreachable, and a live transient server error was observed being masked
+    as an empty corpus across 234 briefings.
+    """
+
+    def _dispatch(self, *, failing_slug: str | None = None, payload: dict | None = None):
+        """Answer every call with *payload*, except the query for *failing_slug*."""
+        payload = payload if payload is not None else {
+            'results': [_result('1', 'A recalled fact.', source_store='mem0')],
+        }
+        reply = {'result': {'content': [{'type': 'text', 'text': json.dumps(payload)}]}}
+        failing = {
+            text for spec, text in queries_for(_task_scope()) if spec.slug == failing_slug
+        }
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['arguments'].get('query') in failing:
+                raise ConnectionError('memory service unreachable')
+            return reply
+
+        return dispatch
+
+    async def test_a_failed_query_names_its_missing_section_and_warns(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        from orchestrator.agents.briefing import MEMORY_SECTION_FAILURE_NOTICE
+
+        with caplog.at_level(logging.DEBUG), patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._dispatch(failing_slug='briefing-task-semantic')),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert '**Task Context**' in context
+        assert MEMORY_SECTION_FAILURE_NOTICE.split('{')[0] in context
+        assert 'transport' in context
+
+        assert '## Conventions & Gotchas' in context, 'the healthy query still renders'
+        assert 'A recalled fact.' in context
+
+        failure_logs = [r for r in caplog.records if 'memory service unreachable' in r.getMessage()]
+        assert failure_logs, 'the transport failure must reach the log'
+        assert all(r.levelno >= logging.WARNING for r in failure_logs), (
+            f'a swallowed search must not be a DEBUG line, got '
+            f'{[(r.levelname, r.getMessage()) for r in failure_logs]}'
+        )
+
+    async def test_a_degraded_reply_names_the_stores_that_failed(
+        self, briefing: BriefingAssembler,
+    ):
+        """The signal was already on the wire and nobody read it: 701
+        briefings carried a ``degraded`` payload that rendered as ordinary
+        (silently partial) recall."""
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._dispatch(payload={
+                'results': [_result('1', 'A recalled fact.', source_store='mem0')],
+                'degraded': True,
+                'failed_stores': ['graphiti'],
+            })),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert 'graphiti' in context
+        assert 'A recalled fact.' in context
+        assert '{' not in context and '}' not in context
+
+    async def test_a_total_outage_reads_differently_from_an_empty_corpus(
+        self, briefing: BriefingAssembler,
+    ):
+        """The defect this closes: both outcomes used to emit the same
+        sentence, so an operator reading a briefing could not tell a dead
+        memory service (234 briefings) from a corpus with nothing to say
+        (77)."""
+        from orchestrator.agents.briefing import MEMORY_EMPTY_NOTICE, MEMORY_OUTAGE_NOTICE
+
+        assert MEMORY_EMPTY_NOTICE != MEMORY_OUTAGE_NOTICE
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=ConnectionError('memory service unreachable')),
+        ):
+            outage = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'result': {'content': []}}),
+        ):
+            empty = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert MEMORY_EMPTY_NOTICE in empty
+        assert MEMORY_EMPTY_NOTICE not in outage
+        assert MEMORY_OUTAGE_NOTICE.split('{')[0] in outage
+        assert 'transport' in outage
+        assert outage != empty
+
+    async def test_a_drop_note_and_a_failure_notice_both_render(
+        self, briefing: BriefingAssembler,
+    ):
+        """A blocked cross-project leak and a broken query are separate
+        facts; neither may displace the other."""
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._dispatch(
+                failing_slug='briefing-task-semantic',
+                payload={'results': [
+                    _result('1', 'Own fact.', metadata={'project_id': 'dark_factory'}),
+                    _result('2', 'Foreign fact.', metadata={'project_id': 'reify'}),
+                ]},
+            )),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert 'tagged to another project and filtered out' in context
+        assert '**Task Context**' in context
+        assert 'Own fact.' in context
+        assert 'Foreign fact.' not in context
+
+
+@pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:
     """A standing caveat covers the leak channel the tag filter cannot reach.
 
