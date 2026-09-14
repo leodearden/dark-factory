@@ -1983,6 +1983,25 @@ class ReconciliationConfig(BaseModel):
     # because the reconciliation subsystem executes it. Read live per
     # MemoryService.search off the shared config object, so it satisfies the
     # reload.py live-read reload-safety rule.
+    topic_anchored_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the topic-anchored canonical pin in MemoryService.search. When '
+            "True, a search whose Mem0 results carry a metadata.topic looks up that "
+            "topic's canonical:true record and PROMOTES it to index 0 of the returned "
+            'window, flagged topic_anchored=True. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live per MemoryService.search by '
+            'resolve_topic_anchor_enabled in services/topic_anchor.py, off the shared '
+            'config object and never captured at construction, so a reload takes '
+            'effect on the next search with no restart). The promoting pin is the arm '
+            "SELECTED BY MEASUREMENT in task 4004 (plans/read-transform-selection-"
+            'report.md, recommendation.arm = promoting_pin): claim recall 1.00 at '
+            '1070.27 tokens/query against a 1181.29 baseline, dropping no ranked '
+            'records. False disables the transform entirely, so every search skips '
+            'the extra backend round-trip.'
+        ),
+    )
+
     # Caller bar for `deterministic-*` done provenance (PRD C5, task 5237).
     # Lives here rather than on ConsolidationAutoConfig because the bar governs
     # every deterministic provenance kind, not only auto-consolidation's.
@@ -2004,25 +2023,6 @@ class ReconciliationConfig(BaseModel):
             'reads is SELF-REPORTED, so it deters a cooperating caller rather '
             'than enforcing a boundary. Green-tier hot-reloadable via '
             'reload_config.'
-        ),
-    )
-
-    topic_anchored_recall_enabled: bool = Field(
-        default=True,
-        description=(
-            'Enable the topic-anchored canonical pin in MemoryService.search. When '
-            "True, a search whose Mem0 results carry a metadata.topic looks up that "
-            "topic's canonical:true record and PROMOTES it to index 0 of the returned "
-            'window, flagged topic_anchored=True. Green-tier hot-reloadable via the '
-            'reload_config MCP tool (read live per MemoryService.search by '
-            'resolve_topic_anchor_enabled in services/topic_anchor.py, off the shared '
-            'config object and never captured at construction, so a reload takes '
-            'effect on the next search with no restart). The promoting pin is the arm '
-            "SELECTED BY MEASUREMENT in task 4004 (plans/read-transform-selection-"
-            'report.md, recommendation.arm = promoting_pin): claim recall 1.00 at '
-            '1070.27 tokens/query against a 1181.29 baseline, dropping no ranked '
-            'records. False disables the transform entirely, so every search skips '
-            'the extra backend round-trip.'
         ),
     )
 

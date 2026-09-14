@@ -478,10 +478,6 @@ def validate_consolidate_args(
             'ledger that stores it once.'
         )
 
-    # See the module docstring: refused HERE so an unattributable delete
-    # costs zero writes rather than stranding a canonical over unfolded
-    # supersedes. Retain-only calls are exempt — they never delete, so
-    # nothing becomes unattributable.
     if limits is not None:
         count_problems = _member_count_problems(retain_ids, limits)
         if count_problems:
@@ -493,6 +489,10 @@ def validate_consolidate_args(
                 'automatic write does.'
             )
 
+    # See the module docstring: refused HERE so an unattributable delete
+    # costs zero writes rather than stranding a canonical over unfolded
+    # supersedes. Retain-only calls are exempt — they never delete, so
+    # nothing becomes unattributable.
     if supersedes_ids and (not isinstance(run_id, str) or not run_id.strip()):
         problems.append(
             'the delete arm requires `run_id`: a supersede cannot be deleted '
