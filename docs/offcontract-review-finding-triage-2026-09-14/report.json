@@ -464,21 +464,47 @@
     },
     {
       "id": "3453-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, all three elements intact. The probe is still `importlib.util.find_spec('escalation.submit')`; the comment above it still says the process 'can prove the invariant here for free (find_spec on an ...)'; and the warning text still reads 'proc_supervision: `escalation.submit` is NOT importable from %s'. find_spec locates a spec without executing the module, so neither the comment nor the warning is true, and the blind spot the finding identified is exactly the failure mode the task was built around: a missing transitive site-packages dependency (escalation.submit -> escalation.queue -> shared.timestamps -> shared/__init__ -> shared.async_sqlite_base -> aiosqlite) leaves the .py file on disk, so find_spec succeeds, the canary stays silent, and the deferred child still dies at fire time having filed no L2. Neither of the finding's two alternative remedies was taken: the probe was not upgraded to a real `importlib.import_module` in a try/except, and the wording was not corrected to say 'cannot be located'. Nothing since 2026-08-01 changed the probe. Read together with 3453[1], per the plan's instruction: these two findings are in the same module and NEITHER has been addressed, so no change resolved one without the other.",
+      "followup_ticket": null,
+      "evidence": {
+        "probe_still_findability_only": "importlib.util.find_spec('escalation.submit'); probe_detail 'find_spec returned None'",
+        "overclaiming_comment_intact": "'it can prove the invariant here for free (find_spec on an ...)'",
+        "overclaiming_warning_intact": "'proc_supervision: `escalation.submit` is NOT importable from %s'",
+        "blind_spot_unchanged": "a missing transitive dep (e.g. aiosqlite) still yields a valid spec, a silent canary, and a child that dies at fire time with 0 L2s",
+        "neither_remedy_taken": "no import_module probe; wording not narrowed to 'cannot be located'",
+        "read_with_sibling": "3453[1] is also still live — no change resolved one of the pair without the other"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3453-blast-radius-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, and the argv makes it unambiguous. `setenv_args = _submit_child_setenv_args()` is spliced into the systemd-run argv BEFORE the payload — `argv = ['systemd-run', '--user', f'--on-active=...', f'--unit=...', '--collect', f'--working-directory=...', *setenv_args, '/bin/sh', '-c', wrapped]` — so PYTHONPATH is set for the whole `/bin/sh -c` payload, not for the on-failure submit branch inside it. The helper's own docstring still frames it as 'the ... systemd-run args for the submit child', which is the framing the finding challenged. The narrower remedy it proposed (drop the systemd-run token and prefix the on-failure command inside the shell wrapper) was not adopted. ONE REAL BOUND worth recording, which keeps this at medium rather than higher: the token is attached only on the escalation-spec branch — the else branch sets `setenv_args = []` — so a payload with no EscalationSpec is entirely unaffected. The exposure is confined to payloads that DO carry a spec, which is precisely the set the finding named (deterministic_runner's detached restart path, routing real deploy scripts). So the contamination surface is real and narrower than 'every transient unit'. Still unpinned by any test.",
+      "followup_ticket": null,
+      "evidence": {
+        "argv_verbatim": "['systemd-run','--user','--on-active=...','--unit=...','--collect','--working-directory=...',*setenv_args,'/bin/sh','-c',wrapped]",
+        "scope": "unit-wide over the whole /bin/sh -c payload, not the submit child",
+        "docstring_framing_unchanged": "'The --setenv=PYTHONPATH=... systemd-run args for the submit child'",
+        "bound_that_limits_it": "setenv_args = [] on the no-EscalationSpec branch, so only spec-carrying payloads are exposed",
+        "narrower_remedy_not_adopted": "no in-wrapper `PYTHONPATH=<roots> <python> -m escalation submit` prefix"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3454-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and fixed to the letter of the finding's own suggestion plus a structural improvement it did not ask for. The finding's remedy was: add 'weekly limit' and 'session limit' to the local `_CAPACITY_FAILURE_MARKERS`, and replace the KNOWN MISLEADING FAILURE paragraph with a note that capped runs now skip. Both happened, and the marker list was promoted out of the test module rather than merely extended. The guard is now `_capacity_skip.result_looks_like_capacity_failure`, backed by shared/src/shared/cap_markers.py and a `REAL_CLI_CAP_MESSAGES` corpus of verbatim observed cap texts, with its own tests (shared/tests/test_capacity_skip.py, test_cap_markers.py). test_capacity_skip.py pins the EXACT string the finding named — \"You've hit your weekly limit - resets Aug 5, 11am\" — as a case that must be recognised. The old local list survives only as a historical reference in _capacity_skip.py's docstring, which names the same defect: 'That copy missed \"You've hit your weekly limit ...\"'. The docstring rewrite is equally complete: 'READING A RED RUN. A capped account now SKIPS: the guard is _capacity_skip.result_looks_like_capacity_failure, pinned (task 3483) against the verbatim weekly text observed here ... which the guard previously did not match, so a capped account used to fail the assertion below with a cap message dressed up as lost context.' The KNOWN MISLEADING FAILURE paragraph is gone. Credited to task 3483.",
+      "followup_ticket": null,
+      "evidence": {
+        "guard_now": "shared/tests/_capacity_skip.py::result_looks_like_capacity_failure, backed by shared/src/shared/cap_markers.py",
+        "exact_string_now_pinned": "shared/tests/test_capacity_skip.py pins \"You've hit your weekly limit - resets Aug 5, 11am\"",
+        "local_list_retired": "_CAPACITY_FAILURE_MARKERS survives only as a historical note in _capacity_skip.py's docstring",
+        "docstring_rewritten": "'A capped account now SKIPS' replaced the KNOWN MISLEADING FAILURE paragraph",
+        "fixed_by": "task 3483",
+        "went_further_than_asked": "the marker corpus was promoted to a shared module with its own tests, rather than the suggested local two-string addition"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3679-test-coverage-0",
