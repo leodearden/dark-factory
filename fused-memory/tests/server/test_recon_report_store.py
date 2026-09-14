@@ -1099,6 +1099,81 @@ class TestSupersedeAcrossEviction:
         finally:
             store_b.close()
 
+    def test_restarted_stage_shadowing_an_evicted_twin_persists_the_live_row(
+        self, tmp_path
+    ):
+        """A same-name stage restarted after eviction must persist the LIVE row.
+
+        ``start_report``'s docstring documents this path as reachable (task
+        3988): Stage 1 completes, ``tick()`` evicts it from ``_state`` while the
+        run stays live (so ``_run_finding_index`` still holds it), and a later
+        ``start_report`` naming that same stage takes the fresh-create path.
+        Two distinct entry objects then share one ``(run_id, stage)`` — the
+        store's primary key.
+
+        Widening ``_persist_run``'s reach to the finding index made that
+        collision reachable: identity-deduping emitted a row for BOTH twins in
+        one ``executemany`` against ``ON CONFLICT(run_id, stage) DO UPDATE``, so
+        the STALE evicted twin landed last and overwrote the live stage's row.
+        Persisted state then diverged from memory and ``hydrate_from_store``
+        resurrected the dead entry while dropping every finding the live stage
+        had filed.
+        """
+        import json
+
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_and_completes(state)
+            self._evict_stage1(state, t, stage1_fid)
+
+            # Stage 1 restarts under the same name, shadowing the evicted twin.
+            state.start_report(
+                run_id=self._RUN, stage=self._S1, project_id='dark_factory'
+            )
+            restarted_fid = state.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='filed by the RESTARTED stage 1',
+                suggested_action='act', actionable=True, task_id='777',
+                flag_type='memory_restarted_stage_claim',
+            )['finding_id']
+
+            # The surviving stage-1 row is the LIVE one, not the stale twin.
+            payload_fids = {
+                f['finding_id']
+                for f in json.loads(self._stage1_row(store_a)['entry_json'])['findings']
+            }
+            assert payload_fids == {restarted_fid}, (
+                'the persisted stage-1 row should hold exactly the restarted '
+                'stage\'s finding; the stale evicted twin overwrote it'
+            )
+            assert (
+                self._persisted_finding(store_a, restarted_fid)['description']
+                == 'filed by the RESTARTED stage 1'
+            )
+
+            # ...because exactly one row per (run_id, stage) is emitted at all.
+            reachable = state._reachable_run_entries(self._RUN)
+            assert len({(e.run_id, e.stage) for e in reachable}) == len(reachable)
+        finally:
+            store_a.close()
+
+        # A restart hydrates the live stage, not the resurrected dead one.
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+            assert state_b._resolve_finding(self._RUN, restarted_fid) is not None
+            assert state_b._resolve_finding(self._RUN, stage1_fid) is None
+        finally:
+            store_b.close()
+
 
 # ---------------------------------------------------------------------------
 # step-13: fresh in-process runs stay byte-identical with/without a store —

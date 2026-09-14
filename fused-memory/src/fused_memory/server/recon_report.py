@@ -712,7 +712,7 @@ class ReconReportState:
     # ------------------------------------------------------------------
 
     def _reachable_run_entries(self, run_id: str) -> list[_ReportEntry]:
-        """Every entry of *run_id* a mutation can still REACH, identity-deduped.
+        """Every entry of *run_id* a mutation can still REACH, one per stage.
 
         The union of this run's ``_state`` entries and the distinct entries
         behind ``_run_finding_index[run_id]``.  The two differ because
@@ -729,21 +729,33 @@ class ReconReportState:
         family as well as the ``supersedes`` stamp — was applied in memory and
         then silently dropped on the way to the store.
 
+        Deduped by ``(run_id, stage)`` — the store's PRIMARY KEY — and NOT by
+        object identity, with the ``_state`` entry winning any collision.  Two
+        distinct entry objects can share one stage: :meth:`start_report`'s
+        docstring documents the evict-then-restart path (task 3988) where an
+        evicted-but-still-indexed entry is shadowed by a fresh same-name entry
+        in ``_state``.  Identity-deduping returned BOTH, and since
+        :meth:`_persist_run` upserts them in one ``executemany`` against
+        ``ON CONFLICT(run_id, stage) DO UPDATE``, the stale twin landed last and
+        overwrote the live stage's row — persisted state silently diverging from
+        memory, and :meth:`hydrate_from_store` resurrecting the dead entry while
+        dropping every finding the live stage had filed.  The live ``_state``
+        row is therefore the one persisted; the evicted twin's stamps are
+        unpersistable because the store has no key to hold them under.
+
         Deliberately NOT for READS.  :meth:`get_assembled_report` stays
         ``_state``-scoped on purpose: an evicted stage dropping out of the
         assembled report is that method's intended semantics, and widening it
         with this helper would change what the report CONTAINS — far beyond
         aligning write reach with mutation reach.
         """
-        entries = [
-            entry for (rid, _stage), entry in self._state.items() if rid == run_id
-        ]
-        seen = {id(entry) for entry in entries}
+        by_key: dict[tuple[str, str], _ReportEntry] = {}
         for entry in self._run_finding_index.get(run_id, {}).values():
-            if id(entry) not in seen:
-                seen.add(id(entry))
-                entries.append(entry)
-        return entries
+            by_key[(entry.run_id, entry.stage)] = entry
+        for (rid, stage), entry in self._state.items():
+            if rid == run_id:
+                by_key[(rid, stage)] = entry  # _state is authoritative
+        return list(by_key.values())
 
     def _persist_run(self, run_id: str) -> None:
         """Write every ``(run_id, *)`` entry through to the store.  No-op if
