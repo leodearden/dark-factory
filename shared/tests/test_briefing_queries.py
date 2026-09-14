@@ -175,3 +175,136 @@ class TestDeriveAreaTerms:
         scope = BriefingScope(files=('shared/src/shared/briefing_queries.py',))
 
         assert derive_area_terms(scope) == derive_area_terms(scope)
+
+
+class TestQuerySpecs:
+    """The table of queries the briefing fires (D1/D2/D3, PRD-γ's D9 slugs)."""
+
+    def test_exactly_three_specs_with_the_registry_slugs(self):
+        from shared.briefing_queries import QUERY_SPECS
+
+        assert tuple(spec.slug for spec in QUERY_SPECS) == (
+            'briefing-conventions-generic',
+            'briefing-conventions-area',
+            'briefing-task-semantic',
+        )
+
+    def test_slugs_are_unique(self):
+        from shared.briefing_queries import QUERY_SPECS
+
+        assert len({spec.slug for spec in QUERY_SPECS}) == len(QUERY_SPECS)
+
+    def test_conventions_specs_are_store_and_category_scoped(self):
+        from shared.briefing_queries import CONVENTIONS_AREA, CONVENTIONS_GENERIC
+
+        for spec in (CONVENTIONS_GENERIC, CONVENTIONS_AREA):
+            assert spec.stores == ('mem0',)
+            assert spec.categories == ('preferences_and_norms', 'procedural_knowledge')
+
+    def test_every_spec_asks_for_five_results(self):
+        from shared.briefing_queries import QUERY_SPECS
+
+        assert [spec.limit for spec in QUERY_SPECS] == [5, 5, 5]
+
+    def test_the_retired_queries_appear_in_no_template(self):
+        """D1 retires these two outright rather than rewording them."""
+        from shared.briefing_queries import QUERY_SPECS
+
+        rendered = ' '.join(spec.text for spec in QUERY_SPECS).lower()
+        assert 'project overview architecture goals' not in rendered
+        assert 'recent decisions and rationale' not in rendered
+
+    def test_specs_are_immutable(self):
+        from shared.briefing_queries import QUERY_SPECS, TASK_SEMANTIC
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            TASK_SEMANTIC.limit = 50
+        assert isinstance(QUERY_SPECS, tuple)
+        for spec in QUERY_SPECS:
+            assert isinstance(spec.stores, tuple)
+            assert isinstance(spec.categories, tuple)
+
+
+class TestQueriesForScope:
+    """``queries_for`` — the ordered ``(spec, query text)`` pairs to fire."""
+
+    def _scope(self) -> BriefingScope:
+        return BriefingScope(
+            task_id='3659',
+            title='Briefing memory rescope',
+            files=('orchestrator/src/orchestrator/agents/briefing.py',),
+        )
+
+    def test_a_task_scoped_dispatch_fires_the_area_and_semantic_specs(self):
+        from shared.briefing_queries import queries_for
+
+        assert [spec.slug for spec, _text in queries_for(self._scope())] == [
+            'briefing-conventions-area',
+            'briefing-task-semantic',
+        ]
+
+    def test_a_scope_with_nothing_to_go_on_fires_the_generic_spec_alone(self):
+        from shared.briefing_queries import queries_for
+
+        assert [spec.slug for spec, _text in queries_for(BriefingScope())] == [
+            'briefing-conventions-generic',
+        ]
+
+    def test_a_title_only_scope_still_reaches_the_area_spec(self):
+        from shared.briefing_queries import queries_for
+
+        scope = BriefingScope(task_id='3659', title='Briefing memory rescope')
+
+        assert [spec.slug for spec, _text in queries_for(scope)] == [
+            'briefing-conventions-area',
+            'briefing-task-semantic',
+        ]
+
+    def test_the_task_semantic_query_carries_the_title_and_the_area_terms(self):
+        from shared.briefing_queries import queries_for
+
+        text = dict((spec.slug, q) for spec, q in queries_for(self._scope()))['briefing-task-semantic']
+
+        assert 'Briefing memory rescope' in text
+        for term in ('orchestrator', 'agents', 'briefing'):
+            assert term in text
+
+    def test_the_task_semantic_query_never_carries_the_bare_task_id(self):
+        """The measured 0/5 failure mode: a bare task number embeds close to
+        OTHER task numbers, so it is kept out of every query text."""
+        from shared.briefing_queries import queries_for
+
+        for _spec, text in queries_for(self._scope()):
+            assert '3659' not in text
+
+    def test_the_conventions_query_is_phrased_from_the_area_terms(self):
+        from shared.briefing_queries import queries_for
+
+        text = dict((spec.slug, q) for spec, q in queries_for(self._scope()))['briefing-conventions-area']
+
+        assert 'conventions' in text
+        assert 'orchestrator agents briefing' in text
+
+    def test_a_title_only_scope_does_not_echo_its_title_twice(self):
+        """With no files the area ladder falls back to the title, which must
+        not read back into the semantic query as a doubled phrase."""
+        from shared.briefing_queries import queries_for
+
+        scope = BriefingScope(task_id='3659', title='Briefing memory rescope')
+        text = dict((spec.slug, q) for spec, q in queries_for(scope))['briefing-task-semantic']
+
+        assert text == 'Briefing memory rescope'
+
+    def test_rendering_is_pure(self):
+        from shared.briefing_queries import queries_for
+
+        assert queries_for(self._scope()) == queries_for(self._scope())
+
+    def test_no_unfilled_slot_survives_rendering(self):
+        from shared.briefing_queries import queries_for
+
+        for scope in (self._scope(), BriefingScope()):
+            for _spec, text in queries_for(scope):
+                assert '{' not in text and '}' not in text
+                assert text == text.strip()
+                assert '  ' not in text
