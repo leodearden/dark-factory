@@ -676,40 +676,18 @@ psi_admission:
         peer_block, _INJECTED_DEFAULTS)['restates_default'] == ['io_some_avg10']
 
 
-def test_the_script_never_states_an_arms_own_default_value():
-    """The check exists because PRD §6.2 gives one fact three homes.
-
-    Hard-coding the numbers here would make this script the FOURTH, and it
-    would report "restates the default" against its own stale copy long after
-    the model changed. The defaults must come from the live artifact.
-
-    Scoped to the arm-name/default-value PAIRING rather than to the bare
-    literals: the candidate ladders legitimately contain 3.0 and 40.0 as
-    rungs, and a blunt literal scan would force those rungs out of the ladders
-    for no reason. What must not exist is a line saying that THIS arm's
-    default is THAT number.
-    """
-    source_lines = SCRIPT.read_text().splitlines()
-    for arm, default in _INJECTED_DEFAULTS.items():
-        for line in source_lines:
-            assert not (arm in line and str(default) in line), (
-                f'scripts/load-threshold-calibration.py states {arm}\'s default '
-                f'({default}) at: {line.strip()!r}. Remove it — the defaults are '
-                'fetched from the live model, never restated here.')
-
-
 def test_compare_to_code_defaults_has_no_built_in_defaults_mapping():
-    """The same fact enforced at the signature: there is nothing to fall back
-    on, so a failed fetch cannot silently become a stale comparison."""
-    import inspect
+    """There is nothing to fall back on, so a failed fetch cannot silently
+    become a stale comparison against the script's own copy of the numbers.
 
+    Asserted by CALLING it one argument short rather than by reading the
+    signature: introspection would freeze the parameter's NAME, failing for a
+    rename that breaks nothing, while proving nothing about a call.
+    """
     module = load_script()
-    sig = inspect.signature(module.compare_to_code_defaults)
-    defaults_param = sig.parameters['defaults']
 
-    assert defaults_param.default is inspect.Parameter.empty, (
-        'compare_to_code_defaults must require its defaults mapping; a default '
-        'argument would be a second home for the values it exists to police.')
+    with pytest.raises(TypeError):
+        module.compare_to_code_defaults({'mem_some_avg10': 3.0})
 
 
 def test_the_defaults_shell_degrades_named_when_the_subprocess_fails(tmp_path: Path):

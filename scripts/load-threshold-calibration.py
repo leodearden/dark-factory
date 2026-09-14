@@ -405,9 +405,7 @@ def compare_to_code_defaults(block: dict | None, defaults: dict | None) -> dict 
     REPORT line: the script never edits either yaml and never removes a leaf.
 
     The numbers themselves are deliberately not written here, not even as
-    prose: a docstring copy goes stale exactly as silently as a code copy,
-    and ``test_the_script_never_states_an_arms_own_default_value`` scans this
-    file's lines for precisely that.
+    prose: a docstring copy goes stale exactly as silently as a code copy.
 
     ``defaults`` is required and has no fallback — a built-in copy here would
     make this script the fourth home of the very fact the check exists to
