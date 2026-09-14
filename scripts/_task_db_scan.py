@@ -156,6 +156,7 @@ class TaskDbProblem(Enum):
     ABSENT = "absent"
     EMPTY_STUB = "empty_stub"
     NO_TABLES = "no_tables"
+    NOT_A_DATABASE = "not_a_database"
 
 
 _REFUSAL_REMEDY = {
@@ -179,8 +180,16 @@ _REFUSAL_REMEDY = {
         "the 0-byte decoy above the live store becomes the moment any process "
         "opens it read-write, which is why size alone cannot catch it."
     ),
+    TaskDbProblem.NOT_A_DATABASE: (
+        "not a sqlite database at all — its bytes carry no database header, "
+        "so no query of any shape will run against it. A reader who lands "
+        "here is pointing at something other than a task store; the live one "
+        "is the MAIN checkout's .taskmaster/tasks/tasks.db."
+    ),
 }
 
+
+_SQLITE_NOTADB_ERRORCODE = 26
 
 TABLE_NAMES_SQL = (
     "SELECT name FROM sqlite_master "
@@ -213,6 +222,14 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     ``no such table: tasks`` — an error that reads as "this store is empty"
     when it in fact means "you are looking at the wrong file".
 
+    A store that cannot be OPENED for some other reason — permissions, a lock,
+    a file that vanished mid-call — propagates as the original
+    :class:`sqlite3.Error`. Only sqlite's own ``SQLITE_NOTADB`` becomes a
+    refusal, because only that code means the bytes are not a database;
+    :class:`sqlite3.OperationalError` is a SUBCLASS of
+    :class:`sqlite3.DatabaseError`, so branching on the exception class would
+    report every unreadable store as "not a database".
+
     The URI is built from the RESOLVED absolute path, so a relative one cannot
     be re-resolved against a different cwd by a subprocess or a later chdir —
     the ``unable to open database file`` shape of the same confusion.
@@ -229,7 +246,14 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
 
     conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
-    if conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone() is None:
+    try:
+        first_table = conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone()
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        if exc.sqlite_errorcode != _SQLITE_NOTADB_ERRORCODE:
+            raise
+        raise TaskDbUnreadable(resolved, TaskDbProblem.NOT_A_DATABASE) from exc
+    if first_table is None:
         conn.close()
         raise TaskDbUnreadable(resolved, TaskDbProblem.NO_TABLES)
     return conn
