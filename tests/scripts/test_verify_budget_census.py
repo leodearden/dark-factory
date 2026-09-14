@@ -945,3 +945,260 @@ class TestLegsAreFilteredToTheResolvedWindow:
         )
 
         assert within_window(legs, window) == ()
+
+
+def _load_record(cpu=1.0, cpu60=None, runqueue=0.5):
+    return {
+        'start': {
+            'cpu_some10': cpu,
+            'cpu_some60': cpu if cpu60 is None else cpu60,
+            'runqueue_ratio': runqueue,
+        },
+        'end': {'cpu_some10': cpu, 'cpu_some60': cpu, 'runqueue_ratio': runqueue},
+        'xdist': {'n_flag': None, 'auto_num_workers': None},
+    }
+
+
+class TestPsiBanding:
+    """Durations bucketed by the host pressure their command actually ran under.
+
+    This is what deliverable 1 exists for: "measure on a quiet host" stops
+    being a precondition, because every record says how quiet its host was.
+    """
+
+    def _banded(self, tmp_path, *entries):
+        from verify_budget_census import (  # noqa: PLC0415
+            by_load_band,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, *entries)
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        ).legs
+        return by_load_band(legs)
+
+    def test_a_quiet_and_a_busy_run_land_in_different_bands(self, tmp_path):
+        bands = self._banded(
+            tmp_path,
+            _leg(duration_secs=3000.0, load=_load_record(cpu=1.0)),
+            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0)),
+        )
+
+        assert bands['unstamped']['durations']['n'] == 0
+        banded = {
+            name: row['durations']['max']
+            for name, row in bands.items()
+            if name != 'unstamped' and row['durations']['n']
+        }
+        assert sorted(banded.values()) == [3000.0, 4600.0]
+        assert len(banded) == 2, 'a quiet and a heavily-loaded run must not share a band'
+
+    def test_the_bands_are_named_constants_not_inline_numbers(self):
+        """Band edges carry a rationale, so a later reader can argue with them."""
+        from verify_budget_census import PSI_BANDS  # noqa: PLC0415
+
+        assert PSI_BANDS
+        for band in PSI_BANDS:
+            assert band.name
+            assert band.why, f'band {band.name} has no stated rationale'
+
+    def test_the_bands_tile_the_range_without_gaps_or_overlap(self):
+        """Every possible pressure reading lands in exactly one band."""
+        from verify_budget_census import PSI_BANDS, band_for  # noqa: PLC0415
+
+        for value in (0.0, 0.01, 4.9, 5.0, 24.9, 25.0, 49.9, 50.0, 99.9, 100.0):
+            matches = [b.name for b in PSI_BANDS if b.lo <= value < b.hi]
+            assert len(matches) == 1, f'{value} matched {matches}'
+            assert band_for(value) == matches[0]
+
+
+class TestUnstampedIsItsOwnRow:
+    """The honesty property that matters most for the HISTORICAL corpus.
+
+    Measured while building this: ZERO records in the live corpus carry a load
+    stamp, because deliverable 1 has not merged. So `unstamped` is not an edge
+    case — today it is the entire corpus, and every figure the budget is
+    currently derived from sits in it.
+
+    Putting those in a zero-pressure band would be the worst available lie: it
+    would file the busiest historical runs in the IDLE band and then invite the
+    conclusion that the suite is slow even on a quiet host.
+    """
+
+    def _banded(self, tmp_path, *entries):
+        from verify_budget_census import (  # noqa: PLC0415
+            by_load_band,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, *entries)
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        ).legs
+        return by_load_band(legs)
+
+    def test_a_record_predating_the_stamp_is_unstamped(self, tmp_path):
+        bands = self._banded(tmp_path, _leg(duration_secs=4991.0, load=None))
+
+        assert bands['unstamped']['durations'] == {
+            'n': 1, 'p50': 4991.0, 'p90': 4991.0, 'max': 4991.0,
+        }
+
+    def test_a_degraded_psi_read_is_unstamped_not_zero_pressure(self, tmp_path):
+        """A null cpu_some10 means "not knowable", never "the host was idle"."""
+        bands = self._banded(
+            tmp_path, _leg(duration_secs=4991.0, load=_load_record(cpu=None)),
+        )
+
+        assert bands['unstamped']['durations']['n'] == 1
+        assert bands[_idle_band_name()]['durations']['n'] == 0
+
+    def test_a_genuinely_idle_host_is_banded_not_unstamped(self, tmp_path):
+        """The complement — 0.0 is a real reading and must not read as missing."""
+        bands = self._banded(
+            tmp_path, _leg(duration_secs=3000.0, load=_load_record(cpu=0.0)),
+        )
+
+        assert bands['unstamped']['durations']['n'] == 0
+        assert bands[_idle_band_name()]['durations']['n'] == 1
+
+    def test_the_bands_reconcile_against_the_selected_n(self, tmp_path):
+        """Never silently dropped: banded + unstamped accounts for every leg."""
+        bands = self._banded(
+            tmp_path,
+            _leg(duration_secs=3000.0, load=_load_record(cpu=0.0)),
+            _leg(duration_secs=3100.0, load=_load_record(cpu=40.0)),
+            _leg(duration_secs=4991.0, load=None),
+            _leg(duration_secs=7200.0, load=None, timed_out=True, rc=-9),
+        )
+
+        accounted = sum(
+            row['durations']['n'] + row['timed_out'] + row['failed']
+            for row in bands.values()
+        )
+        assert accounted == 4
+
+
+def _idle_band_name():
+    from verify_budget_census import PSI_BANDS  # noqa: PLC0415
+
+    return PSI_BANDS[0].name
+
+
+class TestColdSeparabilityIsReportedNotInferred:
+    """D17's ruled fallback, asserted as a property of the report.
+
+    A summary.json carries no is-cold flag. The only available inference —
+    "attempt-1 in a worktree with no prior verify dir is cold" — would mix warm
+    reruns into a cold distribution and then get frozen into a budget as if
+    measured. D17 anticipates this and rules the fallback: label the cold value
+    INTERIM with its basis. So the census says it CANNOT separate them, counts
+    the records it could only have guessed at, and labels no series "cold".
+    """
+
+    def _finding(self, tmp_path, *entries):
+        from verify_budget_census import (  # noqa: PLC0415
+            cold_separability,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, *entries)
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        ).legs
+        return cold_separability(legs)
+
+    def test_the_finding_says_not_separable(self, tmp_path):
+        finding = self._finding(tmp_path, _leg())
+
+        assert finding['cold_separable'] is False
+        assert finding['basis'], 'the finding must state WHY it cannot separate'
+
+    def test_the_guessable_records_are_counted(self, tmp_path):
+        """attempt-1 records are the ones a cold inference would have claimed."""
+        from verify_budget_census import (  # noqa: PLC0415
+            cold_separability,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, _leg(), lane='100')
+        second = _worktree_record(tmp_path, '200', 'attempt-3.orchestrator.summary.json')
+        second.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        ).legs
+        finding = cold_separability(legs)
+
+        assert finding['first_attempt_records'] == 1
+        assert finding['later_attempt_records'] == 1
+
+    def test_no_series_is_labelled_cold(self, tmp_path):
+        """The assertion that stops a guess becoming a measurement."""
+        finding = self._finding(tmp_path, _leg())
+
+        assert 'cold' not in {k.lower() for k in finding} - {'cold_separable'}
+        assert not any(
+            isinstance(v, dict) and 'p50' in v for v in finding.values()
+        ), 'a duration series here would be a cold distribution built on a guess'
+
+
+class TestTheMergeGateBudgetIsReported:
+    """Reported, never changed. The merge gate is ALWAYS cold.
+
+    It verifies a freshly-created worktree every time, so its budget is a
+    different question from the task lane's — and this census does not answer
+    it. Saying so in the report is what stops a reader applying a warm-derived
+    figure to a strictly costlier path.
+    """
+
+    def test_the_project_yaml_value_is_read(self, tmp_path):
+        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+
+        (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
+            'merge_verify_cold_command_timeout_secs: 7200\n', encoding='utf-8',
+        )
+
+        readout = merge_gate_budget(tmp_path)
+
+        assert readout['merge_verify_cold_command_timeout_secs'] == 7200
+        assert readout['source'].endswith('dark-factory-orchestrator.yaml')
+
+    def test_the_defaults_yaml_is_the_fallback(self, tmp_path):
+        """Unset in the project yaml is the LIVE state — the default governs."""
+        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+
+        (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
+            'max_concurrent_tasks: 4\n', encoding='utf-8',
+        )
+        defaults = tmp_path / 'orchestrator' / 'src' / 'orchestrator' / 'defaults.yaml'
+        defaults.parent.mkdir(parents=True)
+        defaults.write_text(
+            'merge_verify_cold_command_timeout_secs: 7200\n', encoding='utf-8',
+        )
+
+        readout = merge_gate_budget(tmp_path)
+
+        assert readout['merge_verify_cold_command_timeout_secs'] == 7200
+        assert readout['source'].endswith('defaults.yaml')
+
+    def test_an_unresolvable_budget_is_null_not_guessed(self, tmp_path):
+        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+
+        readout = merge_gate_budget(tmp_path)
+
+        assert readout['merge_verify_cold_command_timeout_secs'] is None
+        assert readout['source'] is None
+
+    def test_the_readout_states_the_merge_gate_is_always_cold(self, tmp_path):
+        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+
+        readout = merge_gate_budget(tmp_path)
+
+        assert readout['always_cold'] is True
+        assert 'census changes nothing' in readout['note'].lower()
