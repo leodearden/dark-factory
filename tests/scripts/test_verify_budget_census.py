@@ -1473,3 +1473,106 @@ class TestTheReportCarriesItsOwnProvenance:
         assert report['cold_separability']['cold_separable'] is False
         assert report['merge_gate']['always_cold'] is True
         assert 'unstamped' in report['by_load_band']
+
+
+class TestTheCensusAndTheGuardShareOneDerivation:
+    """INV-10, closing guard: the report and the gate cannot drift apart.
+
+    The census prints a derived floor and
+    `test_module_verify_budgets.py`'s excepted branch asserts one. If each
+    spelled `1.5 * max` for itself they could disagree silently — and the
+    disagreement would surface as an operator running the census, reading a
+    floor, setting the budget to it, and watching the gate go red anyway.
+
+    This is the same property
+    `test_the_budget_family_derives_every_floor_from_one_canonical_expression`
+    establishes for `min_budget`, applied to the new expression, and it is what
+    makes step-22's recorded run a genuine REPEAT of what the guard asserts
+    rather than a second opinion.
+    """
+
+    def _report(self, tmp_path, capsys, *entries):
+        _corpus_with(tmp_path, *entries)
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+        return json.loads(out)
+
+    def test_the_printed_floor_equals_the_familys_expression(self, tmp_path, capsys):
+        from module_budget_family import census_budget_floor  # noqa: PLC0415
+
+        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+
+        assert report['budget_check']['derived_floor'] == census_budget_floor(
+            4626.166946739017,
+        )
+
+    @pytest.mark.parametrize('worst', [3753.0, 4626.166946739017, 4991.13326132996])
+    def test_it_agrees_at_every_measured_figure(self, tmp_path, capsys, worst):
+        """Agreement at one value could be coincidence; at the three that
+        matter it is the shared expression."""
+        from module_budget_family import census_budget_floor  # noqa: PLC0415
+
+        report = self._report(tmp_path, capsys, _leg(duration_secs=worst))
+
+        assert report['budget_check']['derived_floor'] == census_budget_floor(worst)
+
+    def test_the_section_names_the_constant_it_feeds(self, tmp_path, capsys):
+        """So the operator running it knows where the number lands."""
+        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.0))
+
+        assert 'ORCHESTRATOR_BUDGET_CENSUS' in report['budget_check']['feeds']
+
+    def test_the_section_names_the_refusal_ceiling_and_its_meaning(
+        self, tmp_path, capsys,
+    ):
+        """A derived floor above the ceiling is a FINDING, and the report must
+        not let an operator discover that only from a red gate."""
+        report = self._report(tmp_path, capsys, _leg(duration_secs=4991.13326132996))
+
+        check = report['budget_check']
+        assert check['refusal_ceiling'] == 7200
+        assert check['exceeds_refusal_ceiling'] is True
+        assert 'escalate' in check['note'].lower()
+
+    def test_a_floor_under_the_ceiling_says_so(self, tmp_path, capsys):
+        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+
+        assert report['budget_check']['exceeds_refusal_ceiling'] is False
+
+    def test_an_empty_selection_derives_no_floor(self, tmp_path, capsys):
+        """No max means no floor — never a 0 that reads as a derived answer."""
+        report = self._report(tmp_path, capsys, _leg(cmd='pytest tests/test_foo.py'))
+
+        assert report['budget_check']['derived_floor'] is None
+        assert report['budget_check']['exceeds_refusal_ceiling'] is False
+
+    def test_the_text_report_prints_the_floor(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(duration_secs=4626.166946739017))
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert '7000' in out
+        assert 'ORCHESTRATOR_BUDGET_CENSUS' in out
+
+    def test_the_census_does_not_respell_the_derivation(self):
+        """The import is the mechanism, so its ABSENCE is the failure mode.
+
+        Asserted against the module's source: a re-spelled `1.5 *` would pass
+        every numeric test above today and drift the moment either side
+        changed, which is exactly what the family's canonical-expression guard
+        exists to prevent for `min_budget`.
+        """
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        import verify_budget_census as mod  # noqa: PLC0415
+
+        source = _Path(mod.__file__).read_text(encoding='utf-8')
+
+        assert 'census_budget_floor' in source
+        assert '1.5 *' not in source, (
+            'the census re-spells the derivation instead of importing '
+            'module_budget_family.census_budget_floor'
+        )
