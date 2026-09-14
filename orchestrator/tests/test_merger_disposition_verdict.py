@@ -208,3 +208,38 @@ class TestResolveAndResubmitVerdictRouting:
         f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
         f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
+
+
+@pytest.mark.asyncio
+class TestMergerPromptTakesNoMemoryScope:
+    """The merger's missing memory block is a decision, not an oversight.
+
+    Task 3659 (PRD lane β, D7). ``build_merger_prompt`` lost its memory block
+    and its ``context`` parameter; this pins the call site as it stands so a
+    later reader — or a later agent "restoring parity" with the reviewer —
+    has to change a test that says why, rather than quietly re-adding it.
+    """
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.git_ops.rebase_onto_main = AsyncMock()
+        f.wf.briefing.build_merger_prompt = AsyncMock(return_value='prompt')
+        f.wf._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
+            return_value=WorkflowOutcome.DONE,
+        )
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_with_verdict(f, blocked=False),
+        )
+        return f
+
+    async def test_the_builder_is_awaited_with_conflicts_and_intent_alone(
+        self, tmp_path: Path,
+    ):
+        f = self._setup(tmp_path)
+
+        await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
+
+        f.wf.briefing.build_merger_prompt.assert_awaited_once()
+        args, kwargs = f.wf.briefing.build_merger_prompt.await_args
+        assert len(args) == 2, f'conflicts and intent, nothing else: {args!r}'
+        assert kwargs == {}, f'the merger gains no scope of any kind: {kwargs!r}'

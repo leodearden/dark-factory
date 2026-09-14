@@ -811,3 +811,43 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         # No retry burned => clear_verdict() never destroyed the artifact.
         assert f.wf._invoke.call_count == 1
         assert aggregation.reviewer_errors == []
+
+
+@pytest.mark.asyncio
+class TestReviewerPromptIsScopedToTheTaskUnderReview:
+    """The reviewer's memory block follows the diff it is reviewing.
+
+    Task 3659 (PRD lane β, D7). ``_run_reviewer`` holds ``self.task`` and
+    ``self.task_id`` at every dispatch, and the reviewer builder now takes a
+    task — so a reviewer's recalled conventions and task context are about
+    the work under review rather than the project at large, and never about
+    a neighbouring task.
+    """
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(f, verdict='PASS', summary='ok'),
+        )
+        return f
+
+    async def test_the_builder_is_given_the_workflow_s_own_task(self, tmp_path: Path):
+        f = self._setup(tmp_path)
+
+        await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        _args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args
+        assert kwargs['task'] is f.wf.task
+        assert kwargs['task']['id'] == f.wf.task_id
+
+    async def test_the_task_is_passed_by_keyword(self, tmp_path: Path):
+        """Keyword-only in the builder and the Protocol alike, so the three
+        lockstep declarations cannot silently disagree on argument order."""
+        f = self._setup(tmp_path)
+
+        await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args
+        assert 'task' in kwargs
+        assert len(args) == 2, f'only reviewer_type and diff are positional, got {args!r}'
