@@ -19,9 +19,9 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -32,13 +32,12 @@ from fastmcp import FastMCP
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
 from shared.mcp_markup_middleware import (
-    FACT_MARKUP_DETECTED,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
-from orchestrator.mcp import markup_sink
+from orchestrator.mcp import markup_journal, markup_sink
 
 logger = logging.getLogger(__name__)
 
@@ -176,24 +175,6 @@ def _submit_merge_disposition(
 _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 
 
-def _emit_markup_fact(fact: dict[str, Any]) -> None:
-    """Emit the ``markup_detected`` record itself, as ONE structured line.
-
-    INV-2: every outcome emits the fact, and no consumer re-derives it by
-    log-scraping. The middleware already logs a human-readable WARNING for an
-    operator reading the stream, so duplicating that prose here would add a
-    second thing to read and still nothing to parse. This emits the RECORD —
-    greppable by its own name, then ``json.loads``-able whole.
-
-    Same emitter shape as ``escalation.server``'s, which is the only other
-    registration site that wires one; the middleware owns the record, so
-    neither builds it.
-
-    Module level rather than a ``create_server`` closure: it captures nothing.
-    """
-    logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
-
-
 #: verdict-tools' declaration of its own escalation channel (task 3690).
 #: Every field is stated here rather than defaulted inside ``markup_sink``:
 #: adding a server to the shared channel must be a decision at every axis, not
@@ -211,21 +192,34 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_consequence=(
         'further review gates strand on verdicts that never land.'
     ),
-    #: The HONEST answer for this boundary, which is not plan-tools' (task
-    #: 4744). verdict-tools is the identical per-agent stdio subprocess with an
-    #: identically ephemeral stderr, and it has no durable journal yet — so it
-    #: names the only route that genuinely exists here rather than inheriting
-    #: either the retired "grep the orchestrator logs" sentence or a journal
-    #: path this server never writes, which would send an operator to a missing
-    #: file. A follow-up is filed to give this boundary the same journal
-    #: plan-tools now has; landing it changes exactly this one string.
+    #: The HONEST answer for this boundary, and still verdict-tools' OWN
+    #: rather than plan-tools' — it names verdict-tools' file. It used to name
+    #: transcript mining, because that was the only route that genuinely
+    #: existed while this server's fact channel was a log line nobody retains;
+    #: task 4917 gave the boundary the journal that follow-up promised, so this
+    #: string now points at it and the transcript instruction is RETIRED rather
+    #: than supplemented.
+    #:
+    #: COMPOSED from ``MARKUP_JOURNAL_DIRNAME`` rather than respelled, so the
+    #: constant stays the single owner of the path an operator is told to read
+    #: and the instruction cannot drift away from the artifact it names — which
+    #: is the failure mode this whole leaf exists to close.
     attribution_source=(
-        'this boundary has no durable per-event journal yet, so the leaking '
-        'caller must be mined out of data/orchestrator/agent-transcripts/ — '
-        'search the burst window for submit_review_verdict calls carrying '
-        'envelope markup'
+        'every markup fact this server sees is journalled one line per event '
+        f'to {markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl under '
+        'the main checkout — each line carries subject_task_id, tool, param, '
+        'outcome and a UTC timestamp, so the leaking task is nameable from the '
+        "burst window's own lines (jq or grep '\"subject_task_id\"'); note "
+        'that under FORWARD_REPAIR a REPAIRED call is never bounced and never '
+        'reaches this escalation channel at all, so the journal is the only '
+        'place a repair is visible'
     ),
 )
+
+
+def _markup_project_root(worktree: Path) -> Path | None:
+    """verdict-tools' seam onto :func:`markup_sink.resolve_project_root`."""
+    return markup_sink.resolve_project_root(worktree)
 
 
 def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
@@ -251,6 +245,41 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         return ''
     task_id = plan.get('task_id') if isinstance(plan, dict) else None
     return task_id if isinstance(task_id, str) else ''
+
+
+def _markup_fact_journal(
+    artifacts: TaskArtifacts,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build verdict-tools' DURABLE fact channel (task 4917).
+
+    The middleware emits one ``markup_detected`` fact on every outcome, and it
+    is the only record anywhere that names WHICH call leaked. Before this it
+    reached exactly one place: a ``logger.info`` in a per-agent stdio
+    subprocess whose stderr the CLI agent that spawned it consumes. This gives
+    it a consumer that survives the process — see ``markup_journal``, the
+    server-agnostic channel task 4744 built for plan-tools and this boundary
+    now reuses unchanged.
+
+    ``server_label`` is read OFF the spec rather than respelled, so the spec
+    stays the single owner of the label and ``verdict-tools.jsonl`` cannot come
+    to disagree with the storm record that points at it.
+
+    ``resolve_root`` is routed through THIS module's ``_markup_project_root``
+    global (a lambda closing over the NAME, not the function), exactly as the
+    escalation sink's is, so a test that substitutes that seam steers a journal
+    ``create_server`` has already built. It is also why one patch steers both
+    channels to the same project root — which is the correct coupling: a
+    residue record and the journal line about it belong in the same checkout.
+
+    ``subject_task_id`` stays a THUNK, evaluated per record on the worker
+    thread: a verdict can be refused before its plan is readable.
+    """
+    return markup_journal.make_fact_journal(
+        worktree=artifacts.worktree,
+        server_label=_MARKUP_SINK_SPEC.server_label,
+        subject_task_id=lambda: _markup_subject_task_id(artifacts),
+        resolve_root=lambda worktree: _markup_project_root(worktree),
+    )
 
 
 def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
@@ -320,14 +349,57 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # `_call_sink` is a second floor under it. A record that cannot be filed
     # anywhere returns None, and the middleware's hint then tells the caller
     # the truth rather than claiming a preservation that did not happen.
+    #
+    # THE FACT SINK IS A DURABLE JOURNAL (task 4917), not a log line. The
+    # middleware emits one `markup_detected` record on EVERY outcome, and it is
+    # the only thing anywhere that names WHICH call leaked. This server is the
+    # per-agent stdio subprocess the orchestrator spawns per invocation, so a
+    # `logger.info` here reached only the stderr the spawning CLI agent
+    # consumes — neither journald nor anything else that survives the process.
+    # That was measured on plan-tools' identical boundary (task 4744): 0
+    # journald lines against 35 real rejections over the same span, which made
+    # the storm record's "identify the leaking caller" instruction
+    # unfollowable. The same journal module serves both boundaries; this one
+    # adds no line format, no size bounds and no failure handling of its own.
+    #
+    # AND IT MATTERS MORE HERE THAN THERE, because of FORWARD_REPAIR. A
+    # repaired call is never bounced: the tool body runs, the verdict lands,
+    # `escalation_sink` is never consulted (it sees only unrepairable residue
+    # and window storms), and the only caller-visible trace is a
+    # `meta['markup_repair']` block on a response nobody retains. So on this
+    # server the journal is not merely the best durable record of a repair —
+    # it is the ONLY one.
+    #
+    # WHAT THAT COSTS, and why it is paid lazily. The fact sink is awaited on
+    # every outcome, so the FORWARD_REPAIR success path now hops to a worker
+    # thread where a `logger.info` used to run inline; on the FIRST markup
+    # event in a given server process that thread also pays one
+    # `git rev-parse --git-common-dir` (markup_sink.resolve_project_root, 10s
+    # timeout) before the append. Successes are memoized, so it is once per
+    # process, and — like the escalation path above — it is reached only on the
+    # measured 0.27% of calls that carry a leak. Resolving eagerly in
+    # `create_server` instead would move that subprocess onto EVERY server
+    # construction, which is one per agent invocation including the ~99.7% that
+    # never leak, against the startup-latency constraint markup_sink's own
+    # header records (an import/exec stall past MCP_TIMEOUT gets the server
+    # silently dropped: tasks 1775 / 1776 / 2942). So the lazy shape is
+    # deliberate here for the same reason it is on plan-tools (task 4744), and
+    # a review that re-derives this trade should stop at this paragraph.
+    #
+    # Both injected channels resolve their project root through the one
+    # `_markup_project_root` seam. Behaviour-identical when unpatched (the seam
+    # just forwards to what was already the default), and the correct coupling:
+    # a residue record and the journal line about it belong in the same
+    # checkout, so two independently-resolved roots cannot silently disagree.
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
-        fact_sink=_emit_markup_fact,
+        fact_sink=_markup_fact_journal(artifacts),
         escalation_sink=markup_sink.make_escalation_sink(
             worktree=artifacts.worktree,
             spec=_MARKUP_SINK_SPEC,
             subject_task_id=lambda: _markup_subject_task_id(artifacts),
+            resolve_root=lambda worktree: _markup_project_root(worktree),
             last_resort=artifacts.write_markup_residue,
         ),
     ))
