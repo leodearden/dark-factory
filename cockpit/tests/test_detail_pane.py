@@ -202,6 +202,9 @@ class TestRenderDecisionDetail:
         assert 'None' not in session_line
 
     def test_empty_or_unparseable_filed_at_degrades_to_the_age_placeholder(self):
+        """Asserted on the filed LINE, not on the whole render: a bare "'?' in
+        rendered" is satisfied by any question ending in a question mark, so it
+        would pass whatever format_age returned here."""
         from cockpit.panes.detail_pane import render_decision_detail
 
         now = datetime(2026, 7, 7, tzinfo=UTC)
@@ -209,7 +212,10 @@ class TestRenderDecisionDetail:
         for filed_at in ('', 'not-a-timestamp'):
             rendered = render_decision_detail(_make_decision(filed_at=filed_at), [], now)
 
-            assert '?' in rendered
+            filed_line = next(
+                line for line in rendered.splitlines() if line.startswith('filed:')
+            )
+            assert filed_line.endswith('(?)')
 
     def test_absent_ids_render_a_placeholder_and_never_the_word_none(self):
         from cockpit.panes.detail_pane import render_decision_detail
