@@ -742,11 +742,12 @@ class TestRetentionCliff:
         try:
             run_id = 'run-with-a-naive-timestamp'
             await self._record_run(journal, run_id, stage_ran=True)
-            await journal._db.execute(
+            db = journal._require_db()
+            await db.execute(
                 'UPDATE runs SET started_at = ?, completed_at = NULL WHERE id = ?',
                 (self._T0.replace(tzinfo=None).isoformat(), run_id),
             )
-            await journal._db.commit()
+            await db.commit()
 
             inside = await service.get_cycle_summary_presence(
                 project_id=_PROJECT_ID,
