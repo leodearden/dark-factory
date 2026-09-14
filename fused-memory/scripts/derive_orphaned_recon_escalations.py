@@ -206,7 +206,7 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
         'reapable_ids': [],
     }
 
-    censuses: dict[str, dict[str, str] | None] = {}
+    censuses: dict[str, dict[str, set[str]] | None] = {}
 
     for esc in reapable:
         project_id = escalation_project_id(esc)
