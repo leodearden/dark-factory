@@ -109,6 +109,7 @@ from fused_memory.utils.validation import _safe_repr, require_full_uuid
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
@@ -2665,6 +2666,7 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root} registry snapshot (task 3088). Injected by
         # set_known_projects at server startup — MemoryService is constructed
         # before build_known_projects_map runs, so it cannot arrive by
@@ -2824,6 +2826,24 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_recon_journal(self, journal: ReconciliationJournal) -> None:
+        """Wire the reconciliation journal in as a READ-ONLY runs-table source.
+
+        ``get_cycle_summary_presence`` uses it, and only it, to tell a reaped
+        or never-written ``cycle_summary`` row from a genuinely lost one. The
+        service never calls a journal WRITER — the harness owns every write —
+        and it takes the same already-``initialize()``d instance the harness
+        holds rather than opening a second connection: one process, and
+        aiosqlite serialises its own connection.
+
+        Wired UNCONDITIONALLY at startup, above the ``recon_ledger_enabled``
+        gate that guards ``set_recon_ledger``. That asymmetry is the point:
+        journal availability and ledger availability are independent signals,
+        and the presence payload reports them separately as
+        ``run_lookup_available`` and ``ledger_available``.
+        """
+        self.recon_journal = journal
 
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).

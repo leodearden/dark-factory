@@ -767,6 +767,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
