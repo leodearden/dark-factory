@@ -864,6 +864,55 @@ class TestGitOpsAbortUniformity:
 
 
 # ---------------------------------------------------------------------------
+# Fail-safe: the guard never becomes the reason recovery fails
+# ---------------------------------------------------------------------------
+
+class TestVanishedWorktreeKeepsTheTypedException:
+    """A worktree deleted out-of-band must still surface as ``WorktreeMissing``.
+
+    The orchestrator races humans who delete a task worktree mid-flight, and
+    two consumers pattern-match the typed exception to recover: merge_queue's
+    ``except WorktreeMissing`` logs ``exc.path``, cleans up the merge worktree
+    and surfaces the task ``blocked``; steward's auto-escalates naming
+    ``exc.path``.  Both read ``.path``, and a bare ``FileNotFoundError``
+    carries neither the type nor the attribute — it escapes to a broader
+    handler with a different disposition and no worktree cleanup.
+
+    Inserting a preflight AHEAD of the abort put a second subprocess spawn in
+    front of ``_run``'s own typed pre-flight check, so the generic error now
+    wins the race.  ``WorktreeMissing`` subclasses ``FileNotFoundError``, so
+    this discriminates: the parent is not an instance of the subclass.
+
+    :meth:`TestPreflightCli.test_an_unresolvable_worktree_does_not_crash_the_cli`
+    does not cover this.  It points at a directory that EXISTS but is not a
+    repository — git runs and exits non-zero — whereas here git never spawns
+    at all.
+    """
+
+    async def test_abort_on_a_vanished_worktree_raises_the_typed_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """Through ``GitOps.abort_merge``: the production wiring, unmocked."""
+        vanished = tmp_path / 'deleted-out-of-band'
+        ops = _make_git_ops(tmp_path)
+
+        with pytest.raises(git_ops_module.WorktreeMissing) as caught:
+            await ops.abort_merge(vanished)
+
+        assert caught.value.path == vanished
+
+    def test_preflight_on_a_vanished_worktree_reports_unresolved(
+        self, tmp_path: Path,
+    ) -> None:
+        """The unit arm: an unspawnable cwd degrades, it does not raise."""
+        vanished = tmp_path / 'deleted-out-of-band'
+
+        result = rebase_recovery.preflight_rebase_recovery(vanished)
+
+        assert result.resolved is False
+        assert result.verdict == rebase_recovery.VERDICT_CLEAN
+
+# ---------------------------------------------------------------------------
 # The CLI the skills invoke
 # ---------------------------------------------------------------------------
 
