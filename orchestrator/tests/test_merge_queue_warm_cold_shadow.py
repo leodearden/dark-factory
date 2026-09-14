@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
-from _orch_helpers import make_placeholder_future, pydantic_spec, wait_responsive
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    make_placeholder_future,
+    pydantic_spec,
+    wait_responsive,
+)
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1307,6 +1312,22 @@ class _ColdLegDouble:
     A double built with a *gate* stays in flight until released, which is how
     the non-blocking contract is observed and how the single-in-flight guard
     is held open.
+
+    Both waits below are charged in loop-responsive time against the shared
+    ``MERGE_GATE_BARRIER_TIMEOUT`` (15s nominal, 30s wall cap), which carries
+    the coupled obligation that the owning test's timeout exceed the worst-case
+    wait — pytest-timeout's ``thread`` method plus ``--max-worker-restart=0``
+    turns an overrun into a dead xdist worker rather than a red test.  The
+    arithmetic, recorded once here so no reader re-derives it: the heaviest
+    test in this file is
+    ``TestVerifyAndAdvanceShadowCompareScheduling::test_done_land_does_not_await_cold_leg``
+    at ``wait_responsive(req.result)`` (MERGE_RESULT_TIMEOUT, 90s cap) plus
+    :meth:`await_start` (30s) plus :meth:`drain` (30s) = 150s worst case,
+    against this package's ini ``timeout = 300``.  So the obligation is already
+    discharged and no ``@pytest.mark.timeout`` is added — the inversion guard
+    in test_timeout_marker_inversion_guard.py rejects any new marker in the
+    open band 60 < N < 300, and a marker of exactly 300 would restate the ini
+    default.
     """
 
     def __init__(self, *, gate: asyncio.Event | None = None) -> None:
@@ -1337,21 +1358,34 @@ class _ColdLegDouble:
         """The leg has begun and has not finished."""
         return self._started.is_set() and not self._finished.is_set()
 
-    async def await_start(self, timeout: float = 10.0) -> None:
+    async def await_start(self) -> None:
         """Block until the spawned leg actually begins running."""
-        await asyncio.wait_for(self._started.wait(), timeout)
+        await wait_responsive(
+            self._started.wait(),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label='_ColdLegDouble.await_start (the cold shadow leg never began)',
+        )
 
-    async def drain(self, timeout: float = 10.0) -> None:
+    async def drain(self) -> None:
         """Release the gate, if any, and wait for the leg to finish.
 
         Replaces the ``for t in worker._shadow_compare_tasks: await t`` drain.
         Draining here is the test's own job either way: unlike the drift
         lane's ``_drift_check_tasks``, ``_shadow_compare_tasks`` is NOT
         drained by ``SpeculativeMergeWorker.stop()``.
+
+        Every caller therefore drains from a ``finally``, never straight-line:
+        a failed assertion — or a :func:`wait_responsive` give-up, which raises
+        the BaseException ``_pytest.outcomes.Failed`` — would otherwise skip
+        the drain and park a live gated task into pytest-asyncio teardown.
         """
         if self._gate is not None:
             self._gate.set()
-        await asyncio.wait_for(self._finished.wait(), timeout)
+        await wait_responsive(
+            self._finished.wait(),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label='_ColdLegDouble.drain (the cold shadow leg never finished)',
+        )
         await _settle()
 
 
@@ -1478,17 +1512,19 @@ class TestMaybeScheduleShadowCompare:
         state = ShadowCompareState(merges_since_last_shadow=9, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
-            # This call must RETURN before the gated leg can complete
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha123', warm, None, None
-            )
-            await cold_leg.await_start()
-            assert cold_leg.in_flight, (
-                '_maybe_schedule_shadow_compare must return before the cold leg completes'
-            )
-            assert len(cold_leg.calls) == 1
-
+        # try/finally, not straight-line — see _ColdLegDouble.drain.
+        try:
+            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+                # This call must RETURN before the gated leg can complete
+                await _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha123', warm, None, None
+                )
+                await cold_leg.await_start()
+                assert cold_leg.in_flight, (
+                    '_maybe_schedule_shadow_compare must return before the cold leg completes'
+                )
+                assert len(cold_leg.calls) == 1
+        finally:
             await cold_leg.drain()
 
     # Due → state reset to 0 + last_shadow_run_at updated
@@ -1523,26 +1559,30 @@ class TestMaybeScheduleShadowCompare:
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
-            # First call: spawns the leg, which stays in flight on its gate
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', warm, None, None
-            )
-            await cold_leg.await_start()
-            assert len(cold_leg.calls) == 1
+        # try/finally, not straight-line — see _ColdLegDouble.drain.
+        try:
+            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+                # First call: spawns the leg, which stays in flight on its gate
+                await _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha', warm, None, None
+                )
+                await cold_leg.await_start()
+                assert len(cold_leg.calls) == 1
 
-            # Second call while first is still in-flight: must NOT spawn another
-            # Reset state so it looks "due" again
-            state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-            _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
+                # Second call while first is still in-flight: must NOT spawn another
+                # Reset state so it looks "due" again
+                state2 = ShadowCompareState(
+                    merges_since_last_shadow=10, last_shadow_run_at=0.0
+                )
+                _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha2', warm, None, None
-            )
-            await _settle()
-            # Still only the one leg
-            assert len(cold_leg.calls) == 1
-
+                await _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha2', warm, None, None
+                )
+                await _settle()
+                # Still only the one leg
+                assert len(cold_leg.calls) == 1
+        finally:
             await cold_leg.drain()
 
     # --- Amendment: in-flight guard must still persist incremented counter (suggestion 3) ---
@@ -1568,34 +1608,39 @@ class TestMaybeScheduleShadowCompare:
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(_shadow_state_path(tmp_path), state)
 
-        with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
-            # First call: due → spawns the leg, resets counter to 0
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', warm, None, None
-            )
-            await cold_leg.await_start()
-            assert len(cold_leg.calls) == 1
+        # try/finally, not straight-line — see _ColdLegDouble.drain.
+        try:
+            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+                # First call: due → spawns the leg, resets counter to 0
+                await _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha', warm, None, None
+                )
+                await cold_leg.await_start()
+                assert len(cold_leg.calls) == 1
 
-            # Manually set state to look "due" again (as if 10 more merges landed)
-            state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
-            _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
+                # Manually set state to look "due" again (as if 10 more merges landed)
+                state2 = ShadowCompareState(
+                    merges_since_last_shadow=10, last_shadow_run_at=0.0
+                )
+                _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
-            # Second call while first is in-flight: skips scheduling but MUST
-            # increment and persist the counter (10 → 11)
-            await _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha2', warm, None, None
-            )
-            await _settle()
+                # Second call while first is in-flight: skips scheduling but MUST
+                # increment and persist the counter (10 → 11)
+                await _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha2', warm, None, None
+                )
+                await _settle()
 
-            # Counter must have been incremented (10 → 11) even though in-flight
-            saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
-            assert saved.merges_since_last_shadow == 11, (
-                f"Expected 11 (incremented from 10), got "
-                f"{saved.merges_since_last_shadow} — in-flight guard must persist counter"
-            )
-            # Still only the one leg in flight
-            assert len(cold_leg.calls) == 1
-
+                # Counter must have been incremented (10 → 11) even though in-flight
+                saved = _load_shadow_compare_state(_shadow_state_path(tmp_path))
+                assert saved.merges_since_last_shadow == 11, (
+                    f"Expected 11 (incremented from 10), got "
+                    f"{saved.merges_since_last_shadow} — in-flight guard must "
+                    f"persist counter"
+                )
+                # Still only the one leg in flight
+                assert len(cold_leg.calls) == 1
+        finally:
             await cold_leg.drain()
 
 
