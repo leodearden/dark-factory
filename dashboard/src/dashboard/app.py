@@ -72,6 +72,7 @@ from dashboard.data.mcp_fanout import (
     TTLCache,
     describe_exc,
     first_success,
+    reap_detached_refreshes,
 )
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
@@ -570,6 +571,17 @@ async def lifespan(app: FastAPI):
     and pytest blames whichever unrelated test is running at that instant.
     ``app.state`` stays assigned for request handlers and for tests that swap
     ``app.state.config``; it is simply not the shutdown path's source of truth.
+
+    **Shutdown also reaps detached cache refreshes**, which are the one thing
+    it ends that this lifespan did not open.  ``TTLCache`` instances are
+    module-level and so process-global: a bypass refresh abandoned by its
+    caller (``TTLCache._start_bypass``) is deliberately never cancelled while
+    the process runs, because a late store still heals the key for whoever
+    asks next.  No one asks next after shutdown, while the task still pins a
+    connection on the ``http_client`` closed below — and, the caches being
+    global, it outlives this app into the next one.  See
+    ``TTLCache.cancel_live_bypasses`` for why that reap is scoped to the
+    running event loop.
     """
     # Config first: the shared client's pool bound is DERIVED from it (see
     # _build_http_limits above). DashboardConfig.from_env() has no dependency
@@ -612,6 +624,10 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    # After the loops above, so nothing can enqueue a fresh refresh behind the
+    # reaper; before http_client.aclose() below, so a cancelled refresh unwinds
+    # into a pool that still exists.
+    await reap_detached_refreshes()
     await burndown_store.close()
     await metrics_store.close()
     await pool.close_all()
