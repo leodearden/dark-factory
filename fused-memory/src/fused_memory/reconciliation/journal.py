@@ -439,6 +439,76 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
+    async def get_run_stage_execution(
+        self, project_id: str, run_id: str, stage: str
+    ) -> dict | None:
+        """Did ``stage`` execute during ``run_id``? Narrow, read-only projection.
+
+        Answers the one question the recon ledger cannot: a gc()-reaped
+        ``cycle_summary`` row is hard-DELETEd, so an absent row is byte-for-byte
+        indistinguishable from one that was never written. The ``runs`` table
+        carries no TTL and therefore outlives the ledger, which is what makes
+        the distinction recoverable at all. Sole caller today is
+        ``services/memory_service.py::MemoryService.get_cycle_summary_presence``.
+
+        ``stage_ran`` is deliberately three-valued:
+
+        - ``True``  — positive evidence the stage executed (it filed a report).
+        - ``False`` — positive evidence it did not, and it stays true regardless
+          of TTL, which is why the presence reader ranks it above "expired".
+        - ``None``  — INDETERMINATE: the stored ``stage_reports`` blob did not
+          parse as a JSON object. That is a fault, not a state, so it is logged
+          at WARNING and must never be collapsed into ``False`` — doing so would
+          silently suppress a real data-loss finding.
+
+        The membership test is keyed on ``stage``, never "is there any report at
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
+        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
+        and a run holding only those did not run the stage.
+
+        Scoped by ``project_id`` — tighter than ``get_run``, which is keyed on
+        ``id`` alone — to match the project-scoped identity of the ledger row it
+        explains. A projection rather than a reuse of ``get_run`` because that
+        is ``SELECT *`` piped through ``_row_to_run``, materialising every
+        ``StageReport`` including the multi-KB ``items_flagged`` blobs, when four
+        columns answer the question.
+
+        Returns ``None`` when no such run row exists for that project.
+        """
+        db = self._require_db()
+        async with db.execute(
+            """SELECT status, stage_reports, started_at, completed_at
+               FROM runs WHERE id = ? AND project_id = ?""",
+            (run_id, project_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        try:
+            reports = json.loads(row['stage_reports'] or '{}')
+            if not isinstance(reports, dict):
+                raise ValueError('stage_reports is not a JSON object')
+            stage_ran = stage in reports
+        except (TypeError, ValueError):
+            logger.warning(
+                'reconciliation.get_run_stage_execution: '
+                'unparseable stage_reports for project_id=%s run_id=%s; '
+                'cannot tell whether stage=%s ran, reporting indeterminate',
+                project_id,
+                run_id,
+                stage,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            stage_ran = None
+
+        return {
+            'status': row['status'],
+            'stage_ran': stage_ran,
+            'started_at': row['started_at'],
+            'completed_at': row['completed_at'],
+        }
+
     async def get_recent_runs(
         self, project_id: str, limit: int = 10
     ) -> list[ReconciliationRun]:
