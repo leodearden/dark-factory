@@ -253,16 +253,25 @@ class GitAuthorityVerdict:
     dataclass is that task's INPUT, and leaf η's (task 4651).
 
     ``merge_sha`` is populated on ``found_on_main`` ONLY — it is the sha a
-    caller may stamp as provenance, WITH ONE EXCEPTION that this dataclass
-    carries structurally rather than leaving to prose: when
-    ``citation_gate_skipped`` is True the project has opted out of citation
-    checking (``git.commit_citation_pattern == ''``) and ``merge_sha`` is
-    the raw BRANCH TIP — not a commit discovered on main, and not
-    effect-present-checked, so a reverted landing is indistinguishable from
-    a live one.  A caller stamping provenance must branch on that flag; do
-    NOT infer the case from ``evidence_sha`` being None, which is a
-    coincidence of that path and not a documented signal.
-    :func:`found_on_main_response` states the full caveat once.
+    caller may stamp as provenance, WITH TWO EXCEPTIONS that this dataclass
+    carries structurally rather than leaving to prose.  They are
+    INDEPENDENT, and they differ in KIND:
+
+    - ``citation_gate_skipped`` — the project opted out of citation checking
+      (``git.commit_citation_pattern == ''``) and ``merge_sha`` is the raw
+      BRANCH TIP: not a commit discovered on main, and not
+      effect-present-checked.
+    - ``rescued_by_delivered_checks`` — ``merge_sha`` IS a genuine commit on
+      main, but its EFFECT is absent at main HEAD and the accept came from
+      the delivered-checks differential instead; i.e. the task-1175
+      reverted-landing shape the FIX 1' effect-present guard exists to
+      catch.
+
+    A provenance writer should ask :attr:`merge_sha_fully_guarded` rather
+    than enumerate these flags, so a third weakening does not silently
+    break it.  Do NOT infer either case from ``evidence_sha`` being None,
+    which is a coincidence of one path and not a documented signal.
+    :func:`found_on_main_response` states both caveats once.
 
     ``evidence_sha`` is the weaker thing: the commit the probe was reasoning
     ABOUT, and it is present on rejects too.
@@ -282,6 +291,26 @@ class GitAuthorityVerdict:
     evidence_sha: str | None = None
     metadata_unavailable: bool = False
     citation_gate_skipped: bool = False
+    rescued_by_delivered_checks: bool = False
+
+    @property
+    def merge_sha_fully_guarded(self) -> bool:
+        """May a caller stamp :attr:`merge_sha` as provenance as-is?
+
+        The ONE question a provenance writer has, asked once here instead
+        of requiring every consumer to know the current list of weakenings
+        (heuristic 11) — a future third weakening updates this expression
+        rather than silently breaking every caller.
+
+        False on ``landed_unconfirmed`` and ``no_signal`` because there is
+        no sha to stamp at all; that is NOT a claim that the branch did not
+        land.
+        """
+        return (
+            self.outcome is GitAuthorityOutcome.found_on_main
+            and not self.citation_gate_skipped
+            and not self.rescued_by_delivered_checks
+        )
 
 
 async def _evidence_verdict(
@@ -319,7 +348,12 @@ async def _evidence_verdict(
     path and can only ever UPGRADE a rejection to an acceptance, so an empty
     list simply leaves that second accept path unreachable — exactly today's
     behaviour, and a failed metadata fetch (which yields ``{}``, hence
-    ``[]``) cannot fabricate a confident ``done``.  The awkward cell — a
+    ``[]``) cannot fabricate a confident ``done``.  For a task that DOES
+    declare checks the wiring is a real change: this is the first production
+    call site ever to pass them, so that second accept path is LIVE here,
+    and an accept may now carry an effect that is ABSENT at main HEAD.
+    :attr:`GitAuthorityVerdict.rescued_by_delivered_checks` is what reports
+    it.  The awkward cell — a
     FAILED fetch reported as 'none_declared' rather than as genuinely-empty
     — is resolved OUT OF BAND by :attr:`TaskMetadataResult.unavailable`, not
     by abusing the third state: the parameter has no fourth value, and
@@ -354,11 +388,21 @@ async def _evidence_verdict(
     # `str`, and a contract violation must degrade to the Tier-4 unknown
     # rather than emit a `done` with a null sha.
     if verdict.accepted and verdict.evidence_sha is not None:
+        # EQUALITY, never truthiness: 'confirmed' is the only accept-path
+        # spelling that means "the effect-present guard REJECTED and the
+        # three-leg differential rescued it".  On a fully-guarded accept the
+        # key is ABSENT, and 'no_signal'/'disabled'/the error case all return
+        # False from the differential and therefore reach _reject, never here
+        # — so a truthiness test would read 'no_signal' as a rescue.  See
+        # orchestrator/src/orchestrator/landing_evidence.py::_delivered_checks_differential.
         return GitAuthorityVerdict(
             outcome=GitAuthorityOutcome.found_on_main,
             merge_sha=verdict.evidence_sha, arm=arm, reason=reason,
             evidence_sha=verdict.evidence_sha,
             metadata_unavailable=fetch.unavailable,
+            rescued_by_delivered_checks=(
+                (verdict.probe or {}).get('delivered_checks_outcome') == 'confirmed'
+            ),
         )
     # NOT no_signal.  git POSITIVELY established this branch's work is on
     # main — its tip is an ancestor of main, or a marker survived the
