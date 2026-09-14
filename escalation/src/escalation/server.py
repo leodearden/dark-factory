@@ -1621,9 +1621,12 @@ def create_server(
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
     ) -> dict[str, Any]:
-        """Report a blocking problem. After calling this, commit any in-progress work,
-        log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-        and you will be re-invoked.
+        """Report a blocking problem. After calling this, follow the response's
+        ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
+        iteration, and STOP — do NOT retry, the handler will resolve the issue and you
+        will be re-invoked.  On ``'keep_driving'`` nothing is confirmed on disk, so do
+        NOT stop: keep driving the task and re-file next iteration (see the Unpersisted
+        response shape below).
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
@@ -1640,7 +1643,8 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
-        normally).  action='terminate_cleanly' is still returned.
+        normally).  It does not by itself change the returned ``action``, which
+        follows the observed persist state like every other filing.
 
         *level* — the escalation ladder rung this filing is born at.  Defaults to
         ``0`` (agent → steward).  Pass ``level=1`` to file a level-1
