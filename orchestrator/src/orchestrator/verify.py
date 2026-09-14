@@ -17,7 +17,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -62,6 +62,7 @@ from orchestrator.verify_classify import (
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
+    _PYTEST_VALUE_FLAGS,
     ChainSegment,
     ToolKind,
     VerifyCmd,
@@ -8896,6 +8897,67 @@ def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
             sample.runqueue_ratio if sample.runqueue_read_ok else None
         ),
     }
+
+
+def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
+    """The xdist worker facts for *cmd*, as two independently-nullable fields.
+
+    Ruling D17 (task 3353) asks for "the worker count actually in effect".
+    Measured, the dominant live case admits no single answer: the orchestrator
+    ``test_command`` carries no ``-n``, so the count is decided by pyproject
+    ``addopts``, which this path never reads. Reporting one resolved integer
+    would therefore mean guessing (hand back the env value with nothing asking
+    for it) or fabricating (hand back a default) — and a guessed worker count
+    inside a measurement corpus is indistinguishable from a measured one a
+    month later, which is the class of fabricated datum this stamp exists to
+    remove.
+
+    So two orthogonal facts, separately sourced:
+
+    - ``n_flag`` — the token after ``-n`` in the command AS PARSED, or ``None``
+      when the command carries none. Read off the STRUCTURED ``base_flags``,
+      never by regex over the string: a regex would find the ``-n`` inside a
+      cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
+      this command's flag. ``_PYTEST_VALUE_FLAGS`` is read rather than
+      re-derived so the flag/value pairing has one home, which is also what
+      keeps a ``-k '-n'`` from being mistaken for a worker count.
+    - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` from the
+      EFFECTIVE verify env, or ``None``. Reported independently of ``n_flag``:
+      a reader that wants the effective count joins them itself, and can see
+      when it cannot.
+
+    ``None`` for every non-pytest tool and for a raw-retained chain — the same
+    no-op guards ``apply_pytest_numprocesses`` documents, for the same reason:
+    a chain has no ONE invocation's flag to report.
+
+    Never raises (INV-1), like ``_load_sample`` above. The env is read BEFORE
+    the parse so an unparseable command still reports the fact that WAS
+    knowable, rather than nulling both.
+    """
+    n_flag: str | None = None
+    auto_num_workers: str | None = None
+    try:
+        auto_num_workers = (verify_env or {}).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
+        parsed = parse_config_command(cmd)
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
+            flags = parsed.base_flags
+            i = 0
+            while i < len(flags):
+                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
+                    if flags[i] == '-n':
+                        n_flag = flags[i + 1]
+                        break
+                    i += 2
+                else:
+                    i += 1
+    except Exception:
+        logger.warning(
+            '_xdist_workers: could not read the worker facts off %r; '
+            'recording nulls for this command',
+            cmd,
+            exc_info=True,
+        )
+    return {'n_flag': n_flag, 'auto_num_workers': auto_num_workers}
 
 
 def _psi_cpu_some10_or_none() -> float | None:
