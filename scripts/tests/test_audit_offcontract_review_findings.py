@@ -26,6 +26,9 @@ measurements, never in an assertion.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from audit_offcontract_review_findings import (
@@ -34,6 +37,7 @@ from audit_offcontract_review_findings import (
     census,
     normalize_issue,
     select_population,
+    validate_report,
 )
 
 # ---------------------------------------------------------------------------
@@ -438,3 +442,219 @@ def test_the_contract_and_triage_severity_sets_are_disjoint():
     """If they ever overlapped, an issue could be both on-contract and in the
     triage band, and `select_population` would silently return nothing."""
     assert not (CONTRACT_SEVERITIES & TRIAGE_SEVERITIES)
+
+
+# ---------------------------------------------------------------------------
+# validate_report — "honest accounting" made mechanical.
+#
+# The claim this task must not make on trust is "all 23 findings were
+# dispositioned". Completeness is a structural property of a data file, so it
+# gets enforced rather than asserted in prose. Every case below runs against
+# in-memory dicts; nothing reads the real report.
+# ---------------------------------------------------------------------------
+
+ROSTER_IDS = ("3041-correctness-0", "3363-design-1")
+
+
+def _report(*dispositions, roster_ids=ROSTER_IDS):
+    return {
+        "roster": [{"id": rid} for rid in roster_ids],
+        "dispositions": list(dispositions),
+    }
+
+
+def _entry(rid, disposition="c", note="Checked against main today.", **extra):
+    return {"id": rid, "disposition": disposition, "note": note, **extra}
+
+
+def test_a_complete_report_validates_clean():
+    report = _report(
+        _entry("3041-correctness-0", "b", followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "a"),
+    )
+    assert validate_report(report) == []
+
+
+@pytest.mark.parametrize("disposition", ["a", "c"])
+def test_a_and_c_entries_need_no_ticket(disposition):
+    report = _report(
+        _entry("3041-correctness-0", disposition),
+        _entry("3363-design-1", disposition),
+    )
+    assert validate_report(report) == []
+
+
+def test_a_roster_id_missing_from_dispositions_is_rejected():
+    report = _report(_entry("3041-correctness-0", "a"))
+    violations = validate_report(report)
+    assert any("3363-design-1" in v for v in violations)
+
+
+def test_a_disposition_for_an_unknown_id_is_rejected():
+    """An id that is not on the frozen roster means the roster moved under the
+    triage, which is the one thing freezing it was supposed to prevent."""
+    report = _report(
+        _entry("3041-correctness-0", "a"),
+        _entry("3363-design-1", "a"),
+        _entry("9999-invented-0", "a"),
+    )
+    violations = validate_report(report)
+    assert any("9999-invented-0" in v for v in violations)
+
+
+def test_a_duplicated_disposition_id_is_rejected():
+    """Two dispositions for one finding means one of them is unread."""
+    report = _report(
+        _entry("3041-correctness-0", "a"),
+        _entry("3041-correctness-0", "b", followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+@pytest.mark.parametrize("disposition", ["d", "A", "", None, "b?", "fixed"])
+def test_a_disposition_outside_abc_is_rejected(disposition):
+    report = _report(
+        _entry("3041-correctness-0", disposition),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+@pytest.mark.parametrize("note", [None, "", "   ", "\n\t "])
+def test_a_missing_or_blank_note_is_rejected(note):
+    """A disposition without reasoning is a verdict, and a verdict nobody can
+    check is how these 23 findings got lost in the first place."""
+    report = _report(
+        _entry("3041-correctness-0", "a", note=note),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+@pytest.mark.parametrize("ticket", [None, "", "   "])
+def test_a_live_defect_without_a_followup_ticket_is_rejected(ticket):
+    """THE accounting invariant this task exists to enforce: a finding judged
+    still-live with no follow-up filed has been dropped a second time."""
+    report = _report(
+        _entry("3041-correctness-0", "b", followup_ticket=ticket),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+def test_a_live_defect_with_a_ticket_is_accepted():
+    report = _report(
+        _entry("3041-correctness-0", "b", followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "b", followup_ticket="tkt_def456"),
+    )
+    assert validate_report(report) == []
+
+
+@pytest.mark.parametrize("disposition", ["a", "c"])
+def test_a_ticket_on_a_not_live_finding_is_rejected(disposition):
+    """The task says file follow-ups for group (b) and ONLY group (b). A ticket
+    hung off an (a) or (c) means either the disposition or the filing is wrong."""
+    report = _report(
+        _entry("3041-correctness-0", disposition, followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+def test_a_gate_deferred_entry_with_a_note_is_accepted():
+    """The stop path is a first-class recorded outcome, not an abandoned one."""
+    report = _report(
+        _entry("3041-correctness-0", None, note="Deferred by the gate: all five "
+               "priority findings dispositioned (a)/(c), so the 18 mediums are "
+               "low yield.", deferred_by_gate=True),
+        _entry("3363-design-1", "a"),
+    )
+    assert validate_report(report) == []
+
+
+@pytest.mark.parametrize("note", [None, "", "   "])
+def test_a_gate_deferred_entry_without_a_note_is_rejected(note):
+    """Deferral must cite the gate's rationale. Otherwise the stop path becomes
+    a way to leave a finding unaccounted for while still validating."""
+    report = _report(
+        _entry("3041-correctness-0", None, note=note, deferred_by_gate=True),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+def test_a_null_disposition_is_only_excused_by_an_explicit_deferral():
+    """`disposition: null` with no `deferred_by_gate` is the seeded starting
+    state — it must NOT validate, or the report could ship untriaged."""
+    report = _report(
+        _entry("3041-correctness-0", None),
+        _entry("3363-design-1", None),
+    )
+    violations = validate_report(report)
+    assert len(violations) >= 2
+
+
+def test_a_gate_deferred_entry_may_not_also_claim_a_disposition():
+    """Deferred and dispositioned are mutually exclusive: an entry that claims
+    both leaves a reader unable to say whether the finding was read."""
+    report = _report(
+        _entry("3041-correctness-0", "a", deferred_by_gate=True),
+        _entry("3363-design-1", "a"),
+    )
+    violations = validate_report(report)
+    assert any("3041-correctness-0" in v for v in violations)
+
+
+def test_the_seeded_report_shape_fails_loudly():
+    """Step 7 seeds all 23 ids with `disposition: null`. That report MUST be
+    rejected — a validator that passed it would certify an untriaged file."""
+    report = _report(*[_entry(rid, None, note=None) for rid in ROSTER_IDS])
+    assert validate_report(report)
+
+
+def test_violations_are_readable_strings():
+    report = _report(_entry("3041-correctness-0", "a"))
+    violations = validate_report(report)
+    assert violations and all(isinstance(v, str) and v.strip() for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# main() --validate, through the CLI, because the exit code is the contract a
+# closing step actually relies on.
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).resolve().parents[1] / "audit_offcontract_review_findings.py"
+
+
+def _run_validate(tmp_path, report):
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--validate", str(path)],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_cli_validate_exits_zero_on_a_complete_report(tmp_path):
+    result = _run_validate(tmp_path, _report(
+        _entry("3041-correctness-0", "b", followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "c"),
+    ))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cli_validate_exits_nonzero_and_names_the_violations(tmp_path):
+    result = _run_validate(tmp_path, _report(
+        _entry("3041-correctness-0", "b", followup_ticket=None),
+    ))
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "3041-correctness-0" in combined
+    assert "3363-design-1" in combined, "the missing roster id must be named too"
