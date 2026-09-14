@@ -56,6 +56,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
+    PYPROJECT_DEFAULT_TIMEOUT,
     pydantic_spec,
     required_timeout_secs,
 )
@@ -893,7 +894,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f'({out_of_bound} x {MEASURED_SPAWN_LATENCY_SECS}s = '
             f'{spawn_allowance}s) — required = {required}s — but carries no '
             f'@pytest.mark.timeout override. Left uncovered, this can '
-            f'silently collide with the 60s orchestrator/pyproject.toml '
+            f'silently collide with the {PYPROJECT_DEFAULT_TIMEOUT}s '
+            f'orchestrator/pyproject.toml '
             f'per-test default — under timeout_method="thread" with '
             f'--max-worker-restart=0, pytest-timeout os._exit()s the xdist '
             f"worker instead of failing cleanly, discarding _run_lane's own "
@@ -914,7 +916,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f'sum + {out_of_bound} out-of-bound real-git spawns x '
             f'{MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
             f'override does not actually clear what it exists to cover. '
-            f'Left uncovered, this can silently collide with the 60s '
+            f'Left uncovered, this can silently collide with the '
+            f'{PYPROJECT_DEFAULT_TIMEOUT}s '
             f'orchestrator/pyproject.toml per-test default — under '
             f'timeout_method="thread" with --max-worker-restart=0, '
             f'pytest-timeout os._exit()s the xdist worker instead of '
@@ -1230,11 +1233,20 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`), and at
     21 out-of-bound spawns this test does ~2.3x the real-git work of a
     B1/B4/B6 test (9 each: the `repo` fixture plus one `_drive_advance`).
-    `required_timeout_secs` puts the requirement at 114.41s — nearly twice
-    the 60s pyproject default this test would otherwise have run under. See
-    the marker comment above for the worked derivation; the value is enforced
-    by `test_every_composing_caller_carries_a_timeout_override`'s row for
-    this test, not by this prose.
+    `required_timeout_secs` puts the requirement at 114.41s. An earlier
+    revision added "— nearly twice the 60s pyproject default this test would
+    otherwise have run under", which commit 64e24b547f falsified by raising
+    that default 60 → 300 (`PYPROJECT_DEFAULT_TIMEOUT`): the marker now
+    TIGHTENS the default rather than loosening it, and the claim had in fact
+    inverted rather than merely gone stale. The marker is kept because 120
+    still clears the 114.41s requirement and a snug bound fails a wedged pass
+    via `_run_lane`'s own well-located TimeoutError; that it is now a
+    tightening is recorded deliberately, and the site is listed in
+    `test_timeout_marker_inversion_guard.py`'s `_GRANDFATHERED` for exactly
+    that reason. See the marker comment above for the worked derivation; the
+    value is enforced by
+    `test_every_composing_caller_carries_a_timeout_override`'s row for this
+    test, not by this prose.
     """
     import orchestrator.git_ops as git_ops_mod
 
