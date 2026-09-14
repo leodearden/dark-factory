@@ -908,6 +908,7 @@ SECTION_HEADER = "header"
 SECTION_FORCE_MARKER = "force-marker"
 SECTION_SATURATION = "saturation"
 SECTION_VERIFICATION = "verification"
+SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
 SECTION_FILED_TASKS = "filed-tasks"
@@ -964,6 +965,7 @@ def census_report_sections(
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
+    dropped_verdicts: tuple[DroppedVerdict, ...] = (),
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -1090,6 +1092,29 @@ def census_report_sections(
             )
         emit(SECTION_VERIFICATION, verification)
 
+    if dropped_verdicts:
+        # Same NO-SILENT-CAPS reasoning as the coverage lines above, applied to
+        # the other thing this run silently paid for: stdout and the WARNING log
+        # of an unattended nightly run are gone by morning, and the dated report
+        # is the artifact an operator actually reads afterwards. "This run paid
+        # for N adjudications that went nowhere" belongs in the channel that
+        # survives. Gated on a non-empty list so a clean run stays byte-identical
+        # to the golden.
+        unresolved = [
+            "",
+            "## Unresolved Verdicts",
+            "",
+            f"- {len(dropped_verdicts)} verdict(s) this run PAID FOR resolved to no "
+            "pending candidate and were DROPPED. Nothing is lost from the codebook -- "
+            "a standing prior adjudication of the same title holds, which is the "
+            "correct outcome -- but the adjudication spend went nowhere and only a "
+            "hand re-open will change that.",
+        ]
+        unresolved.extend(
+            f"  - {_dropped_verdict_message(record)}" for record in dropped_verdicts
+        )
+        emit(SECTION_UNRESOLVED_VERDICTS, unresolved)
+
     emit(SECTION_MATRIX, ["", "## Origin x Manifestation Matrix", "", matrix_md])
 
     # NO leading blank line, deliberately: `matrix_md` is embedded verbatim and
@@ -1142,6 +1167,7 @@ def render_report(
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
+    dropped_verdicts: tuple[DroppedVerdict, ...] = (),
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1164,6 +1190,7 @@ def render_report(
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run,
+        dropped_verdicts=dropped_verdicts,
     ))
 
 
@@ -1401,12 +1428,17 @@ losses differ in substance and not merely in wording."""
 
 
 def _dropped_verdict_message(record: DroppedVerdict) -> str:
-    """The operator-facing WARNING text for *record* -- rendered FROM the
-    record, so the prose is free to be reworded without breaking anything
-    that asserts on the drop."""
+    """The operator-facing prose for *record* -- rendered FROM the record, so
+    the wording is free to change without breaking anything that asserts on
+    the drop.
+
+    Carries no ``census:`` prefix and no leading bullet: it is the ONE
+    rendering, read both from the run's WARNING log and from the persisted
+    report's ``## Unresolved Verdicts`` section, and each of those supplies
+    its own framing."""
     if record.kind == DROP_NO_STANDING:
         return (
-            f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
+            f"{record.verdict} cluster {record.title!r} resolved to no pending "
             "candidate AND no same-title candidate exists at all -- this verdict is "
             "DROPPED with no standing record to explain it; the merge and this run's "
             "cluster list disagree about the title."
@@ -1417,17 +1449,15 @@ def _dropped_verdict_message(record: DroppedVerdict) -> str:
     )
     if record.kind == DROP_CONTRADICTION:
         return (
-            f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
+            f"{record.verdict} cluster {record.title!r} resolved to no pending "
             f"candidate -- this verdict is DROPPED and CONTRADICTS the standing "
-            f"{record.standing_disposition} record ({standing}): "
-            f"{_DROPPED_VERDICT_LOSS[record.verdict]}. Nothing reconciles the two; "
-            "only a hand re-open will change it."
+            f"record ({standing}): {_DROPPED_VERDICT_LOSS[record.verdict]}. Nothing "
+            "reconciles the two; only a hand re-open will change it."
         )
     return (
-        f"census: {record.verdict} cluster {record.title!r} resolved to no pending "
-        "candidate -- this verdict is DROPPED and AGREES with the standing one, which "
-        f"already recorded the title as {record.standing_disposition} ({standing}). "
-        "Nothing to do; only the verify call was spent."
+        f"{record.verdict} cluster {record.title!r} resolved to no pending "
+        f"candidate -- this verdict is DROPPED and AGREES with the standing record "
+        f"({standing}). Nothing to do; only the verify call was spent."
     )
 
 
@@ -1439,7 +1469,7 @@ def _report_dropped_verdicts(records: list[DroppedVerdict]) -> None:
     keeps the summary informative rather than skimmable. The per-record lines
     say WHICH titles; the summary says how much of the run went nowhere."""
     for record in records:
-        logger.warning("%s", _dropped_verdict_message(record))
+        logger.warning("census: %s", _dropped_verdict_message(record))
     if records:
         logger.warning(
             "census: %d unresolved verdict(s) -- verdicts that found no pending "
@@ -2188,6 +2218,7 @@ def run_census(
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
+        dropped_verdicts=tuple(dropped_verdicts),
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one

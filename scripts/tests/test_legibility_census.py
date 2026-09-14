@@ -1586,6 +1586,26 @@ def test_render_report_without_dry_run_filed_tasks_section_unchanged():
 
 # Every flag combination render_report gates a section on, so no branch can
 # render outside the structure.
+def _sample_dropped_verdicts() -> tuple:
+    """Two drop records covering the two shapes the section renders
+    differently: one with a standing record, one without."""
+    return (
+        mod.DroppedVerdict(
+            verdict="rejected",
+            title="Spurious pattern",
+            kind=mod.DROP_CONTRADICTION,
+            standing_id="cand-20260701-7",
+            standing_disposition="promoted",
+            standing_first_seen="2026-07-01",
+        ),
+        mod.DroppedVerdict(
+            verdict="verified",
+            title="A title the merge never saw",
+            kind=mod.DROP_NO_STANDING,
+        ),
+    )
+
+
 _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "flagless": {},
     "forced": {"force": True},
@@ -1595,6 +1615,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
         "filed_task_ids": [],
         "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     },
+    "unresolved_verdicts": {"dropped_verdicts": _sample_dropped_verdicts()},
 }
 
 
@@ -1655,6 +1676,48 @@ def test_census_report_sections_verification_is_gated_and_positioned():
     keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, verified=2, cap=2))
     assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_VERIFICATION)
     assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
+
+
+def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
+    """The durable channel carries the signal too.
+
+    stdout and the WARNING log of an unattended nightly run are ephemeral;
+    the dated report is what an operator reads afterwards, so "this run paid
+    for N adjudications that went nowhere" has to survive there. Gated on
+    there being any, positioned with the other coverage disclosures -- after
+    SATURATION and VERIFICATION, before the MATRIX built from what survived.
+    """
+    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys()
+    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys(dropped_verdicts=())
+
+    keys = _section_keys(dropped_verdicts=_sample_dropped_verdicts())
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+    assert keys.index(mod.SECTION_UNRESOLVED_VERDICTS) < keys.index(mod.SECTION_MATRIX)
+
+    keys = _section_keys(
+        dropped_verdicts=_sample_dropped_verdicts(),
+        verify_coverage=mod.VerifyCoverage(novel=5, verified=2, cap=2),
+    )
+    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+
+
+def test_census_report_unresolved_verdicts_section_names_every_record():
+    """Every dropped record is named, not just counted: a count tells an
+    operator that something went nowhere, the titles tell them WHERE to look.
+
+    Asserted against the records' own field values rather than a hand-picked
+    phrase, exactly as the WARNING is."""
+    records = _sample_dropped_verdicts()
+    text = _section_text(
+        _sections(dropped_verdicts=records), mod.SECTION_UNRESOLVED_VERDICTS,
+    )
+
+    assert str(len(records)) in text, "the section must size the run"
+    for record in records:
+        for value in (record.title, record.standing_id, record.standing_disposition):
+            if value is None:
+                continue
+            assert value in text, f"{value!r} missing from:\n{text}"
 
 
 def test_section_text_names_the_key_and_the_keys_present_when_absent():
@@ -2583,6 +2646,44 @@ def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, ca
     assert dropping_outcome.unresolved_verdicts == len(dropping_outcome.dropped_verdicts)
     assert clean_outcome.unresolved_verdicts == len(clean_outcome.dropped_verdicts)
     assert clean_outcome.dropped_verdicts == ()
+
+
+def test_run_census_persists_the_dropped_verdicts_in_the_report(tmp_path, caplog):
+    """The plumbing, end to end: `run_census` hands its drop records to the
+    report, so the DURABLE artifact carries the signal and not only stdout and
+    the log.
+
+    That is the whole point of the section -- an unattended nightly run's
+    stdout and WARNING records are gone by morning, and the dated report is
+    what an operator reads afterwards. A `render_report` that renders the
+    section correctly while `run_census` passes it nothing satisfies every
+    other test in this file."""
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _codebook_with_standing("promoted"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Unresolved Verdicts" in report
+    for value in (record.title, record.standing_id, record.standing_disposition):
+        assert value in report, f"{value!r} missing from the persisted report"
+
+
+def test_run_census_clean_report_carries_no_unresolved_verdicts_section(tmp_path):
+    """Gated in the artifact too, not just in the builder: a run that dropped
+    nothing must not grow a section saying so. Same reasoning as the summary
+    line's silence -- a section trained to be ignored will be ignored on the
+    run that matters."""
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook())
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.dropped_verdicts == ()
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "Unresolved Verdicts" not in report
 
 
 def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
