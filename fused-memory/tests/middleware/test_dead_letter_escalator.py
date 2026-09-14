@@ -48,7 +48,12 @@ def _filed(root):
 def _emit(root, *, project_id=_PROJECT, operation='add_episode',
           group_id=_PROJECT, item_id=7, attempts=5,
           error: str | None = 'NodeNotFoundError: node abc not found', post_execute=False,
-          content_preview='an episode that never landed', write_op_id='W1'):
+          # Annotated to what the SUBJECT tolerates, not to what the defaults
+          # happen to be: `content_preview` is whatever JSON a queue row held,
+          # and `write_op_id` is absent for every operation carrying no
+          # `write_ops` row to join back to.
+          content_preview: object = 'an episode that never landed',
+          write_op_id: str | None = 'W1'):
     return emit_dead_letter_escalation(
         str(root),
         project_id=project_id,
