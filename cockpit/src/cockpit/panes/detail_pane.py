@@ -7,10 +7,12 @@ for a DecisionRecord (ids, severity/state, age, options, full question).
 Neither is a union over the other -- each reads only its own record's
 fields, so a call site is type-checked against the kind it actually holds.
 
-Fail-soft throughout (PRD §2): a missing/unreadable result file degrades
-to a placeholder rather than raising, a record with no question/children
-still renders, and an absent id renders as a placeholder rather than the
-literal string 'None'.
+Fail-soft throughout (PRD §2), and on the same terms in both renderers: a
+missing/unreadable result file degrades to a placeholder rather than
+raising, a record with no question/children still renders, and an absent
+id renders as the shared
+cockpit/src/cockpit/panes/placeholders.py::ABSENT_PLACEHOLDER rather than
+the literal string 'None'.
 """
 
 from __future__ import annotations
@@ -23,18 +25,12 @@ from pathlib import Path
 from orchestrator.session_registry import DecisionRecord, SessionRecord
 from textual.widgets import Static
 
+from cockpit.panes.placeholders import ABSENT_PLACEHOLDER
 from cockpit.panes.session_table import format_age, format_title, state_glyph
 
 logger = logging.getLogger(__name__)
 
 _NO_RESULT_FILE_PLACEHOLDER = '(no result file)'
-
-# Every optional id routes through this rather than being interpolated
-# possibly-None, so a missing id never surfaces as the literal 'None'
-# (fail-soft, PRD §2). Spelled to match
-# cockpit/src/cockpit/panes/decision_queue.py::_ID_PLACEHOLDER, so the pane
-# and the clipboard payload read the same for the same absent id.
-_ID_PLACEHOLDER = '(none)'
 
 
 def result_file_tail(result_file: str | None, max_lines: int = 20) -> str:
@@ -69,10 +65,10 @@ def render_detail(record: SessionRecord, all_records: list[SessionRecord], now: 
     lines = [
         f'{state_glyph(record.status)} {format_title(record)} ({format_age(record.start_ts, now)})',
         f'project: {record.project}',
-        f'task_id: {record.task_id}',
-        f'escalation_id: {record.escalation_id}',
-        f'parent: {record.parent_session_id}',
-        f'children: {", ".join(children) if children else "(none)"}',
+        f'task_id: {record.task_id or ABSENT_PLACEHOLDER}',
+        f'escalation_id: {record.escalation_id or ABSENT_PLACEHOLDER}',
+        f'parent: {record.parent_session_id or ABSENT_PLACEHOLDER}',
+        f'children: {", ".join(children) if children else ABSENT_PLACEHOLDER}',
     ]
     if record.question is not None:
         lines.append(f'question: {record.question.text}')
@@ -104,8 +100,8 @@ def render_decision_detail(
     lines = [
         f'decision_id: {decision.id}',
         f'project: {decision.project}',
-        f'task_id: {decision.task_id or _ID_PLACEHOLDER}',
-        f'escalation_id: {decision.escalation_id or _ID_PLACEHOLDER}',
+        f'task_id: {decision.task_id or ABSENT_PLACEHOLDER}',
+        f'escalation_id: {decision.escalation_id or ABSENT_PLACEHOLDER}',
         f'severity: {decision.severity}',
         f'state: {decision.state}',
         f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
@@ -120,7 +116,7 @@ def render_decision_detail(
 def _linked_session(session_id: str | None, sessions: Sequence[SessionRecord]) -> str:
     """Render *session_id* as a linked-session value -- see render_decision_detail."""
     if not session_id:
-        return _ID_PLACEHOLDER
+        return ABSENT_PLACEHOLDER
     session = next((s for s in sessions if s.session_slug == session_id), None)
     if session is None:
         return f'{session_id} (unresolved)'

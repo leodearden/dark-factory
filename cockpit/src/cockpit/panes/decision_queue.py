@@ -31,6 +31,7 @@ from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
 
 from cockpit.backends import DisplayTarget
+from cockpit.panes.placeholders import ABSENT_PLACEHOLDER
 from cockpit.panes.session_table import format_age
 from cockpit.priority import Priorities, ScoringItem, score
 
@@ -207,7 +208,6 @@ class QueueItem:
         return self.key.split(':', 1)[1] if ':' in self.key else self.key
 
 
-_ID_PLACEHOLDER = '(none)'
 
 # Bounds the clipboard payload on BOTH copy legs, because there is only one
 # payload: cockpit/src/cockpit/app.py::CockpitApp.action_copy formats it once,
@@ -265,8 +265,8 @@ def format_copy_payload(item: QueueItem) -> str:
         [
             f'question: {question}',
             f'project: {item.project}',
-            f'task_id: {item.task_id or _ID_PLACEHOLDER}',
-            f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
+            f'task_id: {item.task_id or ABSENT_PLACEHOLDER}',
+            f'escalation_id: {item.escalation_id or ABSENT_PLACEHOLDER}',
             id_line,
         ]
     )

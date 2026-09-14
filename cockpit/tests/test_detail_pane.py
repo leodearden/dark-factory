@@ -92,6 +92,22 @@ class TestRenderDetail:
         assert 'grandchild-a' in rendered
         assert 'grandchild-b' in rendered
 
+    def test_absent_ids_render_the_shared_placeholder_and_never_the_word_none(self):
+        """The same fail-soft rendering render_decision_detail gives an absent id:
+        both renderers spell it with placeholders.ABSENT_PLACEHOLDER, so a session
+        with no task_id never reads as though it carried one called 'None'."""
+        from cockpit.panes.detail_pane import render_detail
+
+        record = _make_record(task_id=None, escalation_id=None, parent_session_id=None)
+
+        rendered = render_detail(record, [record], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert 'task_id: (none)' in rendered
+        assert 'escalation_id: (none)' in rendered
+        assert 'parent: (none)' in rendered
+        assert 'children: (none)' in rendered
+        assert 'None' not in rendered
+
     def test_result_file_tail_is_included(self, tmp_path):
         from cockpit.panes.detail_pane import render_detail
 
