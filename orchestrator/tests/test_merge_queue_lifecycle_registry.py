@@ -1625,9 +1625,8 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert req.request_id not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
 
         await worker.stop()
@@ -1710,9 +1709,8 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert req.request_id not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
 
     async def test_passthrough_entry_retires_directly_without_finalizing(
@@ -1767,9 +1765,8 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert req.request_id not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
 
     async def test_runner_unavailable_cascade_finalizing_merging_redispatch_parked(
@@ -2178,9 +2175,8 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'{lane_entry(worker, rid)!r}'
         )
         assert rid not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
         assert _accretion_warnings(caplog) == [], (
             f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
@@ -2410,9 +2406,8 @@ class TestStopMidFlightRetiresEveryContainer:
                 f'census after stop(): {lane_entry(worker, req.request_id)!r}'
             )
             assert req.request_id not in worker._live_items, (
-                'retiring is a transition AND a live-object pop; the census cannot\n'
-                'see the second half, because every snapshot path already skips a\n'
-                'TERMINAL rid -- so a leaked live object is invisible there'
+                'retiring must pop the live object too, and no snapshot path can '
+                'see that half: every one of them already skips a TERMINAL rid'
             )
             assert req.result.done(), f'{req.task_id}: Future must be resolved by stop()'
 
@@ -2472,9 +2467,8 @@ class TestAbandonPredispatchRetiresRegistry:
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert req.request_id not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
         assert req.result.cancelled(), 'the abandon drop must never overwrite the cancellation'
 
@@ -2516,9 +2510,8 @@ class TestAbandonPredispatchRetiresRegistry:
             f'{lane_entry(worker, req.request_id)!r}'
         )
         assert req.request_id not in worker._live_items, (
-            'retiring is a transition AND a live-object pop; the census cannot\n'
-            'see the second half, because every snapshot path already skips a\n'
-            'TERMINAL rid -- so a leaked live object is invisible there'
+            'retiring must pop the live object too, and no snapshot path can '
+            'see that half: every one of them already skips a TERMINAL rid'
         )
 
 
@@ -2596,9 +2589,8 @@ class TestCoalesceSupersededRetiresRegistry:
                 f'train: {lane_entry(worker, req.request_id)!r}'
             )
             assert req.request_id not in worker._live_items, (
-                'retiring is a transition AND a live-object pop; the census cannot\n'
-                'see the second half, because every snapshot path already skips a\n'
-                'TERMINAL rid -- so a leaked live object is invisible there'
+                'retiring must pop the live object too, and no snapshot path can '
+                'see that half: every one of them already skips a TERMINAL rid'
             )
 
         # The new train's OWN request_id is a DIFFERENT registry entry —
