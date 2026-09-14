@@ -397,6 +397,107 @@ def test_an_unwritable_report_dir_is_a_named_degradation_not_a_traceback(
     assert payload['percentiles']['runqueue_ratio']['n'] == 3
 
 
+# ── a hold fraction is meaningless without the coverage it was computed over ──
+
+
+def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: Path):
+    """The denominator is SUCCESSFUL reads, not ticks, so coverage must ship too.
+
+    A failed read emits no value row at all (correctly — persisting α's
+    fail-open 0.0 would fabricate an idle host), so hold_fraction divides by the
+    number of readable ticks. "Holds on 20% of samples" over a fully-observed
+    fortnight and over the 10% of ticks that were readable are opposite verdicts
+    for setting a dispatch threshold, and the report could not tell them apart.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        # read_ok is emitted EVERY tick, so its row count IS the tick count.
+        'runqueue_read_ok': [1.0] * 10 + [0.0] * 90,
+        'runqueue_ratio': [5.0] * 10,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    coverage = trailing_json(result.stdout)['coverage']['runqueue_ratio']
+    assert coverage['ticks'] == 100
+    assert coverage['readable'] == 10
+    assert coverage['readable_fraction'] == pytest.approx(0.1)
+
+
+def test_coverage_below_the_floor_is_a_named_degradation(tmp_path: Path):
+    """Makes the D11 verdict self-checking instead of silently unsound."""
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 3 + [0.0] * 97,
+        'runqueue_ratio': [5.0] * 3,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'low_readability' in payload['degradations'], payload['degradations']
+    detail = next(d for d in payload['degradation_details']
+                  if d.startswith('low_readability'))
+    assert 'runqueue_ratio' in detail and '3' in detail, detail
+
+
+def test_full_coverage_raises_no_readability_degradation(tmp_path: Path):
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 50,
+        'runqueue_ratio': [5.0] * 50,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'low_readability' not in payload['degradations'], payload['degradations']
+    assert payload['coverage']['runqueue_ratio']['readable_fraction'] == pytest.approx(1.0)
+
+
+def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: Path):
+    """own_read_ok:<leaf> is the coverage for own_cpu_some10:<leaf>, per leaf.
+
+    One leaf can be unreadable while its siblings are fine, so pooling the
+    stem's coverage would hide exactly the case worth seeing.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'own_read_ok:orchestrator-reify.service': [1.0] * 20,
+        'own_cpu_some10:orchestrator-reify.service': [30.0] * 20,
+        'own_read_ok:orchestrator-know-live.service': [1.0] * 2 + [0.0] * 18,
+        'own_cpu_some10:orchestrator-know-live.service': [30.0] * 2,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    coverage = trailing_json(result.stdout)['coverage']
+    assert coverage['own_cpu_some10:orchestrator-reify.service'][
+        'readable_fraction'] == pytest.approx(1.0)
+    assert coverage['own_cpu_some10:orchestrator-know-live.service'] == {
+        'ticks': 20, 'readable': 2, 'readable_fraction': 0.1,
+    }
+
+
+def test_a_psi_arm_says_it_has_no_readability_metric_rather_than_inventing_one(
+    tmp_path: Path,
+):
+    """collect_psi emits no read_ok, so its coverage is unknown, not 1.0.
+
+    Reporting a fabricated 100% for the four host-PSI arms would be the same
+    class of defect as persisting α's fail-open 0.0 as a ratio.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'psi_mem_full_avg10': [5.0] * 30})
+
+    result = run_script('--db', str(db), '--arm', 'mem_full_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['psi_mem_full_avg10'] is None
+    assert 'low_readability' not in payload['degradations']
+    assert 'no readability metric' in result.stdout
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 

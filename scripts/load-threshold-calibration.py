@@ -54,6 +54,9 @@ DEFAULT_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
 DEFAULT_REPORT_DIR = Path('/home/leo/src/dark-factory/plans')
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
 
+# {metric: [(ts, value) in ts order]} — what every reader here hands around.
+Series = dict[str, list[tuple[int, float]]]
+
 class ArmSpec(NamedTuple):
     """Everything the report needs about one gate arm.
 
@@ -62,12 +65,19 @@ class ArmSpec(NamedTuple):
     cgroup leaf — the two are read differently and reported separately, never
     pooled. ``ladder`` is the candidate thresholds to evaluate hold fractions
     at. ``unit`` labels the numbers for the human reading the escalation.
+
+    ``readability`` names the ``*_read_ok`` metric recording whether this arm
+    was readable at all, or ``None`` when the collector emits none. It has no
+    default, deliberately: a new arm cannot be added without deciding the
+    question, and an arm whose readability is unknown must SAY so rather than
+    be reported as fully covered.
     """
 
     selector: str
     is_stem: bool
     ladder: tuple[float, ...]
     unit: str
+    readability: str | None
 
 
 # Percentage-pressure arms share one ladder: a PSI avg10 is a percentage of
@@ -84,22 +94,22 @@ _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 # "de-duplicate" this with an import, which would crash the gate.
 ARM_METRIC_SELECTORS = {
     'mem_full_avg10': ArmSpec(
-        'psi_mem_full_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+        'psi_mem_full_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'mem_some_avg10': ArmSpec(
-        'psi_mem_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+        'psi_mem_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'io_some_avg10': ArmSpec(
-        'psi_io_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+        'psi_io_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     'cpu_some_avg10': ArmSpec(
-        'psi_cpu_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT),
+        'psi_cpu_some_avg10', False, _PRESSURE_LADDER, _PRESSURE_UNIT, None),
     # A RATIO, not a percentage: procs_running / len(sched_getaffinity(0)).
     # 1.0 is "as many runnable threads as CPUs"; 4.0 is PRD D9's provisional.
     'runqueue_ratio': ArmSpec(
         'runqueue_ratio', False,
         (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
-        'runnable threads per CPU (ratio)'),
+        'runnable threads per CPU (ratio)', 'runqueue_read_ok'),
     # One series per cgroup leaf, so ':' — reported per leaf, never pooled.
     'own_cpu_some_avg10': ArmSpec(
-        'own_cpu_some10', True, _PRESSURE_LADDER, _PRESSURE_UNIT),
+        'own_cpu_some10', True, _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
 }
 
 
@@ -145,10 +155,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
+    """``{metric: [(ts, value) in ts order]}`` for every selector, one home.
+
+    Shared by the value series and the readability series so the GLOB spelling
+    and its reasoning live in exactly one place (heuristic 11).
+    """
+    series: Series = {}
+    for selector in selectors:
+        rows = con.execute(
+            'SELECT metric, ts, value FROM samples'
+            ' WHERE metric = ? OR metric GLOB ? ORDER BY ts',
+            (selector, f'{selector}:*'),
+        ).fetchall()
+        for metric, ts, value in rows:
+            series.setdefault(metric, []).append((int(ts), float(value)))
+    return series
+
+
 def read_series(
     db: Path, arm: str | None
-) -> tuple[dict[str, list[tuple[int, float]]], list[str]]:
-    """Return ``{metric: [(ts, value) in ts order]}`` and any degradations hit.
+) -> tuple[Series, Series, list[str]]:
+    """Return the value series, the READABILITY series, and any degradations.
+
+    The two are returned apart and never merged: a ``*_read_ok`` row is
+    evidence ABOUT a series, not a sample of it, so pooling them would corrupt
+    the very percentiles and hold fractions it exists to qualify.
 
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
@@ -177,26 +209,23 @@ def read_series(
     try:
         con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     except sqlite3.Error as exc:
-        return {}, [f'db_unavailable: {db} ({exc})']
+        return {}, {}, [f'db_unavailable: {db} ({exc})']
 
-    series: dict[str, list[tuple[int, float]]] = {}
     try:
-        for selector in selectors:
-            rows = con.execute(
-                'SELECT metric, ts, value FROM samples'
-                ' WHERE metric = ? OR metric GLOB ? ORDER BY ts',
-                (selector, f'{selector}:*'),
-            ).fetchall()
-            for metric, ts, value in rows:
-                series.setdefault(metric, []).append((int(ts), float(value)))
+        series = _fetch(con, selectors)
+        readability = _fetch(
+            con, [spec.readability for spec in specs if spec.readability]
+        )
     except sqlite3.Error as exc:
-        return {}, [f'db_unavailable: {db} ({exc})']
+        return {}, {}, [f'db_unavailable: {db} ({exc})']
     finally:
         con.close()
 
     if not series:
-        return {}, [f'no_samples_in_window: no rows for {sorted(selectors)} in {db}']
-    return series, []
+        return {}, {}, [
+            f'no_samples_in_window: no rows for {sorted(selectors)} in {db}'
+        ]
+    return series, readability, []
 
 
 def percentile_table(
@@ -217,6 +246,12 @@ def percentile_table(
 
 # PRD D11: "the gate holds on a minority of ticks (target <= 20%)".
 D11_HOLD_FRACTION_TARGET = 0.20
+
+# Below this readable fraction, a series' hold fractions are reported with a
+# named degradation. It is a REPORTING threshold, not a decision one: the exact
+# coverage is printed either way, so no verdict depends on where this sits — it
+# decides only when the report shouts.
+D11_READABILITY_FLOOR = 0.95
 
 # The paired .timer's OnUnitActiveSec. Only a FALLBACK for a corpus too short
 # to measure spacing from; the real value is read off the data.
@@ -517,6 +552,66 @@ def hold_table(
     return out
 
 
+def coverage_table(
+    series: Series,
+    readability: Series,
+    specs: list[ArmSpec],
+) -> dict[str, dict[str, float] | None]:
+    """Per VALUE metric, the readable-tick coverage its numbers rest on.
+
+    A failed read emits no value row at all, so ``hold_fraction``'s denominator
+    is the number of SUCCESSFUL reads rather than the number of ticks. A
+    ``*_read_ok`` row IS emitted every tick, so its row count is the tick count
+    and its 1.0 count is the readable count — which is the whole reason
+    ``collect_load_metrics`` persists it as a metric instead of a log line.
+    Without this, "holds on 12% of samples" reads identically whether the
+    corpus covered a fortnight or the 3% of it that was readable, and those are
+    opposite verdicts for setting a dispatch threshold.
+
+    ``None`` for an arm whose collector emits no readability metric — the four
+    host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
+    defect as persisting α's fail-open 0.0 as a ratio.
+
+    Keyed by the value metric so a ':' stem reports PER LEAF: one cgroup can be
+    unreadable while its siblings are fine, which is exactly the case worth
+    seeing.
+    """
+    out: dict[str, dict[str, float] | None] = {}
+    for metric in series:
+        arm = _arm_for(metric, specs)
+        spec = ARM_METRIC_SELECTORS[arm] if arm else None
+        if spec is None:
+            continue
+        if spec.readability is None:
+            out[metric] = None
+            continue
+        _stem, separator, tail = metric.partition(':')
+        key = f'{spec.readability}:{tail}' if separator else spec.readability
+        points = readability.get(key, [])
+        ticks = len(points)
+        readable = sum(1 for _ts, value in points if value == 1.0)
+        out[metric] = {
+            'ticks': ticks,
+            'readable': readable,
+            'readable_fraction': round(readable / ticks, 4) if ticks else 0.0,
+        }
+    return out
+
+
+def readability_degradations(
+    coverage: dict[str, dict[str, float] | None]
+) -> list[str]:
+    """One named degradation per series whose coverage is below the floor."""
+    return [
+        f"low_readability: {metric} readable on {stats['readable']}/"
+        f"{stats['ticks']} ticks ({stats['readable_fraction']:.1%}), below the "
+        f'{D11_READABILITY_FLOOR:.0%} floor — read its hold fractions against '
+        'that coverage, not as a fortnight'
+        for metric, stats in sorted(coverage.items())
+        if stats is not None and stats['readable_fraction'] < D11_READABILITY_FLOOR
+    ]
+
+
 def commit_report(path: Path, stamp: str) -> list[str]:
     """`git add --` then `git commit --only <path>`; degrade named on failure.
 
@@ -557,13 +652,15 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC)
     stamp = now.strftime('%Y-%m-%d')
 
-    series, degradations = read_series(args.db, args.arm)
+    series, readability, degradations = read_series(args.db, args.arm)
     specs = (
         [ARM_METRIC_SELECTORS[args.arm]] if args.arm
         else list(ARM_METRIC_SELECTORS.values())
     )
     percentiles = percentile_table({m: [v for _, v in pts] for m, pts in series.items()})
     holds = hold_table(series, specs)
+    coverage = coverage_table(series, readability, specs)
+    degradations += readability_degradations(coverage)
     local_block, local_degradations = load_psi_admission_block(args.config, 'local')
     peer_block, peer_degradations = load_psi_admission_block(args.peer_config, 'peer')
     degradations += local_degradations + peer_degradations
@@ -607,11 +704,28 @@ def main(argv: list[str] | None = None) -> int:
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
         in_force = configured.get(arm) if arm else None
+        stats = coverage.get(metric)
+        if stats is None:
+            readable = (
+                'Coverage: no readability metric for this arm, so the hold '
+                'fractions below are over readable ticks of unknown count.'
+            )
+        else:
+            readable = (
+                f"Coverage: readable on {stats['readable']}/{stats['ticks']} "
+                f"ticks ({stats['readable_fraction']:.1%})"
+                + ('' if stats['readable_fraction'] >= D11_READABILITY_FLOOR
+                   else ' — **BELOW THE FLOOR**, see degradations')
+            )
         lines += [
             f'### `{metric}` — {spec.unit if spec else ""}',
             '',
             f'Configured value in force: '
             f'{in_force if in_force is not None else "(none — see degradations)"}',
+            '',
+            # A hold fraction's denominator is readable ticks, not ticks, so it
+            # is printed beside the coverage it was computed over — never alone.
+            readable,
             '',
             '| candidate | hold fraction | <= target | longest hold run |',
             '|---|---|---|---|',
@@ -690,6 +804,7 @@ def main(argv: list[str] | None = None) -> int:
         'db': str(args.db),
         'percentiles': percentiles,
         'holds': holds,
+        'coverage': coverage,
         'configured': configured,
         'drift': drift,
         'restates_code_default': restatements,
