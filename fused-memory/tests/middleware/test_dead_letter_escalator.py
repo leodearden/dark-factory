@@ -493,3 +493,53 @@ class TestTheRecordIsSelfSufficientForTriage:
 
         assert 'terminal_status' in detail, detail
         assert 'terminal_error' in detail, detail
+
+
+class TestWhatTheCallerWasTold:
+    """`reported_to_caller` must name the claim that was ACTUALLY made.
+
+    The assertions reference `_REPORTED_TO_CALLER` / `_REPORTED_TO_CALLER_DEFAULT`
+    directly rather than quoting their sentences, so rewording a claim is a
+    one-place edit and only a change of BRANCH turns these red.
+    """
+
+    def test_add_episode_names_the_queued_status_it_returned(self, tmp_path):
+        _emit(tmp_path, operation='add_episode')
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER['add_episode'].text in detail, detail
+
+    def test_the_add_memory_leg_names_the_stores_written_it_returned(self, tmp_path):
+        """The claim `add_memory` makes, and the one it does NOT make."""
+        _emit(tmp_path, operation='add_memory_graphiti', write_op_id='W-9')
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, detail
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT not in detail, detail
+
+    def test_a_replayed_add_memory_graphiti_death_claims_no_caller(self, tmp_path):
+        """`add_memory_graphiti` has TWO producers and only one faces a caller.
+
+        `MemoryService.replay_from_store` enqueues this same operation from a
+        background loop: no `add_memory` call, no synchronous `stores_written`
+        claim, and — the discriminator — no `_write_op_id`, which `add_memory`
+        mints for every item it enqueues. Keyed on the operation NAME alone the
+        record would tell an operator a caller had been lied to, and send them
+        hunting for a caller that never existed.
+        """
+        _emit(tmp_path, operation='add_memory_graphiti', write_op_id=None)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail
+        assert dle_mod._REPORTED_TO_CALLER['add_memory_graphiti'].text not in detail, (
+            'a replay-originated death must UNDER-claim, never invent a caller'
+        )
+
+    def test_an_operation_with_no_entry_falls_back_to_the_neutral_default(
+        self, tmp_path,
+    ):
+        """A forgotten entry must under-claim, not claim optimistically."""
+        _emit(tmp_path, operation='mem0_classify_and_add', write_op_id=None)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail

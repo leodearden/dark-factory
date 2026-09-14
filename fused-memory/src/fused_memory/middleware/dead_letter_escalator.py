@@ -47,13 +47,17 @@ CREATES its directory — a read-only root raises at construction, and a cache
 would defer that raise to an arbitrary later call.
 
 WHAT THE CALLER WAS TOLD is carried explicitly, via ``_REPORTED_TO_CALLER``,
-keyed on the durable-queue OPERATION name. The two enqueue sites that report a
-synchronous success make DIFFERENT claims — ``add_episode`` returns
-``status='queued'``, ``add_memory`` returns ``stores_written`` containing
-graphiti — and an alarm that misreported which one was made would not be
-triageable. A new enqueue site that reports success synchronously must add an
+keyed on the durable-queue OPERATION name and gated on the evidence that
+operation's claim rests on. The two enqueue sites that report a synchronous
+success make DIFFERENT claims — ``add_episode`` returns ``status='queued'``,
+``add_memory`` returns ``stores_written`` containing graphiti — and an alarm
+that misreported which one was made would not be triageable. Neither is the
+operation name alone always evidence that a claim was made at all: see
+``_Claim.requires_write_op_id`` for the operation with a second, caller-less
+producer. A new enqueue site that reports success synchronously must add an
 entry there; the default is deliberately neutral rather than optimistic, so a
-forgotten entry under-claims instead of inventing a caller to warn.
+forgotten entry, or a producer that made no claim, under-claims instead of
+inventing a caller to warn.
 
 NEVER RAISES. This runs after the queue has already committed the item's dead
 state, from inside ``_process_item``; turning a lost alarm into an exception
@@ -64,6 +68,7 @@ log line plus ``None``.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -98,37 +103,68 @@ _FINDING_CATEGORY = 'queue_dead_letter'
 # content it records, so the two records truncate the same way.
 _PREVIEW_CHARS = 200
 
+
+@dataclass(frozen=True)
+class _Claim:
+    """What a caller was synchronously told, and the evidence it rests on.
+
+    ``requires_write_op_id`` is here because an operation can have MORE THAN
+    ONE producer and only some of them face a caller, so the operation NAME
+    alone is not always evidence that anybody was told anything.
+    ``add_memory_graphiti`` is the case that forces it: ``add_memory`` mints a
+    ``_write_op_id`` for every item it enqueues and returns ``stores_written``
+    to a live caller, while ``MemoryService.replay_from_store`` enqueues the
+    same operation from a background loop with no caller, no synchronous claim
+    and deliberately no ``_write_op_id``. Ungated, a replayed death would name
+    an ``add_memory`` caller who never existed — the exact invention the
+    neutral default below exists to prevent.
+    """
+
+    text: str
+    requires_write_op_id: bool = False
+
+
 # What the CALLER was synchronously told, keyed on the durable-queue OPERATION
 # name. This is what makes the record say not merely "a write died" but "a
 # caller acted on a success that will never be true" — the difference between
 # an alarm an operator can triage and one they cannot.
 #
-# A new enqueue site that reports success synchronously must add an entry here.
+# A new enqueue site that reports success synchronously must add an entry here,
+# and must set `requires_write_op_id` when it is not that operation's only
+# producer.
 _REPORTED_TO_CALLER = {
-    'add_episode': (
+    'add_episode': _Claim(
         "add_episode returned status='queued' and an episode_id, so the caller "
         'was told the write had been durably accepted and would land'
     ),
-    'add_memory_graphiti': (
+    'add_memory_graphiti': _Claim(
         'add_memory returned stores_written containing graphiti at enqueue '
-        'time — the caller was told this write LANDED, not that it was queued'
+        'time — the caller was told this write LANDED, not that it was queued',
+        requires_write_op_id=True,
     ),
 }
 
-# Deliberately NEUTRAL rather than optimistic, so a forgotten entry
-# UNDER-claims. An operator wrongly told a caller was lied to would go hunting
-# for a caller to warn and find none; the reverse error merely under-reports.
+# Deliberately NEUTRAL rather than optimistic, so a forgotten entry — or a
+# producer whose evidence is absent — UNDER-claims. An operator wrongly told a
+# caller was lied to would go hunting for a caller to warn and find none; the
+# reverse error merely under-reports.
 _REPORTED_TO_CALLER_DEFAULT = (
     'no synchronous success was reported to any caller for this operation'
 )
 
 
-def _reported_to_caller(operation: str, caller_reference: str | None) -> str:
+def _reported_to_caller(
+    operation: str, write_op_id: str | None, caller_reference: str | None,
+) -> str:
     """The one-line statement of what the caller was promised."""
-    claim = _REPORTED_TO_CALLER.get(operation, _REPORTED_TO_CALLER_DEFAULT)
+    claim = _REPORTED_TO_CALLER.get(operation)
+    if claim is None or (claim.requires_write_op_id and write_op_id is None):
+        text = _REPORTED_TO_CALLER_DEFAULT
+    else:
+        text = claim.text
     if caller_reference:
-        return f'{claim} (id handed to the caller: {caller_reference})'
-    return claim
+        return f'{text} (id handed to the caller: {caller_reference})'
+    return text
 
 
 def _error_class(error: str | None) -> str:
@@ -281,7 +317,8 @@ def emit_dead_letter_escalation(
         f'post_execute={post_execute}',
         f'error={error!r}',
         f'content_preview={preview!r}',
-        f'reported_to_caller={_reported_to_caller(operation, caller_reference)!r}',
+        'reported_to_caller='
+        f'{_reported_to_caller(operation, write_op_id, caller_reference)!r}',
         '',
         f'A durably-queued {operation!r} write for project {project_id!r} '
         f'exhausted its attempts and was PERMANENTLY ABANDONED after '
