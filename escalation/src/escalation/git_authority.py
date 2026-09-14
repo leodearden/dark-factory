@@ -99,7 +99,8 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     """Build the git-authority Tier-3.5 done/found_on_main response.
 
     ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
-    explicit exception stated below (task 3103):
+    explicit exception — Exception 1 below (task 3103); Exception 2
+    weakens a different guarantee and leaves this one intact:
 
     - **Live-branch path** (``is_ancestor`` hit): the citation commit
       discovered by ``validate_landing_evidence`` — a commit on main
@@ -109,12 +110,14 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
 
     Both are effect-present-checked against current main HEAD before
     being returned, so ``merge_sha`` is safe to record as provenance
-    as-is.  (Before task 3103 the live-branch path returned the *branch
+    as-is — EXCEPT in the two cases below, which
+    :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` answers as one
+    question.  (Before task 3103 the live-branch path returned the *branch
     tip*, which for a ``--no-ff`` merge is a distinct commit that is not
     on main's first-parent chain — callers were told to prefer the
     deleted-branch path's value.  That caveat no longer applies.)
 
-    **The one exception — ``git.commit_citation_pattern == ''``.**  That
+    **Exception 1 — ``git.commit_citation_pattern == ''``.**  That
     is the documented per-project opt-out for projects with no citation
     convention (config.py; ``find_task_citation_commit`` honours it by
     returning None for everything, so running the gate would reject
@@ -131,6 +134,26 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     than by inspecting config.  The opt-out is ``''`` only; ``None`` means
     "use the built-in default pattern" and keeps the full guarantee.
     Both SKILL.md runbooks carry the same exception.
+
+    **Exception 2 — a delivered-checks rescue.**  ``merge_sha`` is still a
+    commit ON MAIN here (this exception does NOT reach the where-the-sha-
+    came-from paragraphs above), but the EFFECT-PRESENT guarantee is gone:
+    ``validate_landing_evidence``'s second accept path
+    (``orchestrator/src/orchestrator/landing_evidence.py``, both modes)
+    sits INSIDE the ``commit_effect_present_in_main(...) is False`` branch
+    and accepts anyway when the three-leg delivered-checks differential
+    confirms.  So ``merge_sha`` may name a landing that was later REVERTED
+    — the exact task-1175 shape FIX 1' exists to catch.  It is NARROW: it
+    requires (i) the task to declare a non-empty
+    ``metadata.delivered_checks``, (ii) the fleet-wide
+    ``delivered_checks.enabled`` config to be on, and (iii) the
+    differential to actually confirm.  A task declaring no checks passes
+    ``[]``, which is falsy, so the path stays unreachable and its
+    behaviour is unchanged.  A caller detects the case from
+    :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` — preferred, it
+    covers both exceptions — or from
+    :attr:`GitAuthorityVerdict.rescued_by_delivered_checks` for this one
+    specifically, rather than by inspecting task metadata or config.
     """
     return {
         'state': MergeState.done,
