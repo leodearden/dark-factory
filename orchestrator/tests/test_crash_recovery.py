@@ -167,6 +167,29 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
     return out
 
 
+def _reasons_for(
+    harness: Harness,
+    session: object,
+    config_dir: str | None,
+    *,
+    archive_available: bool = False,
+) -> frozenset[str]:
+    """Call the eligibility predicate directly, off the ``_run_slot`` path.
+
+    The ONE place this suite names ``_session_resume_reasons``. The predicate is
+    module-internal, so every case routing through a single seam keeps the
+    coupling to that name at one line rather than one per case — a rename costs
+    an edit here instead of twenty.
+
+    ``archive_available`` defaults to False, the pre-δ answer, so a case that
+    says nothing about the archive reads as one whose outcome does not turn on
+    it; the δ cases below pass it explicitly.
+    """
+    return harness._session_resume_reasons(
+        session, config_dir, archive_available=archive_available
+    )
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -1929,7 +1952,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-both'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'stale', 'no_transcript'})
 
@@ -1946,7 +1969,7 @@ class TestSessionResumeReasons:
         }
         cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
 
-        reasons = harness._session_resume_reasons(session, str(cfg_dir))
+        reasons = _reasons_for(harness, session, str(cfg_dir))
 
         assert reasons == frozenset()
         assert not reasons  # the eligibility predicate itself
@@ -1963,7 +1986,7 @@ class TestSessionResumeReasons:
         gone = tmp_path / 'gone-three' / 'claude-config-x'
         assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
 
-        reasons = harness._session_resume_reasons(session, str(gone))
+        reasons = _reasons_for(harness, session, str(gone))
 
         assert reasons == frozenset({'stale', 'capped', 'reseeded'})
 
@@ -1986,7 +2009,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-dis'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'disabled'})
 
@@ -2000,7 +2023,8 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
 
         cfg1 = _make_transcript(tmp_path, 'uuid-bad')
-        r1 = harness._session_resume_reasons(
+        r1 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad', 'role': 'r',
              'started_at': 'not-a-date', 'resume_count': 0},
             str(cfg1),
@@ -2009,7 +2033,8 @@ class TestSessionResumeReasons:
         assert 'no_transcript' not in r1
 
         cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
-        r2 = harness._session_resume_reasons(
+        r2 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
             str(cfg2),
         )
@@ -2024,14 +2049,16 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
         fresh = datetime.now(UTC).isoformat()
 
-        no_dir = harness._session_resume_reasons(
+        no_dir = _reasons_for(
+            harness,
             {'session_id': 'uuid-nocfg', 'role': 'r',
              'started_at': fresh, 'resume_count': 0},
             None,
         )
         assert 'no_transcript' in no_dir
 
-        no_sid = harness._session_resume_reasons(
+        no_sid = _reasons_for(
+            harness,
             {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
             '/some/where',
         )
@@ -2061,7 +2088,8 @@ class TestSessionResumeReasons:
         monkeypatch.setattr(Path, 'stat', fake_stat)
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(
+        reasons = _reasons_for(
+            harness,
             {'session_id': 'uuid-eacces', 'role': 'r',
              'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
             str(blocked),
@@ -2103,7 +2131,10 @@ class TestSessionResumeReasons:
 
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(bad_session, str(tmp_path))
+        reasons = _reasons_for(
+            harness,
+            bad_session, str(tmp_path)
+        )
 
         assert isinstance(reasons, frozenset)
         assert all(isinstance(r, str) for r in reasons)
@@ -2129,9 +2160,276 @@ class TestSessionResumeReasons:
         """
         harness.config.session_resume = SessionResumeConfig(enabled=False)
 
-        reasons = harness._session_resume_reasons(['a'], str(tmp_path))
+        reasons = _reasons_for(
+            harness,
+            ['a'], str(tmp_path)
+        )
 
         assert reasons == frozenset({'disabled'})
+
+    # ── δ (task 3730 / D2): the durable archive as a SECOND source of
+    #    reachability, and freshness demoted to the no-archive case ─────────
+
+    def test_aged_but_archived_and_config_dir_less_is_eligible(
+        self, harness: Harness
+    ):
+        """(a) B8 HEADLINE — the real crash-recovery shape is now ELIGIBLE.
+
+        An aged sidecar, NO live config dir at all, but the session is still
+        in the durable transcript archive: the empty set. Neither 'stale' nor
+        'no_transcript'.
+
+        This is the shape production actually reaches, which is the whole
+        point. ``run()``'s finally executes an unconditional
+        ``cleanup_config_dir`` teardown while ``session_preserved`` keeps the
+        sidecar, so on every crash-recovery path the config dir is GONE and
+        ``_adopt_recovered_session``'s glob hands the guard ``config_dir=None``.
+        Before δ that combination was uncorroborable by construction, which is
+        why ~91% of post-3578 fallbacks (92 of 101, measured 2026-09-04) had a
+        recoverable archive the predicate never consulted.
+
+        Reachability outranks freshness: an archived transcript does not decay
+        with wall-clock, so "how old is it" is the wrong question for a
+        session that is still reachable. The absolute backstop (D3) is what
+        keeps that from meaning "no age limit at all".
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+            'this row must sit BETWEEN the two thresholds, or it is testing '
+            'the backstop instead of the freshness demotion'
+        )
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert reasons == frozenset()
+        assert not reasons  # the eligibility predicate itself
+
+    def test_the_archive_is_the_only_thing_that_changed_the_answer(
+        self, harness: Harness
+    ):
+        """(b) THE CONTROL for (a) — same session, archive_available=False,
+        and the answer is exactly today's {'stale', 'no_transcript'}.
+
+        Run against byte-identical inputs so the archive is demonstrably the
+        only variable. Without this, (a) would be consistent with δ having
+        loosened something else.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+        # Explicit, though False is the helper's default: this row IS the
+        # archive variable held at False, so spelling it makes the contrast
+        # with (a) legible without cross-referencing the helper.
+        reasons = _reasons_for(harness, session, None, archive_available=False)
+
+        assert reasons == frozenset({'stale', 'no_transcript'})
+
+    def test_fresh_and_archived_without_a_live_transcript_is_eligible(
+        self, harness: Harness
+    ):
+        """(c) Reachability ALONE suffices — the age was never the objection.
+
+        A FRESH sidecar with no live transcript is ineligible today purely on
+        corroboration. With an archive it is reachable, so it is eligible;
+        this separates the corroboration change from the freshness change,
+        which (a) exercises together.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-fresh-arch',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert reasons == frozenset()
+
+    def test_a_live_transcript_still_corroborates_on_its_own(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(d) The archive is an ADDITIONAL source of reachability, not a
+        replacement: a live transcript still corroborates with no archive.
+
+        Pins that δ WIDENED the corroboration leg rather than moving it onto
+        the archive — a rewrite that made the archive the only accepted source
+        would leave every warm-lane resume (the population γ shipped for)
+        newly ineligible, and nothing else in this class would notice.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-live-only',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg_dir = _make_transcript(tmp_path, 'uuid-live-only')
+
+        reasons = _reasons_for(
+            harness,
+            session, str(cfg_dir)
+        )
+
+        assert reasons == frozenset()
+
+
+    # ── δ (task 3730 / D3): the absolute backstop — "archive outranks age"
+    #    must not become "no age limit at all" ────────────────────────────
+
+    def _aged(self, cfg: SessionResumeConfig, age_secs: float) -> dict:
+        """A sidecar back-dated *age_secs*, driven off the config knobs."""
+        return {
+            'session_id': 'uuid-aged',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+    def test_aged_out_rejects_even_an_archived_session(self, harness: Harness):
+        """(a) B9 HEADLINE — reachability outranks FRESHNESS, not the BACKSTOP.
+
+        Past absolute_resume_age_secs a session is rejected however reachable
+        it is, and reports 'aged_out'. Without this leg D2 would read as "an
+        archive exempts a session from age entirely", and a sidecar surviving
+        an arbitrarily long outage would resume into a world that had moved on.
+
+        Back-dated off the CONFIG FIELD rather than a literal, so a re-tuned
+        bound re-tunes this row with it.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'aged_out' in reasons
+        assert reasons  # ineligible, whatever else co-occurs
+
+    def test_aged_out_boundary_is_closed_at_the_bound(self, harness: Harness):
+        """(b) `>=`, matching the freshness leg's existing convention.
+
+        AT the bound is rejected; comfortably below it, with an archive, is
+        eligible — which also proves this row is exercising the BACKSTOP and
+        not the freshness window it sits above.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        at_bound = _reasons_for(
+            harness,
+            self._aged(cfg, cfg.absolute_resume_age_secs),
+            None,
+            archive_available=True,
+        )
+        assert 'aged_out' in at_bound
+
+        below = _reasons_for(
+            harness,
+            self._aged(cfg, cfg.absolute_resume_age_secs - 3600),
+            None,
+            archive_available=True,
+        )
+        assert below == frozenset()
+
+    def test_aged_out_co_occurs_rather_than_replacing(self, harness: Harness):
+        """(c) D5 survives the new token: aged out AND capped reports BOTH.
+
+        The predicate accumulates; a new leg that returned early would undo
+        exactly the co-occurrence reporting task 3728 exists to provide.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+        session['resume_count'] = cfg.max_resumes_per_task
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'aged_out' in reasons
+        assert 'capped' in reasons
+
+    @pytest.mark.parametrize(
+        'started_at',
+        ['not-a-date', None, 12345, ['2026-01-01']],
+        ids=['unparseable', 'none', 'int', 'list'],
+    )
+    def test_an_undateable_session_is_never_laundered_by_the_archive(
+        self, harness: Harness, started_at
+    ):
+        """(d) THE FAIL-SAFE CARVE-OUT — an archive cannot redeem an UNDATEABLE
+        sidecar.
+
+        D2's argument for suppressing 'stale' is that an archived transcript
+        does not decay with wall-clock, so age is the wrong question. That
+        applies only to a session whose age we KNOW. With started_at missing,
+        unparseable or the wrong type the age is unknown, so nothing bounds it
+        — and the D3 backstop cannot be evaluated either, because there is no
+        age to compare against. Suppressing 'stale' here would make an
+        undateable sidecar FULLY ELIGIBLE on the strength of an archive: a
+        fail-OPEN regression against the I3 contract.
+
+        The sharpest way to get δ wrong is to write the suppression as a
+        single `if not archive_available` around the whole freshness leg,
+        which passes every other row in this class. This is the row that
+        catches it.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {'session_id': 'uuid-undateable', 'role': 'r',
+                   'resume_count': 0}
+        if started_at is not None:
+            session['started_at'] = started_at
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'stale' in reasons, (
+            'an undateable sidecar must stay ineligible however reachable it '
+            'is: its age cannot be bounded and the absolute backstop cannot '
+            'be evaluated, so nothing is left to stop it resuming'
+        )
+        # ...and the backstop is NOT claimed, because nothing was compared.
+        assert 'aged_out' not in reasons
+
+    def test_no_archive_reports_both_thresholds_separately(self, harness: Harness):
+        """(e) On the no-archive path an aged-out session reports 'stale' AND
+        'aged_out', so a runs.db census can still tell the two apart.
+
+        They answer different operator questions and are actioned differently:
+        'stale' is "old, with no archive to redeem it" (worth asking why the
+        archive is missing — the U2 population), 'aged_out' is "old past the
+        point resuming is safe regardless of reachability" (the backstop
+        working). Collapsing them into one token would destroy the
+        co-occurrence census D5 built the reason SET to enable.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        reasons = _reasons_for(
+            harness,
+            self._aged(cfg, 2 * cfg.absolute_resume_age_secs),
+            None,
+        )
+
+        assert 'stale' in reasons
+        assert 'aged_out' in reasons
 
 
 @pytest.mark.asyncio
@@ -2142,6 +2440,15 @@ class TestSessionResumeGuard:
     session_resume event. The kill switch (enabled=False) degrades silently
     with no event (B6). The guard is fail-safe (I3) — every ineligible path
     is no-worse than today's fresh dispatch.
+
+    Since task 3730 (δ) the guard also HOISTS the durable-archive lookup and
+    feeds it to the predicate as an eligibility input, so two rows here drive
+    the archive-mediated outcomes end to end: an aged, config-dir-less,
+    archive-backed session is now ADOPTED (D2), and the same session past the
+    absolute bound still falls back with 'aged_out' (D3). Every pre-δ row
+    above is unchanged in meaning: none of them seeds an archive, so the
+    hoisted lookup answers False and they exercise exactly the no-archive
+    world they always did.
     """
 
     async def test_eligible_keeps_session_and_emits(self, harness: Harness, tmp_path: Path):
@@ -2508,6 +2815,157 @@ class TestSessionResumeGuard:
         assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
         assert harness._session_resume_fallback_streak == 0
 
+    async def test_archive_backed_session_with_no_config_dir_is_adopted(
+        self, harness: Harness
+    ):
+        """δ END TO END (task 3730 / D2), at the GUARD rather than the
+        predicate: the real crash-recovery shape — sidecar PRESERVED, config
+        dir GONE, transcript recoverable only from the durable archive — is
+        adopted, injected as ``resume_session_id``, and emits
+        ``session_resume`` instead of ``session_resume_fallback``.
+
+        THE BAR THIS ROW SETS, and why it is not "any session_resume". The
+        task's Tier-1 signal is a resume attributable to the ARCHIVE-MEDIATED
+        predicate; a live-dir resume proves nothing about D2, because that
+        path was already eligible before δ (see
+        :meth:`test_eligible_keeps_session_and_emits`, unchanged). So this row
+        seeds NO config dir at all and back-dates the sidecar PAST
+        ``freshness_window_secs``: before δ that combination was doubly
+        ineligible (``{'no_transcript', 'stale'}``), and it is the shape
+        production reaches on EVERY crash-recovery path — ``run()``'s finally
+        executes an unconditional ``cleanup_config_dir`` teardown
+        (registered by ``workflow.py::TaskWorkflow._on_terminal_cleanups``,
+        run on every terminal exit) while ``session_preserved`` keeps
+        the sidecar, so ``_adopt_recovered_session``'s glob hands the guard
+        ``config_dir=None``. ~91% of post-3578 fallbacks (92 of 101, measured
+        2026-09-04) had exactly this recoverable archive the predicate never
+        consulted.
+
+        Also pins that adoption RESETS the storm streak: an archive-mediated
+        resume is a resume, so it breaks a fallback run like any other.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+            'this row must sit BETWEEN the two thresholds, or it is measuring '
+            'the backstop rather than the freshness demotion'
+        )
+        session = {
+            'session_id': 'uuid-delta-e2e',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz1', 'uuid-delta-e2e')
+        harness._session_resume_fallback_streak = 2  # a run in progress
+
+        resume_id = await _drive_session_slot(harness, 'dz1', session)  # no config_dir
+
+        assert resume_id is session
+        emits = _session_resume_emits(harness)
+        assert [et for et, _ in emits] == [EventType.session_resume]
+        assert harness._session_resume_fallback_streak == 0
+
+    async def test_aged_out_archive_backed_session_still_falls_back(
+        self, harness: Harness
+    ):
+        """The D3 backstop at the guard: the SAME archive-backed, config-dir-less
+        shape adopted above still falls back once it is past
+        ``absolute_resume_age_secs``, and the event carries 'aged_out'.
+
+        Reachability outranks freshness, NOT the backstop — without this row
+        the change above would read as "an archive exempts a session from age
+        entirely". 'aged_out' rather than 'stale' so the two thresholds stay
+        distinguishable in runs.db, and by-design so a batch of week-old
+        sidecars after a long outage cannot page an operator (D4/D5).
+
+        Back-dated off the CONFIG FIELD, never a literal, so a re-derived
+        bound re-tunes this row with it.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-delta-agedout',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.absolute_resume_age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz2', 'uuid-delta-agedout')
+
+        resume_id = await _drive_session_slot(harness, 'dz2', session)  # no config_dir
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # 'stale' is suppressed by the archive; only the backstop fires, and
+        # the corroboration leg is satisfied by the archive too.
+        assert kwargs['data']['reasons'] == ['aged_out']
+        assert kwargs['data']['archive_available'] is True
+        assert harness._session_resume_fallback_streak == 0  # by design (D4)
+
+    async def test_restore_kill_switch_withholds_the_archive_from_eligibility(
+        self, harness: Harness
+    ):
+        """THE NARROW KILL SWITCH STILL REVERTS δ (task 3578's
+        ``restore_from_archive``, at δ's guard).
+
+        Same archive-backed, config-dir-less shape adopted two rows above, with
+        restoration disabled — the switch an operator pulls precisely when they
+        suspect a restore regression. It must put that session back on its
+        pre-δ path: an archive nothing will rehydrate does not make a session
+        reachable.
+
+        WHAT GOES WRONG IF ELIGIBILITY IGNORES THE SWITCH. The guard would
+        adopt the session and emit ``session_resume``; the arm site would then
+        skip rehydration (``restore_outcome='disabled'``), fail
+        re-corroboration against the fresh config dir, veto, and dispatch fresh
+        with ``session_resume_failed(stage='pre_flight')``. Every
+        archive-mediated session would move from ``session_resume_fallback`` to
+        ``session_resume`` while none of them actually resumed — so D8's ratio
+        recipe, and the OPERATIONS.md §14 instruction to watch
+        ``session_resume`` rise, would read 100% resumed at 0% resumed. The
+        switch would have made the signal it exists to preserve actively
+        misleading.
+
+        The INSTRUMENT is NOT withheld with it: ``archive_available`` still
+        reports what is on disk, because 'restore switched off' and 'no archive
+        at all' are different operator situations and this field is the only
+        thing in runs.db that tells them apart. That is the same field
+        ``restore_from_archive``'s own description promises not to go blind on.
+        """
+        cfg = SessionResumeConfig(restore_from_archive=False)
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-delta-norestore',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz3', 'uuid-delta-norestore')
+
+        resume_id = await _drive_session_slot(harness, 'dz3', session)  # no config_dir
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # EXACTLY the pre-δ answer for this shape (cf.
+        # test_the_archive_is_the_only_thing_that_changed_the_answer).
+        assert kwargs['data']['reasons'] == ['no_transcript', 'stale']
+        assert kwargs['data']['archive_available'] is True
+
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:
@@ -2583,7 +3041,13 @@ class TestSessionResumeStorm:
 
         ``restore_failed`` is deliberately the name ε is expected to use.
         """
-        def _reasons(session: dict, config_dir: str | None) -> frozenset[str]:
+        def _reasons(
+            session: dict, config_dir: str | None, *, archive_available: bool
+        ) -> frozenset[str]:
+            # Accepts δ's archive_available (task 3730) so the stub tracks the
+            # real signature — a **kwargs sponge would keep passing if the
+            # caller stopped supplying it, which is the one thing the hoist
+            # rows in TestSessionResumeArchiveAvailable exist to catch.
             return reasons
 
         harness._session_resume_reasons = _reasons  # type: ignore[method-assign]
@@ -2731,7 +3195,7 @@ class TestSessionResumeStorm:
 
         producible = strings - non_reason_literals
         assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
-                              'reseeded'}, (
+                              'reseeded', 'aged_out'}, (
             'the string literals in _session_resume_reasons no longer partition '
             'into the declared non-reasons and the known reason vocabulary. If '
             'you added a REASON, classify it in '
@@ -3448,23 +3912,47 @@ class TestSessionResumeArchiveAvailable:
     """archive_available on session_resume_fallback (task 3727, PRD §8).
 
     Every fallback emit reports whether that session was actually RECOVERABLE
-    from the durable transcript archive — the measurement task 3619 will move
-    and leaf δ may later gate on. It is instrumentation ONLY (D8 / INV-3
-    instrument-before-acting): it must never change what dispatches, so every
-    assertion here also pins that the reasons, the resume decision and the
-    storm streak are exactly what they would be without the field. (Task 3728
-    later reclassified which reasons FEED that streak; the point these rows
-    make — that the instrument itself moves nothing — is unaffected.)
+    from the durable transcript archive. Task 3727 added it as instrumentation
+    ONLY (D8 / INV-3 instrument-before-acting) — measure the recoverable
+    population before gating on it — and these rows pinned that it moved
+    nothing.
+
+    TASK 3730 (δ) DELIBERATELY ENDS THAT, which is the whole point of the
+    instrument-then-act sequence: the measured signal (~91% of post-3578
+    fallbacks were recoverable, 92 of 101 on 2026-09-04) is now an ELIGIBILITY
+    input, so an archive-backed session that used to fall back is adopted.
+    Four rows below therefore assert the OPPOSITE of what they asserted under
+    3727, each saying so in its own docstring; they are updated rather than
+    deleted because the population each one describes is exactly the
+    population δ moves, and a row that watched it fall back is the right place
+    to record that it no longer does.
+
+    What survives unchanged from 3727: the field is still emitted on the
+    fallback branch ONLY (never on session_resume / session_resume_capped), it
+    is still a real JSON bool, and it is still False-on-fault so a broken
+    lookup cannot break dispatch. What is NEW under δ is that the lookup is
+    hoisted into the guard and happens EXACTLY ONCE per dispatch — the value
+    the predicate consumed and the value the event reports are structurally
+    the same bool — and that the disabled path still pays no filesystem I/O.
     """
 
-    async def test_no_transcript_reports_archive_present(
+    async def test_archive_present_now_resumes_instead_of_falling_back(
         self, harness: Harness, tmp_path: Path
     ):
-        """Archive PRESENT under a foreign lane → archive_available is True.
+        """THE POPULATION 3727 COUNTED AND δ MOVES (task 3730 / D2).
 
-        The recoverable population: the transcript is gone from the live
-        config dir but survives in the durable archive, under an encoded-cwd
-        dir belonging to no lane this test uses.
+        Archive PRESENT under a foreign lane, live transcript gone: under 3727
+        this emitted ``session_resume_fallback`` with ``reasons=['no_transcript']``
+        and ``archive_available: true`` — an ineligible dispatch that the
+        instrument could see was recoverable and was not allowed to act on.
+        The measurement it produced (92 of 101 such fallbacks, 2026-09-04) is
+        what authorised δ, so the row now asserts the conversion: the same
+        inputs are ADOPTED, and no fallback is emitted at all.
+
+        A surviving-but-empty config dir rather than an absent one, so this
+        row is distinct from the guard's crash-recovery-shape row: it pins
+        that reachability is answered by the archive even when the live dir is
+        present and simply does not hold this session's transcript.
         """
         session = {
             'session_id': 'uuid-arch-yes',
@@ -3482,22 +3970,13 @@ class TestSessionResumeArchiveAvailable:
             harness, 'ar1', session, config_dir=empty_cfg
         )
 
-        # D8: the resume decision and the reason are untouched.
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['no_transcript']
-        # `is True`, not truthy: the field must be a real JSON bool for
-        # json_extract(data, '$.archive_available') to be queryable in runs.db.
-        assert kwargs['data']['archive_available'] is True
-        # D8: the instrument still perturbs NOTHING — asserted here because the
-        # streak is the one piece of guard state a filesystem-touching
-        # instrument could plausibly disturb. The expected value is 0 rather
-        # than 1 since task 3728 carved 'no_transcript' (and every other
-        # by-design reason) out of the feeder; α's field is unchanged either
-        # way, which is exactly what this row exists to show.
+        assert [et for et, _ in emits] == [EventType.session_resume]
+        # The eligible event stays byte-identical (D8's surviving half): the
+        # field rides the fallback branch only, so event_store.py's ratio
+        # recipe keeps its denominator.
+        assert 'archive_available' not in emits[0][1]['data']
         assert harness._session_resume_fallback_streak == 0
 
     async def test_no_transcript_reports_archive_absent(
@@ -3531,13 +4010,26 @@ class TestSessionResumeArchiveAvailable:
     async def test_stale_also_carries_the_field(
         self, harness: Harness, tmp_path: Path
     ):
-        """reason == 'stale' carries it too — it rides the BRANCH, not one reason."""
-        real = SessionResumeConfig()
-        stale_at = datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+        """reason == 'stale' carries it too — it rides the BRANCH, not one reason.
+
+        RETARGETED BY δ (task 3730), deliberately and not incidentally. This
+        row used to drive an AGE-derived 'stale' with the archive present,
+        which is precisely the combination D2 now makes eligible — so keeping
+        it would have asserted the defect δ removes. It drives the OTHER
+        'stale' instead: an UNPARSEABLE ``started_at``, the one the archive
+        never suppresses, because an undateable session cannot be bounded by
+        the absolute backstop either (fail-safe direction: cannot date it,
+        cannot resume it).
+
+        That keeps the row's original claim exactly — the field rides the
+        fallback BRANCH rather than any one reason, so it is present on a
+        'stale' emit and not only on a corroboration failure — while making it
+        a live statement about δ rather than a fossil of pre-δ behaviour.
+        """
         session = {
             'session_id': 'uuid-arch-stale',
             'role': 'implementer',
-            'started_at': stale_at.isoformat(),
+            'started_at': 'not-a-date',  # undateable: 'stale', never suppressed
             'resume_count': 0,
         }
         cfg = _make_transcript(tmp_path, 'uuid-arch-stale')
@@ -3556,15 +4048,23 @@ class TestSessionResumeArchiveAvailable:
         assert kwargs['data']['archive_available'] is True
         assert harness._session_resume_fallback_streak == 0  # by design (3728)
 
-    async def test_reseeded_also_carries_the_field(
+    async def test_reseeded_lane_with_an_archive_is_now_adopted(
         self, harness: Harness, tmp_path: Path
     ):
-        """The OTHER fallback emit carries it too (task 3256 split it in two).
+        """A RESEEDED lane whose transcript survives in the archive resumes (δ).
 
-        This is the branch where the field matters MOST: a reseeded lane is
-        precisely the population task 3619 will move, so it has to be
-        measurable from day one. Wiring only one of the two emit sites would
-        half-ship the signal AND bias it.
+        3727 called this "the branch where the field matters MOST: a reseeded
+        lane is precisely the population task 3619 will move". δ is what moves
+        it. Warm-lane acquire always re-seeds from base, wiping
+        ``<lane>/.task/`` and the whole live transcript store with it — but
+        the archival pass copied the transcript OUT of that store before the
+        wipe, so the session is still reachable and the wipe is no longer a
+        reason to dispatch fresh.
+
+        The reseeded/no_transcript discrimination itself is untouched and
+        still pinned by :meth:`test_reseeded_reports_absent_archive`, which
+        drives the same wiped-lane shape with an EMPTY archive: that is where
+        the split still decides the answer.
         """
         session = {
             'session_id': 'uuid-arch-reseed',
@@ -3580,14 +4080,9 @@ class TestSessionResumeArchiveAvailable:
 
         resume_id = await _drive_session_slot(harness, 'ar4', session, config_dir=gone)
 
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['reseeded']
-        assert kwargs['data']['archive_available'] is True
-        # D8: 'reseeded' still does NOT feed the storm streak.
+        assert [et for et, _ in emits] == [EventType.session_resume]
         assert harness._session_resume_fallback_streak == 0
 
     async def test_reseeded_reports_absent_archive(
@@ -3735,9 +4230,17 @@ class TestSessionResumeArchiveAvailable:
         looks like a free optimisation and would still leave the whole suite
         green, while silently inverting the contract. Turning archival OFF
         today does not un-archive what was written while it was ON, and those
-        sessions are exactly the recoverable population this instrument exists
-        to count — a config-derived answer would bias the measurement toward
+        sessions are exactly the recoverable population this lookup exists to
+        find — a config-derived answer would bias the measurement toward
         "nothing is recoverable" and mislead an operator triaging the storm L1.
+
+        δ RAISES THE STAKES rather than changing the property (task 3730). The
+        lookup is now an ELIGIBILITY input, so the short-circuit would cost
+        real resumes rather than only a wrong telemetry field: flipping
+        ``transcript_archive.enabled`` off would retroactively make every
+        already-archived session ineligible. The observable therefore moves
+        from ``archive_available is True`` on a fallback to the session being
+        ADOPTED — a strictly louder statement of the same contract.
         """
         session = {
             'session_id': 'uuid-arch-disabled',
@@ -3755,13 +4258,9 @@ class TestSessionResumeArchiveAvailable:
             harness, 'ar11', session, config_dir=empty_cfg
         )
 
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['no_transcript']
-        assert kwargs['data']['archive_available'] is True
+        assert [et for et, _ in emits] == [EventType.session_resume]
 
     async def test_null_session_id_reports_false_without_raising(
         self, harness: Harness, tmp_path: Path
@@ -3830,3 +4329,119 @@ class TestSessionResumeArchiveAvailable:
         ]
         for _et, kwargs in emits:
             assert 'archive_available' not in kwargs['data']
+
+    async def test_one_archive_lookup_per_dispatch_feeds_both_consumers(
+        self, harness: Harness
+    ):
+        """δ WIRING (task 3730 / D-hoist): ONE lookup per dispatch, and the
+        value the predicate consumed IS the value the event reports.
+
+        Before δ the fallback emit did its own ``_archive_available`` call,
+        independent of the predicate (which did none at all). Leaving it that
+        way once the predicate gates on the archive would mean TWO lookups of
+        the same fact per dispatch, and — because an archival pass can land
+        between them — a ``session_resume_fallback`` whose
+        ``archive_available`` contradicts the ``reasons`` printed beside it.
+        An operator reading ``archive_available: true`` next to
+        ``reasons: ['no_transcript']`` would be looking at a state δ makes
+        impossible, with no way to tell it was a race.
+
+        So this row counts the calls (exactly one) AND compares the two
+        consumers' views of the same bool. Counting alone is not enough: a
+        single lookup wired to only ONE of the two consumers, with the other
+        left on a hardcoded default, would also count one.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-arch-once',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.absolute_resume_age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        # Aged OUT, so the dispatch still reaches the fallback emit and the
+        # event is observable at all — an adopted session emits no field.
+        _make_archive(harness.config.project_root, 'ar12', 'uuid-arch-once')
+
+        lookups: list[tuple] = []
+        real_lookup = harness._archive_available
+
+        def counting_lookup(task_id, session_id):
+            lookups.append((task_id, session_id))
+            return real_lookup(task_id, session_id)
+
+        consumed: list[object] = []
+        real_reasons = harness._session_resume_reasons
+
+        def spying_reasons(session_arg, config_dir, *, archive_available):
+            consumed.append(archive_available)
+            return real_reasons(
+                session_arg, config_dir, archive_available=archive_available
+            )
+
+        harness._archive_available = counting_lookup  # type: ignore[method-assign]
+        harness._session_resume_reasons = spying_reasons  # type: ignore[method-assign]
+
+        resume_id = await _drive_session_slot(harness, 'ar12', session)
+
+        assert resume_id is None
+        assert lookups == [('ar12', 'uuid-arch-once')], (
+            f'expected exactly one hoisted archive lookup, got {lookups!r}'
+        )
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['aged_out']
+        # The predicate saw it, the event reports it, and they are the SAME
+        # bool — not merely equal by luck of a second lookup agreeing.
+        assert consumed == [True]
+        assert kwargs['data']['archive_available'] is consumed[0]
+
+    async def test_kill_switch_does_no_archive_lookup_at_all(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """B6, PRESERVED under δ: with ``session_resume.enabled`` False the
+        hoisted lookup never runs — zero filesystem I/O, as today.
+
+        The lookup is on the dispatch path now, not only on the fallback emit,
+        so hoisting it carelessly (above the ``enabled`` check rather than
+        inside it) would make the kill switch cost a glob per dispatch for a
+        feature that is switched off. The predicate returns ``{'disabled'}``
+        alone without consulting the archive, so there is nothing for the
+        lookup to inform.
+
+        This is also the one D8 zero-I/O property δ genuinely preserves: the
+        ELIGIBLE path now pays one glob, and the plan records that as a stated
+        regression rather than an oversight.
+        """
+        session = {
+            'session_id': 'uuid-arch-killed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-killed')
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar13', 'uuid-arch-killed')
+
+        lookups: list[tuple] = []
+        real_lookup = harness._archive_available
+
+        def counting_lookup(task_id, session_id):
+            lookups.append((task_id, session_id))
+            return real_lookup(task_id, session_id)
+
+        harness._archive_available = counting_lookup  # type: ignore[method-assign]
+
+        resume_id = await _drive_session_slot(harness, 'ar13', session, config_dir=cfg)
+
+        assert resume_id is None
+        assert lookups == [], (
+            f'the disabled path must touch the filesystem 0 times, saw {lookups!r}'
+        )
+        assert _session_resume_emits(harness) == []
