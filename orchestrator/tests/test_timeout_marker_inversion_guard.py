@@ -867,6 +867,106 @@ class TestDeepGateSceneBudget:
             'raising this constant alone buys nothing.'
         )
 
+class TestSpawnBudgetVerdict:
+    """``spawn_budget_violation`` -- the budget check as a pure verdict.
+
+    Split out as a FUNCTION rather than written inline in the autouse fixture
+    that calls it, so the fixture stays a thin wire and every branch below is
+    reachable from a test.  A budget check buried in a fixture teardown is
+    exercised only when it PASSES; these are the cases that matter and they
+    are the ones a fixture-only implementation would never run.
+    """
+
+    def test_a_count_within_budget_is_no_violation(self) -> None:
+        """The ordinary case, across the range the class really spans."""
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+
+        for count in (1, 113, 234, budget):
+            assert _orch_helpers.spawn_budget_violation(count, budget, 'm.py::t') is None, (
+                f'{count} spawns against a budget of {budget} was reported as '
+                'a violation. Only a count ABOVE the budget (or a zero count, '
+                'which means the counting seam saw no git at all) is one.'
+            )
+
+    def test_the_budget_itself_is_inside_the_budget(self) -> None:
+        """``count == budget`` passes -- the boundary is inclusive.
+
+        Called out separately from the range above because an off-by-one here
+        would fail a run that is exactly at the figure
+        DEEP_GATE_SCENE_TEST_TIMEOUT was derived from, which is the one count
+        the pair is guaranteed to be correctly sized for.
+        """
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+
+        assert _orch_helpers.spawn_budget_violation(budget, budget, 'm.py::t') is None, (
+            f'a count of exactly {budget} -- the budget itself -- was reported '
+            'as a violation. DEEP_GATE_SCENE_TEST_TIMEOUT is derived from this '
+            'exact number, so it is the one count that must pass.'
+        )
+
+    def test_going_over_budget_names_everything_the_reader_needs(self) -> None:
+        """The failure must say what got heavier, by how much, and what to re-derive.
+
+        A bare "too many spawns" would leave the reader to discover on their
+        own that a marker is sized from this number.  Each fragment is
+        asserted individually so a message that drops one fails naming the
+        fragment it dropped.
+        """
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+        count = budget + 1
+        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+
+        message = _orch_helpers.spawn_budget_violation(count, budget, nodeid)
+
+        assert message is not None, (
+            f'{count} spawns against a budget of {budget} was not reported as '
+            'a violation. One spawn over is over.'
+        )
+        for fragment, why in (
+            (nodeid, 'the node id, so the reader knows WHICH test got heavier'),
+            (str(count), 'the observed count'),
+            (str(budget), 'the budget it broke'),
+            (
+                'DEEP_GATE_SCENE_TEST_TIMEOUT',
+                'the constant to re-derive -- the point of the check is that a '
+                'heavier scene needs a re-sized marker, not merely a raised budget',
+            ),
+        ):
+            assert fragment in message, (
+                f'the over-budget message omits {fragment!r} -- {why}.\n\n'
+                f'got: {message}'
+            )
+
+    def test_a_zero_count_is_a_violation_although_it_is_within_budget(self) -> None:
+        """Zero means the counting seam went blind, which is worse than over-budget.
+
+        A guard that passes because it has been silently DISCONNECTED is worse
+        than no guard: it reports green forever while measuring nothing, and
+        the budget it appears to enforce becomes vacuous.  Zero is inside any
+        budget, so nothing else in the check would catch it.
+        """
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+
+        message = _orch_helpers.spawn_budget_violation(0, budget, nodeid)
+
+        assert message is not None, (
+            'a count of ZERO was accepted as within budget. It is arithmetically '
+            'within any budget, and that is exactly the problem: it means the '
+            'counting seam saw no git subprocess at all, so the budget is '
+            'enforcing nothing. Report it rather than passing.'
+        )
+        assert nodeid in message, (
+            f'the zero-count message omits the node id.\n\ngot: {message}'
+        )
+        assert message != _orch_helpers.spawn_budget_violation(budget + 1, budget, nodeid), (
+            'the zero-count message is identical to the over-budget message, so '
+            'a reader cannot tell "this scene got heavier" (re-derive the '
+            'constants) from "the counting seam broke" (fix the fixture). They '
+            'are different failures with different remedies.'
+        )
+
+
 # ---------------------------------------------------------------------------
 # _timeout_marker_sites(source) -- inline-fixture unit tests.
 #
