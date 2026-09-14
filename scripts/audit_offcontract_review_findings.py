@@ -259,12 +259,79 @@ def select_population(root: Path) -> list[VerdictIssue]:
     ]
 
 
+#: The only three dispositions the triage may reach: (a) already fixed
+#: incidentally, (b) still a live defect, (c) not a defect / no longer applicable.
+DISPOSITIONS = frozenset({"a", "b", "c"})
+
+#: The one disposition that obliges a follow-up task. A (b) with no ticket has
+#: been dropped a second time, by the task that exists to account for the first.
+LIVE_DEFECT = "b"
+
+
+def validate_report(report: dict) -> list[str]:
+    """Check a triage report against its frozen roster. [] means valid.
+
+    Pure: reads the parsed dict, touches no disk. This is the mechanical form of
+    the task's "honest accounting" — completeness is a structural property of a
+    data file, so it is enforced rather than asserted in prose. What it
+    deliberately does NOT check is whether any disposition is CORRECT; that is a
+    judgement over seven weeks of moved code, and a test encoding it would be
+    pinning a conclusion rather than a behaviour.
+    """
+    violations: list[str] = []
+    roster_ids = [entry.get("id") for entry in report.get("roster", [])]
+    seen: Counter = Counter()
+
+    for entry in report.get("dispositions", []):
+        rid = entry.get("id")
+        seen[rid] += 1
+        if rid not in roster_ids:
+            violations.append(f"{rid}: dispositioned but absent from the frozen roster")
+            continue
+        if seen[rid] > 1:
+            violations.append(f"{rid}: dispositioned {seen[rid]} times — one of them is unread")
+            continue
+
+        disposition = entry.get("disposition")
+        deferred = bool(entry.get("deferred_by_gate"))
+        note = entry.get("note")
+        ticket = entry.get("followup_ticket")
+
+        if not (isinstance(note, str) and note.strip()):
+            violations.append(f"{rid}: no note — a disposition without reasoning cannot be checked")
+        if deferred and disposition is not None:
+            violations.append(f"{rid}: claims both a disposition and a gate deferral")
+        elif not deferred and disposition not in DISPOSITIONS:
+            violations.append(f"{rid}: disposition {disposition!r} is not one of {sorted(DISPOSITIONS)}")
+
+        has_ticket = isinstance(ticket, str) and ticket.strip()
+        if disposition == LIVE_DEFECT and not has_ticket:
+            violations.append(f"{rid}: judged a live defect but cites no follow-up ticket")
+        if disposition in DISPOSITIONS - {LIVE_DEFECT} and has_ticket:
+            violations.append(f"{rid}: dispositioned ({disposition}) yet carries a follow-up ticket")
+
+    violations.extend(
+        f"{rid}: on the roster but never dispositioned"
+        for rid in roster_ids if rid not in seen
+    )
+    return violations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                         help="task-meta tree to census (default: %(default)s)")
     parser.add_argument("--json", action="store_true", help="emit the census as JSON")
+    parser.add_argument("--validate", type=Path, metavar="REPORT",
+                        help="validate a triage report against its frozen roster")
     args = parser.parse_args(argv)
+
+    if args.validate:
+        violations = validate_report(json.loads(args.validate.read_text()))
+        for violation in violations:
+            print(violation)
+        print(f"{len(violations)} violation(s) in {args.validate}")
+        return 1 if violations else 0
 
     measured = census(args.root)
     if args.json:
