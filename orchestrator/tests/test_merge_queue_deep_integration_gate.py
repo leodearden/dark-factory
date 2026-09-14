@@ -299,10 +299,18 @@ HARNESS NOTES
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
     Sync tests live in their OWN unmarked class.
-  * The ini default per-test ``timeout`` is 60 s; every class doing real git plus
-    a real worker carries ``@pytest.mark.timeout(300)``.  The CLI ``--timeout=300``
-    some runners pass does NOT remove the need for the mark, and pytest-timeout's
-    thread method ``os._exit()``s the xdist worker on overrun under
+  * The ini default per-test ``timeout`` is
+    ``_orch_helpers.PYPROJECT_DEFAULT_TIMEOUT``, a mirror of
+    orchestrator/pyproject.toml kept honest by
+    test_whole_tree_scan_timeout_guard.py -- deliberately a POINTER and not a
+    number repeated here, which is how this note's previous "60 s" claim
+    outlived the 60 -> 300 raise.  Every class doing real git plus a real
+    worker carries a ``@pytest.mark.timeout`` override;
+    TestRow7KillSwitchByteIdentity's is ``DEEP_GATE_SCENE_TEST_TIMEOUT``,
+    DERIVED from that class's measured git-spawn count and held honest by its
+    autouse budget fixture (task 5333).  The CLI ``--timeout`` some runners
+    pass does NOT remove the need for the mark, and pytest-timeout's thread
+    method ``os._exit()``s the xdist worker on overrun under
     ``--max-worker-restart=0``.
   * Monkeypatching is INSTANCE-level wherever possible:
     test_merge_queue_reachback_patch_guard.py freezes the
@@ -324,6 +332,11 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pytest
 from _merge_lane_census import lanes_by_task, queued_in_lane
+from _orch_helpers import (
+    DEEP_GATE_SCENE_SPAWN_BUDGET,
+    DEEP_GATE_SCENE_TEST_TIMEOUT,
+    spawn_budget_violation,
+)
 from shared.task_metadata import RetryLedger
 
 from orchestrator import merge_queue
@@ -4338,9 +4351,57 @@ other six were silently inert."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+# task 5333: DERIVED from this class's measured git-spawn count rather than
+# chosen -- see DEEP_GATE_SCENE_TEST_TIMEOUT's comment in _orch_helpers.py for
+# the measurement, the rounding and the two ceilings it sits under.
+@pytest.mark.timeout(DEEP_GATE_SCENE_TEST_TIMEOUT)
 class TestRow7KillSwitchByteIdentity:
     """Row 7: at cap=0 a whole RUN is byte-identical to the pre-PRD transcript."""
+
+    @pytest.fixture(autouse=True)
+    def _within_spawn_budget(self, request, monkeypatch):
+        """Fail if this test costs more real git than its marker is sized for.
+
+        WHY THE MARKER NEEDS A GUARD AT ALL: ``DEEP_GATE_SCENE_TEST_TIMEOUT``
+        is derived from ``DEEP_GATE_SCENE_SPAWN_BUDGET``, so it stays correct
+        only while the scene stays inside that budget.  Without this fixture a
+        scene that grew heavier would re-create the under-sizing silently, and
+        the symptom returns as a bare xdist worker crash on someone else's
+        branch -- no assertion, no traceback.  Task 5028 moved this class's
+        counts within a single day, in an unrelated lane, with nothing in the
+        tree reporting it.
+
+        Counts BOTH asyncio spawn entry points, which is what the measurement
+        behind the constants counted.  ``create_subprocess_exec`` is the one
+        ``git_ops._run`` reaches and carries the bulk (231 / 110 / 110), but
+        each of these tests also makes exactly 3 ``create_subprocess_shell``
+        calls; watching ``_exec`` alone undercounts every test by those 3 and
+        would have quietly shipped a budget measured against a different
+        number than the timeout was derived from.
+
+        Per-test and IN-PROCESS by construction, never module state, so it
+        stays correct under ``--dist loadgroup`` where these three tests can
+        land on three different workers.  Patched through ``monkeypatch`` so it
+        is restored at teardown, per the instance-level rule in HARNESS NOTES.
+        """
+        seams = ('create_subprocess_exec', 'create_subprocess_shell')
+        spawns = 0
+
+        def counting(real):
+            async def counting_spawn(*args, **kwargs):
+                nonlocal spawns
+                spawns += 1
+                return await real(*args, **kwargs)
+
+            return counting_spawn
+
+        for seam in seams:
+            monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+        yield
+        violation = spawn_budget_violation(
+            spawns, DEEP_GATE_SCENE_SPAWN_BUDGET, request.node.nodeid
+        )
+        assert violation is None, violation
 
     async def _sequence(
         self, git_repo: Path, tmp_path: Path, monkeypatch, *,
