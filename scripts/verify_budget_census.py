@@ -43,6 +43,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -75,6 +76,9 @@ ARCHIVE_GLOB = 'data/verify-logs/*/*.summary-*.json'
 
 _RELATIVE_RE = re.compile(r'^(\d+)d$')
 _RANGE_SEP = '..'
+
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_WINDOW = '14d'
 
 
 @dataclass(frozen=True)
@@ -812,3 +816,246 @@ def merge_gate_budget(root: Path) -> dict[str, Any]:
             f'always COLD either way, and this census changes nothing about it.'
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI. One report dict, two renderings — the build_report / render split
+# scripts/census_tagger_debris.py establishes, so `--json` and the text output
+# can never describe different runs.
+# ---------------------------------------------------------------------------
+
+
+def resolve_roots(values: Sequence[str] | None) -> list[Path]:
+    """Resolve the repeated ``--root`` values, defaulting to this checkout.
+
+    argparse's ``append`` action leaves the destination at ``None`` (not
+    ``[]``) when the flag never appears, so the default is applied HERE rather
+    than via ``default=[...]``: an argparse list default is shared mutable
+    state that ``append`` extends rather than replaces, which would silently
+    add this checkout to every explicit invocation. (Copied from the sibling,
+    which records the same trap.)
+
+    Every root is ``.resolve()``d and the list de-duplicated order-preservingly,
+    so two spellings of one root cannot be walked twice and double-count its
+    records.
+    """
+    if not values:
+        return [DEFAULT_PROJECT_ROOT]
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for value in values:
+        root = Path(value).resolve()
+        if root not in seen:
+            seen.add(root)
+            roots.append(root)
+    return roots
+
+
+def build_report(
+    roots: Sequence[Path],
+    *,
+    module: str,
+    window: tuple[datetime, datetime],
+    label: str = 'test',
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the whole census as ONE JSON-native dict.
+
+    This dict IS the ``--json`` payload and the text renderer's only input, so
+    the two renderings cannot disagree. It carries its own provenance — the
+    resolved window, the filters, and the command that was compared against —
+    because a duration figure without those is not reproducible; and it carries
+    the skip and rejection counts, so ``n`` can always be reconciled against
+    the corpus rather than taken on trust.
+
+    The expected command is resolved from the FIRST root that declares one:
+    a multi-root run is comparing one module's suite across checkouts, and a
+    per-root command would make the durations incomparable, which is the very
+    thing the shape filter exists to prevent.
+    """
+    corpus = load_records(roots)
+    expected = next(
+        (cmd for cmd in (read_module_test_command(r, module) for r in roots) if cmd),
+        None,
+    )
+    selection = select_full_suite_legs(
+        corpus, root=roots[0], prefix=module, label=label, role=role,
+    )
+    legs = within_window(selection.legs, window)
+    return {
+        'module': module,
+        'label': label,
+        'role': role,
+        'window': [window[0].isoformat(), window[1].isoformat()],
+        'roots': [str(r) for r in roots],
+        'expected_command': expected,
+        'corpus': {
+            'records': len(corpus.records),
+            'skipped': dict(Counter(s.reason for s in corpus.skipped)),
+        },
+        'rejected': selection.rejected,
+        'selected_outside_window': len(selection.legs) - len(legs),
+        'overall': summarise_legs(legs),
+        'by_day': by_day(legs),
+        'by_load_band': by_load_band(legs),
+        'cold_separability': cold_separability(legs),
+        'merge_gate': merge_gate_budget(roots[0]),
+    }
+
+
+def _format_series(series: dict[str, Any]) -> str:
+    """Render one duration series, printing ``-`` for a null rather than 0."""
+    def show(key: str) -> str:
+        value = series[key]
+        return '-' if value is None else f'{value:.0f}'
+
+    return (
+        f"n={series['n']:<4} p50={show('p50'):>7} "
+        f"p90={show('p90'):>7} max={show('max'):>7}"
+    )
+
+
+def _format_row(name: str, row: dict[str, Any]) -> str:
+    return (
+        f"  {name:<14} {_format_series(row['durations'])}"
+        f"  timed_out={row['timed_out']:<3} failed={row['failed']}"
+    )
+
+
+def format_report(report: dict[str, Any]) -> str:
+    """Render *report* as text. Reads only the dict ``--json`` emits."""
+    lo, hi = report['window']
+    lines = [
+        f"verify-budget census — module {report['module']!r}, "
+        f"leg {report['label']!r}, role {report['role'] or 'any'}",
+        f'  window   {lo} .. {hi}',
+        f"  roots    {', '.join(report['roots'])}",
+        f"  command  {report['expected_command'] or '<none declared>'}",
+        '',
+        f"  corpus   {report['corpus']['records']} records loaded, "
+        f"skipped {report['corpus']['skipped'] or 'none'}",
+        f"  rejected {report['rejected'] or 'none'}"
+        f"  (+{report['selected_outside_window']} selected outside the window)",
+        '',
+        'FULL-SUITE DURATIONS (seconds; timed-out and failed legs counted, not averaged)',
+        _format_row('overall', report['overall']),
+    ]
+
+    if report['overall']['durations']['n'] == 0:
+        lines.append(
+            '  NOTE: no full-suite run matched in this window. The nulls above '
+            'are "not measured", NOT a fast suite.',
+        )
+
+    lines += ['', 'BY LOAD BAND (host cpu some avg10 at command START)']
+    for band in PSI_BANDS:
+        lines.append(_format_row(band.name, report['by_load_band'][band.name]))
+    lines.append(_format_row(UNSTAMPED, report['by_load_band'][UNSTAMPED]))
+    lines.append(
+        '  NOTE: unstamped = load not knowable (record predates the stamp, or '
+        'the PSI read degraded). NOT an idle host.',
+    )
+
+    if report['by_day']:
+        lines += ['', 'BY DAY (UTC)']
+        lines += [_format_row(day, row) for day, row in report['by_day'].items()]
+
+    cold = report['cold_separability']
+    lines += [
+        '',
+        'FINDING — cold runs are NOT separable from warm ones in this corpus.',
+        f"  {cold['first_attempt_records']} first-attempt / "
+        f"{cold['later_attempt_records']} later-attempt records.",
+        f"  {cold['basis']}",
+        '',
+        'MERGE GATE (reported, not derived here)',
+        f"  merge_verify_cold_command_timeout_secs = "
+        f"{report['merge_gate']['merge_verify_cold_command_timeout_secs']}"
+        f" (from {report['merge_gate']['source'] or '<unresolved>'})",
+        f"  {report['merge_gate']['note']}",
+        '',
+        'This report asserts no numeric target. The gate that holds a budget '
+        'up is tests/scripts/test_module_verify_budgets.py.',
+    ]
+    return '\n'.join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='verify_budget_census',
+        description=(
+            'Census the verify-summary corpus for one module: full-suite '
+            'durations by day and by host-load band. STRICTLY READ-ONLY.'
+        ),
+    )
+    parser.add_argument(
+        '--root', action='append', dest='roots', metavar='PATH',
+        help='project root to walk; repeatable (default: this checkout)',
+    )
+    parser.add_argument(
+        '--module', default='orchestrator', metavar='PREFIX',
+        help="module prefix whose suite to census (default: 'orchestrator')",
+    )
+    parser.add_argument(
+        '--label', default='test', metavar='LEG',
+        help="which check leg to census (default: 'test')",
+    )
+    parser.add_argument(
+        '--role', default=None, metavar='ROLE',
+        help='restrict to one verify role (task/merge/probe); default: any',
+    )
+    parser.add_argument(
+        '--window', default=DEFAULT_WINDOW, metavar='SPEC',
+        help=f"'<N>d' or '<iso>..<iso>' (default: {DEFAULT_WINDOW})",
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='emit the whole report as one JSON document',
+    )
+    return parser
+
+
+def main(argv: Sequence[str], now: datetime | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes, the vocabulary ``merge_lane_throughput.main`` documents:
+    ``0`` on success, ``1`` when a NAMED root could not be read (the remaining
+    roots still report, and the failure goes to stderr — one bad path must not
+    cost the whole run), ``2`` on malformed arguments with nothing on stdout.
+
+    *now* is a parameter so every caller and test fixes the clock explicitly.
+    """
+    args = build_parser().parse_args(argv)
+    try:
+        window = parse_window(args.window, now or datetime.now(UTC))
+    except argparse.ArgumentTypeError as exc:
+        print(f'verify_budget_census: {exc}', file=sys.stderr)
+        return 2
+
+    roots = resolve_roots(args.roots)
+    readable = [root for root in roots if root.is_dir()]
+    status = 0
+    for root in roots:
+        if root not in readable:
+            print(
+                f'verify_budget_census: cannot read root {root}; skipping it. '
+                f'The remaining roots are reported below.',
+                file=sys.stderr,
+            )
+            status = 1
+    if not readable:
+        return 1
+
+    report = build_report(
+        readable,
+        module=args.module,
+        window=window,
+        label=args.label,
+        role=args.role,
+    )
+    print(json.dumps(report, indent=2) if args.json else format_report(report))
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
