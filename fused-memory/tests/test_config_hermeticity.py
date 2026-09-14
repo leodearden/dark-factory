@@ -107,4 +107,14 @@ class TestAmbientEnvCannotRewriteTheConfig:
         ambient.undo()
 
     def test_an_ambient_bare_env_var_cannot_rewrite_the_suite_config(self):
-        assert FusedMemoryConfig().taskmaster.project_root != PWNED
+        """The planted variable must not reach the value a test would read.
+
+        `.taskmaster` is `TaskmasterConfig | None`, and the scrub leaves the
+        tracked YAML's section in place, so pinning it non-None first reports
+        a lost YAML layer as itself rather than as an attribute error on the
+        assertion that matters.
+        """
+        taskmaster = FusedMemoryConfig().taskmaster
+
+        assert taskmaster is not None
+        assert taskmaster.project_root != PWNED

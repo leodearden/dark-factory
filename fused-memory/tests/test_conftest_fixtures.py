@@ -13,17 +13,6 @@ import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
-# --- the config pin's own value, read from its one definition ---------------
-#
-# ``conftest`` is safe to import by name here: pytest installs this suite's
-# conftest.py as ``sys.modules['conftest']`` before any test module is
-# imported, so this binds that same object rather than re-executing it.  The
-# sibling-subproject collision conftest.py's docstring warns about is a
-# cross-suite hazard, and each registered verify command runs one subproject
-# per process.  Importing it is what keeps the expected path out of this file:
-# restating the derivation here would give the pin two definitions, and the
-# copy could not detect a regression in the original.
-import conftest
 import pytest
 from _fm_helpers import (
     extract_cypher,
@@ -38,6 +27,32 @@ from _fm_helpers import (
 # its docstring says why redirecting the directory is a hard boundary rather
 # than a convenience.  Autouse applies to every test in THIS module.
 from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
+
+CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
+
+
+def _fused_memory_conftest():
+    """The loaded fused-memory conftest, found by PATH rather than by name.
+
+    ``sys.modules['conftest']`` is shared with sibling subprojects'
+    conftests — conftest.py's own docstring says so, which is the reason
+    ``_fm_helpers.py`` exists — so keying on the name could hand back a
+    different package's module.
+
+    A type checker sees the same ambiguity, and resolves it the wrong way:
+    rooted at the REPO ROOT — which is where a scoped verify command runs
+    pyright from — a plain ``import conftest`` binds the root-level
+    ``conftest.py``, and every attribute read off it is an unknown-attribute
+    error.  Resolving by path is CWD-independent under both readings, which
+    is the very invariant the fixtures below exist to establish.
+    """
+    target = CONFTEST_PATH.resolve()
+    for module in list(sys.modules.values()):
+        path = getattr(module, '__file__', None)
+        if path and Path(path).resolve() == target:
+            return module
+    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
+
 
 # ---------------------------------------------------------------------------
 # _isolate_fm_config fixture tests
@@ -66,7 +81,7 @@ class TestIsolateFmConfig:
         """
         pinned = os.environ['CONFIG_PATH']
 
-        assert pinned == str(conftest.FM_CONFIG_PATH)
+        assert pinned == str(_fused_memory_conftest().FM_CONFIG_PATH)
         assert Path(pinned).is_absolute()
         assert Path(pinned).exists()
 
@@ -86,7 +101,7 @@ class TestIsolateFmConfig:
             local.setenv('CONFIG_PATH', str(local_config))
             assert os.environ['CONFIG_PATH'] == str(local_config)
 
-        assert os.environ['CONFIG_PATH'] == str(conftest.FM_CONFIG_PATH)
+        assert os.environ['CONFIG_PATH'] == str(_fused_memory_conftest().FM_CONFIG_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -424,24 +439,7 @@ class TestMakeGraphMockCypherDispatch:
 # The integration-lane in-use lease (task 4775)
 # ---------------------------------------------------------------------------
 
-CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 REAPER_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
-
-
-def _fused_memory_conftest():
-    """The loaded fused-memory conftest, found by PATH rather than by name.
-
-    ``sys.modules['conftest']`` is shared with sibling subprojects'
-    conftests — conftest.py's own docstring says so, which is the reason
-    ``_fm_helpers.py`` exists — so keying on the name could hand back a
-    different package's module.
-    """
-    target = CONFTEST_PATH.resolve()
-    for module in list(sys.modules.values()):
-        path = getattr(module, '__file__', None)
-        if path and Path(path).resolve() == target:
-            return module
-    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
 
 
 class TestTheIntegrationLaneLeaseFixture:
