@@ -1025,18 +1025,26 @@ SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURS
 
 
 # Inlined from docs/code-quality.md, which remains the single normative copy
-# (INV-9). Only what is useless as a pointer is carried here -- the headline
-# TOKENS, the two stances, the do-not-steer-by list -- never the agreed reading
-# of each headline. The inline copy exists at all because a dispatched agent's
-# system prompt cannot follow a cross-reference, the same reason this module
-# already carries its own copy of the refs/stash prohibition.
+# (INV-9). The inline copy exists at all because a dispatched agent's system
+# prompt cannot follow a cross-reference, the same reason this module already
+# carries its own copy of the refs/stash prohibition.
+#
+# CARRIED HERE, and nothing else: the fourteen headline TOKENS; both stances;
+# and the do-not-steer-by list. The Tests stance deliberately FOLDS IN the three
+# measurable symptoms the doc lists under heuristic 13's reading (reach-back
+# imports, cycle-breaking function-local imports, re-export shims), because a
+# reviewer meets all five symptoms as one test-shaped finding rather than as two
+# separate lookups. NOT carried: the agreed reading of every other headline.
 #
 # orchestrator/tests/test_code_quality_guidance_parity.py is the drift guard: it
-# parses the numbered list out of BOTH the doc and the production-RENDERED
-# prompt with one parser and one anchor, so this copy is provably derived rather
-# than a second source. Cited by FILE PATH, not by test class name, because
-# test_cited_test_class_drift.py requires every cited Test<CamelCase> identifier
-# in src prose to resolve to a real class.
+# parses BOTH the doc and the production-RENDERED prompt with one parser, and
+# compares the headline tokens and both bullet lists' LABELS as ordered
+# equalities, so those are provably derived rather than a second source. The
+# folded symptom list is NOT guarded -- labels are compared, bullet bodies are
+# not -- so it is the one place where an edit to heuristic 13's reading in the
+# doc must be mirrored here by hand. Cited by FILE PATH, not by test class name,
+# because test_cited_test_class_drift.py requires every cited Test<CamelCase>
+# identifier in src prose to resolve to a real class.
 #
 # Interpolation-safe by contract: this reaches _REVIEWER_HEURISTICS_TEMPLATE's
 # str.format() call, so it must carry no literal brace.
@@ -2300,7 +2308,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 1. **Read before judging.** Understand the code's intent before flagging issues.
 2. **Respect known gaps.** If the briefing says something is intentionally deferred, don't flag it.
 3. **Be specific.** Every finding must have a file location and concrete description.
-4. **Don't flag style.** Naming preferences, formatting, comment style — these are noise.
+4. **Don't flag cosmetics.** Formatting and layout preferences are noise. Naming and comments are NOT cosmetics: judge them under the code-quality heuristics below, which govern here.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
 """ + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
