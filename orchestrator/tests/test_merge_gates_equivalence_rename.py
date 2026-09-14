@@ -344,3 +344,150 @@ class TestEquivalenceGateRenameAwareness:
             assert 'failing open' in warnings, warnings
         finally:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
+async def _resolution_discards_the_branch_edit(
+    git_ops: GitOps, task_head: str, main_sha: str,
+) -> str:
+    """Keep the branch's relocation but write MAIN's content at the new name.
+
+    Produces a REAL advanced commit whose ``pkg/sub/mod.py`` carries
+    ``MAIN_EDIT`` and NOT ``BRANCH_EDIT``, while ``git diff -M`` still
+    pairs ``pkg/mod.py`` -> ``pkg/sub/mod.py`` across the branch range.
+    That pair is what reaches the suppression arm.
+    """
+    await _run(
+        ['git', 'merge', '--no-commit', '--no-ff', task_head],
+        cwd=git_ops.project_root,
+    )
+    # Tolerant: rename detection may already have staged the removal.
+    await _run(['git', 'rm', '-f', 'pkg/mod.py'], cwd=git_ops.project_root)
+    rc, main_blob, err = await _run(
+        ['git', 'show', f'{main_sha}:pkg/mod.py'], cwd=git_ops.project_root,
+    )
+    assert rc == 0, f'reading main blob failed: {err!r}'
+    target = git_ops.project_root / 'pkg' / 'sub' / 'mod.py'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(main_blob + '\n')
+    await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+    rc, _, err = await _run(
+        ['git', 'commit', '-m', 'Resolution: keep the move, drop branch edit'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, f'resolution commit failed: {err!r}'
+    rc, out, _ = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+    )
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.mark.asyncio
+class TestEquivalenceSuppressionIsContentVerified:
+    """The symmetric half of the drop-guard's content check.
+
+    ``_rename_aware_compare_set`` excluded a path whenever main had
+    touched its rename SOURCE, on the bare existence of a pair.  A
+    resolution that keeps the relocation but writes main's content at the
+    new name still pairs — and the drop-guard cannot backstop it, because
+    the branch's old path is already absent from ``task_head`` and so
+    never reaches the ``D`` set.
+    """
+
+    async def test_relocation_whose_branch_edit_was_discarded_is_still_flagged(
+        self, git_ops: GitOps,
+    ):
+        """A pairable branch rename that LOST the branch's edit is flagged."""
+        await _commit_base_module(git_ops)
+        rc, base_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        base_sha = base_out.strip()
+
+        wt = await _branch_relocates_and_edits(git_ops, 'equiv-discarded')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        branch_head = head_out.strip()
+
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+        advanced = await _resolution_discards_the_branch_edit(
+            git_ops, branch_head, main_sha,
+        )
+
+        # Non-vacuous precondition 1: the relocation was kept.
+        rc, tree_out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', advanced],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        tree = tree_out.split()
+        assert 'pkg/sub/mod.py' in tree, f'advanced tree: {tree!r}'
+        assert 'pkg/mod.py' not in tree, f'advanced tree: {tree!r}'
+
+        # Non-vacuous precondition 2: the branch's work is GENUINELY GONE.
+        rc, blob, _ = await _run(
+            ['git', 'show', f'{advanced}:pkg/sub/mod.py'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert 'MAIN_EDIT' in blob, 'main work should have survived'
+        assert 'BRANCH_EDIT' not in blob, (
+            'fixture is wrong: the branch edit was supposed to be discarded'
+        )
+
+        # Non-vacuous precondition 3: git DOES pair the branch rename, so
+        # the suppression arm is genuinely reached.
+        rc, ns_out, _ = await _run(
+            ['git', 'diff', '-M', '--name-status', base_sha, branch_head],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert any(
+            ln.startswith('R') and 'pkg/mod.py' in ln
+            and 'pkg/sub/mod.py' in ln
+            for ln in ns_out.splitlines()
+        ), f'expected a pairable rename; got {ns_out!r}'
+
+        failed = await _check_post_merge_equivalence(
+            wt, advanced, git_ops, main_sha, task_id='equiv-discarded',
+        )
+        assert failed == ['pkg/sub/mod.py'], (
+            f'a relocation that discarded the branch edit must still be '
+            f'flagged; got {failed!r}'
+        )
+
+    async def test_equivalence_content_probe_git_error_fails_closed(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """An unverifiable survival claim must NOT suppress.
+
+        The OPPOSITE direction from
+        ``test_rename_map_git_error_fails_open``, deliberately, for the
+        same reason as the drop-guard's pair: an unreadable rename map
+        degrades the whole gate and fails open, while an unproven content
+        probe declines only that one suppression, falling back to
+        pre-change behaviour that cannot introduce a false block.
+        """
+        await _commit_base_module(git_ops)
+        wt = await _branch_relocates_and_edits(git_ops, 'equiv-probe-error')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        branch_head = head_out.strip()
+
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+        advanced = await _resolution_discards_the_branch_edit(
+            git_ops, branch_head, main_sha,
+        )
+
+        spy = _RunSpy(fail_when=lambda cmd: 'apply' in cmd)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+
+        failed = await _check_post_merge_equivalence(
+            wt, advanced, git_ops, main_sha, task_id='equiv-probe-error',
+        )
+        assert failed == ['pkg/sub/mod.py'], (
+            f'an unverifiable content probe must not suppress; got {failed!r}'
+        )
