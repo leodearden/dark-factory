@@ -1162,6 +1162,49 @@ async def _rename_pairs(
     return pairs
 
 
+async def _rename_aware_real_drops(
+    dropped_in_merge: list[str],
+    branch_changed: set[str],
+    task_head: str,
+    merge_commit_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Intersect the drop set with branch-authored work, discounting renames.
+
+    A path can disappear from ``task_head`` for two very different
+    reasons: the merge DISCARDED it, or the merge carried it to a new
+    name.  Under ``--no-renames`` those look identical, so a path the
+    merge merely relocated is excluded here — it is a rename SOURCE in
+    ``task_head..merge_commit``, not a drop.
+
+    Merge-diff order is preserved, as the caller's warning reports it.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than flagging a phantom drop on a transient error.
+    """
+    pairs = await _rename_pairs(
+        task_head, merge_commit_sha, git_ops,
+        log_prefix='drop-guard', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    relocated = {old: new for old, new in pairs}
+    authored = [p for p in dropped_in_merge if p in branch_changed]
+    real_drops = [p for p in authored if p not in relocated]
+
+    suppressed = [(p, relocated[p]) for p in authored if p in relocated]
+    if suppressed:
+        logger.info(
+            'drop-guard: rename accounts for disappearance, not flagging '
+            '%r (old, new). task_id=%s merge_commit_sha=%s',
+            suppressed, task_id or '<unknown>', merge_commit_sha,
+        )
+    return real_drops
+
+
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
@@ -1187,9 +1230,22 @@ async def _check_plan_targets_in_tree(
     (``merge-base(task_HEAD, main_sha)``).  ``main_sha`` is the pre-merge
     main tip the merge was computed against (actual or speculative), not
     the post-merge advanced SHA — using it keeps the subtraction robust to
-    ``advance_main``'s CAS-retry rebase.  ``--no-renames`` is deliberate:
-    a sibling rename appears as a delete of the old path on main, which is
-    absent from the branch's add/modify set and therefore dropped here.
+    ``advance_main``'s CAS-retry rebase.
+
+    That intersection alone covers only HALF of the sibling-rename case,
+    and the missing half is what produced a measured false block
+    (esc-6436-4).  When the branch never touched the relocated path, the
+    old path is absent from the branch's add/modify set and the
+    intersection correctly discards it (the esc-3861 case, pinned by
+    ``test_merge_queue.py::TestCheckPlanTargetsInTree::
+    test_sibling_moved_file_not_flagged``).  When the branch MODIFIED it,
+    the old path IS in ``branch_changed`` — so the intersection fires and
+    reports a drop of work that is sitting, intact, at the new name.
+    ``--no-renames`` is retained on both set-building diffs, whose ``AM``
+    / ``D`` filters are what make the intersection meaningful; rename
+    resolution is applied instead as a separate, additive ``-M`` pass over
+    ``task_head..merge_commit`` (:func:`_rename_aware_real_drops`), which
+    excludes an apparently-dropped path that is really a rename SOURCE.
 
     Fail-open on rc != 0: post-merge verify is the next safety net, and
     flagging a phantom drop on a transient git error is worse than missing
@@ -1262,8 +1318,13 @@ async def _check_plan_targets_in_tree(
 
     dropped_in_merge = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # Subtract main-side change: only a path the branch actually produced
-    # AND the merge discarded is a real drop.  Preserve merge-diff order.
-    real_drops = [p for p in dropped_in_merge if p in branch_changed]
+    # AND the merge discarded — not merely relocated — is a real drop.
+    real_drops = await _rename_aware_real_drops(
+        dropped_in_merge, branch_changed, task_head, merge_commit_sha,
+        git_ops, task_id=task_id,
+    )
+    if real_drops is None:
+        return DropGuardResult()
     if real_drops:
         logger.warning(
             'drop-guard: dropped_plan_targets '
