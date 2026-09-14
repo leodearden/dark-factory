@@ -889,6 +889,7 @@ class TestVanishedWorktreeKeepsTheTypedException:
     at all.
     """
 
+    @pytest.mark.asyncio
     async def test_abort_on_a_vanished_worktree_raises_the_typed_exception(
         self, tmp_path: Path,
     ) -> None:

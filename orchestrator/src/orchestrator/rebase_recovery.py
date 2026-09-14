@@ -445,11 +445,25 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
     The two differ in a linked worktree, which is the case that matters here:
     MERGE_RR is per-worktree while rr-cache is shared.  One ``git rev-parse``
     answers both, so this is the module's only subprocess.
+
+    A cwd git cannot even be spawned in — a worktree deleted out-of-band, or a
+    path that is a file — raises ``OSError`` from the spawn itself, before any
+    exit code exists.  That is answered with ``None``, the same as a non-zero
+    exit, so the caller takes the one unresolved-but-clean branch instead of
+    two branches that differ only in how the worktree failed to exist.  It also
+    keeps the vanished-worktree case reaching ``git_ops._run``, whose own
+    pre-flight raises the typed ``WorktreeMissing`` its consumers match on;
+    raising that here instead is impossible without an import cycle (see
+    :data:`AbortRunner`) and would duplicate the class besides.
     """
-    proc = subprocess.run(
-        ['git', 'rev-parse', '--git-dir', '--git-common-dir'],
-        cwd=str(worktree), capture_output=True, text=True, check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ['git', 'rev-parse', '--git-dir', '--git-common-dir'],
+            cwd=str(worktree), capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        logger.warning('Could not spawn git in %s: %s', worktree, exc)
+        return None
     if proc.returncode != 0:
         return None
     lines = proc.stdout.splitlines()
