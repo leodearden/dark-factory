@@ -670,6 +670,78 @@ class TestPreflightEndToEnd:
 
 
 # ---------------------------------------------------------------------------
+# Discovery escape: the preflight must never repair a repository it was not
+# pointed at
+# ---------------------------------------------------------------------------
+
+class TestPreflightRepairsOnlyTheWorktreeItWasGiven:
+    """A cwd that is not itself a worktree must not be repaired via its parent.
+
+    Git's repository discovery walks UP.  A ``.worktrees/<id>`` that exists but
+    carries no ``.git`` — deleted or corrupted out-of-band, which is precisely
+    the wedged class this module is invoked for — therefore resolves to the
+    ENCLOSING repository, which in production is the machine-operated
+    ``project_root``.  The preflight's repairs are destructive, while the bare
+    abort it replaces was inert there ("no rebase in progress"), so an escape
+    would give a recovery helper blast radius the original code never had.
+
+    The guard is an identity check on ``--show-toplevel``, and the two cases
+    cover the two DIFFERENT routes by which git can hand back a repository that
+    is not the one asked about: the upward walk, and the environment naming one
+    outright.  A ceiling on the ascent would close only the first, which is why
+    the check is on the answer rather than on the search.
+    """
+
+    @staticmethod
+    def _wedged_outer_repo(tmp_path: Path) -> tuple[Path, Path]:
+        """A real repo holding repairable state, plus a plain dir nested in it."""
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=100_000)
+        nested = repo / '.worktrees' / '4797'
+        nested.mkdir(parents=True)
+        return repo, nested
+
+    @staticmethod
+    def _assert_outer_untouched(repo: Path) -> None:
+        git_dir = repo / '.git'
+        assert (git_dir / 'MERGE_RR').exists(), 'foreign MERGE_RR was quarantined'
+        assert list(git_dir.glob('MERGE_RR.quarantined-*')) == []
+        assert (git_dir / 'MERGE_RR.lock').exists(), 'foreign lock was unlinked'
+
+    def test_plain_directory_inside_a_repo_resolves_to_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, nested = self._wedged_outer_repo(tmp_path)
+
+        result = rebase_recovery.preflight_rebase_recovery(nested)
+
+        assert result.resolved is False
+        assert result.verdict == 'clean'
+        assert result.merge_rr_backup is None
+        assert result.locks_removed == ()
+        self._assert_outer_untouched(repo)
+
+    def test_a_repo_named_by_the_environment_is_rejected(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """``GIT_DIR``/``GIT_WORK_TREE`` name a repository instead of finding one.
+
+        The orchestrator hands agent subprocesses a copy of its own environment
+        (``agents/invoke.py``), so these arriving set is not hypothetical, and
+        they reach a foreign repository without any upward walk to intercept.
+        """
+        repo, nested = self._wedged_outer_repo(tmp_path)
+        monkeypatch.setenv('GIT_DIR', str(repo / '.git'))
+        monkeypatch.setenv('GIT_WORK_TREE', str(repo))
+
+        result = rebase_recovery.preflight_rebase_recovery(nested)
+
+        assert result.resolved is False
+        self._assert_outer_untouched(repo)
+
+
+# ---------------------------------------------------------------------------
 # git_ops wiring
 # ---------------------------------------------------------------------------
 

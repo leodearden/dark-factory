@@ -506,19 +506,42 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
     MERGE_RR is per-worktree while rr-cache is shared.  One ``git rev-parse``
     answers both, so this is the module's only subprocess.
 
+    IDENTITY IS CHECKED, NOT ASSUMED, and that is what makes the preflight safe
+    to point at a wedged path.  Git's repository discovery walks UP, so a cwd
+    that exists but is not itself a worktree — one whose ``.git`` file was
+    removed or corrupted, which is the very class of wedged state this module
+    is invoked for, or a stale ``.worktrees/<id>`` recreated as a plain
+    directory — resolves to the ENCLOSING repository.  The preflight's repairs
+    are destructive (it quarantines MERGE_RR and unlinks locks), and in
+    production that enclosing repository is ``project_root``, which is
+    machine-operated.  The unguarded abort this decorates was harmless there
+    ("no rebase in progress"), so discovery escape would hand a recovery helper
+    blast radius the code it guards never had.  One measure closes it:
+    ``--show-toplevel`` must name *worktree* itself, and a mismatch answers
+    ``None``.  That covers every route to a foreign repository, not just the
+    upward walk — ``GIT_DIR``/``GIT_WORK_TREE`` inherited from the orchestrator's
+    own environment name one outright, and a ceiling on the ascent would not
+    see them.
+
     A cwd git cannot even be spawned in — a worktree deleted out-of-band, or a
     path that is a file — raises ``OSError`` from the spawn itself, before any
     exit code exists.  That is answered with ``None``, the same as a non-zero
-    exit, so the caller takes the one unresolved-but-clean branch instead of
-    two branches that differ only in how the worktree failed to exist.  It also
-    keeps the vanished-worktree case reaching ``git_ops._run``, whose own
-    pre-flight raises the typed ``WorktreeMissing`` its consumers match on;
-    raising that here instead is impossible without an import cycle (see
-    :data:`AbortRunner`) and would duplicate the class besides.
+    exit and the same as a foreign repository, so the caller takes the one
+    unresolved-but-clean branch instead of branches that differ only in how the
+    worktree failed to be the worktree.  It also keeps the vanished-worktree
+    case reaching ``git_ops._run``, whose own pre-flight raises the typed
+    ``WorktreeMissing`` its consumers match on; raising that here instead is
+    impossible without an import cycle (see :data:`AbortRunner`) and would
+    duplicate the class besides.
     """
     try:
+        resolved_worktree = worktree.resolve()
+    except OSError as exc:
+        logger.warning('Could not resolve %s: %s', worktree, exc)
+        return None
+    try:
         proc = subprocess.run(
-            ['git', 'rev-parse', '--git-dir', '--git-common-dir'],
+            ['git', 'rev-parse', '--git-dir', '--git-common-dir', '--show-toplevel'],
             cwd=str(worktree), capture_output=True, text=True, check=False,
         )
     except OSError as exc:
@@ -527,12 +550,22 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
     if proc.returncode != 0:
         return None
     lines = proc.stdout.splitlines()
-    if len(lines) != 2:
+    if len(lines) != 3:
         return None
     # Split on LINES, not whitespace: git prints one path per line and a git
     # dir may legally contain spaces.  Each path is relative to *worktree*
     # unless already absolute, which ``os.path.join`` handles either way.
-    git_dir, common_dir = (Path(os.path.join(worktree, line)) for line in lines)
+    git_dir, common_dir, toplevel = (
+        Path(os.path.join(worktree, line)) for line in lines
+    )
+    if toplevel.resolve() != resolved_worktree:
+        logger.warning(
+            'Rebase-recovery preflight was pointed at %s, but git resolved that '
+            'to the repository rooted at %s. Refusing to repair a repository '
+            'that is not the worktree asked about.',
+            worktree, toplevel,
+        )
+        return None
     return git_dir, common_dir
 
 
