@@ -989,6 +989,7 @@ class TestTheStormRecordNamesTheJournal:
                 'outcome': 'repaired',
                 'project': None,
             },
+            'test-1',
             verdict_tools._MARKUP_SINK_SPEC,
         )
 
