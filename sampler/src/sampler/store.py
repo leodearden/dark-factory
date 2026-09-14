@@ -22,7 +22,10 @@ Retention policy
   gated by meta.last_cleanup_ts to run at most once per 24h — the DELETE is a
   full table SCAN and cannot be index-backed (see cleanup_old's docstring for
   the measurement and the rejected alternative).
-- maybe_vacuum(now): VACUUM at most once per 24h, gated by meta.last_vacuum_ts.
+- maybe_vacuum(now): VACUUM at most once per 24h, gated by meta.last_vacuum_ts
+  AND by there being >=10% free pages to reclaim — at the 30-day size the
+  rewrite costs 15.5s and a steady-state day reclaims 0.17%, because free pages
+  are reused (see maybe_vacuum's docstring for both measurements).
   VACUUM runs outside a transaction to satisfy SQLite constraints.
 
 The 30-day window is what the threshold calibration in PRD
@@ -82,6 +85,13 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 """
+
+
+# A VACUUM is worth its whole-file rewrite only past this share of free pages.
+# Measured on the 30-day probe: a steady-state daily prune leaves ~3.3% free,
+# which the next day's inserts fully reclaim, so 10% sits clear of the normal
+# transient while still firing on a retention change or a post-outage prune.
+_VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 
 
 class LoadSampleStore:
@@ -264,9 +274,58 @@ class LoadSampleStore:
             return True
         return (now - int(last_str)) >= interval_seconds
 
+    def reclaimable_fraction(self) -> float:
+        """Free pages as a fraction of the file — what a VACUUM would reclaim.
+
+        Both pragmas are header reads, not scans: measured 0.49 ms for
+        connect-plus-both against the 1.16 GB 30-day probe, so this is
+        affordable inside ``maybe_vacuum``'s own interval gate.
+        """
+        conn = self._connect()
+        try:
+            free = conn.execute('PRAGMA freelist_count').fetchone()[0]
+            total = conn.execute('PRAGMA page_count').fetchone()[0]
+        finally:
+            conn.close()
+        return free / total if total else 0.0
+
     def maybe_vacuum(self, now: int) -> None:
-        """Run VACUUM and record the timestamp if the daily interval has elapsed."""
+        """VACUUM once per interval, and only when there are pages to reclaim.
+
+        The interval gate alone was sized for the 24-hour retention this class
+        shipped with. At the 30-day window (see "Retention policy" above) the
+        file is ~85x larger and VACUUM rewrites ALL of it. Measured against a
+        probe carrying this schema and the real 25-metrics-per-tick vocabulary
+        at the 30-day steady state (12,960,000 rows, 1.16 GB): VACUUM takes
+        15.5 s and reclaims 2 MB — 0.17%.
+
+        It reclaims so little because free pages are REUSED. One steady-state
+        day, measured on the same probe: the daily prune left
+        ``freelist_count`` at 9232, and the day's inserts took it back to 0
+        with ``page_count`` up 0.25%. So the file does not bloat at steady
+        state, and an unconditional daily VACUUM buys ~0.17% for ~15 s.
+
+        Fifteen seconds is not free: the systemd unit is Type=oneshot, so the
+        rewrite is one whole tick and the corpus ε1/ε2 calibrate against would
+        carry a ~15 s hole every day. A VACUUM also needs roughly the file size
+        again in temp space, so on a tight filesystem it raises, is swallowed
+        by the ``except`` below, and the file is then never compacted at all.
+
+        Gating on ``reclaimable_fraction`` keeps the compaction where it earns
+        its cost — after a retention change, or a post-outage bulk prune — and
+        skips it in the steady state, where ``cleanup_old`` runs first in the
+        same tick and leaves only ~3.3% free for the next day's inserts to
+        consume.
+
+        A skip STAMPS the clock: deciding there is nothing to reclaim is a
+        successful evaluation, not the transient failure the retry rule below
+        exists for, and stamping keeps the pragma read to once per interval
+        instead of once per 5 s tick.
+        """
         if not self.should_vacuum(now):
+            return
+        if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
+            self._set_meta('last_vacuum_ts', str(now))
             return
         # VACUUM must run outside a transaction.  Connect with isolation_level=None
         # (autocommit) from the start so that pragma application inside

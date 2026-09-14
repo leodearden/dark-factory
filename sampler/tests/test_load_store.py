@@ -605,3 +605,149 @@ class TestCleanupIsIntervalGated:
             'cleanup must not stamp the vacuum clock — the two gates are separate'
         )
         assert store.should_vacuum(now) is True
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 1: the daily VACUUM was sized for 24h retention, not 30d
+# ---------------------------------------------------------------------------
+
+
+def _bulk_insert(db_path: Path, metric: str, first_ts: int, count: int, step: int = 5) -> None:
+    """Seed rows straight through sqlite3 — insert_sample commits per row."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany(
+            'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
+            [(first_ts + i * step, metric, float(i % 97)) for i in range(count)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _vacuum_spy(monkeypatch) -> list[str]:
+    """Return a list that accumulates every SQL statement the store executes.
+
+    maybe_vacuum opens its own connection with sqlite3.connect rather than
+    self._connect (it needs isolation_level=None so VACUUM is not inside a
+    transaction), so the seam is the module's sqlite3 attribute.
+    """
+    import sampler.store as store_module
+
+    real_connect = store_module.sqlite3.connect
+    executed: list[str] = []
+
+    class Spy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        store_module.sqlite3, 'connect', lambda *a, **kw: Spy(real_connect(*a, **kw))
+    )
+    return executed
+
+
+class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
+    """VACUUM rewrites the WHOLE file, so its cost tracks the 30-day size.
+
+    MEASURED on this host against a probe carrying the real schema and the real
+    25-metrics-per-5s-tick vocabulary, built out to the 30-day steady state
+    (12,960,000 rows, 1.16 GB after packing):
+
+      VACUUM, no free pages ............................... 15.9 s
+      VACUUM after one steady-state day ................... 15.5 s
+      ...and it reclaimed 2 MB of 1.160 GB ................ 0.17%
+
+    The reason it reclaims so little is the finding that decides the design:
+    free pages ARE fully reused. One steady-state day — prune the oldest day,
+    write a new one — left freelist_count at 9232 immediately after the DELETE
+    and at 0 after the day's inserts, with page_count up 0.25%. So at steady
+    state the file does not bloat, and the unconditional daily VACUUM was
+    buying ~0.17% of space for ~15 s.
+
+    Fifteen seconds matters because the systemd unit is Type=oneshot: the whole
+    VACUUM is one tick, so the corpus ε1/ε2 calibrate against would get a daily
+    ~15 s hole. And a VACUUM needs ~as much free space again for its temp copy,
+    so on a tight filesystem it raises, is swallowed by the existing
+    `except Exception`, and the file is never compacted at all.
+
+    Gating on free pages keeps the compaction where compaction is actually
+    wanted — after a retention change or a post-outage bulk prune — and skips
+    it in the steady state where it accomplishes nothing.
+    """
+
+    def test_reclaimable_fraction_is_zero_with_no_free_pages(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+
+        assert store.reclaimable_fraction() == 0.0
+
+    def test_reclaimable_fraction_is_high_after_a_bulk_prune(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+
+        assert store.reclaimable_fraction() > 0.10
+
+    def test_a_steady_state_store_runs_no_vacuum(self, tmp_path: Path, monkeypatch):
+        """The 15 s daily hole this closes. Nothing to reclaim -> do not rewrite."""
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+        executed = _vacuum_spy(monkeypatch)
+
+        store.maybe_vacuum(1_000_000)
+
+        assert not [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'VACUUM rewrote a file with no free pages'
+        )
+
+    def test_the_clock_is_still_stamped_so_the_check_is_not_per_tick(
+        self, tmp_path: Path
+    ):
+        """A deliberate skip is a successful evaluation, not a transient failure.
+
+        Stamping keeps the pragma read to once per interval rather than once
+        per 5 s tick, and it is what lets the four pre-existing interval tests
+        above go on describing maybe_vacuum's contract unchanged.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+
+        store.maybe_vacuum(1_000_000)
+
+        assert store.should_vacuum(1_000_000 + 1) is False
+        assert store.should_vacuum(1_000_000 + 86400) is True
+
+    def test_a_bulk_prune_is_still_compacted(self, tmp_path: Path, monkeypatch):
+        """The case the VACUUM exists for must keep working."""
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+        size_before = store.db_path.stat().st_size
+        executed = _vacuum_spy(monkeypatch)
+
+        store.maybe_vacuum(now)
+
+        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'a file that is mostly free pages was left uncompacted'
+        )
+        assert store.db_path.stat().st_size < size_before
