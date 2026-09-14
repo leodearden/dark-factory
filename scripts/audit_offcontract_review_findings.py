@@ -318,7 +318,7 @@ def validate_report(report: dict) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                         help="task-meta tree to census (default: %(default)s)")
     parser.add_argument("--json", action="store_true", help="emit the census as JSON")

@@ -463,7 +463,8 @@ def _report(*dispositions, roster_ids=ROSTER_IDS):
     }
 
 
-def _entry(rid, disposition="c", note="Checked against main today.", **extra):
+def _entry(rid: str, disposition: str | None = "c",
+           note: str | None = "Checked against main today.", **extra):
     return {"id": rid, "disposition": disposition, "note": note, **extra}
 
 
