@@ -50,6 +50,20 @@ watcher session's action, taken under
 ``skills/recon-escalation-watcher/SKILL.md``'s amended playbook row — not an
 implementing agent's.
 
+:func:`run` refuses, before the scan and before the task backend is built,
+unless ``--queue-dir`` names a directory that ALREADY exists.  The default is
+the RELATIVE ``./data/reconciliation/escalations``, so a run from anywhere but
+the project root -- a task worktree in particular, and
+``skills/recon-escalation-watcher/SKILL.md`` documents the invocation without
+pinning a cwd -- would otherwise have ``EscalationQueue.__init__`` mkdir an
+empty queue and report ``"scanned": 0, "reaped": 0``, a false all-clear that
+``main()`` below would hand back as exit 0.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
+
 Safety properties:
 - Dry run is the default; no write happens without ``--apply``.
 - Idempotent: the reap set is re-derived from ``get_pending()`` each run, so
@@ -92,6 +106,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     select_reapable_escalations,
     sole_subject_status,
 )
+from fused_memory.utils.target_store_preflight import assert_queue_dir_exists
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +176,15 @@ async def run(
         — deliberately unlike ``backfill_recon_escalations.py``, which adds
         its apply-only keys conditionally and so forces consumers into
         ``.get()``.  ``reaped`` is simply 0 on a dry run.
+
+    Raises:
+        TargetStoreMissing: When *queue_dir* does not exist — see the module
+            docstring.  The check lives here rather than in ``main()`` so
+            programmatic callers inherit it, and ahead of the backend build so
+            a refusal costs nothing and leaves nothing behind.
     """
+    assert_queue_dir_exists(queue_dir, operation='derive_orphaned_recon_escalations')
+
     owns_backend = taskmaster is None
     if owns_backend:
         from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415

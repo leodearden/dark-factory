@@ -28,6 +28,7 @@ from escalation.queue import EscalationQueue
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import classify_orphan
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'derive_orphaned_recon_escalations.py'
@@ -398,3 +399,90 @@ class TestDeriveOrphanedReconEscalations:
             assert key in report, f'{key} must be present in both modes'
         assert report['queue_dir'] == str(queue_dir)
         json.dumps(report)
+
+
+class TestMissingQueueDirRefusal:
+    """The task-4319 preflight: a queue dir that does not exist is REFUSED.
+
+    ``EscalationQueue.__init__`` mkdirs its ``queue_dir``, so without the guard
+    a mis-targeted ``--queue-dir`` -- or the RELATIVE default run from anywhere
+    but the project root -- manufactures an empty queue, reports
+    ``"scanned": 0, "reaped": 0`` and exits 0: a false all-clear
+    indistinguishable from a clean one.
+
+    Every OTHER class in this file passes an EXISTING ``tmp_path``, so the
+    guard is a verified no-op for them.  If one of them breaks, that is a
+    signal the guard was placed wrongly -- not a licence to weaken it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply_mode', [False, True])
+    async def test_refuses_a_missing_queue_dir(self, tmp_path, taskmaster, apply_mode):
+        """The DRY RUN refuses too: its report is exactly as false as an apply."""
+        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod.run(
+                queue_dir=missing, project_roots=PROJECT_ROOTS,
+                apply=apply_mode, taskmaster=taskmaster,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply_mode', [False, True])
+    async def test_refusal_leaves_no_litter(self, tmp_path, taskmaster, apply_mode):
+        """The queue was never constructed, so the ``mkdir`` never happened."""
+        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod.run(
+                queue_dir=missing, project_roots=PROJECT_ROOTS,
+                apply=apply_mode, taskmaster=taskmaster,
+            )
+
+        assert not missing.exists()
+        assert not (tmp_path / 'data').exists()
+
+    @pytest.mark.asyncio
+    async def test_refusal_precedes_the_backend_build(self, tmp_path):
+        """``taskmaster=None`` would build a real SqliteTaskBackend from config.
+
+        The guard sits ahead of that branch, so a refusal costs no backend and
+        no census read -- which is why this call can pass ``taskmaster=None``
+        without touching a live store.
+        """
+        with pytest.raises(TargetStoreMissing):
+            await _mod.run(
+                queue_dir=tmp_path / 'absent', project_roots=PROJECT_ROOTS,
+                taskmaster=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_existing_queue_dir_passes_the_guard(self, tmp_path, taskmaster):
+        """The guard requires neither absoluteness nor a non-empty queue."""
+        report = await _mod.run(
+            queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+        )
+
+        assert report['scanned'] == 0
+        assert report['reaped'] == 0
+
+    def test_main_does_not_return_zero_for_a_missing_queue_dir(self, tmp_path):
+        """``main()`` returns 0 UNCONDITIONALLY, with no error accounting.
+
+        A refusal routed through the normal report path would therefore exit 0,
+        reproducing the very defect the guard exists to fix.  It must raise.
+        """
+        import sys as _sys  # noqa: PLC0415
+
+        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        old_argv = _sys.argv
+        try:
+            _sys.argv = [
+                'derive_orphaned_recon_escalations.py', '--queue-dir', str(missing),
+            ]
+            with pytest.raises(TargetStoreMissing):
+                _mod.main()
+        finally:
+            _sys.argv = old_argv
+
+        assert not missing.exists()

@@ -616,8 +616,15 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   `orphaned_recon_escalations_missing`, and the emitted
   `orphaned_recon_escalation` flags, each of which names the escalation id,
   the subject's project, and the observed subject status. (ii) On demand,
-  re-derive it live:
+  re-derive it live. **Run from the project root** — `--queue-dir` defaults to
+  the relative `./data/reconciliation/escalations`, so the cwd is what decides
+  which queue is read; from anywhere else the script refuses with
+  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  false clean run (see
+  `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
+  absolute `--queue-dir` if you cannot control the cwd.
   ```bash
+  cd /home/leo/src/dark-factory
   python fused-memory/scripts/derive_orphaned_recon_escalations.py            # dry run (default)
   python fused-memory/scripts/derive_orphaned_recon_escalations.py --apply    # closes them
   ```
