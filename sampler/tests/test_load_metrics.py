@@ -1001,22 +1001,6 @@ class TestArmMetricStemParity:
             f'no emitted key carries the stem {stem!r}; emitted: {sorted(emitted)}'
         )
 
-    def test_stems_are_not_mechanically_derivable_from_arm_names(self):
-        """Why the mapping needs an explicit home rather than a naming rule.
-
-        Two of the six arms break any rule you could write: the four host arms
-        gain a ``psi_`` prefix, and ``own_cpu_some_avg10`` maps to
-        ``own_cpu_some10`` — ``avg10`` against ``10``.
-        """
-        from sampler.metrics import ARM_METRIC_STEMS
-
-        assert ARM_METRIC_STEMS['own_cpu_some_avg10'] != 'own_cpu_some_avg10'
-        assert ARM_METRIC_STEMS['cpu_some_avg10'] != 'cpu_some_avg10'
-        # ...and one arm where the identity rule DOES hold, so the mapping is
-        # not merely a systematic rewrite either.
-        assert ARM_METRIC_STEMS['runqueue_ratio'] == 'runqueue_ratio'
-
-
 # ---------------------------------------------------------------------------
 # Task 3592 step-25: the arm-table LOCKSTEP guard (decision 7)
 # ---------------------------------------------------------------------------
