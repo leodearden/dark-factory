@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
 
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
@@ -389,6 +392,30 @@ untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
 """
 
 
+def _caller_agent_id(task_id: str | None, role: str) -> str:
+    """The agent-id a dispatch is known by, in its prompt and in the journal.
+
+    One home for the format (INV-5): :meth:`BriefingAssembler._agent_identity`
+    renders the prompt's ``## Agent Identity`` block from this, and every
+    memory search declares the same string as ``caller_agent_id`` (D8). A
+    second copy at the search call site would let the identity an agent is
+    TOLD it has drift from the one the journal records it asking under.
+    """
+    return f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+
+
+def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
+    """Scope a post-planning role from the plan it was handed.
+
+    An explicitly-passed *task_id* wins over the plan's own copy, exactly as
+    the ``task_id or plan.get('task_id')`` these call sites used to spell did:
+    the workflow holds the authoritative id, and a plan written in an earlier
+    session can carry a stale one.
+    """
+    scope = BriefingScope.from_plan(plan)
+    return replace(scope, task_id=str(task_id)) if task_id else scope
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
@@ -429,7 +456,7 @@ class BriefingAssembler:
         self.project_id = config.fused_memory.project_id
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
-        agent_id = f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+        agent_id = _caller_agent_id(task_id, role)
         return (
             f'## Agent Identity\n\n'
             f'- **agent_id:** `{agent_id}`\n'
@@ -466,7 +493,9 @@ class BriefingAssembler:
                 the common path.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task, include_files=False)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -555,7 +584,9 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         and either confirms, updates, or recreates it.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -650,7 +681,9 @@ and either confirm it, update it, or recreate it from scratch.
         flawed approach.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -734,7 +767,9 @@ to start over from nothing.
         beyond the current ``plan.files`` set.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
@@ -805,7 +840,9 @@ let a human triage the scope change.
         without invoking the implementer.
         """
         if context is None:
-            context = await self._get_memory_context(task.get('id'))
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'simple_task',
+            )
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'simple_task')
@@ -878,11 +915,11 @@ suggestions-only on this exact tree — call
         wip_notice: list[dict] | None = None,
     ) -> str:
         """Build prompt for the implementer agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
         pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
@@ -1018,11 +1055,11 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         auto-widen). Phrase the rules around the EDIT/CREATE distinction, which
         holds at any depth, never around containment in a "module".
         """
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         log_summary = ''
         if iteration_log:
@@ -1120,11 +1157,11 @@ This task holds locks for the following modules:
         task_id: str | None = None,
     ) -> str:
         """Build prompt for the debugger agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'debugger')
 
-        identity = self._agent_identity(effective_tid, 'debugger')
+        identity = self._agent_identity(scope.task_id, 'debugger')
 
         return f"""\
 {context}
@@ -1166,7 +1203,7 @@ This task holds locks for the following modules:
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
         """
         if context is None:
-            context = await self._get_memory_context()
+            context = await self._get_memory_context(BriefingScope(), 'reviewer')
 
         # Truncate very large diffs to avoid blowing the context
         if len(diff) > 50000:
@@ -1219,11 +1256,11 @@ Prior suggestions the amendment was asked to address:
         context: str | None = None,
     ) -> str:
         """Build prompt for the completion judge agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'judge')
 
-        identity = self._agent_identity(effective_tid, 'judge')
+        identity = self._agent_identity(scope.task_id, 'judge')
 
         # Truncate diff (same cap as reviewer)
         if len(diff) > 50000:
@@ -1281,7 +1318,7 @@ diff is empty or trivial, `substantive_work=false` and `complete=false`.
     ) -> str:
         """Build prompt for the merger agent."""
         if context is None:
-            context = await self._get_memory_context()
+            context = await self._get_memory_context(BriefingScope(), 'merger')
 
         return f"""\
 {context}
@@ -1315,7 +1352,7 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         worktree: Path | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
-        context = await self._get_memory_context(task.get('id'))
+        context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
 
         return f"""\
@@ -1353,7 +1390,9 @@ from where the previous agent left off.
         Includes memory context, task details, escalation info, and action
         instructions.  Used for the initial session and after cap-hit resets.
         """
-        context = await self._get_memory_context(task.get('id'))
+        context = await self._get_memory_context(
+            BriefingScope.from_task(task), 'steward',
+        )
         identity = self._agent_identity(task.get('id'), 'steward')
         task_block = self._format_task(task)
         esc_block = self._format_escalation(escalation)
@@ -1431,8 +1470,16 @@ Handle this escalation, then call `resolve_issue` with a summary.
             lines.append(f'- **Suggested action:** {escalation["suggested_action"]}')
         return chr(10).join(lines)
 
-    async def _get_memory_context(self, task_id: str | None = None) -> str:
-        """Call fused-memory search for project context."""
+    async def _get_memory_context(self, scope: BriefingScope, role: str) -> str:
+        """Recall memory for one dispatch and render it as the ``# Context`` block.
+
+        *scope* says what this dispatch is about and *role* says who is
+        asking. WHAT is asked belongs to :mod:`shared.briefing_queries` — the
+        single home the memory-eval registry pins its phrasings against
+        (D9/INV-5) — so this method only fires the table, filters each reply
+        for cross-project leaks and renders what survives.
+        """
+        caller_agent_id = _caller_agent_id(scope.task_id, role)
         recalled_sections: list[str] = []
         foreign_dropped = 0
         nested_dropped = 0
@@ -1440,40 +1487,17 @@ Handle this escalation, then call `resolve_issue` with a summary.
         memory_unavailable = False
 
         try:
-            # Project overview
-            overview, dropped, nested = await self._scoped_search('project overview architecture goals')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if overview:
-                recalled_sections.append(f'## Project Context\n\n{overview}')
-
-            # Conventions
-            conventions, dropped, nested = await self._scoped_search('coding conventions and project norms')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if conventions:
-                recalled_sections.append(f'## Conventions\n\n{conventions}')
-
-            # Recent decisions
-            decisions, dropped, nested = await self._scoped_search('recent decisions and rationale')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if decisions:
-                recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
-
-            # Task-specific context
-            if task_id:
-                task_ctx, dropped, nested = await self._scoped_search(
-                    f'task {task_id} context and related decisions'
+            for spec, query in queries_for(scope):
+                section, dropped, nested = await self._scoped_search(
+                    spec, query,
+                    caller_agent_id=caller_agent_id,
+                    caller_task_id=scope.task_id,
                 )
                 foreign_dropped += dropped
                 nested_dropped += nested
                 queries_fired += 1
-                if task_ctx:
-                    recalled_sections.append(f'## Task Context\n\n{task_ctx}')
+                if section:
+                    recalled_sections.append(f'## {spec.section_title}\n\n{section}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
@@ -1484,10 +1508,10 @@ Handle this escalation, then call `resolve_issue` with a summary.
         # both "no facts survived" outcomes, and the fact that a leak was
         # caught and blocked must never be discarded along with them — see
         # filter_foreign_project_results' loud-over-silent fail-open stance.
-        # foreign_dropped sums per-query drops over the SAME corpus (four
-        # queries can all match one distinct foreign memory), so the note
-        # names both numbers rather than implying `foreign_dropped` distinct
-        # facts were found.
+        # foreign_dropped sums per-query drops over the SAME corpus (every
+        # query can match one distinct foreign memory), so the note names
+        # both numbers rather than implying `foreign_dropped` distinct facts
+        # were found.
         #
         # Top-level and NESTED drops are named as separate quantities (task
         # 4008 amendment). A nested drop removed an amendment digest or a
@@ -1544,45 +1568,73 @@ Handle this escalation, then call `resolve_issue` with a summary.
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
 
-    async def _scoped_search(self, query: str) -> tuple[str | None, int, int]:
+    async def _scoped_search(
+        self,
+        spec: BriefingQuerySpec,
+        query: str,
+        *,
+        caller_agent_id: str,
+        caller_task_id: str | None,
+    ) -> tuple[str | None, int, int]:
         """Search fused-memory and drop cross-project results from the reply.
 
-        Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
-        which queries fire or their ``limit`` (task 3253 owns that
-        adjudication) — that applies :func:`filter_foreign_project_results`
-        to the raw text before it reaches :meth:`_get_memory_context`.
-        Returns the filter's ``(text, dropped, nested_dropped)`` triple
-        verbatim, or ``(None, 0, 0)`` when the underlying search itself
-        returned nothing (nothing to filter).
+        Thin wrapper over :meth:`_mcp_search` that applies
+        :func:`filter_foreign_project_results` to the raw text before it
+        reaches :meth:`_get_memory_context`. Returns the filter's ``(text,
+        dropped, nested_dropped)`` triple verbatim, or ``(None, 0, 0)`` when
+        the underlying search itself returned nothing (nothing to filter).
 
         Assumes :meth:`_mcp_search` answers with a single JSON document: it
-        joins every MCP response text block with ``'\\n'`` before returning
-        (unchanged by this task, to keep its silent-fallthrough allowlist
-        entry valid). If the search tool ever replies with more than one
-        text block, the joined text is not valid JSON and the filter fails
-        open (unfiltered, WARNING logged) for that query — see
+        joins every MCP response text block with ``'\\n'`` before returning.
+        If the search tool ever replies with more than one text block, the
+        joined text is not valid JSON and the filter fails open (unfiltered,
+        WARNING logged) for that query — see
         ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
         pinned limitation.
         """
-        raw = await self._mcp_search(query)
+        raw = await self._mcp_search(
+            spec, query,
+            caller_agent_id=caller_agent_id,
+            caller_task_id=caller_task_id,
+        )
         if not raw:
             return None, 0, 0
         return filter_foreign_project_results(raw, self.project_id)
 
-    async def _mcp_search(self, query: str) -> str | None:
-        """Search fused-memory via its MCP HTTP endpoint."""
+    async def _mcp_search(
+        self,
+        spec: BriefingQuerySpec,
+        query: str,
+        *,
+        caller_agent_id: str,
+        caller_task_id: str | None,
+    ) -> str | None:
+        """Ask one query of fused-memory over its MCP HTTP endpoint.
+
+        The spec supplies the retrieval scoping — which stores, which
+        categories, how many results — and the caller identity is declared
+        for the journal (D8). An empty ``stores``/``categories`` tuple is
+        omitted rather than sent empty, so the server applies its own routing
+        instead of being handed a filter that matches nothing.
+        """
+        arguments: dict[str, Any] = {
+            'query': query,
+            'project_id': self.project_id,
+            'limit': spec.limit,
+            'caller_agent_id': caller_agent_id,
+        }
+        if spec.stores:
+            arguments['stores'] = list(spec.stores)
+        if spec.categories:
+            arguments['categories'] = list(spec.categories)
+        if caller_task_id:
+            arguments['caller_task_id'] = caller_task_id
+
         try:
             result = await mcp_call(
                 f'{self.memory_url}/mcp',
                 'tools/call',
-                {
-                    'name': 'search',
-                    'arguments': {
-                        'query': query,
-                        'project_id': self.project_id,
-                        'limit': 5,
-                    },
-                },
+                {'name': 'search', 'arguments': arguments},
                 timeout=10,
             )
             content = result.get('result', {}).get('content', [])
