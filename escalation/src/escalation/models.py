@@ -232,6 +232,24 @@ class Amendment(TypedDict):
     options: list[str]    # incoming proposed resolution options
 
 
+# The instruction `escalate_blocker` appends to its response, telling the FILER
+# what to do next.  NO CODE READS IT — the only consumer is the agent reading
+# the tool result — so the string itself is the whole contract: it is quoted
+# verbatim, as plain prose, by `orchestrator.agents.roles.ESCALATION_LADDER_CORE`
+# (role prompts cannot be f-strings) and by `escalate_blocker`'s tool docstring.
+# A rename would therefore silently decouple the instruction from the response
+# it describes, raising no import error anywhere; these names exist so the
+# prompt's copy can be pinned against the emission site from across the package
+# boundary (orchestrator/tests/test_roles_escalation_ladder.py).
+#
+# NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side `resolve_issue`
+# disposition (resume/restart/park/abandon/close_only).  That is an orthogonal
+# vocabulary which merely shares a key name; the two must not be merged.
+ACTION_TERMINATE_CLEANLY: str = 'terminate_cleanly'   # persistence was observed
+ACTION_KEEP_DRIVING: str = 'keep_driving'             # persistence is unconfirmed
+FILER_ACTIONS: tuple[str, ...] = (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+
+
 # Severities that cause an escalation to be created directly at L2,
 # bypassing the auto-watcher and routing straight to a human.
 BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})

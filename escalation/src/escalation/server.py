@@ -40,6 +40,8 @@ from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
+    ACTION_KEEP_DRIVING,
+    ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
@@ -1752,8 +1754,8 @@ def create_server(
         # for L1 or L2 to drain, so standing the filer down would strand its
         # task in silence (task 5368).
         action = (
-            'keep_driving' if result.get('status') == 'accepted_unpersisted'
-            else 'terminate_cleanly'
+            ACTION_KEEP_DRIVING if result.get('status') == 'accepted_unpersisted'
+            else ACTION_TERMINATE_CLEANLY
         )
         return {**result, 'action': action}
 

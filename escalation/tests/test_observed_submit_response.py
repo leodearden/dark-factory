@@ -250,7 +250,7 @@ class TestUnpersistedReachesTheAgentFacingEnvelope:
         result = await _blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result['status'] == 'queued', f'Unexpected status: {result}'
-        assert result['action'] == 'terminate_cleanly', (
+        assert result['action'] == ACTION_TERMINATE_CLEANLY, (
             f'The healthy blocker path must still stand the agent down: {result}'
         )
         assert result['level'] == 1, f'Level echo missing: {result}'
@@ -270,10 +270,10 @@ class TestUnpersistedReachesTheAgentFacingEnvelope:
         result = await _blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
-        assert result['action'] == 'keep_driving', (
-            f"Expected 'keep_driving' on an unpersisted filing, got: {result}"
+        assert result['action'] == ACTION_KEEP_DRIVING, (
+            f'Expected {ACTION_KEEP_DRIVING!r} on an unpersisted filing, got: {result}'
         )
-        assert result['action'] != 'terminate_cleanly'
+        assert result['action'] != ACTION_TERMINATE_CLEANLY
         assert result['level'] == 1, f'Level echo missing: {result}'
 
     @pytest.mark.asyncio
@@ -290,8 +290,8 @@ class TestUnpersistedReachesTheAgentFacingEnvelope:
         result = await _blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
-        assert result['action'] == 'keep_driving', (
-            f"Expected 'keep_driving' on an unpersisted filing, got: {result}"
+        assert result['action'] == ACTION_KEEP_DRIVING, (
+            f'Expected {ACTION_KEEP_DRIVING!r} on an unpersisted filing, got: {result}'
         )
         assert result['level'] == 1, f'Level echo missing: {result}'
 
@@ -328,8 +328,8 @@ class TestUnpersistedReachesTheAgentFacingEnvelope:
         )
 
         assert result['status'] == 'accepted_unpersisted', f'Unexpected status: {result}'
-        assert result['action'] == 'keep_driving', (
-            f"Expected 'keep_driving' on an unpersisted L2 filing, got: {result}"
+        assert result['action'] == ACTION_KEEP_DRIVING, (
+            f'Expected {ACTION_KEEP_DRIVING!r} on an unpersisted L2 filing, got: {result}'
         )
         assert 'level' in result, f'Level echo missing: {result}'
 
