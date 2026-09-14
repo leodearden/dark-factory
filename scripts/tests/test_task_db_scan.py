@@ -169,23 +169,88 @@ def test_connect_ro_refuses_a_zero_byte_stub_with_its_own_reason(tmp_path):
     assert excinfo.value.path == stub.resolve()
 
 
-def test_connect_ro_tells_an_empty_stub_apart_from_an_absent_path(tmp_path):
-    """The two refusals must not read the same.
+def _empty_the_tables_of(path: Path) -> Path:
+    """Make *path* a READABLE sqlite database carrying zero tables.
 
-    Collapsing them into one "unusable store" message would restore exactly
-    the unactionable signal this guard exists to remove — the remedies differ
-    (resolve the main checkout, versus you are one directory too high).
+    Creating then dropping a table leaves 8192 bytes of valid sqlite behind —
+    so this shape passes both the existence check and the size check while
+    being exactly as useless as the 0-byte decoy.
     """
-    stub = tmp_path / "tasks.db"
-    stub.write_bytes(b"")
-    absent = tmp_path / "absent" / "tasks.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE placeholder (x INTEGER)")
+        conn.execute("DROP TABLE placeholder")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
 
+
+def test_connect_ro_refuses_a_readable_store_that_has_no_tables(tmp_path):
+    """A third mistake with a third remedy: a real sqlite file, wrong file."""
+    table_less = _empty_the_tables_of(tmp_path / "tasks.db")
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(table_less)
+
+    assert excinfo.value.reason is TaskDbProblem.NO_TABLES
+    assert excinfo.value.path == table_less.resolve()
+    assert str(excinfo.value.path) in str(excinfo.value)
+
+
+def test_the_three_refusals_of_one_path_each_read_differently(tmp_path):
+    """No two refusals may read the same.
+
+    Collapsing any of them into one "unusable store" message would restore
+    exactly the unactionable signal this guard exists to remove — the three
+    remedies differ (resolve the main checkout; you are one directory too
+    high; you are pointing at some other .db entirely).
+
+    The SAME path takes all three shapes in turn, so a difference between the
+    messages can only come from the remedy prose and never from the path each
+    of them names.
+    """
+    path = tmp_path / "tasks.db"
+
+    path.write_bytes(b"")
     with pytest.raises(TaskDbUnreadable) as stub_refusal:
-        connect_ro(stub)
-    with pytest.raises(TaskDbUnreadable) as absent_refusal:
-        connect_ro(absent)
+        connect_ro(path)
 
-    assert str(stub_refusal.value) != str(absent_refusal.value)
+    _empty_the_tables_of(path)
+    with pytest.raises(TaskDbUnreadable) as table_less_refusal:
+        connect_ro(path)
+
+    path.unlink()
+    with pytest.raises(TaskDbUnreadable) as absent_refusal:
+        connect_ro(path)
+
+    refusals = (stub_refusal, table_less_refusal, absent_refusal)
+    assert len({r.value.reason for r in refusals}) == 3
+    assert len({str(r.value) for r in refusals}) == 3
+
+
+def test_connect_ro_refuses_a_stub_that_grew_past_zero_bytes_without_tables(tmp_path):
+    """The guard has to be SEMANTIC, not size-based — measured here.
+
+    Give the 0-byte decoy one read-write open and a ``PRAGMA
+    journal_mode=WAL`` and it becomes 4096 bytes with still no tables: the
+    ``st_size == 0`` arm stops firing on the very shape it was written to
+    catch, while the file stays exactly as unusable. Size is evidence, never
+    the question.
+    """
+    grown = tmp_path / "tasks.db"
+    grown.write_bytes(b"")
+    conn = sqlite3.connect(grown)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
+    assert grown.stat().st_size > 0
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(grown)
+
+    assert excinfo.value.reason is TaskDbProblem.NO_TABLES
 
 
 def test_an_unguarded_read_only_open_of_a_stub_answers_no_such_table(tmp_path):
@@ -201,6 +266,29 @@ def test_an_unguarded_read_only_open_of_a_stub_answers_no_such_table(tmp_path):
     stub.write_bytes(b"")
 
     conn = sqlite3.connect(f"file:{stub}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            conn.execute("SELECT * FROM tasks")
+    finally:
+        conn.close()
+
+    assert "no such table: tasks" in str(excinfo.value)
+
+
+def test_an_unguarded_read_only_open_of_a_table_less_store_answers_no_such_table(
+    tmp_path,
+):
+    """WHY the third arm earns its place — the error it replaces, reproduced.
+
+    A store that once had tables and no longer does is 8192 bytes of perfectly
+    valid sqlite, so neither the existence check nor the size check can see
+    it. ``mode=ro`` opens it happily and every query then answers `no such
+    table: tasks` — the same unactionable signal, now from a file that looks
+    entirely real.
+    """
+    table_less = _empty_the_tables_of(tmp_path / "tasks.db")
+
+    conn = sqlite3.connect(f"file:{table_less}?mode=ro", uri=True)
     try:
         with pytest.raises(sqlite3.OperationalError) as excinfo:
             conn.execute("SELECT * FROM tasks")

@@ -439,3 +439,29 @@ def test_main_diagnoses_a_zero_byte_stub_differently_from_an_absent_store(
     assert stub_captured.out == ""
     assert str(stub) in stub_captured.err
     assert stub_captured.err != absent_captured.err
+
+
+def test_main_refuses_a_readable_store_that_has_no_tables(tmp_path, capsys):
+    """Exiting 0 with an empty report IS the "this store has no tables" claim
+    that `main`'s own docstring forbids.
+
+    Creating then dropping a table leaves 8192 bytes of perfectly valid
+    sqlite, so neither the existence check nor the size check can see it —
+    and the reader who typed the wrong `--db` would be told the store is
+    empty rather than that it is the wrong file.
+    """
+    table_less = tmp_path / "tasks.db"
+    conn = sqlite3.connect(table_less)
+    try:
+        conn.execute("CREATE TABLE placeholder (x INTEGER)")
+        conn.execute("DROP TABLE placeholder")
+        conn.commit()
+    finally:
+        conn.close()
+
+    exit_code = main(["--db", str(table_less)])
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert captured.out == ""
+    assert str(table_less) in captured.err
