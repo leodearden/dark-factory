@@ -928,3 +928,178 @@ class TestExtractTarget:
         from fused_memory.reconciliation.journal import _extract_target
 
         assert _extract_target({'result_summary': 'not json'}) == '?'
+
+
+class TestGetRunStageExecution:
+    """The narrow runs-table read behind typed cycle-summary absence (task 3731).
+
+    ``get_cycle_summary_presence`` cannot tell "the stage ran and lost its
+    ledger write" from "the stage never ran" or "the row was gc()'d" from the
+    ledger alone — a reaped ``cycle_summary`` row is hard-DELETEd and is then
+    byte-for-byte indistinguishable from one that was never written. The
+    ``runs`` table carries no TTL, so it is the durable evidence that outlives
+    the ledger; this projection is the read that reaches it.
+
+    Deliberately narrower than ``get_run``: project-scoped (the ledger's
+    identity is project-scoped too) and a four-column projection rather than
+    ``SELECT *`` piped through ``_row_to_run``, which materialises every
+    ``StageReport`` including the multi-KB ``items_flagged`` blobs.
+    """
+
+    @staticmethod
+    async def _start(journal, run_id, project_id='test-project', started_at=None):
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=project_id,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=started_at or datetime.now(UTC),
+                status=RunStatus.running,
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_such_run(self, journal):
+        assert (
+            await journal.get_run_stage_execution(
+                'test-project', 'nonexistent-id', 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_run_under_a_different_project(self, journal):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id, project_id='owning-project')
+
+        # get_run would happily return this row — it is keyed on id alone. The
+        # presence lookup must not, because the ledger identity it explains is
+        # project-scoped.
+        assert await journal.get_run(run_id) is not None
+        assert (
+            await journal.get_run_stage_execution(
+                'other-project', run_id, 'task_knowledge_sync'
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_stage_ran_with_run_status_and_timestamps(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'task_knowledge_sync': StageReport(
+                    stage=StageId.task_knowledge_sync,
+                    started_at=now,
+                    completed_at=now,
+                    llm_calls=1,
+                )
+            },
+        )
+        await journal.complete_run(run_id, 'interrupted')
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert set(execution) == {'status', 'stage_ran', 'started_at', 'completed_at'}
+        assert execution['stage_ran'] is True
+        assert execution['status'] == 'interrupted'
+        assert execution['started_at'] is not None
+        assert execution['completed_at'] is not None
+
+    @pytest.mark.asyncio
+    async def test_empty_stage_reports_is_positive_evidence_the_stage_never_ran(
+        self, journal
+    ):
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+        assert execution['status'] == 'running'
+        assert execution['completed_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_out_of_band_error_and_resume_keys_are_not_stage_evidence(
+        self, journal
+    ):
+        """``reconciliation/harness.py`` writes ``_error``/``_resume`` straight
+        into ``run.stage_reports`` before persisting. A run that holds only
+        those must still read as "the stage never ran" — the lookup is
+        stage-keyed, never "is there any report at all"."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                '_error': {'error': 'boom', 'stage': 'task_knowledge_sync'},
+                '_resume': {'resumed_from': 'memory_consolidator'},
+            },
+        )
+
+        execution = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert execution is not None
+        assert execution['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_keyed_on_the_requested_stage(self, journal):
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        await self._start(journal, run_id, started_at=now)
+        await journal.update_run_stage_reports(
+            run_id,
+            {
+                'memory_consolidator': StageReport(
+                    stage=StageId.memory_consolidator,
+                    started_at=now,
+                    completed_at=now,
+                )
+            },
+        )
+
+        ran = await journal.get_run_stage_execution(
+            'test-project', run_id, 'memory_consolidator'
+        )
+        did_not_run = await journal.get_run_stage_execution(
+            'test-project', run_id, 'task_knowledge_sync'
+        )
+
+        assert ran is not None and ran['stage_ran'] is True
+        assert did_not_run is not None and did_not_run['stage_ran'] is False
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stage_reports_is_indeterminate_and_loud(
+        self, journal, caplog
+    ):
+        """Unparseable stored JSON is a FAULT. It must not masquerade as the
+        definitive "the stage never ran" — that would silently suppress a real
+        data-loss finding — so it reports ``None`` and logs a WARNING."""
+        run_id = str(uuid.uuid4())
+        await self._start(journal, run_id)
+        await journal._db.execute(
+            'UPDATE runs SET stage_reports = ? WHERE id = ?', ('not json', run_id)
+        )
+        await journal._db.commit()
+
+        with caplog.at_level('WARNING'):
+            execution = await journal.get_run_stage_execution(
+                'test-project', run_id, 'task_knowledge_sync'
+            )
+
+        assert execution is not None
+        assert execution['stage_ran'] is None
+        assert execution['status'] == 'running'
+        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
