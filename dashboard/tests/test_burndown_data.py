@@ -153,7 +153,7 @@ def _fake_load(by_root_map):
     """
     canonical = {_root_key(k): v for k, v in by_root_map.items()}
 
-    # **_kwargs absorbs the collector's opt-in `page_size=` (task 4360); these
+    # **_kwargs absorbs the collector's opt-in `chunk_size=` (task 5018); these
     # fakes stand in for the whole fetch_tasks seam, so paging is already done
     # by the time they answer.
     async def _fake(client, config, project_root, **_kwargs):
@@ -1616,8 +1616,8 @@ class TestCollectSnapshotTaskSourceAndCap:
             await collect_snapshot(conn, config, client=dummy_client)
 
         assert len(calls) == 1, f'a fitting tree must cost one read, got {calls}'
-        assert 'page_size' not in calls[0], (
-            'the probe must be an ordinary unpaginated read'
+        assert 'chunk_size' not in calls[0], (
+            'the probe must be an ordinary unchunked read'
         )
 
     @pytest.mark.asyncio
@@ -1635,7 +1635,11 @@ class TestCollectSnapshotTaskSourceAndCap:
 
         async def fake_tasks(client, cfg, project_root, **kwargs):
             calls.append(kwargs)
-            if 'page_size' not in kwargs:
+            # `chunk_size`, not `page_size`: the collector's fallback now asks
+            # for a CHUNKED complete read. Keying this fake off the old spelling
+            # would make the probe and the fallback indistinguishable and the
+            # fallback would never appear to succeed.
+            if 'chunk_size' not in kwargs:
                 return {'offline': True, 'error': 'response too large'}
             return [_ztask(status='pending', id=1)]
 
@@ -1645,10 +1649,14 @@ class TestCollectSnapshotTaskSourceAndCap:
         ):
             await collect_snapshot(conn, config, client=dummy_client)
 
-        assert [('page_size' in c) for c in calls] == [False, True], (
-            f'expected probe-then-paginate, got {calls}'
+        assert [('chunk_size' in c) for c in calls] == [False, True], (
+            f'expected probe-then-chunked-walk, got {calls}'
         )
-        assert calls[1]['page_size'] == _SNAPSHOT_PAGE_SIZE
+        # The PYTHON kwarg is `chunk_size`; the MCP WIRE argument is still
+        # `page_size` (fused-memory's tool parameter, out of scope here). Two
+        # names at two layers, both asserted — see the wire assertions over
+        # stubbed `mcp_tool_call` calls further down this file.
+        assert calls[1]['chunk_size'] == _SNAPSHOT_PAGE_SIZE
         async with conn.execute('SELECT pending FROM snapshots') as cur:
             row = await cur.fetchone()
         assert row is not None and row[0] == 1, (
@@ -3078,6 +3086,70 @@ class TestCollectSnapshotPaginatesTheTaskRead:
             }
 
         return _call
+
+    @pytest.mark.asyncio
+    async def test_the_probe_marker_does_not_suppress_the_chunked_fallback(
+        self, burndown_env, dummy_client,
+    ):
+        """NAMED regression pin: `chunk_size` must stay IN the cache key.
+
+        THE HAZARD, stated once at `dashboard/src/dashboard/data/tasks.py::_CompleteRead`:
+        "chunk size selects transport, never the contract" is true of the
+        ANSWER and false of the KEY, and acting on the first half alone
+        suppresses the burndown fallback with the probe's own failure marker.
+        This test is the executable half of that statement.
+
+        NO CACHE CLEAR between the two reads — that is the whole test. The
+        autouse fixture clears around the test, not inside it, so the fallback
+        runs against a cache still holding the probe's fresh marker.
+
+        WHY THIS EXISTS SEPARATELY. `test_a_tree_that_only_fits_in_pages_still
+        _yields_a_row` covers this path INCIDENTALLY. Incidental coverage is
+        what a later edit removes silently: adding a mid-test cache clear, or
+        splitting the probe into its own test, would drop the guard with every
+        test still green. The probe/fallback tests in
+        `TestCollectSnapshotTaskSourceAndCap` cannot catch it at all — they
+        patch `burndown.fetch_tasks` wholesale and never reach the cache.
+        """
+        db_path, config, conn = burndown_env
+        tasks = self._tree()
+        calls: list[dict] = []
+
+        with (
+            patch(
+                'dashboard.data.tasks.mcp_tool_call',
+                new=AsyncMock(side_effect=self._stub(
+                    tasks, calls, oversize_unpaginated=True,
+                )),
+            ),
+            patch(
+                'dashboard.data.burndown.find_running_orchestrators',
+                return_value=[],
+            ),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        assert calls, 'the probe must actually reach the wire'
+        assert calls[0].get('page_size') is None, (
+            f'the probe is the UNPAGINATED read, got {calls[0]}'
+        )
+        assert any(c.get('page_size') == _SNAPSHOT_PAGE_SIZE for c in calls), (
+            'the chunked fallback never reached the server — the probe\'s own '
+            'offline marker suppressed it, which means chunk_size has been '
+            f'dropped from the cache key. Calls: {calls}'
+        )
+
+        async with conn.execute(
+            'SELECT pending, in_progress_live, in_progress_stranded FROM snapshots'
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None, (
+            'an oversize tree must still write its snapshot row — a missing '
+            'row here is a PERMANENT hole in an append-only table'
+        )
+        assert row[0] == 1 and row[1] == 2 and row[2] == 2, (
+            f'the fallback must record the whole tree, got {tuple(row)}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_tree_that_only_fits_in_pages_still_yields_a_row(

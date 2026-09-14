@@ -166,28 +166,46 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     ``fetch_statuses`` unpatched would reach for the network.
 
     So the wrapper emulates exactly what the substrate does — a ``statuses``
-    row filter, then a ``page_size``/``offset`` slice over an ASCENDING-id
-    list — and derives the compact map from the same canned tree.  Tests here
-    are about SHAPING; the wire contract itself is asserted against a canned
-    ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+    row filter, then (for a page read) a ``page_size``/``offset`` slice over an
+    ASCENDING-id list — and derives the compact map from the same canned tree.
+    Tests here are about SHAPING; the wire contract itself is asserted against
+    a canned ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+
+    TWO fakes, not one permissive fake, because the module now reads through
+    two functions with DIFFERENT contracts: ``fetch_tasks`` returns the
+    COMPLETE set and takes no window at all, ``fetch_task_page`` returns ONE
+    page and REQUIRES both ``page_size`` and ``offset``.  A fake laxer than the
+    real signature is how a call-site regression passes its tests — so each
+    fake here accepts exactly what its real counterpart accepts.
 
     *fetch* keeps its original ``(client, config, project_root)`` signature and
     may still return an offline marker dict, which is propagated unchanged.
     """
 
-    async def _narrowed(
-        client, config, project_root, *,
-        statuses=None, page_size=None, offset=0, timeout=None,
-    ):
+    async def _rows(client, config, project_root, statuses):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
             return rows
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
-        rows = sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
-        if page_size is not None:
-            rows = rows[offset:offset + page_size]
-        return rows
+        return sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
+
+    async def _narrowed(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None,
+    ):
+        # The COMPLETE set: chunk_size selects transport, so the fake ignores
+        # it exactly as the real one's ANSWER does.
+        return await _rows(client, config, project_root, statuses)
+
+    async def _page(
+        client, config, project_root, *,
+        page_size, offset, statuses=None, timeout=None,
+    ):
+        rows = await _rows(client, config, project_root, statuses)
+        if not isinstance(rows, list):
+            return rows
+        return rows[offset:offset + page_size]
 
     async def _statuses(client, config, project_root):
         rows = await fetch(client, config, project_root)
@@ -198,6 +216,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
         }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _narrowed)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_page', _page)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _statuses)
 
 
@@ -2364,6 +2383,68 @@ class TestShapeOneProjectNarrowing:
                 "mcp_tool_call's 10s default, so the per-project budget "
                 'arithmetic in test_tasks_budget.py does not describe it'
             )
+
+    async def test_the_terminal_window_goes_through_fetch_task_page(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """The ONE call site whose CONTRACT changes reads through the page API.
+
+        The terminal window wants a PARTIAL answer and its own truncation
+        WARNING already says so ("only the %d highest-id terminal rows are
+        fetched"). After task 5018 that intent is in the function name rather
+        than in an argument combination, so a reader cannot mistake it for a
+        whole-tree read. The ACTIVE read is the control: it wants everything
+        matching its filter and must stay on `fetch_tasks`, with NO page
+        arguments at all.
+        """
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import (
+            _ACTIVE_STATUSES,
+            _TERMINAL_FETCH_WINDOW,
+            _TERMINAL_STATUSES,
+            _shape_one_project,
+        )
+
+        config = self._one_project_config(tmp_path)
+        rows = [
+            {'id': i, 'title': f't{i}', 'status': 'done', 'dependencies': [],
+             'metadata': {}}
+            for i in range(1, 6)
+        ]
+        whole: list[dict] = []
+        paged: list[dict] = []
+
+        async def _fake_tasks(client, cfg, project_root, **kwargs):
+            whole.append(kwargs)
+            return []
+
+        async def _fake_page(client, cfg, project_root, **kwargs):
+            paged.append(kwargs)
+            return rows
+
+        async def _fake_statuses(client, cfg, project_root):
+            return {r['id']: 'done' for r in rows}
+
+        monkeypatch.setattr(at_mod, 'fetch_tasks', _fake_tasks)
+        monkeypatch.setattr(at_mod, 'fetch_task_page', _fake_page)
+        monkeypatch.setattr(at_mod, 'fetch_statuses', _fake_statuses)
+
+        await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=10, max_cancelled_per_project=10,
+        )
+
+        assert len(paged) == 1, f'exactly one windowed read, got {paged}'
+        assert paged[0]['statuses'] == sorted(_TERMINAL_STATUSES)
+        assert paged[0]['page_size'] == _TERMINAL_FETCH_WINDOW
+        assert paged[0]['offset'] == max(0, len(rows) - _TERMINAL_FETCH_WINDOW)
+
+        assert len(whole) == 1, f'exactly one whole-set read, got {whole}'
+        assert whole[0]['statuses'] == sorted(_ACTIVE_STATUSES)
+        assert 'page_size' not in whole[0] and 'offset' not in whole[0], (
+            'the active read asks for everything matching its filter — a page '
+            f'argument here would silently truncate it, got {whole[0]}'
+        )
 
     async def test_tasks_tab_path_issues_a_bounded_terminal_window(
         self, monkeypatch, tmp_path, dummy_client

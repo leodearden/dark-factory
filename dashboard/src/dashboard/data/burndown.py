@@ -296,18 +296,24 @@ async def _fetch_snapshot_tasks(
     if isinstance(probe, list):
         return probe
     logger.debug(
-        'Unpaginated snapshot read rejected for %s (%s); retrying paginated at page_size=%d',
+        'Unchunked snapshot read rejected for %s (%s); retrying the walk at chunk_size=%d',
         root,
         probe.get('error') if isinstance(probe, dict) else probe,
         _SNAPSHOT_PAGE_SIZE,
     )
+    # `chunk_size` alone selects the walk: `fetch_tasks` returns the COMPLETE
+    # set either way, chunked or not, so there is no flag to forget and no way
+    # to accidentally snapshot the first _SNAPSHOT_PAGE_SIZE tasks as the whole
+    # tree.  (`fetch_task_page` is the function that returns one page.)
+    #
+    # This read and the probe above deliberately key SEPARATELY, and that is
+    # NOT an accident to tidy away: `chunk_size` is part of the cache key even
+    # though it is pure transport.  Why removing it silently costs exactly the
+    # oversize trees this path exists for is stated once, at
+    # `dashboard/src/dashboard/data/tasks.py::_CompleteRead`.
     return await fetch_tasks(
         client, config, root,
-        page_size=_SNAPSHOT_PAGE_SIZE,
-        # paginate=True is what turns *page_size* from "one page" into
-        # "walk every page and assemble".  Without it this would silently
-        # snapshot the first _SNAPSHOT_PAGE_SIZE tasks as the whole tree.
-        paginate=True,
+        chunk_size=_SNAPSHOT_PAGE_SIZE,
     )
 
 

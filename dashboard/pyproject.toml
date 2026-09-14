@@ -17,6 +17,13 @@ dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20.0",
     "pyyaml>=6.0",
+    # Direct import (data/mcp_fanout.py), NOT just a fastapi/pydantic transitive:
+    # TTLCache's key TypeVar carries a PEP 696 `default=`, and pyright REJECTS
+    # `typing.TypeVar(default=...)` under this package's `pythonVersion = "3.11"`
+    # pin ("Type variable default types require Python 3.13 or newer"). The
+    # typing_extensions spelling is accepted at that pin and applies the default,
+    # so every single-argument `TTLCache[V]` keeps checking unedited.
+    "typing-extensions>=4.12",
     "escalation>=0.1",
     "dark-factory-shared",
 ]

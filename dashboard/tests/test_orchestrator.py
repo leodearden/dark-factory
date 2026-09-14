@@ -720,6 +720,23 @@ class TestDiscoverOrchestratorsBudget:
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
         ):
+            # Pre-warm the default executor so its FIRST-USE thread spin-up is
+            # not charged to a threshold sized for the loop budget alone — the
+            # same DEFECT-1 remedy applied to
+            # test_two_pids_sharing_one_root_pay_the_budget_once, which this
+            # test was written from and which shares its
+            # `await asyncio.to_thread(find_running_orchestrators)` opening.
+            # Measured over 8 fresh processes each: without the pre-warm this
+            # walk costs 0.20-0.25s idle and 0.22-0.33s under 40 CPU hogs on
+            # 32 cores, against a 0.5s threshold — the ~0.13s of first-use cost
+            # is what a loaded host stretches past the margin (observed 0.510s
+            # under xdist). With it, 0.1015-0.1057s idle and 0.1010-0.1028s
+            # under that same load: the load-sensitive term is gone entirely,
+            # leaving ~3ms of jitter against 400ms of margin. The threshold is
+            # therefore deliberately NOT widened — the remaining margin is 130x
+            # the measured noise, and widening it would only blunt the
+            # discrimination below for no measured benefit.
+            await asyncio.to_thread(lambda: None)
             started = loop.time()
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
@@ -730,6 +747,9 @@ class TestDiscoverOrchestratorsBudget:
         assert len(result) == 2
         assert len(calls) == 1
         # The whole walk costs the LOOP budget, not roots x per-root budget.
+        # 0.5s discriminates with slack on both sides: the healthy path costs
+        # ~0.10s, while the regression costs the per-root 1.0s on the FIRST
+        # root alone (and 2.0s over both, tripping the wait_for guard above).
         assert elapsed < 0.5, (
             f'the walk took {elapsed:.3f}s against a 0.1s loop budget with a '
             '1.0s per-root budget — the per-root bound alone is being applied, '
