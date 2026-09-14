@@ -10172,6 +10172,7 @@ class TaskWorkflow:
         assert self.worktree is not None and self.artifacts is not None
         prompt = await self.briefing.build_reviewer_prompt(
             role.name, diff, amendment_suggestions=amendment_suggestions,
+            task=self.task,
         )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
