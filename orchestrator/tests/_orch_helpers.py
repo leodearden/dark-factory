@@ -395,6 +395,47 @@ DEEP_GATE_SCENE_SPAWN_BUDGET = 260
 DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
 
 
+def spawn_budget_violation(count: int, budget: int, nodeid: str) -> str | None:
+    """Why *count* git spawns is an unacceptable cost for *nodeid*, or None.
+
+    Returns the MESSAGE and never raises: the CALLER decides how to fail.
+    That is what keeps the check reachable from a plain unit test rather than
+    only from the autouse fixture that uses it -- a budget check living
+    inside a fixture teardown is exercised only on the path where it passes.
+
+    TWO offences, kept distinct because their remedies differ.  A count ABOVE
+    *budget* means the scene got heavier and both constants need re-deriving.
+    A count of ZERO means the caller's counting seam saw no git at all, so
+    the budget is enforcing nothing -- and since zero is inside every budget,
+    nothing else here would catch it.
+
+    The derivation behind these numbers is NOT restated here; see
+    :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`'s comment above.
+    """
+    if count == 0:
+        return (
+            f'{nodeid} made NO git subprocess calls, so its spawn budget of '
+            f'{budget} is enforcing nothing. The counting seam has gone blind, '
+            'and a guard that passes because it was silently disconnected is '
+            'worse than no guard at all. Repair the fixture that counts spawns '
+            'before trusting any later green run of this class.'
+        )
+    if count > budget:
+        return (
+            f'{nodeid} made {count} git spawns, over its budget of {budget}. '
+            'The scene got heavier, so @pytest.mark.timeout('
+            f'DEEP_GATE_SCENE_TEST_TIMEOUT) ({DEEP_GATE_SCENE_TEST_TIMEOUT}s) '
+            'is no longer sized for what this class costs -- and an '
+            'under-sized marker does not fail as a red test, it dies as an '
+            'unattributed xdist worker crash on a loaded host. Re-measure the '
+            'per-test spawn counts, then re-derive BOTH '
+            'DEEP_GATE_SCENE_SPAWN_BUDGET and DEEP_GATE_SCENE_TEST_TIMEOUT '
+            'from the new figure (their comment in this file has the model). '
+            'Raising the budget alone leaves the marker under-sized.'
+        )
+    return None
+
+
 # task 3540: the claimant-liveness TTL the row builder below derives its
 # symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
 # imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
