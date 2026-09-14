@@ -470,8 +470,21 @@ RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
 # that guard for a module that never wanted a cold budget.
 RULED_COLD_BUDGET_DECLARATIONS: dict[str, str] = {
     'orchestrator': (
-        "ruling D17 (2026-09-14, task 3353 scope D'): this module declares its "
-        'own cold budget. Populated in step-28.'
+        "ruling D17 (2026-09-14, task 3353 scope D'): "
+        'verify_cold_command_timeout_secs=10800 is a ruled, INTERIM per-module '
+        'cold budget. INTERIM because there is no cold distribution to derive '
+        'from — a summary.json carries no is-cold flag and the attempt-number '
+        'inference cannot tell a cold first verify from a warm re-verify of a '
+        'reset worktree, which scripts/verify_budget_census.py reports as an '
+        'explicit cold_separable=false finding rather than guessing. BASIS: '
+        'the census-derived warm figure (7200) plus the cold preprovision cost '
+        'this lane additionally pays, allotted at the fleet\'s own current '
+        'cold allowance. DECLARED RATHER THAN LEFT TO FALL THROUGH because '
+        "commit 36c4c71eb4's stated revert condition would return the cold "
+        'ceiling to 5400 — BELOW this module\'s warm budget, on a strictly '
+        'costlier path, which is the state in which the cold false-timeout '
+        'hazard was live. A module declaration survives that revert; a '
+        'fall-through does not.'
     ),
 }
 
