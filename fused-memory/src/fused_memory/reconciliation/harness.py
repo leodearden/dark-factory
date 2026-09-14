@@ -444,10 +444,14 @@ def _finding_is_live_actionable(finding: dict) -> bool:
 
     ``get_assembled_report`` already projects such a finding with
     ``actionable`` forced False, which would make the ``superseded_by`` check
-    here look redundant — it is not.  Both partition sites also accept a
-    DICT-shaped ``s3_report`` straight from persisted JSON, which never passed
-    through that projection, so on that path ``actionable`` is whatever was
-    stored.  Checking the pointer explicitly is what closes it.
+    here look redundant.  It is kept anyway, and NOT because some production
+    path is known to skip that projection: both partition sites read
+    ``s3_report`` duck-typed — a ``StageReport`` or the equivalent dict off
+    persisted JSON, from a producer they cannot identify — so neither can
+    verify that the ``actionable`` it is trusting was computed by that
+    projection at all.  Enforcing the invariant locally is cheap, and it keeps
+    the rule readable at the point it is applied instead of implied by an
+    upstream projection two modules away.
 
     Applied at the actionable/non-actionable partition in
     ``_maybe_remediate`` and ``_run_remediation_pass``, so the complement
@@ -4619,7 +4623,27 @@ class ReconciliationHarness:
     # ── Remediation support ───────────────────────────────────────────
 
     async def _get_prior_s3_findings(self, project_id: str) -> list[dict] | None:
-        """Extract S3 findings from the last completed run's stage reports."""
+        """Extract S3 findings from the last completed run's stage reports.
+
+        Superseded findings are dropped (task-4653).  This return value becomes
+        the next cycle's Stage-1 ``prior_s3_findings``, which
+        ``MemoryConsolidator.assemble_payload`` renders under "These issues were
+        found in the last integrity check and should be addressed during this
+        consolidation pass if possible" — so a claim a LATER finding of the
+        producing run already refuted would come back as a live to-do.  Its
+        renderer (``_format_findings``) emits description / severity / category
+        / suggested_action and the typed citation lists only, never
+        ``superseded_by``, so an agent reading the payload could not tell that
+        the claim had been retired.  Same rationale as the Stage-2 channel's
+        filter in ``stages/task_knowledge_sync.py::_query_recon_report_findings``,
+        applied to a stricter instruction.
+
+        The filter runs BEFORE the ``if items:`` fall-through, so a run whose
+        every finding was retired behaves exactly like a run that flagged
+        nothing: an older completed run still gets its turn, and no empty
+        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
+        a finding dict that never carried the key is unaffected.
+        """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
             for r in recent:
@@ -4632,6 +4656,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
+                items = [f for f in items if not f.get('superseded_by')]
                 if items:
                     return items
         except Exception as e:

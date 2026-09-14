@@ -13583,11 +13583,15 @@ async def test_maybe_remediate_mixed_batch_keeps_the_live_finding(
 async def test_maybe_remediate_filters_a_dict_shaped_s3_report(
     journal, event_buffer, mock_memory_service,
 ):
-    """The JSON-fallback path: a DICT-shaped s3_report never passed through
-    get_assembled_report, so `actionable` was never flipped to False there.
+    """The partition enforces the rule on a DICT-shaped s3_report too, not just
+    on a StageReport.
 
-    This is what makes the explicit predicate necessary rather than redundant
-    with the projection's neuter.
+    Both shapes are read duck-typed from a producer the partition cannot
+    identify, so the predicate is applied locally rather than trusting that
+    ``actionable`` came from get_assembled_report's neuter.  The pairing of
+    ``actionable: True`` with ``superseded_by`` is deliberately one no
+    production path emits today — that IS the invariant under test: whatever
+    produced the dict, a superseded finding does not reach remediation.
     """
     harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=4,
@@ -13633,19 +13637,24 @@ async def test_run_remediation_pass_never_gates_a_superseded_finding(
     recon_integrity_issue escalation regardless of recurrence count.
 
     Asserted by proving _finding_persistence_count — the first thing the
-    escalation loop does per finding — is never consulted for it.
+    escalation loop does per finding — is consulted for a LIVE finding of the
+    same batch and NOT for the superseded one.  A live finding is in the batch
+    deliberately: `gated == []` alone would also pass if the escalation loop
+    simply stopped being reached in this fixture, proving nothing about the
+    filter.
     """
     from fused_memory.reconciliation.harness import TierConfig
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
 
     persistence_spy = AsyncMock(return_value=0)
     harness._finding_persistence_count = persistence_spy
 
     _mock_stage_run(harness.stages[0])
     _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2], items_flagged=[superseded])
+    _mock_stage_run(harness.stages[2], items_flagged=[superseded, live])
 
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         await harness._run_remediation_pass(
@@ -13657,11 +13666,61 @@ async def test_run_remediation_pass_never_gates_a_superseded_finding(
         )
 
     gated = [c.args[1].get('description') for c in persistence_spy.await_args_list]
-    assert gated == [], (
-        f'a superseded finding reached the persistence-gated escalation branch: {gated}'
+    assert gated == [live['description']], (
+        f'expected exactly the live finding to be gated, got: {gated}'
     )
     records = _drop_records(caplog, 'reconciliation.non_actionable_integrity_finding')
     assert [getattr(r, 'superseded_by', None) for r in records] == [_SUPERSEDER_FID]
+
+
+@pytest.mark.asyncio
+async def test_get_prior_s3_findings_drops_a_superseded_finding(
+    journal, event_buffer, mock_memory_service,
+):
+    """The CROSS-CYCLE forward feed must not re-present a claim the run refuted.
+
+    _get_prior_s3_findings' return value becomes the next cycle's Stage-1
+    ``prior_s3_findings``, which assemble_payload renders under "These issues
+    were found in the last integrity check and should be addressed during this
+    consolidation pass if possible"
+    (stages/memory_consolidator.py::MemoryConsolidator.assemble_payload) — a
+    stricter instruction than the Stage-2 channel's, and one that reads as a
+    live to-do.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import _format_findings
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
+    await _persist_parent_run(journal, 'test-project', [superseded, live])
+
+    forward_fed = await harness._get_prior_s3_findings('test-project')
+
+    assert forward_fed == [live], (
+        f'a superseded finding was forward-fed into the next cycle: {forward_fed}'
+    )
+    # WHY the filter must live at this source and cannot be left to the reader:
+    # the renderer emits description/severity/category/suggested_action plus the
+    # typed citation lists, and nothing else — so a retirement that survives
+    # this far is invisible by the time an agent reads it.
+    assert _SUPERSEDER_FID not in _format_findings([superseded])
+    assert 'superseded_by' not in _format_findings([superseded])
+
+
+@pytest.mark.asyncio
+async def test_get_prior_s3_findings_looks_past_an_all_superseded_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """A run whose every finding was retired forward-feeds nothing, exactly as
+    a run that flagged nothing does — the ``if items:`` fall-through is
+    evaluated AFTER the filter, so an older completed run still gets its turn
+    and no empty "Prior Stage 3 Findings" section is rendered."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    older_live = _make_s3_findings()[1]
+    await _persist_parent_run(journal, 'test-project', [older_live])
+    await _persist_parent_run(journal, 'test-project', [_make_superseded_finding()])
+
+    assert await harness._get_prior_s3_findings('test-project') == [older_live]
 
 
 @pytest.mark.asyncio
