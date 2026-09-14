@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 #: a dangling rr-cache ref and a stale ``MERGE_RR.lock``.
 RECOVERY_GIT = ('git', '-c', 'rerere.enabled=false')
 
+#: Wall-clock bound on the one subprocess this module spawns.  The probe runs
+#: on the critical path of every abort in the merge lane, against worktrees
+#: that are damaged by construction — so an unbounded ``rev-parse`` would wedge
+#: the lane the abort exists to unwedge, which is this module's own anti-goal.
+#: Ten seconds is ~160x the slowest healthy answer measured here (2.4-61.4ms)
+#: and still bounded; a timeout is answered exactly like any other failure to
+#: resolve, so the bound costs no branch of its own.
+_PROBE_TIMEOUT_SECONDS = 10.0
+
 #: One MERGE_RR record: a conflict id and the path it belongs to.  The id is
 #: ``<40-hex>`` with an OPTIONAL rerere variant suffix ``.<N>``; the suffix is
 #: part of the rr-cache directory name, so the group must capture it.
@@ -525,10 +534,12 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
 
     A cwd git cannot even be spawned in — a worktree deleted out-of-band, or a
     path that is a file — raises ``OSError`` from the spawn itself, before any
-    exit code exists.  That is answered with ``None``, the same as a non-zero
-    exit and the same as a foreign repository, so the caller takes the one
-    unresolved-but-clean branch instead of branches that differ only in how the
-    worktree failed to be the worktree.  It also keeps the vanished-worktree
+    exit code exists, and a probe that never answers within
+    :data:`_PROBE_TIMEOUT_SECONDS` raises ``TimeoutExpired``.  Both are
+    answered with ``None``, the same as a non-zero exit and the same as a
+    foreign repository, so the caller takes the one unresolved-but-clean branch
+    instead of branches that differ only in how the worktree failed to be the
+    worktree.  It also keeps the vanished-worktree
     case reaching ``git_ops._run``, whose own pre-flight raises the typed
     ``WorktreeMissing`` its consumers match on; raising that here instead is
     impossible without an import cycle (see :data:`AbortRunner`) and would
@@ -543,9 +554,17 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
         proc = subprocess.run(
             ['git', 'rev-parse', '--git-dir', '--git-common-dir', '--show-toplevel'],
             cwd=str(worktree), capture_output=True, text=True, check=False,
+            timeout=_PROBE_TIMEOUT_SECONDS,
         )
     except OSError as exc:
         logger.warning('Could not spawn git in %s: %s', worktree, exc)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            'git rev-parse in %s did not answer within %.0fs; treating the '
+            'worktree as unresolved rather than holding the abort behind it.',
+            worktree, _PROBE_TIMEOUT_SECONDS,
+        )
         return None
     if proc.returncode != 0:
         return None
@@ -673,10 +692,24 @@ async def guarded_abort(
     value, and ``git_ops._run`` still raises ``WorktreeMissing`` for a cwd that
     has vanished, which is the typed exception its callers recover from.
 
+    A :data:`VERDICT_BLOCKED` preflight does NOT stop the abort, and it is
+    LOGGED before the abort runs.  Proceeding is the fail-safe choice;
+    proceeding silently would throw the diagnosis away, because the sweep logs
+    only REMOVALS — a lock retained because something still holds it appears in
+    no log at all, and the abort then fails rc 128 with git's "Another git
+    process seems to be running", whose remedy is exactly the holder pid this
+    line carries.
+
     Returns *run*'s ``(rc, stdout, stderr)`` unchanged, so no call site's
     control flow, return value or logging has to change.
     """
-    await asyncio.to_thread(preflight_rebase_recovery, cwd)
+    result = await asyncio.to_thread(preflight_rebase_recovery, cwd)
+    if result.verdict == VERDICT_BLOCKED:
+        logger.warning(
+            'Proceeding with git %s --abort in %s despite findings this run '
+            'did not repair: %s',
+            verb, cwd, '; '.join(result.unrepaired),
+        )
     return await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
 
 

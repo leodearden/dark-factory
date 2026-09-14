@@ -669,6 +669,40 @@ class TestPreflightEndToEnd:
         assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
 
 
+class TestTheGitProbeIsBounded:
+    """The module's one subprocess cannot hang the lane it exists to unwedge.
+
+    The probe sits on the critical path of every abort in the merge lane and
+    runs against worktrees that are damaged by construction, so a hang there
+    wedges the recovery rather than performing it — this module's own stated
+    anti-goal.
+
+    Asserted as a BOUND rather than by observing a hang, because a probe with
+    no timeout can only be caught by waiting forever, which is the failure
+    itself.  What is pinned is the thing whose absence makes
+    ``subprocess.TimeoutExpired`` unreachable and the ``git_probe_times_out``
+    totality arm vacuous.
+    """
+
+    def test_rev_parse_is_spawned_with_a_positive_timeout(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        spawned: list[dict] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            spawned.append(kwargs)
+            return real_run(*args, **kwargs)
+
+        with patch.object(rebase_recovery.subprocess, 'run', side_effect=spy):
+            resolved = rebase_recovery.resolve_git_dirs(repo)
+
+        assert resolved is not None, 'the control must be a resolvable worktree'
+        assert spawned, 'the probe must actually spawn'
+        assert spawned[0].get('timeout', 0) > 0
+
+
 # ---------------------------------------------------------------------------
 # Discovery escape: the preflight must never repair a repository it was not
 # pointed at
@@ -903,6 +937,40 @@ class TestGitOpsGuardedAbort:
         assert recorded == [('merge', repo)]
 
 
+@pytest.mark.asyncio
+class TestGuardedAbortReportsWhatThePreflightCouldNotRepair:
+    """Findings the preflight could not repair must reach the log of the abort.
+
+    ``guarded_abort`` proceeds unconditionally, and that is deliberate — an
+    unguarded abort beats no abort at all.  Proceeding SILENTLY is the part
+    that costs: ``sweep_stale_locks`` logs only REMOVALS, so a lock RETAINED
+    because something still holds it is logged nowhere, and the abort then
+    fails rc 128 with git's "Another git process seems to be running", which
+    names no remedy.  The pid that names it was computed moments earlier.
+    """
+
+    async def test_a_held_lock_pid_is_logged_and_the_abort_still_runs(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        recorded: list[list[str]] = []
+
+        with lock.open('a'), caplog.at_level(
+            logging.WARNING, logger='orchestrator.rebase_recovery',
+        ):
+            await rebase_recovery.guarded_abort(
+                'rebase', repo, _recording_run(recorded),
+            )
+
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(os.getpid()) in logged, logged
+        assert str(lock) in logged, logged
+        assert recorded == [[*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort']], (
+            'the guard reports, it never blocks'
+        )
+
+
 class TestGitOpsAbortUniformity:
     """SPOT, enforced against the FILE rather than against known call sites."""
 
@@ -1131,6 +1199,17 @@ def merge_rr_is_unreadable(tmp_path: Path, monkeypatch) -> Path:
     return repo
 
 
+def git_probe_times_out(tmp_path: Path, monkeypatch) -> Path:
+    """A valid repo whose ``git rev-parse`` probe never answers."""
+    repo, _ = build_mid_rebase_repo(tmp_path)
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd='git rev-parse', timeout=1)
+
+    monkeypatch.setattr(rebase_recovery.subprocess, 'run', _timeout)
+    return repo
+
+
 #: Hostile states the preflight must survive.  Every one was MEASURED to raise
 #: on this branch before the guards landed, so none of them is a hypothetical.
 HOSTILE_STATES = (
@@ -1138,6 +1217,7 @@ HOSTILE_STATES = (
     worktree_is_a_file,
     merge_rr_is_a_directory,
     merge_rr_is_unreadable,
+    git_probe_times_out,
 )
 
 
