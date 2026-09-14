@@ -1479,6 +1479,13 @@ mcp__escalation__resolve_issue(
 
 ### C1 — `action` semantics (single source of truth)
 
+Scope: this is `resolve_issue`'s HANDLER-side `action` parameter (`server.py::RESOLVE_ACTIONS`).
+`escalate_blocker`'s *response* also carries an `action` key, but that is an orthogonal
+filer-facing vocabulary (`terminate_cleanly` / `keep_driving`,
+`escalation.models.FILER_ACTIONS`, described in DESIGN.md) which merely shares the key name —
+you never receive one, since this skill resolves escalations and never files them, and none of
+its values may be passed to `resolve_issue`.
+
 | `action` | Record disposition | Live workflow | Task status effect | Intent |
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
