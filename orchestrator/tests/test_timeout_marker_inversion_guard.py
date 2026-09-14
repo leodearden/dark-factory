@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import math
 import re
 import textwrap
 from collections.abc import Mapping
@@ -629,8 +630,8 @@ class TestSpawnBoundSizingModel:
     model inside test_offline_lane_integration.py, where only that module
     could reach it.  Task 5333 needed the same arithmetic for
     test_merge_queue_deep_integration_gate.py -- which cannot import a test
-    module without coupling the two suites\' collection order -- so it moved to
-    _orch_helpers.py, this package\'s established home for the
+    module without coupling the two suites' collection order -- so it moved to
+    _orch_helpers.py, this package's established home for the
     timeout-constant family.  The last test below is what stops the old copy
     growing back.
     """
@@ -657,7 +658,7 @@ class TestSpawnBoundSizingModel:
     def test_the_model_is_the_bounded_sum_plus_its_priced_spawns(self) -> None:
         """``required = bounded_secs + out_of_bound_spawns x latency``.
 
-        Two of the three rows are numbers the model\'s callers ALREADY
+        Two of the three rows are numbers the model's callers ALREADY
         shipped, so the lifted copy is pinned to reproduce its origin rather
         than merely to be self-consistent: a move that quietly changed the
         arithmetic would leave every marker derived before it mis-sized, and
@@ -703,7 +704,7 @@ class TestSpawnBoundSizingModel:
             )
 
     def test_the_offline_lane_module_no_longer_defines_its_own_copy(self) -> None:
-        """The model\'s ORIGIN must import it, not redeclare it.
+        """The model's ORIGIN must import it, not redeclare it.
 
         Reads the source TEXT rather than the imported module, because that is
         the only way to tell an import apart from a redefinition: a module
@@ -745,6 +746,124 @@ class TestSpawnBoundSizingModel:
             'consolidated them.\n\n' + chr(10).join(redefinitions)
         )
 
+
+class TestDeepGateSceneBudget:
+    """The two constants that size TestRow7KillSwitchByteIdentity (task 5333).
+
+    The DERIVATION -- the measured spawn counts, the headroom, the rounding,
+    and the two ceilings it sits under -- has ONE home: the
+    ``DEEP_GATE_SCENE_TEST_TIMEOUT`` comment block in _orch_helpers.py.  This
+    class is that comment's EXECUTABLE link, the same shape
+    :class:`TestVerifyCliBudgetConstant` gives the YAML pin and
+    :class:`TestSanctionedNameMirrors` gives the mirror map: the literals stay
+    literals, and a runtime re-derivation is what keeps them honest.
+
+    WHY A LITERAL AND NOT AN IMPORT-TIME EXPRESSION -- the argument
+    ``VERIFY_CLI_PER_TEST_TIMEOUT``'s own comment makes, plus a mechanical
+    one: :func:`_resolve_seconds` resolves only bare or dotted NAMES present
+    in :data:`_SANCTIONED_TIMEOUT_NAMES`, so a marker spelled as arithmetic
+    yields None -- "no opinion" -- and the ratchet would stop having a view of
+    this marker at all.
+    """
+
+    def test_the_budget_covers_the_measured_worst_case(self) -> None:
+        """The budget may never be tightened below what the class really costs.
+
+        A budget BELOW the measurement would fail every run, loaded or not.
+        The headroom above it is deliberate, and its size is argued in the
+        constant's comment rather than here.
+        """
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+
+        assert budget >= 234, (
+            f'DEEP_GATE_SCENE_SPAWN_BUDGET is {budget}, below the 234 git '
+            'spawns TestRow7KillSwitchByteIdentity\'s heaviest test '
+            '(test_the_same_sequence_at_cap_six_moves_every_deep_field) was '
+            'MEASURED to make. Measured 2026-09-14 at main 99ab62335a by '
+            'counting asyncio.create_subprocess_exec/_shell per test, '
+            'IDENTICAL across two independent runs (the other two tests cost '
+            '113 each; 460 total, against 0.00s of asyncio.sleep -- which is '
+            'what makes this class spawn-bound rather than sleep- or '
+            'CPU-bound). A budget below the measurement fails every run, not '
+            'just a loaded one. Re-measure before lowering it, and re-derive '
+            'DEEP_GATE_SCENE_TEST_TIMEOUT in the same commit.'
+        )
+
+    def test_the_timeout_is_the_budget_priced_and_rounded_to_the_grid(self) -> None:
+        """``ceil(required_timeout_secs(0.0, budget) / 60) * 60``, re-derived here.
+
+        ``bounded_secs`` is 0.0 because the class was measured to perform
+        0.00s of ``asyncio.sleep``: it has no bounded waits, so its whole cost
+        is the spawn term.
+
+        Sized against the BUDGET and not against the raw measurement, which is
+        what lets the autouse fixture in
+        test_merge_queue_deep_integration_gate.py keep the marker honest: the
+        marker can only be wrong if the budget is breached, and a breach fails
+        loudly, in-process, on the test that caused it.
+        """
+        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
+        timeout = _orch_helpers.DEEP_GATE_SCENE_TEST_TIMEOUT
+        required = _orch_helpers.required_timeout_secs(0.0, budget)
+        expected = math.ceil(required / 60) * 60
+
+        assert timeout == expected, (
+            f'DEEP_GATE_SCENE_TEST_TIMEOUT is {timeout}, but '
+            f'DEEP_GATE_SCENE_SPAWN_BUDGET ({budget} spawns x '
+            f'{_orch_helpers.MEASURED_SPAWN_LATENCY_SECS}s = {required}s) '
+            f'rounds up the 60s pyproject grid to {expected}. The two '
+            'constants are a PAIR -- moving the budget without re-deriving '
+            'the timeout leaves the marker sized for a scene that no longer '
+            'exists, which is the exact failure this task was filed to fix.'
+        )
+
+    def test_the_timeout_never_inverts_the_verify_budget(self) -> None:
+        """A marker may only ever LOOSEN verify's per-test budget, never tighten it.
+
+        The general rule and its cost are argued at
+        ``VERIFY_CLI_PER_TEST_TIMEOUT`` in _orch_helpers.py.  Asserted here
+        directly rather than left to the tree sweep because this marker is
+        DERIVED: a future re-derivation could walk it into the band without
+        anyone writing an in-band number by hand.
+        """
+        timeout = _orch_helpers.DEEP_GATE_SCENE_TEST_TIMEOUT
+
+        assert timeout >= VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'DEEP_GATE_SCENE_TEST_TIMEOUT ({timeout}) is below the verify '
+            f'CLI budget ({VERIFY_CLI_PER_TEST_TIMEOUT}), so the marker meant '
+            'to LOOSEN a slow class would instead TIGHTEN the run that gates '
+            'the merge. Re-derive the budget upward, or re-measure the spawn '
+            'latency -- do not simply clamp this constant.'
+        )
+
+    def test_the_timeout_fits_inside_the_whole_verify_run_budget(self) -> None:
+        """A per-test backstop larger than the whole verify's budget is no backstop.
+
+        Read from the REAL orchestrator.yaml at runtime, through the same
+        :data:`_ORCH_YAML` and in the same shape
+        :class:`TestVerifyCliBudgetConstant` reads the ``--timeout`` token --
+        so an
+        operator retuning the run budget down past this marker fails here
+        loudly instead of leaving a marker that can never fire.
+        """
+        timeout = _orch_helpers.DEEP_GATE_SCENE_TEST_TIMEOUT
+        config = yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))
+        run_budget = config.get('verify_command_timeout_secs')
+
+        assert run_budget is not None, (
+            f'{_ORCH_YAML} carries no verify_command_timeout_secs, which '
+            'DEEP_GATE_SCENE_TEST_TIMEOUT is bounded by. Without it this pin '
+            'checks nothing; restore the key or re-argue the bound.'
+        )
+        assert timeout <= run_budget, (
+            f'DEEP_GATE_SCENE_TEST_TIMEOUT ({timeout}s) exceeds '
+            f'verify_command_timeout_secs ({run_budget}s) in {_ORCH_YAML}. A '
+            'per-test backstop larger than the budget for the WHOLE verify '
+            'run can never fire: verify kills the run first, and the class '
+            'this marker protects goes back to dying as an unattributed '
+            'worker crash. Shrink the scene or raise the run budget -- '
+            'raising this constant alone buys nothing.'
+        )
 
 # ---------------------------------------------------------------------------
 # _timeout_marker_sites(source) -- inline-fixture unit tests.
