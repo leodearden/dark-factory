@@ -1138,6 +1138,123 @@ class TestDegradationIsLoud:
 
 
 @pytest.mark.asyncio
+class TestOutageStreakEscape:
+    """A sustained memory outage escalates once, above the per-dispatch noise.
+
+    Task 3659 (PRD lane β, INV-4). The per-query WARNING and the in-block
+    notice are the base layer: they report one dispatch. Neither says "this
+    has now failed N dispatches running", which is the difference between a
+    flaky call and an outage nobody has noticed.
+
+    A consecutive STREAK, not a time window: it resets on any success and
+    keeps reporting however slowly dispatches arrive (see the module
+    constant's own note on why ``shared.storm_counter`` is the wrong shape).
+    """
+
+    async def _failing_dispatch(self, briefing: BriefingAssembler) -> str:
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=ConnectionError('memory service unreachable')),
+        ):
+            return await briefing._get_memory_context(_task_scope(), 'implementer')
+
+    async def _healthy_dispatch(self, briefing: BriefingAssembler) -> str:
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value=_mcp_search_envelope([
+                _result('1', 'A recalled fact.', source_store='mem0'),
+            ])),
+        ):
+            return await briefing._get_memory_context(_task_scope(), 'implementer')
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    async def test_a_short_run_of_outages_does_not_escalate(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+                await self._failing_dispatch(briefing)
+
+        assert self._errors(caplog) == []
+
+    async def test_crossing_the_threshold_escalates_exactly_once(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await self._failing_dispatch(briefing)
+
+        errors = self._errors(caplog)
+        assert len(errors) == 1, errors
+        assert str(MEMORY_OUTAGE_STREAK_THRESHOLD) in errors[0], (
+            f'the escalation must name the streak it is reporting, got {errors[0]!r}'
+        )
+
+    async def test_a_single_success_resets_the_streak(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """What makes this a streak and not a burst: recovery clears it, so
+        the next run of failures must earn its own escalation from one."""
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+            await self._failing_dispatch(briefing)
+        await self._healthy_dispatch(briefing)
+
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+                await self._failing_dispatch(briefing)
+
+        assert self._errors(caplog) == []
+
+    async def test_the_per_dispatch_layer_still_reports_every_failure(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The escalation is an added layer, not a replacement: every failing
+        dispatch still warns and still says so in its own prompt."""
+        from orchestrator.agents.briefing import (
+            MEMORY_OUTAGE_NOTICE,
+            MEMORY_OUTAGE_STREAK_THRESHOLD,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            blocks = [
+                await self._failing_dispatch(briefing)
+                for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD)
+            ]
+
+        assert all(MEMORY_OUTAGE_NOTICE.split('{')[0] in block for block in blocks)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) >= 2 * MEMORY_OUTAGE_STREAK_THRESHOLD, (
+            'each dispatch fires two queries and each failure warns'
+        )
+
+    async def test_the_threshold_is_code_not_configuration(
+        self, briefing: BriefingAssembler,
+    ):
+        """D7: no new config knob. The query table and its alarm threshold
+        are code, revisited on evidence — hot-reload adds nothing for a
+        module constant, and a knob would invite per-project drift in what
+        counts as an outage."""
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        assert isinstance(MEMORY_OUTAGE_STREAK_THRESHOLD, int)
+        assert MEMORY_OUTAGE_STREAK_THRESHOLD > 1
+
+        knobs = set(type(briefing.config).model_fields) | set(
+            type(briefing.config.fused_memory).model_fields
+        )
+        assert not [name for name in knobs if 'streak' in name or 'outage' in name]
+
+
+@pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:
     """A standing caveat covers the leak channel the tag filter cannot reach.
 
