@@ -1146,6 +1146,87 @@ class TestCalibrationScriptArmTableLockstep:
             'at gate time and cannot import sampler.'
         )
 
+    def test_every_declared_readability_metric_is_one_the_collectors_emit(
+        self, tmp_path
+    ):
+        """The OTHER half of the arm table, which the projection above misses.
+
+        ``test_the_two_arm_tables_are_equal_in_both_directions`` projects only
+        ``spec.selector``, so ``spec.readability`` — the ``*_read_ok`` metric
+        each arm's coverage row is computed from — has no reconciler at all.
+        Renaming ``own_read_ok`` in sampler.metrics leaves every suite green
+        and turns every ``own_*`` coverage row in the ε1/ε2 report into a
+        phantom verdict about a metric nothing writes.
+
+        Reconciled against what the REAL collectors EMIT rather than against
+        another table, because the read_ok names are emitted as literals by
+        ``collect_load_metrics`` and no table owns them.
+        """
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        module = self._load_calibration_script()
+        tree = live_topology(tmp_path)
+        emitted = set(collect_load_metrics(
+            read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        ))
+        emitted_stems = {name.split(':', 1)[0] for name in emitted}
+
+        declared = {
+            spec.readability
+            for spec in module.ARM_METRIC_SELECTORS.values()
+            if spec.readability is not None
+        }
+        assert declared, (
+            'no arm declares a readability metric; the coverage rows in the '
+            'calibration report would all be "unknown"'
+        )
+        assert declared <= emitted_stems, (
+            'DRIFT ALARM. scripts/load-threshold-calibration.py declares '
+            f'readability metrics {sorted(declared - emitted_stems)} that '
+            'sampler.metrics.collect_load_metrics does not emit.\n'
+            f'  emitted: {sorted(emitted_stems)}\n'
+            'Every coverage row computed from a missing metric reports on zero '
+            'ticks, which is a fact about the report, not about the corpus.'
+        )
+
+    def test_every_emitted_read_ok_metric_is_claimed_by_an_arm(self, tmp_path):
+        """The reverse direction: a NEW readability metric must not go unread.
+
+        Without this, adding a ``*_read_ok`` collector and forgetting to point
+        an ArmSpec at it silently produces an arm reported as having no
+        readability metric at all — indistinguishable from the four host-PSI
+        arms, which genuinely have none.
+        """
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        module = self._load_calibration_script()
+        tree = live_topology(tmp_path)
+        emitted = set(collect_load_metrics(
+            read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        ))
+        emitted_read_ok = {
+            name.split(':', 1)[0] for name in emitted if '_read_ok' in name
+        }
+
+        declared = {
+            spec.readability
+            for spec in module.ARM_METRIC_SELECTORS.values()
+            if spec.readability is not None
+        }
+        assert emitted_read_ok <= declared, (
+            'DRIFT ALARM. sampler.metrics emits readability metrics '
+            f'{sorted(emitted_read_ok - declared)} that no ArmSpec claims, so '
+            'nothing in the calibration report is computed from them.'
+        )
+
     def test_loading_the_script_needs_no_first_party_package(self):
         """The property that makes this lockstep test possible at all."""
         module = self._load_calibration_script()

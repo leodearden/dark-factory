@@ -476,7 +476,70 @@ def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: 
         'readable_fraction'] == pytest.approx(1.0)
     assert coverage['own_cpu_some10:orchestrator-know-live.service'] == {
         'ticks': 20, 'readable': 2, 'readable_fraction': 0.1,
+        # Named, so a reader of the escalation can tell WHICH series was
+        # counted — the per-leaf join is the thing this test is about.
+        'readability_metric': 'own_read_ok:orchestrator-know-live.service',
     }
+
+
+def test_an_arm_whose_read_ok_rows_are_absent_reports_unknown_not_zero(
+    tmp_path: Path,
+):
+    """Zero ticks is an UNKNOWN coverage, not a 0% one.
+
+    ``readable/ticks if ticks else 0.0`` fabricated a 0.0 for a series with no
+    ``*_read_ok`` rows at all, and the floor check then emitted
+    "readable on 0/0 ticks (0.0%), below the 90% floor" — a verdict about the
+    corpus derived from the absence of evidence about it. That is the same
+    class of defect this file refuses everywhere else (a fabricated 1.0 for the
+    PSI arms; α's fail-open 0.0 persisted as a ratio).
+
+    It is REACHABLE, not hypothetical: the readability metric simply not being
+    in the corpus is what a sampler that never ran the load group produces, and
+    an operator reading "below the floor" would go looking for a flaky read
+    that never happened instead of for a collector that never ran.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [5.0] * 30})
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['runqueue_ratio']
+    assert coverage['ticks'] == 0
+    assert coverage['readable_fraction'] is None, (
+        'a coverage computed over zero ticks reported a number; '
+        f'got {coverage!r}'
+    )
+    assert 'unknown_readability' in payload['degradations'], payload['degradations']
+    assert 'low_readability' not in payload['degradations'], (
+        'absence of evidence was reported as evidence of a below-floor read '
+        f'rate: {payload["degradation_details"]}'
+    )
+    detail = next(d for d in payload['degradation_details']
+                  if d.startswith('unknown_readability'))
+    assert 'runqueue_read_ok' in detail, detail
+
+
+def test_the_unknown_coverage_line_does_not_claim_a_percentage(tmp_path: Path):
+    """The human report must not print 0.0% for a coverage it does not know."""
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [5.0] * 30})
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    assert 'BELOW THE FLOOR' not in result.stdout, result.stdout
+    coverage_lines = [
+        line for line in result.stdout.splitlines() if line.startswith('Coverage:')
+    ]
+    assert coverage_lines, result.stdout
+    # Scoped to the coverage line on purpose: a 0.0% hold FRACTION on a ladder
+    # rung is a real measurement and must keep printing.
+    for line in coverage_lines:
+        assert 'UNKNOWN' in line, line
+        assert '%' not in line, (
+            'the report printed a coverage percentage it does not know: ' + line
+        )
 
 
 def test_a_psi_arm_says_it_has_no_readability_metric_rather_than_inventing_one(

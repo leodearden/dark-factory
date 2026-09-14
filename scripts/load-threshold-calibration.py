@@ -593,7 +593,13 @@ def coverage_table(
         out[metric] = {
             'ticks': ticks,
             'readable': readable,
-            'readable_fraction': round(readable / ticks, 4) if ticks else 0.0,
+            # None, not 0.0, when there is nothing to divide by. Zero ticks is
+            # an UNKNOWN coverage; 0.0 is the claim "we looked and it was never
+            # readable", and the floor check below would then report absence of
+            # evidence as a below-floor verdict about the corpus. Same class of
+            # defect as the fabricated 1.0 refused above.
+            'readable_fraction': round(readable / ticks, 4) if ticks else None,
+            'readability_metric': key,
         }
     return out
 
@@ -601,15 +607,34 @@ def coverage_table(
 def readability_degradations(
     coverage: dict[str, dict[str, float] | None]
 ) -> list[str]:
-    """One named degradation per series whose coverage is below the floor."""
-    return [
-        f"low_readability: {metric} readable on {stats['readable']}/"
-        f"{stats['ticks']} ticks ({stats['readable_fraction']:.1%}), below the "
-        f'{D11_READABILITY_FLOOR:.0%} floor — read its hold fractions against '
-        'that coverage, not as a fortnight'
-        for metric, stats in sorted(coverage.items())
-        if stats is not None and stats['readable_fraction'] < D11_READABILITY_FLOOR
-    ]
+    """Name each series whose coverage is below the floor, or NOT KNOWN.
+
+    The two are separate degradations because they call for different operator
+    actions: ``low_readability`` says the collector ran and often failed, so
+    read the hold fractions against that coverage; ``unknown_readability`` says
+    the corpus carries no evidence either way, which usually means the
+    collector never ran at all. Folding the second into the first would send an
+    operator hunting a flaky read that never happened.
+    """
+    out = []
+    for metric, stats in sorted(coverage.items()):
+        if stats is None:
+            continue
+        if stats['readable_fraction'] is None:
+            out.append(
+                f"unknown_readability: {metric} has no "
+                f"{stats['readability_metric']} rows in the corpus, so its "
+                'coverage is unknown — not zero. Its hold fractions below are '
+                'over readable ticks of unknown count.'
+            )
+        elif stats['readable_fraction'] < D11_READABILITY_FLOOR:
+            out.append(
+                f"low_readability: {metric} readable on {stats['readable']}/"
+                f"{stats['ticks']} ticks ({stats['readable_fraction']:.1%}), below "
+                f'the {D11_READABILITY_FLOOR:.0%} floor — read its hold fractions '
+                'against that coverage, not as a fortnight'
+            )
+    return out
 
 
 def commit_report(path: Path, stamp: str) -> list[str]:
@@ -709,6 +734,12 @@ def main(argv: list[str] | None = None) -> int:
             readable = (
                 'Coverage: no readability metric for this arm, so the hold '
                 'fractions below are over readable ticks of unknown count.'
+            )
+        elif stats['readable_fraction'] is None:
+            readable = (
+                f"Coverage: UNKNOWN — no `{stats['readability_metric']}` rows in "
+                'the corpus, so the hold fractions below are over readable ticks '
+                'of unknown count. See degradations.'
             )
         else:
             readable = (
