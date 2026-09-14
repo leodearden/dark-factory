@@ -1,6 +1,6 @@
-"""Anti-drift parity guard: the fourteen code-quality heuristic HEADLINES in
-``docs/code-quality.md`` vs the copies the reviewer and architect role prompts
-now carry inline (task 5225).
+"""Anti-drift parity guard: the code-quality LISTS in ``docs/code-quality.md``
+vs the copies the reviewer and architect role prompts now carry inline
+(task 5225).
 
 A dispatched agent's system prompt cannot follow a cross-reference, so
 ``orchestrator/src/orchestrator/agents/roles.py`` carries the fourteen
@@ -12,26 +12,29 @@ second source.
 
 WHAT THIS ASSERTS — three things, and no sentence of prose on either side.
 (1) The 14 bold HEADLINE TOKENS of a numbered markdown list under the literal
-heading ``## The fourteen heuristics``, parsed by ONE parser from BOTH sides and
-compared as an ordered list EQUALITY rather than as a substring pin, so
-renaming, reordering, adding or dropping a headline on either side fails loudly
-and names the divergence. (2) Four STRUCTURAL anchors over the rest of the
-block: two section headings and the two stances' bold item labels. (3) The
-splice contract — which roles carry ``CODE_QUALITY_GUIDANCE``, how many times,
-and into which half of the reviewer's prompt.
+heading ``## The fourteen heuristics``. (2) The bold ITEM LABELS of the two
+bullet lists the prompt also duplicates — the two stances and the
+do-not-steer-by list. Both are read from BOTH sides by the same parser and
+compared as ordered list EQUALITIES rather than as substring pins, so renaming,
+reordering, adding or dropping an item on either side fails loudly and names the
+divergence, and neither list can drift from the doc unnoticed. (3) The splice
+contract — which roles carry ``CODE_QUALITY_GUIDANCE``, how many times, and
+into which half of the reviewer's prompt.
 
 What it does NOT assert is any sentence of prose, on either side. The doc's
-agreed readings and the prompt's surrounding instructions can both be rewritten
-word for word and this module stays green, and the items INSIDE the block's
-sections are deliberately unpinned for the reason recorded above
-``_SECTION_ANCHORS``. ``TestHeadlineParser`` demonstrates the headline half's
+agreed readings, each bullet's body and the prompt's surrounding instructions
+can all be rewritten word for word and this module stays green; only headline
+and label TOKENS are compared, and only against the doc. The items INSIDE those
+bullets are deliberately unpinned for the reason recorded above
+``_LABEL_SECTIONS``. ``TestHeadlineParser`` demonstrates the mechanism's
 can-fail executably rather than by assertion.
 
 TASK 5192 — open when this landed — is adjudicating whether prompt-PROSE drift
-guards earn their edit friction. This guard is over a STRUCTURED numbered list,
-not prose, which is exactly why rewording every sentence on either side is a
-no-op here. But if 5192 rules against structured pins too, THIS MODULE is in
-scope for that ruling: delete it and leave the prompt block in place.
+guards earn their edit friction. This guard is over STRUCTURED lists — numbered
+headlines and bullet labels — not prose, which is exactly why rewording every
+sentence on either side is a no-op here. But if 5192 rules against structured
+pins too, THIS MODULE is in scope for that ruling: delete it and leave the
+prompt block in place.
 
 Built in two halves, in that order — the layout of
 ``orchestrator/tests/test_cited_test_class_drift.py``: unit tests of the pure
@@ -45,7 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
-from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from _orch_helpers import make_prompt_resolution_workflow
@@ -53,6 +56,8 @@ from _role_splice_contract import SpliceContract, assert_brace_free, assert_none
 from code_quality_headlines import (
     DOC_PATH,
     HEADLINE_SECTION_HEADING,
+    bold_item_labels,
+    doc_bold_item_labels,
     doc_headlines,
     numbered_headlines,
 )
@@ -61,15 +66,9 @@ from shared.prompt_artifact import PromptArtifactStore
 from orchestrator.agents.roles import (
     ARCHITECT_CODE_QUALITY_ADDENDUM,
     CODE_QUALITY_GUIDANCE,
-    ERROR_REMEDY_HINT_GUIDANCE,
     REVIEWER_COMPREHENSIVE,
     ROLES,
 )
-
-# orchestrator/tests/test_code_quality_guidance_parity.py -> parents[0]=tests,
-# parents[1]=orchestrator, parents[2]=repo root. Same idiom as
-# orchestrator/tests/conftest.py's REPO_ROOT and test_cited_test_class_drift.py.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _ANCHOR = HEADLINE_SECTION_HEADING
 
@@ -77,13 +76,19 @@ _ANCHOR = HEADLINE_SECTION_HEADING
 _CODE_QUALITY_ROLES = frozenset({'architect', 'deep_reviewer', 'reviewer_comprehensive'})
 
 # ---------------------------------------------------------------------------
-# Anchors for the content half — MEASUREMENT RECORD, read this before adding one.
+# The content half — MEASUREMENT RECORD, read this before adding an anchor.
 #
-# Only SECTION HEADINGS and BOLD ITEM LABELS are pinned. The items INSIDE those
-# sections — the five interface-design smells, the four do-not-steer-by entries,
-# and the cite-by-name instruction — are deliberately NOT pinned. All of them
-# remain MANDATED content of CODE_QUALITY_GUIDANCE; what was removed is a test
-# pin, never the prompt text it pinned. Do not add the pins back.
+# Nothing here is PINNED against a literal written in this file. Every list the
+# prompt duplicates is DERIVED from docs/code-quality.md by the same parser that
+# reads the prompt, and compared as an ordered equality. That is the whole
+# difference between this module and a wording pin: a literal anchor asserts
+# that someone once typed a phrase, while a derivation asserts that the two
+# copies still agree — which is the only property INV-9 actually wants.
+#
+# The items INSIDE the bullets are deliberately not compared: the five
+# interface-design smells, each bullet's one-clause reason, and the cite-by-name
+# instruction. All of them remain MANDATED content of CODE_QUALITY_GUIDANCE;
+# what is absent is a test pin, never the prompt text. Do not add pins back.
 #
 # WHY, measured in both directions against this block's own prose: rewording
 # "monkeypatching a private name by dotted path" to "patching private names via
@@ -96,21 +101,28 @@ _CODE_QUALITY_ROLES = frozenset({'architect', 'deep_reviewer', 'reviewer_compreh
 # That is the standing rule of _role_splice_contract.py; two pins of this exact
 # family were deleted from test_roles_wait_pattern.py under the task 3607
 # review, and test_roles_scope_boundary.py records the same lesson from commit
-# d794419730.
-#
-# The anchors that survive are STRUCTURAL — they name the block's shape, not a
-# sentence in it, so every sentence inside can be rewritten freely. Do not soften
-# them into a looser regex, a case-insensitive match or a substring-of-substrings
-# check, and do not "strengthen" them into a regex either: _role_splice_contract.py
-# forbids both directions for the same reason.
+# d794419730. The bodies of these bullets diverge from the doc's BY DESIGN — the
+# prompt drops the doc's repo-specific measurements — so only labels are
+# comparable, and a body comparison would be a false failure waiting to happen.
 # ---------------------------------------------------------------------------
 
-#: The mandated sections of the block, plus the two stances' item labels.
-_SECTION_ANCHORS = (
-    '## Two stances',
-    '**Comments.**',
-    '**Tests.**',
-    '## Do not steer by',
+
+class _LabelSection(NamedTuple):
+    """A bullet list the role prompts duplicate from the doc, label for label."""
+
+    prompt_heading: str
+    doc_heading: str
+    label_count: int
+
+
+#: The two label lists, with the heading each side files them under. The stances
+#: share one heading; the do-not-steer-by list does not, because the doc keeps it
+#: inside a wider measurement section (a table of instruments, then the four
+#: don'ts) that the prompt deliberately omits. One parser still reads both sides,
+#: so the SHAPE compared is identical — only the section locator differs.
+_LABEL_SECTIONS = (
+    _LabelSection('## Two stances', '## Two stances', 2),
+    _LabelSection('## Do not steer by', '## What to measure, and what not to steer by', 4),
 )
 
 #: Substrings that would break one of the existing all-roles prompt scanners if
@@ -176,6 +188,27 @@ _NON_CONTIGUOUS = (
     '## Two stances\n'
 )
 
+# The anchor DEMOTED below ``## ``, with the section that follows carrying
+# numbered bold items of its own. A substring search would match the demoted
+# heading, and the ``^## `` terminator would not close it.
+_DEMOTED_ANCHOR = (
+    f'#{_ANCHOR}\n\n'
+    '1. **Informative names.** A name says what the thing is and does.\n\n'
+    '## A later section\n\n'
+    '2. **Not a heuristic.** A numbered bold item the slice must never reach.\n'
+)
+
+# Bullet-list synthetics. Continuation lines sit at column 0 carrying their own
+# inline bold, exactly as the real prompt's stances do.
+_BULLET_SECTION = (
+    '## Two stances\n\n'
+    '- **Comments.** Aim for code that is clear with no or low comments, since\n'
+    'a continuation line carries its own **inline bold** and is not an item.\n'
+    "- **Tests.** Test access to a module's internals is an interface smell.\n\n"
+    '## Do not steer by\n\n'
+    '- **Raw line count.** A bullet in a LATER section.\n'
+)
+
 
 class TestHeadlineParser:
     """The pure parser, against synthetic strings and ``tmp_path`` files only.
@@ -234,15 +267,59 @@ class TestHeadlineParser:
         )
         assert numbered_headlines(drifted, _ANCHOR) != numbered_headlines(_WELL_FORMED, _ANCHOR)
 
+    def test_a_demoted_heading_raises_rather_than_matching_as_a_substring(self):
+        # Demoting the heading below ``## `` is real structural drift, and the
+        # ``^## `` terminator cannot close a ``### `` section — so a substring
+        # match would run the slice on into later sections and report success.
+        # The heading is matched as a WHOLE LINE for exactly this reason; both
+        # parsers here share that slicer.
+        with pytest.raises(ValueError, match=re.escape(_ANCHOR)):
+            numbered_headlines(_DEMOTED_ANCHOR, _ANCHOR)
+
+
+class TestBoldItemLabels:
+    """The bullet-label parser, against synthetic strings only.
+
+    Same shape as :class:`TestHeadlineParser` and for the same reason: the real
+    doc and the real prompts agree on arrival, so only synthetics can show that
+    disagreement would be caught.
+    """
+
+    def test_labels_returned_in_document_order(self):
+        assert bold_item_labels(_BULLET_SECTION, '## Two stances') == ['Comments.', 'Tests.']
+
+    def test_a_continuation_line_s_inline_bold_is_not_a_label(self):
+        assert 'inline bold' not in bold_item_labels(_BULLET_SECTION, '## Two stances')
+
+    def test_section_stops_at_the_next_heading(self):
+        assert bold_item_labels(_BULLET_SECTION, '## Do not steer by') == ['Raw line count.']
+
+    def test_missing_heading_raises_naming_the_heading_it_looked_for(self):
+        with pytest.raises(ValueError, match=re.escape('## Nowhere')):
+            bold_item_labels(_BULLET_SECTION, '## Nowhere')
+
+    def test_one_renamed_label_makes_the_two_lists_unequal(self):
+        # THE CAN-FAIL PROOF for the label half.
+        drifted = _BULLET_SECTION.replace('- **Comments.**', '- **On comments.**')
+        assert (
+            bold_item_labels(drifted, '## Two stances')
+            != bold_item_labels(_BULLET_SECTION, '## Two stances')
+        )
+
 
 class TestDocHeadlines:
     """``doc_headlines`` — the file-reading wrapper around the pure parser."""
 
-    def test_doc_path_is_the_repo_root_code_quality_md(self):
+    def test_doc_path_resolves_to_a_real_code_quality_doc(self):
+        # ``is_file()`` is the assertion with content: it is what catches a wrong
+        # ``parents[]`` index in the helper. Re-deriving the expected path here
+        # and asserting equality would not — both sides would move together —
+        # so it is deliberately not done (heuristic 11).
+        #
         # Resolved from ``__file__``, so this holds inside a ``.worktrees/<id>``
         # checkout, which is where this test itself runs.
-        assert DOC_PATH == _REPO_ROOT / 'docs' / 'code-quality.md'
         assert DOC_PATH.is_file()
+        assert DOC_PATH.name == 'code-quality.md'
 
     def test_missing_doc_raises_loudly_rather_than_skipping(self, tmp_path):
         # tmp_path holds no code-quality.md at all. A caller with no doc to
@@ -262,15 +339,28 @@ class TestDocHeadlines:
 
 @pytest.fixture(scope='module')
 def resolved_prompts(tmp_path_factory) -> dict[str, str]:
-    """Every role's system prompt as PRODUCTION renders it.
+    """Every role's system prompt as PRODUCTION renders it, with NOTHING pinned.
 
     Resolved through the single production chokepoint
     ``TaskWorkflow._resolve_role_system_prompt``, which is what the task
     requires: reading ``roles.py`` source, or even ``role.system_prompt``,
     proves only that the text was typed — not that it survived ``str.format``
-    interpolation and ``compose_prompt`` assembly. Both production branches are
-    exercised with no per-role branching here (``prompt_spec`` set -> the
-    artifact store; ``prompt_spec is None`` -> ``system_prompt`` verbatim).
+    interpolation and ``compose_prompt`` assembly.
+
+    WHAT IS AND IS NOT EXERCISED. The artifact store is rooted at a fresh empty
+    ``tmp_path``, so ``reviewer_comprehensive`` — the one ``prompt_spec``-
+    carrying role — always takes the FALLBACK branch to its in-code constant.
+    The pinned branch is not exercised anywhere in this module, and that is the
+    intended semantics rather than a gap: a pinned artifact for (reviewer
+    prompt_id, model, ``_REVIEWER_PROMPT_HARNESS_VERSION``) replaces the whole
+    composed prompt, and the code-quality block lives in the optimizer-owned
+    HEURISTICS half (PRD tier1-prompt-optimization D-3) with the harness version
+    deliberately NOT bumped for it. So a reviewer resolving a pre-existing pin
+    can ship with no code-quality block at all while this module stays green —
+    the optimizer owning that half is the mechanism working as specified. If
+    that ever stops being intended, the remedy is to bump
+    ``_REVIEWER_PROMPT_HARNESS_VERSION`` so old pins stop resolving, not to
+    assert here.
 
     Module-scoped, and built from ``tmp_path_factory`` rather than at import
     time, because resolution needs a real project root and artifacts root. It
@@ -326,10 +416,37 @@ def contract(resolved_prompts) -> SpliceContract:
     the injectable seam for exactly this substitution.
 
     ``capability`` is a required field of the dataclass and has to be supplied,
-    but it is NEVER asserted on here — see
-    ``test_role_set_matches_capability_is_deliberately_not_called``. It is
-    written as an explicit membership predicate over ``_CODE_QUALITY_ROLES`` so
-    that no reader can mistake it for a derivation.
+    but it is NEVER asserted on here. It is written as an explicit membership
+    predicate over ``_CODE_QUALITY_ROLES`` so that no reader can mistake it for
+    a derivation.
+
+    TWO ARMS ARE DELIBERATELY NOT CALLED — do not "complete" the contract.
+
+    ``assert_role_set_matches_capability`` needs a machine-derivable property
+    that justifies the splice, and none exists. Measured: ``AgentRole`` carries
+    no such field; ``mcp_families`` cuts straight across the carrier set
+    (``architect`` shares ``plan_tools`` with ``debugger``/``implementer``/
+    ``simple_task``, and ``deep_reviewer``'s ``frozenset({'orchestrator'})``
+    equals ``steward``'s); and ``prompt_spec is None`` splits it,
+    ``reviewer_comprehensive`` being the sole pinned role. The carrier set is an
+    EDITORIAL judgement about which roles judge or design code, so deriving it
+    from a membership predicate over itself would be exactly the tautology the
+    helper's docstring forbids. ``assert_no_other_role_carries`` is the guard
+    that replaces it.
+
+    ``assert_placement`` cannot be called either: a
+    ``follows=ERROR_REMEDY_HINT_GUIDANCE`` call falls back to the up-front rule
+    for any role whose prompt does not contain that predecessor, and fails
+    there. ``reviewer_comprehensive`` is such a role — the wait/rejection/remedy
+    trio is spliced into ``_UNPINNED_PROMPT_ROLES``, which excludes the one
+    pinned role. Placement is covered instead by the ordered list equalities
+    above and by ``test_the_reviewer_block_landed_in_the_editable_half``.
+
+    Both records are prose, not assertions. Asserting them would pin incidental
+    facts about roles this module has no contract with — a legitimate change to
+    ``steward``'s MCP families, or a later task splicing the remedy-hint block
+    into the reviewer, would redden a code-quality parity test whose failure
+    message could only mislead the editor into "fixing" the wrong thing.
     """
     return SpliceContract(
         constant_name='CODE_QUALITY_GUIDANCE',
@@ -350,14 +467,27 @@ def contract(resolved_prompts) -> SpliceContract:
 class TestStancesAndCarrierSet:
     """The rest of what the block must carry, and where it may and may not land."""
 
-    # -- content: the mandated sections --------------------------------------
+    # -- content: the two lists derived from the doc --------------------------
 
     @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    @pytest.mark.parametrize('anchor', _SECTION_ANCHORS)
-    def test_each_mandated_section_is_structurally_present(
-        self, role_name, anchor, resolved_prompts,
-    ):
-        assert anchor in resolved_prompts[role_name]
+    @pytest.mark.parametrize('section', _LABEL_SECTIONS, ids=lambda s: s.prompt_heading)
+    def test_prompt_labels_equal_the_doc_labels(self, role_name, section, resolved_prompts):
+        # Same mechanism as the fourteen headlines, applied to the other two
+        # lists the prompt duplicates: an ordered equality against the doc, not
+        # a literal anchor. A heading missing on either side raises inside the
+        # parser, naming it, so the section's presence needs no separate test.
+        assert (
+            bold_item_labels(resolved_prompts[role_name], section.prompt_heading)
+            == doc_bold_item_labels(section.doc_heading)
+        )
+
+    @pytest.mark.parametrize('section', _LABEL_SECTIONS, ids=lambda s: s.prompt_heading)
+    def test_each_derived_list_has_its_full_membership(self, section):
+        # Non-vacuity, exactly as test_there_are_exactly_fourteen_of_them is for
+        # the headlines: an equality alone would hold if a list were emptied on
+        # both sides at once, or if a renamed heading were fixed on both sides
+        # while the items were lost.
+        assert len(doc_bold_item_labels(section.doc_heading)) == section.label_count
 
     # -- the splice contract ------------------------------------------------
 
@@ -395,10 +525,10 @@ class TestStancesAndCarrierSet:
         )
 
     def test_no_other_role_carries_the_guidance(self, contract):
-        # This stands in for assert_role_set_matches_capability (not called, see
-        # below): it is the honest guard against an accidental splice into an
-        # excluded role, which would ship silently and be paid on every
-        # invocation of that role.
+        # This stands in for assert_role_set_matches_capability, which is not
+        # called (see the contract fixture): it is the honest guard against an
+        # accidental splice into an excluded role, which would ship silently and
+        # be paid on every invocation of that role.
         contract.assert_no_other_role_carries(
             remedy=(
                 'Either remove the splice from that role, or add it to '
@@ -427,44 +557,6 @@ class TestStancesAndCarrierSet:
                 'block on every invocation of that role.'
             ),
         )
-
-    def test_role_set_matches_capability_is_deliberately_not_called(self):
-        """MEASUREMENT RECORD — do not "complete" the contract by adding it.
-
-        ``assert_role_set_matches_capability`` needs a machine-derivable property
-        that justifies the splice, and none exists. Measured: ``AgentRole``
-        carries no such field; ``mcp_families`` cuts straight across the carrier
-        set (``architect`` shares ``plan_tools`` with ``debugger``/
-        ``implementer``/``simple_task``, and ``deep_reviewer``'s
-        ``frozenset({'orchestrator'})`` equals ``steward``'s); and
-        ``prompt_spec is None`` splits it, ``reviewer_comprehensive`` being the
-        sole pinned role. The carrier set is an EDITORIAL judgement about which
-        roles judge or design code, so deriving it from a membership predicate
-        over itself would be exactly the tautology the helper's docstring
-        forbids. ``assert_no_other_role_carries`` is the guard that replaces it.
-
-        This test asserts the two measurements that make the above true, so the
-        record cannot silently go stale.
-        """
-        assert ROLES['deep_reviewer'].mcp_families == ROLES['steward'].mcp_families
-        assert {name for name in _CODE_QUALITY_ROLES if ROLES[name].prompt_spec is None} == {
-            'architect', 'deep_reviewer',
-        }
-
-    def test_placement_is_deliberately_not_asserted_by_the_contract(self, resolved_prompts):
-        """MEASUREMENT RECORD — ``assert_placement`` cannot be called here.
-
-        A ``follows=ERROR_REMEDY_HINT_GUIDANCE`` call falls back to the up-front
-        rule for any role whose prompt does not contain that predecessor, and
-        fails there. ``reviewer_comprehensive`` is such a role: the
-        wait/rejection/remedy trio is spliced into ``_UNPINNED_PROMPT_ROLES``,
-        which excludes the one pinned role. Placement is instead pinned by the
-        ordered list equality of ``TestFourteenHeuristicsReachTheRolePrompts``
-        and by the editable-half assertion below.
-
-        This asserts the measurement, so the record cannot go stale.
-        """
-        assert ERROR_REMEDY_HINT_GUIDANCE not in resolved_prompts['reviewer_comprehensive']
 
     # -- invariants with no shared helper ------------------------------------
 
