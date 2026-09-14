@@ -421,27 +421,60 @@
     },
     {
       "id": "3308-contract-drift-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "c",
+      "note": "No longer applicable: the docs-vs-code divergence has been documented, which is what the finding asked for. Dispositioned exactly as the plan required — on whether the PRD still states the superseded rows TODAY. It does still state them, at plans/dashboard-availability-prd.md's §Contract table, but they are no longer unannotated, which was the whole complaint ('the document is unchanged'). The PRD now carries an explicit block: 'Note on the shipped dedup horizon and I4's episode-end condition (amended 2026-08-12, task 4088, from the shipped scripts/dashboard-watchdog.py)', which corrects both rows the finding named, by number, and states the reason for correcting rather than rewriting: 'the original wording is what the gamma task was dispatched against, and erasing it would erase the record that the code deliberately diverged, along with the reasoning that justifies the divergence.' Row 1 is now documented as shipping 'at most one L2 per rolling RATE_WINDOW_SECS, keyed on the persisted last_escalation_epoch', with the flapping-dashboard rationale the finding itself judged 'the right call'. Row 2 (I4) is documented as shipping 'no further restarts until the episode ends, where any successful probe ends it'. The note also bounds itself — 'Both corrections are narrow ... only the dedup HORIZON and the episode-END CONDITION are corrected' — which is the precision the finding said a steward reading the contract needed. Recorded as (c) rather than (a) deliberately: nothing was FIXED, because the code was never wrong. The finding was about a document, and the document caught up. Amended 2026-08-12 by task 4088, eleven days after this verdict was emitted and never read.",
+      "followup_ticket": null,
+      "evidence": {
+        "rows_still_present_but_annotated": "the §Contract table rows remain; an explicit correction block now covers both",
+        "annotation": "'Note on the shipped dedup horizon and I4's episode-end condition (amended 2026-08-12, task 4088, from the shipped scripts/dashboard-watchdog.py)'",
+        "row_1_documented_as": "at most one L2 per rolling RATE_WINDOW_SECS, keyed on the persisted last_escalation_epoch",
+        "row_2_documented_as": "no further restarts until the episode ends, where any successful probe ends it",
+        "why_not_rewritten_in_place": "'erasing it would erase the record that the code deliberately diverged, along with the reasoning'",
+        "fixed_by": "task 4088, 2026-08-12",
+        "why_c_not_a": "the code was never wrong; the finding was about the document, and the document caught up"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3340-correctness-0",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live, unchanged. The guard is still exact-equality edge-triggered: `if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS: return` in scripts/legibility/nightly.py. A streak of 4 or more therefore returns early and posts nothing, so the sampling-cut door's only escalation is still the single one on the night the streak first equals the threshold. The finding's sharpest observation stands too: _escalate_barren_streak's own docstring names unread-journal-warnings as the failure mode it refuses to reproduce, and then reproduces it for this door. Its suggested remedy — re-fire on a bounded backoff such as streak in {3, 6, 12, 24} rather than exactly once — was not adopted. Reading this with 3340[1] as the plan directed, the two compound exactly as the finding warned: a persistent sampling-cut suppression escalates once, and the only level-triggered detector that would catch the continuing condition still has no caller.",
+      "followup_ticket": null,
+      "evidence": {
+        "guard_still_edge_triggered": "if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS: return",
+        "consequence": "streak 4+ posts nothing; one escalation ever for a persistent condition",
+        "remedy_not_adopted": "no bounded-backoff re-fire (e.g. {3, 6, 12, 24})",
+        "compounds_with": "3340-test-coverage-1 — the level-triggered detector still has no caller"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3340-test-coverage-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live. Re-ran the finding's own census across the whole repo (excluding this triage's own artifacts and the session's transcript files, both of which mention the name and would otherwise be false hits): every remaining reference is PROSE or the script itself. nightly.py's four hits are docstrings plus a log line; check_trickle_liveness.sh's two are comments; trickle_state.py's are docstrings — one of which still says 'when bound as a ...', i.e. conditional on a binding that does not exist; plans/confusion-reduction-prd.md is PRD prose; and the rest are its own tests. There is no .service or .timer unit, no task predicate binding, no yaml, and no OPERATIONS.md entry — grep for trickle_progress in OPERATIONS.md returns nothing. Dispositioned the way the plan required: on the presence of a CALLER, not on the presence of a test. scripts/tests/test_check_trickle_progress.py exists and is green, which is exactly the trap — 'has a test' is not 'has a caller', and the stdlib-only constraint the module docstrings justify at length is still written for a before_done predicate binding that was never filed. ONE PARTIAL MITIGATION since August, recorded for fairness: nightly.py now emits an operator-facing log line, 'Probe on demand with: check_trickle_progress.py ...', so a reader of the journal is at least told the probe exists. That improves discoverability and does not make the detector level-triggered, which is the property the finding was about. Neither of the finding's two remedies (file the binding, or say plainly in the PRD that the probe is hand-run-only) was taken.",
+      "followup_ticket": null,
+      "evidence": {
+        "caller_census": "all remaining references are prose/docstrings/log text or the script's own tests",
+        "no_binding_of_any_kind": "no .service, no .timer, no task predicate, no yaml, nothing in OPERATIONS.md",
+        "the_trap_the_plan_warned_about": "scripts/tests/test_check_trickle_progress.py exists — 'has a test' is not 'has a caller'",
+        "still_conditional_in_its_own_docs": "trickle_state.py says 'when bound as a ...' — a binding that does not exist",
+        "partial_mitigation": "nightly.py now logs 'Probe on demand with: check_trickle_progress.py ...' — discoverability, not level-triggering",
+        "neither_remedy_taken": "binding not filed; PRD does not say hand-run-only"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3340-correctness-2",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "b",
+      "note": "Still live as written, but LATENT rather than currently reachable — and the distinction matters enough to record, because it changes what the follow-up should say. `trickle_state_path` still derives the path from the calling process's environment: `${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/<project_id>/trickle-state.json`. Nothing pins the writer's and the reader's environments to agree, and the tempfile.gettempdir() degradation on an unset HOME is still in place. So the divergence mechanism is intact. WHAT MAKES IT LATENT: the finding's failure scenario requires the reader to be 'check_trickle_progress.py, ONCE BOUND as a before_done predicate' and EXEC'd by deterministic_runner with the orchestrator's environment. Per 3340[1], that binding still does not exist — there is no orchestrator-EXEC'd reader today, so the two independently-sourced environments never actually meet. The hazard is gated on the very binding whose absence is the other finding. That coupling is the useful output here: whoever files the missing binding (3340[1]) MUST fix the path derivation in the same change, or they will convert a dormant defect into a born-at-L2 milestone_check_failed escalation for a pipeline that is running perfectly — which is exactly the outcome this finding predicted. The follow-up should be worded as a precondition on the binding, not as an independent bug hunt.",
+      "followup_ticket": null,
+      "evidence": {
+        "derivation_unchanged": "${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/<project_id>/trickle-state.json, from the calling process's env",
+        "degradation_still_present": "unset HOME falls back to tempfile.gettempdir(), a path the nightly never writes",
+        "why_latent": "the failure needs an orchestrator-EXEC'd reader; per 3340[1] no such binding exists yet",
+        "coupling": "must be fixed IN THE SAME CHANGE as the 3340[1] binding, or filing that binding converts a dormant defect into a born-at-L2 milestone_check_failed for a healthy pipeline"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3363-correctness-0",
@@ -467,9 +500,17 @@
     },
     {
       "id": "3363-design-1",
-      "disposition": null,
-      "note": null,
-      "followup_ticket": null
+      "disposition": "a",
+      "note": "Fixed, and fixed along the exact line the finding drew. `internal_error` is still a member of `_UNCACHEABLE_ISSUE_KINDS`, so a glance at that frozenset would wrongly suggest nothing changed — the fix is in the predicate. `_is_uncacheable` now ends `return kind != 'internal_error' or issue.get('eval_id') is None`, so a SCOPED internal_error (one carrying an eval_id) is CACHEABLE and only an UNSCOPED one still defeats the cache. That is precisely point 1 of the finding: the per-eval internal_error drops one row and leaves the rest of the payload complete and useful — 'exactly the \"completed over a degraded tree\" case the same predicate deliberately keeps cacheable' — while the docstring's build-aborted argument only ever fitted the unscoped case. Point 2 (a content-reachable bug is deterministic and therefore a steady state) is answered by the same change: the recurring per-eval bug is now cacheable, so it can no longer defeat the cache on every build. The fix also shows its work on the part the finding did NOT ask to change: `unreadable_root` stays unconditionally uncacheable, and the docstring explains why the tempting generalisation was refused — 'A blanket \"any scoped issue is cacheable\" rule reads cleaner and is a no-op today, which is exactly what makes it a trap: unreadable_root means Path.iterdir raised and NOTHING was walked.'",
+      "followup_ticket": null,
+      "evidence": {
+        "frozenset_unchanged": "_UNCACHEABLE_ISSUE_KINDS still contains 'internal_error' — the fix is in the predicate, not the set",
+        "predicate_now": "return kind != 'internal_error' or issue.get('eval_id') is None",
+        "effect": "a scoped (per-eval) internal_error is cacheable; only an unscoped, build-aborting one is not",
+        "matches_finding_point_1": "the per-eval error drops one row and leaves a complete payload — the 'completed over a degraded tree' case",
+        "generalisation_deliberately_refused": "unreadable_root stays unconditionally uncacheable because iterdir raised and nothing was walked"
+      },
+      "checked_at": "2026-09-14"
     },
     {
       "id": "3367-correctness-0",
