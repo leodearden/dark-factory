@@ -3937,3 +3937,103 @@ class TestDecisionQueueDetail:
 
             assert table.get_row_index('session-a') != 0
             assert long_question in detail.rendered_text
+
+    @pytest.mark.timeout(10)
+    async def test_the_queue_emptying_hands_the_pane_back_to_the_session_table(self, tmp_path):
+        """A queue-owned pane must not outlive the queue.
+
+        When a watcher resolves the last open decision while the operator is
+        reading it, the queue empties and its highlighted key becomes None. If
+        ownership stayed with the queue, every later session-table rebuild would
+        decline the pane too, leaving the operator staring at a decision that no
+        longer exists with no rebuild able to clear it -- a wedged pane, not a
+        transient miss. So an empty queue releases ownership.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        # session-parked is NOT session-table row 0, so parking on it is a real
+        # cursor move and the fallback render below is a specific session, not
+        # just "whatever was already there".
+        sr.write_record(
+            _make_record(
+                session_slug='session-first',
+                start_ts='2026-07-07T00:00:00+00:00',
+                question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(
+                session_slug='session-parked',
+                start_ts='2026-07-07T00:01:00+00:00',
+                task_id='7004',
+                question=sr.Question(text='PPP parked question?', asked_at='2026-07-07T00:01:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        # Two decisions, because a move onto the already-highlighted row 0 posts
+        # no RowHighlighted at all -- with one queue row the queue could never
+        # take ownership and this test would pass vacuously.
+        for decision in (
+            sr.DecisionRecord(
+                id='dec-top', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            sr.DecisionRecord(
+                id='dec-read', project='df', text='ZZZ the decision being read?',
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+        ):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            table.move_cursor(row=table.get_row_index('session-parked'))
+            await pilot.pause()
+            assert app._selected_slug == 'session-parked'
+
+            assert queue.select_key('decision:dec-read')
+            await pilot.pause()
+            assert 'ZZZ the decision being read?' in detail.rendered_text
+
+            # a watcher answers every open decision -- the queue empties under
+            # the operator's cursor
+            for decision_id in ('dec-top', 'dec-read'):
+                assert sr.update_decision_state(
+                    decision_id, sr.DecisionState.ANSWERED, root=tmp_path
+                )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 0
+            assert 'ZZZ the decision being read?' not in detail.rendered_text
+            assert 'PPP parked question?' in detail.rendered_text
+
+            # and the pane is not merely cleared once: the session table can
+            # reach it again, so a later rebuild still refreshes it
+            sr.write_record(
+                _make_record(
+                    session_slug='session-parked',
+                    start_ts='2026-07-07T00:01:00+00:00',
+                    task_id='7004',
+                    question=sr.Question(
+                        text='PPP parked question, REVISED?', asked_at='2026-07-07T00:03:00+00:00'
+                    ),
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'PPP parked question, REVISED?' in detail.rendered_text

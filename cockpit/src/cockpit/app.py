@@ -153,8 +153,10 @@ class DetailOwner(StrEnum):
     Ownership is a property of the TABLE that moved, never of the record
     KIND on screen: the queue's own session rows render exactly what the
     session table renders, so the rendered kind cannot tell the two apart.
-    Transferred only by on_data_table_row_highlighted; read only by the
-    two rebuild-time re-syncs.
+    CLAIMED only by on_data_table_row_highlighted, and released back to
+    SESSION_TABLE -- the default, and the only owner that always has a
+    selection to render -- by _resync_queue_detail when the queue empties.
+    Read only by the two rebuild-time re-syncs.
     """
 
     SESSION_TABLE = 'session-table'
@@ -843,9 +845,24 @@ class CockpitApp(App):
         queue still owns the pane, and does nothing at all when it doesn't.
         Must run after self._queue_items_by_key is rebuilt -- that is the
         index _sync_queue_detail resolves *key* through.
+
+        An EMPTY queue (*key* None) RELEASES ownership rather than holding
+        it. The queue has no row left to own the pane with -- a watcher
+        resolved the last open decision, or the last awaiting-input session
+        was answered -- so holding on would lock the session table's
+        rebuilds out of the pane too, and the operator would be left
+        reading a decision that no longer exists with nothing able to clear
+        it. That is the one place "leave the pane as it is" degrades into a
+        wedged view rather than a transient miss, so the session table
+        takes the pane back and renders its own selection.
         """
-        if self._detail_owner is DetailOwner.QUEUE:
-            self._sync_queue_detail(key)
+        if self._detail_owner is not DetailOwner.QUEUE:
+            return
+        if key is None:
+            self._detail_owner = DetailOwner.SESSION_TABLE
+            self._show_session_detail(self._selected_slug)
+            return
+        self._sync_queue_detail(key)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
         """Resolve the focus/arrange backend for *kind* ('wm'/'tmux').
@@ -1392,15 +1409,18 @@ class CockpitApp(App):
         event.data_table disambiguates, the same way
         on_data_table_row_selected does.
 
-        This handler is the ONLY thing that writes self._detail_owner, and
-        so the ONLY thing that transfers detail-pane ownership between the
-        two tables: an operator cursor move hands the pane to the table
-        that moved, and a registry rebuild then refreshes whichever one
+        This handler is the ONLY thing that CLAIMS the detail pane for a
+        table: an operator cursor move hands the pane to the table that
+        moved, and a registry rebuild then refreshes whichever one
         currently owns it (see _rebuild_session_table/_rebuild_queue, both
-        of which suppress their own programmatic cursor events). Only the
-        session branch touches _selected_slug/cockpit-ui.json -- that
-        restore seam is the session table's alone, and a decision has no
-        session slug to restore to.
+        of which suppress their own programmatic cursor events). The one
+        other write to self._detail_owner is _resync_queue_detail's
+        RELEASE back to the session table when the queue empties, which
+        takes ownership away from a table that no longer has a row rather
+        than claiming it on any operator's behalf. Only the session branch
+        touches _selected_slug/cockpit-ui.json -- that restore seam is the
+        session table's alone, and a decision has no session slug to
+        restore to.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         if event.data_table is queue:
