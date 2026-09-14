@@ -100,6 +100,20 @@ _DEEP_GATE_MODULE = 'test_merge_queue_deep_integration_gate.py'
 #: The class whose marker is DERIVED from a measured spawn count (task 5333).
 _ROW7_CLASS = 'TestRow7KillSwitchByteIdentity'
 
+#: The only spellings a timeout marker in :data:`_DEEP_GATE_MODULE` may use.
+#: Two, not one, because the asymmetry is DELIBERATE: Row 7's marker is
+#: derived from its own measured cost, and its neighbours stay at the verify
+#: CLI budget because none of them has been measured.
+_DEEP_GATE_SPELLINGS = frozenset({
+    'VERIFY_CLI_PER_TEST_TIMEOUT',
+    'DEEP_GATE_SCENE_TEST_TIMEOUT',
+})
+
+#: Non-vacuity floor for the sweep of that module: it had eight real-git
+#: classes when the ratchet was written, and a sweep that found none would
+#: pass by finding nothing rather than by finding nothing wrong.
+_MIN_DEEP_GATE_MARKER_SITES = 8
+
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
 #: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
@@ -1717,4 +1731,64 @@ def test_the_marker_census_is_not_vacuous() -> None:
         f'{_MIN_EXPECTED_MARKER_SITES}) -- '
         '_timeout_marker_sites has probably stopped matching, so the ratchet '
         'would pass vacuously. Check it against the inline fixtures above.'
+    )
+
+
+def test_the_deep_gate_module_pins_every_timeout_by_name() -> None:
+    """No bare number may pin a timeout in the deep merge-queue gate.
+
+    WHY THIS MODULE GETS A RATCHET ITS NEIGHBOURS DO NOT.  All eight real-git
+    classes in it carried an IDENTICAL bare ``300`` -- classes whose measured
+    costs differ by more than 2x.  That uniformity is precisely what made
+    TestRow7KillSwitchByteIdentity's under-sizing invisible: a reader had no
+    way to see that one of the eight was roughly twice the weight of its
+    neighbours, because the file said the same thing about all of them.
+
+    A NAME fixes both halves of that.  It makes the next re-derivation ONE
+    edit instead of eight, and it makes a divergent class conspicuous -- the
+    file now states which classes are sized by the verify budget and which by
+    their own measurement, in the marker itself rather than in a comment that
+    can drift from it.
+
+    A FLOOR, not a proof: this checks the SPELLING. The value behind a
+    sanctioned name is held honest separately, by
+    :class:`TestSanctionedNameMirrors`.
+    """
+    sites = [site for module, site in _tree_scan().sites if module == _DEEP_GATE_MODULE]
+
+    assert len(sites) >= _MIN_DEEP_GATE_MARKER_SITES, (
+        f'only {len(sites)} timeout marker site(s) found in '
+        f'{_DEEP_GATE_MODULE} (expected at least '
+        f'{_MIN_DEEP_GATE_MARKER_SITES}). Either the module was renamed -- '
+        'update _DEEP_GATE_MODULE -- or its real-git classes lost their '
+        'markers, which is the condition this sweep exists to prevent and '
+        'would otherwise pass here VACUOUSLY, green because it found nothing '
+        'rather than because it found nothing wrong.'
+    )
+
+    unnamed = sorted(
+        (site for site in sites if site.spelling not in _DEEP_GATE_SPELLINGS),
+        key=lambda site: site.lineno,
+    )
+
+    assert not unnamed, (
+        f'{len(unnamed)} timeout marker(s) in {_DEEP_GATE_MODULE} pin a value '
+        'that is not one of the sanctioned constants '
+        f'{sorted(_DEEP_GATE_SPELLINGS)}.\n\n'
+        'Every real-git class in that file once carried an identical bare '
+        '300, and that uniformity is what hid TestRow7KillSwitchByteIdentity '
+        'being roughly twice the weight of its neighbours until it had cost '
+        'five recorded xdist worker crashes. Spelling the budget as a NAME '
+        'makes a re-derivation one edit rather than eight, and makes a class '
+        'whose budget genuinely differs conspicuous instead of invisible.\n\n'
+        'Import the constant from _orch_helpers rather than writing the '
+        'number: VERIFY_CLI_PER_TEST_TIMEOUT for a class sized by the verify '
+        'budget, DEEP_GATE_SCENE_TEST_TIMEOUT for one sized by its own '
+        'MEASURED spawn count. If a new class needs a third budget, measure '
+        'it and add a named constant -- do not reach for a literal.\n\n'
+        + '\n'.join(
+            f'  {_DEEP_GATE_MODULE}:{site.lineno} {site.qualname} '
+            f'({site.kind}) pins {site.spelling or "<no argument>"}'
+            for site in unnamed
+        )
     )
