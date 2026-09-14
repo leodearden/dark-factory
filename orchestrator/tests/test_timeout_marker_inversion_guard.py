@@ -59,6 +59,7 @@ import _orch_helpers
 import pytest
 import yaml
 from _orch_helpers import (
+    DEEP_GATE_SCENE_TEST_TIMEOUT,
     DELIBERATE_TIGHT_BOUND_CEILING,
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
@@ -130,6 +131,7 @@ _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'HEAVY_BARRIER_TEST_TIMEOUT': 300.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
+    'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
 }
 
 #: Qualname suffix for a ``pytestmark`` binding inside a class body, and the

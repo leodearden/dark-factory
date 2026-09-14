@@ -324,6 +324,77 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
     return bounded_secs + out_of_bound_spawns * MEASURED_SPAWN_LATENCY_SECS
 
 
+# task 5333: what TestRow7KillSwitchByteIdentity
+# (test_merge_queue_deep_integration_gate.py) is ALLOWED to cost, and the
+# per-test timeout derived from it.  This comment is the SINGLE home of that
+# derivation; the class points HERE rather than restating it, and
+# test_timeout_marker_inversion_guard.py::TestDeepGateSceneBudget re-derives
+# the second constant from the first at runtime so neither literal can drift.
+#
+# MEASURED, 2026-09-14 at main 99ab62335a, by counting
+# `asyncio.create_subprocess_exec`/`_shell` per test:
+#     test_the_same_sequence_at_cap_six_moves_every_deep_field   234 spawns
+#     test_the_kill_switched_run_matches_the_golden_transcript   113 spawns
+#     test_a_restarted_worker_inherits_no_halving_suspicion      113 spawns
+#     TOTAL 460 spawns, against 0.00s of summed `asyncio.sleep`.
+# The sleep total is the load-bearing half of that: with no bounded waits at
+# all, this class is ~100% SUBPROCESS-SPAWN-BOUND, so its wall clock is its
+# spawn count multiplied by per-spawn latency -- and per-spawn latency is
+# exactly what host CPU oversubscription inflates.  That is why it dominated
+# the crash census (5 of 7 recorded events): at 234 spawns it is the heaviest
+# thing in that file, while sharing the same 300s marker as classes a third
+# its size.
+#
+# THE COUNTS ARE DETERMINISTIC AND THE WALL CLOCK IS NOT, which IS the
+# load-sensitivity these constants exist to absorb.  Four runs of the same
+# three tests, spawn count identical (460) in every one:
+#     8.06s and 17.72s at loadavg ~98 / 32 cores;
+#     19.03s and 22.81s at loadavg 145 then 304 / 32 cores.
+# A 2.8x spread with the work held fixed. Sizing this marker from wall clock
+# would have meant sizing it from whatever the host happened to be doing; the
+# spawn count is the stable quantity, so the marker is sized from THAT.
+#
+# BUDGET = 234 + 26 (~11% headroom) = 260.  Headroom rather than a snug fit
+# because an unrelated change adding a few spawns must not fail the run --
+# only a change that makes the scene materially heavier should.
+#
+# TIMEOUT = 260 x 4.71 = 1224.6s, rounded UP the 60s pyproject grid to 1260
+# (the same rounding rule the offline lane's `@pytest.mark.timeout(120)`
+# comment works).  ROBUST to small re-measurement drift: every budget in
+# 255-267 rounds to this same 1260, i.e. a re-measured worst case anywhere in
+# 229-241 carrying the same +26 headroom moves nothing here.  (An earlier
+# draft of this comment put that plateau at 235-267; 235 in fact rounds to
+# 1140 -- see esc-5333-1.  The plateau's lower edge is 255, the first budget
+# whose priced cost clears 1200s.)
+#
+# SIZED AGAINST THE BUDGET, NOT AGAINST THE RAW 234 -- the distinction that
+# makes this pair maintainable rather than merely correct today.  A widened
+# marker alone decays: the next change that makes the scene heavier silently
+# re-creates the under-sizing, and the symptom returns as a bare xdist worker
+# crash on an innocent branch, with no assertion and no traceback.  Because
+# the timeout is derived from the BUDGET, and the budget is ENFORCED per test
+# by the autouse fixture on that class, the marker can only be wrong if the
+# budget is breached -- and a breach fails loudly, in-process, on the test
+# that caused it, naming the constant to re-derive.
+#
+# THAT DECAY IS MEASURED, NOT HYPOTHESISED: task 5028's `VerifyPort` injection
+# moved these counts from 231/110/110 to 234/113/113 within a single day, in
+# an unrelated lane, and nothing in the tree reported it -- the drift was
+# found only because this task re-measured by hand.  Which is the concrete
+# reason the budget is enforced rather than merely written down.
+#
+# TWO CEILINGS it sits under, both pinned by TestDeepGateSceneBudget:
+#   * `verify_command_timeout_secs` (7200s, orchestrator/orchestrator.yaml) --
+#     a per-test backstop larger than the whole verify run's own budget could
+#     never fire, so it would be no backstop at all;
+#   * `VERIFY_CLI_PER_TEST_TIMEOUT` -- 1260 is far ABOVE it, so this marker
+#     loosens under both budgets and cannot invert.  It is nowhere near the
+#     (DELIBERATE_TIGHT_BOUND_CEILING, VERIFY_CLI_PER_TEST_TIMEOUT) band and
+#     needs no grandfathering.
+DEEP_GATE_SCENE_SPAWN_BUDGET = 260
+DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
+
+
 # task 3540: the claimant-liveness TTL the row builder below derives its
 # symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
 # imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
