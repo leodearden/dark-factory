@@ -293,3 +293,76 @@ class TestHermeticFusedMemoryUrls:
                 f'_dashboard_helpers.HERMETIC_FUSED_MEMORY_URLS rather than '
                 f'relaxing this check.'
             )
+
+
+class TestApplyIsolatedEnvNeutralizesAmbientFusedMemoryUrls:
+    """The network axis of the same contract, pinned in two halves.
+
+    ``from_env()`` reads ``DASHBOARD_FUSED_MEMORY_URLS``; unset, it falls back
+    to the operator's live fused-memory instance, which every lifespan then
+    dials through ``_burndown_loop`` -> ``collect_snapshot`` -> ``fetch_tasks``
+    and through ``_metrics_loop``.
+
+    TWO halves, because either alone passes while the suite is still
+    un-hermetic.  The helper contract alone would pass if nothing ever called
+    the helper; the end-to-end alone would pass vacuously on a box where the
+    var happened to be set correctly by hand.
+
+    The DELETED case in the first half is the one that matters most, and is
+    why this var is SET rather than deleted like its three siblings: unset is
+    exactly the state the whole suite runs in today, and for this variable
+    unset means production.  The decoy case follows the precedent of
+    ``TestApplyIsolatedEnvNeutralizesAmbientKnownRoots`` above — an operator
+    shell or systemd unit may well have it set to something live.
+    """
+
+    def test_neither_a_decoy_nor_an_absent_value_survives(self, tmp_path):
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+
+        isolated_root = tmp_path / 'isolated'
+        ambient_states = {
+            'decoy': lambda mp: mp.setenv(
+                'DASHBOARD_FUSED_MEMORY_URLS', 'http://localhost:8002'
+            ),
+            'absent': lambda mp: mp.delenv(
+                'DASHBOARD_FUSED_MEMORY_URLS', raising=False
+            ),
+        }
+
+        for label, make_ambient in ambient_states.items():
+            with pytest.MonkeyPatch.context() as mp:
+                make_ambient(mp)
+
+                apply_isolated_env(mp, isolated_root)
+                cfg = DashboardConfig.from_env()
+
+                assert cfg.fused_memory_urls == list(HERMETIC_FUSED_MEMORY_URLS), (
+                    f'[{label}] apply_isolated_env must SET '
+                    f'DASHBOARD_FUSED_MEMORY_URLS at the hermetic endpoint, not '
+                    f'leave from_env() to resolve {cfg.fused_memory_urls}'
+                )
+                assert cfg.fused_memory_urls != list(DEFAULT_FUSED_MEMORY_URLS), (
+                    f'[{label}] the resolved list is the production default — '
+                    f'every app lifespan in this suite would fan out at the '
+                    f"operator's live fused-memory instance"
+                )
+
+    def test_the_real_client_fixture_resolves_the_hermetic_endpoint(self, client):
+        """Non-vacuous end-to-end: no MonkeyPatch context, the real session fixture.
+
+        Pins the whole chain — session-autouse fixture -> env -> ``from_env()``
+        -> ``lifespan`` -> ``app.state.config`` — so an edit that drops the
+        ``setenv`` reds HERE rather than silently re-aiming the suite at
+        production.
+        """
+        from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+
+        assert client.app.state.config.fused_memory_urls == list(
+            HERMETIC_FUSED_MEMORY_URLS
+        ), (
+            f'the live lifespan resolved '
+            f'{client.app.state.config.fused_memory_urls} — the suite is fanning '
+            f'out somewhere other than the measured-dead endpoint'
+        )
