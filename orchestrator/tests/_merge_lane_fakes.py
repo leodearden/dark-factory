@@ -7,7 +7,9 @@ hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
-that owns its worker never falls back to a production adapter by omission.
+that owns its worker never falls back to a production adapter by omission,
+and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
+nothing is draining.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
@@ -15,6 +17,7 @@ Imported by bare module name (``from _merge_lane_fakes import ...``), like
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from collections.abc import Collection, Coroutine, Mapping
 from pathlib import Path
@@ -97,12 +100,18 @@ class FakeVerifier:
 
     ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
     without a script, and records every task id it was asked about in
-    ``verified`` -- setting ``entered`` as it starts, which is how a test
-    waits for a scripted hang to be genuinely under way before it probes the
-    lane. The gates a merge passes through after a green scoped verify all
-    report clean, the disk guard reports *disk_reason* (``None``, the
-    default, being "proceed"), and dry-run investigations are recorded in
-    ``investigations`` rather than run.
+    ``verified``. ``await_entry(n)`` waits for the *n*-th entry into
+    ``run_scoped``, which is how a test waits for a scripted hang to be
+    genuinely under way before it probes the lane -- per CALL, so a test
+    that drives two verifies can wait for the SECOND one instead of being
+    let through early by the first. The gates a merge passes through after a
+    green scoped verify all report clean, the disk guard reports
+    *disk_reason* (``None``, the default, being "proceed"), and dry-run
+    investigations are recorded in ``investigations`` rather than run.
+
+    A subclass that overrides ``run_scoped`` to script a per-CALL sequence
+    calls ``_note_entry`` itself, so ``verified`` and ``entered_count`` stay
+    truthful for it too.
     """
 
     def __init__(
@@ -117,7 +126,27 @@ class FakeVerifier:
         self.disk_reason = disk_reason
         self.verified: list[str | None] = []
         self.investigations: list[dict[str, Any]] = []
-        self.entered = asyncio.Event()
+        self.entered_count = 0
+        self._entry_bell = asyncio.Event()
+
+    def _note_entry(self, task_id: str | None) -> None:
+        """Record one entry into ``run_scoped`` and wake its waiters."""
+        self.verified.append(task_id)
+        self.entered_count += 1
+        self._entry_bell.set()
+
+    async def await_entry(self, n: int = 1) -> None:
+        """Wait until ``run_scoped`` has been entered at least *n* times.
+
+        Nothing here is one-shot: the bell is cleared and re-awaited until
+        the COUNT says so, so waiting for the n-th verify cannot be
+        satisfied by an earlier one. Callers bound the wait themselves
+        (``asyncio.wait_for``), since how long the lane may legitimately take
+        to get there is the caller's knowledge, not this fake's.
+        """
+        while self.entered_count < n:
+            self._entry_bell.clear()
+            await self._entry_bell.wait()
 
     async def run_scoped(
         self,
@@ -128,8 +157,7 @@ class FakeVerifier:
         **options: Any,
     ) -> VerifyResult:
         task_id = options.get('task_id')
-        self.verified.append(task_id)
-        self.entered.set()
+        self._note_entry(task_id)
         script = self.scripts.get(task_id, self.default)
         if script.release is not None:
             await script.release.wait()
@@ -181,18 +209,21 @@ async def _nothing() -> None:
 class FakeClock:
     """``ClockPort`` that moves only when told to.
 
-    ``now`` and ``monotonic`` read ``time``; ``sleep`` advances it by the
-    requested seconds and yields once so other tasks run, keeping every
-    requested sleep in ``sleeps``.
+    Two independent readings, exactly as production has them: ``now`` reads
+    the wall-clock ``time`` (what the lane stamps with) and ``monotonic``
+    reads ``mono`` (what it measures durations against). ``sleep`` advances
+    BOTH by the requested seconds and yields once so other tasks run,
+    keeping every requested sleep in ``sleeps``.
 
-    ``tick`` additionally advances ``time`` on every ``monotonic()`` read.
+    ``tick`` additionally advances ``mono`` on every ``monotonic()`` read.
     That is how a test drives a lane loop which measures elapsed time off
     this clock but waits on something else -- the in-flight verify
     abort-poll waits on ``asyncio.wait(timeout=VERIFY_ABANDON_POLL_SECS)``
     and only READS ``monotonic()``, so with the default ``tick`` of 0 its
-    no-progress budget can never elapse. ``monotonic`` is the lane's
-    duration reference (never a stamp), so a tick is invisible to
-    ``now()``'s callers beyond the value they read.
+    no-progress budget can never elapse. Keeping the two counters apart is
+    what makes that safe: a test that ticks an hour per duration reading
+    does not thereby drag every ``now()`` stamp an hour into the future as a
+    side effect of however many durations the lane happened to read.
 
     ``newest_content_mtime`` reports ``content_mtime`` -- ``None`` or a
     frozen value being a merge worktree nothing is writing to -- and
@@ -210,6 +241,7 @@ class FakeClock:
         content_tick: float = 0.0,
     ) -> None:
         self.time = time
+        self.mono = time
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
@@ -220,8 +252,8 @@ class FakeClock:
         return self.time
 
     def monotonic(self) -> float:
-        reading = self.time
-        self.time += self.tick
+        reading = self.mono
+        self.mono += self.tick
         return reading
 
     def newest_content_mtime(self, root: Path) -> float | None:
@@ -234,6 +266,7 @@ class FakeClock:
     async def sleep(self, secs: float) -> None:
         self.sleeps.append(secs)
         self.time += secs
+        self.mono += secs
         await asyncio.sleep(0)
 
 
@@ -289,3 +322,69 @@ def make_lane(
         clock=FakeClock() if clock is None else clock,
         **kwargs,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class DrivenMerge:
+    """What one ``drive_merge`` produced.
+
+    *result* is what the driven coroutine returned; *request* is the REAL
+    ``MergeRequest`` the production enqueue path parked on the queue, for a
+    caller that wants to read what was actually enqueued.
+    """
+
+    result: Any
+    request: Any
+
+
+async def drive_merge(
+    submit: Coroutine[Any, Any, Any],
+    queue: asyncio.Queue[Any],
+    outcome: Any,
+    *,
+    timeout: float = 10.0,
+) -> DrivenMerge:
+    """Run *submit* to completion, playing the merger for what it enqueues.
+
+    Nothing drains a queue a test owns, so the request the production
+    enqueue path parks there would wait forever: this takes it off and
+    resolves it with *outcome*, delivering the result through the REAL
+    ``MergeRequest`` future the caller is awaiting rather than substituting
+    the lane's entry point.
+
+    The wait for that request RACES the driven coroutine, so a production
+    path that raises BEFORE it ever enqueues -- the common way these break
+    -- surfaces its own traceback here instead of a bare ``TimeoutError``
+    from an empty queue. Both tasks are awaited after cancellation, so a
+    failure never escapes as cross-test "Task exception was never
+    retrieved" noise.
+    """
+    driven = asyncio.ensure_future(submit)
+    getter = asyncio.ensure_future(queue.get())
+    try:
+        done, _pending = await asyncio.wait(
+            (driven, getter), timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise AssertionError(
+                f'nothing was enqueued within {timeout}s and the driven '
+                f'coroutine is still running'
+            )
+        if driven in done and not getter.done():
+            driven.result()  # re-raises the production failure, if there was one
+            raise AssertionError(
+                'the driven coroutine finished without enqueuing a merge request'
+            )
+        request = await getter
+        request.result.set_result(outcome)
+        return DrivenMerge(
+            result=await asyncio.wait_for(driven, timeout=timeout), request=request,
+        )
+    finally:
+        for task in (driven, getter):
+            task.cancel()
+            # Retrieve whatever each task settled on -- including an
+            # exception already re-raised above, which must not replace the
+            # one propagating out of the try block.
+            with contextlib.suppress(BaseException):
+                await task

@@ -478,7 +478,7 @@ class TestWedgedVerifyIntegration:
 
         try:
             await q.put(req)
-            await asyncio.wait_for(verifier.entered.wait(), timeout=15.0)
+            await asyncio.wait_for(verifier.await_entry(), timeout=15.0)
         except TimeoutError:
             gate_release.set()
             with contextlib.suppress(Exception):
@@ -693,6 +693,10 @@ async def _make_merged_item(
 # Nothing below depends on how long the host takes to run them.
 _LANE_SECS_PER_READING = 3600.0
 
+#: Hard stop for `_poll_for_lane_budgets`, so a dead abort poll fails with a
+#: readable assertion instead of spinning into the pytest-timeout worker kill.
+_MAX_LANE_BUDGET_POLLS = 1000
+
 
 def _dead_verify_clock() -> FakeClock:
     """Lane time for a merge worktree nothing is writing to.
@@ -725,9 +729,26 @@ async def _poll_for_lane_budgets(
     CLOCK rather than on a real-time sleep sized to the budget is what makes
     the must-NOT-abort assertions independent of host load. Returns early if
     the verify resolves, so a regression aborts the wait instead of hanging.
+
+    Both exit conditions are supplied by the code under test, so the wait is
+    bounded in POLLS as well: a lane abort poll that stopped running would
+    otherwise leave this spinning until pytest-timeout's ``thread`` method
+    ``os._exit()``s the whole xdist worker (pyproject.toml sets
+    ``timeout_method = 'thread'`` with ``--max-worker-restart=0``), turning a
+    plain regression into a crashed worker nobody can read. The cap is two
+    orders of magnitude above the ~10 polls a live driver needs.
     """
-    deadline = clock.time + budgets * worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
-    while clock.time < deadline and not verify_future.done():
+    deadline = clock.mono + budgets * worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
+    polls = 0
+    while clock.mono < deadline and not verify_future.done():
+        polls += 1
+        if polls > _MAX_LANE_BUDGET_POLLS:
+            raise AssertionError(
+                f'the lane abort poll stopped advancing the clock: after '
+                f'{polls} waits lane time is still {clock.mono} (needs '
+                f'{deadline}, i.e. {budgets} budget(s)) and the verify is '
+                f'still pending -- the poll loop driving this wait is stalled'
+            )
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS)
 
 
@@ -2489,7 +2510,7 @@ class TestContendedLeaseDefers:
             'a defer must leave the per-task dead-verify-abort counter untouched'
         )
 
-        clock.time += 0.1  # push the streak past the 0.05s budget
+        clock.mono += 0.1  # push the streak past the 0.05s budget
 
         # ── Attempt 2: past the budget — terminal, not another defer ──
         req2, result2 = await _drive_one('cap-1')
@@ -3612,7 +3633,7 @@ class TestSoleWaiterAbandonRetiresAtTheSite:
         verify = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
         # The verify is genuinely under way and the abandon poll is spinning
         # before the sole waiter gives up.
-        await asyncio.wait_for(verifier.entered.wait(), timeout=15.0)
+        await asyncio.wait_for(verifier.await_entry(), timeout=15.0)
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS)
         req.result.cancel()  # sole waiter gives up -> _request_abandoned
         vr = await asyncio.wait_for(verify, timeout=15.0)
@@ -3731,7 +3752,10 @@ class _HangThenPassVerify(FakeVerifier):
     async def run_scoped(self, *args: Any, **options: Any) -> Any:
         self.calls += 1
         if self.calls == 1:
-            self.entered.set()
+            # Record the entry through the base class's own bookkeeping, so
+            # `verified` and `entered_count` stay truthful for the call this
+            # override never delegates.
+            self._note_entry(options.get('task_id'))
             await asyncio.Event().wait()
             raise AssertionError('unreachable — never set')  # pragma: no cover
         return await super().run_scoped(*args, **options)
@@ -3811,7 +3835,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
                 # Wait for the DEAD first verify to be entered, so the
                 # no-progress budget is genuinely armed before we wait on
                 # the recovery.
-                await asyncio.wait_for(gate.entered.wait(), timeout=20.0)
+                await asyncio.wait_for(gate.await_entry(), timeout=20.0)
                 outcome = await asyncio.wait_for(req.result, timeout=40.0)
             finally:
                 with contextlib.suppress(Exception):

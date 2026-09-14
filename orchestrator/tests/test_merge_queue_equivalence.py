@@ -355,10 +355,23 @@ class TestCheckPostMergePyrightFailOpen:
     async def test_a_sha_no_worktree_can_be_created_at_fails_open(
         self, git_ops: GitOps, config: OrchestratorConfig, caplog,
     ):
-        """An unresolvable SHA makes worktree creation raise → not broken."""
-        mc = _make_module_config(prefix='pkg')
+        """An unresolvable SHA makes worktree creation raise → not broken.
 
-        with caplog.at_level(logging.WARNING):
+        Nothing was created here, so the merge-worktree set is empty either
+        way: what this row pins is that the infra-error path does not go on
+        to CLEAN UP a worktree that never existed, which only a record of
+        the cleanup calls can see.
+        """
+        mc = _make_module_config(prefix='pkg')
+        cleanups: list[Path] = []
+        original_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _recording_cleanup(merge_wt: Path) -> None:
+            cleanups.append(merge_wt)
+            return await original_cleanup(merge_wt)
+
+        with caplog.at_level(logging.WARNING), \
+                patch.object(git_ops, 'cleanup_merge_worktree', _recording_cleanup):
             result = await _check_post_merge_pyright(
                 'f' * 40, git_ops, config, [mc], task_id='infra-error-test',
             )
@@ -366,7 +379,10 @@ class TestCheckPostMergePyrightFailOpen:
         assert result.broken is False
         assert result.failing_subprojects == []
         assert any('infra error' in r.message.lower() for r in caplog.records)
-        # Nothing was created, so nothing is left to clean up.
+        assert cleanups == [], (
+            f'the infra-error path cleaned up a worktree it never created: '
+            f'{cleanups!r}'
+        )
         assert _merge_worktrees(git_ops) == []
 
     async def test_the_merge_worktree_is_removed_even_when_the_check_fails(
@@ -478,6 +494,35 @@ class TestRunUnscopedTypechecks:
         )
 
         assert result.failing_subprojects == ['pkg']
+
+    async def test_a_command_less_module_is_never_handed_to_the_verifier(
+        self, git_repo: Path, config: OrchestratorConfig,
+    ):
+        """Skipped means NOT RUN, not merely "contributed no failure".
+
+        A command-less module that reached ``run_verification`` would pass
+        vacuously and so never show up in ``failing_subprojects`` either way
+        — the classification lists cannot tell the two apart. Running it does
+        leave a trace: a verify lays its own artefacts down in the worktree
+        it is given, and a module list the helper skips entirely returns
+        before any of that. So the observation is the worktree itself,
+        untouched.
+        """
+        before = sorted(p.name for p in git_repo.iterdir())
+
+        result = await _run_unscoped_typechecks(
+            git_repo, config,
+            [_make_module_config(prefix='no-cmd', type_check_command=None)],
+            block_on_timeout=True, task_id='no-cmd-only-test',
+        )
+
+        assert result.broken is False
+        assert result.failing_subprojects == []
+        assert result.timed_out_subprojects == []
+        assert sorted(p.name for p in git_repo.iterdir()) == before, (
+            'the command-less module was handed to the verifier — it left '
+            'verify artefacts in the caller-owned worktree'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -712,4 +757,8 @@ class TestMergeLanePyrightCallSite:
         await _drain(worker, worker_task)
 
         assert outcome.status == 'blocked'
+        # WHY it blocked, not merely that it did: an unrelated earlier block
+        # would otherwise satisfy this row and leave the pyright path unproven.
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
         assert _merge_worktrees(git_ops) == []

@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
@@ -32,7 +33,6 @@ from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
     MergeOutcome,
-    MergeRequest,
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -121,18 +121,15 @@ async def _submit_with_outcome(
 ) -> WorkflowOutcome | None:
     """Submit to the merge queue and hand the request *outcome* off that queue.
 
-    Nothing drains *merge_queue* here, so the request the production enqueue
-    path parks on it would wait forever. Taking it off and resolving it
-    delivers *outcome* through the REAL MergeRequest the workflow is awaiting,
-    rather than substituting the lane's enqueue entry point.
+    The drive mechanics -- racing the submit against the enqueued request so
+    an early raise surfaces its own traceback, and retrieving both tasks
+    after cancellation -- live in ``drive_merge``; this names the entry point
+    these tests submit through.
     """
-    submit = asyncio.ensure_future(wf._submit_to_merge_queue('99', pre_rebased=False))
-    try:
-        request: MergeRequest = await asyncio.wait_for(merge_queue.get(), timeout=10.0)
-        request.result.set_result(outcome)
-        return await asyncio.wait_for(submit, timeout=10.0)
-    finally:
-        submit.cancel()
+    driven = await drive_merge(
+        wf._submit_to_merge_queue('99', pre_rebased=False), merge_queue, outcome,
+    )
+    return driven.result
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import make_lane
+from _merge_lane_fakes import drive_merge, make_lane
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
@@ -51,18 +51,15 @@ async def _drive_group_merge(
 ) -> WorkflowOutcome | None:
     """Run the group merge, playing the merger for the request it enqueues.
 
-    Nothing drains *merge_queue* in these tests, so the enqueued request would
-    park forever. Taking it off and resolving it delivers *outcome* through the
-    REAL MergeRequest future the workflow is waiting on, rather than stubbing
-    the workflow's own await seam and never enqueuing at all.
+    The drive mechanics -- racing the run against the enqueued request so an
+    early raise surfaces its own traceback, and retrieving both tasks after
+    cancellation -- live in ``drive_merge``; this names the entry point these
+    tests drive.
     """
-    run = asyncio.ensure_future(wf._maybe_enqueue_group_merge())
-    try:
-        request = await asyncio.wait_for(merge_queue.get(), timeout=10.0)
-        request.result.set_result(outcome)
-        return await asyncio.wait_for(run, timeout=10.0)
-    finally:
-        run.cancel()
+    driven = await drive_merge(
+        wf._maybe_enqueue_group_merge(), merge_queue, outcome,
+    )
+    return driven.result
 
 
 # ---------------------------------------------------------------------------
@@ -796,13 +793,15 @@ async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     assert fake_worker.halt_owner_esc_id is None, (
         'halt_owner_esc_id must remain None — set_halt_owner was never reached'
     )
-    # The un-halt carried a REASON, which is what says the orphan-halt guard
-    # fired rather than some unrelated resume: the lane logs it.
+    # WHICH reason the un-halt carried is what says the orphan-halt guard
+    # fired rather than some unrelated resume (workflow_cancelled resumes the
+    # same lane for an entirely different cause), so assert the guard's own
+    # token rather than the shape of the surrounding log line.
     unhalts = [
         r.getMessage() for r in caplog.records
         if 'all lanes un-halted' in r.getMessage()
     ]
-    assert unhalts and unhalts[-1].strip() != 'Merge queue: all lanes un-halted', (
-        f'the un-halt must cite a reason — guard fired on ownerless orphan '
-        f'halt; got {unhalts!r}'
+    assert any('halt_escalation_submit_failed' in m for m in unhalts), (
+        f'the un-halt must cite the orphan-halt guard\'s own reason '
+        f'(halt_escalation_submit_failed); got {unhalts!r}'
     )

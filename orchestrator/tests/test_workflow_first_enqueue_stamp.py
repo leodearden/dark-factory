@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
@@ -352,17 +353,15 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
     # Nothing is draining the queue, so the submit parks on its result until
-    # this test plays the merger: take the enqueued request off the real
-    # queue, resolve it, and let the submit finish.
-    submit = asyncio.ensure_future(wf._submit_to_merge_queue('99', pre_rebased=False))
-    try:
-        req = await asyncio.wait_for(merge_queue.get(), timeout=10.0)
-        req.result.set_result(MergeOutcome('blocked', reason='generic'))
-        await asyncio.wait_for(submit, timeout=10.0)
-    finally:
-        submit.cancel()
+    # this test plays the merger: drive_merge takes the enqueued request off
+    # the real queue, resolves it, and lets the submit finish.
+    driven = await drive_merge(
+        wf._submit_to_merge_queue('99', pre_rebased=False),
+        merge_queue,
+        MergeOutcome('blocked', reason='generic'),
+    )
 
     assert merge_queue.empty(), 'exactly one request must be enqueued'
-    assert req.merge_first_enqueued_at == 111.0
+    assert driven.request.merge_first_enqueued_at == 111.0
     # Write-once fast-path: no persist call
     f.update_task.assert_not_awaited()
