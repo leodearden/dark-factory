@@ -24,7 +24,12 @@ from typing import Any
 
 import pytest
 
-from escalation.models import Escalation
+from escalation.models import (
+    ACTION_KEEP_DRIVING,
+    ACTION_TERMINATE_CLEANLY,
+    FILER_ACTIONS,
+    Escalation,
+)
 from escalation.queue import EscalationQueue, observed_submit_response
 from escalation.server import create_server
 
@@ -327,3 +332,67 @@ class TestUnpersistedReachesTheAgentFacingEnvelope:
             f"Expected 'keep_driving' on an unpersisted L2 filing, got: {result}"
         )
         assert 'level' in result, f'Level echo missing: {result}'
+
+
+# ---------------------------------------------------------------------------
+# The filer-facing action vocabulary
+# ---------------------------------------------------------------------------
+
+
+class TestFilerActionVocabulary:
+    """`action` is an instruction NO CODE READS — its only consumer is the
+    agent reading the tool result.  That makes the wire values load-bearing
+    prose: `orchestrator.agents.roles.ESCALATION_LADDER_CORE` quotes them
+    verbatim to tell an agent which response means "stop" and which means
+    "keep driving", and a role prompt cannot be an f-string.  A rename here
+    would therefore decouple the instruction from the response it describes
+    while raising no import error anywhere — so the values are frozen by name
+    and the vocabulary is closed, letting the prompt's copy be pinned against
+    the emission site from across the package boundary.
+
+    This is NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side
+    `resolve_issue` disposition; the two vocabularies merely share a key name.
+    """
+
+    def test_wire_values_are_frozen(self):
+        """(a) The strings are the contract, not merely the names bound to them."""
+        assert ACTION_TERMINATE_CLEANLY == 'terminate_cleanly'
+        assert ACTION_KEEP_DRIVING == 'keep_driving'
+
+    def test_vocabulary_is_closed_and_enumerable(self):
+        """(b) One name finds every value, as RESOLVE_ACTIONS does handler-side."""
+        assert FILER_ACTIONS == (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+
+    @pytest.mark.asyncio
+    async def test_healthy_branch_emits_the_named_terminate_action(self, tmp_path: Path):
+        """(c)+(d) The observed-persist branch, asserted through the names.
+
+        Asserting through the constant is what makes the emission site and the
+        vocabulary provably the same object rather than two literals that
+        happen to match today.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result['action'] == ACTION_TERMINATE_CLEANLY, f'Unexpected action: {result}'
+        assert result['action'] in FILER_ACTIONS, (
+            f'An action no agent has been told how to read: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unpersisted_branch_emits_the_named_keep_driving_action(
+        self, tmp_path: Path,
+    ):
+        """(c)+(d) The unconfirmed-persist branch, asserted through the names."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result['action'] == ACTION_KEEP_DRIVING, f'Unexpected action: {result}'
+        assert result['action'] in FILER_ACTIONS, (
+            f'An action no agent has been told how to read: {result}'
+        )
