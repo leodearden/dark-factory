@@ -1540,7 +1540,7 @@ class TestTestTreeSweep:
         )
         block = metrics._report_enumeration(cluster, unreadable, coverage)
         assert block['complete'] is False
-        assert 'orchestrator/tests/test_broken.py' in block['unreadable']
+        assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
         with pytest.raises(metrics.MetricsError) as excinfo:
             metrics._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
