@@ -84,11 +84,30 @@ lock_depth: 12
 # segment whose member does not declare pytest-xdist, and not every member does.
 # Task 5408 shrank that set without emptying it — dashboard, escalation and
 # cockpit joined orchestrator and fused-memory. WHICH members do is deliberately
-# not restated here, because a list like that drifts silently: the invariant that
-# a pytest leg running ``-n`` must DECLARE the plugin is derived structurally from
-# the module-config walk and enforced by
+# not restated here, because a list like that drifts silently. What is gated
+# instead, stated at exactly its real width: a pytest leg that DECLARES ``-n``
+# in its own config — the module config's own argv, or the addopts of the member
+# its uv selector names — must declare the plugin. That is derived structurally
+# from the module-config walk by
 # tests/scripts/test_merge_gate_parallelism_config.py::
-# test_every_pytest_leg_running_workers_declares_the_plugin. The worker count
+# test_every_pytest_leg_running_workers_declares_the_plugin.
+#
+# READ THAT NARROWLY, because it is NOT the whole population of legs that end up
+# running ``-n``, and the difference is live today. ``verify_admission_pytest_n``
+# below is set to "8", and verify.py's ``_with_pytest_numprocesses_str`` appends
+# ``-n 8`` to EVERY pytest leg at the roles ``shared.verify_admission
+# .is_gated_role`` names (task, background) — a leg that declares the flag
+# nowhere still receives it. MEASURED on the task-5408 tree by running the
+# production parser over the live commands: sampler's
+# ``uv run --directory sampler pytest tests/ ...`` renders as
+# ``cd sampler && uv run pytest ... -n 8 tests/`` while
+# sampler/pyproject.toml's dev group lists no pytest-xdist at all. It survives
+# only by the same ``uv sync --all-packages`` accident recorded for
+# psutil/sampler further down, and the guard above cannot see it. Filed as
+# follow-up ticket tkt_0RTMJWCW8D5E60N72FATP7EC8F (curator-assigned task id
+# pending), which proposes both halves: declare the plugin for sampler, and
+# widen the guard to count the injected ``-n`` when this knob is a literal. When
+# that lands, widen this paragraph back with it. The worker count
 # belongs in each member's own addopts regardless: there it travels with that
 # member's own timeout/dist settings and also governs a bare
 # ``cd <member> && uv run pytest tests/``, which a flag added here would not.
@@ -151,7 +170,9 @@ lock_depth: 12
 # --tb=short/-q/--import-mode=importlib this segment does not, and task 5408
 # added `-n auto --dist loadgroup` there without parallelising this fallback
 # chain (doing so would need every member in it to declare pytest-xdist, which
-# is the same reason the uniform `-n` cap above stays rejected). That coupling is GATED, not merely asserted here —
+# is the same reason the uniform `-n` cap above stays rejected).
+# The TARGET-LIST coupling — and only that one; the flags above are explicitly
+# NOT coupled — is GATED, not merely asserted here:
 # tests/scripts/test_scripts_module_config.py::
 # test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
 # this segment through the production config loader and fails if either side
