@@ -348,3 +348,144 @@ class TestDropGuardRenameAwareness:
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
+async def _resolution_discards_the_branch_edit(
+    git_ops: GitOps, task_head: str, main_sha: str,
+) -> str:
+    """Merge the branch, then resolve by taking main's relocated file verbatim.
+
+    Produces a REAL merge commit — not a synthetic SHA — so
+    ``git diff -M`` still pairs ``pkg/a.py`` -> ``pkg/b.py``.  That pair
+    is the whole point: it is what reaches the suppression arm, while the
+    branch's ``BRANCH_EDIT`` is genuinely gone from the merged blob.
+    """
+    await _run(
+        ['git', 'merge', '--no-commit', '--no-ff', task_head],
+        cwd=git_ops.project_root,
+    )
+    # Tolerant: rename detection may already have staged the removal.
+    await _run(['git', 'rm', '-f', 'pkg/a.py'], cwd=git_ops.project_root)
+    rc, _, err = await _run(
+        ['git', 'checkout', main_sha, '--', 'pkg/b.py'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, f'checkout of main pkg/b.py failed: {err!r}'
+    rc, _, err = await _run(
+        ['git', 'commit', '-m', 'Resolution: take main, discard branch edit'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, f'resolution commit failed: {err!r}'
+    rc, out, _ = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+    )
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.mark.asyncio
+class TestDropGuardSuppressionIsContentVerified:
+    """A rename pair is a CANDIDATE for suppression, not a licence.
+
+    ``git diff -M`` pairs at ~50% similarity, so a resolution that
+    relocates a file and throws the branch's edit away still pairs.
+    Suppressing on the bare pair turns the drop-guard into a silent
+    work-loss hole; these tests pin that the branch's content must be
+    demonstrably present at the new name before a drop is discounted.
+    """
+
+    async def test_relocation_that_discarded_the_branch_edit_is_still_flagged(
+        self, git_ops: GitOps,
+    ):
+        """A pairable rename that LOST the branch's edit is a real drop."""
+        await _commit_base_module(git_ops)
+        wt, task_head = await _branch_modifies_the_module(
+            git_ops, 'drop-discarded',
+        )
+        await _main_relocates_and_edits(git_ops)
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await _resolution_discards_the_branch_edit(
+            git_ops, task_head, main_sha,
+        )
+
+        # Non-vacuous precondition 1: the file really did relocate.
+        rc, tree_out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', merge_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        tree = tree_out.split()
+        assert 'pkg/b.py' in tree, f'merged tree: {tree!r}'
+        assert 'pkg/a.py' not in tree, f'merged tree: {tree!r}'
+
+        # Non-vacuous precondition 2: the branch's work is GENUINELY GONE.
+        # This is what makes it a real drop rather than the esc-6436-4 case.
+        rc, blob, _ = await _run(
+            ['git', 'show', f'{merge_sha}:pkg/b.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert 'MAIN_EDIT' in blob, 'main work should have survived'
+        assert 'BRANCH_EDIT' not in blob, (
+            'fixture is wrong: the branch edit was supposed to be discarded'
+        )
+
+        # Non-vacuous precondition 3 — the load-bearing pin the existing
+        # negative test cannot provide: git DOES pair the rename, so the
+        # suppression arm is genuinely reached.  (The existing test stages
+        # an unpairable delete, so that arm never runs there.)
+        rc, ns_out, _ = await _run(
+            ['git', 'diff', '-M', '--name-status', task_head, merge_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert any(
+            ln.startswith('R') and 'pkg/a.py' in ln and 'pkg/b.py' in ln
+            for ln in ns_out.splitlines()
+        ), f'expected a pairable rename; got {ns_out!r}'
+
+        result = await _check_plan_targets_in_tree(
+            merge_sha, wt, git_ops, main_sha, task_id='drop-discarded',
+        )
+        assert result.dropped == ['pkg/a.py'], (
+            f'a relocation that discarded the branch edit is a real drop; '
+            f'got {result.dropped!r}'
+        )
+
+    async def test_drop_guard_content_probe_git_error_fails_closed(
+        self, git_ops: GitOps, caplog, monkeypatch,
+    ):
+        """An unverifiable survival claim must NOT suppress.
+
+        Note this is the OPPOSITE direction from
+        ``test_drop_guard_rename_map_git_error_fails_open``, deliberately.
+        An unreadable RENAME MAP means the guard cannot tell a rename from
+        a drop at all, so the whole guard degrades and fails open, uniform
+        with its four existing ``rc != 0`` arms.  An unverifiable CONTENT
+        PROBE means only that this ONE suppression is unproven; declining
+        it falls back to the pre-change ``flag`` behaviour, which by
+        construction cannot introduce a false block relative to main.
+        """
+        await _commit_base_module(git_ops)
+        wt, task_head = await _branch_modifies_the_module(
+            git_ops, 'drop-probe-error',
+        )
+        await _main_relocates_and_edits(git_ops)
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await _resolution_discards_the_branch_edit(
+            git_ops, task_head, main_sha,
+        )
+
+        spy = _RunSpy(fail_when=lambda cmd: 'apply' in cmd)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.merge_queue',
+        ):
+            result = await _check_plan_targets_in_tree(
+                merge_sha, wt, git_ops, main_sha, task_id='drop-probe-error',
+            )
+
+        assert result.dropped == ['pkg/a.py'], (
+            f'an unverifiable content probe must not suppress; got '
+            f'{result.dropped!r}'
+        )
