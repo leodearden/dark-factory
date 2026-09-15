@@ -25,6 +25,7 @@ from _verify_config_corpus import (
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
     ROOT_TYPE_CHECK_COMMAND,
+    SCRIPTS_CONFIG_PATH,
     SCRIPTS_LINT_COMMAND,
     load_config_scalar,
 )
@@ -792,6 +793,142 @@ class TestSerialPytest:
     def test_noop_on_opaque(self):
         cmd = parse_config_command('mypy src/')
         assert serial_pytest(cmd) == cmd
+
+    # ── the xdist worker-flag family `-o addopts=` cannot reach (task 5408) ──
+    #
+    # `serial_pytest` recovers by appending `-p no:xdist -o addopts=`. The
+    # `-o addopts=` clears an ADDOPTS-sourced `-n auto` — which is why the
+    # five modules that carry the flags in pyproject.toml are unaffected —
+    # but it cannot clear a flag already on ARGV, and `-p no:xdist` then
+    # UNREGISTERS the option that flag names. MEASURED on this tree against
+    # the live scripts leg, with `--dist` correctly bound:
+    #
+    #   uv run --project shared pytest ... -n auto --dist loadgroup \
+    #       -p no:xdist -o addopts= <probe>
+    #   pytest: error: unrecognized arguments: -n --dist          (rc=4)
+    #
+    # So every serial recovery of that leg — verify.py's env-transient
+    # re-run, and each flake-confirm re-run — hard-fails on a usage error
+    # instead of recovering. Independent of the `--dist` binding defect: this
+    # reproduces with the flag bound.
+    _XDIST_WORKER_FLAGS = ('-n', '--numprocesses', '--dist', '--maxprocesses')
+    _XDIST_ATTACHED_PREFIXES = ('--dist=', '--numprocesses=', '--maxprocesses=')
+
+    @staticmethod
+    def _live_scripts_test_command() -> str:
+        """The LIVE scripts leg, read from its yaml rather than copied here.
+
+        Same rationale as ``TestSplitAndChainSegmentsLiveConfigDrift``: the
+        recovery path runs whatever that config says today, so a copy would
+        let the config drift out from under this guard silently.
+        """
+        return load_config_scalar(SCRIPTS_CONFIG_PATH, 'test_command')
+
+    def _assert_no_xdist_worker_flags(self, rendered: str, *, what: str) -> None:
+        tokens = shlex.split(rendered)
+        offenders = [
+            token
+            for token in tokens
+            if token in self._XDIST_WORKER_FLAGS
+            or token.startswith(self._XDIST_ATTACHED_PREFIXES)
+        ]
+        assert not offenders, (
+            f'{what}: serial recovery left {offenders} on argv. With '
+            f'`-p no:xdist` also appended, pytest has unregistered those '
+            f'options and exits rc=4 with `unrecognized arguments`. '
+            f'`-o addopts=` clears only the ADDOPTS-sourced copy.\n'
+            f'rendered: {rendered!r}'
+        )
+
+    def test_live_scripts_leg_sheds_its_xdist_flags_on_serial_recovery(self):
+        command = self._live_scripts_test_command()
+        rendered = render(serial_pytest(parse_config_command(command)))
+        self._assert_no_xdist_worker_flags(rendered, what='live scripts leg')
+        assert '-p no:xdist' in rendered, rendered
+        assert '-o addopts=' in rendered, rendered
+        for target in ('tests/scripts/', 'scripts/tests/'):
+            assert target in shlex.split(rendered), (
+                f'the strip dropped the real target {target!r} — recovery must '
+                f'shed the worker flags, not the tests: {rendered!r}'
+            )
+
+    def test_a_doubled_worker_flag_is_stripped_in_full(self):
+        """verify.py can cap the workers BEFORE forcing serial, giving two `-n`.
+
+        Measured: ``apply_pytest_numprocesses(parsed, '8')`` appends `-n 8`
+        to a command whose argv already carries `-n auto`. A strip that
+        removes only the first occurrence leaves the identical usage error,
+        so this pins that ALL occurrences go.
+        """
+        parsed = parse_config_command(self._live_scripts_test_command())
+        capped = apply_pytest_numprocesses(parsed, '8')
+        assert capped.base_flags.count('-n') == 2, (
+            f'precondition lost: the ordering this guards against no longer '
+            f'produces a doubled -n ({capped.base_flags})'
+        )
+        self._assert_no_xdist_worker_flags(
+            render(serial_pytest(capped)), what='worker cap applied before serial',
+        )
+
+    def test_the_strip_preserves_the_already_serial_invariant(self):
+        """Shedding `-n` must not re-open the door `_is_serial_forced` closes.
+
+        ``apply_pytest_numprocesses`` consults ``_is_serial_forced`` to stay a
+        no-op on an already-serial command, precisely so a recovery re-run
+        cannot re-inject the `-n` that `-p no:xdist` has unregistered. That
+        keys on `no:xdist`, which the strip leaves alone — asserted here so
+        the strip cannot regress it, and true before the strip exists too.
+        """
+        stripped = serial_pytest(parse_config_command(self._live_scripts_test_command()))
+        assert _is_serial_forced(stripped)
+        assert apply_pytest_numprocesses(stripped, '8') is stripped, (
+            're-injection guard lost: -n came back after the command was '
+            'forced serial, which is the rc=4 this whole class is about'
+        )
+
+    # Grouped so that this file's real-subprocess probes land on ONE xdist
+    # worker rather than competing across workers; it is the only member
+    # today, and a future exec probe here joins it rather than adding a
+    # second uncoordinated heavyweight. No `uv`-on-PATH skipif: `uv` is a hard
+    # dependency of the command under test, so — exactly as `_BASH` above
+    # argues for bash — a missing toolchain must fail loudly rather than
+    # silently drop the coverage that closes this defect.
+    @pytest.mark.xdist_group('verify_cmd_real_pytest')
+    @pytest.mark.timeout(120)
+    def test_recovered_live_scripts_leg_is_accepted_by_a_real_pytest(self, tmp_path):
+        """The proof the structural arms are not just string-shuffling.
+
+        Renders the recovered command and re-targets it at a one-test probe
+        file, so what is under test is pytest's ARGUMENT GRAMMAR rather than
+        the 5333-test collection the real leg would run. Both streams are
+        captured into the failure message: a usage error is written to
+        STDERR, and omitting it is how this test would fail misleadingly.
+
+        Measured on this tree: rc=4 before the strip, rc=0 (1 passed) after.
+        """
+        probe = tmp_path / 'test_probe.py'
+        probe.write_text('def test_probe():\n    assert True\n', encoding='utf-8')
+
+        parsed = parse_config_command(self._live_scripts_test_command())
+        recovered = dataclasses.replace(serial_pytest(parsed), targets=(str(probe),))
+        rendered = render(recovered)
+
+        result = subprocess.run(
+            [_BASH, '-c', rendered],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=100,
+        )
+        assert result.returncode == 0, (
+            f'the serial-recovered scripts leg was rejected by pytest '
+            f'(rc={result.returncode}), so every env-transient and '
+            f'flake-confirm re-run of that leg fails on a usage error '
+            f'instead of recovering.\n'
+            f'rendered: {rendered!r}\n'
+            f'stdout: {result.stdout}\n'
+            f'stderr: {result.stderr}'
+        )
 
 
 class TestRawRewriteDoesNotSwallowSubshellTerminator:
