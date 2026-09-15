@@ -2763,12 +2763,16 @@ def observed_submit_response(
       'level'}``, carrying the record's REAL values.
 
     ``persist_check`` discriminates the two causes, which are materially
-    different for an operator debugging the outage: ``'absent'`` means
-    ``queue.get`` exhausted the queue root, the archive, a targeted archive
-    re-probe AND the TOCTOU re-locate retry, so the record genuinely is not on
-    disk; ``'unreadable'`` means the read itself failed and the record's state
-    is simply unknown.  It is a structured field rather than two statuses
-    because the distinction does not change what the caller should do.
+    different for an operator debugging the outage: ``'absent'`` means nothing
+    for that id is on disk — ``queue.get`` exhausted the queue root, the
+    archive, a targeted archive re-probe AND the TOCTOU re-locate retry, and a
+    path re-probe agrees; ``'unreadable'`` means a read was attempted and
+    yielded no record, so the record's state is unknown rather than known to be
+    missing.  ``get`` answers ``None`` for BOTH — a file it cannot parse is a
+    ``None`` too — which is why the ``None`` branch re-probes instead of
+    assuming absence (``_classify_failed_reread``).  It is a structured field
+    rather than two statuses because the distinction does not change what the
+    caller should do.
 
     STILL FAIL-OPEN, in the sense that matters: a bookkeeping read never raises
     at the ladder's front door and never costs the caller its escalation id.
@@ -2810,13 +2814,22 @@ def observed_submit_response(
         )
         return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_UNREADABLE)
     if persisted is None:
-        logger.error(
-            'Post-submit re-read of %s found no record in the queue root or '
-            'the archive; the filing did not persist and will never reach '
-            'L1 or L2',
-            esc_id,
-        )
-        return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_ABSENT)
+        persist_check = _classify_failed_reread(queue, esc_id)
+        if persist_check == PERSIST_CHECK_ABSENT:
+            logger.error(
+                'Post-submit re-read of %s found no record in the queue root or '
+                'the archive; the filing did not persist and will never reach '
+                'L1 or L2',
+                esc_id,
+            )
+        else:
+            logger.error(
+                'Post-submit re-read of %s found a file on disk that yielded no '
+                'record (a torn or corrupt write is the likely cause); its '
+                'persistence is UNCONFIRMED and it may never reach L1 or L2',
+                esc_id,
+            )
+        return _unpersisted_response(esc_id, fallback_level, persist_check)
     if persisted.status == 'pending':
         return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
     logger.warning(
@@ -2831,6 +2844,40 @@ def observed_submit_response(
         'resolved_by': persisted.resolved_by,
         'level': persisted.level,
     }
+
+
+def _classify_failed_reread(queue: EscalationQueue, esc_id: str) -> str:
+    """Why a ``None`` re-read yielded nothing: absent, or present-but-unreadable.
+
+    ``EscalationQueue.get`` answers ``None`` for two materially different
+    reasons.  The record may be nowhere — queue root, archive, the targeted
+    archive re-probe and the TOCTOU re-locate retry all missed.  Or a file for
+    that id IS on disk and yields no record: ``get`` warns and returns ``None``
+    when the JSON will not parse into an ``Escalation``, which is the torn or
+    corrupt write — precisely the "accepted but not durable" failure this
+    response exists to name.  Calling that ``'absent'`` would send an operator
+    hunting for a file that is sitting right there, so the path is re-probed to
+    tell the two apart.
+
+    Cheap by construction: the ``_locate_path`` call ``get`` just made
+    negative-caches a genuinely absent id, so this re-probe is a set hit rather
+    than a second archive scan.
+
+    Uses ``queue._locate_path`` because it is the one thing that answers "is
+    anything on disk for this id" without re-reading the record.  That is an
+    intra-module use of the class this module defines, not a reach into another
+    module's internals.
+    """
+    try:
+        located = queue._locate_path(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit path re-probe of %s failed (%s); reporting its persist '
+            'state as unknown rather than as a confirmed absence',
+            esc_id, exc,
+        )
+        return PERSIST_CHECK_UNREADABLE
+    return PERSIST_CHECK_ABSENT if located is None else PERSIST_CHECK_UNREADABLE
 
 
 def _unpersisted_response(

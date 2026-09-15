@@ -71,6 +71,21 @@ def _submit_pending(queue: EscalationQueue, *, level: int = 1) -> str:
     return queue.submit(esc)
 
 
+def _unlink_record(queue: EscalationQueue, esc_id: str) -> Path:
+    """Delete the record's file, so a later `get` misses it for the RIGHT reason."""
+    path = queue.queue_dir / f'{esc_id}.json'
+    path.unlink()
+    return path
+
+
+def _tear_record(queue: EscalationQueue, esc_id: str) -> Path:
+    """Leave a torn write behind: a real file that parses into no record."""
+    path = queue.queue_dir / f'{esc_id}.json'
+    text = path.read_text()
+    path.write_text(text[: len(text) // 2])
+    return path
+
+
 def _error_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno >= logging.ERROR]
 
@@ -102,17 +117,21 @@ class TestObservedSubmitResponseShapes:
         )
 
     def test_absent_record_reports_accepted_unpersisted(self, tmp_path: Path):
-        """(b) A re-read returning None → unpersisted, discriminated as 'absent'.
+        """(b) Nothing on disk → unpersisted, discriminated as 'absent'.
 
         `EscalationQueue.get` searches the queue root, the archive, a targeted
-        archive re-probe and a TOCTOU re-locate retry before returning None, so
-        None is strong evidence the record genuinely is not on disk.
+        archive re-probe and a TOCTOU re-locate retry, and the None it returns
+        is re-probed for a surviving path before the verdict is written — so
+        'absent' is asserted here against a real empty filesystem rather than a
+        stub, because a stub cannot distinguish the two causes it now decides.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         esc_id = _submit_pending(queue, level=1)
-        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+        removed = _unlink_record(queue, esc_id)
 
         result = observed_submit_response(queue, esc_id, fallback_level=1)
+
+        assert not removed.exists(), 'Precondition: the record must really be gone'
 
         assert result['status'] == 'accepted_unpersisted', (
             f"Expected 'accepted_unpersisted' for an absent record, got: {result}"
@@ -122,6 +141,31 @@ class TestObservedSubmitResponseShapes:
         )
         assert result['level'] == 1, f'Level echo lost on the absent branch: {result}'
         assert result['id'] == esc_id, f'Escalation id lost: {result}'
+
+    def test_torn_write_reports_unreadable_not_absent(self, tmp_path: Path):
+        """(b') A file that IS on disk but parses into nothing is not 'absent'.
+
+        `get` answers None for a record it cannot parse exactly as it does for
+        one that is nowhere.  A torn or half-written file is the very "accepted
+        but not durable" failure this response exists to name, so reporting it
+        as a missing file sends the operator hunting for something that is
+        sitting right there — the one case where the two verdicts diverge in
+        practice is the one that must not lie.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc_id = _submit_pending(queue, level=1)
+        torn = _tear_record(queue, esc_id)
+
+        result = observed_submit_response(queue, esc_id, fallback_level=1)
+
+        assert torn.exists(), 'Precondition: the torn file must still be on disk'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'A torn write is still an unconfirmed persist: {result}'
+        )
+        assert result['persist_check'] == 'unreadable', (
+            f"A torn write is unreadable, not absent: {result}"
+        )
+        assert result['level'] == 1, f'Level echo lost on the torn-write branch: {result}'
 
     def test_unreadable_record_reports_accepted_unpersisted(self, tmp_path: Path):
         """(c) A re-read that RAISES → unpersisted, discriminated as 'unreadable'.
@@ -174,7 +218,7 @@ class TestObservedSubmitResponseShapes:
         esc_id = _submit_pending(queue, level=1)
 
         if break_get == 'absent':
-            queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+            _unlink_record(queue, esc_id)
         else:
             def _boom(escalation_id: str):
                 raise OSError('simulated unreadable escalation file')
@@ -195,7 +239,7 @@ class TestUnpersistedLogsAtError:
     def test_absent_branch_logs_error_naming_the_id(self, tmp_path: Path, caplog):
         queue = EscalationQueue(tmp_path / 'esc')
         esc_id = _submit_pending(queue, level=1)
-        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+        _unlink_record(queue, esc_id)
 
         with caplog.at_level(logging.ERROR, logger=_QUEUE_LOGGER):
             observed_submit_response(queue, esc_id, fallback_level=1)
@@ -222,6 +266,35 @@ class TestUnpersistedLogsAtError:
         assert matching, (
             f'Expected an ERROR naming {esc_id}; got: '
             f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    def test_the_two_causes_do_not_share_one_sentence(self, tmp_path: Path, caplog):
+        """(g) A log that cannot tell the two apart necessarily lies about one.
+
+        Deliberately wording-agnostic: what is pinned is that a file left on
+        disk and a file that is gone produce DIFFERENT operator-facing
+        sentences, never a particular phrasing.  The `persist_check` field is
+        the machine-readable half of the same distinction.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        gone_id = _submit_pending(queue, level=1)
+        _unlink_record(queue, gone_id)
+        torn_id = _submit_pending(queue, level=1)
+        _tear_record(queue, torn_id)
+
+        with caplog.at_level(logging.ERROR, logger=_QUEUE_LOGGER):
+            observed_submit_response(queue, gone_id, fallback_level=1)
+            observed_submit_response(queue, torn_id, fallback_level=1)
+
+        said = {
+            esc_id: [r.getMessage() for r in _error_records(caplog) if esc_id in r.getMessage()]
+            for esc_id in (gone_id, torn_id)
+        }
+        assert all(said.values()), f'Both causes must log an ERROR: {said}'
+        gone_sentence = said[gone_id][0].replace(gone_id, '<id>')
+        torn_sentence = said[torn_id][0].replace(torn_id, '<id>')
+        assert gone_sentence != torn_sentence, (
+            f'One sentence for both causes cannot be true of both: {gone_sentence!r}'
         )
 
 
