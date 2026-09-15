@@ -30,7 +30,7 @@ returns False) because they sweep the WHOLE tree, so a mid-edit or deliberately
 malformed fixture file must not redden a guard about something else. This
 instrument inverts that polarity for its own named cluster: an Appendix A file
 the script cannot parse is not noise, it IS the finding (INV-11, no silent
-fail-soft). The 559-file test sweep keeps the siblings' per-file fail-soft
+fail-soft). The whole-test-tree sweep keeps the siblings' per-file fail-soft
 polarity, but every skipped file lands in ``enumeration.unreadable`` and the
 ratchet refuses to compare a partial enumeration at all -- so a degraded sweep
 can never masquerade as a clean tree.
@@ -38,20 +38,42 @@ can never masquerade as a clean tree.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This module AST-parses the 22-path Appendix A cluster plus every *.py under
-# orchestrator/tests/ (559 files at authorship time), and runs complexipy over
-# the cluster. MEASURED end to end at 35-65s. The 60s ini default would be a
-# coin flip, and pytest-timeout's thread method enforces it by os._exit()ing the
-# xdist worker -- which with --max-worker-restart=0 truncates the whole session
-# and reports against an innocent test (esc-3980-1). See
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py.
+# This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, two
+# of them globs) plus every *.py under orchestrator/tests/, and runs complexipy
+# over the cluster. All of that is ONE measurement per session, taken by the
+# module-scoped `live_measurement` fixture below.
+#
+# WALL CLOCK ON THIS HOST IS NOT A RELIABLE MEASURE of this module: repeated
+# runs over ONE unchanged tree spread as widely as the effect of task 5101,
+# which cut the work here fourfold. So every guard added by that task counts
+# WORK -- ast.parse / Path.read_text / complexipy calls -- and none asserts
+# elapsed time; see `no_private_tree_scan` and
+# TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once. The
+# before/after measurement history is recorded once, dated, in
+# plans/merge-lane-quality-prd.md Open Question 7; per-run seconds restated here
+# would only drift.
+#
+# A HIGH RUNTIME HERE IS NOT A COMPLEXIPY VERSION SIGNAL. An earlier version of
+# this comment estimated "MEASURED end to end at 35-65s" and the module then ran
+# several times that, with 6.2.0 correctly resolved and require_complexipy()
+# passing on every one of those runs. A wrong version fails immediately and by
+# name, before any measurement.
+#
+# The 60s ini default would be a coin flip, and pytest-timeout's thread method
+# enforces it by os._exit()ing the xdist worker -- which with
+# --max-worker-restart=0 truncates the whole session and reports against an
+# innocent test (esc-3980-1). See WHOLE_TREE_SCAN_TEST_TIMEOUT in
+# _orch_helpers.py. That mark is PER ITEM and the slowest single item has always
+# sat far below it, so it was never the thing at risk here.
 #
 # NOTE this mark is deliberate and NOT compelled by the family guard
 # test_whole_tree_scan_timeout_guard.py: its ``_scans_whole_tree_py`` detector
@@ -62,11 +84,11 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 #
 # The xdist_group pins the WHOLE module to one worker. Without it, --dist
 # loadgroup distributes these items individually and every worker that draws one
-# pays build_report's measured 72.7s over again -- 22 complexipy runs plus a
-# 559-file AST sweep -- for a single cached result. Grouped, the module takes
-# that cost exactly ONCE (module-scoped `live_report` below) while running in
-# parallel with the rest of the suite. `xdist_group` is a registered marker; see
-# test_marker_registration_drift.py's allowlist.
+# pays build_report over again -- a complexipy pass over the cluster plus a
+# whole-tree AST sweep -- for a single cached result. Grouped, the module takes
+# that cost exactly ONCE (module-scoped `live_measurement` below) while running
+# in parallel with the rest of the suite. `xdist_group` is a registered marker;
+# see test_marker_registration_drift.py's allowlist.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group('merge_lane_ratchet'),
@@ -85,17 +107,115 @@ import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: 
 _REPO_ROOT = Path(__file__).parents[2]
 
 
-@pytest.fixture(scope='module')
-def live_report() -> dict:
-    """THE single real measurement this module takes.
+@dataclasses.dataclass(frozen=True)
+class LiveMeasurement:
+    """The one real ``build_report``, and the complexipy work taking it cost."""
 
-    build_report measures 72.7s on an idle 32-core box: 22 complexipy runs over
-    the cluster (13.0s), the cluster AST/tokenize sweep (4.1s) and the 559-file
-    orchestrator/tests AST sweep (38.6s). Every test that needs live numbers
-    shares this one result, and the module's xdist_group keeps them on one
-    worker so it is paid once per session rather than once per worker.
+    report: dict
+    complexipy_calls: tuple[Path, ...]
+
+
+@pytest.fixture(scope='module')
+def live_measurement() -> LiveMeasurement:
+    """THE single real measurement this module takes, instrumented.
+
+    build_report is the module's whole remaining cost: one complexipy run per
+    cluster file and one AST sweep of orchestrator/tests. EVERY test that needs
+    live numbers shares this one result -- task 5101 folded on the last three
+    stragglers, and `no_private_tree_scan` is what keeps them folded. The
+    module's xdist_group keeps them on one worker so the cost is paid once per
+    session rather than once per worker.
+
+    The recording wrapper RECORDS AND DELEGATES, so the report is a real
+    measurement and the call list is real work rather than a simulation of it.
+    `test_each_cluster_file_is_measured_by_complexipy_once` reads that list, so
+    the per-file-once guarantee costs no measurement of its own. The builtin
+    `monkeypatch` fixture is function-scoped and cannot be requested here,
+    hence `pytest.MonkeyPatch.context()`.
     """
-    return metrics.build_report(_REPO_ROOT)
+    calls: list[Path] = []
+    original = metrics._file_complexity
+
+    def recording(path: Path):
+        calls.append(path)
+        return original(path)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(metrics, '_file_complexity', recording)
+        report = metrics.build_report(_REPO_ROOT)
+    return LiveMeasurement(report=report, complexipy_calls=tuple(calls))
+
+
+@pytest.fixture(scope='module')
+def live_report(live_measurement: LiveMeasurement) -> dict:
+    """The report half of `live_measurement` -- what every live-number test reads."""
+    return live_measurement.report
+
+
+@pytest.fixture()
+def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Forbid the requesting test from sweeping the test tree a second time.
+
+    Task 4520's discipline verbatim (shared/tests/test_tree_scan_sharing.py::
+    _WorkCounter): count WORK, never wall-clock. An `assert elapsed < N` guard
+    on this host would be a new flake planted by an anti-flake task -- repeated
+    `--check` runs over ONE unchanged tree spread more than twofold. Zero work
+    is also the sharper claim: it proves the test CONSUMED the shared
+    measurement, where a fast wall clock only proves the box was quiet.
+
+    The counters RECORD AND DELEGATE -- never raise, never stub -- so the test
+    still exercises real behaviour and a regrown sweep reads as a count.
+
+    Reads are scoped to `*.py` under orchestrator/tests because the claim is
+    "this test swept no tree of its own", not "this test opened no file":
+    `main(['--check'])` legitimately reads the baseline .json, which lives in
+    the swept directory and must not trip the guard.
+
+    Parses are NOT scoped that way and cannot be: `metrics._parse` calls
+    `ast.parse(source)` with no filename, so every parse a sweep makes records
+    as '<unknown>' (measured) and a path-scoped parse counter would witness
+    nothing at all for the regrowth this fixture exists to catch. Broad is also
+    what makes it a backstop -- it still catches a sweep that reads through
+    `open()` and so slips the read counter. The price is that a guarded item
+    parsing anything of its own trips it, so reads (the precise counter) are
+    asserted FIRST and the parse message names both readings.
+    """
+    swept = _REPO_ROOT / 'orchestrator' / 'tests'
+    parses: list[str] = []
+    reads: list[str] = []
+    real_parse = metrics.ast.parse
+    real_read_text = metrics.Path.read_text
+
+    def counting_parse(source, filename='<unknown>', *args, **kwargs):
+        parses.append(str(filename))
+        return real_parse(source, filename, *args, **kwargs)
+
+    def counting_read_text(self_path: Path, *args, **kwargs):
+        if self_path.suffix == '.py' and swept in self_path.parents:
+            reads.append(str(self_path))
+        return real_read_text(self_path, *args, **kwargs)
+
+    monkeypatch.setattr(metrics.ast, 'parse', counting_parse)
+    monkeypatch.setattr(metrics.Path, 'read_text', counting_read_text)
+    yield
+    _SWEPT_ONCE = (
+        'The orchestrator/tests tree is swept exactly ONCE per session, by the '
+        'module-scoped `live_report` fixture. Derive this anchor from that '
+        'report instead of re-walking the tree.'
+    )
+    assert reads == [], (
+        f'This test read {len(reads)} test-tree *.py file(s) of its own '
+        f'(first: {reads[:3]}). {_SWEPT_ONCE}'
+    )
+    assert parses == [], (
+        f'This test called ast.parse {len(parses)} time(s) '
+        f'(filenames: {parses[:3]}; sweeps record <unknown>). The read '
+        f'assertion above passed, so EITHER this is a sweep that read through '
+        f'`open()` -- {_SWEPT_ONCE} -- OR the parse was of something else '
+        f'entirely (a tmp_path fixture, a lazily imported module rewritten by '
+        f'pytest), in which case drop this fixture from this item rather than '
+        f'narrowing the counter; see the fixture docstring.'
+    )
 
 # The 18 orchestrator/src literal paths of PRD Appendix A, verbatim. git_ops.py
 # is listed separately below because Appendix A adds it under a different rule
@@ -638,18 +758,52 @@ class TestCognitiveComplexity:
     def test_keyed_by_complexipy_qualname(self, tmp_path: Path) -> None:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
-        scores = metrics.cognitive_complexity(target)
+        scores = metrics.file_cognitive_measures(target).per_function
         assert scores == {'f': 6, 'C::m': 0}
 
     def test_module_with_no_functions_returns_an_empty_map(self, tmp_path: Path) -> None:
         target = tmp_path / 'empty.py'
         target.write_text('X = 1\n', encoding='utf-8')
-        assert metrics.cognitive_complexity(target) == {}
+        assert metrics.file_cognitive_measures(target).per_function == {}
 
     def test_file_total_is_reported_separately(self, tmp_path: Path) -> None:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
-        assert metrics.file_cognitive_total(target) == 6
+        assert metrics.file_cognitive_measures(target).total == 6
+
+    def test_both_projections_come_from_one_complexipy_measurement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The file total and the per-function map are two VIEWS of one
+        # complexipy result, not two measurements. build_report asked each
+        # cluster file for both and so paid complexipy 50 times over the 25
+        # resolved files; this counter forbids that shape from growing back.
+        #
+        # The counter RECORDS AND DELEGATES rather than stubbing, so the
+        # equalities below are still checked against a real measurement.
+        target = tmp_path / 'tiny.py'
+        target.write_text(_TINY_SOURCE, encoding='utf-8')
+        raw = metrics._file_complexity(target)
+        expected_total = int(raw.complexity)
+        expected_per_function = {f.name: f.complexity for f in raw.functions}
+        # Anti-vacuity: a module measuring 0 with no functions would satisfy
+        # the equalities below while witnessing nothing.
+        assert expected_total > 0
+        assert expected_per_function
+
+        calls: list[Path] = []
+        original = metrics._file_complexity
+
+        def counting(path: Path):
+            calls.append(path)
+            return original(path)
+
+        monkeypatch.setattr(metrics, '_file_complexity', counting)
+        measures = metrics.file_cognitive_measures(target)
+
+        assert calls == [target], calls
+        assert measures.total == expected_total
+        assert measures.per_function == expected_per_function
 
     def test_missing_complexipy_raises_naming_the_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -660,16 +814,18 @@ class TestCognitiveComplexity:
         target = tmp_path / 'tiny.py'
         target.write_text(_TINY_SOURCE, encoding='utf-8')
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.cognitive_complexity(target)
+            metrics.file_cognitive_measures(target)
         message = str(excinfo.value)
         assert 'complexipy' in message
         assert 'dev' in message
 
     def test_unparseable_file_raises_naming_the_path(self, tmp_path: Path) -> None:
+        # INV-11's polarity: a file the instrument cannot measure is the
+        # FINDING, never a silent 0 and never a skip.
         target = tmp_path / 'broken.py'
         target.write_text('def (:\n', encoding='utf-8')
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.cognitive_complexity(target)
+            metrics.file_cognitive_measures(target)
         assert 'broken.py' in str(excinfo.value)
 
     def test_merge_queue_anchor_reproduces_the_prd_background_numbers(self) -> None:
@@ -694,10 +850,10 @@ class TestCognitiveComplexity:
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
         target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
-        scores = metrics.cognitive_complexity(target)
-        assert scores['SpeculativeMergeWorker::_verifier_loop'] >= 100
-        assert scores['SpeculativeMergeWorker::stop'] >= 50
-        assert metrics.file_cognitive_total(target) >= 1000
+        measures = metrics.file_cognitive_measures(target)
+        assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
+        assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
+        assert measures.total >= 1000
 
 
 class TestComplexipyVersionContract:
@@ -910,31 +1066,39 @@ class TestPatchTargets:
             metrics.patch_targets('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
 
-    def test_real_tree_union_anchor(self) -> None:
-        # Anti-vacuity: the PRD Background table's "79 distinct names"; the
-        # string-path form alone measures 78 on this tree.
+    def test_real_tree_union_anchor(
+        self, live_report: dict, no_private_tree_scan: None
+    ) -> None:
+        # Anti-vacuity, read off the ONE live sweep rather than a private
+        # re-walk of the same tree. The PRD Background table's "79 distinct
+        # names", and the 78 the string-path form alone measured, are DAY-ONE
+        # figures and stay written as they were.
         #
-        # Those are DAY-ONE figures and stay written as they were. The floor
-        # below is not: the γ wave retires patch targets by design, so the
-        # union falls as the wave lands and a floor pinned near the day-one
-        # magnitude becomes a countdown timer against the work it measures.
-        # It first bit on γ4 (task 5027) as pure INTEGRATION SKEW — γ1 and γ4
-        # each measured 71 alone, and 69 merged, because each retires names
-        # the other still counts, so neither branch could see it before the
-        # merge. The substantive anti-vacuity check is the membership
-        # assertion below, which a broken detector cannot satisfy at any
-        # magnitude; task 5446 retires the numeric floor outright when it
-        # drives both measures to 0.
+        # The report's union covers only
+        # lane-importing files, where the old body unioned every *.py in
+        # orchestrator/tests. In principle the whole-tree union could be
+        # larger, since a string-path patch needs no import -- MEASURED on this
+        # tree it is not: both unions are equal and their set difference is
+        # EMPTY. The whole-tree DENOMINATOR stays witnessed by
+        # TestBaselineIsNotVacuous::test_the_live_sweep_denominator_covers_the_whole_test_tree,
+        # which floors `enumeration.requested` at 400 orchestrator/tests paths
+        # on this same live report. So this anchor now floors the measure the
+        # gate actually gates -- the same number `derive_totals` computes and
+        # the committed baseline ratchets.
+        #
+        # The FLOOR is deliberately slack, and stays that way. The gamma wave
+        # retires patch targets by design, so the union falls as the wave lands
+        # and a floor pinned near the current magnitude becomes a countdown
+        # timer against the work it measures. It first bit on gamma4 (task
+        # 5027) as pure INTEGRATION SKEW -- gamma1 and gamma4 each measured 71
+        # alone and 69 merged, because each retires names the other still
+        # counts, so neither branch could see it before the merge. The
+        # substantive anti-vacuity check is the membership assertion below,
+        # which a broken detector cannot satisfy at any magnitude; task 5446
+        # retires the numeric floor outright when it drives both measures to 0.
         union: set[str] = set()
-        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
-            try:
-                source = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeDecodeError):
-                continue
-            try:
-                union |= metrics.patch_targets(source, path=str(path))
-            except metrics.MetricsError:
-                continue
+        for entry in live_report['tests'].values():
+            union.update(entry['patch_targets'])
         assert len(union) >= 40, len(union)
         assert 'run_scoped_verification' in union
 
@@ -1047,26 +1211,18 @@ class TestTestFileMeasures:
         assert measures is not None
         assert measures['patch_targets'] == ['a', 'z']
 
-    def test_real_tree_anchors(self) -> None:
-        # Anti-vacuity: >= 150 lane-importing files (measured 167) and a
-        # cluster-wide private-read total > 5000 (measured 9,355).
-        lane_files = 0
-        total_private = 0
-        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
-            try:
-                source = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeDecodeError):
-                continue
-            try:
-                measures = metrics.test_file_measures(source, path=str(path))
-            except metrics.MetricsError:
-                continue
-            if measures is None:
-                continue
-            lane_files += 1
-            private_reads = measures['private_reads']
-            assert isinstance(private_reads, int)
-            total_private += private_reads
+    def test_real_tree_anchors(
+        self, live_report: dict, no_private_tree_scan: None
+    ) -> None:
+        # Anti-vacuity, read off the ONE live sweep rather than a private
+        # re-walk of the same tree: >= 150 lane-importing files (measured 229)
+        # and a cluster-wide private-read total > 5000 (measured 7,847).
+        #
+        # `derive_totals` is the single encoding of the cluster-wide sum, so
+        # this floors the very number the ratchet compares rather than a
+        # second summation of the same per-file entries.
+        lane_files = len(live_report['tests'])
+        total_private = metrics.derive_totals(live_report)['private_reads']
         assert lane_files >= 150, lane_files
         assert total_private > 5000, total_private
 
@@ -1233,6 +1389,23 @@ class TestBuildReport:
     def test_cluster_cognitive_total_anchor(self, report: dict) -> None:
         # Anti-vacuity: measured 4,607 on this tree.
         assert metrics.derive_totals(report)['cognitive'] >= 4000
+
+    def test_each_cluster_file_is_measured_by_complexipy_once(
+        self, live_measurement: LiveMeasurement
+    ) -> None:
+        # build_report wants two cognitive projections per cluster file, and
+        # used to fetch each from its own `_file_complexity` call -- 50 runs
+        # over the 25 files CLUSTER_PATHS' 23 entries resolve to (two are
+        # globs), half of them redundant.
+        #
+        # A MULTISET equality, not a length check: `len(recorded) == len(files)`
+        # stays green when one file is measured twice and another is skipped,
+        # which is precisely the shape a regrown second call site would have.
+        cluster = sorted(_REPO_ROOT / relpath for relpath in live_measurement.report['files'])
+        # Anti-vacuity: an empty cluster would satisfy the equality below
+        # without witnessing a single measurement.
+        assert len(cluster) >= 20, len(cluster)
+        assert sorted(live_measurement.complexipy_calls) == cluster
 
 
 # ---------------------------------------------------------------------------
@@ -1837,8 +2010,12 @@ def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict
 
     The CLI's own job is dispatch, rendering and the exit ladder; build_report
     is already pinned by TestBuildReport against the real tree. Re-measuring
-    once per CLI test would add ~6 x 72.7s to every orchestrator verify leg to
-    re-prove something already proven.
+    once per CLI test would add ~7 x build_report to every orchestrator verify
+    leg to re-prove something already proven -- several times what the whole
+    module now costs.
+
+    It hands back the module's REAL live measurement, not a synthetic one, so a
+    CLI test using this fixture still compares live numbers.
     """
     monkeypatch.setattr(
         metrics, 'build_report', lambda root: copy.deepcopy(live_report)
@@ -1923,13 +2100,46 @@ class TestCheckCli:
         assert _MQ in err
         assert 'lines' in err
 
-    def test_check_is_clean_against_the_committed_baseline(
-        self, capsys: pytest.CaptureFixture[str]
+    def test_check_resolves_its_defaults_and_exits_clean(
+        self, stub_measurement: dict, no_private_tree_scan: None,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # No stub and no --baseline: the exact invocation the twenty downstream
-        # PRD tasks will run. RED until the baseline is generated and committed.
+        # No --baseline and no --root: the argv the twenty downstream PRD tasks
+        # will run, exercising the CLI's half of it -- default root resolution,
+        # default baseline resolution, `load_baseline`, the comparator and the
+        # exit ladder -- against the module's REAL live numbers, since
+        # `stub_measurement` hands back the live measurement rather than a
+        # fixture's. NOT end to end: `build_report` is stubbed here, as it is
+        # at every `main(['--check'])` call site in this module.
+        #
+        # What moved elsewhere is the half this test used to re-prove: the
+        # MEASUREMENT is TestBuildReport's, and the live-tree-versus-committed-
+        # baseline RATCHET is test_merge_lane_ratchet_holds'. Both run against
+        # this same tree and this same baseline, so the second unstubbed
+        # `build_report` here bought nothing but a repeat of the whole sweep.
+        #
+        # The stub replaces `build_report` ONLY, so the baseline read is real
+        # -- which is what makes `no_private_tree_scan` a live check that the
+        # counter's `*.py` scoping does not count that .json.
         assert metrics.main(['--check']) == 0
         assert capsys.readouterr().err == ''
+
+    def test_check_hands_build_report_the_resolved_repo_root(
+        self, live_report: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ONE seam `stub_measurement` stops witnessing above: that `main`
+        # threads its resolved `args.root` INTO build_report, since the stub
+        # ignores its argument. `test_root_defaults_to_the_repo_root` pins only
+        # the PARSER default, so without this the threading would be untested.
+        roots: list[Path] = []
+
+        def recording(root: Path) -> dict:
+            roots.append(root)
+            return copy.deepcopy(live_report)
+
+        monkeypatch.setattr(metrics, 'build_report', recording)
+        assert metrics.main(['--check']) == 0
+        assert [r.resolve() for r in roots] == [_REPO_ROOT.resolve()]
 
 
 class TestWriteBaselineCli:
