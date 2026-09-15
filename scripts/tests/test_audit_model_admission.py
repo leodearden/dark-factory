@@ -485,6 +485,58 @@ def test_the_last_merge_finalized_wins_not_the_first(runs_db):
     assert outcome.merge_sha == 'd411f107'
 
 
+def test_a_later_merger_on_another_model_does_not_lend_its_success_to_this_run(runs_db):
+    """The one error this audit must never make: reporting a failure by the
+    model under audit as a success.
+
+    A merge can be attempted by more than one merger run — the audited model's
+    merger leaves it blocked, a merger on a DIFFERENT model later retries it to
+    done. Joined on task_id and bounded only below, the audited row would render
+    `done (<sha>)`, and the report's central check-2 claim ("no blocked merge
+    appears as a final outcome for any task this model's merger touched") would
+    be unsupportable. The window closes at the next merger run's start.
+    """
+    _fable_merger_run(runs_db, task_id='4377')
+    _event(
+        runs_db, _at(hours=3), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(
+            branch='4377', state='blocked', reason='merge conflict', generation=1,
+        ),
+    )
+    _invocation(  # a merger on another model picks the task up and lands it
+        runs_db, model='opus', role='merger', task_id='4377',
+        started_at=_at(hours=4), completed_at=_at(hours=4, minutes=30),
+    )
+    _event(
+        runs_db, _at(hours=4, minutes=20), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(
+            branch='4377', state='done', merge_sha='d411f107', generation=2,
+        ),
+    )
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert len(rows) == 1  # only the audited model's run is in scope
+    outcome = rows[0].merge_outcome
+    assert outcome is not None
+    assert outcome.state == 'blocked'
+    assert outcome.merge_sha is None
+
+
+def test_a_merge_finalized_before_the_run_started_is_not_attributed_to_it(runs_db):
+    """The window is bounded below as well: an earlier merger run's outcome
+    belongs to that run, not to the next one to touch the same task."""
+    _event(
+        runs_db, _at(hours=1), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(branch='4377', state='blocked', reason='earlier'),
+    )
+    _fable_merger_run(runs_db, task_id='4377')  # starts at +2h
+
+    rows = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert rows[0].merge_outcome is None
+
+
 def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
     _invocation(
         runs_db, model=FABLE, role='merger', task_id='4900', duration_ms=5_000,

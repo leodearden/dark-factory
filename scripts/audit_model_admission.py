@@ -235,6 +235,10 @@ def scan_routing_decisions(
 # producer's own kill verdict; never infer one from duration.
 DEFAULT_ROLE_CEILINGS_SECS: dict[str, int] = {'merger': 600}
 
+# The only role a merge outcome can be attributed to: a merge is resolved by a
+# merger run, and `merge_finalized` events carry no role of their own.
+MERGER_ROLE = 'merger'
+
 
 @dataclass(frozen=True)
 class MergeOutcome:
@@ -325,6 +329,66 @@ def _by_task(rows: Iterable[EventRow]) -> dict[str | None, list[EventRow]]:
     return grouped
 
 
+def _merger_starts_by_task(
+    conn: sqlite3.Connection, *, model: str, since: datetime
+) -> dict[str | None, list[str]]:
+    """When each task's merger runs started — ON ANY MODEL — in chronological order.
+
+    Deliberately UNFILTERED by model, which is the entire point: what ends one
+    merger run's claim on a task's merge outcome is the NEXT merger run,
+    whoever ran it.  A run on the audited model that leaves a merge blocked,
+    retried to done by a merger on a different model, must not read as the
+    audited model's success.
+
+    Bounded below by the earliest audited merger start (computed in SQL, so the
+    bound cannot drift from the rows it bounds), because no boundary earlier
+    than that can end any audited run's window.  One extra scan of the same
+    table, not a correlated subquery per audited row.
+    """
+    grouped: dict[str | None, list[str]] = {}
+    cursor = conn.execute(
+        'SELECT task_id, started_at FROM invocations WHERE role = ? AND started_at > '
+        '(SELECT MIN(started_at) FROM invocations '
+        'WHERE model = ? AND role = ? AND completed_at >= ?) '
+        'ORDER BY started_at, id',
+        (MERGER_ROLE, model, MERGER_ROLE, _iso(since)),
+    )
+    for task_id, started_at in cursor:
+        grouped.setdefault(task_id, []).append(started_at)
+    return grouped
+
+
+def _merge_outcome(
+    finalized: Sequence[EventRow], *, after: str, before: str | None
+) -> MergeOutcome | None:
+    """The LAST `merge_finalized` inside one merger run's attribution window.
+
+    The window is ``[after, before)`` — at or after this run started, and
+    strictly before the next merger run on the same task took over.  *before*
+    is None when no later merger run exists, leaving the window open-ended.
+
+    LAST rather than first, because a post-merge verification failure blocks a
+    task and the same merge is retried to done within the one run's window;
+    reporting the first would read as the merger having failed to resolve a
+    merge it did resolve.  BOUNDED rather than open-ended, because the symmetric
+    error is worse: an unbounded join hands a later merger's success to the run
+    being audited, reporting a failure by the model under audit as a success.
+    """
+    inside = [
+        row for row in finalized
+        if row.timestamp >= after and (before is None or row.timestamp < before)
+    ]
+    if not inside:
+        return None
+    last = inside[-1]
+    return MergeOutcome(
+        timestamp=last.timestamp,
+        state=last.payload.get('state') or '',
+        merge_sha=last.payload.get('merge_sha'),
+        reason=last.payload.get('reason'),
+    )
+
+
 def scan_invocations(
     conn: sqlite3.Connection,
     *,
@@ -341,15 +405,16 @@ def scan_invocations(
     on task_id + role, taking the first such event at or after the invocation's
     ``started_at``.
 
-    MERGE OUTCOME, for merger runs, from the task's LAST `merge_finalized` at or
-    after ``started_at``.  Last, not first: a post-merge verification failure
-    blocks a task and is retried to done, and reporting the first would read as
-    the merger having failed to resolve a merge it did resolve.  Matched on
-    task_id ALONE — the producer leaves these events' `role` column empty.
+    MERGE OUTCOME, for merger runs, from the `merge_finalized` events inside
+    this run's attribution window — see :func:`_merge_outcome` for the window
+    and :func:`_merger_starts_by_task` for the boundary that closes it.
+    Matched on task_id ALONE — the producer leaves these events' `role` column
+    empty — which is exactly why the window has to do the attributing.
     """
     ceilings = DEFAULT_ROLE_CEILINGS_SECS if role_ceilings_secs is None else role_ceilings_secs
     ends = _by_task(_load_events(conn, 'invocation_end', since))
     merges = _by_task(_load_events(conn, 'merge_finalized', since))
+    merger_starts = _merger_starts_by_task(conn, model=model, since=since)
     cursor = conn.execute(
         'SELECT task_id, project_id, role, account_name, cost_usd, duration_ms, '
         'capped, started_at, completed_at FROM invocations '
@@ -365,18 +430,13 @@ def scan_invocations(
             None,
         )
         merge = None
-        if role == 'merger':
-            finalized = [
-                row for row in merges.get(task_id, ()) if row.timestamp >= started_at
-            ]
-            if finalized:
-                last = finalized[-1]
-                merge = MergeOutcome(
-                    timestamp=last.timestamp,
-                    state=last.payload.get('state') or '',
-                    merge_sha=last.payload.get('merge_sha'),
-                    reason=last.payload.get('reason'),
-                )
+        if role == MERGER_ROLE:
+            later_starts = merger_starts.get(task_id, ())
+            merge = _merge_outcome(
+                merges.get(task_id, ()),
+                after=started_at,
+                before=next((s for s in later_starts if s > started_at), None),
+            )
         ceiling_secs = ceilings.get(role)
         records.append(InvocationRecord(
             task_id=task_id,
