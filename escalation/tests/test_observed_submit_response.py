@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _filing_tools import call_blocker as _blocker
+from _filing_tools import call_info as _info
 
 from escalation.models import (
     ACTION_KEEP_DRIVING,
@@ -45,16 +47,6 @@ _COMMON_KWARGS: dict[str, Any] = {
     'category': 'infra_issue',
     'summary': 'post-write re-read could not confirm persistence',
 }
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 def _submit_pending(queue: EscalationQueue, *, level: int = 1) -> str:
@@ -425,16 +417,17 @@ class TestFilerActionVocabulary:
 
     This is NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side
     `resolve_issue` disposition; the two vocabularies merely share a key name.
+
+    Closure is pinned where it has content — `action in FILER_ACTIONS` on each
+    emitting branch below, which a future branch inventing an undeclared value
+    would fail.  Asserting the tuple's own contents back at it would restate
+    one line of models.py and could only fail when someone edited that line.
     """
 
     def test_wire_values_are_frozen(self):
         """(a) The strings are the contract, not merely the names bound to them."""
         assert ACTION_TERMINATE_CLEANLY == 'terminate_cleanly'
         assert ACTION_KEEP_DRIVING == 'keep_driving'
-
-    def test_vocabulary_is_closed_and_enumerable(self):
-        """(b) One name finds every value, as RESOLVE_ACTIONS does handler-side."""
-        assert FILER_ACTIONS == (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
 
     @pytest.mark.asyncio
     async def test_healthy_branch_emits_the_named_terminate_action(self, tmp_path: Path):

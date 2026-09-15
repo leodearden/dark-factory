@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from _filing_tools import call_blocker as _blocker
+from _filing_tools import call_info as _info
 
 from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
@@ -53,16 +55,6 @@ async def _make_lookup(status: str | None):
         return status
 
     return _lookup
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------
