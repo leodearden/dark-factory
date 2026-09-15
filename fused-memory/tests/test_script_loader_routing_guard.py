@@ -69,10 +69,11 @@ EXEMPT_CALL_SITES = frozenset(
     }
 )
 
-# The four scripts these modules load are each installed under a sys.modules key
-# that at least one OTHER module also installs, so they carry the genuine
-# double-execution hazard rather than only the duplication.
-SHARED_KEY_MODULES = [
+# The four scripts the first nine of these load are each installed under a
+# sys.modules key that at least one OTHER module also installs, so they carry
+# the genuine double-execution hazard rather than only the duplication. The
+# rest are single-consumer forks of the same loader.
+COVERED_MODULES = [
     TESTS_ROOT / name
     for name in (
         'test_bake_off_storage_shape.py',
@@ -84,6 +85,24 @@ SHARED_KEY_MODULES = [
         'test_memory_metadata.py',
         'test_rrf_cross_store_merge.py',
         'test_tag_cgl_eta_rehome_scope.py',
+        'test_amend_stale_resume_cwd_records.py',
+        'test_audit_duplicate_memories.py',
+        'test_audit_duplicate_tasks.py',
+        'test_audit_found_on_main_provenance.py',
+        'test_audit_unverified_completion_claims.py',
+        'test_audit_wrong_binding_edges.py',
+        'test_backfill_recon_escalations.py',
+        'test_calibrate_write_triage.py',
+        'test_cgl_eta_auto_apply_impl.py',
+        'test_cgl_eta_scheduler_gate.py',
+        'test_check_asyncmock_assertion_style.py',
+        'test_check_bare_magicmock_config.py',
+        'test_check_consolidation_closure_cli.py',
+        'test_check_found_on_main_spurious_rate.py',
+        'test_cleanup_count_snapshots.py',
+        'test_clear_false_dependency_invalidations.py',
+        'test_clear_malformed_empty_memory.py',
+        'test_consolidate_namespace_families.py',
     )
 ]
 
@@ -121,7 +140,7 @@ def _unrouted_loader_calls(path):
     ]
 
 
-@pytest.mark.parametrize('path', SHARED_KEY_MODULES, ids=_module_key)
+@pytest.mark.parametrize('path', COVERED_MODULES, ids=_module_key)
 def test_loads_scripts_through_the_shared_helper(path):
     """The module must not fork its own non-package script loader."""
     calls = _unrouted_loader_calls(path)
