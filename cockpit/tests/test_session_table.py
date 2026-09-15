@@ -372,13 +372,20 @@ class TestOrderSessions:
 
 
 class TestFilterLiveSessions:
+    """The live band and, now, how much of it the cap hid.
+
+    filter_live_sessions returns a LiveSessions(visible, total) view rather
+    than a bare list: total is the live count BEFORE the cap, so a
+    truncated table is no longer indistinguishable from a complete one.
+    """
+
     def test_terminal_statuses_are_dropped(self):
         from cockpit.panes.session_table import filter_live_sessions
 
         exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
         failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
 
-        assert filter_live_sessions([exited, failed]) == []
+        assert filter_live_sessions([exited, failed]).visible == []
 
     def test_non_terminal_statuses_are_all_kept(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -389,7 +396,7 @@ class TestFilterLiveSessions:
         idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
         records = [awaiting, running, launching, idle]
 
-        kept = filter_live_sessions(records)
+        kept = filter_live_sessions(records).visible
 
         assert [r.session_slug for r in kept] == [r.session_slug for r in records]
 
@@ -398,7 +405,7 @@ class TestFilterLiveSessions:
 
         foreign = _make_record(session_slug='s-foreign', status='some-foreign-status')
 
-        assert filter_live_sessions([foreign]) == [foreign]
+        assert filter_live_sessions([foreign]).visible == [foreign]
 
     def test_relative_order_of_kept_records_is_preserved(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -409,14 +416,17 @@ class TestFilterLiveSessions:
         idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
         ordered_input = [awaiting, exited, running, idle]
 
-        kept = filter_live_sessions(ordered_input)
+        kept = filter_live_sessions(ordered_input).visible
 
         assert [r.session_slug for r in kept] == ['s-awaiting', 's-running', 's-idle']
 
-    def test_empty_input_returns_empty_list(self):
+    def test_empty_input_returns_empty_view(self):
         from cockpit.panes.session_table import filter_live_sessions
 
-        assert filter_live_sessions([]) == []
+        view = filter_live_sessions([])
+
+        assert view.visible == []
+        assert view.total == 0
 
     def test_explicit_cap_keeps_only_the_first_n_by_input_order(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -425,7 +435,7 @@ class TestFilterLiveSessions:
             _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
         ]
 
-        kept = filter_live_sessions(records, cap=3)
+        kept = filter_live_sessions(records, cap=3).visible
 
         assert [r.session_slug for r in kept] == ['s-0', 's-1', 's-2']
 
@@ -437,12 +447,71 @@ class TestFilterLiveSessions:
             for i in range(_DEFAULT_VISIBLE_CAP + 10)
         ]
 
-        kept = filter_live_sessions(records)
+        kept = filter_live_sessions(records).visible
 
         assert len(kept) == _DEFAULT_VISIBLE_CAP
         assert [r.session_slug for r in kept] == [
             f's-{i}' for i in range(_DEFAULT_VISIBLE_CAP)
         ]
+
+    def test_total_reports_the_live_count_the_cap_hid(self):
+        """The number an operator could otherwise never see: reading exactly
+        `cap` rows told you nothing about how many live sessions there
+        really were."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+        ]
+
+        view = filter_live_sessions(records, cap=3)
+
+        assert len(view.visible) == 3
+        assert view.total == 5
+
+    def test_terminal_records_are_excluded_from_total_too(self):
+        """total counts the LIVE band, not the scanned set -- otherwise the
+        notice would claim the cap hid history rows the view never intended
+        to show in the first place."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug='live-0', status=sr.Status.RUNNING),
+            _make_record(session_slug='dead-0', status=sr.Status.EXITED),
+            _make_record(session_slug='live-1', status=sr.Status.IDLE),
+            _make_record(session_slug='dead-1', status=sr.Status.FAILED_TO_START),
+            _make_record(session_slug='dead-2', status=sr.Status.EXITED),
+        ]
+
+        view = filter_live_sessions(records)
+
+        assert view.total == 2
+        assert len(view.visible) == 2
+
+    def test_under_the_cap_total_equals_visible(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(4)
+        ]
+
+        view = filter_live_sessions(records, cap=10)
+
+        assert view.total == len(view.visible) == 4
+
+    def test_visible_never_exceeds_total(self):
+        """The view's own invariant, checked across the cap boundary rather
+        than at one convenient point."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(6)
+        ]
+
+        for cap in range(0, 9):
+            view = filter_live_sessions(records, cap=cap)
+
+            assert len(view.visible) <= view.total
 
 
 class TestFocusMarker:
