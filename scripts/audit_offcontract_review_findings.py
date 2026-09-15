@@ -303,8 +303,10 @@ def _scan(root: Path) -> Scan:
                 record = normalize_issue(path.parent.parent.name, index, raw)
             except ValueError:
                 # The raw dict is still in hand, so the severity it carried is
-                # recorded rather than assumed. A non-dict entry has none.
-                unlocatable_severities[raw.get("severity") if isinstance(raw, dict) else None] += 1
+                # recorded rather than assumed. A non-dict entry carries none,
+                # and None reads as off-contract, which is the right answer.
+                severity = raw.get("severity") if isinstance(raw, dict) else None
+                unlocatable_severities[severity] += 1
                 continue
             issues.append(VerdictIssue(
                 path=path,
