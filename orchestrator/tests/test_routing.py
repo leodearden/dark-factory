@@ -350,6 +350,80 @@ class TestProbeModelsStatusMappingAndDispatch:
             assert call['oauth_token'] in {'tok-x', 'tok-y'}
 
 
+class TestProbeModelsBudgetExhaustion:
+    """A probe turn aborted by the local ``--max-budget-usd`` ceiling records
+    the distinct ``'budget_too_low'`` status, never the generic ``'error'``.
+
+    WHY the budget subtype outranks the catch-all: an
+    ``error_max_budget_usd`` result is positive, structured evidence that
+    the Anthropic API ACCEPTED the request and consumed real tokens --
+    exactly the semantics ``shared/src/shared/usage_gate.py::
+    _probe_hit_local_budget_cap`` already states. So the model string DID
+    resolve for that account and the account was live; only the probe's own
+    ceiling stopped the turn. Letting it fall through to the unclassified
+    catch-all is the defect: a mis-sized budget then masquerades as
+    unavailability and the committed artifact reports a model broken on
+    every account when it is in fact present.
+    """
+
+    def test_budget_abort_is_budget_too_low_and_leaves_the_catch_all_intact(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]] = {
+            ('sonnet', 'tok-x'): AgentResult(
+                success=False, subtype='error_max_budget_usd', output='',
+                turns=1, cost_usd=0.05,
+            ),
+            # Classifies to Failure(kind='unclassified') -- the generic
+            # 'error' branch, asserted in the SAME run so the new budget
+            # branch is shown to narrow nothing.
+            (FABLE_CANDIDATE_MODEL, 'tok-x'): AgentResult(
+                success=False, output='something unexpected went wrong',
+            ),
+        }
+        cli = _ScriptedProbeCli(overrides)
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.accounts['max-x']['sonnet'] == 'budget_too_low'
+        assert report.accounts['max-x'][FABLE_CANDIDATE_MODEL] == 'error'
+        # Unscripted -> the fake's default success: an ordinary probe is
+        # untouched by the new branch.
+        assert report.accounts['max-x']['haiku'] == 'available'
+
+    def test_budget_abort_outranks_a_cap_like_body(self):
+        """Precedence is evidence-based, not incidental ordering: a result
+        carrying BOTH the budget subtype AND a body that reads like an
+        account-level cap hit still records 'budget_too_low'.
+
+        The local ``--max-budget-usd`` ceiling firing is NOT an account cap
+        -- the distinction ``_probe_hit_local_budget_cap`` draws -- so the
+        structured subtype must outrank every string heuristic below it,
+        including the cap tier.
+        """
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]] = {
+            ('sonnet', 'tok-x'): AgentResult(
+                success=False, subtype='error_max_budget_usd',
+                output="You've hit your usage limit. Your plan resets in 3h.",
+                turns=1, cost_usd=0.05,
+            ),
+        }
+        cli = _ScriptedProbeCli(overrides)
+
+        report = asyncio.run(probe_models(
+            accounts, ['sonnet'],
+            models=['sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.accounts['max-x']['sonnet'] == 'budget_too_low'
+
+
 class TestProbeModelsMissingToken:
     """An account whose env token cannot be resolved yields a distinct
     'no_token' status for every target model, without ever calling
