@@ -583,6 +583,83 @@ def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
     )
 
 
+def _install_capturing_probe_models(monkeypatch, report: ProbeReport) -> list[dict]:
+    """Monkeypatch routing.probe_models with a fake that records each call's
+    keyword arguments and returns *report*, and hand back the list it records
+    into.
+
+    Same stub shape as the two tests above, widened to capture ``budget_usd``.
+    Written once so the budget tests below all read the forwarded value the
+    same way -- including the parse-time rejection test, whose whole assertion
+    is that this list stays EMPTY.
+    """
+    calls: list[dict] = []
+
+    async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
+        calls.append({
+            'accounts': accounts, 'allowed_models': allowed_models, 'models': models,
+            'budget_usd': kwargs.get('budget_usd'),
+        })
+        return report
+
+    monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
+    return calls
+
+
+class TestProbeModelsCliBudgetOption:
+    """`probe-models --budget-usd` is the operator control the probe was
+    missing: the CLI forwarded nothing, so every run silently took
+    probe_models's own default. It must forward the routing constant by
+    default, honour an override, and reject a non-positive ceiling at parse
+    time -- with the new classification, a zero or negative ceiling would
+    make EVERY (account, model) pair abort and record 'budget_too_low',
+    committing an artifact that is uniformly and plausibly wrong.
+    """
+
+    def _run(self, monkeypatch, tmp_path, extra_args: list[str]):
+        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
+        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
+        probe_calls = _install_capturing_probe_models(
+            monkeypatch,
+            ProbeReport(models=['haiku'], accounts={'max-x': {'haiku': 'available'}}),
+        )
+
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('')
+
+        result = CliRunner().invoke(main, [
+            'probe-models',
+            '--config', str(cfg_file),
+            '--output', str(tmp_path / 'model-availability.yaml'),
+            *extra_args,
+        ])
+        return result, probe_calls
+
+    def test_default_budget_is_the_routing_constant(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, [])
+
+        assert result.exit_code == 0, result.output
+        assert [call['budget_usd'] for call in probe_calls] == [DEFAULT_PROBE_BUDGET_USD]
+
+    def test_budget_option_is_forwarded(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, ['--budget-usd', '2.5'])
+
+        assert result.exit_code == 0, result.output
+        assert [call['budget_usd'] for call in probe_calls] == [2.5]
+
+    def test_non_positive_budget_is_rejected_before_probing(self, monkeypatch, tmp_path):
+        result, probe_calls = self._run(monkeypatch, tmp_path, ['--budget-usd', '0'])
+
+        assert result.exit_code != 0
+        assert '--budget-usd' in result.output
+        # A VALUE rejection, not an unknown-option one: click's 'Invalid
+        # value' prefix is what proves the FloatRange constraint fired rather
+        # than the option simply not existing (which is how this same test
+        # would pass vacuously before the option is added).
+        assert 'Invalid value' in result.output
+        assert probe_calls == [], 'a rejected ceiling must never reach probe_models'
+
+
 class TestProbeModelsCli:
     def test_writes_artifact_with_fable_row_and_exits_zero(self, monkeypatch, tmp_path):
         fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
