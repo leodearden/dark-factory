@@ -38,7 +38,15 @@ from escalation.declared_pins import normalise_declarers
 # module-private symbol.  Imported under its real, public name: it is a shared
 # cross-module helper, and spelling it `_max_severity` here would signal the
 # opposite at every use site.
-from escalation.models import RESOLUTION_CLASSES, Amendment, Escalation, max_severity
+from escalation.models import (
+    PERSIST_CHECK_ABSENT,
+    PERSIST_CHECK_UNREADABLE,
+    RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
+    Amendment,
+    Escalation,
+    max_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2800,7 +2808,7 @@ def observed_submit_response(
             'UNCONFIRMED and it may never reach L1 or L2',
             esc_id, exc,
         )
-        return _unpersisted_response(esc_id, fallback_level, 'unreadable')
+        return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_UNREADABLE)
     if persisted is None:
         logger.error(
             'Post-submit re-read of %s found no record in the queue root or '
@@ -2808,7 +2816,7 @@ def observed_submit_response(
             'L1 or L2',
             esc_id,
         )
-        return _unpersisted_response(esc_id, fallback_level, 'absent')
+        return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_ABSENT)
     if persisted.status == 'pending':
         return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
     logger.warning(
@@ -2832,13 +2840,18 @@ def _unpersisted_response(
 ) -> dict[str, Any]:
     """The unconfirmed-persist response, carrying *fallback_level* when known.
 
-    *persist_check* is ``'absent'`` (the record is not on disk) or
-    ``'unreadable'`` (the read failed, so its state is unknown).
+    *persist_check* is one of ``models.PERSIST_CHECKS`` — see the
+    ``persist_check`` paragraph in ``observed_submit_response``'s docstring for
+    what each verdict claims.
 
     ``level`` is omitted only when the caller supplied no fallback — legacy
     callers that predate the echo contract — so the key is never fabricated.
     """
-    response = {'id': esc_id, 'status': 'accepted_unpersisted', 'persist_check': persist_check}
+    response = {
+        'id': esc_id,
+        'status': STATUS_ACCEPTED_UNPERSISTED,
+        'persist_check': persist_check,
+    }
     if fallback_level is None:
         return response
     return {**response, 'level': fallback_level}

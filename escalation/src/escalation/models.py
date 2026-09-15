@@ -250,6 +250,28 @@ ACTION_KEEP_DRIVING: str = 'keep_driving'             # persistence is unconfirm
 FILER_ACTIONS: tuple[str, ...] = (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
 
 
+# The `status` a filing carries when the write was ACCEPTED but a post-write
+# re-read could not confirm it landed, and the `persist_check` verdict that
+# says why.  Emitted by `escalation.queue.observed_submit_response`.
+#
+# Unlike FILER_ACTIONS above, CODE reads this status, and across a module
+# boundary: `escalate_blocker` compares it to choose which action to append.
+# So a rename at the emission site would leave the comparison matching nothing
+# and hand an agent `terminate_cleanly` on a filing that never landed — the
+# exact defect the status exists to prevent — while raising no import error
+# anywhere.  Naming it is what makes the emit and the compare the same object.
+STATUS_ACCEPTED_UNPERSISTED: str = 'accepted_unpersisted'
+
+# `absent`: nothing for that id is on disk at all.  `unreadable`: a read was
+# attempted and failed, or a file IS on disk that yields no record (a torn or
+# corrupt write) — either way the record's state is unknown rather than known
+# to be missing.  The distinction is for the operator debugging the outage; it
+# never changes what the filer should do.
+PERSIST_CHECK_ABSENT: str = 'absent'
+PERSIST_CHECK_UNREADABLE: str = 'unreadable'
+PERSIST_CHECKS: tuple[str, ...] = (PERSIST_CHECK_ABSENT, PERSIST_CHECK_UNREADABLE)
+
+
 # Severities that cause an escalation to be created directly at L2,
 # bypassing the auto-watcher and routing straight to a human.
 BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})

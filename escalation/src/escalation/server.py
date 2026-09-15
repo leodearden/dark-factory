@@ -46,6 +46,7 @@ from escalation.models import (
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     EvidenceEntry,
     max_severity,
@@ -1770,7 +1771,8 @@ def create_server(
         # for L1 or L2 to drain, so standing the filer down would strand its
         # task in silence (task 5368).
         action = (
-            ACTION_KEEP_DRIVING if result.get('status') == 'accepted_unpersisted'
+            ACTION_KEEP_DRIVING
+            if result.get('status') == STATUS_ACCEPTED_UNPERSISTED
             else ACTION_TERMINATE_CLEANLY
         )
         return {**result, 'action': action}
