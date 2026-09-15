@@ -36,6 +36,9 @@ TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 # scripts/tests/test_install_reclaim_orphaned_worktrees_timer.py::test_install_copies_units_enables_timer_and_kicks_drain,
 # which asserts that byte-copy directly.
 PRODUCTION_CLAUDE_BIN = "/home/leo/.local/bin/claude"
+# Same reasoning: the unit names the production checkout absolutely, so the
+# account tokens it reads come from THAT .env, never a worktree's.
+PRODUCTION_ENV_FILE = "/home/leo/src/dark-factory/.env"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +304,72 @@ def test_service_template_pins_claude_bin():
     assert "PYTHONPATH" in env, (
         f"The pre-existing PYTHONPATH assignment must survive alongside the "
         f"claude-bin pin; parsed [Service] Environment={env!r}"
+    )
+
+
+def _service_directive(service_text, name):
+    """Every value assigned to directive *name* in the ``[Service]`` section.
+
+    A directive can legally repeat (systemd appends), so this returns a LIST.
+    Sectioned parsing rather than a substring scan over the whole file, for
+    the same reason ``_service_environment`` does it: a directive in [Unit]
+    or [Install] is a different directive, and a test that cannot tell them
+    apart would pass on a unit systemd reads differently.
+    """
+    values = []
+    in_service = False
+    for raw_line in service_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            in_service = line == "[Service]"
+            continue
+        if in_service and line.startswith(f"{name}="):
+            values.append(line[len(name) + 1:].strip())
+    return values
+
+
+def test_service_template_carries_the_account_pool_and_pins_no_account():
+    """Template-content invariant (NOT install behavior), task 5488: the unit
+    must supply the account POOL and pin no single account out of it.
+
+    Two positives and one negative, and the NEGATIVE is the load-bearing one.
+    `EnvironmentFile=` is how CLAUDE_OAUTH_TOKEN_B..H reach the process at all
+    -- `account_pool.build_pool` resolves each roster entry's token out of
+    os.environ, and a unit without them degrades to the ~/.claude fallback
+    account this task exists to remove. `UnsetEnvironment=ANTHROPIC_API_KEY`
+    is the other half: the CLI prefers an API key over the OAuth token, so a
+    key inherited from the manager's environment would silently authenticate
+    every invocation as one identity while the failover still LOOKED like it
+    worked. And re-pinning one account here -- which is exactly what the
+    2026-09-14 stopgap drop-in did with max-h -- would make the whole pool
+    inert again while leaving every test above green.
+    """
+    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
+
+    env_files = _service_directive(service_text, "EnvironmentFile")
+    assert env_files == [PRODUCTION_ENV_FILE], (
+        f"The trickle @.service must read the project .env so the gate can "
+        f"resolve the CLAUDE_OAUTH_TOKEN_* pool; got EnvironmentFile="
+        f"{env_files!r}"
+    )
+
+    # The literal, not a constant read from coder: this asserts what systemd
+    # must UNSET, and coder.child_env's matching removal is a separate
+    # mechanism for a separate child. Two independent guards of one policy is
+    # the intent (docs/code-quality.md heuristic 10), not a duplication.
+    assert _service_directive(service_text, "UnsetEnvironment") == [
+        "ANTHROPIC_API_KEY"
+    ], (
+        "The trickle @.service must unset ANTHROPIC_API_KEY: the CLI prefers "
+        "it over the OAuth token, so leaving it set defeats the account "
+        "choice silently"
+    )
+
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in service_text, (
+        "The unit must pin NO single account -- choosing one per invocation "
+        "is the gate's job now. Re-pinning here reintroduces exactly the "
+        "failure this task removes (the 2026-09-14 max-h drop-in), and does "
+        "it invisibly: every other assertion in this file stays green."
     )
 
 
