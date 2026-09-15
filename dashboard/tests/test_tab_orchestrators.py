@@ -170,3 +170,57 @@ class TestOrchTabEmptyState:
         assert re.search(
             r'\{\s*orchEmptyLabel\s*\}\s*=\s*window\.DF_ORCH_FILTER', tabs_jsx_body
         )
+
+
+class TestOrchTabHealthState:
+    """OrchTab must render *offline* and *degraded* as DISTINCT states.
+
+    These pin WIRING only. The behavioural coverage of the split lives where
+    the facts are produced (``dashboard/tests/test_orchestrator.py``) and
+    shaped (``dashboard/tests/test_redux_api.py``), because this repo renders
+    no JSX under test — what can be asserted here is that the tab reads each
+    field and paints them differently.
+
+    Assertions 4 and 5 are LINE-SCOPED (``[^\n]*``) and therefore assume each
+    pip stays a single-line JSX expression, which is how the rest of OrchTab's
+    summary fragment is written. A reformatter that wraps them must update
+    these regexes rather than delete them.
+
+    The positive anchors in TestOrchTabCurrentFocusRemoved
+    (``function OrchTab(``, ``aria-label="Task filter"``) are what keep
+    assertion 4's negative form from passing vacuously against a deleted or
+    renamed file.
+    """
+
+    def test_offline_pip_branches_on_offline(self, orch_tab_body):
+        """The tab reads o.offline — until this task it consumed neither field."""
+        assert re.search(r'o\.offline\s*&&', orch_tab_body)
+
+    def test_degraded_pip_branches_on_degraded(self, orch_tab_body):
+        """The tab reads o.degraded, so a starved root is visible at all."""
+        assert re.search(r'o\.degraded\s*&&', orch_tab_body)
+
+    def test_degraded_label_is_distinct_from_offline(self, orch_tab_body):
+        """The two states must not read as the same sentence to an operator.
+
+        Proven-down and not-measured call for different actions, so they get
+        different words, not merely different colours.
+        """
+        offline_label = 'offline'
+        degraded_label = 'state unknown'
+        assert degraded_label != offline_label
+        assert re.search(r'o\.offline[^\n]*>' + re.escape(offline_label) + r'<', orch_tab_body)
+        assert re.search(r'o\.degraded[^\n]*>' + re.escape(degraded_label) + r'<', orch_tab_body)
+
+    def test_degraded_pip_does_not_render_in_the_offline_colour(self, orch_tab_body):
+        """A degraded root must never be painted as proven-down.
+
+        Negative and line-scoped, which survives reformatting of the colour
+        expression in a way a positive colour regex would not.
+        """
+        assert not re.search(r'o\.degraded[^\n]*CP\.bad', orch_tab_body)
+
+    def test_offline_pip_renders_in_the_bad_colour_and_degraded_in_warn(self, orch_tab_body):
+        """The positive half: the palette entries are the ones intended."""
+        assert re.search(r'o\.offline[^\n]*CP\.bad', orch_tab_body)
+        assert re.search(r'o\.degraded[^\n]*CP\.warn', orch_tab_body)
