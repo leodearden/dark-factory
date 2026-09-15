@@ -750,7 +750,6 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         """
         from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_queue import (
-            PRODUCTION_CLOCK,
             InflightStatus,
             ItemLifecycleState,
             RealMergeItem,
@@ -768,12 +767,8 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             ),
             'df3082-pair-deadverify': hangs_until(asyncio.Event()),
         })
-        # The real clock, deliberately: the no-progress budget below is read
-        # off the clock port while the abandon poll's cadence is real asyncio
-        # time, so a hand-advanced clock would never reach the budget.
         worker = make_lane(
-            git_ops, queue, verifier=verifier, clock=PRODUCTION_CLOCK,
-            escalation_queue=fake_eq,
+            git_ops, queue, verifier=verifier, escalation_queue=fake_eq,
         )
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
