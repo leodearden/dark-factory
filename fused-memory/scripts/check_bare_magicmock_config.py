@@ -676,7 +676,7 @@ def _dataclass_double_violation(
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
-    'orchestrator/tests/test_merge_queue.py': 317,
+    'orchestrator/tests/test_merge_queue.py': 309,
     'orchestrator/tests/test_merge_queue_concurrent_verify.py': 90,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
