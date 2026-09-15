@@ -365,3 +365,90 @@ def test_rotation_walks_the_whole_pool_before_giving_up():
         'tok-max-e', 'tok-max-d', 'tok-max-c', 'tok-max-b',
     ]
     assert [a.name for a in gate.accounts if a.capped] == ['max-c', 'max-d', 'max-e']
+
+
+# ---------------------------------------------------------------------------
+# step-13: the ruling's THIRD verify case — an exhausted pool still reaches
+# task 4736's exit-0 DEFERRED path, and says WHICH exhaustion it was.
+#
+# This is the one place the 4736 contract is decided. `capped=True` here now
+# means what nightly's summary has always claimed and never actually knew:
+# every account in the pool is out. The never-fabricate contract is
+# untouched — an exhausted pool yields no record at all, never an empty one.
+# ---------------------------------------------------------------------------
+
+def test_an_exhausted_pool_raises_cap_exhausted_without_calling_the_cli():
+    """try_lease returns None on the FIRST call. The CLI must never be
+    invoked — invoking it with no token is precisely the ~/.claude fallback
+    this whole task exists to remove."""
+    gate = _pool(('max-b', True), ('max-c', True))
+    invoke = _RecordingInvoke()
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert invoke.calls == [], (
+        f'an exhausted pool must never reach the CLI — a token-less spawn '
+        f'would silently ride ~/.claude; got {invoke.calls}'
+    )
+    assert excinfo.value.marker, (
+        'the typed marker is what lets the deferral reason say WHY, the same '
+        'way a per-digest cap does'
+    )
+
+
+def test_exhaustion_mid_rotation_also_raises_cap_exhausted():
+    """The pool empties DURING a digest: both accounts banner, and the third
+    lease finds nothing. Same typed outcome, and no extra CLI call."""
+    gate = _pool(('max-b', False), ('max-c', False))
+    banner = 'Claude usage limit reached.'
+    invoke = _RecordingInvoke(raises={
+        'tok-max-b': _cap_exhausted(stdout=banner),
+        'tok-max-c': _cap_exhausted(stdout=banner),
+    })
+
+    with pytest.raises(coder_mod.CoderCapExhausted):
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert len(invoke.calls) == 2, (
+        f'each account gets exactly one try; got {invoke.calls}'
+    )
+    assert all(a.capped for a in gate.accounts)
+
+
+def test_exhaustion_reason_names_how_many_accounts_were_capped():
+    """'all 2 pool accounts capped' — an operator reading the DEFERRED
+    escalation learns the pool size, which is what distinguishes a genuinely
+    exhausted fleet from a pool that resolved almost empty."""
+    gate = _pool(('max-b', True), ('max-c', True))
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
+
+    message = str(excinfo.value)
+    assert '2' in message, message
+    assert 'capped' in message.lower(), message
+
+
+def test_a_pool_that_resolved_NO_accounts_says_so_instead():
+    """The other exhaustion, and a DIFFERENT operator response: 'all accounts
+    capped' self-clears at the weekly reset, 'no pool accounts resolved' is a
+    config fault that will never clear on its own.
+
+    This is the state UsageGate._init_accounts degrades to when no token env
+    var resolves — the very condition that would otherwise silently fall back
+    to ~/.claude — so it must be LOUD and distinguishable, not folded into
+    the routine one.
+    """
+    gate = _pool()  # zero accounts
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
+
+    message = str(excinfo.value).lower()
+    assert 'no pool accounts' in message, (
+        f'a zero-account pool must not read as "all accounts capped" — that '
+        f'would send an operator to wait for a reset that never comes; got '
+        f'{message!r}'
+    )
+    assert 'capped' not in message.split('no pool accounts')[0], message

@@ -1707,6 +1707,65 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# task 5488 / step-13(d): END TO END — an exhausted POOL still lands on task
+# 4736's exit-0 DEFERRED path.
+#
+# The pool-backed invoker is just another (prompt, model) -> str callable
+# through the existing seam, so code_digests' control flow is inherited
+# unchanged. What this pins is that the NEW input it can now produce -- a
+# CoderCapExhausted meaning "every account in the pool is out", rather than
+# "the one login I happened to ride is out" -- still produces exactly the
+# RunResult shape nightly's DEFERRED branch keys on.
+# ---------------------------------------------------------------------------
+
+def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
+    import account_pool
+
+    class _AllCappedGate:
+        """Minimal stand-in for an exhausted pool: nothing to lease, ever."""
+
+        accounts = ()
+
+        def try_lease(self, *, scope=None, reverse=False):
+            return None
+
+        def release_probe_slot(self, oauth_token):
+            pass
+
+        @property
+        def account_count(self):
+            return 7
+
+    def must_not_run(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError(
+            "the CLI must never be invoked once the pool is exhausted"
+        )
+
+    invoke = account_pool.pool_invoke(_AllCappedGate(), invoke=must_not_run)
+
+    result = mod.code_digests(
+        _batch_digests(3), _tiny_codebook(), project="dark_factory",
+        model="haiku", invoke=invoke,
+    )
+
+    assert result.total == 3
+    assert result.capped == 3, (
+        f"every digest the exhausted pool could not code must be labelled "
+        f"capped, never coded and never fabricated; got {result.capped}"
+    )
+    assert result.succeeded == 0
+    assert result.records == [], (
+        "the never-fabricate contract: a digest the CLI never looked at "
+        "yields NO record, not an empty one"
+    )
+    assert result.status == "failure"
+    assert mod.is_cap_deferral(result) is True, (
+        "this is the exact input nightly's exit-0 DEFERRED branch keys on -- "
+        "an all-capped night is expected weather, not an infra page"
+    )
+
+
+# ---------------------------------------------------------------------------
 # task 5488 / step-3: RED — the two streams are carried as STRUCTURED DATA,
 # not only inside the formatted message.
 #
