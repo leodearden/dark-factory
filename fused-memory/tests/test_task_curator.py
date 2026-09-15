@@ -2176,6 +2176,39 @@ class TestPayloadFailureDegradedness:
     ]
 
     @pytest.mark.asyncio
+    async def test_missing_target_counts_and_fires(self):
+        """esc-4448-10: a schema-legal drop/combine naming no target used to
+        return 'invalid-target ... not in pool' with degraded=False, so it
+        bypassed dedupe on every candidate AND cleared the streak. Needs a
+        NON-empty pool, which is why it cannot ride PAYLOAD_FAILURES above."""
+        curator, escalator = self._curator_with_escalator()
+
+        async def one_entry_corpus(*a, **k):
+            return [_PoolEntry(
+                task_id='1', title='Existing', description='d', details='',
+                files_to_modify=[], module_keys=[], status='pending',
+                priority='medium', source='anchor', combine_eligible=True,
+            )], {'anchor': 1, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        result = AgentResult(
+            success=True, output='', cost_usd=0.01,
+            structured_output={'action': 'drop', 'justification': 'dup'},
+        )
+        with patch.object(curator, '_build_corpus', side_effect=one_entry_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=result)):
+            for i in range(8):
+                decision = await curator.curate(
+                    CandidateTask(title=f'M{i}'), project_id='p', project_root='/x',
+                )
+                assert decision.action == 'create'
+                assert 'missing-target' in decision.justification
+                assert decision.degraded is True
+
+        assert curator._consecutive_degraded == 8
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
     async def test_single_path_counts_payload_failure(self, marker, payload):
         """The reviewer's reproducer: 8 consecutive out-of-enum actions used to
@@ -2299,6 +2332,8 @@ class TestParserDegradednessTable:
     CASES = [
         # --- response unusable: the model broke the output contract ---
         ('invalid-action', {'action': 'duplicate'}, True),
+        ('missing-target', {'action': 'drop', 'justification': 'dup'}, True),
+        ('missing-target', {'action': 'combine', 'justification': 'dup'}, True),
         ('ambiguous-drop',
          {'action': 'drop', 'target_id': '1', 'batch_target_index': 0}, True),
         ('combine-missing-rewrite',
@@ -2340,11 +2375,21 @@ class TestParserDegradednessTable:
             f'depended on the response alone or on pool state.'
         )
 
-    def test_every_marker_is_distinct(self):
-        """A copy-paste slip that made two rows exercise the same branch would
-        leave one branch unpinned while the table still looked complete."""
-        markers = [marker for marker, _, _ in self.CASES]
-        assert len(markers) == len(set(markers)), markers
+    def test_every_case_is_distinct(self):
+        """A copy-paste slip that made two rows exercise the same branch with
+        the same payload would leave one branch unpinned while the table still
+        looked complete. Keyed on (marker, payload) rather than marker alone:
+        'missing-target' legitimately has two rows, since 'drop' and 'combine'
+        reach it by different routes through the is_within_batch_drop test."""
+        keys = [(marker, repr(raw)) for marker, raw, _ in self.CASES]
+        assert len(keys) == len(set(keys)), keys
+
+    def test_both_sides_of_the_line_are_represented(self):
+        """The table's value is the LINE, so it is worthless if every row
+        landed on one side of it."""
+        degraded = [m for m, _, d in self.CASES if d]
+        vetoes = [m for m, _, d in self.CASES if not d]
+        assert degraded and vetoes, (degraded, vetoes)
 
 
 class TestCurateHappyPath:

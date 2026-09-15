@@ -357,6 +357,7 @@ class CuratorDecision:
     #   THE RESPONSE ITSELF was unusable  →  degraded=True. Nothing outside
     #     the payload is consulted; the model simply did not honour the
     #     output contract: 'invalid-action' (action outside the enum);
+    #     'missing-target' (an action that requires a target named none);
     #     'ambiguous-drop' (target_id and batch_target_index, which are
     #     mutually exclusive, both set); and the three combine-rewrite
     #     failures 'combine-missing-rewrite', 'rewrite-parse-failed' and
@@ -367,6 +368,13 @@ class CuratorDecision:
     #     chartered against, and it is indistinguishable from health unless
     #     counted — esc-4448-9 measured 8 consecutive out-of-enum actions
     #     holding the streak at 0 while every candidate bypassed dedupe.
+    #
+    # The line is drawn per CAUSE, not per return statement. A single return
+    # whose condition ORs two sufficient causes hands whichever cause the
+    # author was not thinking of the other one's classification, and no
+    # marker-keyed check can see it because the return carries one marker:
+    # that is how 'missing-target' hid inside 'invalid-target' until
+    # esc-4448-10. Give each cause its own branch and its own marker.
     #
     # The list above is exhaustive as written, deliberately with no trailing
     # '…': a reader adding a branch must classify it, not append to prose.
@@ -3431,17 +3439,40 @@ def _parse_decision_dict(
             and batch_target_index is not None
             and target_id is None
         )
-        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=cost_usd,
-            )
+        if not is_within_batch_drop:
+            # Two causes, deliberately NOT sharing one return: they fall on
+            # opposite sides of the degraded line (see CuratorDecision.degraded)
+            # and a compound condition would silently give the payload failure
+            # the state veto's classification — esc-4448-10, where
+            # {'action': 'drop', 'justification': 'dup'} (schema-legal, since
+            # target_id is nullable and not in either schema's `required`) was
+            # reported as 'invalid-target ... not in pool' with degraded=False.
+            if not target_id:
+                # Nothing outside the payload is consulted: the model chose an
+                # action that REQUIRES a target and named none.
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'missing-target: action={action} has no target_id'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=True,
+                )
+            if target_id not in valid_ids:
+                # Turns on pool state: the id may have been trimmed from the
+                # pool, or completed, between prompt construction and here.
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-target: action={action} target_id={target_id!r}; '
+                        f'not in pool'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
         # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).

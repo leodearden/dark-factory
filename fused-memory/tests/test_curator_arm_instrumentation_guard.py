@@ -251,3 +251,91 @@ def test_state_veto_allowlist_still_matches_real_branches():
         f'STATE_VETO_MARKERS entries match no branch in {PARSE_FN}(): '
         f'{orphaned}. Remove them rather than leaving a dead exemption.'
     )
+
+
+# --- Invariant 4: a state veto is state-gated in EVERY disjunct -------------
+#
+# Invariant 3 keys its exemption on the justification marker, and a return
+# carries exactly one marker however many causes reach it. So a condition that
+# ORs two sufficient causes hands whichever cause the author was not thinking
+# of the other one's classification, invisibly: esc-4448-10 found
+# `not is_within_batch_drop and (not target_id or target_id not in valid_ids)`
+# returning ONE 'invalid-target' create for both "the model named no target"
+# (payload failure — nothing outside the response consulted) and "the named
+# target is not in the pool" (state veto). The first was schema-legal
+# ({'action': 'drop', 'justification': 'dup'} — target_id is nullable and in
+# neither schema's `required`), returned degraded=False, and so cleared the
+# streak on every candidate. Invariant 3 passed it because the marker was
+# allowlisted.
+#
+# This closes that by construction: for a branch to claim the state-veto
+# exemption, every alternative cause that can reach it must consult pool
+# state. A disjunct referencing none of these names is a payload test
+# sharing a veto's return, which is the defect.
+POOL_STATE_NAMES = frozenset({'valid_ids', 'target_entry', 'pool'})
+
+
+def _referenced_names(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _is_state_gated(node: ast.AST) -> bool:
+    """Does every alternative cause in *node* consult pool state?
+
+    ``or`` introduces alternative sufficient causes, so EVERY operand must be
+    gated. ``and`` is one combined cause, so ONE gated conjunct suffices to
+    gate the whole of it.
+    """
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.Or):
+            return all(_is_state_gated(v) for v in node.values)
+        return any(_is_state_gated(v) for v in node.values)
+    return bool(_referenced_names(node) & POOL_STATE_NAMES)
+
+
+def _veto_branch_conditions() -> list[tuple[ast.If, ast.Call]]:
+    """Each ``if`` whose body directly returns an allowlisted fail-open create.
+
+    Keyed on the return being DIRECTLY in the ``if`` body so a wrapping
+    ``if`` whose body holds only nested ``if``s is not mistaken for the guard
+    of a return two levels down.
+    """
+    exempt = []
+    for node in ast.walk(_parse_decision_dict_def()):
+        if not isinstance(node, ast.If):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Return):
+                continue
+            for call in calls_named(stmt, DECISION_TYPE):
+                if any(kw.arg == 'degraded' for kw in call.keywords):
+                    continue
+                if any(m in _marker_text(call) for m in STATE_VETO_MARKERS):
+                    exempt.append((node, call))
+    return exempt
+
+
+def test_state_veto_branches_are_state_gated_in_every_disjunct():
+    exempt = _veto_branch_conditions()
+    assert exempt, (
+        f'no state-veto branch found in {PARSE_FN}() — this guard has lost '
+        f'its subject; re-point it rather than deleting it.'
+    )
+    leaky = [
+        (branch, call) for branch, call in exempt
+        if not _is_state_gated(branch.test)
+    ]
+    assert not leaky, (
+        'state-veto branch(es) in '
+        f'{PARSE_FN}() have an alternative cause that consults no pool state '
+        f'({", ".join(sorted(POOL_STATE_NAMES))}): '
+        + '; '.join(
+            f'line {branch.lineno}: if {ast.unparse(branch.test)} -> '
+            f'{_marker_text(call)}'
+            for branch, call in leaky
+        )
+        + '. One return carries one marker however many causes reach it, so a '
+        'payload failure ORed into a veto branch inherits degraded=False and '
+        'clears the streak on every candidate (esc-4448-10). Split the causes '
+        'into separate branches with separate markers and classify each.'
+    )
