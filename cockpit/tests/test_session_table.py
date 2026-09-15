@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from orchestrator import session_registry as sr
 
 
@@ -574,18 +575,19 @@ class TestFocusMarker:
 
     def test_markers_are_distinct_single_chars_outside_the_status_vocabulary(self):
         """The cue must read in BOTH directions and must never be confusable
-        with a status glyph -- the two dimensions are orthogonal, so a
-        marker colliding with '⚙'/'✓'/'⏸'/'☠'/'?' would make one column
-        look like the other."""
-        from cockpit.panes.session_table import focus_marker
+        with a status glyph -- the two dimensions are orthogonal. The
+        exclusion set is READ from _GLYPHS rather than respelled here, so a
+        glyph added to the status vocabulary later is checked too."""
+        from cockpit.panes.session_table import _FALLBACK_GLYPH, _GLYPHS, focus_marker
 
+        status_vocabulary = set(_GLYPHS.values()) | {_FALLBACK_GLYPH}
         focusable = focus_marker(_make_record(display=sr.Display(kind='wm')))
         headless = focus_marker(_make_record(display=None))
 
         assert focusable != headless
         for marker in (focusable, headless):
             assert len(marker) == 1
-            assert marker not in {'⚙', '✓', '⏸', '☠', '?'}
+            assert marker not in status_vocabulary
 
     def test_unrecognized_display_kind_still_reads_focusable_fail_soft(self):
         """A Display whose kind this view doesn't recognize is still a real
@@ -598,21 +600,29 @@ class TestFocusMarker:
         assert is_focusable(record) is True
         assert focus_marker(record) == '▸'
 
-    def test_agrees_with_resolve_target(self):
+    @pytest.mark.parametrize(
+        'display',
+        [
+            sr.Display(kind='wm', wm_title='t'),
+            sr.Display(kind='tmux', tmux_target='sess:0.1'),
+            sr.Display(kind='weird', wm_title='t'),
+            None,
+        ],
+        ids=['wm', 'tmux', 'unrecognized-kind', 'headless'],
+    )
+    def test_agrees_with_resolve_target(self, display):
         """SPOT guard: the cue must mean exactly what Enter does.
 
         resolve_target is imported HERE only -- production session_table
-        must not import decision_queue (import cycle). If resolve_target's
-        SessionRecord branch ever grows a stricter rule, this fails loudly
+        must not import decision_queue (import cycle). Every display shape
+        the tests above assert on is checked in BOTH directions, so a kind
+        allowlist appearing on either side (resolve_target delegates to
+        _to_display_target, and app.py routes on target.kind) fails loudly
         rather than leaving the table quietly lying to the operator.
         """
         from cockpit.panes.decision_queue import resolve_target
         from cockpit.panes.session_table import is_focusable
 
-        with_display = _make_record(
-            session_slug='has-display', display=sr.Display(kind='wm', wm_title='t')
-        )
-        without_display = _make_record(session_slug='no-display', display=None)
+        record = _make_record(display=display)
 
-        for record in (with_display, without_display):
-            assert is_focusable(record) == (resolve_target(record, {}) is not None)
+        assert is_focusable(record) == (resolve_target(record, {}) is not None)
