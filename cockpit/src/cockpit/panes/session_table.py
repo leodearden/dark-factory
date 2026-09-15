@@ -10,6 +10,7 @@ no-coerce policy for spawn_mode/display).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
@@ -243,17 +244,44 @@ def _is_terminal(status: Status | str) -> bool:
 _DEFAULT_VISIBLE_CAP = 200
 
 
+@dataclass(frozen=True)
+class LiveSessions:
+    """The live band actually rendered, plus how big that band really was.
+
+    visible: the live records after the cap -- what the table shows.
+    total: how many live records there were BEFORE the cap.
+
+    len(visible) <= total always, and visible is a strict prefix of the
+    ordered live set. Both numbers come from the one function that computes
+    them, so a caller cannot render the slice while forgetting to ask what
+    it hid -- which is exactly the defect this replaced.
+    """
+
+    visible: list[SessionRecord]
+    total: int
+
+
 def filter_live_sessions(
     records: list[SessionRecord], *, cap: int = _DEFAULT_VISIBLE_CAP
-) -> list[SessionRecord]:
+) -> LiveSessions:
     """Drop terminal-status (exited/failed-to-start) records, preserving order.
 
     Then slices to the first `cap` of what remains -- pass an
     already-ordered list (see order_sessions) so the cap keeps the top-N
-    of that order. Pure and total: an empty input returns [] and a
-    foreign status is kept (see _is_terminal), never raising.
+    of that order. The cap is now REPORTABLE rather than silent: the
+    returned view carries the pre-cap live count alongside the slice, so a
+    truncated table can say so (see format_visible_count) instead of
+    looking identical to a complete one.
+
+    Terminal records are excluded from the count as well as from the slice
+    -- total is the size of the live band, not of the scanned set, so the
+    notice never claims the cap hid history the view never meant to show.
+
+    Pure and total: an empty input returns an empty view with total 0, and
+    a foreign status is kept (see _is_terminal), never raising.
     """
-    return [record for record in records if not _is_terminal(record.status)][:cap]
+    live = [record for record in records if not _is_terminal(record.status)]
+    return LiveSessions(visible=live[:cap], total=len(live))
 
 
 def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int]:

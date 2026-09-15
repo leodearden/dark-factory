@@ -498,7 +498,9 @@ class CockpitApp(App):
         INDEX changes; suppressing them costs nothing and stops a
         same-content rebuild from stealing a decision an operator is reading.
         """
-        visible = self._records if self._show_history else filter_live_sessions(self._records)
+        visible = (
+            self._records if self._show_history else filter_live_sessions(self._records).visible
+        )
         table = self.query_one('#session-table', SessionTable)
         with self.prevent(DataTable.RowHighlighted):
             table.replace_rows(visible, self._now_fn(), all_records=self._records)
