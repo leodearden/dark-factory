@@ -152,3 +152,63 @@ async def test_before_invoke_still_selects_what_try_lease_selects():
             f'{capped_indices} capped: {sync_lease.name} vs {async_lease.name}'
         )
         assert sync_lease.token == async_lease.token
+
+
+# ---------------------------------------------------------------------------
+# reverse= — the ordering preference, opt-in (task 5488 / step-7)
+#
+# The trickle's 33 haiku one-shots drain the roster from the END while the
+# orchestrator takes first-available from the START, so the two workloads meet
+# only when the pool is nearly exhausted — which is exactly when contention is
+# unavoidable anyway. This is the "smallest such knob" the ruling authorizes:
+# an ordering preference expressed IN the gate, rather than a parallel
+# rotation bypassing it.
+#
+# The negative half is load-bearing: reverse defaults to False, so every
+# existing caller — the orchestrator's whole fleet — keeps its b→h order.
+# ---------------------------------------------------------------------------
+
+_POOL = ['max-b', 'max-c', 'max-d', 'max-e', 'max-f', 'max-g', 'max-h']
+
+
+def test_try_lease_reverse_drains_the_roster_from_the_end():
+    gate = make_gate(_POOL)
+
+    lease = gate.try_lease(reverse=True)
+
+    assert lease is not None
+    assert lease.name == 'max-h', (
+        'the trickle drains h→b so it does not contend with the '
+        "orchestrator's b→h first-available order"
+    )
+
+
+def test_try_lease_reverse_skips_capped_accounts_walking_backwards():
+    gate = make_gate(_POOL)
+    gate._accounts[-1].capped = True   # max-h
+    gate._accounts[-2].capped = True   # max-g
+
+    lease = gate.try_lease(reverse=True)
+
+    assert lease is not None
+    assert lease.name == 'max-f'
+
+
+def test_try_lease_default_order_is_unchanged_by_the_new_knob():
+    """reverse is OPT-IN. The default walk is still first-fit from the
+    start — anything else would silently re-order the orchestrator's own
+    account preference, which this task has no business touching."""
+    gate = make_gate(_POOL)
+
+    assert gate.try_lease().name == 'max-b'
+
+
+@pytest.mark.asyncio
+async def test_before_invoke_never_reverses():
+    """The complement, and the real non-regression assertion: before_invoke
+    passes no `reverse`, so every existing async caller keeps b→h."""
+    gate = make_gate(_POOL)
+
+    lease = await gate.before_invoke()
+
+    assert lease is not None and lease.name == 'max-b'
