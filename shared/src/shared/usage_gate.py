@@ -1005,7 +1005,9 @@ class UsageGate:
             len(self._accounts),
         )
 
-    def try_lease(self, *, scope: str | None = None) -> AccountLease | None:
+    def try_lease(
+        self, *, scope: str | None = None, reverse: bool = False,
+    ) -> AccountLease | None:
         """Select an admissible account and return its lease, or ``None`` —
         SYNCHRONOUSLY, and WITHOUT ever blocking.
 
@@ -1041,8 +1043,21 @@ class UsageGate:
         of account emits the failover cost event, same as before_invoke.
         Settle the returned lease through :class:`InvokeSlot` so the claim is
         always released.
+
+        *reverse* walks the roster from the END (max-h → max-b rather than
+        max-b → max-h). It is an ordering PREFERENCE, not a different
+        admission rule: the same skip predicate, the same probe claim, the
+        same lease. The trickle's 33 haiku one-shots drain from the end so
+        they do not contend with the orchestrator's first-available b → h
+        order; the two orders meet only when the pool is nearly exhausted,
+        which is exactly when contention is unavoidable anyway. Opt-in, and
+        that matters: ``before_invoke`` never passes it, so every existing
+        caller keeps the order it has always had. The knob lives HERE, in the
+        gate, rather than in a caller-side rotation that would have to
+        re-implement selection to express it.
         """
-        for acct in self._accounts:
+        roster = reversed(self._accounts) if reverse else self._accounts
+        for acct in roster:
             if acct.capped or acct.probe_in_flight or acct.auth_failed:
                 continue
             if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
