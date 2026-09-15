@@ -1647,6 +1647,32 @@ def test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_cl
     assert abs(freshness) < _datetime.timedelta(seconds=300)
 
 
+def test_a_fixture_report_describes_one_fixed_moment():
+    """A fixture is a fixed moment, so its rendering is a fixed string.
+
+    Under the live clock two renderings of "the same" fixture differ in their
+    microsecond digits, which is what made `table.count(...)` a coin flip:
+    `render_table` prints `measured_at` in the header line, and the counts run
+    over the whole rendering.
+    """
+    assert _report().measured_at == FIXTURE_MEASURED_AT
+    assert _report().arms[0].measured_at == FIXTURE_MEASURED_AT
+    assert (
+        lms_healthcheck.render_table(_report())
+        == lms_healthcheck.render_table(_report())
+    )
+
+    # The RESIDUAL coupling, as a checked invariant rather than lore.  Pinning
+    # the stamp makes today's counts deterministic; it does not stop a future
+    # editor picking a colliding stamp, or adding a pid whose digits appear in
+    # this one.  Either would silently return
+    # `table.count(str(WHISPER_CONSUMER.pid)) == 2` to the ~3e-4-per-run
+    # merge-lane flake it was.  Asserting it here fails deterministically, at
+    # the fixture that caused it, instead.
+    for consumer in (WHISPER_CONSUMER, ARM_CONSUMER, OLLAMA_CONSUMER):
+        assert str(consumer.pid) not in FIXTURE_MEASURED_AT
+
+
 def test_the_report_carries_a_gpu_identity_block():
     """Which card, which driver.  An arm's numbers are meaningless without it:
     the same manifest on a different GPU produces different verdicts, and the
