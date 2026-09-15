@@ -38,6 +38,7 @@ per-invocation rotation lands.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -52,9 +53,99 @@ if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
 import coder  # noqa: E402
-from shared.usage_gate import InvokeSlot  # noqa: E402
+import yaml  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.usage_gate import InvokeSlot, UsageGate  # noqa: E402
 
 logger = logging.getLogger("legibility.account_pool")
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def default_accounts_file() -> Path:
+    """The shared account roster, resolved against THIS checkout.
+
+    ``config/usage-accounts.yaml`` is the fleet's single source of truth for
+    the pool (the orchestrator and fused-memory reconciliation both point
+    ``usage_cap.accounts_file`` at it). Resolved ``__file__``-relatively and
+    never as a hardcoded absolute, so a copy of this script running from a
+    worktree reads its own roster — same reasoning as coder.py's ``shared``
+    bootstrap (tasks 2881/2882/3329). ABSOLUTE by construction, which
+    matters: ``UsageCapConfig``'s validator ``.resolve()``s a relative path
+    against the CWD, and the trickle's CWD is the systemd unit's.
+    """
+    return _REPO_ROOT / "config" / "usage-accounts.yaml"
+
+
+def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
+    """Construct the shared multi-account ``UsageGate`` for the trickle.
+
+    No orchestrator config is loaded or needed — only the roster file, which
+    is the same two-liner ``fused_memory/config/schema.py`` uses. That is
+    what makes the pool reachable from this interpreter at all, and it
+    falsifies the old claim in ``coder.py``'s docstring that a multi-account
+    gate is unreachable here: the ORCHESTRATOR YAML is unreachable, the gate
+    is not.
+
+    ORDER IS LOAD-BEARING. ``load_dotenv`` runs BEFORE the gate is built,
+    because ``UsageGate._init_accounts`` reads ``os.environ`` eagerly at
+    construction: a ``.env`` loaded afterwards resolves nothing, every
+    account comes back token-less, and the gate silently falls back to
+    ``~/.claude/.credentials.json`` as an account named 'default' — which is
+    exactly the broken behaviour this module exists to end. The path is
+    passed EXPLICITLY rather than letting ``load_dotenv()`` search: the bare
+    call is frame-relative and silently switches to the CWD under a
+    debugger or an interactive interpreter.
+
+    Degrades LOUDLY, never raises, when the pool comes back empty. Copies
+    ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
+    shape, for a reason specific to this caller: refusing to start would
+    take the whole night down, while a warned empty pool still reaches task
+    4736's honest DEFERRED path (``pool_invoke`` raises
+    ``CoderCapExhausted`` naming this exact condition). What must never
+    happen is the quiet version.
+    """
+    load_dotenv(env_file if env_file is not None else _REPO_ROOT / ".env")
+
+    resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or str(
+        default_accounts_file()
+    )
+    gate = UsageGate(UsageCapConfig(accounts_file=str(Path(resolved).resolve())))
+
+    names = [acct.name for acct in gate._accounts]
+    if gate.account_count == 0 or names == ["default"]:
+        # `default` is the name _init_accounts gives the ~/.claude fallback,
+        # so it is indistinguishable from the pre-5488 behaviour and equally
+        # useless to fail over with. Name the roster it FAILED to resolve --
+        # the operator's next move is to check which CLAUDE_OAUTH_TOKEN_* the
+        # unit is missing, and only the roster names that.
+        configured = _roster_names(resolved)
+        logger.warning(
+            "legibility account pool resolved NO usable accounts from %s "
+            "(configured: %s) — every invocation would fall back to the "
+            "ambient ~/.claude login. Check the unit's EnvironmentFile "
+            "supplies those CLAUDE_OAUTH_TOKEN_* vars.",
+            resolved, ", ".join(configured) or "<none>",
+        )
+    else:
+        logger.info(
+            "legibility account pool: %d accounts — %s", len(names), ", ".join(names),
+        )
+    return gate
+
+
+def _roster_names(accounts_file) -> list[str]:
+    """Account names the roster FILE declares, whether or not their tokens
+    resolved. Read straight back off the YAML because the gate keeps no
+    record of an account it skipped, and "which account is missing its
+    token" is the only question the warning above is asked to answer."""
+    try:
+        data = yaml.safe_load(Path(accounts_file).read_text()) or {}
+        return [entry.get("name", "?") for entry in data.get("accounts", [])]
+    except OSError:
+        return []
+
 
 _DEFAULT_INVOKE = coder._invoke_cli
 """The real subprocess boundary this pool hands tokens to.
