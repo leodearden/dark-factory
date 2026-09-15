@@ -5001,3 +5001,48 @@ class TestDecisionQueueDetail:
             await pilot.pause()
 
             assert 'PPP parked question, REVISED?' in detail.rendered_text
+
+
+class TestSessionTableFocusCue:
+    """Signal (a): a row says whether Enter can raise anything for it.
+
+    Rendered end-to-end rather than only at the helper level, because the
+    defect being fixed is that replace_rows never consulted record.display
+    at all -- a passing focus_marker unit test would say nothing about what
+    an operator actually sees in the table.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_focusable_and_headless_rows_are_distinguishable(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable, focus_marker, state_glyph
+
+        focusable = _make_record(
+            session_slug='focusable-1',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='focusable title'),
+        )
+        headless = _make_record(
+            session_slug='headless-1', status=sr.Status.RUNNING, display=None
+        )
+        for r in (focusable, headless):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            focusable_row = table.get_row('focusable-1')
+            headless_row = table.get_row('headless-1')
+
+            assert focus_marker(focusable) in focusable_row
+            assert focus_marker(focusable) not in headless_row
+            assert focus_marker(headless) in headless_row
+            assert focus_marker(headless) not in focusable_row
+
+            # The status vocabulary is untouched: both sessions are RUNNING,
+            # and the focusability cue is a second, orthogonal column -- not
+            # a re-spelling of the state glyph.
+            assert state_glyph(sr.Status.RUNNING) in focusable_row
+            assert state_glyph(sr.Status.RUNNING) in headless_row
