@@ -486,6 +486,12 @@ class CockpitApp(App):
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
 
+        The table is also told the live total, because the cap is a policy
+        rather than a count: an operator reading exactly _DEFAULT_VISIBLE_CAP
+        rows previously could not tell a truncated view from the true fleet
+        size. History mode hides nothing by construction, so it reports its
+        own length and the notice stays empty.
+
         The rebuild owns the detail pane only while the pane still belongs
         to the session table: a rebuild refreshes whichever kind currently
         owns the detail, and only an operator cursor move transfers that
@@ -498,12 +504,16 @@ class CockpitApp(App):
         INDEX changes; suppressing them costs nothing and stops a
         same-content rebuild from stealing a decision an operator is reading.
         """
-        visible = (
-            self._records if self._show_history else filter_live_sessions(self._records).visible
-        )
+        if self._show_history:
+            visible, total = self._records, len(self._records)
+        else:
+            live = filter_live_sessions(self._records)
+            visible, total = live.visible, live.total
         table = self.query_one('#session-table', SessionTable)
         with self.prevent(DataTable.RowHighlighted):
-            table.replace_rows(visible, self._now_fn(), all_records=self._records)
+            table.replace_rows(
+                visible, self._now_fn(), all_records=self._records, total=total
+            )
         self._resync_session_detail(table.highlighted_slug())
 
     def _resync_session_detail(self, slug: str | None) -> None:
