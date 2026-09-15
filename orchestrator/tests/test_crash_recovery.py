@@ -3206,6 +3206,83 @@ class TestSessionResumeStorm:
         )
         assert producible == _BY_DESIGN_SESSION_RESUME_REASONS
 
+    async def test_by_design_restore_constant_classifies_every_producible_outcome(self):
+        """``_BY_DESIGN_RESTORE_OUTCOMES`` classifies EXACTLY the restore
+        vocabulary ``TaskWorkflow._invoke``'s arm block can produce (ε/3733).
+
+        The sibling of the row above, one seam downstream. β's constant covers
+        the ELIGIBILITY predicate, evaluated before dispatch on a sidecar; this
+        one covers the archive RESTORE, evaluated inside ``_invoke`` against
+        the filesystem. Because ε keys its feeder on the ARM SEAM rather than
+        on a predicate reason, this — not the reason set — is where an
+        unclassified new value would slip onto the INV-4 storm feeder.
+
+        Fail-CLOSED in the same way, and for the same reason: every string
+        literal anywhere inside a statement that ASSIGNS ``restore_outcome`` is
+        collected, rather than matching one syntax. A fifth outcome introduced
+        as a plain constant, as a ternary arm (which ``'published' if … else
+        'miss'`` already is), as a walrus, or routed through a module-level
+        constant therefore fails HERE instead of becoming a silent feeder.
+
+        The carve-out must also stay a STRICT subset: were it ever to equal the
+        producible set, nothing could feed the streak and INV-4's escape would
+        be inert again — precisely the condition ε exists to end.
+        """
+        import ast  # noqa: PLC0415 — structural read of one method's source
+        import inspect  # noqa: PLC0415
+        import textwrap  # noqa: PLC0415
+
+        import orchestrator.workflow as workflow_mod  # noqa: PLC0415
+        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
+        from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(TaskWorkflow._invoke))
+        ).body[0]
+
+        producible: set[str] = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if value is None or not any(
+                isinstance(t, ast.Name) and t.id == 'restore_outcome' for t in targets
+            ):
+                continue
+            # The WHOLE value subtree, not just a top-level Constant: the
+            # shipped vocabulary already routes two outcomes through a ternary.
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    producible.add(sub.value)
+                elif isinstance(sub, ast.Name):
+                    # ...and a module-global indirection must not hide one.
+                    resolved = getattr(workflow_mod, sub.id, None)
+                    if isinstance(resolved, str):
+                        producible.add(resolved)
+                    elif isinstance(resolved, set | frozenset | tuple | list) and all(
+                        isinstance(item, str) for item in resolved
+                    ):
+                        producible |= set(resolved)
+
+        assert producible == {'disabled', 'miss', 'fault', 'published'}, (
+            'the restore outcomes assigned in TaskWorkflow._invoke no longer '
+            'match the known vocabulary. If you added an OUTCOME, classify it '
+            'in harness.py::_BY_DESIGN_RESTORE_OUTCOMES (or deliberately leave '
+            'it out, making it a genuine storm feeder) and extend this '
+            f'assertion. Saw: {sorted(producible)}'
+        )
+        assert isinstance(_BY_DESIGN_RESTORE_OUTCOMES, frozenset)
+        carved_out = set(_BY_DESIGN_RESTORE_OUTCOMES)
+        assert carved_out == {'disabled', 'miss'}
+        assert carved_out < producible, (
+            'the by-design restore carve-out must be a STRICT subset of the '
+            'producible vocabulary — if it covers everything, no restore '
+            'outcome can feed the streak and the INV-4 escape is inert again'
+        )
+
     async def test_reseeded_fallbacks_never_file_l1(
         self, harness: Harness, tmp_path: Path
     ):
