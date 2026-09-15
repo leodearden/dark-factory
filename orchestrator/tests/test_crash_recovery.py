@@ -3715,6 +3715,203 @@ class TestSessionResumeStorm:
         # must early-return on the absent queue rather than raising.
         await _drive_session_slot(harness, 'x1', self._fresh_session('uuid-x1'))
 
+    # ── ε (task 3733): the ARM-SEAM feeder ──────────────────────────────────
+    #
+    # β's synthetic feeder above stands in at the ELIGIBILITY predicate. ε's
+    # real one reports from `TaskWorkflow._invoke`'s arm seam instead — the
+    # single place both resume producers converge and the only place the
+    # restore actually happens — so these rows drive `note_resume_failed` /
+    # `note_resume_succeeded` directly against the REAL streak, the REAL decay
+    # and the REAL filer, exactly as the synthetic rows do at the other seam.
+
+    @staticmethod
+    def _report(n: int = 0, **over):
+        """Build one `ResumeFailure`, genuine (restore='fault') by default.
+
+        Imported at CALL time, never at module scope, so a missing name in a
+        RED phase fails only these rows instead of collection (the idiom
+        ``_session_resume_emits`` already uses for EventType members).
+        """
+        from orchestrator.harness import ResumeFailure  # noqa: PLC0415
+        fields = {
+            'task_id': f'task-{n}',
+            'session_id': f'uuid-rf-{n}',
+            'role': 'implementer',
+            'stage': 'pre_flight',
+            'restore': 'fault',
+            'archive_root': f'/archive/root-{n}',
+            'archive_path': f'/archive/root-{n}/sess-{n}.jsonl.gz',
+            'detail': f'OSError: [Errno 28] No space left on device #{n}',
+        }
+        return ResumeFailure(**(fields | over))
+
+    async def test_sink_files_one_l1_at_threshold_and_dedups(self, harness: Harness):
+        """A RUN of genuine arm-seam failures reaches the threshold and files
+        EXACTLY ONE L1, whatever follows it.
+
+        The run deliberately mixes both stages: two pre_flight restore faults
+        and one cli-stage rejection. A cli-stage report carries no restore
+        outcome at all (the restore happened a phase earlier), so it can never
+        be in the carve-out — every CLI rejection of a resume WE armed is
+        genuine by construction.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        q = self._queue()
+        # The dedup is only observable if the queue answers "open" once one is
+        # filed; _queue()'s stand-in always says False.
+        q.has_open_l1 = MagicMock(side_effect=lambda _s: q.submit.call_count > 0)
+        harness._escalation_queue = q
+
+        harness.note_resume_failed(self._report(0))
+        assert harness._session_resume_fallback_streak == 1
+        assert q.submit.call_count == 0
+        harness.note_resume_failed(self._report(1))
+        harness.note_resume_failed(self._report(2, stage='cli', restore=None))
+
+        assert harness._session_resume_fallback_streak == 3
+        assert q.submit.call_count == 1
+        assert q.submit.call_args.args[0].level == 1
+
+        # A fourth keeps counting but files nothing — one open storm L1 at a time.
+        harness.note_resume_failed(self._report(3))
+        assert harness._session_resume_fallback_streak == 4
+        assert q.submit.call_count == 1
+
+    @pytest.mark.parametrize('outcome', ['miss', 'disabled'])
+    async def test_sink_ignores_by_design_restore_outcomes(
+        self, harness: Harness, outcome: str,
+    ):
+        """A by-design restore outcome neither feeds the streak nor records a
+        failure, however many arrive (the D4 carve-out at the arm seam).
+
+        threshold=1 makes the very first GENUINE report fire, so a zero submit
+        count across four reports proves these do not feed it at all. 'miss' is
+        the archive-COVERAGE signal β assigns to a future RATE watch;
+        'disabled' is the restore_from_archive kill switch.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        for i in range(4):
+            harness.note_resume_failed(self._report(i, restore=outcome))
+            # Asserted INSIDE the loop: the counter must never transiently
+            # rise, not merely end at 0.
+            assert harness._session_resume_fallback_streak == 0
+            assert harness._last_session_resume_fallback_at is None
+            assert not harness._eligible_but_failed_resumes
+            assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_success_report_retires_the_run(self, harness: Harness):
+        """A corroborated resume that survived resets the streak AND clears the
+        chain's comparison stamp and the recorded failures.
+
+        Clearing all three together is what keeps the L1's detail truthful: a
+        surviving record from a retired run would name a failure that is no
+        longer part of the run being escalated.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        harness.note_resume_failed(self._report(0))
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._last_session_resume_fallback_at is not None
+        assert len(harness._eligible_but_failed_resumes) == 1
+
+        harness.note_resume_succeeded()
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+        assert not harness._eligible_but_failed_resumes
+
+        # ...so the next failure opens a FRESH run and never reaches 2.
+        harness.note_resume_failed(self._report(1))
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_sink_run_decays_after_storm_window(self, harness: Harness):
+        """A gap of >= storm_window_secs between two genuine reports retires
+        the run, so an isolated drip can never accumulate into a false storm.
+
+        The clock is advanced by rewinding the harness's own monotonic stamp,
+        NOT by monkeypatching time.monotonic — deterministic, and it perturbs
+        no unrelated timer (β's idiom, reused).
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        for i in range(2):
+            harness.note_resume_failed(self._report(i))
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._last_session_resume_fallback_at is not None
+
+        harness._last_session_resume_fallback_at -= 120
+
+        harness.note_resume_failed(self._report(2))
+
+        # Decayed to 0, then re-incremented — NOT 3, so no L1 — and the
+        # retired run's records went with it.
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+        assert [f.session_id for f in harness._eligible_but_failed_resumes] == [
+            'uuid-rf-2'
+        ]
+
+    async def test_a_fresh_boot_carries_no_run(self, harness: Harness):
+        """The run is PER-BOOT: a newly constructed Harness starts with no
+        streak, no comparison stamp and no recorded failures.
+
+        Asserted structurally as well as by value — the three fields are
+        per-INSTANCE state initialised in ``__init__``, not class attributes a
+        second orchestrator process (or a second Harness in one interpreter)
+        could inherit a half-finished run from.
+        """
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+        assert not harness._eligible_but_failed_resumes
+
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        harness.note_resume_failed(self._report(0))
+        assert harness._session_resume_fallback_streak == 1
+
+        for field in ('_session_resume_fallback_streak',
+                      '_last_session_resume_fallback_at',
+                      '_eligible_but_failed_resumes'):
+            assert field in vars(harness), f'{field} must be per-instance state'
+            assert not hasattr(Harness, field), (
+                f'{field} is a class attribute — a run would leak across boots'
+            )
+
+    async def test_sink_is_total(self, harness: Harness):
+        """Instrumentation must never break a dispatch (I3).
+
+        Two independent ways it could: a bare harness with no escalation queue
+        at the moment the threshold trips, and a malformed report. Both are
+        swallowed; neither reaches the caller, which is the production
+        ``_invoke`` path.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        harness._escalation_queue = None
+
+        # threshold=1 → the first genuine report trips the filer, which must
+        # early-return on the absent queue rather than raising.
+        harness.note_resume_failed(self._report(0))
+        assert harness._session_resume_fallback_streak == 1
+
+        harness.note_resume_failed(object())  # type: ignore[arg-type]
+        harness.note_resume_succeeded()
+
 
 @pytest.mark.asyncio
 class TestMarkInProgressDoneRecoveryStateCleanup:
