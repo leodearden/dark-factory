@@ -119,10 +119,24 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # stay CLOSED to only value-taking flags — listing a boolean flag (e.g.
 # -x/-s/-v/-q/-l) here would make the walk swallow the following target
 # token, a silent, worse failure than the stranded-value bug this fixes.
+#
+# OMITTING a value-taking flag is the other direction of the same defect,
+# and task 5408 measured what it costs on a live config. With `--dist`
+# unlisted, parse_config_command on scripts/orchestrator.yaml::test_command
+# stranded `--dist` at the end of base_flags and admitted its value
+# `loadgroup` as a TEST TARGET; with_junitxml then rendered
+# `... -n auto --dist --junitxml /tmp/j.xml ... loadgroup`, which exits rc=4
+# with `argument --dist: expected one argument` — on the merge gate's own
+# path, since verify.py injects --junitxml for role=='merge' with
+# merge_verify_breadth=='full'. So the whole xdist worker-flag family is
+# listed here: `--numprocesses`/`--maxprocesses` are xdist's long spellings
+# for the worker count and its cap, and a set that binds `-n` but not `-n`'s
+# own long spelling is the same latent defect one config rename away.
 _PYTEST_VALUE_FLAGS = frozenset({
     '-k', '-m', '-p', '-o', '-c', '-n', '-W',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
+    '--dist', '--numprocesses', '--maxprocesses',
 })
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
