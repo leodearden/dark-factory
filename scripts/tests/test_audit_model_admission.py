@@ -782,6 +782,23 @@ def test_an_empty_window_totals_zero_rather_than_none(runs_db):
     assert spend.at_or_over_ceiling is False
 
 
+def test_an_absent_ceiling_reads_as_unknown_not_as_a_zero_ceiling(runs_db):
+    """A 0.0 default would make ANY spend at all — even zero — compute as
+    at/over ceiling with negative headroom, which renders identically to a real
+    breach on the one column a reader is meant to treat as an alarm."""
+    _invocation(
+        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+        started_at=_at(hours=1), completed_at=_at(hours=1),
+    )
+
+    spend = _spend(runs_db, ceiling_usd=None)
+
+    assert spend.total_usd == pytest.approx(6.08)
+    assert spend.ceiling_usd is None
+    assert spend.headroom_usd is None
+    assert spend.at_or_over_ceiling is None
+
+
 @pytest.mark.parametrize(
     ('cost_usd', 'expected'),
     [(150.0, True), (149.99, False)],
@@ -917,6 +934,13 @@ def test_the_markdown_body_carries_the_measured_values_not_a_summary(live_shaped
         assert token in body, f'{token!r} missing from the rendered report'
 
 
+def test_an_absent_ceiling_renders_as_a_dash_rather_than_as_a_breach(live_shaped_db):
+    body = audit_model_admission.render_markdown(_audit(live_shaped_db, ceiling_usd=None))
+
+    section = body.split('### 5.')[1].split('### 6.')[0]
+    assert '| 2 | 9.94 | - | - | - |' in section
+
+
 def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     payload = json.loads(audit_model_admission.render_json(_audit(live_shaped_db)))
 
@@ -973,6 +997,21 @@ def test_main_emits_parseable_json_and_exits_zero(runs_db_path, live_shaped_db, 
     payload = json.loads(capsys.readouterr().out)
     assert payload['meta']['model'] == FABLE
     assert [r['role'] for r in payload['invocations']] == ['merger', 'steward']
+
+
+def test_main_without_a_ceiling_reports_no_ceiling_rather_than_a_zero_one(
+    runs_db_path, live_shaped_db, capsys
+):
+    """--ceiling is the flag most likely to be forgotten on task 5441's re-run."""
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    spend = json.loads(capsys.readouterr().out)['spend']
+    assert spend['ceiling_usd'] is None
+    assert spend['headroom_usd'] is None
+    assert spend['at_or_over_ceiling'] is None
 
 
 def test_main_leaves_the_store_byte_for_byte_unchanged(runs_db_path, live_shaped_db, capsys):

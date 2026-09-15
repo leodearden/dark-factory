@@ -553,9 +553,9 @@ class SpendInWindow:
     window_end: str
     total_usd: float
     invocation_count: int
-    ceiling_usd: float
-    headroom_usd: float
-    at_or_over_ceiling: bool
+    ceiling_usd: float | None
+    headroom_usd: float | None
+    at_or_over_ceiling: bool | None
 
 
 def spend_in_window(
@@ -564,7 +564,7 @@ def spend_in_window(
     model: str,
     window_start: datetime,
     window_end: datetime,
-    ceiling_usd: float,
+    ceiling_usd: float | None,
 ) -> SpendInWindow:
     """Sum *model*'s cost over the HALF-OPEN window ``[window_start, window_end)``.
 
@@ -573,9 +573,26 @@ def spend_in_window(
     is only reproducible if the convention is fixed, and because task 5441
     re-runs this over a wider window and diffs the two.
 
+    Half-open DELIBERATELY DIFFERS from the producer of the figure the resolver
+    actually enforces against: ``shared/src/shared/cost_store.py::CostStore.
+    model_cost_in_window`` sums with SQLite ``BETWEEN``, which is INCLUSIVE at
+    both ends.  The two therefore disagree about a row stamped exactly at the
+    window end.  Reproducibility wins here — two adjacent audit windows must not
+    both count the row on their shared boundary — so read the headroom below as
+    this audit's measurement of the same rows, not as the number routing
+    compared against.
+
     ``at_or_over_ceiling`` is at-or-ABOVE — spend exactly equal to the ceiling
     counts as exhausted, matching ``routing.py::_model_rejection_reason``, which
-    rejects on ``spend >= ceiling``.
+    rejects on ``spend >= ceiling``.  That comparison IS the resolver's rule.
+
+    With no ceiling supplied, ``ceiling_usd``, ``headroom_usd`` and
+    ``at_or_over_ceiling`` are all None rather than 0.0 / negative / True: a
+    zero default would render every non-empty window as a ceiling breach, which
+    is indistinguishable from a real one on the column most likely to be read as
+    an alarm.  Same convention as ``InvocationRecord.
+    at_or_over_flat_role_ceiling`` — a limit we were not given is unknown, never
+    a plausible-looking False.
     """
     total, count = conn.execute(
         'SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM invocations '
@@ -588,8 +605,8 @@ def spend_in_window(
         total_usd=total,
         invocation_count=count,
         ceiling_usd=ceiling_usd,
-        headroom_usd=ceiling_usd - total,
-        at_or_over_ceiling=total >= ceiling_usd,
+        headroom_usd=None if ceiling_usd is None else ceiling_usd - total,
+        at_or_over_ceiling=None if ceiling_usd is None else total >= ceiling_usd,
     )
 
 
@@ -682,7 +699,7 @@ def audit(
     since: datetime,
     expected_roles: Sequence[str],
     window: tuple[datetime, datetime],
-    ceiling_usd: float,
+    ceiling_usd: float | None,
     role_ceilings_secs: dict[str, int] | None = None,
 ) -> AuditResult:
     """Run all five scans against one connection and freeze the results.
@@ -817,11 +834,18 @@ def render_markdown(result: AuditResult) -> str:
     out += ['']
 
     spend = result.spend
+    # '-' for the three ceiling cells when no ceiling was supplied: there is no
+    # comparison to render, and printing 0.00 / -3.86 / True would read as a
+    # breach. (Section 2's `None` cells are a different thing — a measured
+    # tri-state, rendered like the True/False in the same column.)
+    ceiling = '-' if spend.ceiling_usd is None else f'{spend.ceiling_usd:.2f}'
+    headroom = '-' if spend.headroom_usd is None else f'{spend.headroom_usd:.2f}'
+    over_ceiling = '-' if spend.at_or_over_ceiling is None else spend.at_or_over_ceiling
     out += [f'### 5. Spend on `{model}` over [{spend.window_start}, {spend.window_end})', '']
     out += _table(
         ['invocations', 'total $', 'ceiling $', 'headroom $', 'at/over ceiling'],
-        [(spend.invocation_count, f'{spend.total_usd:.2f}', f'{spend.ceiling_usd:.2f}',
-          f'{spend.headroom_usd:.2f}', spend.at_or_over_ceiling)],
+        [(spend.invocation_count, f'{spend.total_usd:.2f}', ceiling, headroom,
+          over_ceiling)],
     )
     out += ['']
 
@@ -894,8 +918,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help='trailing window for the spend-vs-ceiling section (default: 24h)',
     )
     parser.add_argument(
-        '--ceiling', default=0.0, type=float,
-        help='per-model daily ceiling in USD to measure spend against',
+        '--ceiling', default=None, type=float,
+        help='per-model daily ceiling in USD to measure spend against; omitted '
+             'means no ceiling was supplied, and the ceiling, headroom and '
+             'at/over cells render as "-" rather than as a spurious breach',
     )
     parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
     parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
