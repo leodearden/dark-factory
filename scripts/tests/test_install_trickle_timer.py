@@ -399,6 +399,131 @@ def test_install_is_idempotent(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# task 5488: the installer RETIRES the stale account-pin drop-in
+#
+# NOT cosmetic. A drop-in's `ExecStart=` reset REPLACES the unit's ExecStart
+# entirely, and the 2026-09-14 stopgap
+# (~/.config/systemd/user/legibility-trickle@.service.d/10-account-pin.conf)
+# did exactly that, re-spelling ExecStart with
+# CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN_H} inline. Leave it installed
+# and the trickle stays pinned to one account forever while every change in
+# this task sits silently inert -- the unit file on disk saying one thing and
+# the unit systemd runs saying another.
+#
+# test_remove_lms_dropin_wrapper.py is the in-repo precedent for this shape.
+# ---------------------------------------------------------------------------
+
+STALE_DROPIN_NAME = "10-account-pin.conf"
+
+
+def _dropin_dir(xdg_config):
+    return xdg_config / "systemd" / "user" / "legibility-trickle@.service.d"
+
+
+def _seed_stale_dropin(xdg_config):
+    """Write a byte-faithful copy of the 2026-09-14 stopgap drop-in."""
+    dropin_dir = _dropin_dir(xdg_config)
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    path = dropin_dir / STALE_DROPIN_NAME
+    path.write_text(
+        "[Service]\n"
+        "EnvironmentFile=/home/leo/src/dark-factory/.env\n"
+        "UnsetEnvironment=ANTHROPIC_API_KEY\n"
+        "ExecStart=\n"
+        "ExecStart=/usr/bin/env CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN_H} "
+        "/home/leo/.local/bin/uv run --frozen --project shared python "
+        "scripts/legibility/nightly.py run --project-id %i\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_install_removes_the_stale_account_pin_dropin(tmp_path):
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+    xdg_config = tmp_path / "xdg-config"
+    stale = _seed_stale_dropin(xdg_config)
+
+    result = _run_script(
+        tmp_path, "proj_a",
+        env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert not stale.exists(), (
+        "the stale account-pin drop-in survived the install -- its ExecStart= "
+        "reset replaces the unit's own, so the trickle stays pinned to one "
+        "account and task 5488 is silently inert"
+    )
+    assert not _dropin_dir(xdg_config).exists(), (
+        "an emptied .service.d directory must go too: systemd lists it as a "
+        "drop-in path forever otherwise, and the next reader cannot tell an "
+        "empty override directory from a live one"
+    )
+    assert STALE_DROPIN_NAME in result.stdout, (
+        "removing a live override is a change an operator must see in the "
+        "install output, not a silent side effect"
+    )
+
+
+def test_install_is_idempotent_with_no_dropin_present(tmp_path):
+    """The removal must be a no-op when there is nothing to remove.
+
+    Under `set -euo pipefail` a bare `rm`/`rmdir` of a missing path exits
+    non-zero and would abort the whole install -- turning a first-time setup
+    on a machine that never had the stopgap into a hard failure.
+    """
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+    xdg_config = tmp_path / "xdg-config"
+    env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
+
+    first = _run_script(tmp_path, "proj_a", env=env)
+    assert first.returncode == 0, f"stdout={first.stdout!r} stderr={first.stderr!r}"
+
+    _seed_stale_dropin(xdg_config)
+    second = _run_script(tmp_path, "proj_a", env=env)
+    assert second.returncode == 0
+
+    third = _run_script(tmp_path, "proj_a", env=env)
+    assert third.returncode == 0, (
+        f"a re-run with the drop-in already gone must still exit 0; "
+        f"stdout={third.stdout!r} stderr={third.stderr!r}"
+    )
+    assert STALE_DROPIN_NAME not in third.stdout, (
+        "only an install that actually removed something may say so"
+    )
+
+
+def test_install_removes_only_the_named_dropin(tmp_path):
+    """The guard that matters: an operator's OWN override must survive.
+
+    A blanket `rm -rf .service.d` would silently delete a deliberate local
+    customization -- and the operator would only discover it the next time the
+    behaviour it encoded failed to happen.
+    """
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+    xdg_config = tmp_path / "xdg-config"
+    stale = _seed_stale_dropin(xdg_config)
+    operator_override = _dropin_dir(xdg_config) / "20-operator-nice.conf"
+    operator_override.write_text("[Service]\nNice=10\n", encoding="utf-8")
+
+    result = _run_script(
+        tmp_path, "proj_a",
+        env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert not stale.exists()
+    assert operator_override.is_file(), (
+        "an unrelated drop-in must never be swept up by the retirement"
+    )
+    assert operator_override.read_text() == "[Service]\nNice=10\n"
+
+
 def test_install_fails_when_self_verify_omits_timer(tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
