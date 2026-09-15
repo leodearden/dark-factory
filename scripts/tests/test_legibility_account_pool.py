@@ -698,3 +698,85 @@ def test_subprocess_env_returns_none_when_nothing_can_be_leased():
     gate = _pool(("max-b", True), ("max-h", True))
 
     assert mod.subprocess_env(gate) is None
+
+
+# ---------------------------------------------------------------------------
+# task 5488 / step-26: THE LIVE EXERCISE, as an automatable pin
+#
+# The ruling asks for one real run with a pool token deliberately absent,
+# completing on another account. Marked `integration`, which the root
+# pyproject.toml deselects by default (`-m 'not ... integration ...'`), so it
+# never runs in the normal suite and never spends tokens there. Run it on
+# purpose:
+#
+#     uv run --frozen --project shared python -m pytest \
+#         scripts/tests/test_legibility_account_pool.py -m integration
+#
+# Everything else in this file drives a fake gate and a stub invoker; this is
+# the one case that proves the whole chain is real -- a roster on disk, tokens
+# out of the environment, a genuine `claude -p --model haiku`, and a failover
+# that costs the night nothing.
+# ---------------------------------------------------------------------------
+
+def _roster_token_envs():
+    """The `oauth_token_env` names the REAL roster declares, in file order."""
+    import yaml
+
+    data = yaml.safe_load(mod.default_accounts_file().read_text()) or {}
+    return [entry["oauth_token_env"] for entry in data.get("accounts", [])]
+
+
+@pytest.mark.integration
+def test_live_one_shot_completes_when_a_pool_token_is_missing(monkeypatch, tmp_path):
+    """A token absent from the environment must cost the night NOTHING.
+
+    The account removed is the one the trickle would otherwise take FIRST --
+    the LAST in the roster, since the trickle drains h->b -- so a pass here
+    means failover actually happened rather than the run getting lucky on an
+    account that was never at risk.
+    """
+    import os
+
+    token_envs = _roster_token_envs()
+    available = [name for name in token_envs if os.environ.get(name)]
+    if len(available) < 2:
+        pytest.skip(
+            f"needs at least 2 pool tokens in the environment, have "
+            f"{len(available)} of {len(token_envs)} — source the project .env"
+        )
+
+    # Removed from the ENV, and build_pool pointed at an empty env file, so the
+    # deletion cannot be undone by the .env load inside build_pool.
+    first_choice = available[-1]
+    removed_token = os.environ[first_choice]
+    monkeypatch.delenv(first_choice)
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("")
+
+    gate = mod.build_pool(env_file=str(empty_env))
+    assert gate.account_count == len(available) - 1, (
+        f"expected the pool to resolve every token but {first_choice}; "
+        f"got {gate.account_count} accounts"
+    )
+
+    used_tokens = []
+
+    def _recording_invoke(prompt, model, **kwargs):
+        used_tokens.append(kwargs.get("oauth_token"))
+        return coder_mod._invoke_cli(prompt, model, **kwargs)
+
+    invoke = mod.pool_invoke(gate, invoke=_recording_invoke)
+    try:
+        reply = invoke("Reply with exactly the two characters: OK", "haiku")
+    except coder_mod.CoderCapExhausted as exc:
+        # The same policy shared/tests/_capacity_skip.py applies to every
+        # real-CLI test: a genuinely exhausted fleet is not a failure of this
+        # code, and cannot be told apart from one by running it.
+        pytest.skip(f"the whole pool is capped, nothing to exercise here: {exc}")
+
+    assert reply.strip(), "a live one-shot must come back with a model turn"
+    assert used_tokens, "the CLI seam was never reached"
+    assert removed_token not in used_tokens, (
+        "the run used the account whose token was removed from the "
+        "environment — the pool is not reading the env it claims to"
+    )
