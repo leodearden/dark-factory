@@ -253,7 +253,10 @@ def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int
 class SessionTable(DataTable):
     """The session-registry table: one row per session, keyed by session_slug.
 
-    Columns: state glyph / title / age / project / outstanding children.
+    Columns: focus marker / state glyph / title / age / project /
+    outstanding children. The focus marker answers a different question
+    from the state glyph -- a headless agent session has no terminal
+    anywhere, so Enter can never raise anything for it, however busy it is.
     Selection-preserving: replace_rows re-locates the previously highlighted
     session_slug after a rebuild, so a poll tick never yanks the cursor away
     from the row an operator is looking at.
@@ -271,7 +274,7 @@ class SessionTable(DataTable):
         super().__init__(*args, **kwargs)
 
     def on_mount(self) -> None:
-        self.add_columns('', 'title', 'age', 'project', 'children')
+        self.add_columns('', '', 'title', 'age', 'project', 'children')
 
     def highlighted_slug(self) -> str | None:
         """Return the session_slug of the currently-highlighted row, or None if empty."""
@@ -303,6 +306,7 @@ class SessionTable(DataTable):
         self.clear()
         for record in records:
             self.add_row(
+                focus_marker(record),
                 state_glyph(record.status),
                 format_title(record),
                 format_age(record.start_ts, now),

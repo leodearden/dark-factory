@@ -557,7 +557,7 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
             await pilot.pause()
 
             assert table.row_count == 1
-            assert table.get_row('parent-1')[4] == '1'
+            assert table.get_row('parent-1')[5] == '1'
 
 
 class TestWriteDiscipline:
