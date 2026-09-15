@@ -2739,7 +2739,7 @@ class TestTTLCacheDetachedRefreshReaping:
         return _refresh, entered
 
     @classmethod
-    async def _wedge_one_bypass(cls, cache, key='k'):
+    async def _wedge_one_bypass(cls, cache, key='k', refresh_and_entered=None):
         """Put exactly one genuinely in-flight bypass task on *cache* for *key*.
 
         Holds *key*'s lock so the caller's bounded acquisition times out and
@@ -2747,11 +2747,16 @@ class TestTTLCacheDetachedRefreshReaping:
         actually been ENTERED — not merely scheduled — before returning, so
         the task is in flight by construction rather than by timing luck.
 
+        *refresh_and_entered* substitutes any other ``(refresh, entered)``
+        pair of the same shape for the parked-forever default, which is how
+        the hostile-unwind class below varies only how a reaped refresh ENDS
+        while reusing this wedging idiom rather than re-deriving it.
+
         Returns ``(bypass_task, caller_task)``. The caller is parked on the
         shielded bypass and never returns on its own; hand it to
         :meth:`_drain` once the reaping assertions are done.
         """
-        refresh, entered = cls._never_resolving_refresh()
+        refresh, entered = refresh_and_entered or cls._never_resolving_refresh()
         lock = cache._locks.setdefault(key, asyncio.Lock())
         await lock.acquire()
         try:
@@ -2817,6 +2822,88 @@ class TestTTLCacheDetachedRefreshReaping:
         TTLCache(ttl_seconds=60.0)  # registered, but never used
 
         assert await fanout_mod.reap_detached_refreshes() == 0
+
+
+class TestTTLCacheReapSurvivesAHostileUnwind:
+    """A reaped refresh that ends by RAISING must not escape the reaper.
+
+    Cancellation is a request; how the coroutine ends in response is not the
+    reaper's to choose. A refresh unwinding through httpx/anyio can finish
+    with ``RuntimeError: Attempted to exit cancel scope in a different task``,
+    and any ``finally`` or ``except CancelledError`` cleanup can raise on its
+    own account. Tolerating ``CancelledError`` alone therefore lets that
+    outcome out of ``cancel_live_bypasses``, up through
+    ``reap_detached_refreshes``, and into ``dashboard.app.lifespan`` — where
+    it arrives ABOVE the store, pool and client closes, so the shutdown hook
+    added to prevent stranded handles would strand them instead.
+
+    Two bypasses under different keys, the hostile one wedged FIRST. A reaper
+    that dies at the first raiser leaves its neighbour cancelled but never
+    awaited, so the guarantee the method's docstring makes — by the time it
+    returns, the task has actually unwound — silently stops holding for
+    everything behind the raiser. One task could not show that half.
+    """
+
+    @staticmethod
+    def _refresh_that_raises_while_unwinding():
+        """Refresh stub that enters, parks, then raises NON-cancellation on cancel.
+
+        Deliberately the same shape as ``_never_resolving_refresh`` — enters,
+        signals, never resolves — differing only in how it ends once
+        cancelled. Returns ``(refresh, entered_event)``.
+        """
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+
+        async def _refresh():
+            entered.set()
+            try:
+                await wedged.wait()  # never set
+            except asyncio.CancelledError:
+                raise RuntimeError('cleanup blew up while unwinding') from None
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered
+
+    async def test_a_raising_unwind_neither_escapes_nor_strands_its_neighbour(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        wedge = TestTTLCacheDetachedRefreshReaping._wedge_one_bypass
+
+        # Hostile first: the roster is built in key-insertion order, so this
+        # is the ordering under which a reaper that stops at the first raiser
+        # abandons a neighbour it has already cancelled.
+        hostile, hostile_caller = await wedge(
+            cache, 'hostile', self._refresh_that_raises_while_unwinding()
+        )
+        polite, polite_caller = await wedge(cache, 'polite')
+        assert not hostile.done() and not polite.done(), (
+            'precondition: both bypasses are genuinely in flight'
+        )
+
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # done(), not cancelled(): a task that raises out of its
+        # except-CancelledError cleanup ENDED BY RAISING, so cancelled() is
+        # False — which is why the sibling class's `assert bypass.cancelled()`
+        # is the wrong shape for this outcome.
+        assert hostile.done(), 'the hostile task must have ended'
+        assert polite.done(), (
+            'the reap must await every task it cancelled, so a neighbour '
+            'queued behind a raiser is not left cancelled-but-never-awaited'
+        )
+        assert reaped == 2, (
+            'a task that ended by raising still ENDED, so it released its '
+            f'connection and is legitimately reaped; got {reaped}'
+        )
+        assert cache._live_bypasses == {}, 'the resource roster must be emptied'
+        assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
+
+        await TestTTLCacheDetachedRefreshReaping._drain(hostile_caller, polite_caller)
 
 
 class TestTTLCacheReapIsScopedToTheRunningLoop:
