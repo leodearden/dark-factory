@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import importlib.util
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_staleness_sweep.py'
 
@@ -39,20 +39,7 @@ def _load_module() -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly
     (they call sys.modules.get(cls.__module__)).
     """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'memory_eval_staleness_sweep'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_staleness_sweep')
 
 
 @functools.cache
@@ -2654,7 +2641,7 @@ class TestSeededStalenessSweep:
     """A real supersedes pair and a real dangling pointer, both reported."""
 
     def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
-        self, monkeypatch, sweep_config, sweep_project_id,
+        self, sweep_config, sweep_project_id,
     ):
         """A leaked collection under the default prefix would live forever.
 
@@ -2662,21 +2649,19 @@ class TestSeededStalenessSweep:
         real QdrantClient, and this assertion is about a NAME. Taking it would
         drag the one pure test in this class onto the network.
         """
-        import importlib.util as _ilu  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-
         from fused_memory.models.scope import Scope  # noqa: PLC0415
 
         collection = Scope(project_id=sweep_project_id).mem0_collection_name(
             sweep_config.mem0.collection_prefix,
         )
 
-        path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
-        spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
-        assert spec is not None and spec.loader is not None
-        cleanup = _ilu.module_from_spec(spec)
-        monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
-        spec.loader.exec_module(cleanup)
+        # The SAME module object conftest.py's session lease fixture installs
+        # under this key, not a second copy of it: the key is shared, so a
+        # local re-exec is what would have leaked (task 3895).
+        cleanup = load_script_module(
+            SCRIPT_PATH.parent / 'cleanup_test_collections.py',
+            mod_name='cleanup_test_collections',
+        )
 
         # Asserted against the reaper's OWN constant, not a restated string:
         # a prefix rename over there must not silently strand collections here.

@@ -9,15 +9,14 @@ stand-ins throughout.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
@@ -30,18 +29,7 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its name so that
     reflection-based decorators work correctly.
     """
-    mod_name = 'census_memory_metadata'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='census_memory_metadata')
 
 
 _mod = _load_module()
@@ -1376,24 +1364,19 @@ class TestRegistryCoverageGauge:
         # ::load_topic_registry already established, so the schema
         # check, the zero-entry rejection and the RegistryError type stay
         # single-homed rather than re-parsed here.
-        import importlib.util as _ilu
-        import sys as _sys
-        from pathlib import Path as _Path
-
         assert _mod.__file__ is not None
-        probe_path = _Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py'
-        cached = _sys.modules.get('memory_eval_retrieval_probe')
-        if cached is None:
-            spec = _ilu.spec_from_file_location('memory_eval_retrieval_probe', probe_path)
-            assert spec is not None and spec.loader is not None
-            cached = _ilu.module_from_spec(spec)
-            _sys.modules['memory_eval_retrieval_probe'] = cached
-            spec.loader.exec_module(cached)
+        # The shared loader IS the reuse check this test used to hand-roll:
+        # test_memory_eval_retrieval_probe.py owns this key, so the probe
+        # comes back rather than being executed a second time (task 3895).
+        probe = load_script_module(
+            Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py',
+            mod_name='memory_eval_retrieval_probe',
+        )
         # Through the ACCESSOR, not a module attribute: the loader is bound
         # lazily so an unloadable probe degrades to registry_error instead of
         # killing the import (and with it the whole census). The reuse is
         # still pinned by identity.
-        assert _mod.topic_registry_loader() is cached.load_topic_registry
+        assert _mod.topic_registry_loader() is probe.load_topic_registry
 
     # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that the probe is
     # not loaded AT IMPORT TIME, via `inspect.getsource` +
