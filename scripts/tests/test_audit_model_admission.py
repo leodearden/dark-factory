@@ -9,9 +9,10 @@ captured with
     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
 
 Copied rather than imported because scripts/tests/ is collected by
-`uv run --project shared pytest` and imports NO first-party package
-(dark-factory-orchestrator.yaml:111-112) — so the orchestrator's own event
-store, which owns this DDL, is out of reach here. Re-capture with that command
+`uv run --project shared pytest` and imports NO first-party package — the
+comment on dark-factory-orchestrator.yaml::test_command says so in as many
+words — so the orchestrator's own event store, which owns this DDL, is out of
+reach here. Re-capture with that command
 rather than hand-editing if the writer's schema moves.
 """
 import argparse
@@ -843,8 +844,9 @@ def test_observed_roles_within_the_allowlist_leave_unexpected_empty(runs_db):
 
 
 def test_a_role_outside_the_allowlist_is_named_in_unexpected_roles(runs_db):
-    """The ladder-containment regression dark-factory-orchestrator.yaml's
-    L1241-1244 deviation exists to prevent: the retry ladder was left unchanged
+    """The ladder-containment regression that dark-factory-orchestrator.yaml's
+    "DELIBERATE DEVIATION from P4-06's 'ladder top = fable'" comment — the one
+    guarding routing.ladder — exists to prevent: the ladder was left unchanged
     so a "+1" retry-tier-up cannot route an implementer to Fable."""
     _invocation(
         runs_db, model=FABLE, role='implementer', task_id='a', cost_usd=4.0,

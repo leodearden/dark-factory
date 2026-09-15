@@ -143,15 +143,18 @@ are green-tier and hot-reloadable, which is precisely why dispatch works while
 the red-tier leaf does not.)
 
 **5 — Cost against the ceiling.** Nowhere near it. $3.86 over the trailing 24 h
-and $9.93 across all three invocations since the apply, against a $150.00/day
-`per_model_daily_ceiling_usd` — 6.6 % of one day's ceiling consumed in 31 hours.
-No ceiling rejection fired, and none could have.
+and $9.93 across all three invocations since the apply — that is the *unrounded*
+sum, $9.932856; § 2 rounds each row to the cent, so adding its three rendered
+cells (6.08 + 2.14 + 1.72) gives $9.94. Either way, against a $150.00/day
+`per_model_daily_ceiling_usd` that is 6.6 % of one day's ceiling consumed in
+31 hours. No ceiling rejection fired, and none could have.
 
 **6 — Role containment held.** Observed roles are exactly `{merger, steward}`;
-`unexpected_roles` is empty. This is the property
-`dark-factory-orchestrator.yaml` L1241-1244 deliberately engineered for — the
-retry ladder was left unchanged and absolute model strings used instead, so a
-`+1` retry-tier-up cannot route an implementer, debugger or architect to Fable.
+`unexpected_roles` is empty. This is the property `dark-factory-orchestrator.yaml`'s
+**"DELIBERATE DEVIATION from P4-06's 'ladder top = fable'"** comment — the one
+guarding `routing.ladder` — deliberately engineered for: the retry ladder was
+left unchanged and absolute model strings used instead, so a `+1` retry-tier-up
+cannot route an implementer, debugger or architect to Fable.
 Note both steward dispatches ran at `routing_tier: 1`, which is the rule
 working as specified (second attempt), not a ladder leak.
 

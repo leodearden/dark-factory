@@ -41,9 +41,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-# The orchestrator's own data/ is gitignored (.gitignore:9 "/data/"), so a task
-# worktree has no store of its own and a worktree-relative default would never
-# resolve.  The live store exists only in the main checkout.
+# The orchestrator's own data/ is gitignored (the `/data/` rule in .gitignore),
+# so a task worktree has no store of its own and a worktree-relative default
+# would never resolve.  The live store exists only in the main checkout.
 DEFAULT_RUNS_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
 
 # A trailing-window spec: N hours or N days, N a POSITIVE integer. Anchored so
