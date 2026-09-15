@@ -2626,6 +2626,80 @@ class TestRunMergeVerifyOnWorktree:
         assert effective_config.lint_command == 'ORIG_LINT'
         assert effective_config.type_check_command == 'ORIG_TYPE'
 
+    async def test_spec_verify_env_reaches_zero_module_remote_config(self):
+        """spec.verify_env was dropped entirely on the zero-module path, so the
+        remote decided the merge under its OWN config's test-selection env (the
+        task-2822 false-green class)."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        config = OrchestratorConfig(
+            verify_env={'CARGO_MAKEFLAGS': '--jobserver-auth=fifo:/tmp/reify-jobserver-merge'},
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        spec = MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('crates/x/src/lib.rs',),
+            verify_env={'REIFY_RELEASE_DELTA_SKIP': '1'},
+            cold_timeout_secs=60.0,
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1', (
+            "the dispatcher's verify_env must reach the reconstructed remote config "
+            'even with zero module configs — no ModuleConfig is reconstructed on '
+            'this path, so the spec env has no other consumer'
+        )
+
+    async def test_spec_verify_env_wins_on_conflicting_key(self):
+        """On a key both sides set, the SPEC's value decides the merge — the
+        remote's own config must not re-select which tests run."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        config = OrchestratorConfig(
+            verify_env={'REIFY_GATE_EXCLUDE_HEAVY': '0'},
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        spec = MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('crates/x/src/lib.rs',),
+            verify_env={'REIFY_GATE_EXCLUDE_HEAVY': '1'},
+            cold_timeout_secs=60.0,
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.verify_env['REIFY_GATE_EXCLUDE_HEAVY'] == '1', (
+            "the spec wins on conflict; the remote host's own value must not "
+            'survive to re-select the gate'
+        )
+
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
         from orchestrator.verify_runner import (
