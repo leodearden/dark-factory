@@ -605,6 +605,11 @@ class _FakeFusedMemoryConfigWithoutTaskmaster:
         self.taskmaster = None
 
 
+_FakeConfigClass = (
+    type[_FakeFusedMemoryConfigWithTaskmaster] | type[_FakeFusedMemoryConfigWithoutTaskmaster]
+)
+
+
 class _FakeRunBackend:
     """Read-only fake: only start/close/get_tasks are exercised by _run();
     this script never calls update_task/set_task_status, so those surfaces
@@ -1101,7 +1106,7 @@ class TestMainTargetStoreMissingExitCode:
             ],
         )
 
-    def _patch(self, monkeypatch, config=_FakeFusedMemoryConfigWithTaskmaster):
+    def _patch(self, monkeypatch, config: _FakeConfigClass = _FakeFusedMemoryConfigWithTaskmaster):
         _install_fake_audit_module(monkeypatch, _report([]))
         monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', config)
         _install_fake_backend(monkeypatch, [])
