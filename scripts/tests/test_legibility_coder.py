@@ -1707,6 +1707,127 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# task 5488 / step-3: RED — the two streams are carried as STRUCTURED DATA,
+# not only inside the formatted message.
+#
+# The gate's strict detector wants them SEPARATELY --
+# `detect_cap_hit(stderr, result_text)` -- so the account-failover path in
+# account_pool.py must be able to read each stream as itself. Recovering them
+# by re-parsing `stdout={!r} stderr={!r}` out of the message would be an
+# ad-hoc parser over a meaningful string (docs/code-quality.md heuristic 12),
+# and would couple failover to wording that exists for humans reading
+# journals. `marker` on CoderCapExhausted is the precedent for a typed
+# attribute on this hierarchy.
+#
+# The message text is deliberately NOT changed: it is pinned by
+# test_invoke_cli_nonzero_exit_carries_both_streams_labelled above and lands
+# verbatim in journal lines, run.failures entries and escalation bodies.
+# ---------------------------------------------------------------------------
+
+def test_invocation_error_carries_both_streams_as_structured_attributes(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="STDOUT_STRUCT_SS5488 the CLI's own diagnostic",
+        stderr_text="STDERR_STRUCT_SE5488 the backend's complaint",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+    exc = excinfo.value
+
+    assert exc.stdout == "STDOUT_STRUCT_SS5488 the CLI's own diagnostic", (
+        f"the captured stdout must be readable as ITSELF, not scraped back "
+        f"out of the formatted message; got {exc.stdout!r}"
+    )
+    assert exc.stderr == "STDERR_STRUCT_SE5488 the backend's complaint", (
+        f"likewise stderr, and SEPARATELY -- detect_cap_hit takes the two "
+        f"streams as distinct arguments; got {exc.stderr!r}"
+    )
+
+    # The human-facing message is UNCHANGED. This change adds a data channel
+    # beside the prose; it does not restate or replace it.
+    message = str(exc)
+    assert "STDOUT_STRUCT_SS5488" in message, message
+    assert "STDERR_STRUCT_SE5488" in message, message
+    assert "stdout=" in message and "stderr=" in message, message
+    assert "exited 1" in message, message
+
+
+def test_cap_exhausted_carries_the_streams_alongside_its_marker(tmp_path):
+    """The subclass the failover path actually catches. It already carries a
+    typed `marker`; the streams ride beside it, so account_pool can hand the
+    gate's strict detector exactly what the CLI said on each stream."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    banner = REAL_CLI_CAP_MESSAGES[0]
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=banner, stderr_text="STDERR_CAP_SE5488",
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+    exc = excinfo.value
+
+    assert exc.marker, "the existing typed attribute must survive"
+    assert exc.stdout == banner, (
+        f"the banner the CLI wrote to STDOUT is what the gate's strict "
+        f"detector scans as the result text; got {exc.stdout!r}"
+    )
+    assert exc.stderr == "STDERR_CAP_SE5488", exc.stderr
+
+
+def test_invocation_error_streams_default_to_empty_for_the_streamless_arms(
+    tmp_path, monkeypatch,
+):
+    """The timeout and OSError arms have NO streams to carry -- the process
+    either never finished or never started. They must still expose the
+    attributes, defaulted to '', so every consumer can read `exc.stdout`
+    unconditionally instead of guarding with hasattr (which would quietly
+    treat a future regression as "no cap banner" and never rotate)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=0.2,
+        )
+    assert excinfo.value.stdout == ""
+    assert excinfo.value.stderr == ""
+    assert "timed out" in str(excinfo.value)
+
+    # The never-started arm: a binary that does not exist at all.
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(tmp_path / "no-such-claude"), timeout=10,
+        )
+    assert excinfo.value.stdout == ""
+    assert excinfo.value.stderr == ""
+    assert "could not be started" in str(excinfo.value)
+
+
+def test_invocation_error_is_constructible_with_no_streams_at_all():
+    """Positional-message construction must keep working: three sites raise
+    or catch this type today (code_digest, census._build_default_verify_fn,
+    census.preflight_headroom) and none of them is in this task's scope."""
+    exc = mod.CoderInvocationError("plain message")
+    assert str(exc) == "plain message"
+    assert exc.stdout == ""
+    assert exc.stderr == ""
+
+
+# ---------------------------------------------------------------------------
 # task 5488 / step-1: RED — _invoke_cli(oauth_token=) picks the ACCOUNT the
 # shared UsageGate chose, by handing the child an explicit env.
 #
