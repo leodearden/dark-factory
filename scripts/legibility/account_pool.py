@@ -52,9 +52,20 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-import coder  # noqa: E402
 import yaml  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
+
+# THE PACKAGE SPELLING, never a bare `import coder`, and the difference is
+# load-bearing. scripts/legibility/ sits on sys.path alongside scripts/, so
+# the two spellings build two DISTINCT module objects carrying two distinct
+# `CoderCapExhausted` classes. `pool_invoke` raises that exception and
+# `coder.code_digest` catches it by name, under two except arms with no
+# generic `except Exception` beneath them -- so a mismatch would not
+# mislabel the deferral, it would let the exception escape `run_nightly`
+# entirely and crash the very night task 4736 exists to make exit 0. Any
+# future consumer of this module (census.py, which today reaches the coder
+# by its bare name) must reach it by this same spelling.
+from legibility import coder  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 from shared.usage_gate import InvokeSlot, UsageGate  # noqa: E402
 

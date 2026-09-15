@@ -1721,6 +1721,23 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
     import account_pool
 
+    # THE PAIRING IS THE POINT, and it is why this one test does not drive
+    # `mod`. scripts/legibility/ is on sys.path alongside scripts/, so this
+    # file's `import coder as mod` and account_pool's (and nightly's)
+    # `from legibility import coder` are two DISTINCT module objects carrying
+    # two distinct CoderCapExhausted classes. code_digest catches that
+    # exception BY NAME under two arms with no generic `except Exception`
+    # beneath them, so an unpaired module here would not merely mislabel the
+    # deferral -- in production it would let the exception escape run_nightly
+    # and crash the night task 4736 exists to make exit 0. Drive the pairing
+    # production uses, and assert it rather than assume it.
+    from legibility import coder as paired_coder
+
+    assert paired_coder is account_pool.coder, (
+        'account_pool must raise through the same coder module this test '
+        'drives, or the deferral contract goes untested'
+    )
+
     class _AllCappedGate:
         """Minimal stand-in for an exhausted pool: nothing to lease, ever."""
 
@@ -1743,7 +1760,7 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
 
     invoke = account_pool.pool_invoke(_AllCappedGate(), invoke=must_not_run)
 
-    result = mod.code_digests(
+    result = paired_coder.code_digests(
         _batch_digests(3), _tiny_codebook(), project="dark_factory",
         model="haiku", invoke=invoke,
     )
@@ -1759,7 +1776,7 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
         "yields NO record, not an empty one"
     )
     assert result.status == "failure"
-    assert mod.is_cap_deferral(result) is True, (
+    assert paired_coder.is_cap_deferral(result) is True, (
         "this is the exact input nightly's exit-0 DEFERRED branch keys on -- "
         "an all-capped night is expected weather, not an infra page"
     )

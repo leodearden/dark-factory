@@ -4209,12 +4209,20 @@ def test_missing_claude_binary_journals_both_halves_end_to_end(
 
     escalations = []
     with caplog.at_level(logging.DEBUG):
-        # NO invoke= override: the real coder._invoke_cli seam runs.
+        # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than
+        # left to default. Since task 5488 `invoke=None` resolves to the
+        # pool-backed invoker, which builds a real UsageGate over
+        # config/usage-accounts.yaml and draws real CLAUDE_OAUTH_TOKEN_* out of
+        # the ambient environment. This test is about _invoke_cli's own
+        # missing-binary path, so it pins the bare seam and stays hermetic;
+        # the pool wiring is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool above.
         result = nightly.run_nightly(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            invoke=coder._invoke_cli,
             status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
         )
@@ -4338,12 +4346,20 @@ def _replay_capped_night(tmp_path, monkeypatch, *, stdout_text, stderr_text):
     monkeypatch.setenv('LEGIBILITY_CLAUDE_BIN', str(fake))
 
     escalations = []
-    # NO invoke= override: the real coder._invoke_cli seam runs.
+    # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than left
+    # to default, for the reason spelled out in
+    # test_missing_claude_binary_journals_both_halves_end_to_end: since task
+    # 5488 `invoke=None` builds a real multi-account pool. What these two cases
+    # pin is the per-digest DEFER a banner from ONE login produces, which is
+    # still exactly what the pool hands its failover loop; the pool's own
+    # all-accounts-capped deferral is pinned end-to-end in
+    # test_legibility_coder.py.
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=coder._invoke_cli,
         status_fetcher=None,
         poster=lambda url, envelope: escalations.append((url, envelope)),
     )

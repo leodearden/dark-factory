@@ -27,8 +27,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import account_pool as mod
-import coder as coder_mod
 import pytest
+
+# The `legibility.` spelling, matching account_pool's own import: a bare
+# `import coder` is a SECOND module object whose `CoderCapExhausted` is a
+# different class from the one the pool raises, so every `pytest.raises`
+# below would stop matching what it is supposed to catch.
+from legibility import coder as coder_mod
 from shared.usage_gate import AccountLease
 
 # ---------------------------------------------------------------------------
