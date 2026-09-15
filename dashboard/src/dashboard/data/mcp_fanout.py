@@ -668,10 +668,22 @@ async def reap_detached_refreshes() -> int:
     The registry is snapshotted before the first ``await`` rather than
     iterated lazily: it is a ``WeakSet``, so a collection during one of those
     awaits would otherwise mutate the set mid-iteration.
+
+    **Every registered cache gets its chance to be reaped**, whatever any
+    other cache does — the registry admits any ``TTLCache`` subclass, and this
+    runs inside ``dashboard.app.lifespan``'s teardown, where a cache skipped
+    here leaks its tasks into the next app on a loop that will by then be
+    closed (the task-3466 class). ``Exception``, never ``BaseException``: a
+    ``CancelledError`` here is the SHUTDOWN itself being cancelled, and
+    swallowing that would make this unkillable inside a teardown that is
+    already being torn down.
     """
     total = 0
     for cache in list(_live_caches):
-        total += await cache.cancel_live_bypasses()
+        try:
+            total += await cache.cancel_live_bypasses()
+        except Exception:
+            logger.exception('failed to reap detached refreshes for one cache')
     if total:
         logger.warning(
             'reaped %d detached cache refresh(es) still in flight at shutdown', total
