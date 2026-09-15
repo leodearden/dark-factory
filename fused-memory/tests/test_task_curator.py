@@ -2142,6 +2142,211 @@ class TestDegradedStreakBatchReset:
         escalator.report_consecutive_degraded.assert_awaited_once()
 
 
+class TestPayloadFailureDegradedness:
+    """esc-4448-9: a fail-open whose cause is the RESPONSE, not the pool.
+
+    `_parse_decision_dict` fails open to action='create' from eight branches.
+    Three turn on pool state (a usable decision a guard declined — routine, and
+    correctly uncounted). The other five turn on the payload alone: the model
+    did not honour the output contract. Sustained, that is precisely the
+    model/schema regression the streak alarm was chartered against, so leaving
+    them undegraded did not merely blind the alarm — each such call took
+    curate()'s `else: self._reset_degraded_streak()` branch and actively
+    cleared a streak accumulated from other arms, the same shape as esc-4448-8.
+    """
+
+    @staticmethod
+    def _curator_with_escalator():
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=escalator,
+        )
+        return curator, escalator
+
+    @staticmethod
+    async def _empty_corpus(*a, **k):
+        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+    # (marker, raw decision payload) for each payload-failure branch reachable
+    # with an EMPTY pool, i.e. without a state veto intercepting first.
+    PAYLOAD_FAILURES = [
+        ('invalid-action', {'action': 'duplicate', 'justification': 'x'}),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
+    async def test_single_path_counts_payload_failure(self, marker, payload):
+        """The reviewer's reproducer: 8 consecutive out-of-enum actions used to
+        give degraded=False and _consecutive_degraded == 0 throughout."""
+        curator, escalator = self._curator_with_escalator()
+        result = AgentResult(success=True, output='', cost_usd=0.01,
+                             structured_output=payload)
+        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=result)):
+            for i in range(8):
+                decision = await curator.curate(
+                    CandidateTask(title=f'C{i}'), project_id='p', project_root='/x',
+                )
+                assert decision.action == 'create'
+                assert marker in decision.justification
+                assert decision.degraded is True
+
+        assert curator._consecutive_degraded == 8
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
+    async def test_batch_path_counts_payload_failure(self, marker, payload):
+        """Batch resets on `any(not d.degraded ...)`, so an all-payload-failure
+        batch used to reset too — the esc-4448-8 hole, re-entered by cause."""
+        curator, escalator = self._curator_with_escalator()
+        curator._consecutive_degraded = 4
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        batch = AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                dict(payload, candidate_index=0), dict(payload, candidate_index=1),
+            ]},
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=batch)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert all(d.action == 'create' and d.degraded for d in decisions)
+        assert all(marker in d.justification for d in decisions)
+        assert curator._consecutive_degraded == 6
+        escalator.report_consecutive_degraded.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_state_veto_is_not_counted(self):
+        """The other side of the line, pinned so a later widening of
+        `degraded` cannot quietly start firing on a healthy curator: a pool
+        whose only entry is not combine-eligible vetoes the model's perfectly
+        usable decision, and that must NOT count as degradation."""
+        curator, escalator = self._curator_with_escalator()
+
+        async def one_entry_corpus(*a, **k):
+            return [_PoolEntry(
+                task_id='7', title='Existing', description='d', details='',
+                files_to_modify=[], module_keys=[], status='done',
+                priority='medium', source='anchor', combine_eligible=False,
+            )], {'anchor': 1, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        result = AgentResult(
+            success=True, output='', cost_usd=0.01,
+            structured_output={
+                'action': 'combine', 'target_id': '7',
+                'target_fingerprint': 'Existing', 'justification': 'dup',
+                'rewritten_task': {'title': 't', 'description': 'd', 'details': 'x'},
+            },
+        )
+        with patch.object(curator, '_build_corpus', side_effect=one_entry_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=result)):
+            for i in range(8):
+                decision = await curator.curate(
+                    CandidateTask(title=f'V{i}'), project_id='p', project_root='/x',
+                )
+                assert decision.action == 'create'
+                assert 'invalid-combine-target' in decision.justification
+                assert decision.degraded is False
+
+        assert curator._consecutive_degraded == 0
+        escalator.report_consecutive_degraded.assert_not_awaited()
+
+
+class TestParserDegradednessTable:
+    """The full classification table for `_parse_decision_dict`'s fail-open
+    branches, pinned in one place (esc-4448-9).
+
+    The single/batch tests above can only reach the branches an EMPTY pool
+    allows; the rest need a populated pool, and a table asserted directly on
+    the parser is a cheaper and more legible way to pin them than five more
+    end-to-end curations. The point of the table is the LINE, not the rows:
+    a branch is degraded when only the RESPONSE was consulted (the model
+    broke the output contract), and not degraded when POOL STATE declined an
+    otherwise usable decision.
+    """
+
+    @staticmethod
+    def _pool() -> list[_PoolEntry]:
+        def entry(task_id, status, combine_eligible):
+            return _PoolEntry(
+                task_id=task_id, title=f'T{task_id}', description='d', details='',
+                files_to_modify=[], module_keys=[], status=status,
+                priority='medium', source='anchor', combine_eligible=combine_eligible,
+            )
+        return [
+            entry('1', 'pending', True),    # combinable
+            entry('2', 'done', False),      # not combine-eligible
+            entry('3', 'unknown', False),   # RC3 unconfirmable
+        ]
+
+    REWRITE = {'title': 't', 'description': 'd', 'details': 'x'}
+
+    # (marker, raw payload, expected degraded)
+    CASES = [
+        # --- response unusable: the model broke the output contract ---
+        ('invalid-action', {'action': 'duplicate'}, True),
+        ('ambiguous-drop',
+         {'action': 'drop', 'target_id': '1', 'batch_target_index': 0}, True),
+        ('combine-missing-rewrite',
+         {'action': 'combine', 'target_id': '1', 'target_fingerprint': 'T1'}, True),
+        ('rewrite-parse-failed',
+         {'action': 'combine', 'target_id': '1', 'target_fingerprint': 'T1',
+          'rewritten_task': dict(REWRITE, files_to_modify=5)}, True),
+        ('rewrite-empty-title-or-details',
+         {'action': 'combine', 'target_id': '1', 'target_fingerprint': 'T1',
+          'rewritten_task': {'title': '', 'description': 'd', 'details': ''}}, True),
+        # --- pool state declined a usable decision: routine, not degraded ---
+        ('invalid-target', {'action': 'drop', 'target_id': '99'}, False),
+        ('unknown-status-target',
+         {'action': 'drop', 'target_id': '3'}, False),
+        ('invalid-combine-target',
+         {'action': 'combine', 'target_id': '2', 'target_fingerprint': 'T2',
+          'rewritten_task': REWRITE}, False),
+    ]
+
+    @pytest.mark.parametrize('marker,raw,expect_degraded', CASES)
+    def test_branch_degradedness(self, marker, raw, expect_degraded):
+        result = _parse_decision_dict(
+            raw,
+            pool=self._pool(),
+            pool_sizes={'anchor': 3, 'module': 0, 'embedding': 0, 'dependency': 0},
+            latency_ms=1,
+            cost_usd=0.0,
+        )
+        assert result.action == 'create', (
+            f'{marker}: expected a fail-open create, got {result.action!r}'
+        )
+        assert marker in result.justification, (
+            f'expected marker {marker!r} in {result.justification!r} — the case '
+            f'no longer reaches the branch it was written to pin'
+        )
+        assert result.degraded is expect_degraded, (
+            f'{marker}: degraded={result.degraded}, expected {expect_degraded}. '
+            f'See CuratorDecision.degraded — classify by whether the verdict '
+            f'depended on the response alone or on pool state.'
+        )
+
+    def test_every_marker_is_distinct(self):
+        """A copy-paste slip that made two rows exercise the same branch would
+        leave one branch unpinned while the table still looked complete."""
+        markers = [marker for marker, _, _ in self.CASES]
+        assert len(markers) == len(set(markers)), markers
+
+
 class TestCurateHappyPath:
     @pytest.mark.asyncio
     async def test_create_flows_through_llm(self):

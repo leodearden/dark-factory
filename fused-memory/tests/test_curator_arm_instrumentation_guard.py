@@ -149,3 +149,105 @@ def test_curate_constructs_no_decision_directly():
         f'increments the degraded streak — a decision constructed here bypasses '
         f'the counter and is invisible to the alarm.'
     )
+
+
+# --- Invariant 3: _parse_decision_dict's fail-open returns are classified ----
+#
+# The same hazard as invariant 2, one function away. _parse_decision_dict
+# cannot use the _degraded_create funnel (it is a module-level parser with no
+# curator to count against), so it marks degradation with the `degraded=`
+# field instead — and whether each fail-open branch sets it was, until
+# esc-4448-9, decided by whoever wrote the branch. Five of the eight branches
+# were payload failures and two of those shipped unmarked, which held the
+# streak at 0 through a total dedupe bypass.
+#
+# So this guard asserts the classification is DELIBERATE rather than
+# defaulted: every fail-open return must either set `degraded=` explicitly,
+# or be named in the state-veto allowlist below. Adding a branch without
+# doing one or the other fails here, which is the only place a reader is
+# forced to answer the question the field's contract asks.
+PARSE_FN = '_parse_decision_dict'
+
+# Branches whose verdict turns on POOL STATE, not on the response — the model
+# rendered a usable decision and a downstream guard declined to act on it.
+# Routine on a healthy curator, so deliberately NOT degraded. Keyed by the
+# justification marker each branch emits. See CuratorDecision.degraded.
+STATE_VETO_MARKERS = (
+    'invalid-target',
+    'unknown-status-target',
+    'invalid-combine-target',
+)
+
+
+def _parse_decision_dict_def() -> ast.FunctionDef:
+    tree = parse_python_module(TASK_CURATOR)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == PARSE_FN:
+            return node
+    raise AssertionError(
+        f'{TASK_CURATOR.name}: no def {PARSE_FN}() — this guard has lost its '
+        f'subject and is asserting nothing; re-point it rather than deleting it.'
+    )
+
+
+def _fail_open_returns() -> list[ast.Call]:
+    """Every ``return CuratorDecision(action='create', ...)`` in the parser.
+
+    The terminal ``return`` carries the parsed action through a variable, so
+    keying on the literal ``'create'`` selects exactly the fail-open branches
+    and never the success path.
+    """
+    found = []
+    for node in ast.walk(_parse_decision_dict_def()):
+        if not isinstance(node, ast.Return):
+            continue
+        for call in calls_named(node, DECISION_TYPE):
+            action = next(
+                (kw.value for kw in call.keywords if kw.arg == 'action'), None
+            )
+            if isinstance(action, ast.Constant) and action.value == 'create':
+                found.append(call)
+    return found
+
+
+def _marker_text(call: ast.Call) -> str:
+    justification = next(
+        (kw.value for kw in call.keywords if kw.arg == 'justification'), None
+    )
+    return ast.unparse(justification) if justification is not None else ''
+
+
+def test_every_fail_open_parse_branch_declares_degradedness():
+    unclassified = [
+        call
+        for call in _fail_open_returns()
+        if not any(kw.arg == 'degraded' for kw in call.keywords)
+        and not any(marker in _marker_text(call) for marker in STATE_VETO_MARKERS)
+    ]
+    assert not unclassified, (
+        f'{PARSE_FN}() has fail-open branch(es) at line(s) '
+        f'{sorted(call.lineno for call in unclassified)} that neither set '
+        f'degraded= nor match a known state veto '
+        f'({", ".join(STATE_VETO_MARKERS)}): '
+        + ', '.join(_marker_text(call) or '<no justification>' for call in unclassified)
+        + '. Classify it by what the verdict DEPENDS ON: if only the response '
+        'was consulted, the model broke the output contract and the branch is '
+        'degraded=True; if pool state declined an otherwise usable decision, '
+        'add its marker to STATE_VETO_MARKERS. Leaving it defaulted makes a '
+        'sustained dedupe bypass read as health (esc-4448-9).'
+    )
+
+
+def test_state_veto_allowlist_still_matches_real_branches():
+    """A marker that no longer matches any branch would silently widen the
+    allowlist past its subject, letting a future payload failure inherit an
+    exemption written for a veto that no longer exists."""
+    markers = [_marker_text(call) for call in _fail_open_returns()]
+    orphaned = [
+        veto for veto in STATE_VETO_MARKERS
+        if not any(veto in marker for marker in markers)
+    ]
+    assert not orphaned, (
+        f'STATE_VETO_MARKERS entries match no branch in {PARSE_FN}(): '
+        f'{orphaned}. Remove them rather than leaving a dead exemption.'
+    )

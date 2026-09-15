@@ -341,13 +341,36 @@ class CuratorDecision:
     # to extend a list of marker strings; the whole of task 4448 is what an
     # uncounted degradation costs.
     #
-    # Deliberately NOT set by _parse_decision_dict's safety vetoes
-    # ('invalid-target', 'unknown-status-target', 'invalid-combine-target',
-    # 'combine-missing-rewrite', …). There the model DID render a decision and
-    # a downstream guard declined to act on it — routine in healthy operation,
-    # e.g. a pool holding no combine-eligible entry. Counting those would make
-    # the consecutive-degraded alarm fire on a working curator, which is the
-    # opposite failure from the one it exists to catch.
+    # The line _parse_decision_dict's fail-open returns are sorted on is
+    # WHAT THE VERDICT DEPENDS ON — ask it of any branch added later rather
+    # than matching the branch against a list:
+    #
+    #   POOL STATE said no  →  degraded=False. The model rendered a usable
+    #     decision and a downstream guard declined to act on it because of
+    #     data outside the response: 'invalid-target' (id not in pool),
+    #     'unknown-status-target' (RC3 create-safe), 'invalid-combine-target'
+    #     (target not pending). All routine on a perfectly healthy curator —
+    #     a pool holding no combine-eligible entry produces them forever —
+    #     so counting them would fire the alarm on a working service, the
+    #     opposite failure from the one it exists to catch.
+    #
+    #   THE RESPONSE ITSELF was unusable  →  degraded=True. Nothing outside
+    #     the payload is consulted; the model simply did not honour the
+    #     output contract: 'invalid-action' (action outside the enum);
+    #     'ambiguous-drop' (target_id and batch_target_index, which are
+    #     mutually exclusive, both set); and the three combine-rewrite
+    #     failures 'combine-missing-rewrite', 'rewrite-parse-failed' and
+    #     'rewrite-empty-title-or-details' (prompt and schema both make
+    #     rewritten_task mandatory for combine, so a combine without a
+    #     usable one decides nothing actionable).
+    #     Sustained, this IS the model/schema regression the streak alarm was
+    #     chartered against, and it is indistinguishable from health unless
+    #     counted — esc-4448-9 measured 8 consecutive out-of-enum actions
+    #     holding the streak at 0 while every candidate bypassed dedupe.
+    #
+    # The list above is exhaustive as written, deliberately with no trailing
+    # '…': a reader adding a branch must classify it, not append to prose.
+    # test_curator_arm_instrumentation_guard.py enforces that structurally.
     degraded: bool = False
 
     def to_log_fields(self) -> dict[str, Any]:
@@ -3357,6 +3380,7 @@ def _parse_decision_dict(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
+            degraded=True,
         )
 
     justification = str(raw.get('justification', ''))
@@ -3400,6 +3424,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         is_within_batch_drop = (
             action == 'drop'
@@ -3459,6 +3484,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         try:
             rewritten = RewrittenTask(
@@ -3475,6 +3501,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         if not rewritten.title or not rewritten.details:
             return CuratorDecision(
@@ -3483,6 +3510,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
 
     return CuratorDecision(
