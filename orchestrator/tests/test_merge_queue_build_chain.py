@@ -138,6 +138,11 @@ def _registry_states(worker: SpeculativeMergeWorker) -> dict[str, ItemLifecycleS
     ``chain_snapshot()`` registers or transitions a buffered item. The one
     private hop (``_lifecycle``) is a measured residual — the public surface
     that would remove it is task 5446's.
+
+    EXCLUDES TERMINAL entries, so a regression that registered an item
+    directly AT ``ItemLifecycleState.TERMINAL`` is outside what callers of
+    this helper can see; a later TRANSITION to TERMINAL still shows up, as a
+    key that disappears from the mapping.
     """
     return worker._lifecycle.non_terminal_items()
 
@@ -1853,19 +1858,19 @@ def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
     """
     from orchestrator import git_ops as _go
 
-    real = _run
+    unpatched = _run
     state = {'merged': 0, 'failed': 0}
 
     async def _fake(cmd, cwd=None, *, input_text=None):
         if cmd[:3] == ['git', 'merge', '--no-ff']:
             state['merged'] += 1
-            return await real(cmd, cwd, input_text=input_text)
+            return await unpatched(cmd, cwd, input_text=input_text)
         is_head_read = cmd == ['git', 'rev-parse', 'HEAD']
         armed = (state['merged'] > 0) if after_merge else (state['merged'] == 0)
         if is_head_read and armed and not state['failed']:
             state['failed'] += 1
             return 1, '', 'fatal: not a git repository (simulated)\n'
-        return await real(cmd, cwd, input_text=input_text)
+        return await unpatched(cmd, cwd, input_text=input_text)
 
     monkeypatch.setattr(_go, '_run', _fake)
     return state
