@@ -55,6 +55,7 @@ import contextlib
 import logging
 import math
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1349,6 +1350,13 @@ class _ShortSleepClock:
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(min(secs, self._CAP_SECS))
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        # UNCAPPED, unlike the sleep above: capping it would re-check the
+        # lane's halt and abandonment branches ~500x more often and reorder
+        # the halt-vs-verify interleaving this file's capstone measures.
+        done, _ = await asyncio.wait(aws, timeout=timeout)
+        return done
 
 
 class _HostEscalationQueue:
