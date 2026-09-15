@@ -18,6 +18,12 @@ Its own module rather than a section of ``test_mcp_fanout.py`` (~2900 lines) or
 ``test_durability.py``: the single subject here is one clause of ``lifespan``'s
 shutdown contract, which makes sense read in isolation.
 
+The second clause pinned here is the teardown's ORDERING contract: the reap
+sits above the store, pool and client closes, so anything escaping it would
+skip all four and strand exactly the writable WAL connections whose ``__del__``
+later queues work onto a closed loop. The hook added to prevent that failure
+would otherwise be capable of causing it.
+
 ``lifespan`` is driven DIRECTLY as an async context manager, the shape
 ``test_app_http_limits.py``'s pool-sizing test uses, rather than through a
 ``TestClient``. That keeps the assertions on the same event loop as the test,
@@ -33,6 +39,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 from _dashboard_helpers import apply_isolated_env
 from fastapi import FastAPI
 
@@ -170,4 +177,56 @@ class TestLifespanReapsDetachedBypassRefreshes:
             'the bypass must already be cancelled when http_client.aclose() is '
             f'entered, so it releases its pooled connection to a client that is '
             f'still open; observed at aclose: {observed}'
+        )
+
+
+class TestLifespanClosesItsResourcesEvenIfTheReapFails:
+    """A failing teardown step must not take the closes below it with it.
+
+    ``lifespan``'s teardown is a flat sequence: the reap, then
+    ``burndown_store.close()``, ``metrics_store.close()``, ``pool.close_all()``
+    and ``http_client.aclose()``. Anything escaping the reap skips all four,
+    stranding two writable WAL connections and a ``DbPool`` — the handles
+    whose finalisers queue work onto a by-then-closed loop, which is the
+    ``RuntimeError: Event loop is closed`` failure this same lifespan's
+    docstring records for task 3466. The shutdown hook this task ADDED to
+    prevent stranded work would be capable of causing it.
+
+    The hazard is structural, so it is closed structurally rather than by an
+    argument that nothing above the closes can raise any more.
+    """
+
+    _BOOM = 'the reap itself blew up'
+
+    async def test_a_failing_reap_still_closes_what_the_lifespan_opened(
+        self, tmp_path, monkeypatch
+    ):
+        apply_isolated_env(monkeypatch, tmp_path)
+        # Held, not inlined into the `async with`: app.state is the observable
+        # and it has to outlive the context.
+        app = FastAPI(lifespan=lifespan)
+
+        with (
+            patch(
+                'dashboard.app.reap_detached_refreshes',
+                new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
+            ),
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+            # The fix must not convert a shutdown bug into silence: a reap that
+            # fails is a real defect and its only route to an operator is out
+            # of shutdown.
+            pytest.raises(RuntimeError, match=self._BOOM),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert app.state.http_client.is_closed, (
+            'the resources this lifespan opened must be closed on every exit '
+            'path, including one where a teardown step above them raised. '
+            'aclose() is LAST in that sequence, so this one observable stands '
+            'for the burndown store, the metrics store and the DB pool too'
         )
