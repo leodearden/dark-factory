@@ -1986,6 +1986,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Background tasks killed by memory pressure (turns 415-416); watcher agent in retry loops (40x reap-decisions, 35x heartbeat/lease/drain checks); session score 36.0 with 4 tool_errors and 2 not_found signals
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 02e688d0-2025-46de-9535-a3e2db950f9c
+    origin_phase: ops
+    manifested_phase: merge
+    note: Watcher in a merger-evaluation worktree ran `timeout 1500 tail --pid=$PID -f /dev/null` as a blocking wait on a verify script's PID, and the whole Bash call was killed (exit 137) well before the 1500s budget — the harness's own kill of a long blocking wait, matching the documented '2-min Bash kill of the 540s wait' pattern even though a proper blocking-wait primitive (not busy-poll) was used.
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -2554,6 +2560,12 @@ entries:
     origin_phase: implement
     manifested_phase: unknown
     note: Path-scope guard (darkfactorypathscopeviolation) fired twice in interactive session; matches known over-firing issue (task 2434)
+  - date: '2026-09-13'
+    project: dark_factory
+    session: fd83e30b-89ca-453e-81d0-7ab7386acb04
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session tripped darkfactorypathscopeviolation twice (turns 4 and 22) with zero user turns and no other guard/error signal — consistent with the known path-scope guard's prose-token over-firing pattern (task 2434). Digest is too thin (475 bytes, no quoted trip content) to confirm these were false positives vs. legitimate violations.
 - id: oneoff-2026-07-02
   title: 'Implementer twice re-built the explicitly forbidden _xdist_resilience custom scheduler (task 1907) — model negative-instruction attractor; mitigate mechanically: lead descriptions '
   severity: low
@@ -3113,6 +3125,12 @@ entries:
     origin_phase: recon
     manifested_phase: architect
     note: 'Agent in escalation-investigation worktree (task 5024) attempted to read .task/iterations.jsonl via Bash tail command; file does not exist. Pattern: `tail -c 4000 .task/iterations.jsonl` failed with exit 2.'
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 9c959b2f-f614-4eb3-8168-4fb9e7650912
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated-task session in worktree 4448 tries to read '.task-meta/4448/iterations.jsonl' via a raw open() and hits FileNotFoundError — same class as the known 'resume boilerplate assumes iterations.jsonl always exists' gap, just under the .task-meta/<id>/ path convention rather than .task/.
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -6673,6 +6691,18 @@ entries:
     origin_phase: architect
     manifested_phase: verify
     note: ModuleNotFoundError in task worktree during explore/module resolution (turn 57)
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 02e688d0-2025-46de-9535-a3e2db950f9c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Bare 'modulenotfounderror' signal fired in a task worktree (merger/work/opus50/wt-3807); too little surrounding context in the digest to confirm phase, but matches the general worktree ModuleNotFoundError pattern.
+  - date: '2026-09-14'
+    project: dark_factory
+    session: f0e9bee8-62eb-4354-9b28-7b19fb8cb204
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 3x ModuleNotFoundError (turns 40, 51, 70) while working in cwd=/home/leo/src/dark-factory/.worktrees/5408, consistent with the known worktree venv/import-resolution confusion (un-synced or cold-unverified worktree resolving first-party imports to the main checkout instead of its own tree).
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -6759,6 +6789,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Turn 30: multi-part research query (''how much of the time does orchestrator spend stalled...'') mislabeled as ''User Correction'' when it is a task-framing prompt for downstream agent work'
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 054f487f-c230-4ac9-ba2f-5e85b793f043
+    origin_phase: ops
+    manifested_phase: ops
+    note: User Corrections bucket captures '(turn 4) Match reviewer findings to ground truth issues in this code diff.' — this is the session's sole/initial task-framing instruction (n_user_turns=1), not a corrective statement, mislabeled by the digest extractor exactly as this entry describes.
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -8020,6 +8056,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Two guard trips rendered as bare 'blocked:' templates with no matched-substring detail; digest extraction dropped guard context from turns 4 and 22
+  - date: '2026-09-14'
+    project: dark_factory
+    session: 0e4c274e-98e2-4d98-8397-7fac2e748dbd
+    origin_phase: ops
+    manifested_phase: ops
+    note: Guard Trips section renders '(turn 114) blocked:' with no detail after the colon — the digest template dropped the matched guard-message substring, same bare-template pattern as the cataloged entry.
+  - date: '2026-09-12'
+    project: dark_factory
+    session: 688f8a67-b0f5-44b6-8d90-6d727d5f5c66
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's Guard Trips entry reads '(turn 3) blocked:' and Not Found entry reads '(turn 97) does not exist' — both bare templates with the matched substring/detail dropped, despite df_guard=1 and not_found=1 signal counts firing. Same defect class as entry-cand-20260722-33.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -8473,6 +8521,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Bash watcher-rearm.sh called 8 times with 1 designed-outcome (exit 124 CEILING), flagged as Retry Loops in digest; matches pattern of designed once-per-rotation re-arm calls miscategorized as error retries
+  - date: '2026-09-14'
+    project: dark_factory
+    session: 0e4c274e-98e2-4d98-8397-7fac2e748dbd
+    origin_phase: implement
+    manifested_phase: ops
+    note: The task session ran a designed presence-check chain (`cat .git/MERGE_HEAD 2>/dev/null || git rev-parse MERGE_HEAD`) that is expected to exit nonzero (128) when no merge is in progress — status was clean and HEAD/log printed fine. The digest's signal-scorer counted this designed non-zero exit as tool_error:1, same miscounting-a-designed-outcome pattern as the watcher-rearm.sh exit-124 case.
 - id: entry-cand-20260730-25
   title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
   severity: medium
@@ -8946,6 +9000,54 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest 'User Corrections' section contains escalation esc-5422-4 metadata (steward re-escalation, cleanup_needed category, revert condition status) rather than corrections made by user; labeled as 'User Corrections' but is pasted escalation report/status content
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 74556e4c-61e2-48ab-a5a1-7b48b6d2eafd
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section for this watcher session actually contains a pasted Task Intent (a reviewer follow-up about lease-slug ownership) plus a raw merge-conflict diff dump — non-corrective injected/report content mislabeled as a user correction, matching the cataloged 'pasted non-corrective report/log content' pattern.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: e2e167df-88d5-4f3f-975a-81a910a8e751
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest 'User Corrections' bucket captured a pasted '# Code Diff to Review' block (a diff to test_task_interceptor.py) as if it were corrective user feedback; it's non-corrective review-target content the user supplied, not a correction — same pattern as the pasted report/log mislabeling entry.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 87a19ef4-5586-469d-a10c-7463013752e9
+    origin_phase: merge
+    manifested_phase: unknown
+    note: Digest 'User Corrections' bucket captured a merge-conflict-resolution task briefing (a 'Task Intent' section describing the cockpit decision-registry project-token fragmentation bug, followed by a raw git conflict diff for orchestrator/session_registry.py) and labeled it as a user correction, though it is pasted task/report content, not corrective feedback — same digest-mislabeling root cause already catalogued for '# Context' briefing blocks and JSON/report dumps.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 738f85df-b948-46a6-b017-7292e4d85c34
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest 'User Corrections' bucket captured a pasted '# Code Diff to Review' block (a stage1.py prompt diff about Graphiti snapshot/async-indexing discipline) as if it were corrective user feedback, truncating 10259 of 12257 bytes — same non-discriminating pasted-content capture pattern as the existing candidate.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 5ea5f42e-3de1-4dee-88f3-187f19cc9e5f
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Digest ''User Corrections'' bucket captured the entire session as a single turn-4 ''correction'': a pasted ''# Code Diff to Review'' block (stage1.py prompt diff for Task 1157''s refresh-failure recording), truncated at 5883/7883 bytes dropped. Same root cause as the existing candidate family (digest heuristic captures any large pasted non-corrective block as a User Correction) — here the pasted content is a code diff rather than a ''# Context'' briefing or stage-report JSON, but the failure mode is identical: no verification that turn content is actually corrective feedback before bucketing it.'
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 63d3ba85-12da-4456-8549-55f2886b4ce9
+    origin_phase: ops
+    manifested_phase: ops
+    note: The digest's 'User Corrections' bucket captured turn 3's pasted Task Intent + a raw git merge-conflict diff (conflict markers, file list, session_registry.py hunks) as if it were corrective user feedback -- non-corrective report/log content mislabeled, matching the established pattern but with a new content type (merge-conflict diff dump rather than stage-report/context-block/JSON dump).
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 02e688d0-2025-46de-9535-a3e2db950f9c
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest 'User Corrections' bucket captured a git merge-conflict diff plus 'Task Intent' framing (DecisionRecord project-token fragmentation bug, session_registry.py conflict markers) as if it were corrective user feedback — it's pasted report/conflict content, not a correction.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 3769a263-5caa-4ada-9e4d-b25470fbb862
+    origin_phase: ops
+    manifested_phase: merge
+    note: Digest 'User Corrections' bucket for this merger-worktree session captures a pasted 'Task Intent' bug writeup plus a raw git merge-conflict diff dump (session_registry.py conflict markers, task list) verbatim — non-corrective report/diff content mislabeled as a user correction, matching the recurring digest-mislabeling pattern.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -9684,6 +9786,12 @@ entries:
     manifested_phase: recon
     invariant_violated: digest_evidence_coherence
     note: Digest score (122) is high but 'User Corrections' bucket contains task notifications (turns 276/390/400/423/1030) that are system outputs, not user corrections. Evidence body has 3 truncated items (6–8kb each), making score reliability questionable.
+  - date: '2026-09-14'
+    project: dark_factory
+    session: 7f7b74db-de35-4764-ba9b-3572fd4507ea
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session score=5.0 with every signal_counts field at 0 (tool_error/self_correct/not_found/df_guard/interrupt/designed_outcome all 0), yet the digest's 'User Corrections' section is populated with the session's sole, first (n_user_turns=1) user turn — an ordinary instruction to the assistant with no prior assistant behavior to correct. Both the score and the User Corrections label are decoupled from the underlying signal evidence.
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -10282,6 +10390,24 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: High severity score (5.0) assigned to digest despite every individual signal_count reading zero
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 74556e4c-61e2-48ab-a5a1-7b48b6d2eafd
+    origin_phase: ops
+    manifested_phase: ops
+    note: score=5.0 assigned despite every signal_count (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome) reading exactly 0 — severity score decoupled from the session's own fired signals, same as the cataloged instances.
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 054f487f-c230-4ac9-ba2f-5e85b793f043
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest carries score=5.0 while every signal_counts field (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome) reads 0 — severity assigned with no underlying fired signal, matching this entry's pattern exactly.
+  - date: '2026-09-14'
+    project: dark_factory
+    session: 7f7b74db-de35-4764-ba9b-3572fd4507ea
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest assigns score=5.0 despite all individual signal_counts reading zero, matching the established 'score assigned despite zero signals' pattern.
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -11878,6 +12004,12 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: Digest 'User Corrections' section contains task-framing/adjudication guidance ('You are adjudicating whether each CURRENT review suggestion...'), characteristic of injected briefing/context block being captured and mislabeled as user correction
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 16f3ce75-aed0-4b28-9889-7390683f63bf
+    origin_phase: ops
+    manifested_phase: merge
+    note: Turn 3's 'User Corrections' bucket is actually the injected merge-conflict-resolution task briefing ('# Task Intent' + '# Merge Conflicts' diff dump) for a merger worktree landing task — not real user feedback. Same digest-classifier defect already catalogued for '# Context' project-briefing blocks, just a different injected-content shape (merge-queue/unblock dispatch prompt instead of task-context prompt).
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -14607,6 +14739,32 @@ entries:
     origin_phase: implement
     manifested_phase: verify
     note: Periodic-census verifier confirms busy-polling with repeated ps/pgrep calls persists as an observable pattern; Monitor tool remains a deferred affordance requiring explicit ToolSearch discovery
+- id: entry-cand-20260911-64
+  title: Bash tool's source-parsing pre-check rejects a benign read-only command against a large file with a false 'malicious input' verdict
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 738f85df-b948-46a6-b017-7292e4d85c34
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'Error: Failed to parse source code: Too many AST nodes: 100001 (max: 100000). Possible malicious input.'
+- id: entry-cand-20260911-65
+  title: Full-suite pytest verify run killed by SIGKILL (exit 137) well under its own timeout budget
+  severity: medium
+  status: open
+  origin_phase: verify
+  manifested_phase: verify
+  sightings:
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 9c959b2f-f614-4eb3-8168-4fb9e7650912
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: 'Bash({"command": "uv run python -m pytest fused-memory/tests/ -q -m \"not integration\" -p no:randomly 2>&1 | tail -6", "description": "Run the full fused-memory suite", "timeout": 2400000}) -> [exit 137] Exit code 137'
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -27056,3 +27214,31 @@ candidates:
     origin_phase: architect
     manifested_phase: architect
     evidence_quote: 'Turn 238: add_reuse_item also rejected for identical markup-in-payload pattern (</how> in ''how'' field). Same root cause hitting multiple tools within same session suggests problem is not tool-specific but affects the agent''s encoding of structured payloads during planning phase'
+- id: cand-20260911-64
+  title: Bash tool's source-parsing pre-check rejects a benign read-only command against a large file with a false 'malicious input' verdict
+  cause: 'Running `tail -5 fused-memory/tests/test_stages.py` failed with ''Failed to parse source code: Too many AST nodes: 100001 (max: 100000). Possible malicious input.'' — some layer parses the target file''s full content as source (rather than the shell command actually issued) and hard-caps at 100000 AST nodes, so a trivial read-only tail on an oversized test file is misreported as malicious rather than as a size limit, and the agent gets no signal that the fix is to read a slice instead of the whole file.'
+  area: harness/tooling — Bash tool static-analysis pre-check
+  first_seen: '2026-09-11'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 738f85df-b948-46a6-b017-7292e4d85c34
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'Error: Failed to parse source code: Too many AST nodes: 100001 (max: 100000). Possible malicious input.'
+  promoted_to: entry-cand-20260911-64
+- id: cand-20260911-65
+  title: Full-suite pytest verify run killed by SIGKILL (exit 137) well under its own timeout budget
+  cause: The fused-memory test suite (excluding integration) was launched under a 2400000ms (40min) Bash timeout but terminated with exit 137 (SIGKILL), which is inconsistent with the tool's own timeout enforcement (that would show a different exit/signal) and instead points to an external killer — most likely an OOM condition or a resource cap enforced outside the agent's visibility. The agent has no signal distinguishing 'my command hit a wall-clock timeout' from 'something external killed my process', so it cannot diagnose or work around the failure.
+  area: verify
+  first_seen: '2026-09-11'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-11'
+    project: dark_factory
+    session: 9c959b2f-f614-4eb3-8168-4fb9e7650912
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: 'Bash({"command": "uv run python -m pytest fused-memory/tests/ -q -m \"not integration\" -p no:randomly 2>&1 | tail -6", "description": "Run the full fused-memory suite", "timeout": 2400000}) -> [exit 137] Exit code 137'
+  promoted_to: entry-cand-20260911-65
