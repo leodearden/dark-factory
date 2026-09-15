@@ -2045,3 +2045,143 @@ class TestStartStdinWatchdog:
 
         # (b) the injected fire was invoked exactly once (loop wired to on_fire)
         assert fire_calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-1: WatchdogTrigger — which branch judged the channel dead
+#
+# run_stdin_watchdog has two fire branches whose causes and remedies have
+# nothing in common: EOF (the writing end closed the dispatch channel — the
+# orchestrator died, or ssh dropped) and heartbeat starvation (no beat
+# arrived inside the window — a hard partition, or a timeout tuned too tight
+# for the host).  Both call on_fire() with zero arguments today, so once the
+# process has self-exited nothing downstream can say WHICH one fired.  These
+# tests pin the branch identity through every hop of the callback chain
+# (run_stdin_watchdog -> start_stdin_watchdog's default fire -> cli's
+# _on_watchdog_fire -> fire_watchdog_kill); the stderr line that carries it
+# off the host is step-3.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogTriggerThreading:
+    """The WatchdogTrigger naming the fired branch reaches every callback hop."""
+
+    def test_eof_branch_reports_eof_trigger(self):
+        """A b'' read (writing end closed) fires once with WatchdogTrigger.EOF."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return (rlist, [], [])  # fd ready
+
+        def fake_read(fd, size):
+            return b''  # EOF
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.EOF
+
+    def test_timeout_branch_reports_heartbeat_starvation_trigger(self):
+        """An empty ready set fires once with HEARTBEAT_STARVATION, without ever reading."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+        read_calls = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return ([], [], [])  # timeout -- nothing ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b'\n'  # must never be reached
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.HEARTBEAT_STARVATION
+        assert read_calls == []  # starvation fires without ever reading
+
+    def test_trigger_values_are_the_wire_tokens(self):
+        """The enum is the single definition of both spellings that cross the ssh channel."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        assert {t.value for t in WatchdogTrigger} == {'eof', 'heartbeat_starvation'}
+        assert WATCHDOG_FIRE_TRIGGER_TOKEN == 'watchdog_fire_trigger'
+
+    def test_default_fire_forwards_the_trigger(self, monkeypatch):
+        """With no fire= override the default callback forwards the EOF trigger."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: (rlist, [], []),
+            read_fn=lambda fd, size: b'',  # EOF
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.EOF
+
+    def test_default_fire_forwards_starvation_trigger(self, monkeypatch):
+        """The same default callback forwards HEARTBEAT_STARVATION on the timeout branch."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: ([], [], []),  # starvation
+            read_fn=lambda fd, size: b'\n',  # must never be reached
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION
