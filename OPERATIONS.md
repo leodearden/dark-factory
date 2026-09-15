@@ -1471,7 +1471,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the section below for the 05:00 one.
+for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
 
 **04:30 is free.** The nightly reify closure-staleness sweep and its
 `consume_redispatch_requests` drain that used to hold that slot were retired by
@@ -1490,6 +1490,55 @@ names the deleted wrapper, so once this retirement is on main it fails
 by the orchestrator scheduler's `_phase_redispatch_stranded_blocked`, the
 harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation.
+
+### Legibility trickle accounts (03:00)
+
+**Which accounts it uses.** Every invocation of the night — each digest the
+coder codes, and the census subprocess when the trigger fires — is drawn from
+the shared account pool in `config/usage-accounts.yaml` (`max-b`..`max-h`),
+through the same `shared.usage_gate.UsageGate` the orchestrator uses. The
+trickle drains the roster from the **end** (h→b) while the orchestrator takes
+first-available (b→h), so the two only contend when the pool is nearly
+exhausted anyway. Before task 5488 the trickle had no pool at all: it rode
+whatever login `~/.claude` happened to hold, so one capped account deferred a
+whole night while six live ones sat idle.
+
+**What the unit must supply.** `legibility-trickle@.service` carries
+`EnvironmentFile=/home/leo/src/dark-factory/.env` — that is where the
+`CLAUDE_OAUTH_TOKEN_*` values the roster names come from, and without them the
+gate resolves zero accounts — and `UnsetEnvironment=ANTHROPIC_API_KEY`,
+because the CLI prefers an API key over the OAuth token and one inherited from
+the `systemd --user` manager would silently authenticate every invocation as
+that identity. The unit pins **no** account; choosing one is the gate's job,
+per invocation.
+
+**The 2026-09-14 max-h pin is retired.** `legibility-trickle@.service.d/
+10-account-pin.conf` reset `ExecStart` and re-spelled it with one account's
+token inline. `install-trickle-timer.sh` now deletes that one named drop-in
+(and the directory, if that empties it) on every run, leaving any other
+`*.conf` there untouched. Confirm with `systemctl --user cat
+legibility-trickle@<project>.service`: no drop-in section should appear below
+the unit. A drop-in's `ExecStart=` reset REPLACES the unit's own, so one left
+behind keeps the trickle pinned and makes the pool inert.
+
+**Reading a night in the journal** (`journalctl --user -u
+legibility-trickle@<project>`):
+
+- `legibility account pool: 7 accounts — max-b, ...` at startup. Names only,
+  never tokens.
+- `account max-h is capped — retrying this digest on the next account in the
+  pool`, alongside the gate's own `Account max-h CAPPED: <banner>`: ordinary
+  weather. The digest is retried on the next account, not lost.
+- `legibility trickle coder DEFERRED: all accounts capped, N/M digests
+  returned a usage-limit banner instead of a model turn` — **exit 0**, a
+  deferral rather than an incident (task 4736), with a WARNING-level
+  escalation. The per-digest reason reads `legibility trickle: all N pool
+  accounts capped`. This one self-clears at the weekly reset; nothing to do.
+- `legibility trickle: no pool accounts resolved — check that the unit's
+  EnvironmentFile supplies the CLAUDE_OAUTH_TOKEN_* vars named in
+  config/usage-accounts.yaml` — the OTHER exhaustion, and a config fault that
+  will never clear on its own. Paired with a loud `legibility account pool
+  resolved NO usable accounts` warning naming the roster it failed to resolve.
 
 ### Nightly canonical/topic coverage census (05:00)
 

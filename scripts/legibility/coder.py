@@ -19,11 +19,22 @@ is one pure function: ``cap_markers.looks_like_blocking_banner``, the loose
 OR-substring DEFER GATE — the same matcher ``census.preflight_headroom``
 uses, and explicitly not the strict production cap detector
 (``usage_gate.detect_cap_hit``), whose combined prefix-AND-confirm policy is
-tuned for account failover. This module has nothing to fail over TO: the
-trickle unit runs under an interpreter where the orchestrator config, and
-therefore a multi-account ``UsageGate``, is unreachable. A defer gate is
-exactly the contract it needs, and ``cap_markers``' own docstring argues for
-that split (task 4736). The real LLM call lives behind
+tuned for account failover.
+
+BOTH MATCHERS ARE NOW LIVE IN THE TRICKLE, each doing its own job, and this
+paragraph used to claim otherwise: "the trickle unit runs under an
+interpreter where the orchestrator config, and therefore a multi-account
+``UsageGate``, is unreachable" was FALSE, and task 5488 retires it. Only the
+orchestrator YAML is unreachable; the gate needs nothing but the roster
+file. The loose matcher HERE keeps deciding whether an already-FAILED
+invocation is a per-digest DEFER (task 4736), while the strict detector —
+reached from ``account_pool.pool_invoke``, outside this module — decides
+whether an ACCOUNT is out and should be rotated away from. That is exactly
+the split ``cap_markers``' own docstring argues for, and having a real pool
+to fail over to VINDICATES it rather than weakening it: a loose false
+positive can still only re-label one digest, never burn an account.
+
+The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
 public function accepts as an ``invoke`` override. What no test ever does
 is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
