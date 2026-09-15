@@ -44,6 +44,18 @@ from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 logger = logging.getLogger(__name__)
 
 
+# --- Merge-verify host selection policy (Lever C) ---
+#
+# Defined ONCE here and imported by verify_runner.py, so the config field and
+# HostAllocator.acquire's parameter share one vocabulary: a future third policy
+# cannot be added to the field and silently missed by the allocator, and pyright
+# rejects a typo'd policy string at every call site instead of letting it fall
+# through to the prefer_local branch at runtime.  The import direction is
+# one-way (verify_runner -> config); config.py imports nothing from
+# verify_runner.py, so there is no cycle.
+VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
+
+
 # --- Priority-tier constants (value/h scheduler) ---
 #
 # Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
@@ -4826,6 +4838,26 @@ class OrchestratorConfig(BaseSettings):
             'trip (streak-only).  Complements verify_host_unreachable_escalate_after_n: '
             'the time-based threshold guarantees the alarm fires within ~T seconds even '
             'when merges are sparse and RU events are infrequent.'
+        ),
+    )
+    verify_host_policy: VerifyHostPolicy = Field(
+        default='prefer_local',
+        description=(
+            'When Lever C is on, which host the NEXT merge-verify dispatch prefers.  '
+            "'prefer_local' (default) keeps today's order byte-for-byte: take the "
+            'local slot when it is free, overflow to the first eligible remote '
+            "otherwise.  'prefer_remote' inverts it: take the first eligible remote "
+            '(FREE, not quarantined, not PARKED) and fall back to local when no '
+            'remote is available, so a free remote host absorbs verify load instead '
+            'of idling while the lane serialises on local.  Eligibility rules are '
+            'unchanged in both directions, so a busy/quarantined/PARKED remote still '
+            'falls through to local and the queue never stalls.  '
+            'TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust '
+            'anchor — a laptop false-green once landed a red commit.  Under '
+            "'prefer_remote' nearly every verdict becomes a REMOTE verdict, so "
+            'verify_drift_check_every_n_lands becomes the standing fidelity guard '
+            'rather than a spot check.  This field changes no cadence; set that one '
+            'deliberately before flipping this one.'
         ),
     )
     verify_host_reprobe_interval_s: float = Field(
