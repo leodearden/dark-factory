@@ -48,7 +48,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 DEFAULT_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
 DEFAULT_REPORT_DIR = Path('/home/leo/src/dark-factory/plans')
@@ -618,11 +618,28 @@ def _rung(
     }
 
 
+class Coverage(TypedDict):
+    """One metric's readable-tick coverage, as reported and as serialised.
+
+    A TypedDict rather than a ``dict[str, float]``: the entry carries two
+    counts, a fraction that is ``None`` when there is nothing to divide by,
+    and the NAME of the readability metric the counts came from, and every
+    consumer reads those four back at different types. At runtime it is a
+    plain dict, so the JSON payload and the tests asserting on it are
+    unchanged.
+    """
+
+    ticks: int
+    readable: int
+    readable_fraction: float | None
+    readability_metric: str
+
+
 def coverage_table(
     series: Series,
     readability: Series,
     specs: list[ArmSpec],
-) -> dict[str, dict[str, float] | None]:
+) -> dict[str, Coverage | None]:
     """Per VALUE metric, the readable-tick coverage its numbers rest on.
 
     A failed read emits no value row at all, so ``hold_fraction``'s denominator
@@ -642,7 +659,7 @@ def coverage_table(
     unreadable while its siblings are fine, which is exactly the case worth
     seeing.
     """
-    out: dict[str, dict[str, float] | None] = {}
+    out: dict[str, Coverage | None] = {}
     for metric in series:
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
@@ -671,7 +688,7 @@ def coverage_table(
 
 
 def readability_degradations(
-    coverage: dict[str, dict[str, float] | None]
+    coverage: dict[str, Coverage | None]
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 

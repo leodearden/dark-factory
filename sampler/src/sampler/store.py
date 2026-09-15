@@ -211,7 +211,12 @@ class LoadSampleStore:
             return
         conn = self._connect()
         try:
-            rows = [(ts, metric, value, None, None) for metric, value in unwindowed.items()]
+            # Annotated because the unwindowed comprehension alone would fix the
+            # element type at ``None`` for both window columns, which the
+            # windowed append below then contradicts.
+            rows: list[tuple[int, str, float, float | None, float | None]] = [
+                (ts, metric, value, None, None) for metric, value in unwindowed.items()
+            ]
             for metric, value in windowed.items():
                 window_mean, window_max = self._trailing_window(
                     conn, metric, value, window=window
