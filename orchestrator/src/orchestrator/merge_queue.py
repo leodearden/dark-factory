@@ -21261,9 +21261,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # item) and `req`.  It builds a LocalRunner; _run_inflight_verify will
         # override merge_wt via warm-swap on the local path, so the factory's
         # merge_wt is a reasonable initial value.
-        # NOTE: the factory is called ONLY when the local slot is free (prefer-local
-        # policy in HostAllocator.acquire); the remote path uses the remote runner
-        # directly without calling the factory.
+        # NOTE: the factory is called ONLY when the LOCAL host is selected; which
+        # host acquire() tries first is config-driven (verify_host_policy), and the
+        # remote path uses the remote runner directly without calling the factory.
         _item_for_factory = item
         _req_for_factory = req
 
@@ -21287,7 +21287,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 task_id=_req_for_factory.task_id,
             )
 
-        lease = await allocator.acquire(_local_factory)
+        lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)
         if lease is None:
             # Should not happen (free_host_count > 0 was checked above with no
             # intervening await that could yield to a concurrent dispatch — asyncio

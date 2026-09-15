@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator import flake_ledger, verify
-from orchestrator.config import ModuleConfig
+from orchestrator.config import ModuleConfig, VerifyHostPolicy
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -3331,7 +3331,7 @@ class HostLease:
 
 
 class HostAllocator:
-    """Worker-lifetime host allocator: one slot per host, prefer-local-when-free.
+    """Worker-lifetime host allocator: one slot per host, config-selected order.
 
     Cross-ref (task 2565): the main-health probe
     (:func:`~orchestrator.verify.verify_failure_is_preexisting_on_main`) is
@@ -3340,10 +3340,27 @@ class HostAllocator:
     work never occupies a slot here and a host's occupancy in this allocator
     never reflects a main-health probe running.
 
-    Selection policy (β decision 1): prefer local as the trust anchor; remotes
-    take overflow only when local is busy.  This inverts VerifyRunnerPool's
-    shipped prefer-remote offload policy — the allocator engages local for
-    single-item serial windows (β) and lets γ push overflow to remotes.
+    Selection policy: chosen by ``OrchestratorConfig.verify_host_policy`` and
+    supplied to :meth:`acquire` per call (task 5097 / PRD task C′).
+    ``'prefer_local'`` — the default, and β decision 1's original order — takes
+    local as the trust anchor and lets remotes take overflow only when local is
+    busy.  ``'prefer_remote'`` inverts it, so a free remote absorbs verify load
+    instead of idling while the lane serialises on local.
+
+    The policy is NEVER captured on the allocator.  ``_ensure_host_allocator``
+    caches one allocator for the worker's whole lifetime, so a captured policy
+    could not change without a process restart; reading it per call is what
+    makes the green-tier ``RELOADABLE_FIELDS`` registration real — a flip lands
+    on the NEXT dispatch and cannot split an in-flight merge.
+
+    TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust anchor,
+    after a laptop false-green landed a red commit.  Under ``'prefer_remote'``
+    nearly every verdict becomes a REMOTE verdict, which promotes
+    ``verify_drift_check_every_n_lands`` from a spot check to the standing
+    fidelity guard.  This class sets no cadence.
+
+    Unaffected by the policy: the leaseless main-health probe (above),
+    quarantine, PARKED, cancel-aware release, and ``free_host_count``.
 
     Slot states
     -----------
@@ -3412,13 +3429,24 @@ class HostAllocator:
                 return HostLease(name=name, runner=runner, is_local=False)
         return None
 
-    async def acquire(self, local_factory: Any) -> HostLease | None:
-        """Acquire a host slot, preferring local.
+    async def acquire(
+        self, local_factory: Any, *, policy: VerifyHostPolicy,
+    ) -> HostLease | None:
+        """Acquire a host slot in the order *policy* asks for.
 
-        Policy (β decision 1): prefer local when free; overflow to first
-        available remote (not quarantined, not PARKED); return None when all
-        slots are BUSY/PARKED.
+        'prefer_local' takes local when free and overflows to the first
+        eligible remote; 'prefer_remote' takes the first eligible remote and
+        falls back to local.  Either way, None means nothing was eligible.
+
+        Eligibility is NOT re-checked here: acquire_remote() already demands a
+        FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
+        PARKED remote falls through to local on its own.
         """
+        if policy == 'prefer_remote':
+            remote = self.acquire_remote()
+            if remote is not None:
+                return remote
+            return self.acquire_local(local_factory)
         local = self.acquire_local(local_factory)
         if local is not None:
             return local
