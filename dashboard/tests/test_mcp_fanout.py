@@ -3010,3 +3010,89 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
         assert cache._live_bypasses == {}
 
         await TestTTLCacheDetachedRefreshReaping._drain(caller)
+
+
+class TestReapIsolatesEachCache:
+    """One cache failing to reap must not cost every cache behind it.
+
+    ``reap_detached_refreshes`` fans out over the registry with a bare
+    accumulate, so anything raising out of one cache abandons every cache
+    after it in the traversal AND loses the running count, taking the summary
+    WARNING with it: the sweep would fail silently and PARTIALLY, at the one
+    moment — shutdown — when a cache skipped here leaks its tasks into the
+    next app on a loop that will by then be closed.
+
+    The registry is an open extension point: it admits any ``TTLCache``, and
+    a subclass may override anything. So the exploding cache here is a real
+    subclass enrolling through the real constructor, not a stub reached into
+    the module's internals to plant.
+
+    ``_live_caches`` is a ``WeakSet``, whose iteration order is unspecified,
+    so every assertion below is an invariant over the whole sweep rather than
+    a claim about one traversal. That is not a weakening: without per-cache
+    isolation the escape fails the sweep under EVERY order, and under the
+    orders that put the exploder first it also silently drops the healthy
+    cache's in-flight task.
+    """
+
+    _BOOM = 'this cache cannot be reaped'
+
+    class _ExplodingCache(TTLCache[str]):
+        """A cache whose reap raises — enrolled by ``TTLCache.__init__`` as usual."""
+
+        async def cancel_live_bypasses(self) -> int:
+            raise RuntimeError(TestReapIsolatesEachCache._BOOM)
+
+    async def test_a_failing_cache_neither_aborts_nor_silences_the_sweep(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        # Bound to a local on purpose: the registry is a WeakSet, so an
+        # unreferenced cache drops straight back out of it and the sweep never
+        # meets the exploder at all.
+        exploder = self._ExplodingCache(ttl_seconds=60.0)
+        healthy: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        assert any(cache is exploder for cache in fanout_mod._live_caches), (
+            'precondition: the exploding subclass enrols through the same '
+            'TTLCache.__init__ as any other cache'
+        )
+        bypass, caller = await TestTTLCacheDetachedRefreshReaping._wedge_one_bypass(
+            healthy, 'k'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+        assert reaped == 1, (
+            'the healthy cache must still be reaped whichever side of the '
+            f'exploding one the traversal reaches it from; got {reaped}'
+        )
+        assert bypass.done(), 'the reachable in-flight task must have ended'
+
+        # Not silent: a shutdown hook that swallows an exception trades one
+        # invisible failure for another.
+        failures = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.exc_info is not None
+        ]
+        assert len(failures) == 1, (
+            f'the sweep must record the cache it could not reap; got {failures}'
+        )
+        assert self._BOOM in caplog.text, (
+            'the recorded failure must identify what went wrong, not merely '
+            f'that something did; got: {caplog.text}'
+        )
+
+        # And the ordinary summary still fires for what WAS reaped.
+        summaries = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'reaped' in r.getMessage()
+        ]
+        assert len(summaries) == 1, (
+            f'the reaped-count WARNING must survive a failing cache; got {summaries}'
+        )
+        assert '1' in summaries[0].getMessage()
+
+        await TestTTLCacheDetachedRefreshReaping._drain(caller)
