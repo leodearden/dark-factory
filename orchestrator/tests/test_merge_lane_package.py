@@ -282,3 +282,71 @@ class TestProductionClockWaitsForAny:
         finally:
             forever.cancel()
             await asyncio.gather(forever, return_exceptions=True)
+
+
+class TestFakeClockWaitsForAny:
+    """``wait_for_any`` on the fake every merge-lane test injects.
+
+    The fake's own semantics ARE the subject here. It hands the CADENCE to
+    the test -- ``mono`` moves by the full requested timeout, so a lane loop
+    measuring a no-progress budget off ``monotonic()`` reaches it in a
+    bounded number of polls -- WITHOUT starving the task it waits on.
+
+    The anti-starvation half is load-bearing and was measured, not reasoned.
+    An "advance the counter, then ``await asyncio.sleep(0)``" implementation
+    fails both of the first two tests below: a bare yield reschedules on the
+    ready queue without ever letting a real timer fire, so the poll spins
+    tens of thousands of times per millisecond of real verify work and
+    exhausts the 540-poll budget long before a live verify can finish.
+    Built as a spike, that shape false-aborted two healthy verifies as dead
+    ones -- test_merge_queue_request_liveness.py::TestContendedLeaseDefers::
+    {test_genuine_verify_failure_still_blocks_on_warm_path,
+    test_deferred_attempt_does_not_advance_cold_verify_valve}.
+    """
+
+    POLL_BUDGET = 50
+
+    @pytest.mark.asyncio
+    async def test_a_task_needing_a_real_timer_is_not_starved_by_the_polls(self) -> None:
+        clock = FakeClock()
+        task = asyncio.create_task(asyncio.sleep(0.05))
+        try:
+            done = await clock.wait_for_any({task}, timeout=600.0)
+            polls = 1
+            while not done and polls < self.POLL_BUDGET:
+                done = await clock.wait_for_any({task}, timeout=600.0)
+                polls += 1
+            assert done == {task}, f'starved: still unfinished after {polls} polls'
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_one_poll_really_waits_so_a_lane_loop_cannot_spin(self) -> None:
+        clock = FakeClock()
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            started = time.monotonic()
+            assert await clock.wait_for_any({forever}, timeout=600.0) == set()
+            # A floor well under the fake's own cap, not the cap itself: what
+            # is being pinned is that a poll costs REAL time at all. Measured
+            # 0.021s for a bounded wait against 0.00002s for a bare yield.
+            assert time.monotonic() - started >= 0.01
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_the_wait_charges_monotonic_only_and_records_the_cadence(self) -> None:
+        clock = FakeClock()
+        before_now, before_mono = clock.now(), clock.monotonic()
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            assert await clock.wait_for_any({forever}, timeout=10.0) == set()
+            assert await clock.wait_for_any({forever}, timeout=10.0) == set()
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
+        assert clock.monotonic() - before_mono == 20.0
+        assert clock.now() == before_now
+        assert clock.waits == [10.0, 10.0]
