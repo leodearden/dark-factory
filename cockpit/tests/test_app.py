@@ -5048,6 +5048,21 @@ class TestSessionTableFocusCue:
             assert state_glyph(sr.Status.RUNNING) in headless_row
 
 
+class _FixedScanner:
+    """Fake SessionScanner returning a prebuilt in-memory record list.
+
+    Satisfies SessionScannerProtocol structurally (see _BlockingScanner):
+    a cap test needs a few hundred records to EXIST, not to be on disk, so
+    this skips writing that many record.json files.
+    """
+
+    def __init__(self, records: list) -> None:
+        self._records = records
+
+    def scan(self) -> list:
+        return list(self._records)
+
+
 class TestSessionTableCapNotice:
     """Signal (b): a capped table says so, instead of looking complete.
 
@@ -5095,4 +5110,65 @@ class TestSessionTableCapNotice:
             # never an accidental notice.
             table.replace_rows(records, now)
             await pilot.pause()
+            assert table.border_subtitle == ''
+
+    @pytest.mark.timeout(10)
+    async def test_app_hands_the_table_the_true_live_total(self, tmp_path):
+        """The end-to-end half: _rebuild_session_table must report what
+        filter_live_sessions hid, or the whole mechanism is inert.
+
+        Uses a fake scanner rather than writing _DEFAULT_VISIBLE_CAP+5
+        record.json files -- the records only need to exist in memory for
+        the cap to bite, and this keeps the test in the same sub-second
+        band as its neighbours.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
+
+        over_cap = [
+            _make_record(session_slug=f'over-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 5)
+        ]
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(over_cap), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == (
+                f'showing {_DEFAULT_VISIBLE_CAP} of {_DEFAULT_VISIBLE_CAP + 5}'
+            )
+
+    @pytest.mark.timeout(10)
+    async def test_small_fleet_and_history_view_claim_no_truncation(self, tmp_path):
+        """Two ways of hiding nothing, both of which must stay quiet.
+
+        The history view is the interesting one: it renders self._records
+        UNFILTERED, so it hides nothing by construction and must never
+        inherit a notice from the capped view it replaced.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        records = [
+            _make_record(session_slug='small-0', status=sr.Status.RUNNING),
+            _make_record(session_slug='small-1', status=sr.Status.IDLE),
+        ]
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(records), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == 2
+            assert table.border_subtitle == ''
+
+            await pilot.press('h')
+            await pilot.pause()
+
             assert table.border_subtitle == ''
