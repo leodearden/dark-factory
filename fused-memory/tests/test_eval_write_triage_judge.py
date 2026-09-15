@@ -21,13 +21,13 @@ and traceability — never about whether a number is large enough.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import logging
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -49,19 +49,7 @@ def _load_module(path: Path, mod_name: str) -> types.ModuleType:
     ``sys.modules.get(cls.__module__)``. Same loader as
     ``test_calibrate_write_triage.py``.
     """
-    import sys  # noqa: PLC0415
-
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(path, mod_name=mod_name)
 
 
 @functools.cache

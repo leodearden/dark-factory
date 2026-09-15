@@ -15,7 +15,6 @@ that must agree byte-for-byte with the real one and cannot be kept in agreement.
 
 from __future__ import annotations
 
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -24,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'repair_recon_citation.py'
 
@@ -34,18 +34,7 @@ SUCCESSOR = '746b4ab9-ca3c-418b-982a-32b85bfcf94b'
 
 
 def _load_module() -> types.ModuleType:
-    mod_name = 'repair_recon_citation'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='repair_recon_citation')
 
 
 _mod = _load_module()

@@ -6,7 +6,6 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import sys
@@ -17,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
@@ -27,18 +27,7 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its name so that
     reflection-based decorators work correctly.
     """
-    mod_name = 'sweep_orphan_flag_markers'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='sweep_orphan_flag_markers')
 
 
 _mod = _load_module()
