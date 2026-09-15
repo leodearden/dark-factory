@@ -32,6 +32,7 @@ from orchestrator.config import (
 )
 from orchestrator.routing import (
     DEFAULT_ALLOWED_MODELS,
+    DEFAULT_PROBE_BUDGET_USD,
     FABLE_CANDIDATE_MODEL,
     ProbeReport,
     probe_models,
@@ -422,6 +423,56 @@ class TestProbeModelsBudgetExhaustion:
         ))
 
         assert report.accounts['max-x']['sonnet'] == 'budget_too_low'
+
+
+class TestProbeModelsBudgetForwarding:
+    """The per-invocation budget probe_models forwards as ``max_budget_usd``
+    defaults to the named ``DEFAULT_PROBE_BUDGET_USD`` constant, and an
+    explicit ``budget_usd=`` still overrides it.
+
+    Asserted through what actually REACHES invoke_fn (the fake's recorded
+    calls), never through ``inspect.signature`` -- a declared default that
+    some layer then overwrites would still be a defect, and the forwarded
+    value is the thing the probe's behaviour depends on.
+    """
+
+    def test_default_budget_is_the_named_constant(self):
+        # The single pin of the chosen number. Basis: one turn still pays for
+        # the CLI's own preamble, and one fable turn measures ~$0.15-0.25 that
+        # way, so $1.00 clears the most expensive probed model with ~4x margin
+        # -- and the old $0.05 did not, which is the defect (task 5404).
+        assert DEFAULT_PROBE_BUDGET_USD == 1.0
+
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        asyncio.run(probe_models(
+            accounts, ['haiku'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert cli.calls, 'expected at least one probe invocation'
+        for call in cli.calls:
+            assert call['max_budget_usd'] == DEFAULT_PROBE_BUDGET_USD
+            # Pinned in the same loop: this stays a ONE-turn probe, which is
+            # the premise that makes 'budget_too_low' mean "the ceiling is
+            # mis-sized" rather than "the agent ran long".
+            assert call['max_turns'] == 1
+
+    def test_explicit_budget_argument_is_forwarded(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        asyncio.run(probe_models(
+            accounts, ['haiku'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+            budget_usd=0.25,
+        ))
+
+        assert cli.calls, 'expected at least one probe invocation'
+        assert all(call['max_budget_usd'] == 0.25 for call in cli.calls)
 
 
 class TestProbeModelsMissingToken:
