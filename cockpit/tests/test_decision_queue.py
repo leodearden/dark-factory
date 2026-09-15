@@ -58,6 +58,7 @@ def _make_queue_item(**overrides) -> QueueItem:
         'target': None,
         'handling': False,
         'escalation_id': 'esc-1',
+        'session_slug': None,
     }
     fields.update(overrides)
     return QueueItem(**fields)
@@ -315,6 +316,7 @@ class TestFormatCopyPayload:
             kind='session',
             decision_id=None,
             question='Which host?',
+            session_slug='my-slug',
         )
 
         payload = format_copy_payload(item)
@@ -656,3 +658,22 @@ class TestKnownProjectRoots:
         roots = known_project_roots(sessions, ['/home/leo/src/dark-factory'])
 
         assert roots == ['/home/leo/src/dark-factory']
+
+
+class TestQueueItemSessionSlug:
+    """QueueItem.session_slug -- carried from the SessionRecord order_queue
+    already holds, so it is asserted on order_queue's own output rather than
+    on a hand-built item."""
+
+    def test_order_queue_carries_the_slug_on_a_session_item_and_none_on_a_decision(self):
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
+        sessions = [_make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)]
+
+        items = order_queue([decision], sessions, Priorities.default(), _NOW)
+
+        by_kind = {item.kind: item for item in items}
+        assert by_kind['session'].session_slug == 'awaiting-1'
+        assert by_kind['decision'].session_slug is None

@@ -28,6 +28,7 @@ import os
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from orchestrator.session_registry import (
@@ -146,6 +147,22 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
     }
 
 
+class DetailOwner(StrEnum):
+    """Which table's cursor last claimed the detail pane.
+
+    Ownership is a property of the TABLE that moved, never of the record
+    KIND on screen: the queue's own session rows render exactly what the
+    session table renders, so the rendered kind cannot tell the two apart.
+    CLAIMED only by on_data_table_row_highlighted, and released back to
+    SESSION_TABLE -- the default, and the only owner that always has a
+    selection to render -- by _resync_queue_detail when the queue empties.
+    Read only by the two rebuild-time re-syncs.
+    """
+
+    SESSION_TABLE = 'session-table'
+    QUEUE = 'queue'
+
+
 class CockpitApp(App):
     """Fleet Cockpit TUI: decision queue + session table + detail pane, polling for changes."""
 
@@ -244,6 +261,10 @@ class CockpitApp(App):
         # in _poll_registry is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
+        # The pane starts on the session-flavoured placeholder (and, when
+        # cockpit-ui.json carries one, the restored session), so the
+        # session table owns it until an operator moves the queue's cursor.
+        self._detail_owner = DetailOwner.SESSION_TABLE
         # Round-tripped through on_mount/_persist_ui_config so a hand-edited
         # cockpit-ui.json value survives a save -- see _persist_ui_config's
         # docstring. Seeded from the constructor kwarg here only so an
@@ -433,11 +454,51 @@ class CockpitApp(App):
         the FULL self._records, so outstanding-children counts never
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
+
+        The rebuild owns the detail pane only while the pane still belongs
+        to the session table: a rebuild refreshes whichever kind currently
+        owns the detail, and only an operator cursor move transfers that
+        ownership (see on_data_table_row_highlighted). Hence the two
+        deliberate moves below -- `prevent` so a programmatic rebuild emits
+        no cursor events at all, and _resync_session_detail so the explicit
+        re-sync that replaces them respects the same ownership rule. The
+        re-sync has always been explicit rather than left to those reposts,
+        because clear()'s cursor reset only reposts when the highlighted row
+        INDEX changes; suppressing them costs nothing and stops a
+        same-content rebuild from stealing a decision an operator is reading.
         """
         visible = self._records if self._show_history else filter_live_sessions(self._records)
         table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(visible, self._now_fn(), all_records=self._records)
-        self._sync_detail_pane(table.highlighted_slug())
+        with self.prevent(DataTable.RowHighlighted):
+            table.replace_rows(visible, self._now_fn(), all_records=self._records)
+        self._resync_session_detail(table.highlighted_slug())
+
+    def _resync_session_detail(self, slug: str | None) -> None:
+        """Rebuild-time counterpart of _sync_detail_pane -- remember, re-render if ours.
+
+        _selected_slug is assigned unconditionally, so cockpit-ui.json's
+        restore seam stays a pure function of the session table's cursor
+        regardless of which pane is on screen. The RE-RENDER is what's
+        gated: a rebuild refreshes the detail only while this table still
+        owns the pane, never stealing it back from a queue row the
+        operator moved to.
+
+        A CHANGED slug is persisted here and now, because the rebuild is
+        the one cursor move nothing else reports: suppressing the rebuild's
+        RowHighlighted reposts (see _rebuild_session_table) also suppressed
+        the _persist_ui_config call the handler made on their behalf, so
+        without this a cursor the rebuild moved itself -- the highlighted
+        session left the live view, say -- would live in memory only until
+        on_unmount, and a hard kill would restore the operator to a session
+        that is already gone. Gated on an actual change so the write stays
+        where it has always been (on a move), not on every poll tick.
+        """
+        changed = slug != self._selected_slug
+        self._selected_slug = slug
+        if changed:
+            self._persist_ui_config()
+        if self._detail_owner is DetailOwner.SESSION_TABLE:
+            self._show_session_detail(slug)
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
@@ -723,6 +784,17 @@ class CockpitApp(App):
         decision-row boost) call this afterward instead of waiting for the
         next poll tick.
 
+        Like its _rebuild_session_table sibling, this rebuild is
+        programmatic, so it emits no cursor events at all -- replace_rows
+        does clear() + move_cursor, which reposts RowHighlighted on every
+        rebuild whose highlighted row INDEX shifts, and `prevent` stops
+        that repost from handing the detail pane to the queue behind the
+        operator's back. A rebuild refreshes whichever table currently owns
+        the detail; only an operator cursor move transfers that ownership
+        (see on_data_table_row_highlighted). The explicit
+        _resync_queue_detail below is what refreshes the highlighted row in
+        those suppressed reposts' place.
+
         Also prunes self._handling down to the keys still present in the
         freshly-built queue: a key whose item LEFT the queue (resolved/
         dropped, or a session moved off AWAITING_INPUT) stops being
@@ -771,10 +843,39 @@ class CockpitApp(App):
             deferred=self._deferred,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
-        queue.replace_rows(queue_items, now)
+        with self.prevent(DataTable.RowHighlighted):
+            queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
         self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
+        self._resync_queue_detail(queue.highlighted_key())
+
+    def _resync_queue_detail(self, key: str | None) -> None:
+        """Rebuild-time counterpart of _sync_queue_detail -- re-render if ours.
+
+        The queue-side mirror of _resync_session_detail: refreshes the
+        highlighted row's detail with the freshly-scanned record while the
+        queue still owns the pane, and does nothing at all when it doesn't.
+        Must run after self._queue_items_by_key is rebuilt -- that is the
+        index _sync_queue_detail resolves *key* through.
+
+        An EMPTY queue (*key* None) RELEASES ownership rather than holding
+        it. The queue has no row left to own the pane with -- a watcher
+        resolved the last open decision, or the last awaiting-input session
+        was answered -- so holding on would lock the session table's
+        rebuilds out of the pane too, and the operator would be left
+        reading a decision that no longer exists with nothing able to clear
+        it. That is the one place "leave the pane as it is" degrades into a
+        wedged view rather than a transient miss, so the session table
+        takes the pane back and renders its own selection.
+        """
+        if self._detail_owner is not DetailOwner.QUEUE:
+            return
+        if key is None:
+            self._detail_owner = DetailOwner.SESSION_TABLE
+            self._show_session_detail(self._selected_slug)
+            return
+        self._sync_queue_detail(key)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
         """Resolve the focus/arrange backend for *kind* ('wm'/'tmux').
@@ -1246,38 +1347,103 @@ class CockpitApp(App):
             return
         self._backend_for(target.kind).focus(target)
 
-    def _sync_detail_pane(self, slug: str | None) -> None:
+    def _show_session_detail(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
 
         Looked up against self._records -- the ordered set from the most
         recent scan -- so this always reflects current data, not whatever
-        object identity a stale event might carry. Also remembers *slug* for
-        _persist_ui_config, since on_unmount runs after the DataTable itself
-        has already been torn down and can no longer be queried.
+        object identity a stale event might carry.
+
+        The render half alone, with no _selected_slug bookkeeping, so the
+        decision queue's own session rows can reuse it without writing the
+        session TABLE's restore seam -- see _sync_queue_detail.
         """
-        self._selected_slug = slug
         record = next((r for r in self._records if r.session_slug == slug), None)
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
 
+    def _sync_detail_pane(self, slug: str | None) -> None:
+        """Render *slug*'s record into the detail pane AND remember it as the selection.
+
+        The session table's path: the render (_show_session_detail) plus
+        remembering *slug* for _persist_ui_config, since on_unmount runs
+        after the DataTable itself has already been torn down and can no
+        longer be queried.
+        """
+        self._selected_slug = slug
+        self._show_session_detail(slug)
+
+    def _sync_queue_detail(self, key: str | None) -> None:
+        """Render the DecisionQueue row *key* into the detail pane.
+
+        Resolves *key* the way every other queue action does -- key ->
+        QueueItem (self._queue_items_by_key) -- so the pane sees the same
+        item identity as focus/boost/copy, with no second index. Both row
+        kinds render: a session row reuses the session render, since the
+        queue truncates its question exactly as it truncates a decision's.
+        A decision row resolves on to its DecisionRecord and renders THAT
+        rather than the QueueItem, because severity/state and the true
+        filed_at live only on the record (the queue's deferred overlay may
+        have shifted the item's).
+
+        Never writes _selected_slug -- that is the session TABLE's restore
+        seam (cockpit-ui.json), and a decision has no session slug to
+        restore to, so the queue renders through _show_session_detail
+        rather than _sync_detail_pane.
+
+        Fail-soft (PRD §2): an empty queue, a key with no QueueItem, or an
+        item whose backing record is gone leaves the pane as it is rather
+        than raising or blanking it.
+        """
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        if item.kind == 'session':
+            self._show_session_detail(item.session_slug)
+            return
+        if item.decision_id is None:
+            return
+        decision = self._decision_by_id(item.decision_id)
+        if decision is None:
+            return
+        detail = self.query_one('#detail', DetailPane)
+        detail.show_decision(decision, self._records, self._now_fn())
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Keep the detail pane in sync with the SessionTable's highlighted row.
+        """Keep the detail pane in sync with whichever table's cursor moved.
 
         Covers interactive cursor moves (e.g. arrow keys, or a test/caller
-        calling move_cursor directly). The complementary rebuild-time sync
-        lives in refresh_registry -- clear()'s cursor reset only reposts
-        this message when the highlighted row index actually changes, so a
-        same-row-different-content rebuild needs its own explicit sync.
+        calling move_cursor directly). SessionTable and DecisionQueue are
+        both DataTable subclasses, so Textual routes both their
+        RowHighlighted messages through this same handler (dispatch is by
+        the base DataTable message namespace, not the subclass) --
+        event.data_table disambiguates, the same way
+        on_data_table_row_selected does.
 
-        SessionTable and DecisionQueue are both DataTable subclasses, so
-        Textual routes both their RowHighlighted messages through this same
-        handler (dispatch is by the base DataTable message namespace, not
-        the subclass) -- event.data_table disambiguates so moving the
-        DecisionQueue's cursor never clobbers the session detail sync.
+        This handler is the ONLY thing that CLAIMS the detail pane for a
+        table: an operator cursor move hands the pane to the table that
+        moved, and a registry rebuild then refreshes whichever one
+        currently owns it (see _rebuild_session_table/_rebuild_queue, both
+        of which suppress their own programmatic cursor events). The one
+        other write to self._detail_owner is _resync_queue_detail's
+        RELEASE back to the session table when the queue empties, which
+        takes ownership away from a table that no longer has a row rather
+        than claiming it on any operator's behalf. Only the session branch
+        touches _selected_slug/cockpit-ui.json -- that restore seam is the
+        session table's alone, and a decision has no session slug to
+        restore to.
         """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        if event.data_table is queue:
+            self._detail_owner = DetailOwner.QUEUE
+            self._sync_queue_detail(event.row_key.value)
+            return
         table = self.query_one('#session-table', SessionTable)
         if event.data_table is not table:
             return
+        self._detail_owner = DetailOwner.SESSION_TABLE
         self._sync_detail_pane(event.row_key.value)
         self._persist_ui_config()
 

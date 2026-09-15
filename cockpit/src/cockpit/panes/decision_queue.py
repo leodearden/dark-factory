@@ -31,6 +31,7 @@ from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
 
 from cockpit.backends import DisplayTarget
+from cockpit.panes.placeholders import ABSENT_PLACEHOLDER
 from cockpit.panes.session_table import format_age
 from cockpit.priority import Priorities, ScoringItem, score
 
@@ -179,6 +180,13 @@ class QueueItem:
     escalation_id: the backing record's escalation_id, or None -- not
         rendered by format_queue_row, but consumed by format_copy_payload
         (the copy affordance, task 2517).
+    session_slug: the backing SessionRecord's slug for a session item, None
+        for a decision item. Carried as its own field rather than decoded
+        back out of *key*: order_queue already holds the record the slug
+        comes from, so encoding it into a string only to write a parser for
+        it would be the meaningful-string shape heuristic 12 rules out --
+        and the parser's fail-soft branch would be dead code, since every
+        session key this codebase builds comes from _session_key.
     """
 
     key: str
@@ -192,9 +200,9 @@ class QueueItem:
     target: DisplayTarget | None
     handling: bool
     escalation_id: str | None
+    session_slug: str | None
 
 
-_ID_PLACEHOLDER = '(none)'
 
 # Bounds the clipboard payload on BOTH copy legs, because there is only one
 # payload: cockpit/src/cockpit/app.py::CockpitApp.action_copy formats it once,
@@ -234,7 +242,7 @@ def format_copy_payload(item: QueueItem) -> str:
     escalation_id degrades to a placeholder, never the literal string
     'None'. The trailing id line is derived from item.kind/item.key --
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
-    session (slug = item.key after its 'session:' prefix). The question
+    session (QueueItem.session_slug). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
     long question can't silently vanish on a terminal that drops rather
     than truncates an over-long OSC 52 payload. One payload serves both
@@ -244,8 +252,7 @@ def format_copy_payload(item: QueueItem) -> str:
     _cap_for_clipboard's comment).
     """
     if item.kind == 'session':
-        slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
-        id_line = f'session: {slug}'
+        id_line = f'session: {item.session_slug}'
     else:
         id_line = f'decision_id: {item.decision_id}'
     question = _cap_for_clipboard(item.question or _QUESTION_PLACEHOLDER)
@@ -253,8 +260,8 @@ def format_copy_payload(item: QueueItem) -> str:
         [
             f'question: {question}',
             f'project: {item.project}',
-            f'task_id: {item.task_id or _ID_PLACEHOLDER}',
-            f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
+            f'task_id: {item.task_id or ABSENT_PLACEHOLDER}',
+            f'escalation_id: {item.escalation_id or ABSENT_PLACEHOLDER}',
             id_line,
         ]
     )
@@ -376,6 +383,7 @@ def order_queue(
                 target=resolve_target(decision, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=decision.escalation_id,
+                session_slug=None,
             )
         )
 
@@ -402,6 +410,7 @@ def order_queue(
                 target=resolve_target(session, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=session.escalation_id,
+                session_slug=session.session_slug,
             )
         )
 
