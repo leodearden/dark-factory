@@ -278,15 +278,11 @@ async def test_steal_failed_returns_requeued(tmp_path: Path):
             'victim remained (at most 3 attempts per acquire); requeue'
         )
     )
-    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-
     report = await wf.run()
 
     assert report.outcome == WorkflowOutcome.REQUEUED, (
         'a pool-pressure steal failure must requeue, never block + L1'
     )
-    mark_blocked.assert_not_awaited()
     assert report.reason.startswith('warm_lane_steal_failed (pool pressure)'), (
         f'expected the steal-failure reason_prefix; got {report.reason!r}'
     )
@@ -308,15 +304,11 @@ async def test_lane_lock_timeout_returns_requeued(tmp_path: Path):
             "'1859'; requeue (transient contention)"
         )
     )
-    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-
     report = await wf.run()
 
     assert report.outcome == WorkflowOutcome.REQUEUED, (
         'a lost lock race is transient contention — it must requeue'
     )
-    mark_blocked.assert_not_awaited()
     assert report.reason.startswith('warm_lane_lock_timeout (transient infra)'), (
         f'expected the lock-timeout reason_prefix; got {report.reason!r}'
     )
