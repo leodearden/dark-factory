@@ -34,6 +34,7 @@ from orchestrator.merge_lane import (
 )
 from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_queue import (
+    PRODUCTION_CLOCK,
     SpeculativeMergeWorker,
     _resolve_dispatch_time_merge_base,
 )
@@ -243,3 +244,41 @@ async def test_the_injected_clock_is_what_the_worker_ages_worktrees_by(
     report = await MergeLane(git_ops, queue, clock=next_week).reap_orphaned_merge_worktrees()
     assert report['reaped'] == [str(stray)]
     assert not stray.exists()
+
+
+# ---------------------------------------------------------------------------
+# The clock port's bounded wait
+# ---------------------------------------------------------------------------
+
+
+class TestProductionClockWaitsForAny:
+    """``ClockPort.wait_for_any`` on the adapter the running orchestrator uses.
+
+    The in-flight verify abandon poll hands its cadence to this method, so
+    the contract it needs is exactly the one its former bare ``asyncio.wait``
+    gave it: a timeout is a BOUND, not an error. An unfinished wait reports
+    an empty set and the waited-on task keeps running.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_finishing_task_comes_back_in_the_done_set(self) -> None:
+        task = asyncio.create_task(asyncio.sleep(0.01))
+        try:
+            done = await PRODUCTION_CLOCK.wait_for_any({task}, timeout=5.0)
+            assert isinstance(done, set)
+            assert done == {task}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_an_unfinished_wait_is_an_empty_set_not_a_raised_timeout(self) -> None:
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            done = await PRODUCTION_CLOCK.wait_for_any({forever}, timeout=0.01)
+            assert isinstance(done, set)
+            assert done == set()
+            assert not forever.done()
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
