@@ -2626,10 +2626,26 @@ class TestRunMergeVerifyOnWorktree:
         assert effective_config.lint_command == 'ORIG_LINT'
         assert effective_config.type_check_command == 'ORIG_TYPE'
 
-    async def test_spec_verify_env_reaches_zero_module_remote_config(self):
-        """spec.verify_env was dropped entirely on the zero-module path, so the
-        remote decided the merge under its OWN config's test-selection env (the
-        task-2822 false-green class)."""
+    @staticmethod
+    def _host_config(**kwargs):
+        """A real (never MagicMock) host config on the merge-verify shape.
+
+        run_merge_verify_on_worktree calls a real ``model_copy``, and the whole
+        point of the verify_env merge is what the REAL config properties compute.
+        """
+        return OrchestratorConfig(
+            merge_verify_workspace=False, merge_verify_breadth='scoped', **kwargs
+        )
+
+    @staticmethod
+    async def _merge_verify_effective_config(config, spec_env, verify_commands=()):
+        """Run the merge-verify path; return what was threaded into run_scoped.
+
+        Returns ``(effective_config, module_configs)`` — ``run_scoped.await_args``
+        positions 1 and 2, the observation point the sibling 2822/2883/4536
+        override tests use.  ``verify_commands=()`` is the zero-module-config
+        project (reify), where no ModuleConfig is reconstructed at all.
+        """
         from orchestrator.verify_runner import run_merge_verify_on_worktree
 
         run_scoped = AsyncMock(return_value=_make_pass_result())
@@ -2639,15 +2655,11 @@ class TestRunMergeVerifyOnWorktree:
                 failing_subprojects=[], timed_out_subprojects=[],
             )
         )
-        config = OrchestratorConfig(
-            verify_env={'CARGO_MAKEFLAGS': '--jobserver-auth=fifo:/tmp/reify-jobserver-merge'},
-            merge_verify_workspace=False, merge_verify_breadth='scoped',
-        )
         spec = MergeVerifySpec(
-            verify_commands=(),
+            verify_commands=verify_commands,
             unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
-            task_files=('crates/x/src/lib.rs',),
-            verify_env={'REIFY_RELEASE_DELTA_SKIP': '1'},
+            task_files=('src/a/m.py',),
+            verify_env=dict(spec_env),
             cold_timeout_secs=60.0,
         )
 
@@ -2657,86 +2669,65 @@ class TestRunMergeVerifyOnWorktree:
         )
 
         assert run_scoped.await_args is not None
-        effective_config = run_scoped.await_args[0][1]
-        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1', (
-            "the dispatcher's verify_env must reach the reconstructed remote config "
-            'even with zero module configs — no ModuleConfig is reconstructed on '
-            'this path, so the spec env has no other consumer'
-        )
-
-    async def test_spec_verify_env_wins_on_conflicting_key(self):
-        """On a key both sides set, the SPEC's value decides the merge — the
-        remote's own config must not re-select which tests run."""
-        from orchestrator.verify_runner import run_merge_verify_on_worktree
-
-        run_scoped = AsyncMock(return_value=_make_pass_result())
-        run_unscoped = AsyncMock(
-            return_value=MagicMock(
-                broken=False, timed_out=False,
-                failing_subprojects=[], timed_out_subprojects=[],
-            )
-        )
-        config = OrchestratorConfig(
-            verify_env={'REIFY_GATE_EXCLUDE_HEAVY': '0'},
-            merge_verify_workspace=False, merge_verify_breadth='scoped',
-        )
-        spec = MergeVerifySpec(
-            verify_commands=(),
-            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
-            task_files=('crates/x/src/lib.rs',),
-            verify_env={'REIFY_GATE_EXCLUDE_HEAVY': '1'},
-            cold_timeout_secs=60.0,
-        )
-
-        await run_merge_verify_on_worktree(
-            MagicMock(), config, spec,
-            run_scoped=run_scoped, run_unscoped=run_unscoped,
-        )
-
-        assert run_scoped.await_args is not None
-        effective_config = run_scoped.await_args[0][1]
-        assert effective_config.verify_env['REIFY_GATE_EXCLUDE_HEAVY'] == '1', (
-            "the spec wins on conflict; the remote host's own value must not "
-            'survive to re-select the gate'
-        )
+        return run_scoped.await_args[0][1], run_scoped.await_args[0][2]
 
     async def test_host_only_verify_env_key_survives_spec_merge(self):
-        """A host key the spec never mentions is PRESERVED — the rule is a merge,
-        not a replace. dict(spec.verify_env) would silently drop the laptop's own
-        CARGO_MAKEFLAGS jobserver pin, which no dispatcher-built spec can carry."""
-        from orchestrator.verify_runner import run_merge_verify_on_worktree
+        """Both sides' keys reach the zero-module remote config at once.
 
-        run_scoped = AsyncMock(return_value=_make_pass_result())
-        run_unscoped = AsyncMock(
-            return_value=MagicMock(
-                broken=False, timed_out=False,
-                failing_subprojects=[], timed_out_subprojects=[],
-            )
-        )
-        config = OrchestratorConfig(
-            verify_env={'CARGO_MAKEFLAGS': '--jobserver-auth=fifo:/tmp/reify-jobserver-merge'},
-            merge_verify_workspace=False, merge_verify_breadth='scoped',
-        )
-        spec = MergeVerifySpec(
-            verify_commands=(),
-            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
-            task_files=('crates/x/src/lib.rs',),
-            verify_env={'REIFY_RELEASE_DELTA_SKIP': '1'},
-            cold_timeout_secs=60.0,
+        Without the merge, spec.verify_env has NO consumer on this path (no
+        ModuleConfig is reconstructed), so the remote decides the merge under its
+        own config's test-selection env — the task-2822 false-green class.  With
+        a 'replace' spelling the host's own keys vanish instead.  The live
+        host-only class is the remote verify runner's own ``--config`` (reify
+        wires one at ``/home/leo/.config/orchestrator/reify-laptop.yaml``): the
+        16-thread laptop widens the ``REIFY_VERIFY_*_TIMEOUT`` budgets from
+        per-host measurements the workstation-built spec cannot know.
+        """
+        config = self._host_config(verify_env={'REIFY_VERIFY_TEST_TIMEOUT': '90m'})
+
+        effective_config, _ = await self._merge_verify_effective_config(
+            config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
         )
 
-        await run_merge_verify_on_worktree(
-            MagicMock(), config, spec,
-            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        # Asserted together so neither the 'ignore' nor the 'replace' spelling
+        # can pass: both sides' keys must be present at once.
+        assert effective_config.verify_env['REIFY_VERIFY_TEST_TIMEOUT'] == '90m', (
+            'a host key absent from the spec must survive — the spec is dispatcher-shaped'
+        )
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1', (
+            "the dispatcher's verify_env must reach the reconstructed remote config "
+            'even with zero module configs'
         )
 
-        assert run_scoped.await_args is not None
-        effective_config = run_scoped.await_args[0][1]
-        assert effective_config.verify_env['CARGO_MAKEFLAGS'] == (
-            '--jobserver-auth=fifo:/tmp/reify-jobserver-merge'
-        ), "a host key absent from the spec must survive — the spec is dispatcher-shaped"
-        # Asserted together so the test cannot pass against an 'ignore' spelling
-        # either: both sides' keys must be present at once.
+    async def test_sccache_backend_env_reaches_zero_module_remote_config(self):
+        """The host side is read through ``effective_verify_env``, the PROPERTY.
+
+        Property and field differ exactly when the config was built directly
+        rather than through ``load_config`` (which folds the one into the
+        other): the shared sccache backend then lives ONLY in
+        ``sccache.backend_env``.  Reading the field would drop it from the
+        zero-module remote leg — the same κ fidelity hole
+        ``build_merge_verify_spec`` reads the property to close on the
+        producing side.
+        """
+        from orchestrator.config import SccacheConfig
+
+        config = self._host_config(
+            sccache=SccacheConfig(
+                enabled=True, backend_env={'SCCACHE_REDIS': 'redis://backend:6380'},
+            ),
+        )
+        assert 'SCCACHE_REDIS' not in config.verify_env  # the field read would miss it
+
+        effective_config, _ = await self._merge_verify_effective_config(
+            config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
+        )
+
+        assert effective_config.verify_env['SCCACHE_REDIS'] == 'redis://backend:6380', (
+            'the shared sccache backend must reach the remote leg; it is absent '
+            'from both config.verify_env and spec.verify_env, so only the '
+            'effective_verify_env property carries it'
+        )
         assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
 
     async def test_caller_config_verify_env_is_not_mutated(self):
@@ -2749,33 +2740,12 @@ class TestRunMergeVerifyOnWorktree:
         shared value and corrupt the CALLER's config, the object cli.py loaded
         from disk and may still use.
         """
-        from orchestrator.verify_runner import run_merge_verify_on_worktree
-
-        run_scoped = AsyncMock(return_value=_make_pass_result())
-        run_unscoped = AsyncMock(
-            return_value=MagicMock(
-                broken=False, timed_out=False,
-                failing_subprojects=[], timed_out_subprojects=[],
-            )
-        )
-        caller_config = OrchestratorConfig(
-            verify_env={'CARGO_MAKEFLAGS': '--jobserver-auth=fifo:/tmp/reify-jobserver-merge'},
-            merge_verify_workspace=False, merge_verify_breadth='scoped',
-        )
+        caller_config = self._host_config(verify_env={'REIFY_VERIFY_TEST_TIMEOUT': '90m'})
         original_dict = caller_config.verify_env
         original_items = dict(caller_config.verify_env)
 
-        spec = MergeVerifySpec(
-            verify_commands=(),
-            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
-            task_files=('crates/x/src/lib.rs',),
-            verify_env={'REIFY_RELEASE_DELTA_SKIP': '1'},
-            cold_timeout_secs=60.0,
-        )
-
-        await run_merge_verify_on_worktree(
-            MagicMock(), caller_config, spec,
-            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        effective_config, _ = await self._merge_verify_effective_config(
+            caller_config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
         )
 
         assert caller_config.verify_env is original_dict, (
@@ -2789,8 +2759,7 @@ class TestRunMergeVerifyOnWorktree:
         )
         # Sanity: the copy really did receive the spec's key, so the identity
         # assertion above is not passing vacuously against a no-op.
-        assert run_scoped.await_args is not None
-        assert run_scoped.await_args[0][1].verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
 
     async def test_zero_module_and_per_module_resolve_the_same_verify_env(self):
         """Close the loop past the config field to the env actually handed to
@@ -2803,10 +2772,9 @@ class TestRunMergeVerifyOnWorktree:
         byte-identity claim rather than deriving it.
         """
         from orchestrator.verify import _resolve_verify_env
-        from orchestrator.verify_runner import run_merge_verify_on_worktree
 
         host_env = {
-            'CARGO_MAKEFLAGS': '--jobserver-auth=fifo:/tmp/reify-jobserver-merge',
+            'REIFY_VERIFY_TEST_TIMEOUT': '90m',
             'REIFY_GATE_EXCLUDE_HEAVY': '0',
         }
         spec_env = {
@@ -2814,43 +2782,22 @@ class TestRunMergeVerifyOnWorktree:
             'REIFY_RELEASE_DELTA_SKIP': '1',
         }
 
-        async def _run(verify_commands):
-            run_scoped = AsyncMock(return_value=_make_pass_result())
-            run_unscoped = AsyncMock(
-                return_value=MagicMock(
-                    broken=False, timed_out=False,
-                    failing_subprojects=[], timed_out_subprojects=[],
-                )
-            )
-            config = OrchestratorConfig(
-                verify_env=dict(host_env),
-                merge_verify_workspace=False, merge_verify_breadth='scoped',
-            )
-            spec = MergeVerifySpec(
-                verify_commands=verify_commands,
-                unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
-                task_files=('src/a/m.py',),
-                verify_env=dict(spec_env),
-                cold_timeout_secs=60.0,
-            )
-            await run_merge_verify_on_worktree(
-                MagicMock(), config, spec,
-                run_scoped=run_scoped, run_unscoped=run_unscoped,
-            )
-            assert run_scoped.await_args is not None
-            return run_scoped.await_args[0][1], run_scoped.await_args[0][2]
-
-        zero_config, zero_modules = await _run(())
+        zero_config, zero_modules = await self._merge_verify_effective_config(
+            self._host_config(verify_env=dict(host_env)), spec_env,
+        )
         assert zero_modules == []
         zero_env = _resolve_verify_env(zero_config, None, role='merge')
 
-        per_config, per_modules = await _run((VerifyCommand('src/a', test_command='true'),))
+        per_config, per_modules = await self._merge_verify_effective_config(
+            self._host_config(verify_env=dict(host_env)), spec_env,
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+        )
         assert len(per_modules) == 1
         per_env = _resolve_verify_env(per_config, per_modules[0], role='merge')
 
         assert zero_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
         assert zero_env['REIFY_GATE_EXCLUDE_HEAVY'] == '1', 'the spec wins the conflict'
-        assert zero_env['CARGO_MAKEFLAGS'] == host_env['CARGO_MAKEFLAGS'], (
+        assert zero_env['REIFY_VERIFY_TEST_TIMEOUT'] == '90m', (
             'the host-only key survives into the executed env'
         )
         assert zero_env == per_env, (

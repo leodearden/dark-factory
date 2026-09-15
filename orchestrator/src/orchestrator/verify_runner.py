@@ -275,45 +275,38 @@ class MergeVerifySpec:
                           run_merge_verify_on_worktree (task 5496): the spec wins
                           on conflict, host keys absent from the spec are
                           preserved. Neither 'replace' nor 'ignore' — the spec is
-                          dispatcher-shaped and carries host paths the remote
-                          lacks, while the host carries local necessities the
-                          spec cannot (the laptop's
-                          CARGO_MAKEFLAGS=--jobserver-auth=fifo:… pin).
-                          These keys SELECT TESTS, so they are merge-deciding
-                          rather than cosmetic: REIFY_RELEASE_DELTA_SKIP decides
-                          whether the release profile runs at all, and
-                          REIFY_RUN_ALL_FLAKY_LEDGER / REIFY_RUN_ALL_SKIP_STATE
-                          decide which members are skipped. A remote green
-                          reached under a different env is the task-2822
-                          false-green class, not a performance detail.
-                          Dispatcher-path-valued keys ship VERBATIM and resolve
-                          against the REMOTE filesystem. Deliberately so: the
-                          per-module path already ships them verbatim, and a
-                          name-based denylist would put one project's vocabulary
+                          dispatcher-shaped, while a remote runner's own --config
+                          carries per-host local necessities no dispatcher-built
+                          spec can know (a narrower verify-only host widening its
+                          own per-host-measured timeout budgets is the live case).
+                          MERGE-DECIDING, not cosmetic: these keys SELECT TESTS,
+                          so a remote green reached under a different env is the
+                          task-2822 false-green class, not a performance detail.
+                          Path-valued keys ship VERBATIM and resolve against the
+                          REMOTE filesystem — no rewrite, no denylist, on purpose:
+                          the per-module path already ships them verbatim, and a
+                          name-based filter would put one project's vocabulary
                           inside generic transport code and re-diverge the two
-                          paths task 5496 just unified. Reify's are
-                          REIFY_RUN_ALL_FLAKY_LEDGER and REIFY_RUN_ALL_SKIP_STATE
-                          (absolute main-checkout paths under
-                          /home/leo/src/reify/data/verify-logs/, absolute on
-                          purpose — an in-lane path is wiped by the reseed `git
-                          clean`) and CARGO_HOME (/tmp/reify-agent-cargo-home,
-                          pinned byte-identical to the sandboxed agents' value
-                          because cargo's per-unit fingerprint embeds the
-                          registry source path). Consequences are benign: an
-                          absent ledger/state path is the consuming tool's own
-                          absent-file case, and an absent CARGO_HOME is created
-                          cold by cargo — a cold registry fetch, not a
-                          correctness break.
-                          The ONE case genuinely invalid to ship verbatim:
-                          REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG/_RELEASE,
-                          injected by
-                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env,
-                          are absolute paths to UNTRACKED files under the
-                          DISPATCHER's merge_wt. git push does not carry them, so
-                          on a remote dispatch they name files that do not exist
-                          while REIFY_VERIFY_RETRY_SCOPE=failed_only ships
-                          alongside. Resolving it needs merge_queue.py (outside
-                          task 5496's scope); follow-up ticket
+                          paths task 5496 unified. Which keys a project sets, and
+                          why any of them is deliberately absolute, stays in that
+                          project's own dark-factory-orchestrator.yaml — its single
+                          home (INV-9), and the file to read before assuming what a
+                          key here means.
+                          Residual risk on a REMOTE dispatch is wasted wall-clock,
+                          not a false green. The measured case is the retry env
+                          from
+                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
+                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
+                          paths to UNTRACKED files that git push does not carry, so
+                          the remote finds them missing — and reify's consumer then
+                          refuses to narrow, loudly, and runs that profile FULL (an
+                          independent tree-OID guard refuses the same way on a
+                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
+                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
+                          by that guard, and are sound here: the remote verifies the
+                          same pushed tree and consumes no dispatcher build artefacts.
+                          Making the filter files shippable needs merge_queue.py
+                          (outside task 5496's scope); follow-up ticket
                           tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
@@ -647,10 +640,12 @@ async def run_merge_verify_on_worktree(
     # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
     # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
     # local necessities, which are by construction absent from any
-    # dispatcher-built spec — the laptop's CARGO_MAKEFLAGS jobserver pin being
-    # the live example; cargo would warn and fall back to uncoordinated
-    # parallelism on the merge lane. The spec is dispatcher-shaped and the host
-    # config is host-shaped; only a merge carries both.
+    # dispatcher-built spec: a remote runner is dispatched against its OWN
+    # --config, and a narrower verify-only host widens its per-host-measured
+    # timeout budgets there — values the dispatching workstation never measured
+    # and cannot ship, which 'replace' would silently narrow back to the
+    # workstation's. The spec is dispatcher-shaped and the host config is
+    # host-shaped; only a merge carries both.
     #
     # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
     # already computes exactly {**config.verify_env, **module_config.verify_env}
