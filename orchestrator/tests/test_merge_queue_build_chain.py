@@ -1285,6 +1285,26 @@ def _spy_merges(git_ops: GitOps, monkeypatch) -> list[str]:
     return calls
 
 
+def _spy_merge_attempt_events(monkeypatch) -> list[tuple[str, object]]:
+    """Replace ``merge_queue._emit_merge_attempt`` with a recorder.
+
+    Ruled residual (esc-5029-12): ``build_chain`` takes no event store and
+    ``_emit_merge_attempt`` sits behind none of the injected ports, so a
+    dotted-path spy on the module global is the only seam that can observe
+    an emit from inside the chain builder. ``store.events`` on a worker
+    constructed only for ``chain_snapshot()`` cannot.
+    """
+    from orchestrator import merge_queue as _mq
+
+    calls: list[tuple[str, object]] = []
+
+    def _recording(_event_store, task_id, outcome, **_kw) -> None:
+        calls.append((task_id, outcome))
+
+    monkeypatch.setattr(_mq, '_emit_merge_attempt', _recording)
+    return calls
+
+
 def _spy_note_conflict_detected(monkeypatch) -> list[str]:
     """Replace ``SpeculativeMergeWorker._note_conflict_detected`` with a recorder.
 
@@ -1412,16 +1432,19 @@ class TestBuildChainTruncation:
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
     async def test_emits_no_merge_attempt_event(self, git_repo: Path, monkeypatch):
-        """Zero events of ANY type — an outcome event would be a false report."""
-        from _recording_event_store import _RecordingEventStore
+        """No merge_attempt emit from inside build_chain — it would be a false report.
 
+        Observed through the ``_emit_merge_attempt`` spy: build_chain holds no
+        event store, so the worker's store is not a seam here (the worker
+        exists only to produce ``chain_snapshot()``).
+        """
         from orchestrator.merge_liveness import release_chain_build_lane
         from orchestrator.merge_queue import build_chain
 
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
-        store = _RecordingEventStore()
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store)  # type: ignore[arg-type]
+        worker = _make_worker(git_ops)
+        emitted = _spy_merge_attempt_events(monkeypatch)
         await self._conflicting_trio(git_repo)
         head = await _rev_parse(git_repo)
         worker._lane_buffers['normal'].extend(
@@ -1433,7 +1456,7 @@ class TestBuildChainTruncation:
         )
 
         assert res.truncated_at == '102'
-        assert store.events == []
+        assert emitted == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
     async def test_does_not_mutate_queue_state(self, git_repo: Path, monkeypatch):
