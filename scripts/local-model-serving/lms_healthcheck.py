@@ -1269,6 +1269,7 @@ def run_healthcheck(
     probe: ArmProber | None = None,
     baseline: lms_vram.GpuBaseline | None = None,
     repeat: int = 1,
+    now: Callable[[], str] = _now_iso,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -1301,6 +1302,16 @@ def run_healthcheck(
     latency, still behind exactly one warm-up.  It is observability only: the
     first measured result alone supplies the verdict, so no number of repeats
     can turn a row green.
+
+    `now` is the clock, injectable for a reason more specific than "for
+    testing": `render_table` prints `measured_at` in its header line, so a
+    report stamped off the live clock puts six microsecond digits into every
+    rendering.  A test that counts digit runs over a whole table -- the
+    consumer pid counts in
+    `scripts/tests/test_lms_healthcheck.py::test_the_table_lists_who_else_held_the_card_at_each_reading`
+    -- therefore had a ~3e-4 chance per run of counting a timestamp digit as a
+    pid.  On 2026-09-14 it did, and blocked an unrelated branch in the merge
+    lane.  A fixture pins this; a real run leaves it alone.
     """
     if repeat < 1:
         # A caller error, never an arm failure -- recording it as a FAIL would
@@ -1369,7 +1380,7 @@ def run_healthcheck(
         baseline_free_mib=base.reading.free_mib,
     )
 
-    measured_at = _now_iso()
+    measured_at = now()
     rows: list[ArmRow] = []
     for arm in arms:
         # The PAIRING lives here, not in `probe_arm`, because `run_healthcheck`
