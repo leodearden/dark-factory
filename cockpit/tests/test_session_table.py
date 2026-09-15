@@ -346,3 +346,77 @@ class TestFilterLiveSessions:
         assert [r.session_slug for r in kept] == [
             f's-{i}' for i in range(_DEFAULT_VISIBLE_CAP)
         ]
+
+
+class TestFocusMarker:
+    """The per-row focusability cue: can Enter raise a terminal for this row?
+
+    `display` is the only thing that makes a row focusable -- decision_queue.
+    resolve_target's SessionRecord branch resolves straight from it, and
+    that is the code app.py::_focus_slug actually runs. is_focusable is
+    restated in session_table rather than imported from decision_queue
+    (which already imports this module -- a reverse import would be a
+    cycle), so test_agrees_with_resolve_target below is what keeps the two
+    statements honest.
+    """
+
+    def test_record_with_display_is_focusable(self):
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=sr.Display(kind='wm', wm_title='t'))
+
+        assert is_focusable(record) is True
+        assert focus_marker(record) == '▸'
+
+    def test_record_without_display_is_not_focusable(self):
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=None)
+
+        assert is_focusable(record) is False
+        assert focus_marker(record) == '·'
+
+    def test_markers_are_distinct_single_chars_outside_the_status_vocabulary(self):
+        """The cue must read in BOTH directions and must never be confusable
+        with a status glyph -- the two dimensions are orthogonal, so a
+        marker colliding with '⚙'/'✓'/'⏸'/'☠'/'?' would make one column
+        look like the other."""
+        from cockpit.panes.session_table import focus_marker
+
+        focusable = focus_marker(_make_record(display=sr.Display(kind='wm')))
+        headless = focus_marker(_make_record(display=None))
+
+        assert focusable != headless
+        for marker in (focusable, headless):
+            assert len(marker) == 1
+            assert marker not in {'⚙', '✓', '⏸', '☠', '?'}
+
+    def test_unrecognized_display_kind_still_reads_focusable_fail_soft(self):
+        """A Display whose kind this view doesn't recognize is still a real
+        terminal somewhere -- mirroring _is_terminal/state_glyph fail-soft
+        (PRD §2), an unknown kind must never mislabel it unactionable."""
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=sr.Display(kind='weird', wm_title='t'))
+
+        assert is_focusable(record) is True
+        assert focus_marker(record) == '▸'
+
+    def test_agrees_with_resolve_target(self):
+        """SPOT guard: the cue must mean exactly what Enter does.
+
+        resolve_target is imported HERE only -- production session_table
+        must not import decision_queue (import cycle). If resolve_target's
+        SessionRecord branch ever grows a stricter rule, this fails loudly
+        rather than leaving the table quietly lying to the operator.
+        """
+        from cockpit.panes.decision_queue import resolve_target
+        from cockpit.panes.session_table import is_focusable
+
+        with_display = _make_record(
+            session_slug='has-display', display=sr.Display(kind='wm', wm_title='t')
+        )
+        without_display = _make_record(session_slug='no-display', display=None)
+
+        for record in (with_display, without_display):
+            assert is_focusable(record) == (resolve_target(record, {}) is not None)
