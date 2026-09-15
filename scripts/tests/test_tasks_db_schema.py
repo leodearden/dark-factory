@@ -37,6 +37,8 @@ from pathlib import Path
 import pytest
 from _task_db_scan import connect_ro
 from tasks_db_schema import (
+    EXIT_OK,
+    EXIT_UNREADABLE,
     MainCheckoutUnresolved,
     introspect,
     main,
@@ -161,6 +163,11 @@ def _arbitrary_db(tmp_path: Path) -> Path:
     A composite primary key exercises the pk ORDINAL rather than a boolean,
     and ``loose`` declares a column with no type at all — sqlite's dynamic
     affinity, which the tool must report as unconstrained rather than guess.
+
+    ``assorted.payload`` is a BLOB column holding a **str**, deliberately. A
+    bytes value there would satisfy a ``-> bytes`` claim by coincidence and
+    leave the round-trip assertions passing for the wrong reason; BLOB affinity
+    coerces nothing, so a str is what actually comes back out.
     """
     path = tmp_path / "arbitrary.db"
     conn = sqlite3.connect(path)
@@ -183,7 +190,7 @@ def _arbitrary_db(tmp_path: Path) -> Path:
         )
         conn.execute(
             "INSERT INTO assorted (label, ratio, payload) VALUES (?, ?, ?)",
-            ("a label", 1.5, b"\x00bytes"),
+            ("a label", 1.5, "a str in a BLOB column"),
         )
         conn.commit()
     finally:
@@ -310,23 +317,43 @@ def test_a_task_id_read_from_the_store_has_no_isdigit(make_tasks_db):
 
 
 def test_python_type_follows_affinity_rules_not_an_exact_type_table(tmp_path):
-    """``VARCHAR(20)``/``DOUBLE``/``BLOB`` are none of them the canonical
-    spellings, and all three round-trip to the reported type."""
+    """``VARCHAR(20)`` and ``DOUBLE`` are neither of them the canonical
+    spellings, and both round-trip to the reported type."""
     conn = connect_ro(_arbitrary_db(tmp_path))
     try:
         columns = _columns_of(conn, "assorted")
-        row = conn.execute("SELECT label, ratio, payload FROM assorted").fetchone()
+        row = conn.execute("SELECT label, ratio FROM assorted").fetchone()
     finally:
         conn.close()
 
     assert [type(value) for value in row] == [
-        columns[name].python_type for name in ("label", "ratio", "payload")
+        columns[name].python_type for name in ("label", "ratio")
     ]
-    assert [columns[name].python_type for name in ("label", "ratio", "payload")] == [
-        str,
-        float,
-        bytes,
-    ]
+    assert [columns[name].python_type for name in ("label", "ratio")] == [str, float]
+
+
+def test_a_blob_column_is_unconstrained_because_blob_affinity_coerces_nothing(
+    tmp_path,
+):
+    """BLOB is the one affinity that is the ABSENCE of coercion.
+
+    "A column with affinity BLOB does not prefer one storage class over
+    another and no attempt is made to coerce data" — so a ``-> bytes`` claim
+    is false for every value that was not written as bytes, and is exactly the
+    authoritative-looking wrong answer this tool exists to remove. Measured
+    here rather than argued: the fixture writes a **str** into the BLOB column
+    and a str is what comes back.
+    """
+    conn = connect_ro(_arbitrary_db(tmp_path))
+    try:
+        payload = _columns_of(conn, "assorted")["payload"]
+        (stored,) = conn.execute("SELECT payload FROM assorted").fetchone()
+    finally:
+        conn.close()
+
+    assert payload.declared_type == "BLOB"
+    assert type(stored) is str
+    assert payload.python_type is None
 
 
 def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
@@ -411,6 +438,29 @@ def test_main_with_no_path_arguments_resolves_from_the_cwd(
     assert "tasks" in capsys.readouterr().out
 
 
+def test_main_diagnoses_a_git_that_wedges_past_the_timeout(tmp_path, monkeypatch, capsys):
+    """`subprocess.TimeoutExpired` is a SubprocessError, NOT an OSError.
+
+    A handler catching only `OSError` lets a wedged git escape `main`'s own
+    ``except`` and surface as a raw traceback — breaking the contract its
+    docstring states ("the reader gets the shape, or a diagnosis, and never
+    silence") in precisely the incident this tool is for: a loaded box with a
+    contended ``.git``.
+    """
+    def _wedged(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else "git", timeout=30)
+
+    monkeypatch.setattr("tasks_db_schema.subprocess.run", _wedged)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_UNREADABLE
+    assert captured.out == ""
+    assert str(tmp_path.resolve()) in captured.err
+
+
 def test_main_exits_non_zero_and_says_why_when_the_store_is_absent(tmp_path, capsys):
     """A forensic tool that exits 0 having reported nothing is worse than no
     tool: it tells the reader the store has no tables."""
@@ -419,7 +469,7 @@ def test_main_exits_non_zero_and_says_why_when_the_store_is_absent(tmp_path, cap
     exit_code = main(["--db", str(absent)])
 
     captured = capsys.readouterr()
-    assert exit_code != 0
+    assert exit_code == EXIT_UNREADABLE
     assert captured.out == ""
     assert str(absent) in captured.err
 
@@ -435,7 +485,7 @@ def test_main_diagnoses_a_zero_byte_stub_differently_from_an_absent_store(
     absent_exit = main(["--db", str(tmp_path / "nowhere" / "tasks.db")])
     absent_captured = capsys.readouterr()
 
-    assert (stub_exit, absent_exit) != (0, 0)
+    assert (stub_exit, absent_exit) == (EXIT_UNREADABLE, EXIT_UNREADABLE)
     assert stub_captured.out == ""
     assert str(stub) in stub_captured.err
     assert stub_captured.err != absent_captured.err
@@ -462,7 +512,7 @@ def test_main_refuses_a_readable_store_that_has_no_tables(tmp_path, capsys):
     exit_code = main(["--db", str(table_less)])
 
     captured = capsys.readouterr()
-    assert exit_code != 0
+    assert exit_code == EXIT_UNREADABLE
     assert captured.out == ""
     assert str(table_less) in captured.err
 
@@ -475,6 +525,52 @@ def test_main_refuses_a_file_that_is_not_a_sqlite_database(tmp_path, capsys):
     exit_code = main(["--db", str(not_a_database)])
 
     captured = capsys.readouterr()
-    assert exit_code != 0
+    assert exit_code == EXIT_UNREADABLE
     assert captured.out == ""
     assert str(not_a_database) in captured.err
+
+
+def test_main_refuses_an_empty_db_argument_instead_of_reading_the_live_store(
+    tmp_path, monkeypatch, capsys
+):
+    """``--db ''`` is a path the reader NAMED, not an argument they omitted.
+
+    Branching on truthiness would fall through to the live store and hand back
+    a confident report about a different database than the one asked for — the
+    same authoritative-wrong-answer class as the column types, one layer up.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["--db", ""])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_UNREADABLE
+    assert captured.out == ""
+
+
+def test_main_refuses_an_empty_project_root_argument_the_same_way(
+    tmp_path, monkeypatch, capsys
+):
+    """The sibling flag has the sibling bug, so it gets the sibling guard."""
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["--project-root", ""])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_UNREADABLE
+    assert captured.out == ""
+
+
+def test_the_unreadable_exit_does_not_collide_with_argparses_usage_error():
+    """A scripted caller must tell "I mistyped a flag" from "the store was
+    unreadable", and argparse already owns 2.
+
+    Measured against argparse itself rather than asserted as a literal, so the
+    guard still holds if that code ever moves.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--no-such-flag"])
+
+    assert excinfo.value.code == 2
+    assert excinfo.value.code != EXIT_UNREADABLE
+    assert EXIT_UNREADABLE != EXIT_OK

@@ -20,9 +20,12 @@ AFFINITY — what a value is coerced to on the way in — and not a guarantee
 about every value already stored. Affinity is nonetheless the answer to the
 question that keeps being asked wrong: ``tasks.id`` is declared INTEGER, so a
 task id read out of the store arrives as ``int`` and ``.isdigit()`` on it
-raises. A declaration that carries no affinity rule of its own — none at all,
-or a NUMERIC-ish one that can come back as either int or float — is reported
-as unconstrained rather than guessed.
+raises. A declaration that pins no single python type is reported as
+unconstrained rather than guessed, and three shapes land there: no declaration
+at all, a NUMERIC-ish one that can come back as either int or float, and BLOB —
+whose affinity is precisely the absence of coercion, so a str written to a BLOB
+column reads back as str (measured) and any claim of ``bytes`` would be the
+authoritative wrong answer this tool exists to retire.
 
 WHY IT RESOLVES THE MAIN CHECKOUT ITSELF, rather than importing
 ``fused_memory.models.scope.resolve_main_checkout`` — a knowing duplication,
@@ -53,9 +56,12 @@ from _task_db_scan import (
 _GIT_TIMEOUT_SECS = 30
 
 EXIT_OK = 0
-# "I could not read a store", numbered as Tier 2/3 of _task_db_scan number
-# their own nothing-was-read exit.
-EXIT_UNREADABLE = 2
+# "I could not read a store" — 3, matching _task_db_scan.AUDIT_EXIT_NOTHING_AUDITED,
+# whose semantics are the same "nothing was read, so this is not a clean run".
+# NOT 2: argparse spends that code on its own usage errors (measured), so a
+# scripted caller reading 2 could not tell a mistyped flag from an unreadable
+# store.
+EXIT_UNREADABLE = 3
 
 
 class MainCheckoutUnresolved(Exception):
@@ -96,7 +102,11 @@ def resolve_live_db_path(start: str | Path) -> Path:
             timeout=_GIT_TIMEOUT_SECS,
             check=False,
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
+        # SubprocessError, not just OSError: a git wedged past the timeout
+        # raises TimeoutExpired, which is NOT an OSError — and a loaded box
+        # with a contended .git is exactly the incident this tool is for, so
+        # that shape must arrive as a diagnosis rather than as a traceback.
         raise MainCheckoutUnresolved(resolved_start, str(exc)) from exc
 
     if listed.returncode != 0:
@@ -142,10 +152,16 @@ class Table(NamedTuple):
 # rather than on a table of exact declarations is what lets an unfamiliar
 # spelling — VARCHAR(20), DOUBLE, BIGINT — be classified instead of crashing or
 # silently defaulting to str.
-_AFFINITY_RULES: tuple[tuple[tuple[str, ...], type], ...] = (
+#
+# BLOB resolves to None — unconstrained — rather than to bytes, because BLOB
+# affinity is sqlite's one rule that coerces NOTHING. It stays in the table,
+# and in this position, because the ORDER is load-bearing: sqlite applies the
+# BLOB rule before the REAL one, so dropping the rung would let a declaration
+# carrying both spellings fall through to float.
+_AFFINITY_RULES: tuple[tuple[tuple[str, ...], type | None], ...] = (
     (("INT",), int),
     (("CHAR", "CLOB", "TEXT"), str),
-    (("BLOB",), bytes),
+    (("BLOB",), None),
     (("REAL", "FLOA", "DOUB"), float),
 )
 
@@ -241,9 +257,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_db_path(args: argparse.Namespace) -> Path:
-    if args.db:
+    """Where to read, from the arguments — ``is not None``, never truthiness.
+
+    An empty ``--db ''`` is a path the reader NAMED, so it must reach
+    :func:`connect_ro` and earn a refusal naming it. Branching on truthiness
+    would silently read the live store instead and report a confident answer
+    about a different database than the one asked for.
+    """
+    if args.db is not None:
         return Path(args.db)
-    if args.project_root:
+    if args.project_root is not None:
         return tasks_db_path(args.project_root)
     return resolve_live_db_path(Path.cwd())
 
