@@ -5906,6 +5906,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # merge's breadth, and is read fresh off req.config at each gate
         # evaluation.  A safety kill switch behind a restart is not one.
         'merge_disjoint_skip_requires_verified_drift',
+        # Merge-verify host selection order (task 5097, Lever C) — green-tier
+        # for the same reason as verify_cross_check_remote_green: the policy
+        # is supplied per HostAllocator.acquire call and never captured on the
+        # allocator, so a mid-process flip cannot split an in-flight merge; it
+        # only changes which host the NEXT dispatch prefers.  TRUST-ANCHOR CAVEAT before flipping this live: under
+        # prefer_remote nearly every verdict becomes a REMOTE verdict, which
+        # promotes verify_drift_check_every_n_lands from a spot check to the
+        # standing fidelity guard (see the field's own description).
+        'verify_host_policy',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task
