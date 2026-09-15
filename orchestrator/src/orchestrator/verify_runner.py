@@ -592,6 +592,44 @@ async def run_merge_verify_on_worktree(
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
+    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
+    # config: the spec wins on conflict, host keys absent from the spec are
+    # preserved. Without this the zero-module-config path (spec.verify_commands
+    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
+    # has NO consumer and the remote decides the merge under its own config's
+    # test-selection env — the task-2822 false-green class, since these keys
+    # select which tests run.
+    #
+    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
+    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
+    # local necessities, which are by construction absent from any
+    # dispatcher-built spec — the laptop's CARGO_MAKEFLAGS jobserver pin being
+    # the live example; cargo would warn and fall back to uncoordinated
+    # parallelism on the merge lane. The spec is dispatcher-shaped and the host
+    # config is host-shaped; only a merge carries both.
+    #
+    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
+    # already computes exactly {**config.verify_env, **module_config.verify_env}
+    # on the per-module path. The merge here is therefore byte-identical there —
+    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
+    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
+    # makes the ONE existing rule uniform across both paths.
+    #
+    # Spelling constraints:
+    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
+    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
+    #    dict object as the caller's — the same hazard the task-4536 registry
+    #    comment below spells out. An in-place write would corrupt the config
+    #    cli.py loaded from disk and may still use.
+    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
+    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
+    #    writes the verify_env FIELD, because the property is read-only and
+    #    _resolve_verify_env — the sole builder of the executed env — reads the
+    #    field.
+    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
+    #    env", which under this rule already leaves every host key intact, so a
+    #    guard would buy a branch with no behavioural difference.
+    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
     # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
     # global full-gate commands; apply them onto the reconstructed remote config
     # so the remote runs the SAME gate as local (the module_configs=[] Site-2
