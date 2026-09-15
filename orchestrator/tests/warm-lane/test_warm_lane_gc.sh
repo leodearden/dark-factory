@@ -484,6 +484,139 @@ run_helper reclaim \
 assert "A11d: a NEGATIVE --max-record-age-days exits 2 (never a blanket downgrade)" \
     test "$RC" -eq 2
 
+# A11e-A11k: the two doors A11b/A11d do not reach. `^[0-9]+$` rejects junk and
+# negatives, but a LEADING ZERO and an OVERFLOWING MAGNITUDE both sail through
+# it and then mean something other than what the operator typed — the exact
+# silent direction the guard's own comment declares must never happen.
+#
+# `08` is the LOUD-but-wrong door: accepted by the regex, then read as OCTAL by
+# `$(( … * 86400 ))`, which dies with a raw bash diagnostic that `set -e` does
+# not abort on, leaving MAX_RECORD_AGE_SECS UNSET for the rest of the pass.
+# `010` is the SILENT and more dangerous one: accepted, and quietly means 8
+# days instead of 10. Neither is discoverable from the summary line.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 08
+assert "A11e: a LEADING-ZERO --max-record-age-days 08 exits 2 (never read as octal)" \
+    test "$RC" -eq 2
+# Two halves, and the second is what keeps this assert honest if the guard is
+# ever re-loosened: a raw bash arithmetic diagnostic reaching an operator is the
+# tell that the value got as far as the multiply, i.e. the guard was bypassed
+# rather than enforced. `grep -qF --` for the same reason A11c documents.
+assert "A11f: ...and stderr names the flag and the value 08, with NO raw bash arithmetic diagnostic" \
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "--max-record-age-days" \
+        && printf "%s\n" "$1" | grep -qF -- "08" \
+        && ! printf "%s\n" "$1" | grep -qF -- "value too great for base"' _ "$ERR_OUT"
+
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 010
+assert "A11g: --max-record-age-days 010 exits 2 (it would SILENTLY mean 8 days, not 10)" \
+    test "$RC" -eq 2
+
+# The disable escape hatch is documented as exactly `0`. `00` is the same
+# ambiguous-token class and must not become a second, undocumented spelling of
+# a switch that turns the valve off.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 00
+assert "A11h: --max-record-age-days 00 exits 2 (the disable hatch is spelled 0, and only 0)" \
+    test "$RC" -eq 2
+
+# The env var is a REAL second door into the same guard, so it must be guarded
+# identically — and the message must name the door the operator actually used,
+# not a flag they never passed. Inline command prefix, NEVER an export, per the
+# file's established REIFY_* idiom (K4's PATH prefix, O-env).
+REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=09 run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target"
+assert "A11i: a leading-zero value via the ENV VAR exits 2 too (the same guard, the other door)" \
+    test "$RC" -eq 2
+assert "A11j: ...and the error names the env var, not only the flag the operator never passed" \
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS"' _ "$ERR_OUT"
+
+# Overflow is the same forbidden SILENT direction as 010, reached through a
+# different door, and A11d's negative case cannot reach it because the typed
+# value is positive: `9223372036854775807 * 86400` WRAPS to -86400, which then
+# fails the `-gt 0` test and disables the bound outright while
+# `downgraded_assigned=0` reads as "nothing was stale".
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 9223372036854775807
+assert "A11k: an OVERFLOWING --max-record-age-days exits 2 (a wrap would silently disable the valve)" \
+    test "$RC" -eq 2
+
+# NON-VACUITY. Without this the block would pass a guard that rejected
+# everything, and A11's reader cannot see Block S-age's accepting cases from
+# here (heuristic 13 — a block makes internal sense in isolation).
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 14
+assert "A11l: NON-VACUITY — a plain --max-record-age-days 14 still exits 0 on the same fixture" \
+    test "$RC" -eq 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block A11-boundary — the bound is validated BEFORE any lane is touched
+# ──────────────────────────────────────────────────────────────────────────────
+# The property that makes the finding's severity concrete, and one no A11 case
+# above can reach because A7's fixture has no lanes at all. A guard that fires
+# at the boundary makes a misconfigured bound reclaim NOTHING; a guard that
+# fires mid-pass makes it reclaim HALF A POOL and then die without a summary
+# line to say so.
+#
+# Glob order is deliberately exploited: `_lane-1` (reclaimable) sorts before
+# `_lane-2` (assigned, and so the first lane that reads MAX_RECORD_AGE_SECS),
+# so a boundary guard and a mid-pass abort are distinguishable by looking at
+# `_lane-1` alone. All <lane>.lock FREE, no live process references, no
+# --extra-protect-glob.
+echo ""
+echo "--- Block A11-boundary: a misconfigured bound reclaims NOTHING (task 5504) ---"
+
+A11B_ROOT="$(mktemp -d /tmp/test-gc-a11b-XXXXXX)"
+_TMPDIRS+=("$A11B_ROOT")
+mkdir -p "$A11B_ROOT/worktrees" "$A11B_ROOT/base"
+make_repo "$A11B_ROOT/repo"
+mkdir -p "$A11B_ROOT/base/target.gen.1"
+touch "$A11B_ROOT/base/target.gen.1.lock"
+ln -sfn "$A11B_ROOT/base/target.gen.1" "$A11B_ROOT/base/target"
+for _a11b_name in _lane-1 _lane-2; do
+    git -C "$A11B_ROOT/repo" worktree add -q "$A11B_ROOT/worktrees/$_a11b_name"
+    mkdir -p "$A11B_ROOT/worktrees/$_a11b_name/target"
+    touch "$A11B_ROOT/worktrees/$_a11b_name/target/DIVERGENT_MARKER"
+done
+make_lane_state "$A11B_ROOT/worktrees" _lane-1 released
+make_lane_state "$A11B_ROOT/worktrees" _lane-2 assigned 5504
+_seed_stub_body > "$A11B_ROOT/seed_stub.sh"
+chmod +x "$A11B_ROOT/seed_stub.sh"
+export SEED_LOG="$A11B_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$A11B_ROOT/worktrees" \
+    --base-target "$A11B_ROOT/base/target" \
+    --seed-script "$A11B_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --max-record-age-days 08
+
+# Exit 2, the usage/WIRING class — not the runtime 1 a mid-pass `set -u` abort
+# produces, and the distinction is load-bearing: an operator (or the sweep's
+# own error handling) reads the class to decide whether the invocation could
+# have avoided it.
+assert "A11-boundary1: a misconfigured bound exits 2 (usage/wiring), not 1 (runtime)" \
+    test "$RC" -eq 2
+assert "A11-boundary2: the seed stub was NEVER invoked — no lane was reclaimed" \
+    bash -c '[ ! -s "$1" ]' _ "$A11B_ROOT/seed_calls.log"
+assert "A11-boundary3: the reclaimable _lane-1 is INTACT (a mid-pass abort would have reset it first)" \
+    test -f "$A11B_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "A11-boundary4: the assigned _lane-2 is likewise untouched" \
+    test -f "$A11B_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER"
+assert "A11-boundary5: NO reclaim: summary line on stdout (a misconfigured bound must not half-run a pass)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "reclaim complete:"' _ "$OUT"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — reset a divergent FREE lane
 # ──────────────────────────────────────────────────────────────────────────────
