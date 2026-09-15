@@ -422,7 +422,7 @@ def _summary(*commands, **top):
     return payload
 
 
-def _leg(label='test', cmd=_FULL_SUITE, **overrides):
+def _leg(label: str = 'test', cmd: str | None = _FULL_SUITE, **overrides):
     entry = {
         'label': label,
         'cmd': cmd,
@@ -947,7 +947,7 @@ class TestLegsAreFilteredToTheResolvedWindow:
         assert within_window(legs, window) == ()
 
 
-def _load_record(cpu=1.0, cpu60=None, runqueue=0.5):
+def _load_record(cpu: float | None = 1.0, cpu60: float | None = None, runqueue: float = 0.5):
     return {
         'start': {
             'cpu_some10': cpu,

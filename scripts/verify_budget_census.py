@@ -1110,7 +1110,13 @@ def _census_budget_floor(worst: float) -> int | None:
     if str(_FAMILY_DIR) not in sys.path:
         sys.path.insert(0, str(_FAMILY_DIR))
     try:
-        from module_budget_family import census_budget_floor
+        # Resolved by the sys.path insertion above, so pyright cannot see it.
+        # Suppressed at this single site rather than by widening the root
+        # extraPaths table: a static path entry would also claim a guarantee
+        # this function deliberately does not make — hence the ImportError arm.
+        from module_budget_family import (  # pyright: ignore[reportMissingImports]
+            census_budget_floor,
+        )
     except ImportError:
         return None
     return census_budget_floor(worst)

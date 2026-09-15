@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -31,7 +32,10 @@ def _sample(**overrides):
     """A healthy host sample; overrides degrade exactly the component under test."""
     from shared.psi import PsiSample  # noqa: PLC0415
 
-    fields = dict(
+    # dict[str, Any], not the inferred join: a dict mixing floats with bools
+    # widens to dict[str, float], and PsiSample's bool/str fields reject that
+    # under **-unpacking. The helper is override-driven anyway.
+    fields: dict[str, Any] = dict(
         cpu_some10=2.50,
         cpu_some60=1.80,
         mem_some10=1.23,

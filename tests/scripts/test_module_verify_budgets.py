@@ -759,7 +759,16 @@ def test_module_carries_its_own_measured_verify_budget(
     # untouched for every other prefix, so the misreading (f) exists to make
     # un-silent stays closed for them.
     cold_declaration = RULED_COLD_BUDGET_DECLARATIONS.get(prefix)
-    root_cold_ceiling = root_config.verify_cold_command_timeout_secs
+    # The fleet's EFFECTIVE cold ceiling. An unset root cold knob is not the
+    # absence of a ceiling: the cascade's step 3 falls through to the root WARM
+    # budget (verify._resolve_verify_timeout), so that is the figure a module
+    # declaration must still clear. Reading it as None would both make the
+    # floor below vacuous and raise TypeError on the comparison.
+    root_cold_ceiling = (
+        root_config.verify_cold_command_timeout_secs
+        if root_config.verify_cold_command_timeout_secs is not None
+        else root_config.verify_command_timeout_secs
+    )
     if cold_declaration is not None:
         declared_cold = mc.verify_cold_command_timeout_secs
         assert declared_cold is not None, (
@@ -805,8 +814,10 @@ def test_module_carries_its_own_measured_verify_budget(
         # with it.
         assert declared_cold >= root_cold_ceiling, (
             f'{prefix} declares verify_cold_command_timeout_secs='
-            f'{declared_cold}, below the repo-root '
-            f'verify_cold_command_timeout_secs={root_cold_ceiling}. The root '
+            f'{declared_cold}, below the repo-root effective cold ceiling '
+            f'{root_cold_ceiling} (its verify_cold_command_timeout_secs, or '
+            f'the warm budget the cold cascade falls through to when that is '
+            f'unset). The root '
             f'ceiling is operator-tunable and this module\'s figure is ruled, '
             f'so the declaration exists precisely to survive a revert of that '
             f'ceiling — a module figure that falls back with it buys nothing'
