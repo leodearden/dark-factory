@@ -371,6 +371,7 @@ def _invoke_cli(
     claude_bin: str | None = None,
     timeout: float = _DEFAULT_INVOKE_TIMEOUT_SECS,
     cwd: str | os.PathLike | None = None,
+    oauth_token: str | None = None,
 ) -> str:
     """Invoke the real headless ``claude -p --model <model>`` CLI exactly
     once, delivering *prompt* via stdin, and return its raw stdout.
@@ -379,6 +380,21 @@ def _invoke_cli(
     public function accepts an ``invoke`` override, and most tests inject
     a fake one. *claude_bin* resolves, in order: the explicit argument,
     the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
+
+    *oauth_token*, when given, is the ACCOUNT the caller chose -- the token
+    of a lease taken from the shared multi-account ``UsageGate`` (see
+    ``account_pool.pool_invoke``, which is what passes it). It is handed to
+    the child as ``CLAUDE_CODE_OAUTH_TOKEN`` in an explicit env built the
+    same way every other CLI spawn in the fleet builds one
+    (``agents/invoke.py``, ``cli_invoke.py``, ``usage_gate.py``): a copy of
+    ``os.environ`` with ``ANTHROPIC_API_KEY`` REMOVED. The removal is the
+    load-bearing half, not tidiness -- the CLI prefers an API key over the
+    OAuth token, so leaving one set silently authenticates as the API key's
+    identity and the account choice is defeated while the failover still
+    LOOKS like it worked. ``None`` (the default) passes ``env=None``, which
+    is subprocess's own "inherit the parent unchanged", so this parameter is
+    strictly additive: census's wiring (``preflight_headroom`` and
+    ``_build_stage_invokes``) spawns byte-identically to before it existed.
 
     THIS FUNCTION IS ITSELF UNDER TEST -- it is no longer true that "no
     test ever reaches it", and the resolution order above is exactly what
@@ -442,6 +458,11 @@ def _invoke_cli(
     """
     resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
 
+    env = None
+    if oauth_token:
+        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+
     try:
         proc = subprocess.run(
             [resolved_bin, "-p", "--model", model],
@@ -450,6 +471,7 @@ def _invoke_cli(
             capture_output=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise CoderInvocationError(
