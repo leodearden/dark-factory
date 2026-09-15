@@ -17,6 +17,7 @@ rather than hand-editing if the writer's schema moves.
 import argparse
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 
 import audit_model_admission
@@ -1013,6 +1014,66 @@ def test_main_without_a_ceiling_reports_no_ceiling_rather_than_a_zero_one(
     assert spend['ceiling_usd'] is None
     assert spend['headroom_usd'] is None
     assert spend['at_or_over_ceiling'] is None
+
+
+@pytest.mark.parametrize(
+    ('spec', 'expected'),
+    [('24h', timedelta(hours=24)), ('1h', timedelta(hours=1)), ('14d', timedelta(days=14))],
+)
+def test_a_window_spec_parses_to_the_span_it_names(spec, expected):
+    """24h is this report's window and 14d is task 5441's — both hand-typed."""
+    assert audit_model_admission._parse_window(spec) == expected
+
+
+@pytest.mark.parametrize(
+    'spec', ['24', '24x', '24hours', '24h ', 'h', '', '0h', '-1h', '1.5d', '24 h', '24H'],
+)
+def test_a_malformed_window_spec_is_rejected_rather_than_truncated(spec):
+    """'24' silently read as 24 hours would move the window every spend figure
+    is measured over without saying so; the anchors are the only thing
+    preventing it, and nothing else in the suite exercises them."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        audit_model_admission._parse_window(spec)
+
+
+@pytest.fixture
+def host_tz_is_not_utc(monkeypatch):
+    """Pin the process's local zone to a non-UTC one for the duration of a test.
+
+    Without this, "naive means UTC" is unfalsifiable on a UTC host: reading a
+    naive bound as local time would be indistinguishable from reading it as
+    UTC, and the assertion would pass against either implementation.
+    """
+    monkeypatch.setenv('TZ', 'America/New_York')
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_a_naive_since_is_read_as_utc_not_as_host_local_time(host_tz_is_not_utc):
+    """The store is UTC throughout and these values are used directly as SQL
+    comparands, so shifting a hand-typed bound by the host's offset would move
+    the whole window silently."""
+    parsed = audit_model_admission._parse_moment('2026-09-12T06:43:16')
+
+    assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
+    assert parsed == APPLY
+
+
+def test_an_offset_bearing_since_is_converted_to_the_same_utc_instant():
+    """The apply commit is stamped +01:00; the report's --since is its UTC
+    equivalent, and both spellings must resolve to one instant."""
+    parsed = audit_model_admission._parse_moment('2026-09-12T07:43:16+01:00')
+
+    assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
+    assert parsed.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize('spec', ['yesterday', '2026-13-01T00:00:00', ''])
+def test_a_junk_since_is_rejected_by_the_argument_parser(spec):
+    with pytest.raises(argparse.ArgumentTypeError):
+        audit_model_admission._parse_moment(spec)
 
 
 @pytest.mark.parametrize(

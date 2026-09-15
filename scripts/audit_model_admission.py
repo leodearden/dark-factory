@@ -46,9 +46,11 @@ from typing import Any
 # resolve.  The live store exists only in the main checkout.
 DEFAULT_RUNS_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
 
-# A trailing-window spec: N hours or N days, N a positive integer. Anchored so
-# '24' and '24x' are both rejected rather than silently truncated to 24.
-_WINDOW_RE = re.compile(r'^(\d+)([hd])$')
+# A trailing-window spec: N hours or N days, N a POSITIVE integer. Anchored so
+# '24' and '24x' are both rejected rather than silently truncated to 24, and
+# leading digit 1-9 so '0h' is rejected too: an empty window renders a truthful
+# $0.00 of spend, which reads as a measurement rather than as a typo.
+_WINDOW_RE = re.compile(r'^([1-9]\d*)([hd])$')
 
 # orchestrator/src/orchestrator/routing.py::_model_rejection_reason returns
 # exactly these three; resolve_route namespaces each as "<layer>:<reason>"
@@ -873,15 +875,18 @@ def _merge_cell(outcome: MergeOutcome | None) -> str:
 
 
 def _parse_window(spec: str) -> timedelta:
-    """Parse a `<N>h` / `<N>d` trailing-window spec.
+    """Parse a `<N>h` / `<N>d` trailing-window spec, N a positive integer.
 
     Anchored: '24' and '24x' must both be rejected rather than silently
-    truncated to 24 hours.
+    truncated to 24 hours — a truncation would move the window every spend
+    figure is measured over without saying so.  '0h' is rejected for the same
+    reason: an empty window reports $0.00, which reads as a measurement.
     """
     match = _WINDOW_RE.match(spec)
     if not match:
         raise argparse.ArgumentTypeError(
-            f'bad --window {spec!r}: expected <N>h or <N>d, e.g. 24h or 14d.'
+            f'bad --window {spec!r}: expected <N>h or <N>d with N positive, '
+            f'e.g. 24h or 14d.'
         )
     size = int(match.group(1))
     return timedelta(hours=size) if match.group(2) == 'h' else timedelta(days=size)
