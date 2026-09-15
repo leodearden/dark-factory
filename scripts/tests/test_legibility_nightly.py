@@ -1208,6 +1208,167 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task 5488: the census subprocess must be handed a POOL-CHOSEN account
+#
+# census.py runs as a GRANDCHILD -- run_nightly -> _default_census_launcher ->
+# subprocess.run(census.py) -- and that call carries no `env` of its own, so
+# the grandchild is authenticated today only because the 2026-09-14 stopgap
+# drop-in exported one account's token into the systemd unit. Retiring that
+# drop-in (steps 21-24) without this would leave the census riding whatever
+# ~/.claude holds: strictly WORSE than today, and invisible, because
+# census.preflight_headroom fails SAFE -- a token-less census silently defers
+# the whole run rather than erroring.
+#
+# A non-regression gate, not a new feature. The env is an OVERLAY on the
+# parent's, and "no account available" degrades to inheriting exactly as
+# before: a census launch must never crash or fail the nightly run, and must
+# never be blocked by a pool problem either.
+# ---------------------------------------------------------------------------
+
+def _spy_subprocess_run(monkeypatch):
+    """Capture the kwargs of the launcher's subprocess.run, return the dict."""
+    seen = {}
+
+    def _fake_run(args, **kwargs):
+        seen['args'] = args
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', _fake_run)
+    return seen
+
+
+def test_default_census_launcher_passes_an_explicit_env_through(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-from-the-pool'}
+
+    nightly._default_census_launcher(env=env)
+
+    assert seen['env'] is env, (
+        'the census subprocess must be spawned with the env it was given, or '
+        'the account the pool chose never reaches census.py'
+    )
+    assert seen['check'] is False, (
+        "check=False is the launcher's never-crash-the-nightly contract and "
+        'must survive the new parameter'
+    )
+
+
+def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch):
+    """No env means the pre-5488 behaviour, byte for byte.
+
+    ``env=None`` and an omitted ``env`` are the SAME thing to subprocess --
+    inherit the parent's -- which is what keeps this parameter strictly
+    additive for every other caller of the launcher.
+    """
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher()
+
+    assert seen.get('env') is None
+
+
+class TestRunNightlyBindsTheCensusLauncherToThePool:
+    """The wiring half: the launcher run_nightly hands the census step is
+    bound to THIS run's pool, so the account census.py authenticates as is one
+    the gate believes is live -- rather than the hardcoded max-h of the
+    stopgap drop-in this task retires."""
+
+    class _Lease:
+        def __init__(self, name, token):
+            self.name = name
+            self.token = token
+
+    class _OneAccountGate:
+        """A pool with exactly one leasable account, leased by token."""
+
+        account_count = 1
+
+        def __init__(self, token='tok-census-account'):
+            self.token = token
+            self.released = []
+
+        def try_lease(self, **_kwargs):
+            return TestRunNightlyBindsTheCensusLauncherToThePool._Lease(
+                'max-h', self.token,
+            )
+
+        def release_probe_slot(self, oauth_token):
+            self.released.append(oauth_token)
+
+    @staticmethod
+    def _capture_launcher(monkeypatch):
+        seen = {}
+
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+            seen['launcher'] = launcher
+            return 'census trigger: NO-FIRE -- stub', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+        return seen
+
+    @staticmethod
+    def _env_the_census_would_get(launcher, monkeypatch):
+        """Resolve *launcher* the way evaluate_census_step does, run it with
+        subprocess.run spied, and return the env the census subprocess got."""
+        seen = _spy_subprocess_run(monkeypatch)
+        (launcher if launcher is not None else nightly._default_census_launcher)()
+        return seen.get('env')
+
+    def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
+        gate = self._OneAccountGate()
+        monkeypatch.setattr(nightly.account_pool, 'build_pool', lambda **kw: gate)
+        # The invoke half is stubbed out: this class is about the census env,
+        # and a pool-backed invoker over a FAKE token would spawn the REAL
+        # `claude` on PATH (a 401 here, genuine billable spend the day a test
+        # stub holds a live token). The invoke wiring itself is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool.
+        monkeypatch.setattr(
+            nightly.account_pool, 'pool_invoke',
+            lambda pool, **kw: (
+                lambda prompt, model: '{"matches": [], "candidates": []}'
+            ),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        # No invoke= : the production path, where a pool IS built.
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=None,
+        )
+
+        env = self._env_the_census_would_get(seen['launcher'], monkeypatch)
+        assert env is not None, (
+            'the census inherited the parent env -- after the account-pin '
+            'drop-in is retired that means ~/.claude, and preflight_headroom '
+            'would defer the whole census with no error anyone can see'
+        )
+        assert env['CLAUDE_CODE_OAUTH_TOKEN'] == gate.token
+        assert 'ANTHROPIC_API_KEY' not in env
+
+    def test_a_run_with_no_pool_leaves_the_census_env_inherited(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """An injected invoke= builds no gate, and that must not be allowed to
+        cost the census its env: unchanged inheritance is the fail-safe."""
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setattr(
+            nightly.account_pool, 'build_pool',
+            lambda **kw: pytest.fail('no pool may be built on the injected path'),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
+        )
+
+        assert self._env_the_census_would_get(seen['launcher'], monkeypatch) is None
+
+
+# ---------------------------------------------------------------------------
 # task 4148: run_nightly must DEFAULT the census status_fetcher seam
 #
 # The production path is the systemd `nightly.py run --project-id %i`

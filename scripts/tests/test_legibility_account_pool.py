@@ -619,3 +619,82 @@ def test_build_pool_warns_LOUDLY_when_it_resolves_no_accounts(
         f"name the accounts it could not resolve, so an operator knows which "
         f"env var is missing; got {warnings}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5488 / step-19: subprocess_env — the census grandchild's account
+#
+# nightly's census launcher spawns scripts/legibility/census.py with no ``env``
+# of its own, so today that grandchild is authenticated only because the
+# 2026-09-14 stopgap drop-in exported ONE account's token into the systemd
+# unit. This helper is what replaces that pin, and it is strictly better than
+# what it replaces: a LIVE pool-chosen account at launch time rather than a
+# hardcoded max-h.
+#
+# It must degrade to None rather than raise or block. ``census.preflight_
+# headroom`` fails SAFE, so a census that cannot authenticate silently defers
+# the whole run instead of erroring -- "no account to give it" therefore has to
+# mean "inherit exactly as before", never "fail the census".
+#
+# Per-invocation rotation INSIDE census.py (its own file lock, a mining loop
+# over many batches) is a separate job and is filed as a follow-up.
+# ---------------------------------------------------------------------------
+
+def test_subprocess_env_carries_a_pool_token_and_strips_the_api_key(monkeypatch):
+    """The two halves of the env contract, and why the strip is half of it:
+    the CLI prefers ANTHROPIC_API_KEY over the OAuth token, so leaving it set
+    silently defeats the account choice -- the identical reasoning that put
+    the strip in ``_invoke_cli``."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-survive")
+    monkeypatch.setenv("LEGIBILITY_UNRELATED_VAR", "kept")
+    gate = _pool(("max-b", False), ("max-h", False))
+
+    env = mod.subprocess_env(gate)
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-max-h", (
+        "the census draws from the END of the roster like the rest of the "
+        "trickle, so it does not contend with the orchestrator's b->h order"
+    )
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["LEGIBILITY_UNRELATED_VAR"] == "kept", (
+        "the rest of the parent env rides along -- census.py needs PATH, HOME "
+        "and the unit's own vars, so this is an OVERLAY, not a replacement"
+    )
+    assert gate.lease_calls == [{"scope": None, "reverse": True}]
+
+
+def test_subprocess_env_skips_a_capped_account():
+    gate = _pool(("max-b", False), ("max-g", True), ("max-h", True))
+
+    env = mod.subprocess_env(gate)
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-max-b"
+
+
+def test_subprocess_env_never_keeps_the_probe_claim():
+    """The lease is read for its token and handed straight back.
+
+    The census runs in ANOTHER process, so the gate can observe nothing it
+    does and nothing will ever settle the slot. Holding a PROBE_IN_FLIGHT
+    claim for the census's whole runtime (its stages carry 120/900/1800s
+    timeouts) would make that account inadmissible to the trickle's own
+    digests for the rest of the night -- the pool would silently shrink by one
+    every time a census fired.
+    """
+    gate = _pool(("max-b", False), ("max-h", False))
+
+    env = mod.subprocess_env(gate)
+
+    assert gate.released == [env["CLAUDE_CODE_OAUTH_TOKEN"]]
+
+
+def test_subprocess_env_returns_none_when_nothing_can_be_leased():
+    """An exhausted pool means "inherit as before", not "fail the census".
+
+    Returning None is what keeps the census's best-effort contract intact: a
+    census launch must never crash or fail the nightly run, and must never be
+    BLOCKED by a pool problem either.
+    """
+    gate = _pool(("max-b", True), ("max-h", True))
+
+    assert mod.subprocess_env(gate) is None
