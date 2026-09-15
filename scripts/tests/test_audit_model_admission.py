@@ -749,7 +749,7 @@ def test_restarts_are_found_even_though_live_rows_carry_a_task_id(runs_db):
 # --- spend_in_window (check 5) and roles_on_model (check 6) ---
 
 
-def _spend(runs_db, *, model=FABLE, ceiling_usd=150.0):
+def _spend(runs_db, *, model=FABLE, ceiling_usd: float | None = 150.0):
     return audit_model_admission.spend_in_window(
         runs_db, model=model, window_start=APPLY,
         window_end=APPLY + timedelta(hours=24), ceiling_usd=ceiling_usd,
