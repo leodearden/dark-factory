@@ -558,15 +558,16 @@ def submit_or_dedupe(
       'resolved_by', 'level'}``.  See ``queue.observed_submit_response``: the
       response reports observed post-write state, never write intent.
     - Unpersisted: ``{'id', 'status': 'accepted_unpersisted', 'persist_check',
-      'level'}`` when the post-write re-read is unavailable — the write was
-      accepted but nothing is guaranteed on disk for L1 or L2 to drain, so the
-      filer must keep driving its blocked task rather than standing down
-      (task 5368).  That recovery is bounded at ONE re-file by
-      ``escalate_blocker``'s docstring and the role prompt, NOT by this gate:
-      a repeat only folds when its category is in
-      ``config.infra_dedupe_categories`` and it lands inside the window, so on
-      any other category each repeat mints a fresh record.
-      ``persist_check`` is ``'absent'`` or ``'unreadable'``.
+      'level'}`` when the post-write re-read could not confirm the write, so the
+      filer keeps driving its blocked task rather than standing down.  What that
+      status does and does not claim, and the ``persist_check`` verdicts, are
+      stated once in
+      ``escalation/src/escalation/queue.py::observed_submit_response`` (task
+      5368).  The part local to THIS gate: the filer's re-file is bounded by
+      ``escalate_blocker``'s docstring and the role prompt, NOT here — a repeat
+      folds only when its category is in ``config.infra_dedupe_categories`` and
+      it lands inside the window, so on any other category each repeat mints a
+      fresh record.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id,
                         'level': esc.level}``

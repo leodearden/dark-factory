@@ -1168,14 +1168,14 @@ def create_server(
           function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
           post-write state rather than write intent.
         - Unpersisted: ``{'id', 'status': 'accepted_unpersisted',
-          'persist_check', 'level'}`` when the post-write re-read is
-          unavailable — the write was accepted but nothing is guaranteed on
-          disk for L1 or L2 to drain, so the filer must keep driving its
-          blocked task rather than standing down (task 5368).  The filer's
-          retry is bounded at ONE re-file by ``escalate_blocker``'s docstring
-          and the role prompt, not by this gate: the gate folds only
-          ``config.infra_dedupe_categories``, and the L2 branch above does not
-          consult it at all.
+          'persist_check', 'level'}`` when the post-write re-read could not
+          confirm the write, so the filer keeps driving its blocked task rather
+          than standing down; see
+          ``escalation/src/escalation/dedupe.py::submit_or_dedupe``, which
+          produces it, and through it
+          ``queue.py::observed_submit_response`` (task 5368).  Local to THIS
+          function: the L2 branch above never consults the dedupe gate, so an
+          L2 re-file cannot fold either.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id,
                             'level': esc.level}``
@@ -1582,8 +1582,9 @@ def create_server(
         - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
           persist_check, level}``.  A post-write re-read could not confirm the
           write, so nothing is guaranteed on disk for a drain to find.
-          ``persist_check`` is ``'absent'`` (not on disk) or ``'unreadable'``
-          (the read failed, so its state is unknown).  This path carries no
+          ``persist_check`` is ``'absent'`` (nothing for that id is on disk)
+          or ``'unreadable'`` (a read was attempted and yielded no record — a
+          torn write reads this way — so its state is unknown).  This path carries no
           ``action`` key — that is only on the blocker path — so an info filer
           simply carries on, as it already does on every other branch.
         """
@@ -1719,8 +1720,9 @@ def create_server(
           human.  Bounding at one retry is what stops a persistent re-read
           outage from minting one record per agent iteration.
           ``persist_check`` is
-          ``'absent'`` (the record is not on disk) or ``'unreadable'`` (the
-          read failed, so its state is unknown).  ``action`` is
+          ``'absent'`` (nothing for that id is on disk) or ``'unreadable'`` (a
+          read was attempted and yielded no record — a torn write reads this
+          way — so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.
         """
         if severity not in KNOWN_SEVERITIES:

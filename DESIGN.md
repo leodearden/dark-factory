@@ -499,7 +499,8 @@ When task 99 submits a blocker that dedupes into task 42's pending parent:
   `escalation.models.FILER_ACTIONS`: `terminate_cleanly` on every branch whose
   persistence was observed, and `keep_driving` on `status: 'accepted_unpersisted'`,
   where the write was accepted but a post-write re-read could not confirm the record.
-  Nothing is on disk for a handler to see on that branch, so the filer must keep
+  Nothing is *guaranteed* on disk for a handler to see on that branch — the
+  re-read either found no record or could not read one — so the filer must keep
   driving its task and re-file rather than stop.  No code reads this key — its only
   consumer is the agent reading the tool result — and
   `orchestrator.agents.roles.ESCALATION_LADDER_CORE` quotes both tokens verbatim in
