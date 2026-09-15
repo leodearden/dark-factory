@@ -7,7 +7,6 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import json
 import types
 import uuid
@@ -15,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 from escalation.dedupe import compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -31,20 +31,7 @@ def _load_module() -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly
     (they call sys.modules.get(cls.__module__)).
     """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'backfill_recon_escalations'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(SCRIPT_PATH, mod_name='backfill_recon_escalations')
 
 
 _mod = _load_module()
