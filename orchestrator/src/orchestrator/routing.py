@@ -67,6 +67,15 @@ DEFAULT_PROBE_ARTIFACT_PATH: str = 'config/model-availability.yaml'
 # turn, without incurring meaningful cost.
 DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
 
+# AgentResult.subtype the Claude CLI stamps when the local --max-budget-usd
+# ceiling fires: ``error_max_budget_usd``, WITH the ``_usd`` suffix -- not
+# ``error_max_budget`` (the same warning
+# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). Spelled here
+# per-package on purpose rather than imported from that module's private
+# name: this is a one-value constant, and an import would couple the routing
+# probe to an unrelated module's internals to save nothing.
+PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
+
 
 def _dedup_preserve_order(items: list[str]) -> list[str]:
     """Deduplicate *items*, preserving first-seen order."""
@@ -89,18 +98,48 @@ class ProbeReport:
     accounts: dict[str, dict[str, str]]
 
 
-def classify_probe_outcome(outcome: object) -> str:
-    """Map a ``shared.invocation_outcome.InvocationOutcome`` to a probe
-    status string: OK->available, ModelNotFound->unavailable,
-    AuthFailed->auth_error, CapHit/NearCap->capped, else->error.
+def classify_probe_outcome(result: AgentResult) -> str:
+    """Map one probe invocation's ``AgentResult`` to a probe status string.
 
-    Pure -- reads only *outcome*, performs no I/O. Note this 'error'
-    catch-all is only reachable via a classified Failure *outcome*; a raised
-    exception from *invoke_fn* itself is handled separately by
-    ``probe_models`` as the distinct ``'invoke_error'`` status.
+    A budget abort is checked FIRST, above everything else including the cap
+    tier: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
+    request and consumed real tokens, so the model resolved for this account
+    and the account is NOT capped -- the distinction
+    ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. That explicit
+    subtype is positive, structured evidence, so it outranks every
+    string-heuristic tier below, and a budget-aborted turn is reported as
+    ``'budget_too_low'`` (raise the probe's ``budget_usd`` and re-run) rather
+    than as a broken model. Detection keys on the subtype ALONE, never on a
+    ``cost_usd >= budget_usd`` heuristic -- an agent can spend close to the
+    ceiling and then fail for an unrelated reason (the rule
+    ``orchestrator.dry_run_unblock::_is_budget_exhausted`` records).
+
+    Otherwise the result is classified through ``classify_invocation`` and
+    mapped: OK->available, ModelNotFound->unavailable, AuthFailed->auth_error,
+    CapHit/NearCap->capped, else->error. This function owns the probe's
+    ``strict_confirm=False, backend='claude'`` classification regime so it is
+    spelled in exactly one place.
+
+    Pure -- reads only *result*, performs no I/O (``classify_invocation`` is
+    itself pure). Note the 'error' catch-all is only reachable via a
+    classified Failure; a raised exception from *invoke_fn* itself is handled
+    separately by ``probe_models``, as is an unresolvable account token --
+    those are the distinct ``'invoke_error'`` and ``'no_token'`` statuses,
+    assigned around this function rather than by it.
     """
-    from shared.invocation_outcome import OK, AuthFailed, CapHit, ModelNotFound, NearCap
+    from shared.invocation_outcome import (
+        OK,
+        AuthFailed,
+        CapHit,
+        ModelNotFound,
+        NearCap,
+        classify_invocation,
+    )
 
+    if (result.subtype or '') == PROBE_BUDGET_EXHAUSTED_SUBTYPE:
+        return 'budget_too_low'
+
+    outcome = classify_invocation(result, strict_confirm=False, backend='claude')
     if isinstance(outcome, OK):
         return 'available'
     if isinstance(outcome, ModelNotFound):
@@ -137,9 +176,8 @@ async def probe_models(
     target model is recorded as ``'no_token'`` for that account and
     *invoke_fn* is never called for it. Otherwise, *invoke_fn* (default
     ``invoke_claude_agent``) is called once per target model with a cheap
-    1-turn invocation, and the result is classified via
-    ``classify_invocation`` / ``classify_probe_outcome`` into a status
-    string. If *invoke_fn* raises (network error, subprocess crash, or any
+    1-turn invocation, and the result is classified into a status string
+    by ``classify_probe_outcome``. If *invoke_fn* raises (network error, subprocess crash, or any
     other exception not surfaced as an ``AgentResult``), that single
     (account, model) pair is recorded as ``'invoke_error'`` and the probe
     continues -- a single transient failure must not abort the whole run
@@ -159,7 +197,6 @@ async def probe_models(
     from pathlib import Path as _Path
 
     from shared.cli_invoke import invoke_claude_agent
-    from shared.invocation_outcome import classify_invocation
 
     invoke = invoke_fn or invoke_claude_agent
     target_models = (
@@ -199,8 +236,7 @@ async def probe_models(
                 )
                 statuses[model] = 'invoke_error'
                 continue
-            outcome = classify_invocation(result, strict_confirm=False, backend='claude')
-            statuses[model] = classify_probe_outcome(outcome)
+            statuses[model] = classify_probe_outcome(result)
         report_accounts[account.name] = statuses
 
     return ProbeReport(models=target_models, accounts=report_accounts)
