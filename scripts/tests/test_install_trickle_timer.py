@@ -365,7 +365,16 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
         "choice silently"
     )
 
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in service_text, (
+    # Over DIRECTIVES, never the raw file: the comments are allowed -- and
+    # want -- to name the variable they explain. Not over the parsed
+    # `Environment=` dict either, because the shape being excluded is exactly
+    # what the 2026-09-14 drop-in used: an `ExecStart=` reset carrying the
+    # assignment inline, which no Environment= parser would ever see.
+    directives = "\n".join(
+        line for line in service_text.splitlines()
+        if not line.lstrip().startswith(("#", ";"))
+    )
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in directives, (
         "The unit must pin NO single account -- choosing one per invocation "
         "is the gate's job now. Re-pinning here reintroduces exactly the "
         "failure this task removes (the 2026-09-14 max-h drop-in), and does "

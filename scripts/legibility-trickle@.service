@@ -25,6 +25,23 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
 # inherits this Environment.
 Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
+# The multi-account pool (task 5488). account_pool.build_pool resolves each
+# entry of config/usage-accounts.yaml (max-b..max-h) to its
+# CLAUDE_OAUTH_TOKEN_* value out of os.environ, so without these the gate
+# resolves ZERO accounts and falls back to ~/.claude/.credentials.json as an
+# account literally named 'default' -- one login for the whole night, which is
+# the failure this unit's 2026-09-14 stopgap drop-in was papering over.
+# EnvironmentFile rather than a token pin: WHICH account each invocation uses
+# is the gate's decision, made per invocation, not this file's.
+EnvironmentFile=/home/leo/src/dark-factory/.env
+# The other half, and load-bearing rather than tidiness: the CLI prefers
+# ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN, so one inherited from the
+# `systemd --user` manager's environment would authenticate every invocation
+# as the key's identity while the gate's failover still LOOKED like it worked.
+# Stripped here for this process, and again by coder.child_env for each child
+# it spawns -- one policy, two enforcement points, because neither covers the
+# other's scope.
+UnsetEnvironment=ANTHROPIC_API_KEY
 ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal
