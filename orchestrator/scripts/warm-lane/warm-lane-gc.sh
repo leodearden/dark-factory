@@ -94,8 +94,15 @@
 #                          acquire_lane always re-seeds from base (D10 §9.5).
 #                          Applies to every flock-free lane in Pass 1
 #                          (always-reclaim); counted as `reset` in the
-#                          summary. Default: REIFY_WARM_LANE_GC_DISK_PRESSURE
-#                          (any non-empty value = on). Off by default.
+#                          summary. ALSO DOWNGRADES the Pass-1 record gate: an
+#                          assigned/in_use record stops being decisive and the
+#                          lane falls through to the LIVE-REFERENCE gate
+#                          instead of being preserved outright (task 5504).
+#                          The emergency therefore trades an AUTHORITATIVE
+#                          preserve for a PROBED one, never for none — a live
+#                          build is still protected. Default:
+#                          REIFY_WARM_LANE_GC_DISK_PRESSURE (any non-empty
+#                          value = on). Off by default.
 #   -h, --help             Print this message and exit.
 #
 # Exit codes:
@@ -362,6 +369,12 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
     --disk-pressure       Fast-path: reclaim via `rm -rf <lane>/target` instead
                           of the α reflink-reseed clone (default:
                           REIFY_WARM_LANE_GC_DISK_PRESSURE). Off by default.
+                          ALSO downgrades the Pass-1 record gate: an
+                          assigned/in_use record stops being decisive and the
+                          lane falls through to the live-reference gate rather
+                          than being preserved. Never reclaims an assigned lane
+                          outright — a live build keeps its /proc backstop, and
+                          the lane flock is untouched.
     -h, --help            Print this message and exit.
 
   Exit codes:
@@ -371,13 +384,26 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
 
   Output:
     stdout: machine-readable summary:
-            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A
+            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A downgraded_assigned=D
             (L is the share of K held back by a live process reference — the
              only preserve reason that can shield an entry indefinitely)
             (A is the share of K held back by dark-factory's own durable lane
              record reading assigned/in_use — the only preserve reason that is
-             AUTHORITATIVE rather than a probe, and one that self-clears when
-             the lane is released)
+             AUTHORITATIVE rather than a probe. It self-clears only when the
+             release's DURABLE WRITE succeeds: WarmLanePool._note_released_durable
+             swallows OSError by design (fail-open release, invariant I3), so an
+             ENOSPC at release leaves `assigned` on disk while the in-memory
+             pool reads FREE. Such a record never clears itself, and composed
+             with an unbounded preserve it would hold the ENOSPC valve shut
+             with the very failure the valve responds to. --disk-pressure is
+             the override that stops that composition: see D below.)
+            (D is the count of lanes whose assigned/in_use record was
+             DOWNGRADED — read, believed, and then deliberately made
+             non-decisive. Downgrade means the lane FALLS THROUGH to the
+             live-reference gate; it is not a reclaim. A lane counted in D is
+             therefore in exactly one of: reset, or preserved via
+             preserved_live_ref. D and A partition the assigned lanes a pass
+             saw, so A+D is that pass's assigned population.)
     stderr: all diagnostics.
 EOF
 }
@@ -618,6 +644,34 @@ _is_reclaimable() {
     return 0
 }
 
+# _record_gate_downgrade_reason
+# Prints a human reason when the AUTHORITATIVE lane record must stop being
+# decisive for the lane whose LANE_STATE_* globals are currently published, and
+# prints NOTHING when the gate stands. Reads the globals rather than taking
+# arguments, so it describes THE SAME observation the gate is about to act on.
+#
+# The reasons are ORTHOGONAL dimensions of "the record is not decisive", OR'd
+# here at one site rather than nested into the loop body:
+#   ACUTE   — an emergency is in progress. About the whole pass, not one record.
+#   CHRONIC — this one record is too old to be believed. About one record, not
+#             the pass. (Added in task 5504's staleness step.)
+# Adding a third reason means adding a leg here, not another branch at the call
+# site, and each leg's own wording keeps the reasons separately attributable in
+# dark-factory's logs.
+_record_gate_downgrade_reason() {
+    # ACUTE, and deliberately FIRST. --disk-pressure means the disk is at or
+    # below its critical floor and reclaim IS the response; an authoritative
+    # record that says "assigned" is exactly what a stranded ENOSPC-at-release
+    # record says, so believing it here is believing the failure's own alibi.
+    # Ordering it first also makes the valve immune to the chronic leg's
+    # fail-safe: no unreadable timestamp can hold the emergency shut.
+    if [ -n "$DISK_PRESSURE" ]; then
+        printf '%s' '--disk-pressure emergency override'
+        return 0
+    fi
+    return 0
+}
+
 # ── reclaim subcommand ─────────────────────────────────────────────────────────
 _do_reclaim() {
     local reset_count=0
@@ -637,11 +691,32 @@ _do_reclaim() {
     # Sub-count of preserved_count attributable to the Pass-1 lane-record gate
     # (task 3075). Reported SEPARATELY from preserved_live_ref_count, not folded
     # into it, because the two shares mean opposite things about pool health: a
-    # rising preserved_assigned is a BUSY pool and self-clears the moment
-    # dark-factory releases the lane, whereas a rising preserved_live_ref can
-    # shield a lane INDEFINITELY. One combined number would hide a permanently
-    # shielded pool behind ordinary business.
+    # rising preserved_assigned is usually a BUSY pool, whereas a rising
+    # preserved_live_ref can shield a lane INDEFINITELY. One combined number
+    # would hide a permanently shielded pool behind ordinary business.
+    #
+    # "Usually", because the record self-clears only when the release's DURABLE
+    # WRITE succeeds. WarmLanePool._note_released_durable swallows OSError by
+    # design — release must always succeed (invariant I3), and a full disk must
+    # not fail releases — so an ENOSPC at release leaves `assigned` on disk
+    # while the in-memory pool reads FREE. That record is stranded: nothing
+    # rewrites it until the lane is acquired again, and this gate would preserve
+    # it forever. Composed with the gate's position BEFORE the --disk-pressure
+    # branch, that held the ENOSPC valve shut with the very failure it responds
+    # to (task 5504). The downgrade counter below is the release valve.
     local preserved_assigned_count=0
+    # Count of lanes whose assigned/in_use record was read, believed, and then
+    # deliberately made NON-DECISIVE. Disjoint from preserved_assigned_count by
+    # construction — a lane takes one branch or the other — so the two partition
+    # the assigned lanes a pass saw and A+D is the assigned population.
+    #
+    # Counted separately rather than folded into reset_count because a downgrade
+    # is not an outcome: a downgraded lane falls through to the live-reference
+    # gate and may still be preserved there. D rising is the signal that the
+    # pool's authoritative records are being overridden, which is exactly the
+    # thing an operator wants to see explicitly rather than infer from a
+    # preserved_assigned that quietly stopped rising.
+    local downgraded_assigned_count=0
 
     info "warm-lane-gc.sh reclaim: worktrees_dir=$WORKTREES_DIR  base_target=$BASE_TARGET  main_ref=$MAIN_REF"
 
@@ -751,8 +826,14 @@ _do_reclaim() {
         #     share one critical section and nothing can reassign the lane
         #     between verdict and action.
         #   - BEFORE both reset branches below (the --disk-pressure rm and the α
-        #     reseed), so neither path can bypass it — the same "before BOTH
-        #     branches" property Block K5 pins for the live-reference gate.
+        #     reseed), so neither path can bypass the READ — the same "before
+        #     BOTH branches" property Block K5 pins for the live-reference gate.
+        #     Its VERDICT, however, is advisory under --disk-pressure: see the
+        #     downgrade below. Evaluated-before is not the same as
+        #     decisive-always, and conflating the two is what let a stranded
+        #     record hold the ENOSPC valve shut (task 5504). The live-reference
+        #     gate below IS decisive on both paths, which is why a downgrade
+        #     falls through to it rather than reclaiming.
         #   - AFTER the flock acquire, so a flock-held lane keeps its own
         #     distinct diagnostic and all three preserve reasons stay
         #     distinguishable in dark-factory's logs.
@@ -772,21 +853,37 @@ _do_reclaim() {
         local lane_class
         lane_class="$(lane_state_class "$LANE_STATE_RAW")"
         if [ "$lane_class" = "ASSIGNED" ]; then
-            exec 8>&-
-            # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
-            # `preserving _lane-5: assigned to task 5334` matching as a
-            # substring while surfacing `in_use` vs `assigned` — the distinction
-            # leaf δ will begin writing and leaf ε depends on. A record with no
-            # task_id gets its OWN wording: `assigned to task ` with an empty id
-            # would be a dangling fact.
+            # The `assigned to task N` / `assigned, no task id` split is shared
+            # by the preserve and downgrade wordings, so it is resolved once:
+            # `assigned to task ` with an empty id would be a dangling fact.
+            local assigned_desc
             if [ -n "$LANE_STATE_TASK_ID" ]; then
-                warn "preserving $name: assigned to task $LANE_STATE_TASK_ID (state=$LANE_STATE_RAW)"
+                assigned_desc="assigned to task $LANE_STATE_TASK_ID"
             else
-                warn "preserving $name: assigned, no task id in record (state=$LANE_STATE_RAW)"
+                assigned_desc="assigned, no task id in record"
             fi
-            preserved_count=$((preserved_count + 1))
-            preserved_assigned_count=$((preserved_assigned_count + 1))
-            continue
+            local downgrade_reason
+            downgrade_reason="$(_record_gate_downgrade_reason)"
+            if [ -n "$downgrade_reason" ]; then
+                # DOWNGRADE, not reclaim. FD 8 stays OPEN and there is no
+                # `continue`: the lane falls through to the live-reference gate
+                # below, still inside this critical section. So the emergency
+                # trades an AUTHORITATIVE preserve for a PROBED one, never for
+                # none — a live build keeps its /proc backstop, and Pass 2's
+                # conservative _is_reclaimable rule is untouched.
+                warn "downgrading record gate for $name: $downgrade_reason (state=$LANE_STATE_RAW, $assigned_desc); falling through to the live-reference gate"
+                downgraded_assigned_count=$((downgraded_assigned_count + 1))
+            else
+                exec 8>&-
+                # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
+                # `preserving _lane-5: assigned to task 5334` matching as a
+                # substring while surfacing `in_use` vs `assigned` — the
+                # distinction leaf δ will begin writing and leaf ε depends on.
+                warn "preserving $name: $assigned_desc (state=$LANE_STATE_RAW)"
+                preserved_count=$((preserved_count + 1))
+                preserved_assigned_count=$((preserved_assigned_count + 1))
+                continue
+            fi
         fi
 
         # Deliberately ASYMMETRIC, and the asymmetry is the point.
@@ -866,6 +963,15 @@ _do_reclaim() {
             # α, this path never reads the base/gen tree. Still under the
             # lane flock acquired above, mirroring the manual 2026-07-10
             # remediation.
+            #
+            # This branch is reachable for a lane whose record says
+            # assigned/in_use, via the record-gate downgrade above — that is
+            # task 5504's whole point. warm-lane-gc-sweep.sh needs NO wiring
+            # change to get it: the sweep measures `df -B1 --output=avail` once
+            # per run and APPENDS --disk-pressure below its critical floor, so
+            # the unattended systemd path inherits the valve for free. The ε
+            # path (git_ops.py::_run_warm_lane_gc_reclaim) never passes the
+            # flag, so steady-state reclaim behaviour is unchanged.
             info "  resetting lane (disk-pressure): $name"
             local rm_err
             if rm_err="$(rm -rf "$lane/target" 2>&1)"; then
@@ -981,14 +1087,15 @@ _do_reclaim() {
     done
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    # preserved_live_ref and preserved_assigned are APPENDED, never interposed:
-    # existing consumers match the reset=/removed=/preserved= prefix (and the
-    # `preserved=N preserved_live_ref=M` adjacency), so a trailing field extends
-    # the line without breaking them.
-    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d\n' \
+    # preserved_live_ref, preserved_assigned and downgraded_assigned are
+    # APPENDED, never interposed: existing consumers match the
+    # reset=/removed=/preserved= prefix (and the
+    # `preserved=N preserved_live_ref=M preserved_assigned=A` adjacency), so a
+    # trailing field extends the line without breaking them.
+    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d downgraded_assigned=%d\n' \
         "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count" \
-        "$preserved_assigned_count"
-    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count"
+        "$preserved_assigned_count" "$downgraded_assigned_count"
+    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count downgraded_assigned=$downgraded_assigned_count"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────
