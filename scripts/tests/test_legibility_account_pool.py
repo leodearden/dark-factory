@@ -24,6 +24,8 @@ deselected by default (``addopts = -m 'not integration'``).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import account_pool as mod
 import coder as coder_mod
 import pytest
@@ -456,3 +458,159 @@ def test_a_pool_that_resolved_NO_accounts_says_so_instead():
         f'{message!r}'
     )
     assert 'capped' not in message.split('no pool accounts')[0], message
+
+
+# ---------------------------------------------------------------------------
+# step-15: build_pool() — a REAL UsageGate from nothing but an accounts file.
+#
+# The trickle's original excuse for riding ~/.claude was that the
+# orchestrator config is unreachable from its interpreter. Only the
+# orchestrator YAML is: UsageCapConfig(accounts_file=...) needs nothing else,
+# which is the same two-liner fused_memory/config/schema.py already uses.
+# ---------------------------------------------------------------------------
+
+_ROSTER_YAML = """\
+accounts:
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-c
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_C
+  - name: max-d
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_D
+"""
+
+
+@pytest.fixture
+def roster_file(tmp_path):
+    path = tmp_path / "usage-accounts.yaml"
+    path.write_text(_ROSTER_YAML)
+    return path
+
+
+def _set_pool_tokens(monkeypatch, *letters):
+    for letter in letters:
+        monkeypatch.setenv(f"CLAUDE_OAUTH_TOKEN_{letter}", f"tok-{letter.lower()}")
+
+
+def test_build_pool_resolves_the_roster_in_file_order(roster_file, monkeypatch):
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+
+    gate = mod.build_pool(accounts_file=str(roster_file))
+
+    assert gate.account_count == 3
+    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"], (
+        "order is the failover order — config/usage-accounts.yaml says so in "
+        "its own header, and reverse= depends on it"
+    )
+
+
+def test_build_pool_defaults_to_the_repo_accounts_file_file_relatively(monkeypatch):
+    """Never a hardcoded absolute: a copy of this script running from a
+    worktree must read ITS OWN roster, the same reason coder.py resolves
+    `shared` __file__-relatively (tasks 2881/2882/3329)."""
+    monkeypatch.delenv("USAGE_ACCOUNTS_FILE", raising=False)
+    repo_root = Path(mod.__file__).resolve().parents[2]
+
+    assert mod.default_accounts_file() == repo_root / "config" / "usage-accounts.yaml"
+    assert mod.default_accounts_file().exists(), (
+        "the default must point at a roster that actually exists in this "
+        "checkout — a missing accounts_file degrades to an EMPTY pool with "
+        "only a warning, which is the silent ~/.claude fallback again"
+    )
+
+
+def test_build_pool_honours_the_USAGE_ACCOUNTS_FILE_override(
+    roster_file, monkeypatch,
+):
+    """The fleet convention, shared with fused_memory/config/schema.py and
+    scripts/run_vllm_eval.py."""
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+    monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(roster_file))
+
+    gate = mod.build_pool()
+
+    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"]
+
+
+def test_build_pool_hands_the_validator_an_ABSOLUTE_path(roster_file, monkeypatch):
+    """A relative accounts_file is `.resolve()`d against the CWD by
+    UsageCapConfig's validator, and a path that misses degrades to an empty
+    pool with only a warning. The trickle's CWD is the systemd unit's, not
+    the repo's, so a relative path would resolve somewhere arbitrary."""
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+
+    assert mod.default_accounts_file().is_absolute()
+
+    gate = mod.build_pool(accounts_file=str(roster_file))
+    assert gate.account_count == 3
+
+
+def test_build_pool_loads_dotenv_before_building_the_gate(tmp_path, monkeypatch):
+    """ORDER IS THE WHOLE POINT: _init_accounts reads os.environ EAGERLY at
+    construction, so a .env loaded afterwards resolves nothing and the pool
+    silently falls back to ~/.claude — today's broken behaviour."""
+    roster = tmp_path / "roster.yaml"
+    roster.write_text(_ROSTER_YAML)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CLAUDE_OAUTH_TOKEN_B=tok-from-dotenv-b\n"
+        "CLAUDE_OAUTH_TOKEN_C=tok-from-dotenv-c\n"
+        "CLAUDE_OAUTH_TOKEN_D=tok-from-dotenv-d\n"
+    )
+    for letter in ("B", "C", "D"):
+        monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+
+    gate = mod.build_pool(accounts_file=str(roster), env_file=str(env_file))
+
+    assert gate.account_count == 3
+    assert gate._accounts[0].token == "tok-from-dotenv-b", (
+        "the token must have come from the .env — if the gate were built "
+        "first, every account would have resolved token-less"
+    )
+
+
+def test_build_pool_logs_the_resolved_roster_but_never_a_token(
+    roster_file, monkeypatch, caplog,
+):
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+
+    with caplog.at_level("INFO", logger="legibility.account_pool"):
+        mod.build_pool(accounts_file=str(roster_file))
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "max-b" in logged and "max-d" in logged, logged
+    assert "3" in logged, logged
+    assert "tok-b" not in logged and "tok-d" not in logged, (
+        f"a token must NEVER reach the journal; got {logged!r}"
+    )
+
+
+def test_build_pool_warns_LOUDLY_when_it_resolves_no_accounts(
+    tmp_path, monkeypatch, caplog,
+):
+    """The degradation that must never be silent. _init_accounts skips a
+    token-less account with a warning and, if ZERO survive, falls back to
+    ~/.claude/.credentials.json as an account literally named 'default' —
+    which is precisely today's broken behaviour. It has to be VISIBLE, or
+    this task's fix silently un-does itself the day a token env var is
+    dropped from the unit.
+    """
+    roster = tmp_path / "roster.yaml"
+    roster.write_text(_ROSTER_YAML)
+    for letter in ("B", "C", "D"):
+        monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("")
+
+    with caplog.at_level("WARNING", logger="legibility.account_pool"):
+        mod.build_pool(accounts_file=str(roster), env_file=str(empty_env))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, (
+        "a pool that resolved no real accounts must SAY so — silently "
+        "returning the ~/.claude fallback is the defect this task removes"
+    )
+    assert any("max-b" in w for w in warnings), (
+        f"name the accounts it could not resolve, so an operator knows which "
+        f"env var is missing; got {warnings}"
+    )
