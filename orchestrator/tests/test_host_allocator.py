@@ -1340,3 +1340,207 @@ class TestHostAllocatorReadmit:
         alloc.readmit('remoteA')
         recovered = alloc.acquire_remote()
         assert recovered is not None and recovered.name == 'remoteA'
+
+
+# ---------------------------------------------------------------------------
+# 5097/step-5 RED: acquire(policy=...) selection matrix + prefer_remote fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorAcquirePolicy:
+    """acquire() takes the host-selection policy as a REQUIRED keyword-only
+    argument and honours it per call.
+
+    'prefer_local' is today's order, now stated explicitly rather than assumed;
+    'prefer_remote' inverts it so a free remote absorbs verify load instead of
+    idling while the lane serialises on local.  Eligibility is unchanged in both
+    directions — acquire_remote() already demands FREE, non-quarantined and
+    non-PARKED — so every ineligible-remote shape falls through to local on its
+    own, with no second eligibility check to drift out of step.
+    """
+
+    def _make_allocator(self, *, remotes=('remoteA', 'remoteB'), quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+
+        q = quarantine if quarantine is not None else set()
+        return HostAllocator([_FakeRemoteRunner(n) for n in remotes], quarantine=q)
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    # -- (a) the two orders ---------------------------------------------------
+
+    async def test_prefer_local_takes_local_first(self):
+        """'prefer_local' is today's behaviour, byte-for-byte."""
+        alloc = self._make_allocator()
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_local')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert lease.is_local is True
+
+    async def test_prefer_remote_takes_first_remote_first(self):
+        """The user-observable signal of this task: with a free remote,
+        'prefer_remote' dispatches there and local stays untouched.
+        """
+        alloc = self._make_allocator()
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'remoteA'
+        assert lease.is_local is False
+        assert alloc.is_busy('local') is False
+
+    async def test_prefer_remote_exhausts_remotes_before_falling_back(self):
+        """Remote exhaustion PRECEDES the local fallback: the second
+        prefer_remote acquire takes remoteB, not local.
+        """
+        alloc = self._make_allocator()
+
+        first = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        second = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert first is not None and first.name == 'remoteA'
+        assert second is not None and second.name == 'remoteB'
+        assert alloc.is_busy('local') is False
+
+        third = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert third is not None and third.name == 'local'
+
+    # -- (b) every ineligible-remote shape falls through to local -------------
+
+    async def test_prefer_remote_falls_back_to_local_when_remotes_busy(self):
+        alloc = self._make_allocator()
+        assert alloc.acquire_remote() is not None   # remoteA busy
+        assert alloc.acquire_remote() is not None   # remoteB busy
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert lease.is_local is True
+
+    async def test_prefer_remote_never_selects_a_quarantined_host(self):
+        shared_q = {'remoteA'}
+        alloc = self._make_allocator(remotes=('remoteA',), quarantine=shared_q)
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        # The quarantine is untouched by the fallback — the host stays out of
+        # the pool until a real recovery path readmits it.
+        assert 'remoteA' in shared_q
+        assert alloc.is_busy('remoteA') is False
+
+    async def test_prefer_remote_never_selects_a_parked_host(self):
+        """PARKED is reached through the REAL cancel-fail path, not by hand-
+        mutating a slot, so the fallback is exercised against production state.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable(
+            'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        alloc = HostAllocator([remote_a], quarantine=set())
+        remote_lease = alloc.acquire_remote()
+        assert remote_lease is not None
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        parked = await alloc.cancel_and_release(
+            remote_lease, sleep=noop_sleep, max_attempts=2,
+        )
+        assert parked is False
+        assert alloc.is_parked('remoteA') is True
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert alloc.is_parked('remoteA') is True
+
+    async def test_prefer_remote_returns_none_when_nothing_is_eligible(self):
+        """Local busy AND every remote ineligible → None, exactly as
+        'prefer_local' returns None in the same situation.  The caller puts the
+        item back; it is not a stall.
+        """
+        shared_q = {'remoteA'}
+        alloc = self._make_allocator(remotes=('remoteA',), quarantine=shared_q)
+        assert alloc.acquire_local(self._local_factory) is not None
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is None
+
+    # -- (c) the policy is read PER CALL, never captured ----------------------
+
+    async def test_policy_is_read_per_call_not_captured(self):
+        """ONE allocator, alternating policies: the selection order changes on
+        every call.
+
+        This is what keeps the RELOADABLE_FIELDS registration honest.
+        _ensure_host_allocator caches the allocator for the worker's whole
+        lifetime, so a constructor-captured policy would not change until a
+        process restart — "reloadable in name only".  Reading it per call is
+        what makes a green-tier flip land on the next dispatch.
+        """
+        alloc = self._make_allocator()
+
+        for expected in ['local', 'remoteA', 'local', 'remoteA']:
+            policy = 'prefer_local' if expected == 'local' else 'prefer_remote'
+            lease = await alloc.acquire(self._local_factory, policy=policy)
+            assert lease is not None
+            assert lease.name == expected, (
+                f'policy={policy!r} selected {lease.name!r}, expected '
+                f'{expected!r} — the policy must not be captured on the allocator'
+            )
+            await alloc.release(lease)
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorPreferRemoteFallbackBoundary:
+    """INV-10 boundary: the prefer_remote → local fallback is EXECUTED, not
+    merely asserted about.
+
+    Amendment R11 item 2: pinning the policy string is not enough.  This drives
+    the real production quarantine path (quarantine_and_release, the
+    RunnerUnavailable handler in _finalize_inflight) between two acquires, so a
+    mid-dispatch remote failure under prefer_remote is shown to re-dispatch onto
+    local rather than stalling the queue.
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    async def test_runner_unavailable_under_prefer_remote_redispatches_local(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = set()
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=shared_q)
+
+        first = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert first is not None
+        assert first.name == 'remoteA'
+        assert first.is_local is False
+
+        # RunnerUnavailable mid-dispatch, driven through the REAL path.
+        await alloc.quarantine_and_release(first)
+
+        assert 'remoteA' in shared_q
+        # The slot was freed, not leaked: both slots are physically FREE, so the
+        # failure cost the pool no capacity.
+        assert alloc.free_host_count() == 2
+
+        second = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        # The re-dispatch lands — the queue drains rather than stalling on a
+        # sick remote, even though the policy still says prefer_remote.
+        assert second is not None
+        assert second.name == 'local'
+        assert second.is_local is True
+        assert 'remoteA' in shared_q
