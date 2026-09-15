@@ -771,7 +771,7 @@ class TestDiscoverOrchestratorsBudget:
         )
 
     async def test_two_pids_sharing_one_root_pay_the_budget_once(
-        self, tmp_path, monkeypatch, dummy_client,
+        self, tmp_path, monkeypatch, dummy_client, caplog,
     ):
         """Two processes on one root cost ONE budget, not one each.
 
@@ -783,9 +783,13 @@ class TestDiscoverOrchestratorsBudget:
         that is what must not regress.
 
         The deterministic ``len(calls) == 1`` assertion is what actually pins
-        that property; the timing assertion below is a secondary backstop.
+        that property. Its backstop is the WARNING COUNT below — exactly one
+        'exceeded its ... share' record means exactly one budget was actually
+        SPENT — and no longer a wall-clock ceiling; see this class's docstring
+        for why nothing here measures elapsed time.
         """
         import asyncio
+        import logging
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -799,7 +803,9 @@ class TestDiscoverOrchestratorsBudget:
             await asyncio.Event().wait()
 
         monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        budget = 0.5
+        # The hang stub means this test literally sleeps for one budget, and
+        # nothing asserts on its magnitude now that the clock is gone.
+        budget = 0.05
         monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', budget)
 
         proj = tmp_path / 'proj_shared'
@@ -813,28 +819,14 @@ class TestDiscoverOrchestratorsBudget:
              'running': True, 'started': 'Mar18'},
         ]
 
-        loop = asyncio.get_running_loop()
         with patch(
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
-        ):
-            # Pre-warm the default executor so its FIRST-USE thread spin-up (a
-            # one-off cost of tens of ms) is not charged to the budget: the
-            # first act of dashboard/src/dashboard/data/orchestrator.py::
-            # discover_orchestrators is
-            # `await asyncio.to_thread(find_running_orchestrators)`, and that
-            # spin-up is not the budget under test. `_resolve_project_root`'s
-            # filesystem walks run inside the timed region too and CANNOT be
-            # pre-warmed away from the test side — they are absorbed by the
-            # widened 1.5x margin instead. Both remedies are needed here;
-            # neither alone suffices.
-            await asyncio.to_thread(lambda: None)
-            started = loop.time()
+        ), caplog.at_level(logging.WARNING, logger='dashboard.data.orchestrator'):
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
                 timeout=2.0,
             )
-            elapsed = loop.time() - started
 
         assert len(calls) == 1, (
             f'the shared root was fetched {len(calls)} times — one PID per '
@@ -845,22 +837,22 @@ class TestDiscoverOrchestratorsBudget:
         assert sorted(result[0]['pids']) == [1234, 5678]
         assert result[0]['offline'] is True
         assert result[0]['error']
-        # Secondary backstop to `len(calls) == 1` above. The budget is
-        # deliberately large for a test whose subject is a timeout: it is
-        # scaled so the ABSOLUTE jitter margin exceeds host scheduling noise,
-        # not because the operation needs 0.5 s. One root fetched once costs
-        # ~1x budget; the per-process regression costs 2 PIDs x budget = ~2x;
-        # 1.5x sits midway, giving 0.25 s of slack on both sides instead of
-        # the 50 ms that flaked at ~4% per run. Do NOT shrink it back.
-        assert elapsed < 1.5 * budget, (
-            f'one root took {elapsed:.3f}s against a {1.5 * budget}s '
-            f'threshold (1.5 x the {budget}s per-root budget). The '
-            'len(calls) == 1 assertion above already passed, so the root was '
-            'fetched EXACTLY ONCE and this is not per-process payment: a '
-            'single fetch overran one budget of wall time. Look at the '
-            'per-root wait_for wiring and the min(remaining, '
-            '_ORCHESTRATORS_PER_ROOT_BUDGET) deadline arithmetic in '
-            'discover_orchestrators — or, failing that, at host jitter.'
+        # Backstop to `len(calls) == 1`: one budget SPENT, not merely one
+        # fetch issued. Each root that overruns logs exactly one 'exceeded
+        # its ... share' WARNING, so a walk that charged per PROCESS would
+        # log two for this single shared root.
+        overruns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'exceeded its' in r.getMessage()
+        ]
+        assert len(overruns) == 1, (
+            f'{len(overruns)} budget-overrun warnings were logged for ONE '
+            'shared root, which overruns once and so must log once. More than '
+            'one means an N-orchestrator host pays N x the budget for a single '
+            'project on every poll: look at the `groups` merge and the '
+            '`if project_root not in project_cache` guard in '
+            f'discover_orchestrators. Messages: '
+            f'{[r.getMessage() for r in overruns]}'
         )
 
 
