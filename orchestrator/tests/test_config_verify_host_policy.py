@@ -24,8 +24,11 @@ import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    RELOADABLE_FIELDS,
     OrchestratorConfig,
+    apply_reload,
     census_config_keys,
+    diff_config,
 )
 
 
@@ -118,3 +121,73 @@ class TestVerifyHostPolicyCheckConfigCensus:
 
         assert census.parse_error is None
         assert [uk.path for uk in census.unknown] == []
+
+
+class TestVerifyHostPolicyReloadDisposition:
+    """verify_host_policy is GREEN-TIER: a prefer_remote flip and its rollback
+    are one `reload_config` each, with no process restart.
+
+    Safe to flip mid-process because the policy is supplied per
+    HostAllocator.acquire call and never captured on the allocator, so a reload
+    cannot split an in-flight merge — it only changes which host the NEXT
+    dispatch prefers.  The in-place mutation asserted below is what makes that
+    true end to end: apply_reload mutates the live config OBJECT, and
+    MergeRequest holds that same object by reference, so the next dispatch
+    reads the new value without anything being re-plumbed.
+    """
+
+    def test_field_is_reloadable(self):
+        assert 'verify_host_policy' in RELOADABLE_FIELDS, (
+            "'verify_host_policy' is expected to be green-tier reloadable but "
+            'is missing from RELOADABLE_FIELDS'
+        )
+
+    def test_edit_lands_in_applied_candidates_not_restart_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_host_policy='prefer_local')
+        fresh = OrchestratorConfig(verify_host_policy='prefer_remote')
+
+        diff = diff_config(live, fresh)
+
+        assert 'verify_host_policy' in diff.applied_candidates
+        assert 'verify_host_policy' not in diff.restart_required
+
+    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_host_policy='prefer_local')
+        fresh = OrchestratorConfig(verify_host_policy='prefer_remote')
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True
+        assert report['applied']['verify_host_policy'] == {
+            'old': 'prefer_local', 'new': 'prefer_remote',
+        }
+        assert 'verify_host_policy' not in report['restart_required']
+        # IN PLACE on the same object — not a replacement config.  This is what
+        # reaches the next dispatch through MergeRequest(config=...)'s reference.
+        assert live.verify_host_policy == 'prefer_remote'
+
+    def test_rollback_is_one_reload_too(self, monkeypatch, tmp_path):
+        """The flip and its rollback are symmetric: an operator who flips to
+        prefer_remote and regrets it gets back with a second reload_config, not
+        a restart.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_host_policy='prefer_local')
+
+        apply_reload(live, OrchestratorConfig(verify_host_policy='prefer_remote'))
+        assert live.verify_host_policy == 'prefer_remote'
+
+        back = apply_reload(live, OrchestratorConfig(verify_host_policy='prefer_local'))
+
+        assert back['reloaded'] is True
+        assert back['applied']['verify_host_policy'] == {
+            'old': 'prefer_remote', 'new': 'prefer_local',
+        }
+        assert live.verify_host_policy == 'prefer_local'
