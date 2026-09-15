@@ -103,7 +103,7 @@ class TestBriefingScopeIsImmutable:
         scope = BriefingScope.from_task({'id': '3659'})
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            scope.task_id = '3212'
+            scope.task_id = '3212'  # type: ignore[misc]
 
     def test_files_are_a_tuple_not_a_list(self):
         scope = BriefingScope.from_task({'metadata': {'files': ['a/b.py']}})
@@ -242,7 +242,7 @@ class TestQuerySpecs:
         from shared.briefing_queries import QUERY_SPECS, TASK_SEMANTIC
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            TASK_SEMANTIC.limit = 50
+            TASK_SEMANTIC.limit = 50  # type: ignore[misc]
         assert isinstance(QUERY_SPECS, tuple)
         for spec in QUERY_SPECS:
             assert isinstance(spec.stores, tuple)

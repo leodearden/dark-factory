@@ -239,7 +239,7 @@ class TestMergerPromptTakesNoMemoryScope:
 
         await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf.briefing.build_merger_prompt.assert_awaited_once()
-        args, kwargs = f.wf.briefing.build_merger_prompt.await_args
+        f.wf.briefing.build_merger_prompt.assert_awaited_once()  # type: ignore[attr-defined]
+        args, kwargs = f.wf.briefing.build_merger_prompt.await_args  # type: ignore[attr-defined]
         assert len(args) == 2, f'conflicts and intent, nothing else: {args!r}'
         assert kwargs == {}, f'the merger gains no scope of any kind: {kwargs!r}'

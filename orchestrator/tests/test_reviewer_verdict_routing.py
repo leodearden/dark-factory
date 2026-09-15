@@ -837,7 +837,7 @@ class TestReviewerPromptIsScopedToTheTaskUnderReview:
 
         await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
-        _args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args
+        _args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args  # type: ignore[attr-defined]
         assert kwargs['task'] is f.wf.task
         assert kwargs['task']['id'] == f.wf.task_id
 
@@ -848,6 +848,6 @@ class TestReviewerPromptIsScopedToTheTaskUnderReview:
 
         await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
-        args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args
+        args, kwargs = f.wf.briefing.build_reviewer_prompt.await_args  # type: ignore[attr-defined]
         assert 'task' in kwargs
         assert len(args) == 2, f'only reviewer_type and diff are positional, got {args!r}'
