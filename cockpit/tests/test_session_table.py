@@ -369,11 +369,10 @@ class TestOrderSessions:
 
 
 class TestFilterLiveSessions:
-    """The live band and, now, how much of it the cap hid.
+    """The live band, and how much of it the cap hid.
 
-    filter_live_sessions returns a LiveSessions(visible, total) view rather
-    than a bare list: total is the live count BEFORE the cap, so a
-    truncated table is no longer indistinguishable from a complete one.
+    filter_live_sessions returns a LiveSessions(visible, total) view: total
+    is the live count BEFORE the cap.
     """
 
     def test_terminal_statuses_are_dropped(self):
@@ -544,13 +543,10 @@ class TestFormatVisibleCount:
 class TestFocusMarker:
     """The per-row focusability cue: can Enter raise a terminal for this row?
 
-    `display` is the only thing that makes a row focusable -- decision_queue.
-    resolve_target's SessionRecord branch resolves straight from it, and
-    that is the code app.py::_focus_slug actually runs. is_focusable is
-    restated in session_table rather than imported from decision_queue
-    (which already imports this module -- a reverse import would be a
-    cycle), so test_agrees_with_resolve_target below is what keeps the two
-    statements honest.
+    `display` is the only thing that makes a row focusable, and
+    session_table restates that rule rather than importing decision_queue
+    (which imports session_table -- a reverse import would be a cycle), so
+    test_agrees_with_resolve_target below is what keeps the two honest.
     """
 
     def test_record_with_display_is_focusable(self):
@@ -586,9 +582,8 @@ class TestFocusMarker:
             assert marker not in status_vocabulary
 
     def test_unrecognized_display_kind_still_reads_focusable_fail_soft(self):
-        """A Display whose kind this view doesn't recognize is still a real
-        terminal somewhere -- mirroring _is_terminal/state_glyph fail-soft
-        (PRD §2), an unknown kind must never mislabel it unactionable."""
+        """An unrecognized kind is still a real terminal somewhere, so it
+        must never be mislabelled unactionable (fail-soft, PRD §2)."""
         from cockpit.panes.session_table import focus_marker, is_focusable
 
         record = _make_record(display=sr.Display(kind='weird', wm_title='t'))

@@ -45,26 +45,20 @@ def state_glyph(status: Status | str) -> str:
 
 # The focusability cue's vocabulary, deliberately disjoint from _GLYPHS
 # above: status ("is it working?") and focusability ("can I get to it?")
-# are orthogonal, so a marker that collided with a status glyph would make
-# one column read as the other. Both are single-width, so the leading
-# marker column can never shift the columns beside it.
+# are orthogonal, so a collision would make one column read as the other.
+# Both are single-width, so the leading column shifts nothing beside it.
 _FOCUSABLE_MARKER = '▸'
 _HEADLESS_MARKER = '·'
 
 
 def is_focusable(record: SessionRecord) -> bool:
-    """Can Enter raise a terminal for *record*?
+    """Can Enter raise a terminal for *record*? True iff it has a display.
 
-    Mirrors decision_queue.resolve_target's SessionRecord branch, which is
-    literally ``display -> DisplayTarget, None -> None`` and is the code
-    app.py::_focus_slug actually runs -- a display-less (headless) agent
-    session has no terminal anywhere, so focusing it is a no-op.
-
-    Restated here rather than imported because decision_queue already
-    imports this module (a reverse import would be a cycle); the agreement
-    is pinned by test_session_table.py::TestFocusMarker::
-    test_agrees_with_resolve_target instead, so the two statements cannot
-    silently drift apart.
+    Restates decision_queue.resolve_target's SessionRecord branch, the code
+    app.py::_focus_slug actually runs. Importing it would be a cycle
+    (decision_queue imports this module), so test_session_table.py::
+    TestFocusMarker::test_agrees_with_resolve_target is what holds the two
+    statements together.
     """
     return record.display is not None
 
@@ -72,13 +66,11 @@ def is_focusable(record: SessionRecord) -> bool:
 def focus_marker(record: SessionRecord) -> str:
     """Render *record*'s focusability as its row marker.
 
-    Both states get a present, distinct glyph rather than marking one and
-    leaving the other blank: ~85% of live rows are headless, so an absence
-    would read as "column not populated yet" instead of "nothing to raise".
-    Total over any record shape -- any display at all reads focusable,
-    including an unrecognized kind (fail-soft, PRD §2: an unknown kind is
-    still a real terminal, and mislabelling it unactionable is the worse
-    error).
+    Both states get a present, distinct glyph rather than one marked and
+    the other blank, since a mostly-empty column reads as "not populated
+    yet" rather than "nothing to raise". Total over any record shape: any
+    display at all reads focusable, unrecognized kinds included (fail-soft,
+    PRD §2 -- an unknown kind is still a real terminal).
     """
     return _FOCUSABLE_MARKER if is_focusable(record) else _HEADLESS_MARKER
 
@@ -260,10 +252,10 @@ def filter_live_sessions(
 
     Then slices to the first `cap` of what remains -- pass an
     already-ordered list (see order_sessions) so the cap keeps the top-N
-    of that order. The cap is now REPORTABLE rather than silent: the
-    returned view carries the pre-cap live count alongside the slice, so a
-    truncated table can say so (see format_visible_count) instead of
-    looking identical to a complete one.
+    of that order. The cap is reportable rather than silent: the returned
+    view carries the pre-cap live count alongside the slice, so a truncated
+    table can say so (see format_visible_count) instead of looking
+    identical to a complete one.
 
     Terminal records are excluded from the count as well as from the slice
     -- total is the size of the live band, not of the scanned set, so the
@@ -328,9 +320,8 @@ class SessionTable(DataTable):
 
     # The border is not decoration: textual paints border labels as part
     # of the border EDGE, so without one the "showing N of M" notice
-    # replace_rows writes to border_subtitle is a silent no-op -- set and
-    # readable, but invisible. See TestSessionTableCapNotice, which asserts
-    # the border is still there for exactly this reason.
+    # replace_rows writes to border_subtitle is set, readable, and
+    # invisible. TestSessionTableCapNotice asserts it is still here.
     DEFAULT_CSS = """
     SessionTable {
         width: 1fr;
