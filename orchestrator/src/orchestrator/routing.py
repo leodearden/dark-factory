@@ -76,6 +76,17 @@ DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
 # probe to an unrelated module's internals to save nothing.
 PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
 
+# Per-invocation USD ceiling probe_models forwards as max_budget_usd. This
+# was $0.05, which was too small to be a ceiling at all: a one-turn probe
+# still pays for the CLI's own preamble, and one claude-fable-5-1 turn
+# measures ~$0.15-0.25 that way, so EVERY fable probe aborted
+# error_max_budget_usd and the artifact reported fable unavailable on every
+# account when six of seven actually carry it (task 5404). $1.00 leaves ~4x
+# headroom over the most expensive probed model while staying a trivially
+# small per-(account, model) spend. It is a CEILING, not a spend: a probe
+# that completes normally still costs a single cheap turn.
+DEFAULT_PROBE_BUDGET_USD: float = 1.0
+
 
 def _dedup_preserve_order(items: list[str]) -> list[str]:
     """Deduplicate *items*, preserving first-seen order."""
@@ -161,7 +172,7 @@ async def probe_models(
     prompt: str = DEFAULT_PROBE_PROMPT,
     cwd: Path | None = None,
     max_turns: int = 1,
-    budget_usd: float = 0.05,
+    budget_usd: float = DEFAULT_PROBE_BUDGET_USD,
 ) -> ProbeReport:
     """Probe every (account, model) pair for availability.
 
@@ -182,6 +193,12 @@ async def probe_models(
     (account, model) pair is recorded as ``'invoke_error'`` and the probe
     continues -- a single transient failure must not abort the whole run
     and discard every status already collected.
+
+    *budget_usd* is a per-invocation ceiling, forwarded as
+    ``max_budget_usd`` on every probe call. It must clear one turn of the
+    MOST expensive probed model -- undershooting it does not fail quietly:
+    the pair is recorded as the distinct ``'budget_too_low'`` status rather
+    than as unavailability (see ``classify_probe_outcome``).
 
     *invoke_fn* and *token_resolver* are dependency-injected (mirrors
     ``invoke_with_cap_retry``'s ``invoke_fn=`` seam) so callers can drive
