@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import account_pool as mod
 import coder as coder_mod
+import pytest
 from shared.usage_gate import AccountLease
 
 # ---------------------------------------------------------------------------
@@ -213,3 +214,154 @@ def test_pool_invoke_defaults_to_the_real_coder_seam():
     # Constructing the closure must not invoke anything.
     assert callable(mod.pool_invoke(gate))
     assert mod._DEFAULT_INVOKE is coder_mod._invoke_cli
+
+
+# ---------------------------------------------------------------------------
+# step-11: the ruling's SECOND verify case — a blocking banner MARKS THE
+# ACCOUNT CAPPED and the SAME digest completes on the next account.
+#
+# Within a digest, not across digests, and that is a deliberate reading of
+# the existing code rather than of the task's prose: CoderCapExhausted's
+# docstring defines capped as "there is no headroom left to code this
+# digest", and both coder.is_cap_deferral and nightly's DEFERRED summary
+# read it as "the CLI never looked at this digest". If one account's banner
+# set capped=True, that predicate would silently weaken to "the account I
+# happened to draw was out", and a night with six live accounts could still
+# read as DEFERRED — turning the deferral branch into a place real failures
+# hide.
+#
+# Rotation is driven ONLY by the gate's STRICT detector. coder's loose
+# OR-substring matcher keeps its own job (labelling an already-failed
+# invocation as a per-digest defer); if the strict prefix-AND-confirm policy
+# does not agree, the original exception propagates unrotated. A loose false
+# positive can therefore re-label one digest and can never burn the pool —
+# which is exactly the split shared/src/shared/cap_markers.py argues for.
+# ---------------------------------------------------------------------------
+
+def _cap_exhausted(marker='weekly limit', *, stdout='', stderr=''):
+    return coder_mod.CoderCapExhausted(
+        f'claude CLI exited 1 (...): stdout={stdout!r} stderr={stderr!r}',
+        marker=marker, stdout=stdout, stderr=stderr,
+    )
+
+
+def test_a_banner_caps_that_account_and_the_same_digest_completes_next_door():
+    banner = 'Claude usage limit reached. Your limit will reset at 3pm.'
+    gate = _pool(('max-b', False), ('max-c', False))
+    invoke = _RecordingInvoke(
+        # reverse=True leases max-c first; it banners, max-b then answers.
+        raises={'tok-max-c': _cap_exhausted(stdout=banner, stderr='')},
+        replies={'tok-max-b': '{"matches": [], "candidates": []}'},
+    )
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    # (a) The SAME digest was retried, not abandoned, and it was retried on
+    #     the OTHER account.
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-max-c', 'tok-max-b'], (
+        f'the same digest must be retried on the next account; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert [c['prompt'] for c in invoke.calls] == ['the digest prompt'] * 2, (
+        'the retry must carry the SAME prompt — a different one would be '
+        'coding a different digest'
+    )
+
+    # (b) The gate's STRICT detector decided it, and was handed the two
+    #     streams SEPARATELY, as structured data.
+    assert len(gate.detect_calls) == 1, gate.detect_calls
+    assert gate.detect_calls[0]['oauth_token'] == 'tok-max-c', (
+        'the verdict must be attributed to the account that banner came '
+        'from, never to whichever account is current'
+    )
+    assert gate.detect_calls[0]['output'] == banner
+    assert gate.detect_calls[0]['stderr'] == ''
+
+    # (c) The account is now capped, so the rest of the night skips it.
+    assert gate.account_named('max-c').capped is True
+    assert gate.account_named('max-b').capped is False
+
+    # (d) Nothing was fabricated: the second account's real reply came back.
+    assert out == '{"matches": [], "candidates": []}'
+
+
+def test_a_loose_false_positive_propagates_unrotated():
+    """THE guard that keeps a loose matcher from burning the pool.
+
+    coder's loose gate fired (so the exception is a CoderCapExhausted), but
+    the gate's strict prefix-AND-confirm policy did NOT verdict a cap. The
+    original exception must propagate untouched and NO second account may be
+    leased — the loose verdict can re-label this one digest and nothing
+    more. This is the case where healthy model output quotes a cap-themed
+    session, which in this repo's codebook is common rather than exotic.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    gate.cap_verdict = False          # strict detector disagrees
+    original = _cap_exhausted(stdout='a digest that merely QUOTES a limit banner')
+    invoke = _RecordingInvoke(raises={'tok-max-c': original})
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value is original, (
+        'the ORIGINAL exception must propagate — re-wrapping would lose the '
+        'marker and the streams the journal reads'
+    )
+    assert len(invoke.calls) == 1, (
+        f'no second account may be leased when the strict detector says this '
+        f'was not a cap; got {invoke.calls}'
+    )
+    assert gate.account_named('max-c').capped is False, (
+        'a loose false positive must never mark an account capped — the '
+        'consequence there is account failover (cap_markers docstring)'
+    )
+    assert len(gate.lease_calls) == 1
+
+
+def test_an_ordinary_failure_never_consults_the_gate_at_all():
+    """A plain CoderInvocationError is not a capacity signal. It propagates
+    immediately, without a cap verdict and without rotation: the account is
+    fine, this digest is not."""
+    gate = _pool(('max-b', False), ('max-c', False))
+    boom = coder_mod.CoderInvocationError(
+        'claude CLI exited 1: the model backend is down',
+        stdout='', stderr='backend down',
+    )
+    invoke = _RecordingInvoke(raises={'tok-max-c': boom})
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value is boom
+    assert not isinstance(excinfo.value, coder_mod.CoderCapExhausted)
+    assert gate.detect_calls == [], (
+        f'an ordinary failure must not be offered to the cap detector at '
+        f'all; got {gate.detect_calls}'
+    )
+    assert len(invoke.calls) == 1
+    assert gate.account_named('max-c').capped is False
+
+
+def test_rotation_walks_the_whole_pool_before_giving_up():
+    """Three banners, three caps, then the fourth account answers. The loop
+    is structurally terminating: each iteration marks exactly one account
+    capped, so the admissible set strictly shrinks."""
+    gate = _pool(
+        ('max-b', False), ('max-c', False), ('max-d', False), ('max-e', False),
+    )
+    banner = 'Claude usage limit reached.'
+    invoke = _RecordingInvoke(
+        raises={
+            f'tok-{n}': _cap_exhausted(stdout=banner)
+            for n in ('max-e', 'max-d', 'max-c')
+        },
+        replies={'tok-max-b': 'the reply'},
+    )
+
+    out = mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert out == 'the reply'
+    assert [c['oauth_token'] for c in invoke.calls] == [
+        'tok-max-e', 'tok-max-d', 'tok-max-c', 'tok-max-b',
+    ]
+    assert [a.name for a in gate.accounts if a.capped] == ['max-c', 'max-d', 'max-e']
