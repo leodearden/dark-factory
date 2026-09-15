@@ -334,10 +334,16 @@ class SessionTable(DataTable):
     from the row an operator is looking at.
     """
 
+    # The border is not decoration: textual paints border labels as part
+    # of the border EDGE, so without one the "showing N of M" notice
+    # replace_rows writes to border_subtitle is a silent no-op -- set and
+    # readable, but invisible. See TestSessionTableCapNotice, which asserts
+    # the border is still there for exactly this reason.
     DEFAULT_CSS = """
     SessionTable {
         width: 1fr;
         height: 1fr;
+        border: round $panel;
     }
     """
 
@@ -361,6 +367,7 @@ class SessionTable(DataTable):
         now: datetime,
         *,
         all_records: list[SessionRecord] | None = None,
+        total: int | None = None,
     ) -> None:
         """Rebuild VISIBLE rows from *records* (already ordered), preserving the cursor by slug.
 
@@ -371,6 +378,12 @@ class SessionTable(DataTable):
         themselves are hidden from view. Counted via a single O(all_records)
         pass (_count_children_by_parent) rather than one full rescan of
         all_records per visible row.
+
+        *total* is how many live sessions exist in total; None means
+        nothing was hidden, so every existing caller stays correct without
+        change. The resulting notice is assigned to border_subtitle
+        unconditionally, so a rebuild that is no longer truncated clears a
+        stale notice rather than leaving it on screen.
         """
         counting_set = all_records if all_records is not None else records
         children_by_parent = _count_children_by_parent(counting_set)
@@ -386,6 +399,9 @@ class SessionTable(DataTable):
                 str(children_by_parent.get(record.session_slug, 0)),
                 key=record.session_slug,
             )
+        self.border_subtitle = format_visible_count(
+            len(records), len(records) if total is None else total
+        )
         if not self.row_count:
             return
         if previous_slug is not None:
