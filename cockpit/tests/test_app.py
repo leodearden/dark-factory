@@ -5046,3 +5046,53 @@ class TestSessionTableFocusCue:
             # a re-spelling of the state glyph.
             assert state_glyph(sr.Status.RUNNING) in focusable_row
             assert state_glyph(sr.Status.RUNNING) in headless_row
+
+
+class TestSessionTableCapNotice:
+    """Signal (b): a capped table says so, instead of looking complete.
+
+    Driven through the widget rather than only the formatter because the
+    notice's failure mode is silent: border labels are painted as part of
+    the border edge (measured, textual 8.2.8), so a subtitle set on a
+    border-less widget reads back correctly and renders NOTHING.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_replace_rows_reports_and_clears_the_cap_notice(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(3)
+        ]
+        now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            # The notice has somewhere to paint. Without a border this
+            # whole class would keep passing while the operator saw
+            # nothing -- which is the exact defect the task exists to fix.
+            assert table.styles.border_bottom[0] != ''
+
+            table.replace_rows(records, now, total=12)
+            await pilot.pause()
+            assert table.border_subtitle == 'showing 3 of 12'
+
+            # Unconditional assignment: a rebuild that is no longer
+            # truncated must CLEAR the notice, not leave a stale one up.
+            table.replace_rows(records, now, total=3)
+            await pilot.pause()
+            assert table.border_subtitle == ''
+
+            table.replace_rows(records, now, total=12)
+            await pilot.pause()
+            assert table.border_subtitle == 'showing 3 of 12'
+
+            # Omitting total entirely must mean "nothing was hidden",
+            # never an accidental notice.
+            table.replace_rows(records, now)
+            await pilot.pause()
+            assert table.border_subtitle == ''
