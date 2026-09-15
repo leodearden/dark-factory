@@ -5137,13 +5137,9 @@ class TestSessionTableCapNotice:
             )
 
     @pytest.mark.timeout(10)
-    async def test_small_fleet_and_history_view_claim_no_truncation(self, tmp_path):
-        """Two ways of hiding nothing, both of which must stay quiet.
-
-        The history view is the interesting one: it renders self._records
-        UNFILTERED, so it hides nothing by construction and must never
-        inherit a notice from the capped view it replaced.
-        """
+    async def test_small_fleet_claims_no_truncation(self, tmp_path):
+        """A fleet that fits stays quiet -- a complete table must not
+        announce itself as capped."""
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
@@ -5162,7 +5158,49 @@ class TestSessionTableCapNotice:
             assert table.row_count == 2
             assert table.border_subtitle == ''
 
+    @pytest.mark.timeout(15)
+    async def test_history_toggle_clears_and_restores_the_notice(self, tmp_path):
+        """The transition that matters: an actually-capped view toggled to
+        history and back.
+
+        History renders self._records UNFILTERED, so it hides nothing by
+        construction and must clear the notice it inherits -- and toggling
+        back must bring the notice returned. Driven from a genuinely
+        over-cap fleet (plus terminal records, which history shows and the
+        live band does not) because with a small fleet an empty subtitle
+        after 'h' is true no matter what the history branch reports.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
+
+        live = [
+            _make_record(session_slug=f'live-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 5)
+        ]
+        exited = [
+            _make_record(session_slug=f'exited-{i}', status=sr.Status.EXITED)
+            for i in range(3)
+        ]
+        notice = f'showing {_DEFAULT_VISIBLE_CAP} of {_DEFAULT_VISIBLE_CAP + 5}'
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(live + exited), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == notice
+
             await pilot.press('h')
             await pilot.pause()
 
+            assert table.row_count == len(live) + len(exited)
             assert table.border_subtitle == ''
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == notice
