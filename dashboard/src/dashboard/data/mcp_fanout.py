@@ -36,7 +36,6 @@ and no caller depends on the session surviving one.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import time
@@ -1424,6 +1423,16 @@ class TTLCache(Generic[V, K]):
         is AWAITED, so by the time this returns the task has actually unwound
         and released its connection rather than merely been asked to.
 
+        EVERY outcome of that unwind is consumed, not only ``CancelledError``
+        — a refresh can finish by raising on its own account (an anyio/httpx
+        cancel-scope ``RuntimeError``, a ``finally`` that blows up), and a
+        detached bypass by construction has no awaiter such an outcome could
+        mean anything to. :meth:`_start_bypass`'s done-callback already
+        settles that policy for the same tasks while the process runs; this
+        matches it rather than narrowing it to one exception type. Narrowing
+        is not cosmetic here: an escape reaches :func:`reap_detached_refreshes`
+        and then ``dashboard.app.lifespan``, above the closes that follow it.
+
         Reads the roster through :meth:`_live_bypasses_for` so its sweep
         applies: a task that finished before its done-callback ran is dropped
         rather than counted as reaped. Both maps are emptied first, so the
@@ -1462,9 +1471,7 @@ class TTLCache(Generic[V, K]):
         self._live_bypasses.clear()
         for task in reapable:
             task.cancel()
-        for task in reapable:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await asyncio.gather(*reapable, return_exceptions=True)
         return len(reapable)
 
     def clear(self) -> None:
