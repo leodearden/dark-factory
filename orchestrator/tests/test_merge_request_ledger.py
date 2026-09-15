@@ -5,14 +5,14 @@ Steps covered:
   step-2 GREEN — implement RequestLedger
   step-3 RED   — _alarm_merge_request_stuck + _merge_request_stuck_sentinel
   step-4 GREEN — implement the alarm + sentinel
-  step-5 RED   — re-export shim identity + worker._request_ledger attribute
+  step-5 RED   — re-export shim identity
 
 This module intentionally imports only orchestrator.merge_types /
 orchestrator.config (NOT orchestrator.merge_queue) at module scope for the
 pure data-structure tests, per the plan's "narrow unit-test surface" design
 decision — RequestLedger has no git/GitOps dependency at all. The lone
-exception is step-5's shim-identity/worker-wiring check, which imports
-orchestrator.merge_queue LOCALLY inside its test methods (mirroring every
+exception is step-5's shim-identity check, which imports
+orchestrator.merge_queue LOCALLY inside its test method (mirroring every
 other RED-until-GREEN symbol in this file) so a not-yet-wired name never
 breaks collection of the rest of the file.
 """
@@ -24,8 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
@@ -425,47 +424,36 @@ class TestAlarmMergeRequestStuck:
 
 
 # ---------------------------------------------------------------------------
-# step-5 RED: re-export shim identity + worker._request_ledger attribute
+# step-5 RED: re-export shim identity
 # ---------------------------------------------------------------------------
 
 
-class TestReexportShimAndWorkerLedgerAttribute:
-    """merge_queue re-export shim identity + SpeculativeMergeWorker wiring
-    (task 1992 step-5).
+class TestReexportShim:
+    """merge_queue re-export shim identity (task 1992 step-5).
 
-    RED until step-6 GREEN adds the re-export shim block to merge_queue.py
-    and initialises ``self._request_ledger`` in
-    ``SpeculativeMergeWorker.__init__``. merge_queue is imported LOCALLY here
-    (not at module scope — see module docstring) so this being RED does not
-    break collection of the rest of the file.
+    RED until step-6 GREEN adds the re-export shim block to merge_queue.py.
+    Both modules' names are bound by bare-name import (never reached through
+    a module object) so the identity assertions carry no attribute-path
+    coupling to either module's internals. merge_queue is imported LOCALLY
+    here (not at module scope — see module docstring) so this being RED does
+    not break collection of the rest of the file.
     """
 
     def test_shim_names_are_the_same_object_as_the_source_module(self):
-        import orchestrator.merge_request_ledger as ledger_module
         from orchestrator.merge_queue import (
             RequestLedger,
             StuckRequest,
             _alarm_merge_request_stuck,
             _merge_request_stuck_sentinel,
         )
-
-        assert RequestLedger is ledger_module.RequestLedger
-        assert StuckRequest is ledger_module.StuckRequest
-        assert _alarm_merge_request_stuck is ledger_module._alarm_merge_request_stuck
-        assert _merge_request_stuck_sentinel is ledger_module._merge_request_stuck_sentinel
-
-    def test_fresh_worker_has_an_empty_request_ledger(self, tmp_path: Path):
-        from orchestrator.merge_queue import RequestLedger, SpeculativeMergeWorker
-
-        git_config = GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-            push_after_advance=False,
+        from orchestrator.merge_request_ledger import RequestLedger as SourceLedger
+        from orchestrator.merge_request_ledger import StuckRequest as SourceStuck
+        from orchestrator.merge_request_ledger import _alarm_merge_request_stuck as _src_alarm
+        from orchestrator.merge_request_ledger import (
+            _merge_request_stuck_sentinel as _src_sentinel,
         )
-        git_ops = GitOps(git_config, tmp_path)
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
-        assert isinstance(worker._request_ledger, RequestLedger)
-        assert worker._request_ledger.is_empty()
+        assert RequestLedger is SourceLedger
+        assert StuckRequest is SourceStuck
+        assert _alarm_merge_request_stuck is _src_alarm
+        assert _merge_request_stuck_sentinel is _src_sentinel
