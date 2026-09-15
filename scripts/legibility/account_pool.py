@@ -79,6 +79,35 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     order. The two meet only when the pool is nearly exhausted, which is
     when contention is unavoidable anyway.
 
+    FAILOVER HAPPENS WITHIN A DIGEST, not across digests. A blocking banner
+    marks the account capped and the SAME prompt is retried on the next
+    account; ``CoderCapExhausted`` escapes only when the whole pool is
+    exhausted. That is a reading of the existing code rather than a
+    preference: ``CoderCapExhausted`` already means "there is no headroom
+    left to code this digest", and both ``coder.is_cap_deferral`` and
+    nightly's DEFERRED summary read ``capped`` as "the CLI never looked at
+    this digest". If one account's banner set ``capped=True``, that
+    predicate would silently weaken to "the account I happened to draw was
+    out" — a night with six live accounts could then trip the majority rule
+    and read as DEFERRED, making the deferral branch a place real failures
+    hide. Rotating here instead also stops burning one digest per burned
+    account. The payoff: nightly's long-standing "all accounts capped"
+    summary becomes TRUE for the first time.
+
+    TERMINATION IS STRUCTURAL, not a retry budget: every iteration marks
+    exactly one account capped, so the admissible set strictly shrinks and
+    ``try_lease`` returns None after at most ``account_count`` passes.
+
+    ONLY THE GATE'S STRICT DETECTOR ROTATES. ``coder``'s loose
+    OR-substring matcher keeps its own job — labelling an already-FAILED
+    invocation as a per-digest defer — while ``slot.detect_cap_hit`` (prefix
+    AND confirm) decides whether an ACCOUNT is out. When it disagrees the
+    original exception propagates unrotated, so a loose false positive can
+    re-label one digest and can never burn the pool. That is exactly the
+    split ``shared/src/shared/cap_markers.py``'s docstring argues for, and
+    it matters here because this repo's codebook is dominated by clusters
+    ABOUT usage limits, so healthy model output quotes banner text.
+
     LEASE DISCIPLINE mirrors ``UsageGate.invoke_slot``'s, because a leaked
     PROBE_IN_FLIGHT claim is permanent: the account is never admissible
     again for this process, so the pool would silently shrink by one
@@ -96,13 +125,24 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     """
 
     def invoke_through_pool(prompt: str, model: str) -> str:
-        lease = gate.try_lease(reverse=reverse)
-        slot = InvokeSlot(gate, lease)
-        try:
-            reply = invoke(prompt, model, oauth_token=slot.token)
-            slot.confirm()
-            return reply
-        finally:
-            gate.release_probe_slot(slot.token)
+        while True:
+            lease = gate.try_lease(reverse=reverse)
+            slot = InvokeSlot(gate, lease)
+            try:
+                reply = invoke(prompt, model, oauth_token=slot.token)
+                slot.confirm()
+                return reply
+            except coder.CoderCapExhausted as exc:
+                # The loose per-digest gate fired. Ask the STRICT detector
+                # whether this ACCOUNT is out; it marks the account capped and
+                # settles the slot when it agrees.
+                if not slot.detect_cap_hit(exc.stderr, exc.stdout):
+                    raise
+                logger.info(
+                    "account %s is capped — retrying this digest on the next "
+                    "account in the pool", slot.account_name,
+                )
+            finally:
+                gate.release_probe_slot(slot.token)
 
     return invoke_through_pool
