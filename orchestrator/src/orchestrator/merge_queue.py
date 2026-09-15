@@ -18254,7 +18254,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS / 2
             while True:
-                done, _ = await asyncio.wait(
+                done = await self._clock.wait_for_any(
                     {verify_task},
                     timeout=self.VERIFY_ABANDON_POLL_SECS,
                 )

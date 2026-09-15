@@ -689,13 +689,14 @@ async def _make_merged_item(
 
 
 # ── Driving the in-flight abort poll (task 2420's subject) ────────────────
-# The poll measures its no-progress budget off `ClockPort.monotonic` but waits
-# on `asyncio.wait(timeout=VERIFY_ABANDON_POLL_SECS)`, so the two are driven
-# separately: the injected clock jumps an hour per duration reading (crossing
-# production's real 90-minute INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS in two
-# polls, with no rescaled budget to keep in step with production), while
-# VERIFY_ABANDON_POLL_SECS alone stays small so those polls happen promptly.
-# Nothing below depends on how long the host takes to run them.
+# The poll takes BOTH its no-progress measurement and its cadence from the
+# injected clock, so there is one time source to drive rather than two. `tick`
+# is what drives it here: the clock jumps an hour per duration reading, which
+# crosses production's real 90-minute INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS in
+# two polls with no rescaled budget to keep in step with production. The
+# poll's own per-wait charge is VERIFY_ABANDON_POLL_SECS, which every test
+# below keeps small so those polls also happen promptly in real time. Nothing
+# below depends on how long the host takes to run them.
 _LANE_SECS_PER_READING = 3600.0
 
 #: Hard stop for `_poll_for_lane_budgets`, so a dead abort poll fails with a
