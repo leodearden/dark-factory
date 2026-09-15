@@ -17,6 +17,20 @@ fixture loads and then holds a lease on while four test modules re-executed and
 replaced it. ``load_script_module`` reuses by resolved file identity, tracks
 which keys it installed, and refuses to shadow an entry it did not install.
 
+The scope is DISCOVERED — every ``*.py`` under ``tests/`` — where the sibling
+``test_falkor_probe_routing_guard.py`` deliberately pins a fixed list of six.
+That difference is a property of the two properties, not an inconsistency.
+Reachability-gating has several legitimate shapes (a ``pytestmark`` entry, a
+fixture-level check, an autouse skip), so a discovered set would pre-empt a
+future module's valid choice. Loading a non-package script by file path has
+exactly ONE correct shape, and the 42 independent forks this task removed are
+the evidence that a fixed list would not have held the line. The cost is paid
+honestly, in three explicitly-documented exemptions, rather than by weakening
+the property.
+
+``_fm_helpers.py`` is excluded from discovery: the one call there DEFINES the
+shared loader, so it is the implementation rather than a fork of it.
+
 Deliberately NOT asserted: which identifiers a module imports from
 ``_fm_helpers``. That is name-pinning over sibling test source — a re-fork
 under another name evades it, so it buys no coverage while giving false
@@ -66,45 +80,30 @@ EXEMPT_CALL_SITES = frozenset(
             'test_paths_are_derived_from___file___not_baked_in',
         ),
         ('test_bake_off_storage_shape.py', 'test_the_default_path_follows_a_relocated_script'),
+        # Loads a PACKAGE module (fused_memory.reconciliation.stage1_stall_detector),
+        # not a scripts/ file, under a synthetic name with sys.modules['escalation']
+        # and ['escalation.models'] stubbed to None and restored in `finally`. It
+        # needs a guaranteed-FRESH exec and no residue; load_script_module reuses by
+        # file identity and never unloads. Outside the helper's stated purpose —
+        # "Load a non-package script".
+        (
+            'reconciliation/test_stage1_stall_detector.py',
+            'test_except_branch_binds_escalation_to_none',
+        ),
     }
 )
 
-# The four scripts the first nine of these load are each installed under a
-# sys.modules key that at least one OTHER module also installs, so they carry
-# the genuine double-execution hazard rather than only the duplication. The
-# rest are single-consumer forks of the same loader.
-COVERED_MODULES = [
-    TESTS_ROOT / name
-    for name in (
-        'test_bake_off_storage_shape.py',
-        'test_census_memory_metadata.py',
-        'test_cleanup_test_collections.py',
-        'test_memory_eval_e1_first_live_run.py',
-        'test_memory_eval_retrieval_probe.py',
-        'test_memory_eval_staleness_sweep.py',
-        'test_memory_metadata.py',
-        'test_rrf_cross_store_merge.py',
-        'test_tag_cgl_eta_rehome_scope.py',
-        'test_amend_stale_resume_cwd_records.py',
-        'test_audit_duplicate_memories.py',
-        'test_audit_duplicate_tasks.py',
-        'test_audit_found_on_main_provenance.py',
-        'test_audit_unverified_completion_claims.py',
-        'test_audit_wrong_binding_edges.py',
-        'test_backfill_recon_escalations.py',
-        'test_calibrate_write_triage.py',
-        'test_cgl_eta_auto_apply_impl.py',
-        'test_cgl_eta_scheduler_gate.py',
-        'test_check_asyncmock_assertion_style.py',
-        'test_check_bare_magicmock_config.py',
-        'test_check_consolidation_closure_cli.py',
-        'test_check_found_on_main_spurious_rate.py',
-        'test_cleanup_count_snapshots.py',
-        'test_clear_false_dependency_invalidations.py',
-        'test_clear_malformed_empty_memory.py',
-        'test_consolidate_namespace_families.py',
-    )
-]
+# The loader DEFINITION, not a fork of it.
+HELPER_MODULE = TESTS_ROOT / '_fm_helpers.py'
+
+
+def _discovered_modules():
+    """Every Python module under ``tests/``, the helper itself excepted.
+
+    Discovered rather than listed: a new test module that forks the loader must
+    fail this guard on arrival, without anyone remembering to enrol it.
+    """
+    return sorted(path for path in TESTS_ROOT.rglob('*.py') if path != HELPER_MODULE)
 
 
 def _module_key(path):
@@ -140,7 +139,7 @@ def _unrouted_loader_calls(path):
     ]
 
 
-@pytest.mark.parametrize('path', COVERED_MODULES, ids=_module_key)
+@pytest.mark.parametrize('path', _discovered_modules(), ids=_module_key)
 def test_loads_scripts_through_the_shared_helper(path):
     """The module must not fork its own non-package script loader."""
     calls = _unrouted_loader_calls(path)
