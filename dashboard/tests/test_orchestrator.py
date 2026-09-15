@@ -562,6 +562,20 @@ class TestDiscoverOrchestratorsBudget:
     ``asyncio.wait_for(..., timeout=2.0)``. The inner budget is monkeypatched
     down to 0.05 s, so the guard is 40x the budget: it can only trip on a real
     regression, never on scheduling jitter.
+
+    NO ASSERTION IN THIS CLASS MAY MEASURE WALL CLOCK. Every bound here is
+    proven by call counts and by the operator-facing budget messages — which
+    are what the code actually promises an operator — and the 2.0 s test-side
+    ``wait_for`` above is the only clock permitted, because its job is to stop
+    an unbounded walk hanging pytest rather than to measure anything. Two
+    elapsed-time assertions used to live here and both recurred as flakes on a
+    loaded host: task 5201's 0.534 s against a 0.5 s ceiling, and task 5032's
+    merge-verify 0.793 s against 1.5x a 0.5 s budget. Each time the behaviour
+    under test passed and only the clock missed. They were removed after
+    measuring that they discriminated nothing the mechanism assertions did not
+    already catch (see the mutation recorded in
+    ``test_the_loop_deadline_truncates_a_root_share_not_the_per_root_budget``).
+    Do not restore one.
     """
 
     async def test_a_hanging_fetch_tasks_does_not_hang_discover_orchestrators(
@@ -682,6 +696,21 @@ class TestDiscoverOrchestratorsBudget:
         exists to prevent. Here the per-root budget is 10x the loop budget, so
         only the ``min`` can keep the walk bounded, and only the ``min`` can
         report the share the root ACTUALLY got.
+
+        The discriminator for that mutation is the REPORTED SHARE, not a clock.
+        Measured 2026-09-15: mutating ``share = min(remaining,
+        _ORCHESTRATORS_PER_ROOT_BUDGET)`` to the bare per-root constant, with
+        both of this class's wall-clock assertions simultaneously neutralised,
+        still reddened this test — on ``'1.0s share' not in error``. The
+        elapsed-time assertion that used to sit below was therefore pure flake
+        surface, and is gone.
+
+        One residual is knowingly left uncovered: the reported share and the
+        applied ``timeout=`` read the same ``share`` local, so a mutation
+        touching ONLY the ``timeout=`` argument would slip past. Catching it
+        would mean monkeypatching ``asyncio.wait_for`` to observe a call this
+        module makes internally — reaching past the module's interface for a
+        mutation nobody has seen. Deliberately not chased.
         """
         import asyncio
         import re
@@ -715,46 +744,17 @@ class TestDiscoverOrchestratorsBudget:
              'running': True, 'started': 'Mar18'},
         ]
 
-        loop = asyncio.get_running_loop()
         with patch(
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
         ):
-            # Pre-warm the default executor so its FIRST-USE thread spin-up is
-            # not charged to a threshold sized for the loop budget alone — the
-            # same DEFECT-1 remedy applied to
-            # test_two_pids_sharing_one_root_pay_the_budget_once, which this
-            # test was written from and which shares its
-            # `await asyncio.to_thread(find_running_orchestrators)` opening.
-            # Measured over 8 fresh processes each: without the pre-warm this
-            # walk costs 0.20-0.25s idle and 0.22-0.33s under 40 CPU hogs on
-            # 32 cores, against a 0.5s threshold — the ~0.13s of first-use cost
-            # is what a loaded host stretches past the margin (observed 0.510s
-            # under xdist). With it, 0.1015-0.1057s idle and 0.1010-0.1028s
-            # under that same load: the load-sensitive term is gone entirely,
-            # leaving ~3ms of jitter against 400ms of margin. The threshold is
-            # therefore deliberately NOT widened — the remaining margin is 130x
-            # the measured noise, and widening it would only blunt the
-            # discrimination below for no measured benefit.
-            await asyncio.to_thread(lambda: None)
-            started = loop.time()
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
                 timeout=2.0,
             )
-            elapsed = loop.time() - started
 
         assert len(result) == 2
         assert len(calls) == 1
-        # The whole walk costs the LOOP budget, not roots x per-root budget.
-        # 0.5s discriminates with slack on both sides: the healthy path costs
-        # ~0.10s, while the regression costs the per-root 1.0s on the FIRST
-        # root alone (and 2.0s over both, tripping the wait_for guard above).
-        assert elapsed < 0.5, (
-            f'the walk took {elapsed:.3f}s against a 0.1s loop budget with a '
-            '1.0s per-root budget — the per-root bound alone is being applied, '
-            'so N roots cost N x 1.0s and the deadline buys nothing'
-        )
 
         # The operator message must name the share this root actually got, not
         # the per-root constant it never received.
