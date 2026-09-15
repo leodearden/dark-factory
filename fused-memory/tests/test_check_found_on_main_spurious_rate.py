@@ -97,6 +97,7 @@ def _stamped_task(
 
 
 SINCE = datetime(2026, 7, 16, 0, 0, 0, tzinfo=UTC)
+SINCE_ARG = '2026-07-16T00:00:00Z'  # the same instant as SINCE, as --since spells it
 BEFORE_SINCE = '2026-07-15T23:00:00Z'
 AFTER_SINCE = '2026-07-16T01:00:00Z'
 
@@ -605,11 +606,6 @@ class _FakeFusedMemoryConfigWithoutTaskmaster:
         self.taskmaster = None
 
 
-_FakeConfigClass = (
-    type[_FakeFusedMemoryConfigWithTaskmaster] | type[_FakeFusedMemoryConfigWithoutTaskmaster]
-)
-
-
 class _FakeRunBackend:
     """Read-only fake: only start/close/get_tasks are exercised by _run();
     this script never calls update_task/set_task_status, so those surfaces
@@ -672,11 +668,43 @@ def _run_args(
     *,
     ref: str = 'main',
     config: str | None = None,
-    since: str = '2026-07-16T00:00:00Z',
 ) -> argparse.Namespace:
-    """The parsed-args namespace `_run()` reads, as `main()` would build it."""
+    """The parsed-args namespace `_run()` reads, as `main()` would build it.
+
+    `since` is carried so the namespace mirrors what main() builds, but it is
+    not a knob: main() parses --since itself and passes the datetime as _run()'s
+    second argument, so _run() never reads this field (see TestRunCliWiring)."""
     return argparse.Namespace(
-        project_root=str(project_root), config=config, ref=ref, since=since,
+        project_root=str(project_root), config=config, ref=ref, since=SINCE_ARG,
+    )
+
+
+def _install_clean_run_fakes(
+    monkeypatch, config: type = _FakeFusedMemoryConfigWithTaskmaster,
+) -> dict:
+    """The three source-module fakes a clean, empty `_run()` needs: an empty
+    audit report, *config*, and a backend over no tasks. Returns
+    `_install_fake_backend`'s holder — on a refusal its 'backend' key is simply
+    absent, which is how the preflight tests assert nothing was constructed.
+
+    `_run()` imports the backend and config FUNCTION-LOCALLY, so these patch the
+    SOURCE module paths; patching an attribute on the script module would have
+    no effect. Hoisted to module level so that wiring is stated once: every copy
+    is an independent place it can drift from _run()'s actual import points."""
+    _install_fake_audit_module(monkeypatch, _report([]))
+    monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', config)
+    return _install_fake_backend(monkeypatch, [])
+
+
+def _argv(monkeypatch, project_root: Path | str, *, since: str = SINCE_ARG) -> None:
+    """The `sys.argv` main() parses, as an operator would type it."""
+    monkeypatch.setattr(
+        sys, 'argv',
+        [
+            'check_found_on_main_spurious_rate.py',
+            '--since', since,
+            '--project-root', str(project_root),
+        ],
     )
 
 
@@ -691,21 +719,12 @@ class TestRunTargetStorePreflight:
     report and exit 0 — a false all-clear on a predicate whose exit 0 means
     "check passed".
 
-    `_run()` imports the backend and config FUNCTION-LOCALLY, so these reuse
-    the fakes' SOURCE-module patches; patching an attribute on the script
-    module would have no effect.
+    The fakes come from `_install_clean_run_fakes`, which also records why they
+    patch source-module paths rather than script-module attributes.
     """
 
-    def _patch(self, monkeypatch) -> dict:
-        _install_fake_audit_module(monkeypatch, _report([]))
-        monkeypatch.setattr(
-            'fused_memory.config.schema.FusedMemoryConfig',
-            _FakeFusedMemoryConfigWithTaskmaster,
-        )
-        return _install_fake_backend(monkeypatch, [])
-
     async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch):
-        self._patch(monkeypatch)
+        _install_clean_run_fakes(monkeypatch)
 
         with pytest.raises(TargetStoreMissing):
             await _mod._run(_run_args(tmp_path), SINCE)
@@ -714,7 +733,7 @@ class TestRunTargetStorePreflight:
         """The load-bearing pin: reaching get_tasks is what CREATES the empty
         db, so refusing before the backend exists is what makes the guard
         non-destructive rather than merely noisy."""
-        backend_holder = self._patch(monkeypatch)
+        backend_holder = _install_clean_run_fakes(monkeypatch)
 
         with pytest.raises(TargetStoreMissing):
             await _mod._run(_run_args(tmp_path), SINCE)
@@ -724,7 +743,7 @@ class TestRunTargetStorePreflight:
     async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
         """The guard writes nothing in either direction — no probe file, no
         mkdir (see target_store_preflight's "WHY NOT A CAPABILITY PROBE")."""
-        self._patch(monkeypatch)
+        _install_clean_run_fakes(monkeypatch)
 
         with pytest.raises(TargetStoreMissing):
             await _mod._run(_run_args(tmp_path), SINCE)
@@ -734,7 +753,7 @@ class TestRunTargetStorePreflight:
     async def test_proceeds_when_the_db_exists(self, project_root, monkeypatch):
         """The regression pair: a guard that refuses a project which works
         would be caught here, not by the three refusal tests above."""
-        backend_holder = self._patch(monkeypatch)
+        backend_holder = _install_clean_run_fakes(monkeypatch)
 
         exit_code = await _mod._run(_run_args(project_root), SINCE)
 
@@ -1064,24 +1083,12 @@ class TestRunCliWiring:
 
 class TestMainMalformedSinceExitCode:
     def test_malformed_since_exits_with_distinct_usage_code(self, monkeypatch, capsys):
-        _install_fake_audit_module(monkeypatch, _report([]))
-        monkeypatch.setattr(
-            'fused_memory.config.schema.FusedMemoryConfig',
-            _FakeFusedMemoryConfigWithTaskmaster,
-        )
-        monkeypatch.setattr(
-            sys, 'argv',
-            [
-                'check_found_on_main_spurious_rate.py',
-                '--since', 'not-a-date',
-                # Deliberately a NONEXISTENT path, unlike the rest of this
-                # file: main() parses --since before _run() is reached, so
-                # this pins that the usage error out-ranks _run()'s
-                # target-store guard. Pointing it at a real store would
-                # silently discard that precedence signal.
-                '--project-root', '/proj',
-            ],
-        )
+        _install_clean_run_fakes(monkeypatch)
+        # Deliberately a NONEXISTENT project root, unlike the rest of this
+        # file: main() parses --since before _run() is reached, so this pins
+        # that the usage error out-ranks _run()'s target-store guard. Pointing
+        # it at a real store would silently discard that precedence signal.
+        _argv(monkeypatch, '/proj', since='not-a-date')
 
         exit_code = _mod.main()
 
@@ -1096,45 +1103,27 @@ class TestMainMalformedSinceExitCode:
 # ===========================================================================
 
 class TestMainTargetStoreMissingExitCode:
-    def _argv(self, monkeypatch, project_root, *, since='2026-07-16T00:00:00Z'):
-        monkeypatch.setattr(
-            sys, 'argv',
-            [
-                'check_found_on_main_spurious_rate.py',
-                '--since', since,
-                '--project-root', str(project_root),
-            ],
-        )
-
-    def _patch(self, monkeypatch, config: _FakeConfigClass = _FakeFusedMemoryConfigWithTaskmaster):
-        _install_fake_audit_module(monkeypatch, _report([]))
-        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', config)
-        _install_fake_backend(monkeypatch, [])
-
     def test_missing_task_store_exits_three(self, tmp_path, monkeypatch):
-        self._patch(monkeypatch)
-        self._argv(monkeypatch, tmp_path)
+        """3, and specifically neither 0 nor 1 — the property the reserved code
+        exists to buy. Exit 0 would be the false all-clear this guard kills.
+        Exit 1 already means BOTH "gating offenders found" and "task backend not
+        configured", so a refusal landing there is indistinguishable from a
+        genuine finding under an exit-code-only contract. The invariant is
+        enforced redundantly across DIFFERENT inputs by the two tests below, not
+        by re-asserting `not in (0, 1)` over this one's inputs — that assertion
+        is arithmetic given `== 3`, so it could never fail independently."""
+        _install_clean_run_fakes(monkeypatch)
+        _argv(monkeypatch, tmp_path)
 
         assert _mod.main() == 3
 
-    def test_missing_task_store_exits_neither_zero_nor_one(self, tmp_path, monkeypatch):
-        """The property that matters, pinned separately from the literal code.
-
-        Exit 0 would be the false all-clear this guard exists to kill. Exit 1
-        already means BOTH "gating offenders found" and "task backend not
-        configured", so a refusal landing there is indistinguishable from a
-        genuine finding under an exit-code-only contract.
-        """
-        self._patch(monkeypatch)
-        self._argv(monkeypatch, tmp_path)
-
-        assert _mod.main() not in (0, 1)
-
-    def test_refusal_message_reaches_stderr(self, tmp_path, monkeypatch, capsys):
-        """The operator gets the diagnosis, not a bare number — and it lands
-        on stderr, so it can never be read as the trailing JSON verdict."""
-        self._patch(monkeypatch)
-        self._argv(monkeypatch, tmp_path)
+    def test_refusal_message_reaches_stderr_and_not_stdout(self, tmp_path, monkeypatch, capsys):
+        """The operator gets the diagnosis, not a bare number — and it lands on
+        stderr ONLY. The LAST stdout line is the machine-read counts object, so
+        a refusal that printed anything to stdout would hand a non-JSON final
+        line to DeterministicRunner._summarize_predicate_output's extractor."""
+        _install_clean_run_fakes(monkeypatch)
+        _argv(monkeypatch, tmp_path)
 
         _mod.main()
 
@@ -1142,20 +1131,21 @@ class TestMainTargetStoreMissingExitCode:
         assert str(tmp_path.resolve()) in captured.err
         assert 'tasks.db' in captured.err
         assert '--project-root' in captured.err
+        assert captured.out == ''
 
     def test_missing_store_outranks_unconfigured_taskmaster(self, tmp_path, monkeypatch):
         """Pins _run()'s ordering from the outside: the guard runs before the
         config load, so a mis-target is never reported as the coarse infra-1."""
-        self._patch(monkeypatch, config=_FakeFusedMemoryConfigWithoutTaskmaster)
-        self._argv(monkeypatch, tmp_path)
+        _install_clean_run_fakes(monkeypatch, config=_FakeFusedMemoryConfigWithoutTaskmaster)
+        _argv(monkeypatch, tmp_path)
 
         assert _mod.main() == 3
 
     def test_malformed_since_still_outranks_the_store_guard(self, tmp_path, monkeypatch):
         """main() parses --since before _run() is reached, so the usage error
         stays on top of the ladder even when the store is also absent."""
-        self._patch(monkeypatch)
-        self._argv(monkeypatch, tmp_path, since='not-a-date')
+        _install_clean_run_fakes(monkeypatch)
+        _argv(monkeypatch, tmp_path, since='not-a-date')
 
         assert _mod.main() == 2
 
@@ -1185,14 +1175,7 @@ class TestMainScopedValueErrorHandling:
             _FakeFusedMemoryConfigWithTaskmaster,
         )
         backend_holder = _install_fake_backend(monkeypatch, [])
-        monkeypatch.setattr(
-            sys, 'argv',
-            [
-                'check_found_on_main_spurious_rate.py',
-                '--since', '2026-07-16T00:00:00Z',  # a perfectly valid --since
-                '--project-root', str(project_root),
-            ],
-        )
+        _argv(monkeypatch, project_root)  # a perfectly valid --since
 
         # Must raise the real ValueError straight out of main() — NOT
         # return exit code 2 (which would mean it got misidentified as a
@@ -1227,14 +1210,7 @@ class TestMainScopedValueErrorHandling:
             _FakeFusedMemoryConfigWithTaskmaster,
         )
         _install_fake_backend(monkeypatch, [])
-        monkeypatch.setattr(
-            sys, 'argv',
-            [
-                'check_found_on_main_spurious_rate.py',
-                '--since', '2026-07-16T00:00:00Z',
-                '--project-root', str(project_root),
-            ],
-        )
+        _argv(monkeypatch, project_root)
 
         with pytest.raises(RuntimeError, match='boom: internal failure'):
             _mod.main()
