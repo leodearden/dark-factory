@@ -819,6 +819,110 @@ X-band for the payoff (`REIFY_WARM_LANE_IACT_PREFIX` moves which band is
 protected, asserted in both directions) and X-degrade for the `||`. Suite
 wall-clock and the test-side cost mitigation: `orchestrator/tests/warm-lane/README.md`.
 
+### Delta 10 — `warm-lane-gc.sh` bounds its ASSIGNED preserve, and `--disk-pressure` overrides it
+
+**`warm-lane-gc.sh` diverges from reify a fourth time** (after Deltas 3, 6, 7
+and 9). Added by **task 5504**. `lib_lane_state.sh` also gains a fourth
+published global here; that library is dark-factory-native and so is not a
+reify divergence at all, but it is recorded in the same place because the two
+changes are one contract and a reader who meets either needs the other.
+
+**The defect.** Delta 6's record gate `continue`d unconditionally on an
+`assigned`/`in_use` record, with no upper bound on how old that record could
+be, and it sits BEFORE the `--disk-pressure` branch. Composed with
+`WarmLanePool._note_released_durable`, which swallows `OSError` by design
+(release must always succeed — fail-open, invariant I3 — and a full disk must
+not fail releases), that is a closed loop: an ENOSPC at release leaves
+`"state": "assigned"` on disk while the in-memory pool reads FREE, and nothing
+rewrites that record until the lane is acquired again. The emergency rm branch
+was therefore unreachable for exactly the lanes a disk-full incident strands —
+**the ENOSPC valve was held shut by the very failure it exists to respond to.**
+A second producer needs no failure at all: a lane whose task is still
+pending/in-progress/blocked is skipped BY DESIGN by
+`harness.py::_reclaim_terminal_lane_records` (which keys on terminal task
+status, not age), so its record ages indefinitely while
+`_stale_lane_assignment_census` — the tree's only age bound on this field —
+prints it in a digest and never acts.
+
+**The fix.** The record keeps its verdict unless one of two **orthogonal**
+reasons makes it non-decisive, OR'd at a single site
+(`_record_gate_downgrade_reason`) rather than nested into the loop body:
+
+- **ACUTE** — `--disk-pressure` downgrades the gate for the whole pass.
+- **CHRONIC** — an `updated_at` older than `--max-record-age-days` (default 14)
+  downgrades that one record, in every mode.
+
+Four properties, none of them cosmetic:
+
+- **"Downgrade" means FALL THROUGH, never "reclaim outright".** FD 8 stays open
+  and there is no `continue`, so the lane still meets Pass 1's third gate,
+  `live_ref_present`, inside the same critical section. The emergency trades an
+  AUTHORITATIVE preserve for a PROBED one, not for none. A live build is still
+  protected on both branches, the inv.2 flock is untouched, Pass 2's
+  conservative `_is_reclaimable` rule is untouched, and `rm -rf <lane>/target`
+  still touches only the checkout — committed work lives on
+  `refs/heads/task/NNNN` (sizing-lifecycle T1) and `acquire_lane` always
+  re-seeds (D10 §9.5). Reclaiming an assigned lane outright would re-open
+  esc-5375-1, a live cargo build wiped mid-flight.
+- **The two directions of failure are deliberately OPPOSITE.** An unreadable
+  STATE fails OPEN (reclaim — failing closed on a corrupt record would freeze a
+  lane out of reclaim forever); an unreadable AGE fails SAFE (preserve, with one
+  attributable warn). The reads answer different questions: a readable
+  `assigned` state is a trustworthy claim about STATE, so a bad timestamp leaves
+  only the AGE unknown, and reclaiming on that would let a malformed field
+  delete a live lane's build. That is verbatim the policy
+  `harness.py::_stale_lane_assignment_census` already documents for the same
+  field. The acute leg is evaluated FIRST and returns before the chronic one, so
+  the valve is never subject to that fail-safe — otherwise the fail-safe would
+  re-create the finding.
+- **The default is 14 days and the relationship to `lane_stale_report_days`
+  (7.0) is machine-checked, not documented-and-hoped.** Two full census periods,
+  so the digest's `## Stale lane assignments` section surfaces a lane for a
+  fortnight before the sweep acts on it — report-before-act. The two numbers
+  cannot be kept in sync mechanically across the bash/pydantic boundary, which
+  is the same hazard Delta 9 solved for `PROTECTED_PREFIXES`, so it takes the
+  same remedy: `orchestrator/tests/test_harness_warm_lane_gc.py::TestGcRecordAgeBoundDoesNotUndercutTheCensus`
+  asserts the ORDERING (`>=`, not equality — equality would forbid a deployment
+  widening its gc margin for no reason). `0` is the documented escape hatch; a
+  non-integer or negative value is a fatal usage error, because both silent
+  directions are invisible in the summary line.
+- **`updated_at` reaches bash as a FOURTH global from the SAME single slurp**,
+  not a second read and not the record file's mtime. `lib_lane_state.sh`'s
+  header states why: the orchestrator rewrites these records on every acquire
+  and release, so a second read is a DIFFERENT INSTANT and can report a pair of
+  values that never coexisted. The existing `_lane_state_scalar` handles the
+  field unchanged — it is a flat top-level quoted string, the exact shape that
+  function documents, and its miss behaviour is already the desired
+  "unjudgeable" reading.
+
+**`warm-lane-gc-sweep.sh` is deliberately NOT wired, and this is a verified
+finding rather than an open question.** It measures `df -B1 --output=avail`
+once per sweep and APPENDS `--disk-pressure` to its argv whenever available
+space is at or below the critical floor — so the one path that runs unattended
+at true low water, which is exactly the window in which this composition bites,
+inherits the valve with ZERO changes. A separate manual-only `--force` flag
+would have left the finding open on that path and needed a second wiring change
+to close it. Dark-factory's own ε path
+(`git_ops.py::_run_warm_lane_gc_reclaim`) passes only
+`reclaim --mount [--seed-script]` and never the flag, so steady-state reclaim
+behaviour is unchanged.
+
+**Deliberately out of scope.** `_note_released_durable`'s swallowed `OSError`
+stays: un-swallowing it would make a full disk fail releases, which is the
+failure mode the fail-open exists to prevent, and the drift L2 at
+`warm_lane_drift_l2_threshold` already makes it non-silent. This closes the
+CONSEQUENCE (the held-shut valve), not the producer. No orchestrator config
+knob was added — gc.sh is project-agnostic, and its knobs are flags plus
+`REIFY_WARM_LANE_GC_*` env vars, per every sibling.
+
+**Pinned by** Blocks S-pressure, S-age, S-age-degrade and A11 in
+`orchestrator/tests/warm-lane/test_warm_lane_gc.sh`; the fourth global by
+`orchestrator/tests/test_lane_state_lib.py::TestLaneStateReadPublishesUpdatedAt`;
+the 14-vs-7.0 ordering by the drift gate named above. **Block K5 is the other
+half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS
+the live-reference gate, S-pressure that it DOWNGRADES the record gate, and the
+downgrade is only safe because the gate K5 pins is still standing.
+
 ## Sibling-seed defaults, and who resolves them
 
 Two of the relocated scripts default their `--seed-script` to a **sibling**

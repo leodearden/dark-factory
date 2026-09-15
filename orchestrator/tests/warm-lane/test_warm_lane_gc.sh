@@ -20,7 +20,10 @@
 #       (wiring error) before argv is parsed (A9, task 5572 review); the same
 #       contract for the new sibling scripts/lib_lane_state.sh, with
 #       lib_live_refs.sh PRESENT so A9's guard cannot account for it
-#       (A10, task 3075)
+#       (A10, task 3075); --max-record-age-days is validated and a
+#       misconfiguration is FATAL — missing value, non-integer and negative all
+#       exit 2, because a silently-defaulted or silently-zeroed bound is
+#       invisible in the summary line (A11, task 5504)
 #   B — reset a divergent FREE lane (seed-script invoked with resolved gen path)
 #   C — remove an orphaned-landed clean worktree
 #   D — always-reclaim (task 5326): a DIRTY POOL LANE is now RECLAIMED (reset),
@@ -40,7 +43,11 @@
 #       the live-reference gate covers THIS branch too — Block P only ever
 #       drives the α branch, so gc.sh's "before BOTH reset branches" claim was
 #       structurally true but unasserted on the destructive one (task 5572
-#       review)
+#       review). K5 and S-pressure are the TWO HALVES OF ONE CONTRACT — K5
+#       pins that --disk-pressure still HONOURS the live-reference gate,
+#       S-pressure that it DOWNGRADES the record gate; a reader who meets
+#       either should read the other, because "downgrade" is only safe
+#       BECAUSE the gate K5 pins is still standing (task 5504)
 #   M — ephemeral verify/sweep worktrees (_mainsweep-*/_mainprobe-*) protected
 #       by the DEFAULT protect-glob, DF-faithful (--mount only, no
 #       --protect-glob) (task 5221)
@@ -89,7 +96,25 @@
 #       record is loud while the ordinary recordless case stays quiet;
 #       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
 #       so the read cannot be hoisted into an up-front classification pass
-#       without going RED (GREEN on arrival, like Block R)
+#       without going RED (GREEN on arrival, like Block R).
+#       Task 5504 BOUNDS that preserve, because an unbounded one composed with
+#       the gate's position before the --disk-pressure branch held the ENOSPC
+#       valve shut with the very failure it responds to (a release whose
+#       durable write hit ENOSPC and was swallowed leaves `assigned` on disk
+#       while the pool reads FREE). Two orthogonal downgrade reasons, OR'd:
+#       S-pressure pins the ACUTE one — --disk-pressure downgrades the gate
+#       to warn-and-fall-through, with a two-arm fixture proving the change is
+#       scoped to the emergency path, and with a live-referenced lane proving
+#       "downgrade" means FALL THROUGH to the /proc gate, never reclaim
+#       outright; S-age pins the CHRONIC one — a record whose `updated_at` is
+#       older than --max-record-age-days (default 14) is downgraded in every
+#       mode, with a fresh sibling preserved in the same pass so it is
+#       discrimination and not blanket expiry, plus `0` as the escape hatch
+#       and the REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS knob; S-age-degrade
+#       pins the DELIBERATE ASYMMETRY — an unreadable STATE reclaims (S15/S17)
+#       while an unreadable AGE preserves loudly, and Arm B pins that the
+#       acute valve is never subject to that fail-safe because the
+#       --disk-pressure leg is evaluated first
 #   X — the DEFAULT protect-glob is RENDERED from dark-factory's
 #       PROTECTED_PREFIXES via lib_lane_state.sh's lane_protect_glob, not
 #       hand-mirrored as a literal (task 3292). X-band pins the observable
