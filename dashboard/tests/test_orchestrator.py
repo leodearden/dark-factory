@@ -581,7 +581,7 @@ class TestDiscoverOrchestratorsBudget:
     async def test_a_hanging_fetch_tasks_does_not_hang_discover_orchestrators(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """One root whose fetch never returns degrades to the offline marker."""
+        """One root whose fetch never returns is reported DEGRADED, not offline."""
         import asyncio
         from unittest.mock import patch
 
@@ -618,17 +618,24 @@ class TestDiscoverOrchestratorsBudget:
         assert len(calls) == 1, 'the hang stub must actually have been reached'
         assert len(result) == 1
         entry = result[0]
-        # Exactly the shape the module's EXISTING offline path already writes,
-        # so no shaper, wire contract or React change is needed.
         assert entry['tasks'] == []
-        assert entry['offline'] is True
+        assert entry['offline'] is False, (
+            'the budget cancelled this fetch; nothing about it demonstrably '
+            'FAILED. Reporting it offline tells an operator fused-memory is '
+            f'down when the handler merely ran out of time: {entry}'
+        )
+        assert entry['degraded'] is True, (
+            "a cancelled fetch leaves this root's task tree UNKNOWN, and the "
+            'entry must say so in a field a consumer can branch on, not only '
+            f'inside the free-text error: {entry}'
+        )
         assert entry['summary']['total'] == 0
         assert 'error' in entry
         # A starved root must not read as a healthy project with zero tasks:
         # the real cause has to reach the operator on the wire.
         assert 'budget' in entry['error']
 
-    async def test_a_root_that_never_got_its_turn_is_marked_offline_not_silently_empty(
+    async def test_a_root_that_never_got_its_turn_is_marked_degraded_not_silently_empty(
         self, tmp_path, monkeypatch, dummy_client,
     ):
         """The whole-loop deadline degrades the unreached root, not the loop."""
@@ -675,10 +682,16 @@ class TestDiscoverOrchestratorsBudget:
         # The loop is not abandoned: BOTH roots still come back.
         assert len(result) == 2
         for entry in result:
-            assert entry['offline'] is True, (
+            assert entry['degraded'] is True, (
                 'a root the budget never let us measure must not render as a '
                 'healthy project with zero tasks — that is the invisible '
-                'failure this whole task exists to close'
+                f'failure this whole task exists to close: {entry}'
+            )
+            assert entry['offline'] is False, (
+                'neither root was proven unreachable — one was cancelled '
+                'mid-fetch and the other never attempted at all. Reporting '
+                'them offline sends an operator to restart a healthy service: '
+                f'{entry}'
             )
             assert entry['error']
         # The second root was skipped outright, not attempted and abandoned.
@@ -835,7 +848,13 @@ class TestDiscoverOrchestratorsBudget:
         )
         assert len(result) == 1
         assert sorted(result[0]['pids']) == [1234, 5678]
-        assert result[0]['offline'] is True
+        assert result[0]['offline'] is False, (
+            'the single fetch was cancelled by the budget, not proven to fail'
+        )
+        assert result[0]['degraded'] is True, (
+            "the shared root's task tree is UNKNOWN for this render, and both "
+            'PIDs must carry that fact rather than a confident zero'
+        )
         assert result[0]['error']
         # Backstop to `len(calls) == 1`: one budget SPENT, not merely one
         # fetch issued. Each root that overruns logs exactly one 'exceeded
@@ -1101,7 +1120,19 @@ class TestDiscoverOrchestratorsPerProject:
 
 
 class TestDiscoverOrchestratorsOfflineMarker:
-    """Tests for discover_orchestrators propagating the MCP offline marker."""
+    """discover_orchestrators carries *offline* and *degraded* SEPARATELY.
+
+    This class owns the SPLIT, not merely the marker's survival. The invariant
+    itself — *offline* means the fetch demonstrably failed and the project is
+    proven unreachable, *degraded* means a budget expired first and the
+    project's state is simply UNKNOWN — is stated once, at
+    ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``,
+    together with the operator consequence of collapsing them.
+
+    ``TestDiscoverOrchestratorsBudget`` pins the degraded corner. What is
+    pinned here is the other two: a fetch that demonstrably failed, and a
+    healthy one.
+    """
 
     async def test_offline_marker_preserved_not_discarded(self, tmp_path, monkeypatch, dummy_client):
         """When fetch_tasks returns the offline marker, the project entry must still appear
@@ -1129,9 +1160,45 @@ class TestDiscoverOrchestratorsOfflineMarker:
         entry = result[0]
         assert entry.get('offline') is True, f'expected offline=True, got: {entry}'
         assert entry.get('error') == 'boom', f'expected error=boom, got: {entry}'
+        assert entry.get('degraded') is False, (
+            'this fetch was attempted and demonstrably failed, so the project '
+            'is proven unreachable — reporting it merely degraded understates '
+            f'a real outage as an unmeasured one: {entry}'
+        )
         # Summary should be all-zero (no tasks)
         s = entry.get('summary', {})
         assert s.get('total', -1) == 0
+
+    async def test_a_healthy_root_is_neither_offline_nor_degraded(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """The common case sets BOTH flags False — neither may be absent.
+
+        Every consumer downstream reads the pair unconditionally (the shaper
+        ``bool()``-coerces both; the orchestrators tab branches on both), so
+        "no key at all" is not an acceptable spelling of "healthy".
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 4242, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
+
+        async def healthy_fetch(client, cfg, project_root):
+            return [{'id': 1, 'title': 'a real task', 'status': 'done'}]
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', healthy_fetch)
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry['summary']['total'] == 1, f'the success arm was not taken: {entry}'
+        assert entry['offline'] is False, f'a fetch that returned tasks is not offline: {entry}'
+        assert entry['degraded'] is False, f'a fetch that returned tasks is not degraded: {entry}'
 
 
 class TestReadMaxConcurrentTasks:
