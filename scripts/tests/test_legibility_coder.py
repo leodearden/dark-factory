@@ -1707,6 +1707,101 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# task 5488 / step-1: RED — _invoke_cli(oauth_token=) picks the ACCOUNT the
+# shared UsageGate chose, by handing the child an explicit env.
+#
+# Two facts, and the second is as load-bearing as the first:
+#   * with a token, the child gets CLAUDE_CODE_OAUTH_TOKEN=<token> and
+#     ANTHROPIC_API_KEY REMOVED — the CLI prefers the API key over the OAuth
+#     token, so leaving it set would silently bill the wrong identity and
+#     defeat the account choice entirely (the failover would look like it
+#     worked while every invocation rode the same login);
+#   * with NO token the parent env is inherited UNCHANGED, because that is
+#     census/preflight_headroom's path and this parameter must be strictly
+#     additive.
+# ---------------------------------------------------------------------------
+
+def _write_fake_claude_echoing_env(bin_dir):
+    """Fake `claude` binary: echoes the two env vars that decide WHICH
+    account the real CLI authenticates as, then exits 0.
+
+    ``:-<unset>`` rather than a bare expansion, deliberately: an absent var
+    and a var set to the empty string both echo as an empty line otherwise,
+    and "ANTHROPIC_API_KEY was REMOVED from the child env" is exactly the
+    distinction these tests exist to pin."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > /dev/null\n"
+        'echo "OAUTH=${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}"\n'
+        'echo "ANTHROPIC=${ANTHROPIC_API_KEY:-<unset>}"\n'
+    )
+    p.chmod(0o755)
+
+
+def test_invoke_cli_oauth_token_reaches_the_child_with_anthropic_key_stripped(
+    tmp_path, monkeypatch,
+):
+    """The account the gate leased must be the account the CLI actually
+    uses. Pins both halves of the fleet's OAuth-env idiom (identical to
+    agents/invoke.py, cli_invoke.py and usage_gate.py): set the OAuth token,
+    and REMOVE ANTHROPIC_API_KEY so it cannot take precedence."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_echoing_env(bin_dir)
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+
+    # Set in the PARENT env, so the strip is observable rather than vacuous:
+    # without this the child would report <unset> no matter what the code does.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-key-MUST-NOT-LEAK")
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+        oauth_token="oauth-tok-ACCOUNT-F",
+    )
+
+    assert "OAUTH=oauth-tok-ACCOUNT-F" in raw, (
+        f"the leased account's token must reach the child as "
+        f"CLAUDE_CODE_OAUTH_TOKEN; got {raw!r}"
+    )
+    assert "ANTHROPIC=<unset>" in raw, (
+        f"ANTHROPIC_API_KEY must be REMOVED from the child env — the CLI "
+        f"prefers it over the OAuth token, so leaving it set silently "
+        f"defeats the account choice; got {raw!r}"
+    )
+
+
+def test_invoke_cli_without_oauth_token_inherits_the_parent_env_unchanged(
+    tmp_path, monkeypatch,
+):
+    """The no-token call is census's path (`preflight_headroom` and the
+    mining/verify/synthesis primitive), and it must not move: `env=None` is
+    subprocess's own "inherit the parent", so BOTH vars pass through exactly
+    as the parent set them — including ANTHROPIC_API_KEY, which this
+    function has no business stripping when no account was chosen."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_echoing_env(bin_dir)
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-key-INHERITED")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "parent-oauth-INHERITED")
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+    )
+
+    assert "OAUTH=parent-oauth-INHERITED" in raw, raw
+    assert "ANTHROPIC=sk-ant-parent-key-INHERITED" in raw, (
+        f"with no oauth_token the parent env must be inherited UNCHANGED — "
+        f"stripping here would silently change census's own invocations; "
+        f"got {raw!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-17: RED — main(argv) end-to-end, LLM mocked via monkeypatch of
 # mod._invoke_cli (never a real subprocess)
 # ---------------------------------------------------------------------------
