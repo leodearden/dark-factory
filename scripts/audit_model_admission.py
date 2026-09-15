@@ -219,8 +219,11 @@ def scan_routing_decisions(
 
 # timeouts.<role>, from orchestrator/src/orchestrator/defaults.yaml::timeouts.
 # Passed IN rather than read from config: scripts/tests/ imports no first-party
-# package (dark-factory-orchestrator.yaml:111-112), so importing orchestrator
-# config here would break test collection outright.
+# package (see the comment on dark-factory-orchestrator.yaml::test_command —
+# "scripts/tests/ imports no first-party package"), so importing orchestrator
+# config here would break test collection outright.  `--role-ceiling
+# <role>=<secs>` overrides an entry at the command line, so auditing a role
+# whose timeouts.<role> differs needs no edit to this file.
 #
 # THIS IS NOT A TOTAL WALL CLOCK, and the distinction is the whole reason the
 # flag derived from it is named for the FLAT CEILING rather than for a timeout.
@@ -898,6 +901,23 @@ def _parse_moment(spec: str) -> datetime:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
+def _parse_role_ceiling(spec: str) -> tuple[str, int]:
+    """Parse a ``<role>=<seconds>`` flat-ceiling override into a structured pair.
+
+    Rejected at the boundary rather than downstream: ``merger=`` and
+    ``merger=0`` would otherwise reach :data:`DEFAULT_ROLE_CEILINGS_SECS`'s
+    at-or-above comparison as a zero and flag every run of that role as over
+    its ceiling.
+    """
+    role, separator, seconds = spec.partition('=')
+    if not separator or not role or not seconds.isdigit() or int(seconds) <= 0:
+        raise argparse.ArgumentTypeError(
+            f'bad --role-ceiling {spec!r}: expected <role>=<positive seconds>, '
+            f'e.g. merger=600.'
+        )
+    return role, int(seconds)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description='Audit whether an admitted model is actually being dispatched, '
@@ -923,6 +943,14 @@ def main(argv: Sequence[str] | None = None) -> int:
              'means no ceiling was supplied, and the ceiling, headroom and '
              'at/over cells render as "-" rather than as a spurious breach',
     )
+    parser.add_argument(
+        '--role-ceiling', action='append', default=[], type=_parse_role_ceiling,
+        metavar='ROLE=SECS',
+        help='flat per-role wall-clock ceiling the "over flat ceiling" column is '
+             'measured against, e.g. merger=600; repeatable, and merged over the '
+             f'defaults {DEFAULT_ROLE_CEILINGS_SECS}. A role with no ceiling is '
+             'reported as unknown rather than as under one.',
+    )
     parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
     parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
     args = parser.parse_args(argv)
@@ -939,6 +967,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             window=(window_end - args.window, window_end),
             ceiling_usd=args.ceiling,
+            role_ceilings_secs={
+                **DEFAULT_ROLE_CEILINGS_SECS, **dict(args.role_ceiling),
+            },
         )
     finally:
         conn.close()

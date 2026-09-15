@@ -14,6 +14,7 @@ Copied rather than imported because scripts/tests/ is collected by
 store, which owns this DDL, is out of reach here. Re-capture with that command
 rather than hand-editing if the writer's schema moves.
 """
+import argparse
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -1012,6 +1013,41 @@ def test_main_without_a_ceiling_reports_no_ceiling_rather_than_a_zero_one(
     assert spend['ceiling_usd'] is None
     assert spend['headroom_usd'] is None
     assert spend['at_or_over_ceiling'] is None
+
+
+@pytest.mark.parametrize(
+    ('spec', 'expected'),
+    [('merger=600', ('merger', 600)), ('reviewer=1200', ('reviewer', 1200))],
+)
+def test_a_role_ceiling_spec_parses_to_a_role_and_its_seconds(spec, expected):
+    assert audit_model_admission._parse_role_ceiling(spec) == expected
+
+
+@pytest.mark.parametrize(
+    'spec', ['merger', 'merger=', '=600', 'merger=0', 'merger=-1', 'merger=10m'],
+)
+def test_a_malformed_role_ceiling_spec_is_rejected_at_the_boundary(spec):
+    """`merger=0` in particular: accepted, it would flag every merger run as
+    at-or-over its ceiling, since the comparison is at-or-above."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        audit_model_admission._parse_role_ceiling(spec)
+
+
+def test_the_role_ceiling_flag_binds_and_leaves_the_other_defaults_standing(
+    runs_db_path, live_shaped_db, capsys
+):
+    """The flat-ceiling mapping is a real CLI dimension, not a test-only seam:
+    a future admission on a role whose timeouts.<role> differs is auditable
+    without editing the module."""
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--runs-db', str(runs_db_path),
+        '--role-ceiling', 'steward=60', '--format', 'json',
+    ])
+
+    rows = {r['role']: r for r in json.loads(capsys.readouterr().out)['invocations']}
+    assert rows['steward']['at_or_over_flat_role_ceiling'] is True   # 90 s run, 60 s limit
+    assert rows['merger']['at_or_over_flat_role_ceiling'] is False   # default 600 s stands
 
 
 def test_main_leaves_the_store_byte_for_byte_unchanged(runs_db_path, live_shaped_db, capsys):
