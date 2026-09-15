@@ -18,6 +18,7 @@ import shutil
 import subprocess
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _verify_config_corpus import (
     DF_CONFIG_PATH,
     FM_LINT_COMMAND,
@@ -893,8 +894,17 @@ class TestSerialPytest:
     # dependency of the command under test, so — exactly as `_BASH` above
     # argues for bash — a missing toolchain must fail loudly rather than
     # silently drop the coverage that closes this defect.
+    #
+    # The mark is the VERIFY CLI BUDGET itself, and NOT a number picked to sit
+    # just above the `timeout=` below: a marker is a two-way override, so any
+    # value under that budget TIGHTENS the run that gates the merge instead of
+    # loosening this slow probe — the inversion the VERIFY_CLI_PER_TEST_TIMEOUT
+    # comment block in _orch_helpers.py derives and
+    # test_timeout_marker_inversion_guard.py ratchets. The subprocess timeout
+    # stays the operative bound, so a hung probe surfaces as a `TimeoutExpired`
+    # carrying both streams rather than as an `os._exit()`d xdist worker.
     @pytest.mark.xdist_group('verify_cmd_real_pytest')
-    @pytest.mark.timeout(120)
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     def test_recovered_live_scripts_leg_is_accepted_by_a_real_pytest(self, tmp_path):
         """The proof the structural arms are not just string-shuffling.
 
