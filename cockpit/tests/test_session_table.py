@@ -275,13 +275,7 @@ class TestOrderSessions:
         assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
 
     def test_focusable_sorts_ahead_of_headless_within_a_status_band(self):
-        """Inside one status band, a row Enter can act on comes first.
-
-        This is load-bearing beyond mere ordering: app.py orders BEFORE
-        capping (filter_live_sessions slices an already-ordered list), so
-        under a 200+ live backlog the rows an operator can actually act on
-        are the ones that survive the cap.
-        """
+        """Under focus_first, a row Enter can act on comes first in its band."""
         from cockpit.panes.session_table import order_sessions
 
         focusable = _make_record(
@@ -293,13 +287,37 @@ class TestOrderSessions:
             session_slug='headless', status=sr.Status.RUNNING, display=None
         )
 
-        assert [r.session_slug for r in order_sessions([headless, focusable])] == [
-            'focusable',
-            'headless',
+        for order in ([headless, focusable], [focusable, headless]):
+            ordered = order_sessions(order, focus_first=True)
+            assert [r.session_slug for r in ordered] == ['focusable', 'headless']
+
+    def test_focusability_is_opt_in_so_chronological_consumers_keep_their_order(self):
+        """spawn_tree.py orders sibling groups with this same function, where
+        oldest-first IS the signal (the spawn sequence). The flag is the
+        whole difference, on one pair, in both directions."""
+        from cockpit.panes.session_table import order_sessions
+
+        older_headless = _make_record(
+            session_slug='older-headless',
+            status=sr.Status.RUNNING,
+            display=None,
+            start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        )
+        newer_focusable = _make_record(
+            session_slug='newer-focusable',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        records = [newer_focusable, older_headless]
+
+        assert [r.session_slug for r in order_sessions(records)] == [
+            'older-headless',
+            'newer-focusable',
         ]
-        assert [r.session_slug for r in order_sessions([focusable, headless])] == [
-            'focusable',
-            'headless',
+        assert [r.session_slug for r in order_sessions(records, focus_first=True)] == [
+            'newer-focusable',
+            'older-headless',
         ]
 
     def test_state_rank_still_dominates_focusability(self):
@@ -319,7 +337,7 @@ class TestOrderSessions:
             display=sr.Display(kind='wm', wm_title='t'),
         )
 
-        ordered = order_sessions([focusable_running, headless_blocked])
+        ordered = order_sessions([focusable_running, headless_blocked], focus_first=True)
 
         assert [r.session_slug for r in ordered] == [
             'headless-blocked',
@@ -345,31 +363,9 @@ class TestOrderSessions:
             start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
         )
 
-        assert [r.session_slug for r in order_sessions([newer, older])] == ['older', 'newer']
+        ordered = order_sessions([newer, older], focus_first=True)
 
-    def test_headless_records_are_never_dropped(self):
-        """Ordering reorders; it never hides. A headless session is real
-        running work, and how many there are is itself fleet state."""
-        from cockpit.panes.session_table import order_sessions
-
-        records = [
-            _make_record(session_slug='h-1', status=sr.Status.RUNNING, display=None),
-            _make_record(
-                session_slug='f-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=sr.Display(kind='wm'),
-            ),
-            _make_record(session_slug='h-2', status=sr.Status.IDLE, display=None),
-            _make_record(
-                session_slug='f-2', status=sr.Status.RUNNING, display=sr.Display(kind='tmux')
-            ),
-        ]
-
-        ordered = order_sessions(records)
-
-        assert len(ordered) == len(records)
-        assert {r.session_slug for r in ordered} == {r.session_slug for r in records}
-
+        assert [r.session_slug for r in ordered] == ['older', 'newer']
 
 
 class TestFilterLiveSessions:

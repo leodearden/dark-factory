@@ -141,12 +141,10 @@ def count_outstanding_children(slug: str, all_records: list[SessionRecord]) -> i
     )
 
 
-# Documented state ranking for order_sessions -- the PRIMARY of its three
-# keys: blocked-on-you first, then working, then idle, then dead.
-# launching folds into "working" (rank 1) and both terminal statuses fold
-# into "dead" (rank 3), mirroring _GLYPHS' four-bucket grouping. A
-# foreign/unrecognized status sorts last of all. _focus_rank breaks ties
-# WITHIN a band and start_ts below that; see order_sessions.
+# Documented state ranking for order_sessions: blocked-on-you first, then
+# working, then idle, then dead. launching folds into "working" (rank 1)
+# and both terminal statuses fold into "dead" (rank 3), mirroring _GLYPHS'
+# four-bucket grouping. A foreign/unrecognized status sorts last of all.
 _STATE_RANK: dict[Status, int] = {
     Status.AWAITING_INPUT: 0,
     Status.RUNNING: 1,
@@ -168,10 +166,6 @@ def _state_rank(status: Status | str) -> int:
 
 
 def _focus_rank(record: SessionRecord) -> int:
-    """Sort a focusable record (0) ahead of a headless one (1).
-
-    Secondary to _state_rank, never primary -- see order_sessions.
-    """
     return 0 if is_focusable(record) else 1
 
 
@@ -192,21 +186,23 @@ def _start_ts_sort_key(start_ts: str) -> tuple[int, str]:
     return (1, '')
 
 
-def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
-    """Order *records* by state rank, then focusable-before-headless, then oldest first.
+def order_sessions(
+    records: list[SessionRecord], *, focus_first: bool = False
+) -> list[SessionRecord]:
+    """Order *records* by state rank, then focusability if asked, then oldest first.
 
-    Three levels, in that order. State rank stays PRIMARY because
-    blocked-on-you is still the top signal: a headless awaiting-input
-    session outranks a focusable running one, so focusability reorders
-    within a band and never across bands. Below focusability, the start_ts
-    tiebreak is unchanged.
+    State rank is always PRIMARY: blocked-on-you is the top signal, so a
+    headless awaiting-input session outranks a focusable running one.
 
-    The middle key also does work beyond legibility. app.py orders before
-    capping (filter_live_sessions slices an already-ordered list), so under
-    a live backlog past the cap the rows an operator can actually act on
-    are the ones that survive it. Nothing is hidden either way -- a
-    headless session is real running work, and how many there are is itself
-    fleet state.
+    focus_first sorts focusable-before-headless between that rank and the
+    start_ts tiebreak. Opt-in because the two consumers want different
+    things: the session table orders BEFORE capping (filter_live_sessions
+    slices an already-ordered list), so it wants the rows an operator can
+    actually act on to be the ones that survive the cap, while
+    spawn_tree.py orders sibling groups, where oldest-first IS the signal
+    (the spawn sequence) and must not be reshuffled by whether a child
+    happens to own a terminal. Ordering only reorders; which rows are
+    dropped is the cap's business, not this function's.
 
     A deterministic, dependency-free stand-in for the C5b priority score
     (this task's dependency surface is C1 only -- see design_decisions).
@@ -217,7 +213,7 @@ def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
         records,
         key=lambda record: (
             _state_rank(record.status),
-            _focus_rank(record),
+            _focus_rank(record) if focus_first else 0,
             _start_ts_sort_key(record.start_ts),
         ),
     )

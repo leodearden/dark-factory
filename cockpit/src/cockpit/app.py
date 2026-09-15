@@ -466,7 +466,7 @@ class CockpitApp(App):
         self._snapshot = new_snapshot
         self._decisions_snapshot = new_decisions_snapshot
         self._decisions = decisions
-        self._records = order_sessions(records)
+        self._records = order_sessions(records, focus_first=True)
         try:
             self._rebuild_session_table()
             self._rebuild_queue()
