@@ -390,13 +390,38 @@ def validate_report(report: dict) -> list[str]:
     deliberately does NOT check is whether any disposition is CORRECT; that is a
     judgement over seven weeks of moved code, and a test encoding it would be
     pinning a conclusion rather than a behaviour.
+
+    It must also never FAIL OPEN, which is a sharper requirement than checking
+    the entries it is given. Every check below is "each roster id appears once,
+    validly" — a shape an EMPTY roster satisfies vacuously, so a report with no
+    roster, or one whose roster key is misspelled, would be certified complete.
+    A completeness gate that passes a file containing nothing inverts its own
+    purpose, so the roster's own usability is checked first.
     """
     violations: list[str] = []
-    roster_ids = [entry.get("id") for entry in report.get("roster", [])]
+    roster_ids: list[str] = []
     seen: Counter = Counter()
 
-    for entry in report.get("dispositions", []):
-        rid = entry.get("id")
+    for entry in report.get("roster") or []:
+        # A blank id is not a benign omission: `None` matches `None`, so a
+        # roster entry and a disposition entry that both lack one pair up and
+        # validate each other. An unusable id is reported and never matched.
+        if rid := _text(entry, "id"):
+            roster_ids.append(rid)
+        else:
+            violations.append(f"roster entry carries no usable id: {entry!r}")
+
+    if not roster_ids:
+        violations.append(
+            "report carries no usable roster — every check below is satisfied "
+            "vacuously by an empty one, so there is nothing to validate against"
+        )
+
+    for entry in report.get("dispositions") or []:
+        rid = _text(entry, "id")
+        if not rid:
+            violations.append(f"disposition entry carries no usable id: {entry!r}")
+            continue
         seen[rid] += 1
         if rid not in roster_ids:
             violations.append(f"{rid}: dispositioned but absent from the frozen roster")

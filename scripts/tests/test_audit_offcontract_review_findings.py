@@ -800,6 +800,76 @@ def test_the_seeded_report_shape_fails_loudly():
     assert validate_report(report)
 
 
+# ---------------------------------------------------------------------------
+# The degenerate cases, which are a sharper requirement than the ones above.
+# Every check in `validate_report` reads "each roster id appears once, validly"
+# — a shape an EMPTY roster satisfies vacuously. investigation.md leans on
+# `--validate ... exits 0` as the proof that all 23 findings were accounted
+# for, so a gate that certifies an empty or structurally-broken file inverts
+# the one thing it exists to do. Same principle as
+# `test_the_seeded_report_shape_fails_loudly`, one step further down.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("report", [
+    {},
+    {"roster": [], "dispositions": []},
+    {"roster": []},
+    {"dispositions": [{"id": "3041-correctness-0", "disposition": "a", "note": "n"}]},
+    {"rooster": [{"id": "3041-correctness-0"}], "dispositions": []},
+    {"roster": None, "dispositions": None},
+], ids=["empty", "both-empty", "roster-only", "no-roster-key", "misspelled-roster", "nulls"])
+def test_a_report_with_no_usable_roster_is_never_certified_complete(report):
+    """A completeness gate that passes a file containing nothing is worse than
+    no gate: it reads as proof. Each of these used to return [] and exit 0."""
+    assert validate_report(report), "an empty roster must not validate"
+
+
+def test_a_roster_entry_without_an_id_is_rejected():
+    report = _report(_entry("3363-design-1", "a"),
+                     roster_ids=ROSTER_IDS)
+    report["roster"].append({"task": "3041", "severity_as_emitted": "high"})
+    violations = validate_report(report)
+    assert any("no usable id" in v for v in violations)
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_a_nameless_disposition_cannot_pair_with_a_nameless_roster_entry(blank):
+    """One field narrower than the empty-roster case, and the reason a blank id
+    is excluded from the match rather than merely reported: `None` matches
+    `None`, so two entries that both lack an id would satisfy each other and
+    the report would validate with nothing actually dispositioned."""
+    report = {
+        "roster": [{"id": blank, "task": "3041"}],
+        "dispositions": [{"id": blank, "disposition": "a", "note": "Checked."}],
+    }
+    violations = validate_report(report)
+
+    assert len(violations) >= 2, violations
+    assert any("roster entry carries no usable id" in v for v in violations)
+    assert any("disposition entry carries no usable id" in v for v in violations)
+
+
+def test_a_nameless_disposition_does_not_excuse_a_real_roster_id():
+    """The nameless entry must not be counted as having dispositioned anything:
+    the roster ids it does not name are still owed a disposition."""
+    report = {
+        "roster": [{"id": rid} for rid in ROSTER_IDS],
+        "dispositions": [{"disposition": "a", "note": "Checked."}],
+    }
+    violations = validate_report(report)
+
+    assert all(any(rid in v for v in violations) for rid in ROSTER_IDS)
+
+
+def test_the_real_reports_shape_still_validates_after_the_guard():
+    """The guard must reject the degenerate shapes without rejecting the shape
+    the closing step actually runs — a roster and one disposition per id."""
+    assert validate_report(_report(
+        _entry("3041-correctness-0", "b", followup_ticket="tkt_abc123"),
+        _entry("3363-design-1", "c"),
+    )) == []
+
+
 def test_violations_are_readable_strings():
     report = _report(_entry("3041-correctness-0", "a"))
     violations = validate_report(report)
