@@ -1310,6 +1310,16 @@ BASELINE_MEASURED_AT = _datetime.datetime(
     2026, 8, 6, 9, 30, tzinfo=_datetime.UTC,
 )
 
+#: When the fixture's PROBE reading was taken: one minute after
+#: BASELINE_MEASURED_AT, because a healthcheck reads the card AFTER the arm
+#: started.  Pinned for the same reason the baseline's stamp is -- and for
+#: one more, specific to this one: `render_table` prints it in the header
+#: line, so a stamp read off the live clock puts six microsecond digits into
+#: every rendering this module asserts over.
+FIXTURE_MEASURED_AT = _datetime.datetime(
+    2026, 8, 6, 9, 31, tzinfo=_datetime.UTC,
+).isoformat()
+
 
 def _baseline(
     used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
@@ -1592,6 +1602,49 @@ def test_the_report_is_stamped_with_an_aware_utc_timestamp():
 
     assert stamped.tzinfo is not None
     assert stamped.utcoffset() == _datetime.timedelta(0)
+
+
+def test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock():
+    """Both halves of the clock seam, on the function that owns it.
+
+    A test may pin the stamp, and a real run may not: a naive or stale
+    timestamp would make a dead artifact indistinguishable from a live one,
+    and proving a live run happened is this artifact's whole job.  Called
+    directly rather than through `_report()`, which exists to hide the very
+    argument under test.
+    """
+    injected = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+        now=lambda: FIXTURE_MEASURED_AT,
+    )
+
+    # The ROW too, not just the report: `run_healthcheck` stamps every ArmRow
+    # from the same local, so the seam has to reach that far to be worth
+    # anything to a test asserting over a rendering.
+    assert injected.measured_at == FIXTURE_MEASURED_AT
+    assert injected.arms[0].measured_at == FIXTURE_MEASURED_AT
+
+    default = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+    )
+
+    stamped = _datetime.datetime.fromisoformat(default.measured_at)
+
+    assert default.measured_at != FIXTURE_MEASURED_AT
+    assert stamped.tzinfo is not None
+    assert stamped.utcoffset() == _datetime.timedelta(0)
+    # DELIBERATELY loose.  This only has to tell a live reading from a stamp
+    # pinned ~40 days in the past, and a tight bound would re-introduce the
+    # very wall-clock coupling this seam exists to remove -- a slow runner or
+    # a container clock step would then fail a test about injection.
+    freshness = _datetime.datetime.now(_datetime.UTC) - stamped
+    assert abs(freshness) < _datetime.timedelta(seconds=300)
 
 
 def test_the_report_carries_a_gpu_identity_block():
