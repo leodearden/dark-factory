@@ -399,7 +399,10 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
 
     The per-turn budget defaults to routing.DEFAULT_PROBE_BUDGET_USD and must
     clear one turn of the most expensive probed model; a pair that aborts on
-    that ceiling is recorded as budget_too_low, never as unavailability.
+    that ceiling is recorded as budget_too_low, never as unavailability. Such
+    pairs are counted and warned about on stderr, and a run in which EVERY
+    probed pair aborted exits non-zero -- it produced no availability
+    evidence at all, so it must not read as a successful probe.
     """
     from datetime import UTC, datetime
 
@@ -431,6 +434,30 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     out_path.write_text(artifact)
 
     click.echo(f'Wrote model availability artifact to {out_path}')
+
+    # A POSITIVE but mis-sized ceiling passes the parse-time FloatRange check
+    # and still yields an artifact that is uniformly and plausibly wrong, so
+    # the artifact alone cannot be the only signal: an operator who never
+    # opens the YAML would read exit 0 as evidence the models are available.
+    # The artifact is written first either way -- budget_too_low rows are
+    # honest evidence about the BUDGET, and must not be discarded.
+    statuses = [status for row in report.accounts.values() for status in row.values()]
+    aborted = sum(1 for status in statuses
+                  if status == routing.PROBE_BUDGET_TOO_LOW_STATUS)
+    if aborted:
+        click.echo(
+            f'WARNING: {aborted} of {len(statuses)} (account, model) pairs aborted '
+            f'on the budget ceiling in force (--budget-usd {budget}); those rows are '
+            f'NOT availability evidence. Re-run with a higher --budget-usd.',
+            err=True,
+        )
+        if aborted == len(statuses):
+            click.echo(
+                'Error: every probed pair aborted on the budget ceiling — this run '
+                'produced no availability evidence.',
+                err=True,
+            )
+            sys.exit(1)
 
 
 @main.command('check-config')

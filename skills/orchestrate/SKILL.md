@@ -415,6 +415,8 @@ Per `(account, model)` pair, the artifact records one status (from `routing.clas
 | `budget_too_low` | the probe turn aborted on the local `--budget-usd` ceiling. The API accepted the request and consumed real tokens, so the model DID resolve for this account — the turn simply never completed. This is a mis-sized budget, NOT unavailability: re-run with a higher `--budget-usd` |
 | `error` | a classified failure outcome matching none of the rows above (not a raised exception — that's `invoke_error`; not a budget abort — that's `budget_too_low`) |
 
+A mis-sized but *positive* `--budget-usd` clears the parse-time check and still produces an artifact that is uniformly and plausibly wrong, so the command reports budget aborts itself rather than leaving them for whoever opens the YAML: any `budget_too_low` rows raise a stderr warning naming how many pairs aborted and the ceiling in force, and a run in which **every** probed pair aborted exits **non-zero** — it produced no availability evidence at all, so it must not read as a successful probe. The artifact is written either way, before the non-zero exit; `budget_too_low` rows are honest evidence about the budget and are not discarded.
+
 This artifact is the per-`(account, model)` availability evidence an admission decision consumes — including for `routing.FABLE_CANDIDATE_MODEL`, which the probe unions into its target set whether or not a config already admits it. Running the probe does not itself admit anything: admission is a per-config operator edit to that project's `routing.allowed_models`.
 
 ### Reading routing decisions

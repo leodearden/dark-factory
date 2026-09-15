@@ -58,13 +58,12 @@ DEFAULT_LADDER: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
 # The ADMITTED Fable literal: the string the live evals dispatch
 # (orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO) and the
-# one a live routing.allowed_models now carries. probe_models unions it into
-# its target set so the per-(account, model) availability evidence an
-# admission decision consumes exists even for a config that has not admitted
-# it. Previously 'claude-fable-5', a string no admission ruling names -- so
-# the default probe set never exercised the model actually under
-# consideration, and the artifact reported it unavailable everywhere
-# (task 5404).
+# one a live routing.allowed_models carries. INVARIANT: it must track
+# whatever string admission actually names -- probe_models unions it into its
+# target set so the per-(account, model) availability evidence an admission
+# decision consumes exists even for a config that has not admitted it, and a
+# value no admission ruling names makes that evidence vacuous. Pinned
+# referentially against the eval arm by test_routing.py, not just by eye.
 FABLE_CANDIDATE_MODEL: str = 'claude-fable-5-1'
 
 # Default path for the committed probe-models artifact, sibling of
@@ -79,22 +78,29 @@ DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
 # AgentResult.subtype the Claude CLI stamps when the local --max-budget-usd
 # ceiling fires: ``error_max_budget_usd``, WITH the ``_usd`` suffix -- not
 # ``error_max_budget`` (the same warning
-# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). Spelled here
-# per-package on purpose rather than imported from that module's private
-# name: this is a one-value constant, and an import would couple the routing
-# probe to an unrelated module's internals to save nothing.
+# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). This is a CLI
+# wire contract, so its canonical home is beside AgentResult in
+# ``shared.cli_invoke``, which every package that spells it already depends
+# on; consolidating the several per-package copies is filed follow-up work,
+# outside this module's scope.
 PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
 
-# Per-invocation USD ceiling probe_models forwards as max_budget_usd. This
-# was $0.05, which was too small to be a ceiling at all: a one-turn probe
-# still pays for the CLI's own preamble, and one claude-fable-5-1 turn
-# measures ~$0.15-0.25 that way, so EVERY fable probe aborted
-# error_max_budget_usd and the artifact reported fable unavailable on every
-# account when six of seven actually carry it (task 5404). $1.00 leaves ~4x
-# headroom over the most expensive probed model while staying a trivially
-# small per-(account, model) spend. It is a CEILING, not a spend: a probe
-# that completes normally still costs a single cheap turn.
+# Per-invocation USD ceiling probe_models forwards as max_budget_usd.
+# INVARIANT: it must clear one turn of the most expensive probed model. A
+# one-turn probe still pays for the CLI's own preamble, and one
+# FABLE_CANDIDATE_MODEL turn measures ~$0.15-0.25 that way, so a ceiling
+# below that aborts every such probe with PROBE_BUDGET_EXHAUSTED_SUBTYPE and
+# yields no availability evidence at all. $1.00 leaves ~4x headroom while
+# staying a trivially small per-(account, model) spend, and it is a CEILING,
+# not a spend: a probe that completes normally still costs one cheap turn.
 DEFAULT_PROBE_BUDGET_USD: float = 1.0
+
+# The status classify_probe_outcome returns for a turn that aborted on that
+# ceiling. Named because it is the one status crossing a module boundary:
+# `orchestrator probe-models` counts these rows to warn that the run produced
+# no availability evidence for them. The other statuses stay internal to this
+# module and the artifact it renders.
+PROBE_BUDGET_TOO_LOW_STATUS: str = 'budget_too_low'
 
 
 def _dedup_preserve_order(items: list[str]) -> list[str]:
@@ -121,31 +127,24 @@ class ProbeReport:
 def classify_probe_outcome(result: AgentResult) -> str:
     """Map one probe invocation's ``AgentResult`` to a probe status string.
 
-    A budget abort is checked FIRST, above everything else including the cap
-    tier: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
+    A budget abort is checked FIRST, above every other tier including cap
+    detection: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
     request and consumed real tokens, so the model resolved for this account
     and the account is NOT capped -- the distinction
-    ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. That explicit
-    subtype is positive, structured evidence, so it outranks every
-    string-heuristic tier below, and a budget-aborted turn is reported as
-    ``'budget_too_low'`` (raise the probe's ``budget_usd`` and re-run) rather
-    than as a broken model. Detection keys on the subtype ALONE, never on a
-    ``cost_usd >= budget_usd`` heuristic -- an agent can spend close to the
-    ceiling and then fail for an unrelated reason (the rule
-    ``orchestrator.dry_run_unblock::_is_budget_exhausted`` records).
+    ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. Detection keys
+    on that subtype ALONE, never on a ``cost_usd >= budget_usd`` heuristic:
+    an agent can spend close to the ceiling and then fail for an unrelated
+    reason (the rule ``orchestrator.dry_run_unblock::_is_budget_exhausted``
+    records).
 
     Otherwise the result is classified through ``classify_invocation`` and
     mapped: OK->available, ModelNotFound->unavailable, AuthFailed->auth_error,
     CapHit/NearCap->capped, else->error. This function owns the probe's
-    ``strict_confirm=False, backend='claude'`` classification regime so it is
-    spelled in exactly one place.
+    ``strict_confirm=False, backend='claude'`` regime so it is spelled in
+    exactly one place.
 
-    Pure -- reads only *result*, performs no I/O (``classify_invocation`` is
-    itself pure). Note the 'error' catch-all is only reachable via a
-    classified Failure; a raised exception from *invoke_fn* itself is handled
-    separately by ``probe_models``, as is an unresolvable account token --
-    those are the distinct ``'invoke_error'`` and ``'no_token'`` statuses,
-    assigned around this function rather than by it.
+    Pure -- reads only *result*. ``'invoke_error'`` and ``'no_token'`` are
+    assigned by ``probe_models`` around this function, never by it.
     """
     from shared.invocation_outcome import (
         OK,
@@ -157,7 +156,7 @@ def classify_probe_outcome(result: AgentResult) -> str:
     )
 
     if (result.subtype or '') == PROBE_BUDGET_EXHAUSTED_SUBTYPE:
-        return 'budget_too_low'
+        return PROBE_BUDGET_TOO_LOW_STATUS
 
     outcome = classify_invocation(result, strict_confirm=False, backend='claude')
     if isinstance(outcome, OK):

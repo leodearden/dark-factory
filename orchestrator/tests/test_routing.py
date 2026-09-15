@@ -30,6 +30,7 @@ from orchestrator.config import (
     UnblockAutoConfig,
     apply_reload,
 )
+from orchestrator.evals.reviewer_trial.variants import VARIANT_FABLE51_SOLO
 from orchestrator.routing import (
     DEFAULT_ALLOWED_MODELS,
     DEFAULT_PROBE_BUDGET_USD,
@@ -292,18 +293,22 @@ class TestProbeModelsTargetSet:
         assert report.models == ['opus']
         assert {call['model'] for call in cli.calls} == {'opus'}
 
-    def test_fable_candidate_is_the_admitted_literal_and_is_dispatched(self):
-        """The one place the fable model string is pinned. Both admission
-        rulings name 'claude-fable-5-1', so a future reader can re-check the
-        coupling rather than guess: D5 admitted it to the eval arm
-        (``orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO``,
-        ``model='claude-fable-5-1'``) and D6 admitted it to a live runtime
-        allowlist (``dark-factory-orchestrator.yaml``'s
-        ``routing.allowed_models``, commit 526e0eba99). Spelled as a LITERAL
-        here on purpose -- the rest of this module asserts symbolically
-        against the constant, so this test is what would catch the constant
-        being repointed away from admission again.
+    def test_fable_candidate_tracks_the_admitted_model_and_is_dispatched(self):
+        """The fable constant must track whatever string admission actually
+        NAMES -- the defect class this task exists to close, since a constant
+        that drifts away from admission silently probes a model nobody is
+        deciding about.
+
+        So the load-bearing assertion is REFERENTIAL, against the live eval
+        arm the admission ruling dispatches
+        (``orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO``):
+        it survives a future rename of the model string, and fails the moment
+        either side moves without the other. The literal below is a
+        readability anchor for a human reader, not the drift tripwire -- a
+        literal alone would just get hand-edited alongside the constant, which
+        is exactly how the constant went stale the first time.
         """
+        assert VARIANT_FABLE51_SOLO.reviewers[0].model == FABLE_CANDIDATE_MODEL
         assert FABLE_CANDIDATE_MODEL == 'claude-fable-5-1'
 
         accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
@@ -633,16 +638,22 @@ def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
     )
 
 
-def _install_capturing_probe_models(monkeypatch, report: ProbeReport) -> list[dict]:
-    """Monkeypatch routing.probe_models with a fake that records each call's
-    keyword arguments and returns *report*, and hand back the list it records
-    into.
+def _invoke_probe_models_cli(monkeypatch, tmp_path, report: ProbeReport,
+                             extra_args: list[str] | None = None):
+    """Run `orchestrator probe-models` network-free against a hermetic config,
+    with routing.probe_models stubbed to record every call's arguments and
+    return *report*.
 
-    Same stub shape as the two tests above, widened to capture ``budget_usd``.
-    Written once so the budget tests below all read the forwarded value the
-    same way -- including the parse-time rejection test, whose whole assertion
-    is that this list stays EMPTY.
+    Returns ``(CliRunner result, recorded calls, artifact path)``. Every
+    probe-models CLI test below drives the command through this one seam, so
+    the stub shape and the argv shape are each spelled exactly once -- a test
+    asserting on what was FORWARDED reads ``calls``, one asserting on what was
+    WRITTEN reads the returned path. The recorded list staying EMPTY is itself
+    the assertion for a parse-time rejection.
     """
+    fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
+    monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
+
     calls: list[dict] = []
 
     async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
@@ -653,7 +664,18 @@ def _install_capturing_probe_models(monkeypatch, report: ProbeReport) -> list[di
         return report
 
     monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
-    return calls
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+    out_path = tmp_path / 'model-availability.yaml'
+
+    result = CliRunner().invoke(main, [
+        'probe-models',
+        '--config', str(cfg_file),
+        '--output', str(out_path),
+        *(extra_args or []),
+    ])
+    return result, calls, out_path
 
 
 class TestProbeModelsCliBudgetOption:
@@ -667,22 +689,11 @@ class TestProbeModelsCliBudgetOption:
     """
 
     def _run(self, monkeypatch, tmp_path, extra_args: list[str]):
-        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
-        probe_calls = _install_capturing_probe_models(
-            monkeypatch,
+        result, probe_calls, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
             ProbeReport(models=['haiku'], accounts={'max-x': {'haiku': 'available'}}),
+            extra_args,
         )
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-
-        result = CliRunner().invoke(main, [
-            'probe-models',
-            '--config', str(cfg_file),
-            '--output', str(tmp_path / 'model-availability.yaml'),
-            *extra_args,
-        ])
         return result, probe_calls
 
     def test_default_budget_is_the_routing_constant(self, monkeypatch, tmp_path):
@@ -710,40 +721,94 @@ class TestProbeModelsCliBudgetOption:
         assert probe_calls == [], 'a rejected ceiling must never reach probe_models'
 
 
+class TestProbeModelsCliBudgetAbortWarning:
+    """The half of the defect a parse-time check cannot catch: a POSITIVE but
+    mis-sized ceiling. `--budget-usd 0.05` -- the exact value that caused this
+    bug -- clears FloatRange, so every fable pair records 'budget_too_low' and
+    the command would otherwise print 'Wrote ...' and exit 0. The artifact is
+    honest to whoever opens the YAML; the operator who RAN the probe must not
+    have to open it to learn the run produced no availability evidence.
+    """
+
+    def test_budget_aborts_are_counted_and_warned_on_stderr(self, monkeypatch, tmp_path):
+        result, _, out_path = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', FABLE_CANDIDATE_MODEL],
+                accounts={
+                    'max-x': {'haiku': 'available',
+                              FABLE_CANDIDATE_MODEL: 'budget_too_low'},
+                    'max-y': {'haiku': 'available',
+                              FABLE_CANDIDATE_MODEL: 'budget_too_low'},
+                },
+            ),
+            ['--budget-usd', '0.05'],
+        )
+
+        # Partial evidence is still evidence: a run with SOME usable rows
+        # succeeds and keeps its artifact -- the warning is the signal here,
+        # not a failure exit.
+        assert result.exit_code == 0, result.output
+        assert out_path.exists()
+        assert 'WARNING' in result.stderr
+        # The count and the ceiling that produced it, so the remedy needs no
+        # second command to work out.
+        assert '2 of 4' in result.stderr
+        assert '0.05' in result.stderr
+        assert '--budget-usd' in result.stderr
+        # On stderr, so redirecting stdout to a file cannot swallow it.
+        assert 'WARNING' not in result.stdout
+
+    def test_clean_run_warns_about_nothing(self, monkeypatch, tmp_path):
+        result, _, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(models=['haiku'], accounts={'max-x': {'haiku': 'available'}}),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == '', 'a clean probe must stay quiet on stderr'
+
+    def test_a_wholly_aborted_run_exits_non_zero_and_still_writes_the_artifact(
+            self, monkeypatch, tmp_path):
+        """When EVERY probed pair aborted, the run yielded no availability
+        evidence whatsoever, so exit 0 would be a lie to any script gating on
+        it. The artifact is still written first: 'budget_too_low' rows are
+        honest evidence about the BUDGET, and discarding them would leave the
+        operator with neither the rows nor a way to see what went wrong.
+        """
+        result, _, out_path = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', FABLE_CANDIDATE_MODEL],
+                accounts={'max-x': {'haiku': 'budget_too_low',
+                                    FABLE_CANDIDATE_MODEL: 'budget_too_low'}},
+            ),
+            ['--budget-usd', '0.05'],
+        )
+
+        assert result.exit_code != 0
+        assert '2 of 2' in result.stderr
+
+        assert out_path.exists(), 'the artifact must survive the non-zero exit'
+        parsed = yaml.safe_load(out_path.read_text())
+        assert parsed['accounts']['max-x'][FABLE_CANDIDATE_MODEL] == 'budget_too_low'
+
+
 class TestProbeModelsCli:
     def test_writes_artifact_with_fable_row_and_exits_zero(self, monkeypatch, tmp_path):
-        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
-
-        scripted_report = ProbeReport(
-            models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
-            accounts={
-                'max-x': {
-                    'haiku': 'available',
-                    'sonnet': 'available',
-                    FABLE_CANDIDATE_MODEL: 'available',
+        result, probe_calls, output_file = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(
+                models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
+                accounts={
+                    'max-x': {
+                        'haiku': 'available',
+                        'sonnet': 'available',
+                        FABLE_CANDIDATE_MODEL: 'available',
+                    },
                 },
-            },
+            ),
         )
-        probe_calls: list[dict] = []
-
-        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
-            probe_calls.append({
-                'accounts': accounts, 'allowed_models': allowed_models, 'models': models,
-            })
-            return scripted_report
-
-        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-        output_file = tmp_path / 'model-availability.yaml'
-
-        result = CliRunner().invoke(main, [
-            'probe-models',
-            '--config', str(cfg_file),
-            '--output', str(output_file),
-        ])
 
         assert result.exit_code == 0, result.output
         assert output_file.exists(), 'expected the artifact file to be written at --output'
@@ -758,27 +823,11 @@ class TestProbeModelsCli:
         assert [a.name for a in probe_calls[0]['accounts']] == ['max-x']
 
     def test_models_option_is_forwarded_to_probe_models(self, monkeypatch, tmp_path):
-        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
-
-        probe_calls: list[list[str] | None] = []
-
-        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
-            probe_calls.append(models)
-            return ProbeReport(models=models or [], accounts={})
-
-        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
-
-        cfg_file = tmp_path / 'config.yaml'
-        cfg_file.write_text('')
-        output_file = tmp_path / 'model-availability.yaml'
-
-        result = CliRunner().invoke(main, [
-            'probe-models',
-            '--config', str(cfg_file),
-            '--output', str(output_file),
-            '--models', 'opus,haiku',
-        ])
+        result, probe_calls, _ = _invoke_probe_models_cli(
+            monkeypatch, tmp_path,
+            ProbeReport(models=['opus', 'haiku'], accounts={}),
+            ['--models', 'opus,haiku'],
+        )
 
         assert result.exit_code == 0, result.output
-        assert probe_calls == [['opus', 'haiku']]
+        assert [call['models'] for call in probe_calls] == [['opus', 'haiku']]
