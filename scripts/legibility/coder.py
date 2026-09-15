@@ -106,7 +106,27 @@ class CoderInvocationError(Exception):
     with one plain cause was investigated as twenty causeless failures.
     A diagnostic the process EMITTED must never be dropped on the floor
     because it arrived on the less-expected stream.
+
+    The same two tails are ALSO carried as structured ``stdout``/``stderr``
+    attributes, beside the formatted message rather than only inside it.
+    ``account_pool``'s failover path feeds them to the gate's strict
+    detector, ``InvokeSlot.detect_cap_hit(stderr, result_text)``, which takes
+    the streams as two distinct arguments; recovering them by re-parsing
+    ``stdout={!r} stderr={!r}`` back out of the message would be an ad-hoc
+    parser over a meaningful string (docs/code-quality.md heuristic 12) and
+    would couple account failover to wording that exists for humans reading
+    journals. ``CoderCapExhausted.marker`` is the established precedent for
+    a typed attribute on this hierarchy. Both default to ``''`` -- the
+    timeout and never-started arms have no streams to carry -- so every
+    consumer can read them unconditionally instead of guarding with
+    ``hasattr``, which would silently read a regression as "no banner" and
+    never rotate the account.
     """
+
+    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class CoderCapExhausted(CoderInvocationError):
@@ -137,8 +157,10 @@ class CoderCapExhausted(CoderInvocationError):
     ``cap_exhausted:`` cell from a reported mean rather than scoring it 0.0.
     """
 
-    def __init__(self, message: str, *, marker: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, marker: str, stdout: str = "", stderr: str = "",
+    ) -> None:
+        super().__init__(message, stdout=stdout, stderr=stderr)
         self.marker = marker
 
 
@@ -517,8 +539,10 @@ def _invoke_cli(
         # function and scan what comes BACK" -- working unchanged.
         marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
         if marker:
-            raise CoderCapExhausted(message, marker=marker)
-        raise CoderInvocationError(message)
+            raise CoderCapExhausted(
+                message, marker=marker, stdout=stdout_tail, stderr=stderr_tail,
+            )
+        raise CoderInvocationError(message, stdout=stdout_tail, stderr=stderr_tail)
 
     return proc.stdout
 
