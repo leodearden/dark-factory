@@ -2556,6 +2556,140 @@ kill "$SPB_HELPER_PID" 2>/dev/null || true
 wait "$SPB_HELPER_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
 
+# ── S-age: an ASSIGNED record too OLD to believe is downgraded (task 5504) ────
+# The chronic half of the same defect, on the ORDINARY (non-emergency) path.
+#
+# THE PRODUCER. A lane record is stranded `assigned` whenever the transition
+# that should have cleared it never landed — the ENOSPC-at-release swallow, or
+# a task that is still pending/in-progress/blocked and so is skipped BY DESIGN
+# by harness.py's terminal-status reclaim. dark-factory already knows about
+# such lanes: _stale_lane_assignment_census bounds exactly this field
+# (`updated_at`) by exactly this predicate (age > a days threshold) and prints
+# them under the digest's `## Stale lane assignments`. It is report-only by
+# explicit design, so the age bound terminated in a digest line and never in a
+# reclaim. This block pins the bound REUSED rather than re-derived: same field,
+# same predicate, same documented handling of an unreadable value — different
+# ACTION.
+#
+# Nothing here has a live process reference and every <lane>.lock is FREE, with
+# no --extra-protect-glob, so neither the /proc gate nor the flock nor a glob
+# can account for any outcome observed. The ONLY variable is record age.
+echo ""
+echo "--- Block S-age: the record's updated_at bounds an ASSIGNED preserve (task 5504) ---"
+
+# 400 days against a 14-day default leaves a ~386-day margin, so no clock skew
+# and no pass duration can flip the verdict. Computed ONCE so all three
+# sub-cases judge the same record.
+SA_STALE_TS="$(date -u -d '-400 days' +%Y-%m-%dT%H:%M:%S.000000+00:00)"
+
+# _make_sa_fixture <root>
+# The three-lane fixture all three sub-cases share, built identically each time
+# so the flag/env knob under test is the only variable between them.
+_make_sa_fixture() {
+    local root="$1"
+    mkdir -p "$root/worktrees" "$root/base"
+    make_repo "$root/repo"
+    mkdir -p "$root/base/target.gen.1"
+    touch "$root/base/target.gen.1.lock"
+    ln -sfn "$root/base/target.gen.1" "$root/base/target"
+    local _sa_name
+    for _sa_name in _lane-1 _lane-2 _lane-3; do
+        git -C "$root/repo" worktree add -q "$root/worktrees/$_sa_name"
+        mkdir -p "$root/worktrees/$_sa_name/target"
+        touch "$root/worktrees/$_sa_name/target/DIVERGENT_MARKER"
+    done
+    # _lane-1: stale, via make_lane_state's 6th argument (the branch argument is
+    # empty, the shape an unassigned-branch record carries).
+    make_lane_state "$root/worktrees" _lane-1 assigned 5504 '' "$SA_STALE_TS"
+    # _lane-2: the factory's default — stamped NOW. The discrimination control.
+    make_lane_state "$root/worktrees" _lane-2 assigned 5505
+    make_lane_state "$root/worktrees" _lane-3 released
+    _seed_stub_body > "$root/seed_stub.sh"
+    chmod +x "$root/seed_stub.sh"
+}
+
+# ── S-age-fires: the bound acts, and acts on ONE lane ─────────────────────────
+SAF_ROOT="$(mktemp -d /tmp/test-gc-saf-XXXXXX)"
+_TMPDIRS+=("$SAF_ROOT")
+_make_sa_fixture "$SAF_ROOT"
+export SEED_LOG="$SAF_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAF_ROOT/worktrees" \
+    --base-target "$SAF_ROOT/base/target" \
+    --seed-script "$SAF_ROOT/seed_stub.sh" \
+    --main-ref main
+
+assert "S-age1: exit 0" test "$RC" -eq 0
+assert "S-age2: the stale assigned _lane-1 IS reset (the seed stub ran for it and its marker is gone)" \
+    bash -c 'test -f "$1" && grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$SAF_ROOT/seed_calls.log" "$SAF_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age3: stderr names _lane-1's downgrade with the record's own timestamp and the effective bound" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-1: record updated_at=$2 is 400d old, past the --max-record-age-days 14 bound"' _ "$ERR_OUT" "$SA_STALE_TS"
+assert "S-age4: ...and the downgraded lane does NOT also print the ordinary assigned-preserve line" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504"' _ "$ERR_OUT"
+# DISCRIMINATION, not a blanket expiry: the two assigned lanes differ ONLY in
+# their record's timestamp, and they take opposite branches in ONE pass.
+assert "S-age5: the fresh assigned _lane-2 is PRESERVED with Block S's existing wording" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5505 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age6: ...and its divergent marker is intact (the seed stub never ran for it)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$SAF_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER" "$SAF_ROOT/seed_calls.log"
+assert "S-age7: released _lane-3 still resets (non-vacuity: the pass ran the reset branch)" \
+    bash -c 'grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SAF_ROOT/seed_calls.log" "$SAF_ROOT/worktrees/_lane-3/target/DIVERGENT_MARKER"
+assert "S-age8: summary reports reset=2 with the two assigned lanes split 1 preserved / 1 downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=2 removed=0 preserved=1 preserved_live_ref=0 preserved_assigned=1 downgraded_assigned=1"' _ "$OUT"
+
+# ── S-age-disabled: 0 is the documented escape hatch ──────────────────────────
+# An operator who wants pre-5504 behaviour must have a way to get it that is
+# explicit and visible in the invocation, not a source edit.
+SAD_ROOT="$(mktemp -d /tmp/test-gc-sad-XXXXXX)"
+_TMPDIRS+=("$SAD_ROOT")
+_make_sa_fixture "$SAD_ROOT"
+export SEED_LOG="$SAD_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAD_ROOT/worktrees" \
+    --base-target "$SAD_ROOT/base/target" \
+    --seed-script "$SAD_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --max-record-age-days 0
+
+assert "S-age9: exit 0 under --max-record-age-days 0" test "$RC" -eq 0
+assert "S-age10: with the bound disabled the 400-day-stale _lane-1 is PRESERVED again" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age11: ...and its divergent marker is intact (0 really means no bound, not a large one)" \
+    test -f "$SAD_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age12: summary reports both assigned lanes preserved and none downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+# ── S-age-env: the knob is wired as every sibling REIFY_WARM_LANE_GC_* is ─────
+# The flag's default comes from the env var, so a deployment can widen the bound
+# without editing the sweep's argv. Asserted with a value that CHANGES the
+# verdict (1000 > 400), so a knob that were read but ignored goes red.
+SAE_ROOT="$(mktemp -d /tmp/test-gc-sae-XXXXXX)"
+_TMPDIRS+=("$SAE_ROOT")
+_make_sa_fixture "$SAE_ROOT"
+export SEED_LOG="$SAE_ROOT/seed_calls.log"
+export REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=1000
+
+run_helper reclaim \
+    --worktrees-dir "$SAE_ROOT/worktrees" \
+    --base-target "$SAE_ROOT/base/target" \
+    --seed-script "$SAE_ROOT/seed_stub.sh" \
+    --main-ref main
+
+unset REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS
+
+assert "S-age13: exit 0 under REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=1000" test "$RC" -eq 0
+assert "S-age14: a 1000-day bound preserves the 400-day-stale _lane-1 (the env knob is the flag's default)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age15: ...and its divergent marker is intact" \
+    test -f "$SAE_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age16: summary reports both assigned lanes preserved and none downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block X — the PROTECT_GLOB default is RENDERED from dark-factory's registry
 # (task 3292)
