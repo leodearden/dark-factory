@@ -299,17 +299,21 @@ class TestProbeModelsTargetSet:
         that drifts away from admission silently probes a model nobody is
         deciding about.
 
-        So the load-bearing assertion is REFERENTIAL, against the live eval
-        arm the admission ruling dispatches
+        So the assertion is REFERENTIAL, against the live eval arm the
+        admission ruling dispatches
         (``orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO``):
-        it survives a future rename of the model string, and fails the moment
-        either side moves without the other. The literal below is a
-        readability anchor for a human reader, not the drift tripwire -- a
-        literal alone would just get hand-edited alongside the constant, which
-        is exactly how the constant went stale the first time.
+        it survives a future rename of the model string and fails the moment
+        either side moves without the other.
+
+        No verbatim ``== 'claude-fable-5-1'`` pin accompanies it. Against a
+        constant with a single definition such a pin is tautological -- it
+        compares the constant to a copy of its own definition, so it cannot
+        fail on a regression and only fires on a deliberate rename that must
+        edit the test in lockstep anyway. That lockstep edit is precisely how
+        the constant went stale the first time, so the literal would document
+        the drift rather than catch it.
         """
         assert VARIANT_FABLE51_SOLO.reviewers[0].model == FABLE_CANDIDATE_MODEL
-        assert FABLE_CANDIDATE_MODEL == 'claude-fable-5-1'
 
         accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
         cli = _ScriptedProbeCli()
