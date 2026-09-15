@@ -2409,6 +2409,153 @@ assert "S22: ...and preserved for the RIGHT reason (the record, read at gate tim
 assert "S23: summary reset=1 with the preserve attributed to the record gate" \
     bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
 
+# ── S-pressure: --disk-pressure DOWNGRADES the record gate (task 5504) ────────
+# Block K5 pins one half of the "before BOTH reset branches" contract: under
+# --disk-pressure the LIVE-REFERENCE gate still fires. This is the other half,
+# and it is the half the composition in task 5504 turns on.
+#
+# THE DEFECT. The record gate `continue`d unconditionally on ASSIGNED, and it
+# sits BEFORE the --disk-pressure branch. So a lane whose durable record says
+# `assigned` was unreachable by the emergency rm — including a lane that is
+# assigned ONLY because the release that should have cleared the record hit
+# ENOSPC and WarmLanePool._note_released_durable swallowed the OSError
+# (fail-open release, invariant I3). That composition holds the ENOSPC valve
+# shut with the very failure it exists to respond to, and it does so on the
+# UNATTENDED path: warm-lane-gc-sweep.sh measures `df -B1 --output=avail` once
+# per sweep and APPENDS --disk-pressure below the critical floor.
+#
+# THE CONTRACT. --disk-pressure downgrades the record gate to
+# warn-and-fall-through. "Downgrade" means FALL THROUGH, never "reclaim
+# outright": the lane still meets the live-reference gate, so the emergency
+# trades an AUTHORITATIVE preserve for a PROBED one, not for none. Arm A is the
+# emergency; Arm B is the SAME fixture without the flag, proving the change is
+# scoped to the emergency path and Block S's ordinary contract is untouched.
+#
+# DF-faithful throughout: every <lane>.lock FREE and NO --extra-protect-glob, so
+# neither the flock nor a protect glob can account for any preservation seen.
+echo ""
+echo "--- Block S-pressure: --disk-pressure downgrades the record gate (task 5504) ---"
+
+# _make_sp_fixture <root-var-prefix-dir>
+# Builds the three-lane fixture both arms share, into the directory given.
+# A function, not a copy-paste: the two arms MUST be identical apart from the
+# flag, or the discrimination the block claims is not discrimination.
+_make_sp_fixture() {
+    local root="$1"
+    mkdir -p "$root/worktrees" "$root/base"
+    make_repo "$root/repo"
+    mkdir -p "$root/base/target.gen.1"
+    touch "$root/base/target.gen.1.lock"
+    ln -sfn "$root/base/target.gen.1" "$root/base/target"
+    local _sp_name
+    for _sp_name in _lane-1 _lane-2 _lane-3; do
+        git -C "$root/repo" worktree add -q "$root/worktrees/$_sp_name"
+        mkdir -p "$root/worktrees/$_sp_name/target"
+        touch "$root/worktrees/$_sp_name/target/DIVERGENT_MARKER"
+    done
+    # Both assigned records are FRESH (the factory stamps NOW), so nothing in
+    # this block can be explained by the staleness bound — the only variable
+    # between the two arms is --disk-pressure.
+    make_lane_state "$root/worktrees" _lane-1 assigned 5504
+    make_lane_state "$root/worktrees" _lane-2 assigned 5505
+    make_lane_state "$root/worktrees" _lane-3 released
+    _seed_stub_body > "$root/seed_stub.sh"
+    chmod +x "$root/seed_stub.sh"
+}
+
+# ── Arm A: WITH --disk-pressure ───────────────────────────────────────────────
+SPA_ROOT="$(mktemp -d /tmp/test-gc-spa-XXXXXX)"
+_TMPDIRS+=("$SPA_ROOT")
+_make_sp_fixture "$SPA_ROOT"
+
+# _lane-2 also carries a live cwd holder, established causally (technique R, no
+# wall-clock sleep) exactly as K5 does. It is the lane that proves the downgrade
+# hands the record's verdict to the /proc gate rather than discarding it.
+SPA_READY="$SPA_ROOT/lane2-holder.ready"
+( cd "$SPA_ROOT/worktrees/_lane-2/target" && touch "$SPA_READY" && exec sleep 300 ) &
+SPA_HELPER_PID=$!
+_BGPIDS+=("$SPA_HELPER_PID")
+_wait_for_reader_lock "$SPA_READY" 30
+
+export SEED_LOG="$SPA_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SPA_ROOT/worktrees" \
+    --base-target "$SPA_ROOT/base/target" \
+    --seed-script "$SPA_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --disk-pressure
+
+assert "S-pressure1: exit 0" test "$RC" -eq 0
+assert "S-pressure2: assigned _lane-1 target/ DELETED (the record gate was downgraded and the rm branch was reached)" \
+    bash -c '[ ! -d "$1" ]' _ "$SPA_ROOT/worktrees/_lane-1/target"
+assert "S-pressure3: stderr names _lane-1's downgrade and attributes it to --disk-pressure" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-1: --disk-pressure emergency override"' _ "$ERR_OUT"
+assert "S-pressure4: ...and the downgraded lane does NOT also print the ordinary assigned-preserve line" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504"' _ "$ERR_OUT"
+# THE LOAD-BEARING HALF. Downgrade means fall through, not reclaim: _lane-2 is
+# assigned AND live-referenced, and the emergency must still stop at the /proc
+# gate. If this goes red the valve has become a wipe.
+assert "S-pressure5: live-referenced _lane-2 target/ SURVIVES (downgrade falls through to the live-reference gate, it does not reclaim outright)" \
+    test -d "$SPA_ROOT/worktrees/_lane-2/target"
+assert "S-pressure6: live-referenced _lane-2 divergent marker intact (nothing under it was deleted)" \
+    test -f "$SPA_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER"
+assert "S-pressure7: ...and _lane-2's preserve is attributed to the /proc gate, the backstop the downgrade hands it to" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: live consumer (process reference)"' _ "$ERR_OUT"
+assert "S-pressure8: released _lane-3 target/ DELETED (non-vacuity: the pass really ran the rm branch)" \
+    bash -c '[ ! -d "$1" ]' _ "$SPA_ROOT/worktrees/_lane-3/target"
+assert "S-pressure9: the seed stub was NOT invoked for any lane (the disk-pressure branch has no α fallback)" \
+    bash -c '[ ! -s "$1" ]' _ "$SPA_ROOT/seed_calls.log"
+# Full adjacent tail, the way S11 does it: pins BOTH downgraded_assigned's value
+# AND that it was APPENDED after preserved_assigned rather than interposed.
+assert "S-pressure10: summary APPENDS downgraded_assigned=2 after preserved_assigned (never interposed)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=2 removed=0 preserved=1 preserved_live_ref=1 preserved_assigned=0 downgraded_assigned=2"' _ "$OUT"
+
+kill "$SPA_HELPER_PID" 2>/dev/null || true
+wait "$SPA_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── Arm B: the SAME fixture, WITHOUT --disk-pressure ──────────────────────────
+# The control that proves the downgrade is scoped to the emergency path. Every
+# byte of the fixture is identical (same factory function); the flag is the only
+# difference, so any divergence in outcome is attributable to it alone.
+SPB_ROOT="$(mktemp -d /tmp/test-gc-spb-XXXXXX)"
+_TMPDIRS+=("$SPB_ROOT")
+_make_sp_fixture "$SPB_ROOT"
+
+SPB_READY="$SPB_ROOT/lane2-holder.ready"
+( cd "$SPB_ROOT/worktrees/_lane-2/target" && touch "$SPB_READY" && exec sleep 300 ) &
+SPB_HELPER_PID=$!
+_BGPIDS+=("$SPB_HELPER_PID")
+_wait_for_reader_lock "$SPB_READY" 30
+
+export SEED_LOG="$SPB_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SPB_ROOT/worktrees" \
+    --base-target "$SPB_ROOT/base/target" \
+    --seed-script "$SPB_ROOT/seed_stub.sh" \
+    --main-ref main
+
+assert "S-pressure11: exit 0" test "$RC" -eq 0
+assert "S-pressure12: off the emergency path _lane-1 is PRESERVED with Block S's existing wording" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-pressure13: ...and its target/ and divergent marker are intact" \
+    test -f "$SPB_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER" -a -f "$SPB_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-pressure14: _lane-2 preserved by the RECORD gate, not the /proc gate (record is still checked first off the emergency path)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5505 (state=assigned)"' _ "$ERR_OUT"
+assert "S-pressure15: no downgrade was reported for any lane" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "downgrading record gate"' _ "$ERR_OUT"
+assert "S-pressure16: released _lane-3 still resets via the seed stub (the α branch, not the rm branch)" \
+    bash -c 'test -f "$1" && grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SPB_ROOT/seed_calls.log" "$SPB_ROOT/worktrees/_lane-3/target/DIVERGENT_MARKER"
+assert "S-pressure17: summary reports preserved_assigned=2 downgraded_assigned=0 (Block S's contract, untouched off the emergency path)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 removed=0 preserved=2 preserved_live_ref=0 preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+kill "$SPB_HELPER_PID" 2>/dev/null || true
+wait "$SPB_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block X — the PROTECT_GLOB default is RENDERED from dark-factory's registry
 # (task 3292)
