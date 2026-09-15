@@ -2363,15 +2363,20 @@ ST_SEED_STUB="$ST_ROOT/seed_stub.sh"
 # The trigger stub: behaves like _seed_stub_body for every lane, and
 # ADDITIONALLY, when invoked for _lane-1, reassigns _lane-2 before returning.
 # The record is written in the SAME byte shape make_lane_state emits, so the
-# fixture and the mid-pass mutation cannot disagree about the record format.
+# fixture and the mid-pass mutation cannot disagree about the record format --
+# including updated_at, which the stub takes from $TOCTOU_UPDATED_AT stamped
+# from the same clock the factory uses. A frozen past literal here would read
+# as STALE to the Pass-1 record gate's age bound (task 5504) and the mid-pass
+# reassignment would be downgraded rather than honoured, which is the opposite
+# of what S21-S23 exist to pin.
 cat > "$ST_SEED_STUB" << 'STUB_EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$SEED_LOG"
 LANE_DIR="$2"
 rm -rf "$LANE_DIR/target/DIVERGENT_MARKER" 2>/dev/null || true
 if [ "${LANE_DIR##*/}" = "_lane-1" ]; then
-    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
-        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" \
+    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "%s"\n}' \
+        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" "$TOCTOU_UPDATED_AT" \
         > "$TOCTOU_STATE_DIR/_lane-2.json"
 fi
 exit 0
@@ -2381,6 +2386,7 @@ chmod +x "$ST_SEED_STUB"
 export SEED_LOG="$ST_SEED_LOG"
 export TOCTOU_STATE_DIR="$ST_WORKTREES/.lane-state"
 export TOCTOU_TASK_ID="5334"
+export TOCTOU_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%S.000000+00:00)"
 
 run_helper reclaim \
     --worktrees-dir "$ST_WORKTREES" \
@@ -2388,7 +2394,7 @@ run_helper reclaim \
     --seed-script "$ST_SEED_STUB" \
     --main-ref main
 
-unset TOCTOU_STATE_DIR TOCTOU_TASK_ID
+unset TOCTOU_STATE_DIR TOCTOU_TASK_ID TOCTOU_UPDATED_AT
 
 # Non-vacuity: without S20 the whole sub-case could pass because the stub never
 # ran and the mutation never fired.
