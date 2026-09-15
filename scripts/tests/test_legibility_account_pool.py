@@ -8,9 +8,9 @@ pool turns the gate's roster into the ``(prompt, model) -> str`` callable
 the seam already speaks.
 
 THE FAKE GATE IS THE POINT, not a shortcut. ``account_pool`` depends on
-five methods of the real 3004-line ``UsageGate`` — ``try_lease``,
-``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete`` and
-``release_probe_slot`` — and stating exactly those here is how the test
+six members of the real 3004-line ``UsageGate`` — ``try_lease``,
+``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete``,
+``release_probe_slot`` and ``account_count`` — and stating exactly those here is how the test
 says what the interface IS rather than reaching through it into gate
 internals (docs/code-quality.md: tests that reach a module's internals are
 an interface-design smell). The leases it hands out are REAL
@@ -43,7 +43,7 @@ class FakeAccount:
 
 
 class FakeGate:
-    """Exactly the five methods ``account_pool`` calls, and nothing else.
+    """Exactly the six members ``account_pool`` calls, and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
     ``reverse`` knob; ``detect_cap_hit`` reproduces the STRICT detector's
@@ -86,6 +86,10 @@ class FakeGate:
             if acct.token == oauth_token:
                 acct.capped = True
         return True
+
+    @property
+    def account_count(self):
+        return len(self.accounts)
 
     # -- settle surface ----------------------------------------------------
     def confirm_account_ok(self, oauth_token):

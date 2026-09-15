@@ -17,8 +17,9 @@ while six live accounts sat idle — and the deferral was indistinguishable
 from a genuinely exhausted fleet.
 
 THE NARROW INTERFACE IT CONSUMES, and the only reason it can live outside
-``shared``: five gate methods, all synchronous — ``try_lease`` (the sync,
+``shared``: six gate members, all synchronous — ``try_lease`` (the sync,
 non-blocking selection knob added for exactly this caller),
+``account_count`` (how the exhaustion reason says WHICH exhaustion), and
 ``detect_cap_hit`` / ``confirm_account_ok`` / ``on_agent_complete`` /
 ``release_probe_slot`` (reached through the real ``InvokeSlot``, whose
 constructor is a plain ``def``; ``UsageGate.invoke_slot`` is async only
@@ -61,6 +62,37 @@ _DEFAULT_INVOKE = coder._invoke_cli
 Captured as a module constant rather than spelled as a default argument so
 the wiring is assertable without calling it -- a test that had to INVOKE
 the default to discover it would be spawning a real `claude`."""
+
+
+_EXHAUSTED_MARKER = "pool exhausted"
+"""Marker carried by the pool's own CoderCapExhausted.
+
+``CoderCapExhausted.marker`` names the signal that fired, so a deferral
+reason can quote WHICH one. A per-digest cap quotes the banner phrase the
+CLI printed; this one is not a banner at all -- it is the gate reporting
+that no account remains -- and saying so is the honest spelling."""
+
+
+def _exhaustion_reason(gate) -> str:
+    """Say WHICH exhaustion this is, because the two need different
+    operator responses.
+
+    "all N pool accounts capped" self-clears at the weekly reset and is
+    expected weather (task 4503). "no pool accounts resolved" is a config
+    fault that will never clear on its own -- it is the state
+    ``UsageGate._init_accounts`` degrades to when no token env var resolves,
+    which is also the state whose silent fallback to ``~/.claude`` this task
+    exists to remove. Folding the second into the first would send an
+    operator to wait for a reset that never comes.
+    """
+    count = gate.account_count
+    if not count:
+        return (
+            "no pool accounts resolved — check that the unit's EnvironmentFile "
+            "supplies the CLAUDE_OAUTH_TOKEN_* vars named in "
+            "config/usage-accounts.yaml"
+        )
+    return f"all {count} pool accounts capped"
 
 
 def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
@@ -127,6 +159,11 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     def invoke_through_pool(prompt: str, model: str) -> str:
         while True:
             lease = gate.try_lease(reverse=reverse)
+            if lease is None:
+                raise coder.CoderCapExhausted(
+                    f"legibility trickle: {_exhaustion_reason(gate)}",
+                    marker=_EXHAUSTED_MARKER,
+                )
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
