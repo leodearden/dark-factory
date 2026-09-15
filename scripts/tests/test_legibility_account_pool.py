@@ -651,6 +651,7 @@ def test_subprocess_env_carries_a_pool_token_and_strips_the_api_key(monkeypatch)
 
     env = mod.subprocess_env(gate)
 
+    assert env is not None, "two live accounts must yield an env"
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-max-h", (
         "the census draws from the END of the roster like the rest of the "
         "trickle, so it does not contend with the orchestrator's b->h order"
@@ -668,6 +669,7 @@ def test_subprocess_env_skips_a_capped_account():
 
     env = mod.subprocess_env(gate)
 
+    assert env is not None
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-max-b"
 
 
@@ -685,6 +687,7 @@ def test_subprocess_env_never_keeps_the_probe_claim():
 
     env = mod.subprocess_env(gate)
 
+    assert env is not None
     assert gate.released == [env["CLAUDE_CODE_OAUTH_TOKEN"]]
 
 
