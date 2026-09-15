@@ -748,7 +748,12 @@ def render_json(result: AuditResult) -> str:
         },
         'routing_decisions': asdict(result.routing),
         'invocations': [asdict(r) for r in result.invocations],
-        'steward_tier_escalation': {
+        # Named for the DATA — a role-agnostic view over routing.selections at
+        # tier >= 1 — not for the steward rule that motivated it, so a JSON
+        # consumer auditing another role's admission does not read its own
+        # dispatches under a key naming someone else's. Matches both the
+        # AuditResult property and the markdown heading.
+        'tier_escalation': {
             'exercised': bool(result.tier_escalations),
             'dispatches': [asdict(s) for s in result.tier_escalations],
         },

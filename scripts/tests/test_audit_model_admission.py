@@ -947,7 +947,7 @@ def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     payload = json.loads(audit_model_admission.render_json(_audit(live_shaped_db)))
 
     assert set(payload) == {
-        'meta', 'routing_decisions', 'invocations', 'steward_tier_escalation',
+        'meta', 'routing_decisions', 'invocations', 'tier_escalation',
         'scoped_cap', 'spend', 'role_containment',
     }
     assert payload['meta']['model'] == FABLE
@@ -955,7 +955,7 @@ def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
 
 
 def _tier_section(result):
-    return json.loads(audit_model_admission.render_json(result))['steward_tier_escalation']
+    return json.loads(audit_model_admission.render_json(result))['tier_escalation']
 
 
 def test_a_tier_escalation_that_never_happened_does_not_render_as_one(runs_db):
