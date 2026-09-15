@@ -270,7 +270,51 @@ class MergeVerifySpec:
     verify_commands     : one VerifyCommand per module, scoped to task_files
     unscoped_typecheck  : the _run_unscoped_typechecks gate spec
     task_files          : files in the merge commit (None → full verify)
-    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
+    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …).
+                          APPLIED ONTO the consuming host's config in
+                          run_merge_verify_on_worktree (task 5496): the spec wins
+                          on conflict, host keys absent from the spec are
+                          preserved. Neither 'replace' nor 'ignore' — the spec is
+                          dispatcher-shaped and carries host paths the remote
+                          lacks, while the host carries local necessities the
+                          spec cannot (the laptop's
+                          CARGO_MAKEFLAGS=--jobserver-auth=fifo:… pin).
+                          These keys SELECT TESTS, so they are merge-deciding
+                          rather than cosmetic: REIFY_RELEASE_DELTA_SKIP decides
+                          whether the release profile runs at all, and
+                          REIFY_RUN_ALL_FLAKY_LEDGER / REIFY_RUN_ALL_SKIP_STATE
+                          decide which members are skipped. A remote green
+                          reached under a different env is the task-2822
+                          false-green class, not a performance detail.
+                          Dispatcher-path-valued keys ship VERBATIM and resolve
+                          against the REMOTE filesystem. Deliberately so: the
+                          per-module path already ships them verbatim, and a
+                          name-based denylist would put one project's vocabulary
+                          inside generic transport code and re-diverge the two
+                          paths task 5496 just unified. Reify's are
+                          REIFY_RUN_ALL_FLAKY_LEDGER and REIFY_RUN_ALL_SKIP_STATE
+                          (absolute main-checkout paths under
+                          /home/leo/src/reify/data/verify-logs/, absolute on
+                          purpose — an in-lane path is wiped by the reseed `git
+                          clean`) and CARGO_HOME (/tmp/reify-agent-cargo-home,
+                          pinned byte-identical to the sandboxed agents' value
+                          because cargo's per-unit fingerprint embeds the
+                          registry source path). Consequences are benign: an
+                          absent ledger/state path is the consuming tool's own
+                          absent-file case, and an absent CARGO_HOME is created
+                          cold by cargo — a cold registry fetch, not a
+                          correctness break.
+                          The ONE case genuinely invalid to ship verbatim:
+                          REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG/_RELEASE,
+                          injected by
+                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env,
+                          are absolute paths to UNTRACKED files under the
+                          DISPATCHER's merge_wt. git push does not carry them, so
+                          on a remote dispatch they name files that do not exist
+                          while REIFY_VERIFY_RETRY_SCOPE=failed_only ships
+                          alongside. Resolving it needs merge_queue.py (outside
+                          task 5496's scope); follow-up ticket
+                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
