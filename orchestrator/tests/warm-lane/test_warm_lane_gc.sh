@@ -444,8 +444,11 @@ run_helper reclaim \
     --base-target "$A7_BASE/target" \
     --max-record-age-days notanumber
 assert "A11b: --max-record-age-days notanumber exits 2" test "$RC" -eq 2
+# `grep -qF --` is load-bearing: without the end-of-options marker grep parses
+# the pattern itself as an unrecognized long option and exits 2, which reads as
+# "no match" and would make this assertion silently un-assertable.
 assert "A11c: ...and stderr names the flag and the offending value" \
-    bash -c 'printf "%s\n" "$1" | grep -qF "--max-record-age-days" && printf "%s\n" "$1" | grep -qF "notanumber"' _ "$ERR_OUT"
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "--max-record-age-days" && printf "%s\n" "$1" | grep -qF -- "notanumber"' _ "$ERR_OUT"
 
 # A negative would make MAX_RECORD_AGE_SECS negative, and `age > negative` is
 # true for every record — a blanket downgrade of the whole pool from a typo.

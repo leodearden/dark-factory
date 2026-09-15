@@ -640,6 +640,22 @@ fi
 # refs/heads/task/NNNN intact for acquire_lane to re-seed (D10 §9.5,
 # sizing-lifecycle T1).
 [ -n "$MAX_RECORD_AGE_DAYS" ] || MAX_RECORD_AGE_DAYS=14
+
+# A MISCONFIGURED BOUND IS FATAL, not fail-open, and that is the one place in
+# this script where fail-open is the wrong answer. Both silent directions are
+# INVISIBLE in the summary line: a silently-defaulted bound leaves an operator
+# believing they widened it, and a silently-zeroed one disables the valve while
+# `downgraded_assigned=0` reads as "nothing was stale". A negative is sharpest —
+# `age > negative` is true for every record, so a typo becomes a blanket
+# downgrade of the whole pool. One grep rejects negatives, floats and junk
+# together; same shape as warm-lane-gc-sweep.sh's --critical-free-gib guard.
+# Exit 2, the usage/WIRING class: nothing about the invocation could have
+# avoided it.
+if ! printf '%s\n' "$MAX_RECORD_AGE_DAYS" | grep -qE '^[0-9]+$'; then
+    err "--max-record-age-days must be a non-negative integer (days); got: $MAX_RECORD_AGE_DAYS"
+    err "Run '$(basename "$0") --help' for usage."
+    exit 2
+fi
 MAX_RECORD_AGE_SECS=$(( MAX_RECORD_AGE_DAYS * 86400 ))
 
 # The clock is read ONCE per invocation, not once per lane.
@@ -711,11 +727,13 @@ _is_reclaimable() {
     return 0
 }
 
-# _record_gate_downgrade_reason
+# _record_gate_downgrade_reason <lane-name>
 # Prints a human reason when the AUTHORITATIVE lane record must stop being
 # decisive for the lane whose LANE_STATE_* globals are currently published, and
-# prints NOTHING when the gate stands. Reads the globals rather than taking
-# arguments, so it describes THE SAME observation the gate is about to act on.
+# prints NOTHING when the gate stands. The OBSERVATION comes from the globals,
+# never from arguments, so it is necessarily the same one the gate is about to
+# act on; <lane-name> is carried purely so a degraded read can name itself on
+# stderr.
 #
 # The reasons are ORTHOGONAL dimensions of "the record is not decisive", OR'd
 # here at one site rather than nested into the loop body:
@@ -726,6 +744,7 @@ _is_reclaimable() {
 # site, and each leg's own wording keeps the reasons separately attributable in
 # dark-factory's logs.
 _record_gate_downgrade_reason() {
+    local name="$1"
     # ACUTE, and deliberately FIRST. --disk-pressure means the disk is at or
     # below its critical floor and reclaim IS the response; an authoritative
     # record that says "assigned" is exactly what a stranded ENOSPC-at-release
@@ -746,8 +765,44 @@ _record_gate_downgrade_reason() {
     # digest's `## Stale lane assignments` census — this is the bound that lets
     # the sweep act on what the census has been reporting for a fortnight.
     [ "$MAX_RECORD_AGE_SECS" -gt 0 ] || return 0   # 0 = bound disabled
+
+    # FAIL SAFE — preserve, loudly — when the age cannot be judged: an absent
+    # `updated_at` (lane_state_read publishes ''), a value `date -d` refuses,
+    # or a non-GNU `date` that cannot parse ISO-8601 at all. This is the
+    # OPPOSITE direction to the state read's documented FAIL OPEN, and the
+    # asymmetry is the point. The two reads answer different questions: a
+    # readable `assigned` state is a trustworthy claim about STATE, so a bad
+    # timestamp leaves only the AGE unknown. Reclaiming on that would let a
+    # malformed field delete a genuinely live lane's build — strictly worse
+    # than one extra sweep of preservation. It is also verbatim the policy
+    # harness.py::_stale_lane_assignment_census documents for the same field
+    # ("a record with an empty/unparseable `updated_at` is skipped").
+    #
+    # The acute valve is NOT subject to this: --disk-pressure is evaluated
+    # FIRST and returns before this leg runs, so no unreadable timestamp can
+    # hold the ENOSPC valve shut. That ordering is load-bearing, not incidental
+    # line order — Block S-age-degrade Arm B asserts it directly.
+    #
+    # ONE warn per affected lane, and the channel stays anomaly-only: a real
+    # producer (LaneLifecycle.transition) always stamps the field, so this
+    # fires only on a record something wrote wrong. It cannot train operators
+    # to ignore it the way a per-lane line on the ORDINARY reading would —
+    # the same asymmetry the unparseable-record vs no-readable-record comment
+    # above makes. Degrading SILENTLY would be worse than the bound not
+    # existing: the summary's downgraded_assigned=0 would read as "nothing was
+    # stale" when it actually means "nothing could be judged".
+    # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
+    # does not fail — it succeeds and answers TODAY. Handing an absent
+    # `updated_at` to date would therefore read a record with no timestamp as
+    # freshly stamped: preserved, but for a fabricated reason and with no warn,
+    # which is precisely the silent degradation this branch exists to prevent.
     local record_epoch
-    record_epoch="$(date -d "$LANE_STATE_UPDATED_AT" +%s 2>/dev/null)" || return 0
+    if [ -z "$LANE_STATE_UPDATED_AT" ] \
+       || ! record_epoch="$(date -d "$LANE_STATE_UPDATED_AT" +%s 2>/dev/null)" \
+       || [ -z "$record_epoch" ]; then
+        warn "$name: cannot judge lane-state record age (updated_at='$LANE_STATE_UPDATED_AT') — the staleness bound does not apply, so the record's preserve stands"
+        return 0
+    fi
     local age_secs=$(( NOW_EPOCH - record_epoch ))
     if [ "$age_secs" -gt "$MAX_RECORD_AGE_SECS" ]; then
         printf 'record updated_at=%s is %dd old, past the --max-record-age-days %s bound' \
@@ -951,7 +1006,7 @@ _do_reclaim() {
                 assigned_desc="assigned, no task id in record"
             fi
             local downgrade_reason
-            downgrade_reason="$(_record_gate_downgrade_reason)"
+            downgrade_reason="$(_record_gate_downgrade_reason "$name")"
             if [ -n "$downgrade_reason" ]; then
                 # DOWNGRADE, not reclaim. FD 8 stays OPEN and there is no
                 # `continue`: the lane falls through to the live-reference gate
