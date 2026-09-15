@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import account_pool as mod
 import coder as coder_mod
-import pytest
-
 from shared.usage_gate import AccountLease
 
 # ---------------------------------------------------------------------------
