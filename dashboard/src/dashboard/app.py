@@ -582,6 +582,16 @@ async def lifespan(app: FastAPI):
     global, it outlives this app into the next one.  See
     ``TTLCache.cancel_live_bypasses`` for why that reap is scoped to the
     running event loop.
+
+    **Whatever else shutdown does, the resources this lifespan OPENED are
+    closed on every exit path**, including one where a teardown step above
+    them raises.  The objects at stake are the two writable WAL connections
+    and the ``DbPool`` above: strand one and its finaliser queues work onto a
+    by-then-closed loop, the same ``RuntimeError`` this docstring already
+    describes — so a failure anywhere in teardown must not be able to cause
+    the very condition teardown exists to prevent.  Such a failure still
+    propagates: a reap that raises is a real defect, and out of shutdown is
+    its only route to an operator.
     """
     # Config first: the shared client's pool bound is DERIVED from it (see
     # _build_http_limits above). DashboardConfig.from_env() has no dependency
@@ -619,19 +629,21 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    for task in (collector_task, metrics_task):
-        task.cancel()
-    for task in (collector_task, metrics_task):
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    # After the loops above, so nothing can enqueue a fresh refresh behind the
-    # reaper; before http_client.aclose() below, so a cancelled refresh unwinds
-    # into a pool that still exists.
-    await reap_detached_refreshes()
-    await burndown_store.close()
-    await metrics_store.close()
-    await pool.close_all()
-    await http_client.aclose()
+    try:
+        for task in (collector_task, metrics_task):
+            task.cancel()
+        for task in (collector_task, metrics_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        # After the loops above, so nothing can enqueue a fresh refresh behind
+        # the reaper; before http_client.aclose() below, so a cancelled refresh
+        # unwinds into a pool that still exists.
+        await reap_detached_refreshes()
+    finally:
+        await burndown_store.close()
+        await metrics_store.close()
+        await pool.close_all()
+        await http_client.aclose()
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
