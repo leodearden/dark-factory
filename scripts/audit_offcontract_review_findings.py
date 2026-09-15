@@ -20,7 +20,10 @@ It does three things and NO JUDGEMENT:
   - `normalize_issue` collapses any of the six observed issue schemas into one
     record. It is the single place that knows about the shape variance, so a
     caller never re-derives "where is the headline in this one".
-  - `census` / `select_population` measure a verdict tree.
+  - `census` / `select_population` measure a verdict tree. Both REFUSE a root
+    that is not a directory rather than returning zeros, and both report the
+    residue they could not read — a count the caller is handed, never a number
+    quietly shortened.
   - `validate_report` checks a finished triage report against its frozen roster.
 
 Whether a given finding is still live on today's main is a judgement over code
@@ -45,6 +48,13 @@ from typing import NamedTuple
 
 DEFAULT_ROOT = Path("/home/leo/src/dark-factory/.worktrees/.task-meta")
 
+#: The one place that knows the live tree's layout. Named rather than inlined
+#: because a zero-file census has to be able to SAY what it looked for: the
+#: frozen `corpus/` in this task's artifact directory is stored flat as
+#: `<task>.json`, so pointing `--root` at it matches nothing, and an unnamed
+#: zero there reads as a measurement instead of a layout mismatch.
+VERDICT_GLOB = "*/verdicts/*.json"
+
 #: The only two severities the review gates understand. Anything else is read as
 #: a suggestion and skipped by the in-scope filter — the drop this task triages.
 CONTRACT_SEVERITIES = frozenset({"blocking", "suggestion"})
@@ -65,6 +75,21 @@ DETAIL_KEYS = ("description", "detail", "summary")
 SUPPLEMENT_KEYS = ("failure_scenario", "reproduce", "suggestion", "suggested_fix", "recommendation")
 
 
+def _is_off_contract(severity: object) -> bool:
+    """Whether a severity is one the review gates cannot read.
+
+    Named rather than inlined because the REFUSED issues have to be classified
+    the same way as the read ones. Two spellings of this test is how a tally
+    starts counting a population it never inspected.
+    """
+    return severity not in CONTRACT_SEVERITIES
+
+
+def _is_selectable(severity: object) -> bool:
+    """Whether a severity puts an issue in the population task 5430 triages."""
+    return _is_off_contract(severity) and severity in TRIAGE_SEVERITIES
+
+
 def _text(raw: dict, key: str) -> str | None:
     """Return raw[key] as stripped text, or None when absent/blank.
 
@@ -75,6 +100,30 @@ def _text(raw: dict, key: str) -> str | None:
     if not isinstance(value, str):
         return None
     return value.strip() or None
+
+
+def _raw_issues(payload: object) -> list | None:
+    """The `verdict.issues[]` list in a payload, or None when the shape is wrong.
+
+    Valid JSON of the wrong TYPE is exactly as unreadable as broken JSON, and
+    refusing it here is what keeps that a TALLY rather than an abort: reaching
+    `.get` on a top-level list raises `AttributeError`, which the walk's
+    `except (OSError, ValueError)` does not catch, so one malformed file would
+    kill the walk of every other one. The input is untracked runtime state from
+    a pipeline already measured emitting six mutually incompatible issue
+    schemas, so this is a live class of malformation, not a hypothetical.
+
+    An ABSENT or null `verdict`/`issues` is benign and yields `[]`, not a
+    refusal — 29 of the 1,271 live verdict files legitimately carry no `issues`
+    key, and counting those as malformed would invent unparseable files.
+    """
+    if not isinstance(payload, dict):
+        return None
+    verdict = payload.get("verdict") or {}
+    if not isinstance(verdict, dict):
+        return None
+    issues = verdict.get("issues") or []
+    return issues if isinstance(issues, list) else None
 
 
 def _resolve_location(raw: dict) -> str:
@@ -122,6 +171,10 @@ def normalize_issue(task_id: str, index: int, raw: dict) -> dict:
     position in `verdict.issues[]`, which is what makes the derived `id` stable
     and re-checkable against a frozen verdict file.
     """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"issue entry is not an object but a {type(raw).__name__}: {raw!r}"
+        )
     return {
         "id": f"{task_id}-{raw.get('category')}-{index}",
         "task": task_id,
@@ -130,7 +183,7 @@ def normalize_issue(task_id: str, index: int, raw: dict) -> dict:
         "category": raw.get("category"),
         "location": _resolve_location(raw),
         "statement": _resolve_statement(raw),
-        "off_contract": raw.get("severity") not in CONTRACT_SEVERITIES,
+        "off_contract": _is_off_contract(raw.get("severity")),
     }
 
 
@@ -158,6 +211,14 @@ class Census(NamedTuple):
     `location_less` are deliberately separate tallies: the 23 findings task 5430
     triages were in both, which is how the two review gates compounded, but a
     census that folded them together could never show the two diverging.
+
+    The refused residue folds into the two tallies ASYMMETRICALLY, and the
+    asymmetry is the point. `location_less` absorbs all of it, because an issue
+    the normalizer refused is by definition location-less. `off_contract_severity`
+    absorbs only the part whose severity was ACTUALLY off-contract: a refused
+    issue can carry `severity: "blocking"`, and folding it in wholesale would
+    contaminate this tally with a population whose severity was never inspected
+    — defeating the separation the paragraph above exists to preserve.
     """
     files: int
     unparseable: int
@@ -172,13 +233,23 @@ class Census(NamedTuple):
 
 
 class Scan(NamedTuple):
+    """One walk's raw result. `unlocatable_severities` counts the REFUSED issues
+    by the severity they carried, so both consumers classify that residue from
+    one place: the census asks which of them were off-contract, the population
+    asks which would have been selected. A bare refusal count could answer
+    neither without re-inspecting the raw dicts the walk has already discarded.
+    """
     issues: list[VerdictIssue]
     files: int
     unparseable: int
-    unlocatable: int
+    unlocatable_severities: Counter
     verdicts_with_issues: int
     emitted_at: list[str]
     roles: Counter
+
+    @property
+    def unlocatable(self) -> int:
+        return sum(self.unlocatable_severities.values())
 
 
 def _scan(root: Path) -> Scan:
@@ -187,13 +258,24 @@ def _scan(root: Path) -> Scan:
     Tolerant by tallying, never by dropping: a file that will not parse and an
     issue the normalizer refuses are both counted, so a caller is told what the
     walk could not read rather than being handed a quietly short number.
+
+    That contract has one input it cannot honour by tallying, so it refuses it
+    instead: `Path.glob` on a missing directory yields nothing rather than
+    raising, which would hand back an all-zero census indistinguishable from a
+    real tree that happens to hold no verdicts. An unreadable root is a broken
+    QUESTION, not a measurable answer, so it raises.
     """
+    if not root.is_dir():
+        raise NotADirectoryError(
+            f"not a directory, so there is nothing to census: {root}"
+        )
     issues: list[VerdictIssue] = []
-    files = unparseable = unlocatable = verdicts_with_issues = 0
+    files = unparseable = verdicts_with_issues = 0
     emitted_at: list[str] = []
     roles: Counter = Counter()
+    unlocatable_severities: Counter = Counter()
 
-    for path in sorted(root.glob("*/verdicts/*.json")):
+    for path in sorted(root.glob(VERDICT_GLOB)):
         files += 1
         try:
             payload = json.loads(path.read_text())
@@ -201,7 +283,10 @@ def _scan(root: Path) -> Scan:
             unparseable += 1
             continue
 
-        raw_issues = payload.get("verdict", {}).get("issues") or []
+        raw_issues = _raw_issues(payload)
+        if raw_issues is None:
+            unparseable += 1
+            continue
         if raw_issues:
             verdicts_with_issues += 1
         role = payload.get("role") or path.stem
@@ -217,7 +302,9 @@ def _scan(root: Path) -> Scan:
             try:
                 record = normalize_issue(path.parent.parent.name, index, raw)
             except ValueError:
-                unlocatable += 1
+                # The raw dict is still in hand, so the severity it carried is
+                # recorded rather than assumed. A non-dict entry has none.
+                unlocatable_severities[raw.get("severity") if isinstance(raw, dict) else None] += 1
                 continue
             issues.append(VerdictIssue(
                 path=path,
@@ -227,7 +314,8 @@ def _scan(root: Path) -> Scan:
                 record=record,
             ))
 
-    return Scan(issues, files, unparseable, unlocatable, verdicts_with_issues, emitted_at, roles)
+    return Scan(issues, files, unparseable, unlocatable_severities,
+                verdicts_with_issues, emitted_at, roles)
 
 
 def census(root: Path) -> Census:
@@ -239,7 +327,11 @@ def census(root: Path) -> Census:
         unlocatable=scan.unlocatable,
         verdicts_with_issues=scan.verdicts_with_issues,
         issues=len(scan.issues) + scan.unlocatable,
-        off_contract_severity=sum(i.record["off_contract"] for i in scan.issues) + scan.unlocatable,
+        off_contract_severity=(
+            sum(i.record["off_contract"] for i in scan.issues)
+            + sum(count for severity, count in scan.unlocatable_severities.items()
+                  if _is_off_contract(severity))
+        ),
         location_less=sum(i.location_less for i in scan.issues) + scan.unlocatable,
         roles=dict(scan.roles),
         emitted_first=min(scan.emitted_at, default=None),
@@ -247,16 +339,37 @@ def census(root: Path) -> Census:
     )
 
 
-def select_population(root: Path) -> list[VerdictIssue]:
+class Population(NamedTuple):
+    """The issues a triage roster can be frozen from, plus the ones that cannot.
+
+    `unselectable` is not a footnote. A roster is frozen from `issues`, and a
+    finding absent from a roster is never dispositioned — which is precisely how
+    the 23 findings this task exists to account for were lost. An issue the
+    normalizer refused is unrosterable for a different reason (no location) but
+    with the identical consequence, so the count travels WITH the population
+    rather than being available only from a separate census call.
+
+    It counts the refused issues whose severity would have SELECTED them, not
+    every refusal: a refused `low` was never in this population anyway, and
+    reporting it here would overstate what the roster is missing.
+    """
+    issues: list[VerdictIssue]
+    unselectable: int
+
+
+def select_population(root: Path) -> Population:
     """The issues task 5430 triages: off-contract severity AND in the band.
 
     Never filters on role. Role is a census observation, and excluding a role
     here would understate the residue while looking like it had measured it.
     """
-    return [
-        issue for issue in _scan(root).issues
-        if issue.record["off_contract"] and issue.record["severity"] in TRIAGE_SEVERITIES
-    ]
+    scan = _scan(root)
+    return Population(
+        issues=[issue for issue in scan.issues
+                if _is_selectable(issue.record["severity"])],
+        unselectable=sum(count for severity, count in scan.unlocatable_severities.items()
+                         if _is_selectable(severity)),
+    )
 
 
 #: The only three dispositions the triage may reach: (a) already fixed
@@ -333,14 +446,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(violations)} violation(s) in {args.validate}")
         return 1 if violations else 0
 
-    measured = census(args.root)
+    try:
+        measured = census(args.root)
+        population = select_population(args.root)
+    except NotADirectoryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # The glob is reported alongside the counts so a zero names what it looked
+    # for. Both modes carry it: `--json` is what provenance.json quotes as the
+    # reproduction command, so a field missing there is a number a reader
+    # cannot re-derive.
     if args.json:
-        print(json.dumps({"root": str(args.root), **measured._asdict()}, indent=2))
+        print(json.dumps({
+            "root": str(args.root), "glob": VERDICT_GLOB,
+            **measured._asdict(),
+            "triage_population": len(population.issues),
+            "triage_unselectable": population.unselectable,
+        }, indent=2))
     else:
         print(f"root: {args.root}")
+        print(f"  glob: {VERDICT_GLOB}")
         for field, value in measured._asdict().items():
             print(f"  {field}: {value}")
-        print(f"  triage_population: {len(select_population(args.root))}")
+        print(f"  triage_population: {len(population.issues)} "
+              f"(+{population.unselectable} unlocatable, not selectable)")
     return 0
 
 

@@ -253,6 +253,16 @@ def test_an_issue_with_no_location_signal_at_all_raises():
         normalize_issue("3340", 0, raw)
 
 
+@pytest.mark.parametrize("raw", ["just a string", ["a", "list"], 42, None])
+def test_an_issue_entry_that_is_not_an_object_at_all_raises(raw):
+    """`normalize_issue` is the SPOT for issue shape, so "this is not an issue"
+    is its refusal to make, not the walker's. Reaching `.get` on a str instead
+    raises AttributeError, which the walk does not catch — one such entry would
+    abort the census of every other file."""
+    with pytest.raises(ValueError, match="not an object"):
+        normalize_issue("3340", 0, raw)
+
+
 def test_a_file_without_a_line_does_not_stringify_the_missing_line():
     """Same silent-None failure class as above, one field narrower."""
     raw = {
@@ -331,6 +341,11 @@ def _fixture_tree(tmp_path):
     unparseable = root / "3363" / "verdicts" / "reviewer_comprehensive.json"
     unparseable.parent.mkdir(parents=True, exist_ok=True)
     unparseable.write_text("{not json at all")
+    # Valid JSON of the WRONG TYPE — the malformation class that used to abort
+    # the whole walk with an uncaught AttributeError rather than be tallied.
+    wrong_type = root / "3340" / "verdicts" / "reviewer_comprehensive.json"
+    wrong_type.parent.mkdir(parents=True, exist_ok=True)
+    wrong_type.write_text('["a list, not an object"]')
 
     return root
 
@@ -338,7 +353,7 @@ def _fixture_tree(tmp_path):
 def test_census_counts_files_verdicts_and_issues_separately(tmp_path):
     result = census(_fixture_tree(tmp_path))
 
-    assert result.files == 7
+    assert result.files == 8
     assert result.verdicts_with_issues == 5, "the empty verdict must not be counted"
     assert result.issues == 5
 
@@ -375,8 +390,64 @@ def test_census_reports_the_emission_window(tmp_path):
 def test_census_tallies_a_malformed_file_instead_of_crashing_or_dropping_it(tmp_path):
     result = census(_fixture_tree(tmp_path))
 
+    assert result.unparseable == 2, "broken JSON and valid-JSON-of-the-wrong-type"
+    assert result.files == 8, "an unparseable file is still a file that was there"
+
+
+@pytest.mark.parametrize("payload", [
+    '["a list, not an object"]',
+    '{"verdict": "not an object either"}',
+    '{"verdict": {"issues": {"keyed": {"severity": "high"}}}}',
+    '"a bare string"',
+    '7',
+])
+def test_census_tallies_a_wrongly_shaped_payload_instead_of_aborting_the_walk(tmp_path, payload):
+    """Valid JSON of the wrong TYPE is as unreadable as broken JSON. Each of
+    these used to reach `.get` on a non-dict and raise AttributeError, which
+    `except (OSError, ValueError)` does not catch."""
+    root = tmp_path / ".task-meta"
+    path = root / "9001" / "verdicts" / "reviewer_comprehensive.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(payload)
+
+    result = census(root)
+
+    assert result.files == 1
     assert result.unparseable == 1
-    assert result.files == 7, "an unparseable file is still a file that was there"
+    assert result.issues == 0
+
+
+def test_one_malformed_file_does_not_cost_the_walk_of_the_others(tmp_path):
+    """The failure this tolerance exists for is not the bad file's own count —
+    it is the 1,270 good files whose measurement a single abort would destroy."""
+    root = tmp_path / ".task-meta"
+    _write_verdict(root, "3041", "reviewer_comprehensive", "2026-08-10T00:00:00+00:00", [
+        {"severity": "medium", "category": "correctness",
+         "file": "e/f.py", "line": 3, "title": "readable, and after the bad file"},
+    ])
+    broken = root / "3031" / "verdicts" / "reviewer_comprehensive.json"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text('["sorts before 3041, so it is walked first"]')
+
+    result = census(root)
+
+    assert result.unparseable == 1
+    assert result.issues == 1, "the good file after the bad one was still read"
+    assert [i.record["severity"] for i in select_population(root).issues] == ["medium"]
+
+
+def test_a_non_dict_issue_entry_is_tallied_as_unlocatable_not_a_crash(tmp_path):
+    """A non-dict ENTRY is an issue-level refusal, so it lands in `unlocatable`
+    where the normalizer's other refusals do — not in the file-level tally."""
+    root = tmp_path / ".task-meta"
+    _write_verdict(root, "3041", "reviewer_comprehensive", "2026-08-10T00:00:00+00:00",
+                   ["just a string, not an issue object"])
+
+    result = census(root)
+
+    assert result.unparseable == 0, "the FILE parsed and was well-shaped"
+    assert result.unlocatable == 1
+    assert result.issues == 1, "the refused entry is still counted as present"
 
 
 def test_census_tallies_an_unlocatable_issue_instead_of_crashing_or_dropping_it(tmp_path):
@@ -400,8 +471,43 @@ def test_census_of_an_empty_tree_is_all_zeroes(tmp_path):
     assert result.emitted_last is None
 
 
+@pytest.mark.parametrize("walker", [census, select_population],
+                         ids=["census", "select_population"])
+def test_a_root_that_does_not_exist_is_refused_rather_than_censused(tmp_path, walker):
+    """`Path.glob` on a missing directory yields nothing rather than raising, so
+    an unchecked root hands back an all-zero census indistinguishable from a
+    real tree holding no verdicts. Both entry points must refuse it: a caller
+    that reads zeros as a measurement is the no-silent-fail-soft failure."""
+    missing = tmp_path / "moved-or-renamed"
+
+    with pytest.raises(NotADirectoryError, match=str(missing)):
+        walker(missing)
+
+
+@pytest.mark.parametrize("walker", [census, select_population],
+                         ids=["census", "select_population"])
+def test_a_root_that_is_a_file_is_refused_too(tmp_path, walker):
+    not_a_tree = tmp_path / "task-meta.json"
+    not_a_tree.write_text("{}")
+
+    with pytest.raises(NotADirectoryError):
+        walker(not_a_tree)
+
+
+def test_an_existing_root_with_the_wrong_layout_still_measures_zero(tmp_path):
+    """The distinction the guard draws: a MISSING root is a broken question, an
+    existing one holding no matching files is a real (if empty) answer. The
+    frozen corpus/ in this task's artifact directory is the live instance —
+    stored flat as `<task>.json`, so it matches nothing and must not raise."""
+    flat = tmp_path / "corpus"
+    flat.mkdir()
+    (flat / "3041.json").write_text('{"verdict": {"issues": []}}')
+
+    assert census(flat).files == 0
+
+
 def test_select_population_keeps_only_off_contract_issues_in_the_triage_band(tmp_path):
-    selected = select_population(_fixture_tree(tmp_path))
+    selected = select_population(_fixture_tree(tmp_path)).issues
 
     assert {issue.record["severity"] for issue in selected} == {"medium", "high"}
     assert all(issue.record["off_contract"] for issue in selected)
@@ -409,19 +515,19 @@ def test_select_population_keeps_only_off_contract_issues_in_the_triage_band(tmp
 
 
 def test_select_population_excludes_the_on_contract_suggestion(tmp_path):
-    selected = select_population(_fixture_tree(tmp_path))
+    selected = select_population(_fixture_tree(tmp_path)).issues
     assert "suggestion" not in {issue.record["severity"] for issue in selected}
 
 
 def test_select_population_excludes_severities_below_the_triage_floor(tmp_path):
-    selected = select_population(_fixture_tree(tmp_path))
+    selected = select_population(_fixture_tree(tmp_path)).issues
     assert "low" not in {issue.record["severity"] for issue in selected}
 
 
 def test_select_population_never_filters_on_role(tmp_path):
     """Role is a census OBSERVATION, not a selection criterion. The foreign-role
     `high` is in the population; dropping it would understate the residue."""
-    selected = select_population(_fixture_tree(tmp_path))
+    selected = select_population(_fixture_tree(tmp_path)).issues
 
     assert {issue.role for issue in selected} == {"reviewer_comprehensive", "reviewer_scoped"}
     assert any(issue.role == "reviewer_scoped" for issue in selected)
@@ -430,12 +536,86 @@ def test_select_population_never_filters_on_role(tmp_path):
 def test_select_population_carries_the_verdict_facts_the_issue_itself_lacks(tmp_path):
     """Role, emission time and source path belong to the verdict file, not the
     issue, so `normalize_issue` cannot supply them and the walker must."""
-    foreign = next(i for i in select_population(_fixture_tree(tmp_path)) if i.role == "reviewer_scoped")
+    foreign = next(i for i in select_population(_fixture_tree(tmp_path)).issues
+                   if i.role == "reviewer_scoped")
 
     assert foreign.emitted_at == "2026-08-05T00:00:00+00:00"
     assert foreign.path.name == "reviewer_scoped.json"
     assert foreign.location_less is True
     assert foreign.record["location"] == "g/h.py:4"
+
+
+def _tree_with_one_unlocatable(tmp_path, severity):
+    """A tree whose ONLY issue is unlocatable, carrying `severity`.
+
+    Deliberately not folded into `_fixture_tree`: that fixture's unlocatable
+    issue is a `medium`, so every fold of the refused residue looks correct
+    there whether or not the severity is ever inspected. Varying the severity
+    is the only way to tell the two apart."""
+    root = tmp_path / ".task-meta"
+    _write_verdict(root, "3308", "reviewer_comprehensive", "2026-08-02T00:00:00+00:00", [
+        {"severity": severity, "category": "correctness", "title": "nowhere"},
+    ])
+    return root
+
+
+def test_an_on_contract_refusal_is_not_counted_into_the_off_contract_tally(tmp_path):
+    """The refused residue folds into `location_less` soundly (a refusal IS
+    location-less) but into `off_contract_severity` only on inspection. A
+    `blocking` issue with no location is refused AND on-contract; counting it
+    off-contract contaminates the tally with a severity nobody read."""
+    result = census(_tree_with_one_unlocatable(tmp_path, "blocking"))
+
+    assert (result.issues, result.unlocatable) == (1, 1)
+    assert result.location_less == 1, "a refused issue is by definition location-less"
+    assert result.off_contract_severity == 0, "its severity was on-contract"
+
+
+@pytest.mark.parametrize("severity", ["high", "medium", "low", None])
+def test_an_off_contract_refusal_is_still_counted_into_the_off_contract_tally(tmp_path, severity):
+    """The other half of the same pin: inspecting the severity must not turn
+    into dropping the residue. Everything outside the contract still counts."""
+    result = census(_tree_with_one_unlocatable(tmp_path, severity))
+
+    assert result.off_contract_severity == 1
+    assert result.location_less == 1
+
+
+def test_the_population_reports_the_refusals_it_could_not_put_on_a_roster(tmp_path):
+    """A finding absent from the roster is never dispositioned — the exact loss
+    this task accounts for. So the refusal count travels WITH the population,
+    not only via a separate census call a caller may not make."""
+    root = tmp_path / ".task-meta"
+    _write_verdict(root, "3075", "reviewer_comprehensive", "2026-08-05T00:00:00+00:00", [
+        {"severity": "high", "category": "correctness",
+         "file": "g/h.py", "line": 4, "title": "rosterable"},
+        {"severity": "high", "category": "correctness", "title": "unlocatable, and in band"},
+    ])
+
+    population = select_population(root)
+
+    assert len(population.issues) == 1
+    assert population.unselectable == 1, "the in-band refusal must be visible"
+
+
+@pytest.mark.parametrize("severity", ["low", "blocking", "suggestion"])
+def test_a_refusal_outside_the_population_is_not_reported_as_missing_from_it(tmp_path, severity):
+    """`unselectable` must not overstate what the roster is missing: a refused
+    `low` or on-contract issue was never in this population to begin with."""
+    population = select_population(_tree_with_one_unlocatable(tmp_path, severity))
+
+    assert population.issues == []
+    assert population.unselectable == 0
+
+
+def test_the_fixture_trees_refusal_is_reported_by_both_walkers(tmp_path):
+    """`census.unlocatable` and `Population.unselectable` answer different
+    questions over the same residue, and both must see the fixture's one
+    refused `medium`: it is location-less AND would have been selected."""
+    root = _fixture_tree(tmp_path)
+
+    assert census(root).unlocatable == 1
+    assert select_population(root).unselectable == 1
 
 
 def test_the_contract_and_triage_severity_sets_are_disjoint():
