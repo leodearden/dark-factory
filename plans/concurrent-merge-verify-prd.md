@@ -70,6 +70,9 @@ backed by a **host allocator** and a **remote cancellation contract**.
 - **Host allocator:** worker-lifetime object owning one slot per host (local + each
   enabled runner). Policy: **prefer-local-when-free** (trust anchor, marginally faster
   — deliberately inverts the shipped prefer-remote, whose purpose was offload).
+  (As of 2026-09-15 the order is selected by `OrchestratorConfig.verify_host_policy`,
+  default `prefer_local`, which preserves this decision — task 5097 /
+  `plans/merge-lane-throughput-prd.md` task C′.)
   `RunnerUnavailable` → quarantine host (existing `_runner_quarantine` set) +
   re-dispatch on a free host; a dead laptop degrades to serial-local, never a stall.
   Remote slot release: on clean completion, or **after `cancel-verify` confirms**;
@@ -89,7 +92,7 @@ backed by a **host allocator** and a **remote cancellation contract**.
 | Kill ssh + probe-before-reuse (no remote CLI) | Zombie burns laptop CPU ≤12 min and the slot is held on a probe loop; saves little vs the small cancel CLI. User selected the cancel endpoint. |
 | Never abort remote (hold slot to completion) | Each N-fail/abandon wastes a full laptop verify of overlap capacity; contradicts 1681's existing abort-the-wasted-compute semantics. |
 | Concurrent CAS / out-of-order landing | Violates the ordered-advance invariant everything downstream assumes (equivalence gates, trains, recover-main); not on the table. |
-| Keep prefer-remote selection | With overlap, first-free + prefer-local engages the trust anchor for single-item windows and overflow goes remote; prefer-remote was an offload-era policy. |
+| Keep prefer-remote selection | With overlap, first-free + prefer-local engages the trust anchor for single-item windows and overflow goes remote; prefer-remote was an offload-era policy. As of 2026-09-15 prefer-remote is available as an opt-in `verify_host_policy: prefer_remote` rather than rejected outright — task 5097 / `plans/merge-lane-throughput-prd.md` task C′. |
 
 ## 4. Pre-conditions (G3 — verified on main this session)
 
@@ -173,7 +176,9 @@ path (:6324-6339); `enabled_verify_runners` (config.py:1411). New mechanisms: th
   observable in the run dir. **Consumer:** β (slot release), γ (downstream abort).
 - **β — Host allocator** (`verify_runner.py` + the pool-construction seam in
   `merge_queue.py` + tests). Worker-lifetime allocator: one slot per host;
-  prefer-local-when-free; cached RemoteRunners (+ main-push dedup via
+  prefer-local-when-free (as of 2026-09-15 config-selected via
+  `verify_host_policy`, default `prefer_local` — task 5097 / task C′);
+  cached RemoteRunners (+ main-push dedup via
   `_last_pushed_main_sha`); `RunnerUnavailable` → quarantine + redispatch (never a
   stall); remote slot freed on clean completion or confirmed `cancel-verify`, else
   host quarantined until a `pgrep`-probe is clean; drift check acquires through the

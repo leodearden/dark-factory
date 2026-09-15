@@ -2667,11 +2667,11 @@ async def _run_post_merge_verify(
             production ``SpeculativeMergeWorker._run_inflight_verify`` call
             site passes ``self.operator_halt``; every other (module-level,
             test-local) caller omits it (default ``None`` → no halt), keeping
-            them byte-identical.  Cross-check REMAINS a trailing detector, not
-            a pre-adoption gate (pre-gating every remote-sole verdict would
-            double Lever-C cost); the halt is synchronous purely so it
-            precedes any further adoption — incident 83336a32 halted +3s too
-            late via the async escalation gate.
+            them byte-identical.  With ``verify_cross_check_remote_green`` on
+            (default True) the cross-check is a BLOCKING pre-land local
+            re-verify, NOT a trailing detector; the halt is synchronous purely
+            so it precedes any further adoption — incident 83336a32 halted +3s
+            too late via the async escalation gate, which trails it.
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
@@ -3392,9 +3392,9 @@ async def _run_post_merge_verify(
                 # outcome — so no FURTHER adoption can occur before a human looks.
                 # The async escalation-queue gate is only checked at the NEXT
                 # merger iteration, so it TRAILS adoption: incident 83336a32
-                # diverged +3s AFTER CAS-advance.  Cross-check REMAINS a TRAILING
-                # detector, not a pre-adoption gate (pre-gating every remote-sole
-                # verdict would double Lever-C cost); the halt is synchronous
+                # diverged +3s AFTER CAS-advance.  With verify_cross_check_remote_green
+                # on (default True) the cross-check is a BLOCKING pre-land local
+                # re-verify, NOT a trailing detector; the halt is synchronous
                 # purely so it precedes any further adoption.  None-safe: only the
                 # production worker call site threads self.operator_halt.
                 #
