@@ -12,6 +12,12 @@ Older stamps (already covered by a prior run, or predating the fix this
 predicate soaks) are reported but do not gate, so they are not re-escalated
 on every invocation.
 
+"Wrapper" here is function-level reuse, not CLI reuse: this script imports
+that module's :func:`build_audit_report` and drives its own backend, never
+invoking that script's ``_run``. Its ``--fail-on-findings`` 0/1/2 ladder is
+therefore NOT this script's, and the "Contract" block below — the reserved
+exit 3 included — is the only exit-code ladder this predicate speaks.
+
 Freshness (task 3576): the timestamp compared against ``--since`` is
 ``metadata.done_provenance.stamped_at`` — the dedicated stamp-*write*
 instant recorded server-side by fused-memory's
