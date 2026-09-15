@@ -261,10 +261,10 @@ class _ScriptedProbeCli:
 
 class TestProbeModelsTargetSet:
     """The probe's default target model set is dedup(allowed_models +
-    [claude-fable-5]), order-preserving -- fable is probed even though it is
-    NOT admitted to the runtime allowlist (task beta is the G3 gate that
-    produces the fable-availability data task xi's admission gate later
-    consumes; see this task's plan design_decisions)."""
+    [FABLE_CANDIDATE_MODEL]), order-preserving -- so the fable candidate is
+    exercised even where a config has not admitted it, and exactly once
+    where a config has. The artifact this produces is the per-(account,
+    model) availability evidence an admission decision consumes."""
 
     def test_default_target_set_is_allowed_models_plus_fable(self):
         accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
@@ -291,6 +291,56 @@ class TestProbeModelsTargetSet:
 
         assert report.models == ['opus']
         assert {call['model'] for call in cli.calls} == {'opus'}
+
+    def test_fable_candidate_is_the_admitted_literal_and_is_dispatched(self):
+        """The one place the fable model string is pinned. Both admission
+        rulings name 'claude-fable-5-1', so a future reader can re-check the
+        coupling rather than guess: D5 admitted it to the eval arm
+        (``orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO``,
+        ``model='claude-fable-5-1'``) and D6 admitted it to a live runtime
+        allowlist (``dark-factory-orchestrator.yaml``'s
+        ``routing.allowed_models``, commit 526e0eba99). Spelled as a LITERAL
+        here on purpose -- the rest of this module asserts symbolically
+        against the constant, so this test is what would catch the constant
+        being repointed away from admission again.
+        """
+        assert FABLE_CANDIDATE_MODEL == 'claude-fable-5-1'
+
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['haiku', 'sonnet', 'claude-fable-5-1']
+        # Genuinely dispatched, not merely listed in report.models.
+        assert 'claude-fable-5-1' in {call['model'] for call in cli.calls}
+
+    def test_config_that_already_admits_the_candidate_gets_no_phantom_row(self):
+        """A config whose allowlist already carries the candidate must be
+        probed for it exactly once -- _dedup_preserve_order collapses the
+        union to a no-op.
+
+        WHY this is asserted: while the constant is stale, this same call
+        yields a FIFTH trailing entry that every account probes as
+        'unavailable', writing a phantom always-red row into the committed
+        artifact -- re-telling the very lie this task exists to stop. The
+        allowlist below is dark-factory's own live one
+        (dark-factory-orchestrator.yaml, routing.allowed_models).
+        """
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet', 'opus', 'claude-fable-5-1'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['haiku', 'sonnet', 'opus', 'claude-fable-5-1']
 
 
 class TestProbeModelsStatusMappingAndDispatch:
