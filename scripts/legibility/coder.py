@@ -386,6 +386,34 @@ diagnostic loss. Bounded because the text lands verbatim in journal lines,
 CLI's last words are its diagnostic ones."""
 
 
+def child_env(oauth_token):
+    """The environment a child process needs to authenticate as *oauth_token*,
+    or ``None`` to inherit the parent's unchanged.
+
+    A copy of ``os.environ`` with ``ANTHROPIC_API_KEY`` REMOVED and
+    ``CLAUDE_CODE_OAUTH_TOKEN`` set -- the same construction every other CLI
+    spawn in the fleet uses (``agents/invoke.py``, ``cli_invoke.py``,
+    ``usage_gate.py``). The removal is the load-bearing half, not tidiness:
+    the CLI prefers an API key over the OAuth token, so leaving one set
+    silently authenticates as the API key's identity and the account choice is
+    defeated while the failover still LOOKS like it worked.
+
+    An OVERLAY on the parent env rather than a replacement, because a child
+    still needs PATH, HOME and whatever the systemd unit exported.
+
+    Public and separate from ``_invoke_cli`` because the trickle spawns a
+    SECOND child that must make the same choice: ``account_pool.subprocess_env``
+    builds the env for the census subprocess (task 5488). One statement of the
+    policy, two spawn sites -- a second copy would be the fifth in the fleet
+    and the first that could drift from this one silently.
+    """
+    if not oauth_token:
+        return None
+    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+    return env
+
+
 def _invoke_cli(
     prompt: str,
     model: str,
@@ -405,16 +433,10 @@ def _invoke_cli(
 
     *oauth_token*, when given, is the ACCOUNT the caller chose -- the token
     of a lease taken from the shared multi-account ``UsageGate`` (see
-    ``account_pool.pool_invoke``, which is what passes it). It is handed to
-    the child as ``CLAUDE_CODE_OAUTH_TOKEN`` in an explicit env built the
-    same way every other CLI spawn in the fleet builds one
-    (``agents/invoke.py``, ``cli_invoke.py``, ``usage_gate.py``): a copy of
-    ``os.environ`` with ``ANTHROPIC_API_KEY`` REMOVED. The removal is the
-    load-bearing half, not tidiness -- the CLI prefers an API key over the
-    OAuth token, so leaving one set silently authenticates as the API key's
-    identity and the account choice is defeated while the failover still
-    LOOKS like it worked. ``None`` (the default) passes ``env=None``, which
-    is subprocess's own "inherit the parent unchanged", so this parameter is
+    ``account_pool.pool_invoke``, which is what passes it). The child env it
+    produces, and why ``ANTHROPIC_API_KEY`` is stripped from it, is
+    :func:`child_env`'s. ``None`` (the default) passes ``env=None``, which is
+    subprocess's own "inherit the parent unchanged", so this parameter is
     strictly additive: census's wiring (``preflight_headroom`` and
     ``_build_stage_invokes``) spawns byte-identically to before it existed.
 
@@ -480,10 +502,7 @@ def _invoke_cli(
     """
     resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
 
-    env = None
-    if oauth_token:
-        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+    env = child_env(oauth_token)
 
     try:
         proc = subprocess.run(

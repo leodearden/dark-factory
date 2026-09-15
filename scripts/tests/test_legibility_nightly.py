@@ -1413,7 +1413,7 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             factory_calls.append(project_root)
             return sentinel
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None):
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
             seen['status_fetcher'] = status_fetcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -3903,6 +3903,36 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # `nightly._default_census_launcher`. The two tests below are the pattern.
 # ---------------------------------------------------------------------------
 
+def _stub_census_launcher_and_pool(monkeypatch):
+    """Stub both of a ``main()``-driven run's reaches into the real world, and
+    return the launcher's call list.
+
+    MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
+    subprocess-runs scripts/legibility/census.py (real LLM spend + real git
+    writes) and ``_default_entrypoint_exists`` is true in a real checkout --
+    and reaching FIRE is the entire point of the tests that call this. Since
+    task 5488, main() -- which injects no ``invoke`` -- also makes run_nightly
+    build a REAL multi-account pool out of the operator's own
+    CLAUDE_OAUTH_TOKEN_* vars and hand one of those tokens to that launcher.
+    A test about the census trigger has no business touching either.
+    """
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda env=None: launcher_calls.append(1),
+    )
+
+    class _EmptyPool:
+        account_count = 0
+
+        def try_lease(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        nightly.account_pool, 'build_pool', lambda **_kwargs: _EmptyPool(),
+    )
+    return launcher_calls
+
+
 def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     tmp_path, monkeypatch, caplog, install_fake_httpx,
 ):
@@ -3959,14 +3989,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     install_fake_httpx(_fake_post)
 
-    # MANDATORY, not cosmetic: on FIRE the real launcher subprocess-runs
-    # scripts/legibility/census.py (real LLM spend + git writes), and
-    # _default_entrypoint_exists is true in a real checkout -- and reaching
-    # FIRE is the entire point of this test.
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     # Empty -> empty sample -> no digests -> `invoke` is never called and
     # nothing is committed, so no LLM and no git.
@@ -4067,10 +4090,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 
     install_fake_httpx(_refusing_post)
 
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()

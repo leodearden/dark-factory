@@ -285,3 +285,43 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 gate.release_probe_slot(slot.token)
 
     return invoke_through_pool
+
+
+def subprocess_env(gate, *, reverse = True):
+    """The env a CHILD PROCESS needs to run as an account from *gate*, or
+    ``None`` to inherit the parent's unchanged.
+
+    The trickle spawns one child it does not drive through the gate: the
+    periodic census (``nightly._default_census_launcher`` ->
+    ``subprocess.run(census.py)``). That grandchild carried no env of its own,
+    so it was authenticated only because a 2026-09-14 stopgap drop-in exported
+    ONE account's token into the systemd unit. This is what replaces that pin,
+    and it is strictly better than what it replaces: an account the gate
+    believes is live AT LAUNCH TIME, rather than a hardcoded max-h that may
+    have capped hours earlier.
+
+    THE LEASE IS READ AND HANDED STRAIGHT BACK. Nothing in another process can
+    settle a slot, so a retained PROBE_IN_FLIGHT claim would never be released
+    and that account would be inadmissible to the trickle's own digests for the
+    rest of the night -- the pool silently shrinking by one every time a census
+    fired. The cost of handing it back is that the census's spend is invisible
+    to the gate; per-invocation rotation INSIDE census.py (its own file lock, a
+    mining loop over many batches) is the real fix and is filed as a follow-up.
+
+    DEGRADES TO ``None``, never raises. ``census.preflight_headroom`` folds any
+    failure into a fail-SAFE defer, so a census that cannot authenticate
+    silently skips instead of erroring: "no account to give it" must therefore
+    mean "inherit exactly as before", which is what the census did before this
+    existed, and never "fail the census".
+    """
+    lease = gate.try_lease(reverse=reverse)
+    if lease is None:
+        logger.info(
+            "legibility account pool: no account available for the census "
+            "subprocess — it inherits the unit's environment, as before",
+        )
+        return None
+    try:
+        return coder.child_env(lease.token)
+    finally:
+        gate.release_probe_slot(lease.token)
