@@ -273,6 +273,103 @@ class TestOrderSessions:
 
         assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
 
+    def test_focusable_sorts_ahead_of_headless_within_a_status_band(self):
+        """Inside one status band, a row Enter can act on comes first.
+
+        This is load-bearing beyond mere ordering: app.py orders BEFORE
+        capping (filter_live_sessions slices an already-ordered list), so
+        under a 200+ live backlog the rows an operator can actually act on
+        are the ones that survive the cap.
+        """
+        from cockpit.panes.session_table import order_sessions
+
+        focusable = _make_record(
+            session_slug='focusable',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+        )
+        headless = _make_record(
+            session_slug='headless', status=sr.Status.RUNNING, display=None
+        )
+
+        assert [r.session_slug for r in order_sessions([headless, focusable])] == [
+            'focusable',
+            'headless',
+        ]
+        assert [r.session_slug for r in order_sessions([focusable, headless])] == [
+            'focusable',
+            'headless',
+        ]
+
+    def test_state_rank_still_dominates_focusability(self):
+        """Blocked-on-you stays the top signal: a HEADLESS awaiting-input
+        session outranks a FOCUSABLE running one. Focusability is a
+        tiebreak inside a band, never a reordering across bands."""
+        from cockpit.panes.session_table import order_sessions
+
+        headless_blocked = _make_record(
+            session_slug='headless-blocked',
+            status=sr.Status.AWAITING_INPUT,
+            display=None,
+        )
+        focusable_running = _make_record(
+            session_slug='focusable-running',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+        )
+
+        ordered = order_sessions([focusable_running, headless_blocked])
+
+        assert [r.session_slug for r in ordered] == [
+            'headless-blocked',
+            'focusable-running',
+        ]
+
+    def test_age_still_breaks_ties_below_focusability(self):
+        """Two records alike in band and focusability still order oldest
+        first -- focusability is inserted between the two existing keys,
+        it does not replace the age tiebreak."""
+        from cockpit.panes.session_table import order_sessions
+
+        newer = _make_record(
+            session_slug='newer',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        older = _make_record(
+            session_slug='older',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        )
+
+        assert [r.session_slug for r in order_sessions([newer, older])] == ['older', 'newer']
+
+    def test_headless_records_are_never_dropped(self):
+        """Ordering reorders; it never hides. A headless session is real
+        running work, and how many there are is itself fleet state."""
+        from cockpit.panes.session_table import order_sessions
+
+        records = [
+            _make_record(session_slug='h-1', status=sr.Status.RUNNING, display=None),
+            _make_record(
+                session_slug='f-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=sr.Display(kind='wm'),
+            ),
+            _make_record(session_slug='h-2', status=sr.Status.IDLE, display=None),
+            _make_record(
+                session_slug='f-2', status=sr.Status.RUNNING, display=sr.Display(kind='tmux')
+            ),
+        ]
+
+        ordered = order_sessions(records)
+
+        assert len(ordered) == len(records)
+        assert {r.session_slug for r in ordered} == {r.session_slug for r in records}
+
+
 
 class TestFilterLiveSessions:
     def test_terminal_statuses_are_dropped(self):
