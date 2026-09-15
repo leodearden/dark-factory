@@ -261,6 +261,265 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 
+# task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
+# 2.13/3.10/4.71, load-per-core 6.6) -- the per-spawn price
+# `required_timeout_secs` below charges.
+#
+# A DELIBERATELY PESSIMISTIC CEILING, NOT AN ESTIMATE OF ANY CALLER'S SCENE
+# (task 5333 reviewer amendment).  4.71 is the SLOWEST of three single-spawn
+# samples taken from one workload; it is the price a caller pays so that a
+# marker derived from it cannot be too small.  Read as a prediction of what a
+# spawn costs it is wildly high -- measured against this file's own
+# DEEP_GATE_SCENE_* caller, whose per-spawn cost is quantified in that
+# constant's comment, it over-charges by two orders of magnitude.  That gap is
+# intended and is the whole point: these markers are BACKSTOPS that must never
+# fire on a healthy run, not budgets tuned to a scene's typical cost.  A
+# re-deriver who mistakes it for the latter will "correct" it downward and
+# re-create the very under-sizing it exists to prevent.
+#
+# WHY THAT PROVENANCE LICENSES REUSE BEYOND THE OFFLINE LANE (task 5333): the
+# figure is a worst case measured UNDER CONTENTION, at load-per-core 6.6, and
+# the TestRow7KillSwitchByteIdentity crashes it is now also used to size were
+# recorded at load-per-core 5.5-11 -- the same regime, BRACKETED rather than
+# extrapolated from.  A latency measured on an idle host would not transfer;
+# this one does.  (That argument licenses the TRANSFER of the figure between
+# workloads.  It says nothing about the figure being tight for either of them,
+# which the paragraph above is careful not to claim.)
+#
+# MOVED HERE from test_offline_lane_integration.py by task 5333, which needed
+# the same arithmetic in test_merge_queue_deep_integration_gate.py -- a module
+# that cannot import a test module without coupling the two suites' collection
+# order.  Pinned, along with a guard against a second copy growing back, by
+# test_timeout_marker_inversion_guard.py::TestSpawnBoundSizingModel.
+MEASURED_SPAWN_LATENCY_SECS = 4.71
+
+
+def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
+    """Task 4203 -- THE canonical sizing model for ``@pytest.mark.timeout``
+    OVERRIDES on tests whose cost is dominated by real subprocess spawns.
+
+    This is the single, callable statement of the model: callers CALL it
+    rather than re-deriving or re-stating it in prose, so the rule cannot
+    drift into per-callsite copies the way a spawn count already had before
+    4203 consolidated it (two landed docstrings undercounted
+    ``_drive_advance``, inconsistently).
+
+    THE MODEL: a test's effective per-test pytest-timeout must cover its
+    bounded-wait sum (*bounded_secs* -- the sums of ``_LANE_PASS_BOUND_SECS``
+    -style waits the test's own body composes) PLUS its counted out-of-bound
+    real-git subprocess spawns (*out_of_bound_spawns* -- real git work done
+    OUTSIDE any bounded ``wait_for`` window), each spawn priced at the
+    worst-case measured :data:`MEASURED_SPAWN_LATENCY_SECS`.  Every term is
+    an already-measured, already-pinned quantity; nothing guessed.
+
+    WHY THE ADDITIVE TERM EXISTS: pytest-timeout 2.4.0 installs its timer in
+    ``pytest_runtest_protocol`` whenever ``func_only`` is False -- unset
+    repo-wide, so true for every test here -- meaning the per-test budget
+    covers fixture setup/teardown and all real-git test-body work, not just
+    the bounded waits.  Before 4203 the marker-CARRYING guard in
+    test_offline_lane_integration.py compared a marker against the
+    bounded-wait sum alone, reserving ZERO headroom for that real-git work,
+    while the marker-LESS guard beside it reserved 40% of the budget for
+    exactly it.  That asymmetry, not any one test's marker value, is what
+    4203 fixed.
+
+    SCOPE -- the marker-carrying OVERRIDES only, i.e. a number a suite
+    CHOOSES.  A marker-less population is deliberately NOT gated by this
+    model; see test_offline_lane_integration.py::
+    test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling for why.
+
+    THE ROUNDING RULE deliberately lives with the CALLERS, not here: each
+    takes this figure up to the next multiple of the 60s pyproject grid (see
+    :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`, and the worked
+    ``@pytest.mark.timeout(120)`` comment in test_offline_lane_integration.py).
+    Returning the raw requirement keeps the model one idea wide, and lets a
+    caller that wants the unrounded number have it.
+    """
+    return bounded_secs + out_of_bound_spawns * MEASURED_SPAWN_LATENCY_SECS
+
+
+# task 5333: what TestRow7KillSwitchByteIdentity
+# (test_merge_queue_deep_integration_gate.py) is ALLOWED to cost, and the
+# per-test timeout derived from it.  This comment is the SINGLE home of that
+# derivation; the class points HERE rather than restating it, and
+# test_timeout_marker_inversion_guard.py::TestDeepGateSceneBudget re-derives
+# the second constant from the first at runtime so neither literal can drift.
+#
+# MEASURED, 2026-09-14 at main 99ab62335a, by counting
+# `asyncio.create_subprocess_exec`/`_shell` per test:
+#     test_the_same_sequence_at_cap_six_moves_every_deep_field   234 spawns
+#     test_the_kill_switched_run_matches_the_golden_transcript   113 spawns
+#     test_a_restarted_worker_inherits_no_halving_suspicion      113 spawns
+#     TOTAL 460 spawns, against 0.00s of summed `asyncio.sleep`.
+# The sleep total is the load-bearing half of that: with no bounded waits at
+# all, this class is ~100% SUBPROCESS-SPAWN-BOUND, so its wall clock is its
+# spawn count multiplied by per-spawn latency -- and per-spawn latency is
+# exactly what host CPU oversubscription inflates.
+#
+# WHAT IS OBSERVED, AND WHAT IS ONLY HYPOTHESISED (task 5333 reviewer
+# amendment -- stated separately so a later reader does not inherit a guess as
+# a finding).  OBSERVED: this class is 5 of the 7 recorded crash-census
+# events; at 234 spawns it is the heaviest thing in that file; it shared an
+# identical 300s marker with classes a third its size; and every recorded run
+# of it, at every load, finished far under 300s (see the wall clocks below --
+# the largest is 22.81s for all three tests together).  HYPOTHESIS: that the
+# 300s marker is what fired in those crashes, via a load excursion larger than
+# any yet recorded.  NOT OBSERVED, and the gap matters: no recorded run shows
+# this class approaching 300s, so nothing here demonstrates the old marker
+# firing.  Another cause would fit the same census -- git_ops.py documents
+# EMFILE/ENOMEM paths on `create_subprocess_exec`, and a bare xdist worker
+# death looks identical from the outside whichever killed it.  A widened
+# marker is therefore a HEDGE against the timeout cause, not a proven repair;
+# the budget fixture below is what this change contributes unconditionally,
+# since it reports scene growth whatever the crash mechanism turns out to be.
+# If Row 7 crashes again with this marker in place, the timeout hypothesis is
+# falsified -- look at fd and memory limits next, and do not widen further.
+#
+# THAT FALSIFIER HAS NOW TRIGGERED ONCE (2026-09-15, task 5333 amendment pass,
+# recorded here because a hedge whose test has been run is worth more than one
+# still waiting for it).  OBSERVED, full `pytest tests/` at this marker:
+#   * 1 failed, 16975 passed, 16 skipped in 2484s -- the single failure being
+#     "worker 'gw2' crashed while running ...TestRow7KillSwitchByteIdentity::
+#     test_the_same_sequence_at_cap_six_moves_every_deep_field";
+#   * NO `+++ Timeout +++` banner anywhere in that log, which pytest-timeout
+#     writes before its `os._exit()`;
+#   * the same suite at the same marker had passed 21216 tests, rc=0, in this
+#     lane's own verify attempt-1 (2026-09-14T21:25, 2445s).  So: one crash in
+#     two full-suite runs, not a reproducible failure;
+#   * the shortfall between those counts is the crash's real cost -- under
+#     `--max-worker-restart=0` the dead worker is not replaced, so ~4200 tests
+#     assigned to it never ran, and the run reported green-ish anyway.
+# HYPOTHESIS (unproven, and now the LEADING one): the worker is not dying of
+# this timeout.  Reaching 1260s needs a ~150x slowdown on a test measured at
+# 8.28s, where the worst contention ever recorded here cost 2.8x, and no
+# timeout banner was emitted.  NOT INVESTIGATED: fd and memory ceilings at the
+# moment of death -- the next place to look, per the line above.
+# WHAT THIS DOES NOT OVERTURN: the marker is still correctly sized for what it
+# covers, and it is genuinely in force under verify -- measured directly, a
+# `@pytest.mark.timeout` marker overrides verify's CLI `--timeout=300`
+# (pytest-timeout resolves the marker first and falls back to ini/CLI only in
+# its absence).  What is in doubt is whether a timeout was ever the cause.
+#
+# THE COUNTS ARE DETERMINISTIC AND THE WALL CLOCK IS NOT, which IS the
+# load-sensitivity these constants exist to absorb.  Five runs of the same
+# three tests, spawn count identical (460) in every one:
+#     8.06s and 17.72s at loadavg ~98 / 32 cores;
+#     19.03s and 22.81s at loadavg 145 then 304 / 32 cores;
+#     18.12s at loadavg 247 / 32 cores, the run that also took the per-test
+#     split below (8.28s / 4.05s / 5.20s for the 234 / 113 / 113 tests).
+# A 2.8x spread with the work held fixed. Sizing this marker from wall clock
+# would have meant sizing it from whatever the host happened to be doing; the
+# spawn count is the stable quantity, so the marker is sized from THAT.
+#
+# 1260 IS ~150x THE HEAVIEST RECORDED RUN OF THE HEAVIEST TEST, and that is
+# deliberate rather than an arithmetic slip (task 5333 reviewer amendment).
+# Dividing the wall clocks above by 460 puts THIS scene's per-spawn cost at
+# 0.018-0.050s -- against the 4.71s `MEASURED_SPAWN_LATENCY_SECS` charges, a
+# 95-270x over-charge.  The 4.71 is a worst-case SINGLE-spawn latency from a
+# different workload, i.e. a pessimistic ceiling and not an estimate of this
+# scene (see its own comment above); pricing 260 spawns at it assumes every
+# spawn simultaneously hits that worst case, which no recorded run comes near.
+# KEPT ANYWAY, on the tradeoff these markers are for: too LARGE costs at most
+# one wedged test burning 1260s of a 7200s verify budget before it reports --
+# bounded, attributed, and recoverable.  Too SMALL costs an `os._exit()`d
+# xdist worker with no assertion and no traceback, which is what made this
+# class's crashes cost ~38-minute merge cycles to diagnose.  Those are not
+# symmetric, so the sizing deliberately errs high.  The price of erring high
+# is real and is named here so the next re-deriver weighs it rather than
+# rediscovering it: do not read 1260 as a claim about what this class costs.
+#
+# BUDGET = 234 + 26 (~11% headroom) = 260.  Headroom rather than a snug fit
+# because an unrelated change adding a few spawns must not fail the run --
+# only a change that makes the scene materially heavier should.
+#
+# TIMEOUT = 260 x 4.71 = 1224.6s, rounded UP the 60s pyproject grid to 1260
+# (the same rounding rule the offline lane's `@pytest.mark.timeout(120)`
+# comment works).  ROBUST to small re-measurement drift: every budget in
+# 255-267 rounds to this same 1260, i.e. a re-measured worst case anywhere in
+# 229-241 carrying the same +26 headroom moves nothing here.  (An earlier
+# draft of this comment put that plateau at 235-267; 235 in fact rounds to
+# 1140 -- see esc-5333-1.  The plateau's lower edge is 255, the first budget
+# whose priced cost clears 1200s.)
+#
+# SIZED AGAINST THE BUDGET, NOT AGAINST THE RAW 234 -- the distinction that
+# makes this pair maintainable rather than merely correct today.  A widened
+# marker alone decays: the next change that makes the scene heavier silently
+# re-creates the under-sizing, and the symptom returns as a bare xdist worker
+# crash on an innocent branch, with no assertion and no traceback.  Because
+# the timeout is derived from the BUDGET, and the budget is ENFORCED per test
+# by the autouse fixture on that class, the marker can only be wrong if the
+# budget is breached -- and a breach fails loudly, in-process, on the test
+# that caused it, naming the constant to re-derive.
+#
+# THAT DECAY IS MEASURED, NOT HYPOTHESISED: task 5028's `VerifyPort` injection
+# moved these counts from 231/110/110 to 234/113/113 within a single day, in
+# an unrelated lane, and nothing in the tree reported it -- the drift was
+# found only because this task re-measured by hand.  Which is the concrete
+# reason the budget is enforced rather than merely written down.
+#
+# TWO CEILINGS it sits under, both pinned by TestDeepGateSceneBudget:
+#   * `verify_command_timeout_secs` (7200s, orchestrator/orchestrator.yaml) --
+#     a per-test backstop larger than the whole verify run's own budget could
+#     never fire, so it would be no backstop at all;
+#   * `VERIFY_CLI_PER_TEST_TIMEOUT` -- 1260 is far ABOVE it, so this marker
+#     loosens under both budgets and cannot invert.  It is nowhere near the
+#     (DELIBERATE_TIGHT_BOUND_CEILING, VERIFY_CLI_PER_TEST_TIMEOUT) band and
+#     needs no grandfathering.
+DEEP_GATE_SCENE_SPAWN_BUDGET = 260
+DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
+
+
+def deep_gate_spawn_budget_violation(count: int, nodeid: str) -> str | None:
+    """Why *count* git spawns is an unacceptable cost for *nodeid*, or None.
+
+    Returns the MESSAGE and never raises: the CALLER decides how to fail.
+    That is what keeps the check reachable from a plain unit test rather than
+    only from the autouse fixture that uses it -- a budget check living
+    inside a fixture teardown is exercised only on the path where it passes.
+
+    SCOPED TO :data:`DEEP_GATE_SCENE_SPAWN_BUDGET`, which it reads rather than
+    accepts (task 5333 reviewer amendment).  An earlier revision took the
+    budget as a parameter while its message named the DEEP_GATE_SCENE_*
+    constants as the pair to re-derive, so any second caller the general
+    signature invited would have been told to re-derive constants that had
+    nothing to do with it.  The narrow spelling makes the parameters and the
+    message agree about how wide this function is, and lets its unit tests pin
+    the REAL budget boundary instead of a synthetic one.
+
+    TWO offences, kept distinct because their remedies differ.  A count ABOVE
+    the budget means the scene got heavier and both constants need
+    re-deriving.  A count of ZERO means the caller's counting seam saw no git
+    at all, so the budget is enforcing nothing -- and since zero is inside
+    every budget, nothing else here would catch it.
+
+    The derivation behind these numbers is NOT restated here; see
+    :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`'s comment above.
+    """
+    budget = DEEP_GATE_SCENE_SPAWN_BUDGET
+    if count == 0:
+        return (
+            f'{nodeid} made NO git subprocess calls, so its spawn budget of '
+            f'{budget} is enforcing nothing. The counting seam has gone blind, '
+            'and a guard that passes because it was silently disconnected is '
+            'worse than no guard at all. Repair the fixture that counts spawns '
+            'before trusting any later green run of this class.'
+        )
+    if count > budget:
+        return (
+            f'{nodeid} made {count} git spawns, over its budget of {budget}. '
+            'The scene got heavier, so @pytest.mark.timeout('
+            f'DEEP_GATE_SCENE_TEST_TIMEOUT) ({DEEP_GATE_SCENE_TEST_TIMEOUT}s) '
+            'is no longer sized for what this class costs -- and an '
+            'under-sized marker does not fail as a red test, it dies as an '
+            'unattributed xdist worker crash on a loaded host. Re-measure the '
+            'per-test spawn counts, then re-derive BOTH '
+            'DEEP_GATE_SCENE_SPAWN_BUDGET and DEEP_GATE_SCENE_TEST_TIMEOUT '
+            'from the new figure (their comment in this file has the model). '
+            'Raising the budget alone leaves the marker under-sized.'
+        )
+    return None
+
+
 # task 3540: the claimant-liveness TTL the row builder below derives its
 # symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
 # imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a

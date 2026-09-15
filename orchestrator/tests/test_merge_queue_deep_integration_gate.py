@@ -299,10 +299,21 @@ HARNESS NOTES
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
     Sync tests live in their OWN unmarked class.
-  * The ini default per-test ``timeout`` is 60 s; every class doing real git plus
-    a real worker carries ``@pytest.mark.timeout(300)``.  The CLI ``--timeout=300``
-    some runners pass does NOT remove the need for the mark, and pytest-timeout's
-    thread method ``os._exit()``s the xdist worker on overrun under
+  * The ini default per-test ``timeout`` is
+    ``_orch_helpers.PYPROJECT_DEFAULT_TIMEOUT``, a mirror of
+    orchestrator/pyproject.toml kept honest by
+    test_whole_tree_scan_timeout_guard.py -- deliberately a POINTER and not a
+    number repeated here, which is how this note's previous "60 s" claim
+    outlived the 60 -> 300 raise.  Every class doing real git plus a real
+    worker carries a ``@pytest.mark.timeout`` override, always spelled as a
+    named constant and never as a literal (ratcheted by
+    test_timeout_marker_inversion_guard.py).
+    TestRow7KillSwitchByteIdentity's is ``DEEP_GATE_SCENE_TEST_TIMEOUT``,
+    DERIVED from that class's measured git-spawn count and held honest by its
+    autouse budget fixture (task 5333); the rest pin
+    ``VERIFY_CLI_PER_TEST_TIMEOUT``.  The CLI ``--timeout`` some runners
+    pass does NOT remove the need for the mark, and pytest-timeout's thread
+    method ``os._exit()``s the xdist worker on overrun under
     ``--max-worker-restart=0``.
   * Monkeypatching is INSTANCE-level wherever possible:
     test_merge_queue_reachback_patch_guard.py freezes the
@@ -324,6 +335,16 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pytest
 from _merge_lane_census import lanes_by_task, queued_in_lane
+
+# task 5333: Row 7 ALONE is sized by measurement (DEEP_GATE_SCENE_TEST_TIMEOUT);
+# every other real-git class here stays at the verify CLI budget because none of
+# their spawn counts has been measured, and widening an unmeasured marker is the
+# guessing this task replaced. The asymmetry is a decision, not an oversight.
+from _orch_helpers import (
+    DEEP_GATE_SCENE_TEST_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
+    deep_gate_spawn_budget_violation,
+)
 from shared.task_metadata import RetryLedger
 
 from orchestrator import merge_queue
@@ -2833,7 +2854,7 @@ async def _make_gate_scene(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepScaleBuild:
     """A real 16-item chain at ``chain_cap=32`` — the PRD's stated maximum."""
 
@@ -2955,7 +2976,7 @@ class TestDeepScaleBuild:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow11TimeoutMargin:
     """Row 11: a 16-item chain (cap 32) fits inside the merge-verify budget."""
 
@@ -3348,7 +3369,7 @@ _ROW3_CAP = 6
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow3HalvingIsolatesTheBadItem:
     """Row 3: one genuinely-red item, and a bisection that terminates on it."""
 
@@ -3781,7 +3802,7 @@ _ROW8_FOLLOWERS = 8
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow8DeepFailsNeverFeedTheThrashLadder:
     """Row 8: a red deep tip renders nothing, so the ladder has nothing to eat."""
 
@@ -4338,9 +4359,52 @@ other six were silently inert."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+# task 5333: DERIVED from this class's measured git-spawn count rather than
+# chosen -- see DEEP_GATE_SCENE_TEST_TIMEOUT's comment in _orch_helpers.py for
+# the measurement, the rounding and the two ceilings it sits under.
+@pytest.mark.timeout(DEEP_GATE_SCENE_TEST_TIMEOUT)
 class TestRow7KillSwitchByteIdentity:
     """Row 7: at cap=0 a whole RUN is byte-identical to the pre-PRD transcript."""
+
+    @pytest.fixture(autouse=True)
+    def _within_spawn_budget(self, request, monkeypatch):
+        """Fail if this test costs more real git than its marker is sized for.
+
+        WHY THE MARKER NEEDS A GUARD AT ALL -- and why the budget rather than
+        a comment is what keeps it honest -- is argued once, at
+        ``_orch_helpers.py::DEEP_GATE_SCENE_TEST_TIMEOUT``.  Not restated here:
+        prose copies of a derivation are what drift.  This docstring covers
+        only what is local to the fixture and stated nowhere else.
+
+        Counts BOTH asyncio spawn entry points, which is what the measurement
+        behind the constants counted.  ``create_subprocess_exec`` is the one
+        ``git_ops._run`` reaches and carries the bulk (231 / 110 / 110), but
+        each of these tests also makes exactly 3 ``create_subprocess_shell``
+        calls; watching ``_exec`` alone undercounts every test by those 3 and
+        would have quietly shipped a budget measured against a different
+        number than the timeout was derived from.
+
+        Per-test and IN-PROCESS by construction, never module state, so it
+        stays correct under ``--dist loadgroup`` where these three tests can
+        land on three different workers.  Patched through ``monkeypatch`` so it
+        is restored at teardown, per the instance-level rule in HARNESS NOTES.
+        """
+        seams = ('create_subprocess_exec', 'create_subprocess_shell')
+        spawns = 0
+
+        def counting(real):
+            async def counting_spawn(*args, **kwargs):
+                nonlocal spawns
+                spawns += 1
+                return await real(*args, **kwargs)
+
+            return counting_spawn
+
+        for seam in seams:
+            monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+        yield
+        violation = deep_gate_spawn_budget_violation(spawns, request.node.nodeid)
+        assert violation is None, violation
 
     async def _sequence(
         self, git_repo: Path, tmp_path: Path, monkeypatch, *,
@@ -4550,7 +4614,7 @@ truncates and nothing is left over: the chain is exactly the queue."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBoundaryRowsComposed:
     """Rows 1, 2, 5, 6, 9 and 10, each inside ONE continuous multi-round run."""
 
@@ -5190,7 +5254,7 @@ reason for it are documented on :func:`_setup_repo`.)
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow4ConflictTruncatesSilently:
     """Row 4: a chain conflict is a fact about the CHAIN, not a verdict."""
 
@@ -5524,7 +5588,7 @@ round-by-round failure rather than as a mysteriously mis-armed hook."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepGateCapstone:
     """One continuous six-round run: conservation, and telemetry vs git."""
 
