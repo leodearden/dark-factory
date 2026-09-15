@@ -480,8 +480,8 @@ async def discover_orchestrators(
         if project_root not in project_cache:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                # Never got its turn. Reported through the offline marker
-                # rather than silently omitted or rendered as zero tasks.
+                # Never got its turn: DEGRADED (state unknown), not offline —
+                # nothing about this root was measured.
                 message = (
                     f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
                     'orchestrators budget was already spent before this root '
