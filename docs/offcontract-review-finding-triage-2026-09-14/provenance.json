@@ -158,5 +158,19 @@
     "the_47_location_less_on_contract_findings": "Not part of this task's roster: they were adjudicated normally, since severity is what the gates key on for scope. Recorded here only to bound the two defects' blast radii.",
     "recurrence_prevention": "Owned by the companion submit_review_verdict validation task.",
     "fixes": "Every live defect is filed as a follow-up task; none is fixed here."
+  },
+  "script_amended_after_measurement": {
+    "why": "A code review of this task's own audit script surfaced five robustness findings; all five were reproduced and fixed in an amendment pass (commits a77ce79f3e, 296b50e38b). `script_sha` above is left as-is: it is the sha the numbers below were MEASURED with, and rewriting it would make this file claim a provenance it does not have.",
+    "script_sha_after_amendment": "431beb69819de982f04fc23208f14df95dfb210e",
+    "what_changed": [
+      "An unreadable `--root` now raises instead of returning an all-zero census and exit 0.",
+      "Both output modes now name the verdict glob, so a zero-file census says what it searched for.",
+      "A wrongly-TYPED payload is tallied as `unparseable` instead of aborting the walk with an uncaught AttributeError.",
+      "`off_contract_severity` now inspects the refused residue's severity instead of assuming all of it was off-contract.",
+      "`select_population` returns `Population(issues, unselectable)`, so refusals it cannot roster are reported rather than dropped.",
+      "`validate_report` no longer certifies a report with an empty, absent or misspelled roster, nor pairs two entries that both lack an `id`."
+    ],
+    "numbers_unchanged": "Re-measured after the amendment: off_contract_severity 74, location_less 121, triage_population 22, unparseable 0, unlocatable 0, triage_unselectable 0 — every load-bearing number in `census_live` is identical. `files`, `issues` and `verdicts_with_issues` read 1271/3344/947 against the 1267/3331/943 recorded below; that is the ongoing corpus growth `census_drift` already documents, not an effect of the amendment. The four findings about the refused residue were latent throughout: the live tree has never measured a nonzero `unlocatable`.",
+    "reproduce_completeness_check_after_amendment": "Unchanged command, unchanged result: 0 violations, exit 0."
   }
 }

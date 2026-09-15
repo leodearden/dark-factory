@@ -4,6 +4,14 @@
 branch `task/5430` · branch base `99ab62335a` · audit code at
 `907353ec41ce9944567ab1bf9cf0bf4626508e91`
 
+> The audit script was amended AFTER this triage was measured, in response to
+> five robustness findings against the script itself — so the sha above no
+> longer matches the file in the tree. It is kept because it is the sha the
+> numbers below were measured with. The amendment changed no load-bearing
+> number (re-measured: off-contract 74, location-less 121, triage population
+> 22) and the completeness check still exits 0. See
+> `provenance.json -> script_amended_after_measurement`.
+
 Between 2026-07-19 and 2026-08-10, `reviewer_comprehensive` emitted verdicts
 whose `verdict.issues[]` entries used an off-contract shape: `severity` outside
 `{blocking, suggestion}`, and `file`+`line` instead of `location`. Both review
