@@ -42,6 +42,46 @@ def state_glyph(status: Status | str) -> str:
     return _GLYPHS.get(resolved, _FALLBACK_GLYPH)
 
 
+# The focusability cue's vocabulary, deliberately disjoint from _GLYPHS
+# above: status ("is it working?") and focusability ("can I get to it?")
+# are orthogonal, so a marker that collided with a status glyph would make
+# one column read as the other. Both are single-width, so the leading
+# marker column can never shift the columns beside it.
+_FOCUSABLE_MARKER = '▸'
+_HEADLESS_MARKER = '·'
+
+
+def is_focusable(record: SessionRecord) -> bool:
+    """Can Enter raise a terminal for *record*?
+
+    Mirrors decision_queue.resolve_target's SessionRecord branch, which is
+    literally ``display -> DisplayTarget, None -> None`` and is the code
+    app.py::_focus_slug actually runs -- a display-less (headless) agent
+    session has no terminal anywhere, so focusing it is a no-op.
+
+    Restated here rather than imported because decision_queue already
+    imports this module (a reverse import would be a cycle); the agreement
+    is pinned by test_session_table.py::TestFocusMarker::
+    test_agrees_with_resolve_target instead, so the two statements cannot
+    silently drift apart.
+    """
+    return record.display is not None
+
+
+def focus_marker(record: SessionRecord) -> str:
+    """Render *record*'s focusability as its row marker.
+
+    Both states get a present, distinct glyph rather than marking one and
+    leaving the other blank: ~85% of live rows are headless, so an absence
+    would read as "column not populated yet" instead of "nothing to raise".
+    Total over any record shape -- any display at all reads focusable,
+    including an unrecognized kind (fail-soft, PRD §2: an unknown kind is
+    still a real terminal, and mislabelling it unactionable is the worse
+    error).
+    """
+    return _FOCUSABLE_MARKER if is_focusable(record) else _HEADLESS_MARKER
+
+
 def format_title(record: SessionRecord) -> str:
     """Render 'role:project#task_id' (the '#task_id' segment omitted when absent).
 
