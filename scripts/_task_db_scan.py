@@ -154,6 +154,7 @@ class TaskDbProblem(Enum):
     """
 
     ABSENT = "absent"
+    IS_A_DIRECTORY = "is_a_directory"
     EMPTY_STUB = "empty_stub"
     NO_TABLES = "no_tables"
     NOT_A_DATABASE = "not_a_database"
@@ -165,6 +166,14 @@ _REFUSAL_REMEDY = {
         ".taskmaster/tasks/tasks.db; .taskmaster/ is not tracked in git, so it "
         "never exists inside a worktree. `git worktree list --porcelain` names "
         "the main checkout on its first line."
+    ),
+    TaskDbProblem.IS_A_DIRECTORY: (
+        "a directory, not a file. Two spellings land here: naming the "
+        "CONTAINING directory (.taskmaster/tasks) instead of the store inside "
+        "it (.taskmaster/tasks/tasks.db), and an EMPTY path string, which "
+        "resolves to the current working directory. sqlite opens neither — it "
+        "reports `disk I/O error`, which names no path and suggests a failing "
+        "disk rather than a mistyped argument."
     ),
     TaskDbProblem.EMPTY_STUB: (
         "0 bytes — an empty stub, not a task store. Opening it read-only would "
@@ -226,6 +235,8 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     a file that vanished mid-call — propagates as the original
     :class:`sqlite3.Error`. Only sqlite's own ``SQLITE_NOTADB`` becomes a
     refusal, because only that code means the bytes are not a database;
+    ``SQLITE_IOERR`` for a directory is caught EARLIER, by ``is_dir()``, since
+    that code is indistinguishable from a genuinely failing disk;
     :class:`sqlite3.OperationalError` is a SUBCLASS of
     :class:`sqlite3.DatabaseError`, so branching on the exception class would
     report every unreadable store as "not a database".
@@ -242,6 +253,8 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     resolved = Path(path).resolve()
     if not resolved.exists():
         raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
+    if resolved.is_dir():
+        raise TaskDbUnreadable(resolved, TaskDbProblem.IS_A_DIRECTORY)
     if resolved.stat().st_size == 0:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
 

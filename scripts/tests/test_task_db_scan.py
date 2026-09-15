@@ -63,6 +63,7 @@ from typing import NamedTuple
 import pytest
 from _task_db_scan import (
     _DEFAULT_PROJECT_ROOTS,
+    _SQLITE_NOTADB_ERRORCODE,
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
@@ -170,6 +171,44 @@ def test_connect_ro_refuses_a_zero_byte_stub_with_its_own_reason(tmp_path):
     assert excinfo.value.path == stub.resolve()
 
 
+def test_connect_ro_refuses_a_directory_rather_than_reporting_a_disk_io_error(
+    tmp_path,
+):
+    """A directory is a fifth mistake, and sqlite's own answer to it is unusable.
+
+    Measured: a read-only open of a directory raises ``disk I/O error``
+    (``SQLITE_IOERR``) from ``sqlite3.connect`` itself — a message that names
+    no path and reads as failing hardware rather than as a mistyped argument.
+    Two spellings land here and both are live: naming ``.taskmaster/tasks``
+    instead of the store inside it, and an empty path string, which
+    ``Path("").resolve()`` turns into the current working directory.
+    """
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro(tmp_path)
+
+    assert excinfo.value.reason is TaskDbProblem.IS_A_DIRECTORY
+    assert excinfo.value.path == tmp_path.resolve()
+    assert str(tmp_path.resolve()) in str(excinfo.value)
+
+
+def test_connect_ro_refuses_an_empty_path_as_the_directory_it_resolves_to(tmp_path,
+                                                                          monkeypatch):
+    """``Path("")`` is not "no path" — it resolves to the cwd.
+
+    A caller forwarding an empty ``--db``/``--project-root`` therefore hands
+    this function a real, existing directory, which is why the arm above is
+    reached by an argument the reader typed rather than only by a path they
+    chose.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(TaskDbUnreadable) as excinfo:
+        connect_ro("")
+
+    assert excinfo.value.reason is TaskDbProblem.IS_A_DIRECTORY
+    assert excinfo.value.path == tmp_path.resolve()
+
+
 def _empty_the_tables_of(path: Path) -> Path:
     """Make *path* a READABLE sqlite database carrying zero tables.
 
@@ -199,19 +238,21 @@ def test_connect_ro_refuses_a_readable_store_that_has_no_tables(tmp_path):
     assert str(excinfo.value.path) in str(excinfo.value)
 
 
-def test_the_four_refusals_of_one_path_each_read_differently(tmp_path):
-    """No two refusals may read the same.
+def test_every_refusal_of_one_path_reads_differently(tmp_path):
+    """No two refusals may read the same, and EVERY arm is covered.
 
     Collapsing any of them into one "unusable store" message would restore
     exactly the unactionable signal this guard exists to remove — the whole
-    point of the enum is that the reader learns WHICH of four mistakes they
-    made, and each has its own remedy (resolve the main checkout; you are one
-    directory too high; you are pointing at some other .db; that is not a
-    database at all).
+    point of the enum is that the reader learns WHICH mistake they made, and
+    each has its own remedy (resolve the main checkout; you named the
+    containing directory; you are one directory too high; you are pointing at
+    some other .db; that is not a database at all).
 
-    The SAME path takes all four shapes in turn, so a difference between the
-    messages can only come from the remedy prose and never from the path each
-    of them names.
+    The expected arms are read off ``TaskDbProblem`` rather than counted here,
+    so a new arm shipped without its own remedy prose fails THIS test instead
+    of waiting for someone to notice the count. The SAME path takes every
+    shape in turn, so a difference between the messages can only come from the
+    remedy prose and never from the path each of them names.
     """
     path = tmp_path / "tasks.db"
 
@@ -231,14 +272,19 @@ def test_the_four_refusals_of_one_path_each_read_differently(tmp_path):
     with pytest.raises(TaskDbUnreadable) as absent_refusal:
         connect_ro(path)
 
+    path.mkdir()
+    with pytest.raises(TaskDbUnreadable) as directory_refusal:
+        connect_ro(path)
+
     refusals = (
         stub_refusal,
         table_less_refusal,
         not_a_database_refusal,
         absent_refusal,
+        directory_refusal,
     )
-    assert len({r.value.reason for r in refusals}) == 4
-    assert len({str(r.value) for r in refusals}) == 4
+    assert {r.value.reason for r in refusals} == set(TaskDbProblem)
+    assert len({str(r.value) for r in refusals}) == len(refusals)
 
 
 def test_connect_ro_refuses_a_stub_that_grew_past_zero_bytes_without_tables(tmp_path):
@@ -320,17 +366,26 @@ def test_a_store_that_cannot_be_OPENED_is_not_relabelled_not_a_database(make_tas
     Measured here: non-sqlite bytes report `SQLITE_NOTADB` (26) while a real
     store at mode 000 reports `SQLITE_CANTOPEN` (14). Only the structured
     code tells them apart, so only the structured code may be branched on.
+
+    Asserted as the POSITIVE fact, not as "the reason is not NOT_A_DATABASE".
+    That negative was satisfied by several genuine regressions it read as
+    covering — a `connect_ro` that relabelled this store `ABSENT` or
+    `EMPTY_STUB`, or that stopped refusing in some other way, would have
+    passed. Requiring the original `sqlite3.OperationalError` through, with
+    `SQLITE_CANTOPEN` on it, pins the discrimination the production
+    `if exc.sqlite_errorcode != _SQLITE_NOTADB_ERRORCODE` branch implements.
     """
     unopenable = make_tasks_db([{"id": 1, "status": "done"}])
     unopenable.chmod(0o000)
     try:
-        with pytest.raises((sqlite3.OperationalError, TaskDbUnreadable)) as excinfo:
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
             connect_ro(unopenable)
     finally:
         unopenable.chmod(0o600)
 
-    claimed_reason = getattr(excinfo.value, "reason", None)
-    assert claimed_reason is not TaskDbProblem.NOT_A_DATABASE
+    assert excinfo.value.sqlite_errorcode == sqlite3.SQLITE_CANTOPEN
+    assert excinfo.value.sqlite_errorcode != _SQLITE_NOTADB_ERRORCODE
+    assert not isinstance(excinfo.value, TaskDbUnreadable)
 
 
 def test_an_unguarded_read_only_open_of_a_table_less_store_answers_no_such_table(
