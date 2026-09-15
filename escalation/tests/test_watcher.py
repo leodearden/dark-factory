@@ -7,13 +7,16 @@ import itertools
 import json
 import logging
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from escalation.models import Escalation
-from escalation.watcher import _initial_scan, _send_ntfy
+from escalation.watcher import _emit, _initial_scan, _send_ntfy
 
 
 @pytest.fixture
@@ -141,6 +144,177 @@ class TestSendNtfy:
             assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
             assert req.get_header('Priority') == 'urgent'
             assert req.get_header('Tags') == 'rotating_light'
+
+
+class TestEmitNtfyFailure:
+    """A dropped push must be countable, and must cost the operator nothing else.
+
+    `_emit` reported an ntfy failure with a bare `print(..., file=sys.stderr)`
+    — watcher.py was the one module in the package with no logger, so the
+    failure never reached the stream the watcher's other failures travel, and
+    carried no marker an operator or skill agent could grep for.  Because
+    `_emit` runs at most once per process (both call sites `sys.exit(0)` on
+    the next line), the only countable unit is the marker line itself,
+    aggregated across the re-arm loop's stderr.
+    """
+
+    @staticmethod
+    def _failing_ntfy():
+        return patch(
+            'escalation.watcher._send_ntfy',
+            side_effect=RuntimeError('simulated ntfy outage'),
+        )
+
+    def test_failure_logs_the_marker_at_error(self, blocking_escalation: Escalation, caplog):
+        """(a) ERROR on escalation.watcher, carrying marker + id + cause."""
+        with self._failing_ntfy(), caplog.at_level(logging.ERROR, logger='escalation.watcher'):
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR
+            and 'WATCHER_NTFY_OUTCOME: FAILED' in r.getMessage()
+        ]
+        assert matching, (
+            'Expected an ERROR carrying the WATCHER_NTFY_OUTCOME marker; got: '
+            f'{[(r.name, r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        message = matching[0].getMessage()
+        assert matching[0].name == 'escalation.watcher', (
+            f'Marker logged on the wrong logger: {matching[0].name!r}'
+        )
+        assert blocking_escalation.id in message, (
+            f'Marker must name the escalation whose push was dropped: {message!r}'
+        )
+        assert 'simulated ntfy outage' in message, (
+            f'Marker must carry the underlying cause: {message!r}'
+        )
+
+    def test_failure_is_logged_not_bare_printed(
+        self, blocking_escalation: Escalation, capsys,
+    ):
+        """(b) The failure travels the logging stream, not a bare print.
+
+        The empty direct-stderr read is the ABSENCE OF A BARE PRINT, not a
+        claim that the marker never reaches stderr — under `caplog` the record
+        is captured by a handler, and in production `main` configures one that
+        writes to stderr.  `TestMarkerReachesRealStderr` below pins that
+        delivery, in a real child process, where it can actually be observed.
+        """
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        assert capsys.readouterr().err == '', (
+            'The failure must go through logging, not a bare print to stderr'
+        )
+
+    def test_stdout_still_carries_the_escalation_json(
+        self, blocking_escalation: Escalation, capsys,
+    ):
+        """(c) A dropped push never costs the operator the queue item.
+
+        stdout must also stay PURE JSON: the skill tells agents to parse it
+        without `2>&1`, so a diagnostic leaking there would break every
+        consumer.
+        """
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed['id'] == blocking_escalation.id, f'Unexpected stdout payload: {parsed}'
+        assert parsed['summary'] == blocking_escalation.summary
+
+    def test_failure_does_not_raise(self, blocking_escalation: Escalation):
+        """(d) The push is best-effort — its failure never propagates."""
+        with self._failing_ntfy():
+            _emit(blocking_escalation, 'https://ntfy.sh/t')  # must not raise
+
+    def test_successful_push_logs_no_error(self, blocking_escalation: Escalation, caplog):
+        """(d) A working push raises no false outage signal.
+
+        Only a FAILED line is emitted, never a SENT companion: the marker is
+        the countable unit of an OUTAGE, so a success line carrying the same
+        prefix would make every count of it wrong.
+        """
+        with patch('escalation.watcher._send_ntfy'), caplog.at_level(logging.DEBUG):
+            _emit(blocking_escalation, 'https://ntfy.sh/t')
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            f'A successful push must log no ERROR; got: '
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        assert not [
+            r for r in caplog.records if 'WATCHER_NTFY_OUTCOME' in r.getMessage()
+        ], 'The marker must mean a DROPPED push and nothing else'
+
+
+class TestMarkerReachesRealStderr:
+    """The stderr promise holds because `main` configures logging, not by luck.
+
+    Every test above proves only that the marker is LOGGED: `caplog` attaches
+    its own handler, which is also what detaches `logging.lastResort`.  What
+    invariant (c) and `skills/escalation-watcher/SKILL.md` promise an operator
+    is a greppable line on REAL stderr from a plain `python -m
+    escalation.watcher` run — a promise that, while it rested on
+    `logging.lastResort`, would have evaporated unnoticed the moment anything
+    configured a root handler in-process.  Only a child process can observe
+    that, so exactly one test pays for one.
+
+    The ntfy URL carries a scheme no opener handles, so the push fails inside
+    `urlopen` before any socket is opened: the drop is deterministic and the
+    test needs no network.
+    """
+
+    def test_dropped_push_marks_stderr_and_leaves_stdout_pure(self, tmp_path):
+        repo_root = Path(__file__).resolve().parents[2]
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-5368-1', task_id='5368', agent_role='implementer',
+            severity='blocking', category='infra_issue',
+            summary='a filing whose push we then drop',
+        )
+        _write_esc(queue_dir, esc)
+
+        proc = subprocess.run(
+            [
+                sys.executable, '-m', 'escalation.watcher',
+                '--queue-dir', str(queue_dir),
+                '--ntfy-url', 'ntfy-outage://unreachable',
+                '--timeout', '30',
+            ],
+            capture_output=True, text=True, timeout=120,
+            env={
+                **os.environ,
+                'PYTHONPATH': os.pathsep.join([
+                    str(repo_root / 'escalation' / 'src'),
+                    str(repo_root / 'shared' / 'src'),
+                ]),
+            },
+        )
+
+        assert proc.returncode == 0, (
+            f'A dropped push must not change the exit code: rc={proc.returncode} '
+            f'stderr={proc.stderr!r}'
+        )
+        marker_line = next(
+            (ln for ln in proc.stderr.splitlines() if 'WATCHER_NTFY_OUTCOME: FAILED' in ln),
+            None,
+        )
+        assert marker_line is not None, (
+            f'The marker never reached real stderr: {proc.stderr!r}'
+        )
+        assert 'ERROR' in marker_line, (
+            'The line must name its severity, which is also the evidence that this '
+            'process configured its own handler: `logging.lastResort` emits the bare '
+            f'message with no level at all.  Got: {marker_line!r}'
+        )
+        assert esc.id in proc.stderr, (
+            f'The marker must name the escalation whose push was dropped: {proc.stderr!r}'
+        )
+        assert json.loads(proc.stdout)['id'] == esc.id, (
+            f'stdout must stay pure escalation JSON: {proc.stdout!r}'
+        )
 
 
 def _write_esc(queue_dir, esc: Escalation) -> None:

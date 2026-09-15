@@ -40,10 +40,13 @@ from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
+    ACTION_KEEP_DRIVING,
+    ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     EvidenceEntry,
     max_severity,
@@ -1163,9 +1166,16 @@ def create_server(
           e.g. a concurrent sweep won the race): ``{'id', 'status',
           'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
           function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
-          post-write state rather than write intent, and fail open to
-          ``'queued'`` — carrying ``esc.level`` — when the re-read is
-          unavailable.
+          post-write state rather than write intent.
+        - Unpersisted: ``{'id', 'status': 'accepted_unpersisted',
+          'persist_check', 'level'}`` when the post-write re-read could not
+          confirm the write, so the filer keeps driving its blocked task rather
+          than standing down; see
+          ``escalation/src/escalation/dedupe.py::submit_or_dedupe``, which
+          produces it, and through it
+          ``queue.py::observed_submit_response`` (task 5368).  Local to THIS
+          function: the L2 branch above never consults the dedupe gate, so an
+          L2 re-file cannot fold either.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id,
                             'level': esc.level}``
@@ -1180,8 +1190,8 @@ def create_server(
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc_id = queue.submit(esc)
             # Task 3236: this branch does NOT route through dedupe, so it needs
-            # the observed-state response separately.  Fail-open to 'queued'
-            # (still carrying esc.level, so the 'level' echo is never missing).
+            # the observed-state response separately (still carrying esc.level,
+            # so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
@@ -1569,6 +1579,14 @@ def create_server(
           with the record's REAL status — the response reports observed
           post-write state, never write intent (task 3236).
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level}``.  A post-write re-read could not confirm the
+          write, so nothing is guaranteed on disk for a drain to find.
+          ``persist_check`` is ``'absent'`` (nothing for that id is on disk)
+          or ``'unreadable'`` (a read was attempted and yielded no record — a
+          torn write reads this way — so its state is unknown).  This path carries no
+          ``action`` key — that is only on the blocker path — so an info filer
+          simply carries on, as it already does on every other branch.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1609,9 +1627,13 @@ def create_server(
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
     ) -> dict[str, Any]:
-        """Report a blocking problem. After calling this, commit any in-progress work,
-        log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-        and you will be re-invoked.
+        """Report a blocking problem. After calling this, follow the response's
+        ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
+        iteration, and STOP — do NOT retry, the handler will resolve the issue and you
+        will be re-invoked.  On ``'keep_driving'`` nothing is confirmed on disk, so do
+        NOT stop: keep driving the task and re-file ONCE on your next iteration, then
+        terminate cleanly regardless (see the Unpersisted response shape below for why
+        the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
@@ -1628,7 +1650,8 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
-        normally).  action='terminate_cleanly' is still returned.
+        normally).  It does not by itself change the returned ``action``, which
+        follows the observed persist state like every other filing.
 
         *level* — the escalation ladder rung this filing is born at.  Defaults to
         ``0`` (agent → steward).  Pass ``level=1`` to file a level-1
@@ -1665,8 +1688,8 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape always includes ``action='terminate_cleanly'`` and
-        ``level`` (on EVERY branch, including the fail-open one) plus:
+        Response shape always includes ``action`` and ``level`` (on EVERY
+        branch, including the degraded one) plus:
         - Queued:        ``{id, status, level, action}``  where status='queued'
         - Deduped:       ``{id, status, parent_id, child_id, level, action}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -1675,12 +1698,32 @@ def create_server(
           sweep won the race): ``{id, status, resolution, resolved_by, level,
           action}`` with the record's REAL status.  Task 3236: the response
           reports observed post-write state, never write intent — a
-          ``status='queued'`` reply now means the record really was pending
+          ``status='queued'`` reply means the record really was pending
           after the write.  ``level`` echoes the level actually persisted
           (falling back to the level written when a post-write re-read is
           unavailable), so a caller that passed ``level=1`` can confirm it
           landed without risking a ``KeyError`` on a degraded path.
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level, action: 'keep_driving'}``.  The write was
+          accepted but a post-write re-read could not confirm it, so NOTHING
+          is guaranteed on disk for L1 or L2 to drain.  DO NOT terminate on
+          this branch — that would remove the task from every recovery path
+          in exchange for an escalation no handler will ever see.  Keep
+          driving the blocked task, re-file ONCE on the next iteration, then
+          terminate cleanly regardless — the repeat is NOT generally folded,
+          so the retry has to be bounded here rather than by the dedupe gate.
+          ``_submit_or_dedupe`` folds only the categories in this server's
+          ``DedupeConfig`` (stock: ``('infra_issue',)``, 600s window), and a
+          born-at-L2 severity bypasses dedupe altogether; on every other path
+          a repeat mints a NEW record, and on that one a NEW page to the
+          human.  Bounding at one retry is what stops a persistent re-read
+          outage from minting one record per agent iteration.
+          ``persist_check`` is
+          ``'absent'`` (nothing for that id is on disk) or ``'unreadable'`` (a
+          read was attempted and yielded no record — a torn write reads this
+          way — so its state is unknown).  ``action`` is
+          ``'terminate_cleanly'`` on every OTHER branch above.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1725,7 +1768,16 @@ def create_server(
             level=level,
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
-        return {**result, 'action': 'terminate_cleanly'}
+        # The instruction must follow the observed state, not the intent to
+        # file.  When persistence is unconfirmed there may be nothing on disk
+        # for L1 or L2 to drain, so standing the filer down would strand its
+        # task in silence (task 5368).
+        action = (
+            ACTION_KEEP_DRIVING
+            if result.get('status') == STATUS_ACCEPTED_UNPERSISTED
+            else ACTION_TERMINATE_CLEANLY
+        )
+        return {**result, 'action': action}
 
     # --- Handler-side tools ---
 
@@ -2971,7 +3023,8 @@ def create_server(
         - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
-          queue_depth, eta_seconds}``.
+          queue_depth, eta_seconds}``, where ``position`` is ``int | None``
+          (see the Queued shape below).
         - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
           wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
           Resolves within clamp → terminal outcome shape.
@@ -3010,7 +3063,9 @@ def create_server(
           (e.g. ``'mr-a1b2c3d4'``).
         - Queued: ``{status='queued', request_id, snapshot_tip, generation,
           position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
-          (or wait_secs timeout expired).
+          (or wait_secs timeout expired).  ``position`` is ``int | None``;
+          ``None`` means the live merge-worker snapshot was unavailable, so
+          render it as "unknown" — NEVER as front-of-queue (task 5368).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
           position, queue_depth, eta_seconds, inflight_task_id, source,
           inflight_request_id, poll_by, pollable}``.  Branch is
@@ -3372,10 +3427,19 @@ def create_server(
             request_id; falls back to merge_queue.qsize() when no worker is
             reachable (standalone / unit tests that wire a bare asyncio.Queue).
             eta_seconds from the in-flight registry; generation is always 0 in β1.
+
+            ``position`` is ``int | None``.  ``None`` means the live worker
+            snapshot was unavailable, i.e. NOBODY COMPUTED A POSITION — render
+            it as "unknown", never as front-of-queue.  It is never omitted, so
+            a caller keying on it reads that verdict rather than hitting a
+            KeyError.  The two branches that fall back to
+            ``max(0, queue_depth - 1)`` are not fabrications: the request was
+            just enqueued, so "last in a queue of this depth" is an honest
+            derivation from a real ``queue_depth``.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
             worker = _get_merge_worker(harness)
-            position: int = 0
+            position: int | None = None
             queue_depth: int = merge_queue.qsize()  # type: ignore[union-attr]
             if worker is not None:
                 try:
@@ -3388,8 +3452,15 @@ def create_server(
                             break
                     else:
                         position = max(0, queue_depth - 1)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # position stays None: the snapshot is the only source that
+                    # could have told us, so reporting any number here would be
+                    # inventing one.
+                    logger.warning(
+                        'Live merge-worker snapshot failed for request_id=%s (%s); '
+                        'reporting position as unknown',
+                        request_id_val, exc,
+                    )
             else:
                 # No live worker: queue_depth already holds merge_queue.qsize() from
                 # the initialiser above; only position needs to be set.
