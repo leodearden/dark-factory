@@ -42,6 +42,17 @@
 # — belongs to _serial_pytest_str and is tracked separately; it would make this
 # flag redundant but not wrong.
 #
+# A DIFFERENT xdist strip now exists, and the two are easy to confuse. Since
+# this command gained -n auto --dist loadgroup below (task 5408) the worker
+# flags arrive on ARGV, where `-o addopts=` cannot reach them at all — and
+# `-p no:xdist` then unregisters the options they name, so the serial re-run
+# exited rc=4 with "unrecognized arguments: -n --dist". That is closed in
+# orchestrator/src/orchestrator/verify_cmd.py::serial_pytest, which sheds the
+# worker flags from argv before appending the recovery pair. It does NOT
+# implement the addopts-derivation described just above: `-o addopts=` still
+# blanks root addopts wholesale, so --import-mode=importlib stays load-bearing
+# here and that general fix stays outstanding.
+#
 # Pin -n auto --dist loadgroup HERE and not in the root pyproject.toml's addopts
 # (task 5408). scripts/ has no pyproject.toml of its own, so this command's
 # rootdir — and therefore its inifile — resolves to the REPO ROOT (confirmed: a
