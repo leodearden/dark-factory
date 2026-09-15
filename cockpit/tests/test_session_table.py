@@ -514,6 +514,36 @@ class TestFilterLiveSessions:
             assert len(view.visible) <= view.total
 
 
+class TestFormatVisibleCount:
+    """The cap notice: '' means "nothing to say", never "unknown"."""
+
+    def test_truncated_reports_both_numbers(self):
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(200, 412) == 'showing 200 of 412'
+
+    def test_nothing_hidden_renders_nothing(self):
+        """When the whole live band fits, the view must not add a notice --
+        a complete table claiming "showing 39 of 39" is noise that trains
+        an operator to stop reading the line that matters."""
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(39, 39) == ''
+
+    def test_empty_table_renders_nothing(self):
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(0, 0) == ''
+
+    def test_impossible_pair_renders_nothing_fail_soft(self):
+        """More shown than exist is not a state this module can produce,
+        but a view must degrade rather than render a backwards count --
+        mirroring state_glyph/_is_terminal fail-soft (PRD §2)."""
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(5, 3) == ''
+
+
 class TestFocusMarker:
     """The per-row focusability cue: can Enter raise a terminal for this row?
 
