@@ -284,6 +284,23 @@ def filter_live_sessions(
     return LiveSessions(visible=live[:cap], total=len(live))
 
 
+def format_visible_count(shown: int, total: int) -> str:
+    """Render the cap notice: 'showing N of M', or '' when nothing is hidden.
+
+    '' means "nothing to say", not "unknown" -- the caller assigns this
+    result straight to border_subtitle, where an empty label renders
+    nothing (measured on textual 8.2.8), so the notice appears only when
+    the cap actually hid something and a complete table stays quiet.
+
+    Total over any pair: shown > total is not a state filter_live_sessions
+    can produce, but it degrades to '' rather than rendering a backwards
+    count (fail-soft, PRD §2).
+    """
+    if total > shown:
+        return f'showing {shown} of {total}'
+    return ''
+
+
 def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int]:
     """Precompute {parent_slug: outstanding-child-count} in a single pass over *all_records*.
 
