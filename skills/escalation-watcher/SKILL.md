@@ -279,7 +279,9 @@ that you need to recover; what is lost is the user's out-of-band ping, so **tell
 trigger is down** rather than silently relying on it. One line is emitted per dropped push, which
 is how an outage is counted: a single line is a one-off (a flaky POST), the same marker recurring
 across successive arms is an ntfy outage. There is deliberately no success counterpart — a line
-here always means a drop.
+here always means a drop. The line travels the watcher's logging stream, so it carries its
+level as a prefix (`ERROR: WATCHER_NTFY_OUTCOME: FAILED ...`) — match on the marker as a
+substring rather than anchoring at the start of the line.
 
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
 returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool

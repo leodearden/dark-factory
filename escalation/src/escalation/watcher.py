@@ -38,6 +38,11 @@ Load-bearing invariants (callers MUST rely on these):
       changes the exit code — a re-arm whose push was dropped still reports
       `WATCHER_REARM_OUTCOME: FIRED exit=0`.  The one signal is a
       `WATCHER_NTFY_OUTCOME: FAILED` line on stderr, one per dropped push.
+      `main` configures the logging stream to stderr at INFO, as every sibling
+      CLI in this package does, so the line is there for a plain
+      `python -m escalation.watcher` run rather than by grace of
+      `logging.lastResort` — which anything configuring a root handler
+      in-process would take away.
       That line is also the only way to COUNT an outage: `_emit` runs at most
       once per process (both call sites `sys.exit(0)` on the next line), so a
       process-local integer could never read more than 1 — the aggregate is
@@ -205,6 +210,14 @@ def _emit(esc: Escalation, ntfy_url: str | None) -> None:
 
 
 def main() -> None:
+    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
+    # has to own a handler: without one it reaches stderr only by grace of
+    # `logging.lastResort`, which anything configuring a root handler in-process
+    # silently takes away — and which emits the bare message with no level.
+    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
+    # it is a no-op when a caller has already configured logging — the same call
+    # every sibling CLI here makes (submit, sweep, archive).
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     parser = argparse.ArgumentParser(description='Watch for escalation events')
