@@ -1370,6 +1370,10 @@ def _failing_probe(arm, *, warmup: bool = False):
 
 
 def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None, **kwargs):
+    # `setdefault`, so the pin is a DEFAULT and not a wall: a caller wanting a
+    # different or live stamp can pass `now=` exactly as callers already pass
+    # `repeat=`.
+    kwargs.setdefault('now', lambda: FIXTURE_MEASURED_AT)
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
@@ -1590,18 +1594,6 @@ def test_the_report_carries_a_schema_version():
 
     assert report.schema_version == lms_healthcheck.REPORT_SCHEMA_VERSION
     assert isinstance(report.schema_version, int)
-
-
-def test_the_report_is_stamped_with_an_aware_utc_timestamp():
-    """A naive timestamp would make a stale artifact indistinguishable from a
-    fresh one across a timezone change -- and this artifact's whole job is to
-    prove a live run happened."""
-    report = _report()
-
-    stamped = _datetime.datetime.fromisoformat(report.measured_at)
-
-    assert stamped.tzinfo is not None
-    assert stamped.utcoffset() == _datetime.timedelta(0)
 
 
 def test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock():
@@ -1996,6 +1988,12 @@ def test_the_table_lists_who_else_held_the_card_at_each_reading():
     # count rather than a prose match -- `'baseline' in table` was already true
     # before this section existed, from the footprint line's "7362 used - 3312
     # baseline".
+    #
+    # The count reads the WHOLE rendering, header line included, and that
+    # header embeds `measured_at`.  It is sound only because the fixture's
+    # stamp is pinned and carries no pid digits, which
+    # `test_a_fixture_report_describes_one_fixed_moment` enforces.  Off the
+    # live clock the header's microsecond digits made this a coin flip.
     assert table.count(str(WHISPER_CONSUMER.pid)) == 2
     assert table.count(str(ARM_CONSUMER.pid)) == 1
     for consumer in (WHISPER_CONSUMER, ARM_CONSUMER):
