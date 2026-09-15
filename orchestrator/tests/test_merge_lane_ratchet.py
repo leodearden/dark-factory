@@ -913,6 +913,18 @@ class TestPatchTargets:
     def test_real_tree_union_anchor(self) -> None:
         # Anti-vacuity: the PRD Background table's "79 distinct names"; the
         # string-path form alone measures 78 on this tree.
+        #
+        # Those are DAY-ONE figures and stay written as they were. The floor
+        # below is not: the γ wave retires patch targets by design, so the
+        # union falls as the wave lands and a floor pinned near the day-one
+        # magnitude becomes a countdown timer against the work it measures.
+        # It first bit on γ4 (task 5027) as pure INTEGRATION SKEW — γ1 and γ4
+        # each measured 71 alone, and 69 merged, because each retires names
+        # the other still counts, so neither branch could see it before the
+        # merge. The substantive anti-vacuity check is the membership
+        # assertion below, which a broken detector cannot satisfy at any
+        # magnitude; task 5446 retires the numeric floor outright when it
+        # drives both measures to 0.
         union: set[str] = set()
         for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
             try:
@@ -923,7 +935,7 @@ class TestPatchTargets:
                 union |= metrics.patch_targets(source, path=str(path))
             except metrics.MetricsError:
                 continue
-        assert len(union) >= 70, len(union)
+        assert len(union) >= 40, len(union)
         assert 'run_scoped_verification' in union
 
 
