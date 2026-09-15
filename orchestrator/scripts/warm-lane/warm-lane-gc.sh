@@ -109,8 +109,12 @@
 #                          is older than N days is DOWNGRADED exactly as under
 #                          --disk-pressure: the lane falls through to the
 #                          live-reference gate instead of being preserved
-#                          (task 5504). `0` disables the bound — the explicit
-#                          escape hatch back to an unbounded preserve. Default:
+#                          (task 5504). N is a plain non-negative integer of at
+#                          most 5 digits with NO leading zero; anything else
+#                          exits 2 rather than risk meaning something other
+#                          than what was typed. `0` disables the bound — the
+#                          explicit escape hatch back to an unbounded
+#                          preserve. Default:
 #                          REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS, else 14 —
 #                          twice dark-factory's stock lane_stale_report_days
 #                          (7.0), so the daily digest's `## Stale lane
@@ -382,7 +386,7 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
                           without restating the default list (default:
                           REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB). Off by default.
     --seed-script PATH    Path to α seed primitive (default: sibling seed-warm-lane.sh).
-    --disk-pressure       Fast-path: reclaim via `rm -rf <lane>/target` instead
+    --disk-pressure       Fast-path: reclaim via \`rm -rf <lane>/target\` instead
                           of the α reflink-reseed clone (default:
                           REIFY_WARM_LANE_GC_DISK_PRESSURE). Off by default.
                           ALSO downgrades the Pass-1 record gate: an
@@ -392,13 +396,16 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
                           outright — a live build keeps its /proc backstop, and
                           the lane flock is untouched.
     --max-record-age-days N
-                          Downgrade an assigned/in_use record whose `updated_at`
+                          Downgrade an assigned/in_use record whose \`updated_at\`
                           is older than N days, the same way --disk-pressure
                           does (default: REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS,
                           else 14 — twice dark-factory's stock
                           lane_stale_report_days, so the digest's stale-lane
-                          census reports a lane for a fortnight first). `0`
-                          disables the bound.
+                          census reports a lane for a fortnight first). N is a
+                          plain non-negative integer of at most 5 digits with
+                          NO leading zero — \`08\` and \`010\` are rejected rather
+                          than read as octal, and an overflowing magnitude is
+                          rejected rather than wrapped. \`0\` disables the bound.
     -h, --help            Print this message and exit.
 
   Exit codes:
@@ -416,7 +423,7 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
              AUTHORITATIVE rather than a probe. It self-clears only when the
              release's DURABLE WRITE succeeds: WarmLanePool._note_released_durable
              swallows OSError by design (fail-open release, invariant I3), so an
-             ENOSPC at release leaves `assigned` on disk while the in-memory
+             ENOSPC at release leaves \`assigned\` on disk while the in-memory
              pool reads FREE. Such a record never clears itself, and composed
              with an unbounded preserve it would hold the ENOSPC valve shut
              with the very failure the valve responds to. TWO bounds stop that
@@ -642,21 +649,70 @@ fi
 [ -n "$MAX_RECORD_AGE_DAYS" ] || MAX_RECORD_AGE_DAYS=14
 
 # A MISCONFIGURED BOUND IS FATAL, not fail-open, and that is the one place in
-# this script where fail-open is the wrong answer. Both silent directions are
-# INVISIBLE in the summary line: a silently-defaulted bound leaves an operator
-# believing they widened it, and a silently-zeroed one disables the valve while
-# `downgraded_assigned=0` reads as "nothing was stale". A negative is sharpest —
-# `age > negative` is true for every record, so a typo becomes a blanket
-# downgrade of the whole pool. One grep rejects negatives, floats and junk
-# together; same shape as warm-lane-gc-sweep.sh's --critical-free-gib guard.
-# Exit 2, the usage/WIRING class: nothing about the invocation could have
-# avoided it.
-if ! printf '%s\n' "$MAX_RECORD_AGE_DAYS" | grep -qE '^[0-9]+$'; then
-    err "--max-record-age-days must be a non-negative integer (days); got: $MAX_RECORD_AGE_DAYS"
+# this script where fail-open is the wrong answer. Every failure direction
+# below is INVISIBLE in the summary line, which is why none of them may be
+# tolerated:
+#   * silently DEFAULTED — an operator believes they widened the bound;
+#   * silently ZEROED    — the valve is off while `downgraded_assigned=0`
+#                          reads as "nothing was stale";
+#   * NEGATIVE           — `age > negative` is true for every record, so a
+#                          typo becomes a blanket downgrade of the whole pool;
+#   * LEADING ZERO       — `$(( … * 86400 ))` reads it as OCTAL. `08` dies
+#                          with a raw `value too great for base` that `set -e`
+#                          does NOT abort on, leaving MAX_RECORD_AGE_SECS
+#                          unset and aborting the sweep mid-pass under `set -u`
+#                          AFTER earlier lanes were already reclaimed; `010`
+#                          is worse because it is silent — it means 8 days;
+#   * OVERFLOW           — a value near 2^63 wraps the multiply to a negative,
+#                          which then fails the `-gt 0` test below and
+#                          disables the valve outright.
+#
+# The first cut of this guard was `^[0-9]+$`, inherited from
+# warm-lane-gc-sweep.sh's --critical-free-gib guard, and it covers only the
+# first three. There the latent octal flaw is inert; HERE the value gates a
+# destructive branch, which is what made it load-bearing.
+#
+# `^(0|[1-9][0-9]{0,4})$` closes all five. `0|` preserves the documented
+# disable hatch exactly; a leading `[1-9]` kills every leading-zero spelling in
+# one character class. THE 5-DIGIT CAP IS NOT COSMETIC — do not "simplify"
+# `{0,4}` back to `+`. It is what makes 64-bit overflow UNREACHABLE: the
+# largest accepted product is 99999 * 86400 = 8639913600, ~9 orders of
+# magnitude under 2^63. 99999 days is ~273 years, so the cap cannot constrain
+# any real operator.
+#
+# REJECTION, NOT NORMALIZATION. `MAX_RECORD_AGE_DAYS=$((10#$MAX_RECORD_AGE_DAYS))`
+# would make `010` mean 10, and is deliberately not used: the value is
+# interpolated VERBATIM into the operator-facing downgrade reason below (`past
+# the --max-record-age-days %s bound`), so normalizing would need a second
+# variable kept in sync with the first, or the message would name a different
+# number than the one applied. Two things to keep honest where one loud
+# rejection suffices. (`10#` is also a no-op once the regex rejects leading
+# zeros, while reading as if they were expected and tolerated.)
+#
+# The error names the ENV VAR as well as the flag — the env var is a real
+# second door into this same guard, and an operator who set it would otherwise
+# get an error naming only a flag they never passed. Same wording shape as
+# warm-lane-gc-sweep.sh's sibling guard. Exit 2, the usage/WIRING class:
+# nothing about the invocation could have avoided it.
+if ! printf '%s\n' "$MAX_RECORD_AGE_DAYS" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+    err "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS (or --max-record-age-days) must be a non-negative integer of at most 5 digits, with no leading zero (days); got: '$MAX_RECORD_AGE_DAYS'"
     err "Run '$(basename "$0") --help' for usage."
     exit 2
 fi
 MAX_RECORD_AGE_SECS=$(( MAX_RECORD_AGE_DAYS * 86400 ))
+
+# REDUNDANT BACKSTOP (heuristic 10). With the regex above this can only ever
+# fire on a bug, which is the point: it converts any residual arithmetic
+# failure into the correct exit class AT THE BOUNDARY, before a single lane is
+# touched, instead of a `set -u` abort mid-Pass-1 with exit 1 and no summary
+# line. NOTE there is deliberately no `MAX_RECORD_AGE_SECS=0` pre-assignment
+# before the multiply: it looks like the same belt-and-braces and is the
+# opposite, because 0 means "bound disabled" — a swallowed arithmetic failure
+# would silently open the very hole this guard exists to close.
+if ! printf '%s\n' "${MAX_RECORD_AGE_SECS:-}" | grep -qE '^[0-9]+$'; then
+    err "internal: --max-record-age-days $MAX_RECORD_AGE_DAYS did not yield a non-negative seconds bound; got: '${MAX_RECORD_AGE_SECS:-}'"
+    exit 2
+fi
 
 # The clock is read ONCE per invocation, not once per lane.
 #
