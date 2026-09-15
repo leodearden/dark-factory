@@ -242,15 +242,11 @@ _DEFAULT_VISIBLE_CAP = 200
 
 @dataclass(frozen=True)
 class LiveSessions:
-    """The live band actually rendered, plus how big that band really was.
+    """The records a view should render, plus how many there were before the cap.
 
-    visible: the live records after the cap -- what the table shows.
-    total: how many live records there were BEFORE the cap.
-
-    len(visible) <= total always, and visible is a strict prefix of the
-    ordered live set. Both numbers come from the one function that computes
-    them, so a caller cannot render the slice while forgetting to ask what
-    it hid -- which is exactly the defect this replaced.
+    visible is a prefix of the ordered input and len(visible) <= total, so
+    total - len(visible) is what the view is hiding. The two travel
+    together from producer to renderer; see filter_live_sessions.
     """
 
     visible: list[SessionRecord]
@@ -359,28 +355,28 @@ class SessionTable(DataTable):
 
     def replace_rows(
         self,
-        records: list[SessionRecord],
+        view: LiveSessions,
         now: datetime,
         *,
         all_records: list[SessionRecord] | None = None,
-        total: int | None = None,
     ) -> None:
-        """Rebuild VISIBLE rows from *records* (already ordered), preserving the cursor by slug.
+        """Rebuild VISIBLE rows from *view* (already ordered), preserving the cursor by slug.
+
+        Takes the whole view rather than its slice: the rows and the count
+        they were cut from cannot be separated at this boundary, so no
+        caller can render a truncated table that looks complete. The notice
+        is written unconditionally, so a rebuild that is no longer
+        truncated clears a stale one rather than leaving it on screen.
 
         Outstanding-children counts are computed against *all_records* when
-        given (the full scanned set), falling back to *records* otherwise --
-        so a filtered/capped visible subset never undercounts a visible
-        parent's non-terminal children just because those children
+        given (the full scanned set), falling back to the visible rows
+        otherwise -- so a filtered/capped visible subset never undercounts a
+        visible parent's non-terminal children just because those children
         themselves are hidden from view. Counted via a single O(all_records)
         pass (_count_children_by_parent) rather than one full rescan of
         all_records per visible row.
-
-        *total* is how many live sessions exist in total; None means
-        nothing was hidden, so every existing caller stays correct without
-        change. The resulting notice is assigned to border_subtitle
-        unconditionally, so a rebuild that is no longer truncated clears a
-        stale notice rather than leaving it on screen.
         """
+        records = view.visible
         counting_set = all_records if all_records is not None else records
         children_by_parent = _count_children_by_parent(counting_set)
         previous_slug = self.highlighted_slug()
@@ -395,9 +391,7 @@ class SessionTable(DataTable):
                 str(children_by_parent.get(record.session_slug, 0)),
                 key=record.session_slug,
             )
-        self.border_subtitle = format_visible_count(
-            len(records), len(records) if total is None else total
-        )
+        self.border_subtitle = format_visible_count(len(records), view.total)
         if not self.row_count:
             return
         if previous_slug is not None:

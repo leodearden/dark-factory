@@ -535,7 +535,7 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
         `records` -- so a visible parent's non-terminal child is never
         undercounted just because the child itself is hidden from view."""
         from cockpit.app import CockpitApp
-        from cockpit.panes.session_table import SessionTable
+        from cockpit.panes.session_table import LiveSessions, SessionTable
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
         running_child = _make_record(
@@ -550,7 +550,7 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
             table = app.query_one(SessionTable)
 
             table.replace_rows(
-                [parent],
+                LiveSessions(visible=[parent], total=1),
                 datetime.fromisoformat('2026-07-07T00:00:00+00:00'),
                 all_records=[parent, running_child],
             )
@@ -5075,7 +5075,7 @@ class TestSessionTableCapNotice:
     @pytest.mark.timeout(10)
     async def test_replace_rows_reports_and_clears_the_cap_notice(self, tmp_path):
         from cockpit.app import CockpitApp
-        from cockpit.panes.session_table import SessionTable
+        from cockpit.panes.session_table import LiveSessions, SessionTable
 
         records = [
             _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(3)
@@ -5092,25 +5092,19 @@ class TestSessionTableCapNotice:
             # nothing -- which is the exact defect the task exists to fix.
             assert table.styles.border_bottom[0] != ''
 
-            table.replace_rows(records, now, total=12)
+            table.replace_rows(LiveSessions(visible=records, total=12), now)
             await pilot.pause()
             assert table.border_subtitle == 'showing 3 of 12'
 
             # Unconditional assignment: a rebuild that is no longer
             # truncated must CLEAR the notice, not leave a stale one up.
-            table.replace_rows(records, now, total=3)
+            table.replace_rows(LiveSessions(visible=records, total=3), now)
             await pilot.pause()
             assert table.border_subtitle == ''
 
-            table.replace_rows(records, now, total=12)
+            table.replace_rows(LiveSessions(visible=records, total=12), now)
             await pilot.pause()
             assert table.border_subtitle == 'showing 3 of 12'
-
-            # Omitting total entirely must mean "nothing was hidden",
-            # never an accidental notice.
-            table.replace_rows(records, now)
-            await pilot.pause()
-            assert table.border_subtitle == ''
 
     @pytest.mark.timeout(10)
     async def test_app_hands_the_table_the_true_live_total(self, tmp_path):
