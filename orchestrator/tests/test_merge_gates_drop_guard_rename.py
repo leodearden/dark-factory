@@ -489,3 +489,185 @@ class TestDropGuardSuppressionIsContentVerified:
             f'an unverifiable content probe must not suppress; got '
             f'{result.dropped!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Binary staging — the same esc-6436-4 shape with an UNDECODABLE payload.
+#
+# ``git_ops._run`` returns ``stdout.decode()``, so any content probe that
+# reads a blob as text raises ``UnicodeDecodeError`` on a binary file.  That
+# exception escapes the guard entirely: ``merge_queue.classify_and_merge``
+# re-raises it after cleaning up the merge worktree, so the merge dies with a
+# traceback instead of taking either of this module's two documented error
+# directions (fail-open, or keep-flagging).
+# ---------------------------------------------------------------------------
+
+_BASE_BLOB = b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 4
+_BRANCH_BLOB = _BASE_BLOB + b'\x00branch-payload\xff'
+
+
+async def _commit_base_binary(git_ops: GitOps) -> None:
+    """Put a genuinely binary ``pkg/a.bin`` on main — the shared fork point."""
+    (git_ops.project_root / 'pkg').mkdir(exist_ok=True)
+    (git_ops.project_root / 'pkg' / 'a.bin').write_bytes(_BASE_BLOB)
+    await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+    await _run(
+        ['git', 'commit', '-m', 'Main: add pkg/a.bin'],
+        cwd=git_ops.project_root,
+    )
+
+
+@pytest.mark.asyncio
+class TestDropGuardBinaryRename:
+    """A binary payload must not take the guard out of its error model."""
+
+    async def test_sibling_relocation_of_a_branch_modified_binary(
+        self, git_ops: GitOps,
+    ):
+        """The esc-6436-4 shape on a binary file → no raise, no flag.
+
+        The branch's bytes land verbatim at the relocated path, so the
+        probe can settle this by blob identity without ever decoding the
+        payload — which is both the honest answer and the only one
+        reachable, since the blob is not valid UTF-8.
+        """
+        await _commit_base_binary(git_ops)
+
+        wt = (await git_ops.create_worktree('drop-bin')).path
+        (wt / 'pkg' / 'a.bin').write_bytes(_BRANCH_BLOB)
+        await git_ops.commit(wt, 'Branch: edit pkg/a.bin')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        task_head = head_out.strip()
+
+        rc, _, err = await _run(
+            ['git', 'mv', 'pkg/a.bin', 'pkg/b.bin'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'git mv failed: {err!r}'
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Sibling: move pkg/a.bin -> pkg/b.bin'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(wt, 'drop-bin')
+        assert merge_result.success, (
+            f'expected clean 3-way merge; details={merge_result.details!r}'
+        )
+        assert merge_result.merge_commit is not None
+        try:
+            # Non-vacuous precondition 1: the blob really is undecodable,
+            # so a text-reading probe would raise rather than merely differ.
+            rc, oid_out, _ = await _run(
+                ['git', 'rev-parse', '--verify',
+                 f'{merge_result.merge_commit}:pkg/b.bin'],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, 'fixture is wrong: the relocation should have landed'
+            # ``git cat-file -p`` is deliberately NOT used to assert this:
+            # reading the blob through ``_run`` is the very thing that
+            # raises, so the check is made on the payload directly.
+            with pytest.raises(UnicodeDecodeError):
+                _BRANCH_BLOB.decode()
+
+            # Non-vacuous precondition 2: the raw drop set DOES contain the
+            # old path, so rename resolution is what must clear it.
+            rc, raw_out, _ = await _run(
+                ['git', 'diff', '--name-only', '--no-renames',
+                 '--diff-filter=D', task_head, merge_result.merge_commit],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0
+            assert 'pkg/a.bin' in raw_out, (
+                f'expected merge to drop pkg/a.bin; raw drop set: {raw_out!r}'
+            )
+
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, wt, git_ops, main_sha,
+                task_id='drop-bin',
+            )
+            assert result.dropped == [], (
+                f'a relocated binary whose bytes survived must not be '
+                f'flagged; got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_binary_relocation_that_discarded_the_branch_bytes(
+        self, git_ops: GitOps,
+    ):
+        """A relocation that LOST the branch's bytes flags, without raising.
+
+        The fail-CLOSED half, and the one that reaches the text read: the
+        merged blob differs from what the branch produced, so identity
+        cannot settle it and the payload cannot be decoded.  The guard
+        must decline the suppression with a WARNING rather than let a
+        ``UnicodeDecodeError`` escape into ``classify_and_merge``.
+        """
+        await _commit_base_binary(git_ops)
+
+        wt = (await git_ops.create_worktree('drop-bin-lost')).path
+        (wt / 'pkg' / 'a.bin').write_bytes(_BRANCH_BLOB)
+        await git_ops.commit(wt, 'Branch: edit pkg/a.bin')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        task_head = head_out.strip()
+
+        rc, _, err = await _run(
+            ['git', 'mv', 'pkg/a.bin', 'pkg/b.bin'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'git mv failed: {err!r}'
+        (git_ops.project_root / 'pkg' / 'b.bin').write_bytes(
+            _BASE_BLOB + b'\x00main-payload\xfe'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Sibling: move pkg/a.bin and rewrite it'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        # Resolution: keep the relocation, take MAIN's bytes — the branch's
+        # payload is genuinely gone.
+        await _run(
+            ['git', 'merge', '--no-commit', '--no-ff', task_head],
+            cwd=git_ops.project_root,
+        )
+        await _run(['git', 'rm', '-f', 'pkg/a.bin'], cwd=git_ops.project_root)
+        rc, _, err = await _run(
+            ['git', 'checkout', main_sha, '--', 'pkg/b.bin'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'checkout of main pkg/b.bin failed: {err!r}'
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Resolution: take main, discard branch'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'resolution commit failed: {err!r}'
+        rc, out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        merge_sha = out.strip()
+
+        # Non-vacuous precondition: git pairs the rename, so the
+        # suppression arm — and therefore the blob read — is reached.
+        rc, ns_out, _ = await _run(
+            ['git', 'diff', '-M', '--name-status', task_head, merge_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert any(
+            ln.startswith('R') and 'pkg/a.bin' in ln and 'pkg/b.bin' in ln
+            for ln in ns_out.splitlines()
+        ), f'expected a pairable rename; got {ns_out!r}'
+
+        result = await _check_plan_targets_in_tree(
+            merge_sha, wt, git_ops, main_sha, task_id='drop-bin-lost',
+        )
+        assert result.dropped == ['pkg/a.bin'], (
+            f'a relocation that discarded the branch bytes is a real drop; '
+            f'got {result.dropped!r}'
+        )

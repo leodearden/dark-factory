@@ -169,9 +169,22 @@ what was renamed between two trees.
   branch *modified* no longer produces a false `Merge commit is missing plan target
   files` (measured: reify esc-6436-4).
 
-The content check is one shared primitive used by both gates: diff the branch's own
-delta blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`) and reverse-apply
-it against the merged blob with `git apply --check -R`.
+The content check is one shared primitive used by both gates, gathering evidence in
+three ascending steps. First the merged path must **resolve to a blob** at all. Then, if
+the merged blob is **byte-identical** to the one the branch produced (`git diff --quiet`
+between the two blob revisions — it prints nothing, so it answers even for a payload
+that cannot be decoded), the branch's content landed verbatim and nothing need be read. Only otherwise — main edited the same content on top —
+is the branch's delta diffed blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`)
+and reverse-applied against the merged blob with `git apply --check -R`.
+
+The existence step is load-bearing and comes first for a reason a later step cannot
+cover: a **pure relocation**'s delta is *empty*, and an empty patch reverse-applies
+against anything — including a resolution that deleted the file outright. On the
+equivalence gate both halves of such a rename are otherwise invisible (the source is
+discarded by the `main_touched` arm, the target by the suppression arm), so without it
+the compare set is empty and the gate passes a merge that destroyed the branch's work.
+Existence is the whole of a pure relocation's claim, so it is the whole of what is
+checked there.
 
 **A rename pair is not, by itself, evidence the work survived.** Git pairs renames at
 ~50% similarity, so a resolution that relocates a file and *discards* the branch's edit
@@ -182,8 +195,18 @@ content check, and hence two deliberately *different* error directions: an unrea
 the gate cannot tell a rename from a drop at all, so it degrades), while an unverifiable
 **content probe** declines to suppress, falling back to pre-change flagging, which by
 construction cannot introduce a false block relative to main. The probe is conservative
-in the same direction throughout: `git apply` matches context with no fuzz, and binary
-files produce a patch it will not take, so both flag rather than silently pass.
+in the same direction throughout: `git apply` matches context with no fuzz, so a
+main-side edit inside the branch hunk's context lines flags rather than silently passes.
+
+**A binary payload must not take either gate out of that error model.** `git_ops._run`
+decodes stdout as strict UTF-8, so reading a merged blob that is binary — or text in a
+legacy encoding — raises `UnicodeDecodeError`, and neither gate catches it:
+`classify_and_merge` re-raises after cleaning up the merge worktree, so the merge would
+die with a traceback instead of failing open OR keeping the flag. The OID step settles
+the common case without reading anything (a binary file only the branch touched
+suppresses on identity), and the read that remains is guarded and flags. An earlier
+draft of this entry claimed binary files "produce a patch `git apply` will not take" —
+that was wrong: control never reached `git apply`.
 
 `-C` is deliberately not passed, since a copy leaves its source in place. All five
 pre-existing diffs are byte-identical; `--no-renames` on the equivalence gate's
@@ -199,10 +222,14 @@ a relocated path requires; reading that diff backwards, and a `--follow`-less hi
 that looked empty, are what steered the esc-5694-5 RCA to the opposite of the truth.
 
 The merge-lane ratchet baseline is regenerated accordingly. `merge_gates.py`'s
-`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content probe and
-their docstrings. Extracting the adapters rather than inlining them actually *lowered*
-both host functions (`_check_post_merge_equivalence` 25→24, `_check_plan_targets_in_tree`
-16→15), and the four new keys land at 5/8/11/11 against the cognitive-15 new-key ceiling.
+`cognitive`/`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content
+probe and their docstrings. Extracting the adapters rather than inlining them actually
+*lowered* both host functions (`_check_post_merge_equivalence` 25→24,
+`_check_plan_targets_in_tree` 16→15), and the four new keys land at 5/8/11/11 against the
+cognitive-15 new-key ceiling. The existence and byte-identity steps then take
+`_branch_delta_survives` 5→10 — still inside that ceiling, and the smallest shape that
+closes both holes: identity is asked with `git diff --quiet` rather than a pair of
+`rev-parse` reads precisely so it costs one branch instead of two.
 
 #### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
 

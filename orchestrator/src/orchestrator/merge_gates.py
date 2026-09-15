@@ -1193,15 +1193,39 @@ async def _branch_delta_survives(
     introduce a false block relative to main, whereas failing open here
     would hide genuine work loss.
 
-    Deliberately conservative in three known ways, every one erring
+    Evidence is gathered in three ascending steps, each cheaper and
+    stronger than the one below it:
+
+    1. The merged path must RESOLVE TO A BLOB.  This is checked first and
+       unconditionally, because a branch delta can legitimately be EMPTY —
+       a pure relocation edits nothing — and an empty patch reverse-applies
+       against anything, including a resolution that deleted the file
+       outright.  Existence is the whole of the branch's claim in that
+       case and the only thing separating "relocated" from "dropped"; an
+       empty delta may be trusted only once it holds.
+    2. Byte identity.  When the merged blob is identical to the one the
+       branch produced, its content landed verbatim and nothing need be
+       read at all — which is also what makes a binary or otherwise
+       undecodable file suppressible in the common case where only the
+       branch touched it.
+    3. Reverse-application of the branch's patch against the merged blob,
+       for the case where main edited the same content on top.
+
+    Deliberately conservative in four known ways, every one erring
     toward a false flag and never toward a false negative.  ``git apply`` matches
     exact context with no fuzz, so a main-side edit landing inside the
     branch hunk's three context lines yields a flag (measured: an edit
-    three lines away still reverse-applies cleanly).  And a binary file
-    produces a patch ``git apply`` will not take, so it flags too.  A
-    third follows from ``_run`` stripping stdout: a patch whose final
-    context line carries trailing whitespace loses it and will not
-    apply — again a flag, never a silent suppression.
+    three lines away still reverse-applies cleanly).  A blob that is not
+    valid UTF-8 — binary, or text in a legacy encoding — cannot reach step
+    3 at all, because ``_run`` decodes stdout strictly; the read is
+    therefore guarded and flags.  (Step 3 is reached only when step 2
+    failed, i.e. main also edited it — a binary file the branch alone
+    touched suppresses at step 2 without a read.)  A third follows from
+    ``_run`` stripping stdout: a patch whose final context line carries
+    trailing whitespace loses it and will not apply — again a flag, never
+    a silent suppression.  A fourth is step 2's asymmetry: OID equality
+    proves survival but inequality proves nothing, so it may only
+    short-circuit toward True.
     """
     rc, patch, err = await _run(
         ['git', 'diff', f'{before[0]}:{before[1]}', f'{after[0]}:{after[1]}'],
@@ -1215,13 +1239,45 @@ async def _branch_delta_survives(
             rc, err.strip(), task_id or '<unknown>',
         )
         return False
+    rc, _oid, err = await _run(
+        ['git', 'rev-parse', '--verify', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: merged path %s:%s resolves to no blob (rc=%d, stderr=%s); '
+            'the branch delta did not survive, not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
     if not patch.strip():
         return True
 
-    rc, blob, err = await _run(
-        ['git', 'show', f'{merged[0]}:{merged[1]}'],
+    # ``--quiet`` implies ``--exit-code`` and prints nothing, so this asks
+    # "are these two blobs identical?" without decoding either — the one
+    # question about an undecodable payload that can still be answered.
+    rc, _out, _err = await _run(
+        ['git', 'diff', '--quiet',
+         f'{after[0]}:{after[1]}', f'{merged[0]}:{merged[1]}'],
         cwd=git_ops.project_root,
     )
+    if rc == 0:
+        return True
+
+    try:
+        rc, blob, err = await _run(
+            ['git', 'show', f'{merged[0]}:{merged[1]}'],
+            cwd=git_ops.project_root,
+        )
+    except UnicodeDecodeError:
+        logger.warning(
+            '%s: merged blob %s:%s is not valid UTF-8 and cannot be '
+            'patch-verified; not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], task_id or '<unknown>',
+        )
+        return False
     if rc != 0:
         logger.warning(
             '%s: merged blob %s:%s unreadable (rc=%d, stderr=%s); '

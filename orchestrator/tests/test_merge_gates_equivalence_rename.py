@@ -491,3 +491,182 @@ class TestEquivalenceSuppressionIsContentVerified:
         assert failed == ['pkg/sub/mod.py'], (
             f'an unverifiable content probe must not suppress; got {failed!r}'
         )
+
+
+async def _branch_relocates_without_editing(
+    git_ops: GitOps, branch: str,
+) -> tuple[Path, str]:
+    """Cut *branch* and ``git mv`` the module with NO content change.
+
+    The PURE-relocation shape, and the only one in this file whose branch
+    delta is EMPTY.  Every other fixture here edits content, which is
+    exactly why the empty-patch arm of the content probe went uncovered.
+    """
+    wt = (await git_ops.create_worktree(branch)).path
+    (wt / 'pkg' / 'sub').mkdir(parents=True)
+    rc, _, err = await _run(
+        ['git', 'mv', 'pkg/mod.py', 'pkg/sub/mod.py'], cwd=wt,
+    )
+    assert rc == 0, f'git mv failed: {err!r}'
+    await git_ops.commit(wt, 'Branch: relocate pkg/mod.py verbatim')
+    rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+    assert rc == 0
+    return wt, head_out.strip()
+
+
+async def _resolution_deletes_the_module(
+    git_ops: GitOps, task_head: str,
+) -> str:
+    """Merge the branch, then resolve by deleting the module outright.
+
+    A real merge commit, so ``git diff -M`` still sees the branch-side
+    rename pair across ``base..branch_head`` — the pair reaches the
+    suppression arm while the file exists at NEITHER path in the result.
+    """
+    await _run(
+        ['git', 'merge', '--no-commit', '--no-ff', task_head],
+        cwd=git_ops.project_root,
+    )
+    # Tolerant: rename detection may already have staged either removal.
+    for path in ('pkg/mod.py', 'pkg/sub/mod.py'):
+        await _run(['git', 'rm', '-f', path], cwd=git_ops.project_root)
+    rc, _, err = await _run(
+        ['git', 'commit', '-m', 'Resolution: drop the module entirely'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, f'resolution commit failed: {err!r}'
+    rc, out, _ = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+    )
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.mark.asyncio
+class TestEmptyBranchDeltaIsNotProofOfSurvival:
+    """A pure relocation still has to LAND somewhere.
+
+    The content probe re-applies the branch's delta against the merged
+    blob — but a pure relocation's delta is empty, and an empty patch
+    reverse-applies against anything, including nothing at all.  The
+    branch's whole claim in that case is "the file is at the new name",
+    so that, and only that, is what must be checked.
+    """
+
+    async def test_pure_relocation_dropped_by_the_resolution_is_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Branch relocates verbatim, resolution deletes it → flagged.
+
+        Both halves of the rename are otherwise invisible to the gate:
+        the SOURCE is discarded by the ``main_touched`` arm (main edited
+        it there) and the TARGET by the suppression arm.  Without an
+        existence check the compare set is empty and the gate passes a
+        merge that destroyed the branch's work outright.
+        """
+        await _commit_base_module(git_ops)
+        wt, task_head = await _branch_relocates_without_editing(
+            git_ops, 'equiv-pure-rename',
+        )
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+        advanced = await _resolution_deletes_the_module(git_ops, task_head)
+
+        # Non-vacuous precondition 1: the branch delta really IS empty, so
+        # the probe's empty-patch arm is the one under test.
+        rc, base_out, _ = await _run(
+            ['git', 'merge-base', task_head, main_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        base_sha = base_out.strip()
+        rc, delta, _ = await _run(
+            ['git', 'diff', f'{base_sha}:pkg/mod.py',
+             f'{task_head}:pkg/sub/mod.py'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert delta.strip() == '', (
+            f'fixture is wrong: the relocation was supposed to be verbatim; '
+            f'got {delta!r}'
+        )
+
+        # Non-vacuous precondition 2: the work is GENUINELY gone — the
+        # module survives at neither path in the resolved tree.
+        rc, tree_out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', advanced],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        tree = tree_out.split()
+        assert 'pkg/mod.py' not in tree, f'merged tree: {tree!r}'
+        assert 'pkg/sub/mod.py' not in tree, f'merged tree: {tree!r}'
+
+        # Non-vacuous precondition 3: git DOES pair the branch-side rename,
+        # so the suppression arm is genuinely reached.
+        rc, ns_out, _ = await _run(
+            ['git', 'diff', '-M', '--name-status', base_sha, task_head],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert any(
+            ln.startswith('R') and 'pkg/mod.py' in ln
+            and 'pkg/sub/mod.py' in ln
+            for ln in ns_out.splitlines()
+        ), f'expected a pairable rename; got {ns_out!r}'
+
+        failed = await _check_post_merge_equivalence(
+            wt, advanced, git_ops, main_sha, task_id='equiv-pure-rename',
+        )
+        assert failed == ['pkg/sub/mod.py'], (
+            f'a relocation the resolution deleted must still be flagged; '
+            f'got {failed!r}'
+        )
+
+    async def test_pure_relocation_that_landed_is_not_flagged(
+        self, git_ops: GitOps,
+    ):
+        """The same shape with an HONEST resolution → no flag.
+
+        The discriminator for the test above: what makes the drop a drop
+        is the deletion, not the empty delta.  Without this pin the
+        existence check could be tightened into a blanket refusal to
+        suppress pure relocations — reinstating the very false block the
+        gate was fixed to stop emitting.
+        """
+        await _commit_base_module(git_ops)
+        wt, _task_head = await _branch_relocates_without_editing(
+            git_ops, 'equiv-pure-rename-ok',
+        )
+        await _main_edits_the_rename_source(git_ops)
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(wt, 'equiv-pure-rename-ok')
+        assert merge_result.success, (
+            f'expected clean 3-way merge; details={merge_result.details!r}'
+        )
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            outcome = await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='equiv-pure-rename-ok', max_attempts=1,
+            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
+
+            rc, blob, _ = await _run(
+                ['git', 'show', f'{advanced}:pkg/sub/mod.py'],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, 'fixture is wrong: the relocation should have landed'
+            assert 'MAIN_EDIT' in blob, 'main work missing from merge'
+
+            failed = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, main_sha,
+                task_id='equiv-pure-rename-ok',
+            )
+            assert failed == [], (
+                f'a relocation that landed must not be flagged; got {failed!r}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
