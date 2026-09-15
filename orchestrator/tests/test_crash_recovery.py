@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3403,28 +3404,24 @@ class TestSessionResumeStorm:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['restore_failed', 'stale']
 
-    async def test_storm_l1_directs_the_operator_at_the_reason_set(
+    async def test_storm_l1_names_the_failures_rather_than_a_census(
         self, harness: Harness
     ):
         """The filed L1 must send the operator to the EVIDENCE first.
 
         Its detail used to name ``stale`` and ``no_transcript`` as the only
-        surviving causes and send the operator to check NTP FIRST. After D4
-        those are excluded by construction, so that text would be a confident
-        instruction to investigate a population that provably did not
-        contribute — the exact misdirection this task exists to remove, now
-        printed on the escalation itself.
+        surviving causes and send the operator to check NTP FIRST. Task 3728
+        excluded those by construction, and this row then pinned the
+        replacement: a SQL census the operator had to run, and a reason to
+        guess at from its output.
 
-        Stated POSITIVELY rather than as blanket "word X is absent" pins. The
-        earlier form asserted ``'stale' not in text`` and three siblings, which
-        pinned cosmetic phrasing instead of behaviour: they also forbid
-        'staleness', and they would fail a strictly BETTER detail that names
-        the excluded by-design reasons explicitly ("a stale sidecar is excluded
-        by construction and did not contribute") — plausible operator guidance,
-        and closer to what this escalation is for. The real contract is that
-        the L1 is filed at level 1 and its FIRST directive is to read the
-        reason sets off the events rather than to start from a guess, so that
-        is what is asserted; the wording around it stays free to improve.
+        ε (task 3733) removes the guess entirely. The streak now has a live
+        feeder that records WHICH resumes failed, so the escalation can name
+        them — task, session, role, stage, restore outcome, archive path — and
+        the census prose this row used to pin is gone. What survives unchanged
+        is the CONTRACT it was really asserting: the L1 is filed at level 1 and
+        its first directive starts from evidence rather than from a guess. The
+        wording around it stays free to improve.
         """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = self._queue()
@@ -3434,15 +3431,15 @@ class TestSessionResumeStorm:
 
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
-        # The detail hands over the exact query, keyed on the composite field
-        # this task put on the wire — not on the retired first-match scalar.
-        assert "json_extract(data,'$.reasons')" in esc.detail
-        assert "'$.reason'" not in esc.detail
-        # ...and the FIRST thing the operator is told to do is run it. Scoped
-        # to the opening directive, so the rest of suggested_action can say
-        # whatever later turns out to help.
+        # The failure is NAMED — the same renderer the arm-seam feeder uses,
+        # so there is one streak and one L1 (SPOT).
+        assert 'p1' in esc.detail
+        assert 'uuid-p1' in esc.detail
+        assert 'restore_failed' in esc.detail
+        # ...and the operator is no longer handed a census to run and read.
+        assert "json_extract(data,'$.reasons')" not in esc.detail
         first_directive = esc.suggested_action.split('.')[0].lower()
-        assert 'query' in first_directive
+        assert 'query' not in first_directive
 
     async def test_genuine_failures_still_file_l1_across_by_design(
         self, harness: Harness, tmp_path: Path
@@ -3911,6 +3908,101 @@ class TestSessionResumeStorm:
 
         harness.note_resume_failed(object())  # type: ignore[arg-type]
         harness.note_resume_succeeded()
+
+    async def test_storm_l1_names_every_recorded_failure(self, harness: Harness):
+        """INV-2 structured-facts-at-failure: the L1 names what actually failed.
+
+        Every recorded field of every failure in the run appears VERBATIM, so
+        an operator can go straight to the archive root and the session that
+        broke instead of reconstructing the run from a census. The run here
+        deliberately varies every dimension — two stages, two restore outcomes,
+        three roles, three tasks — because a renderer that collapsed any of
+        them would still pass a single-failure assertion.
+
+        A missing archive_root/archive_path is rendered as an explicit "none
+        located", never as a bare ``None`` and never by dropping the line: the
+        difference between "the archive was checked and held nothing" and "the
+        lookup itself faulted" is exactly what an operator needs, and a
+        silently absent line reads as the former.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        reports = [
+            self._report(
+                0, task_id='4101', session_id='uuid-aa', role='implementer',
+                stage='pre_flight', restore='fault',
+                archive_root='/srv/archive-aa',
+                archive_path='/srv/archive-aa/4101/uuid-aa.jsonl.gz',
+                detail='OSError: [Errno 28] No space left on device',
+            ),
+            # Archive-root COMPOSITION faulted, so neither path was ever
+            # located — the best-effort lookup must not masquerade as a miss.
+            self._report(
+                1, task_id='4102', session_id='uuid-bb', role='architect',
+                stage='pre_flight', restore='fault',
+                archive_root=None, archive_path=None,
+                detail='TypeError: unsupported operand type(s) for /',
+            ),
+            # A cli-stage rejection: no restore outcome at all (it ran a phase
+            # earlier), which is why every one of these is genuine.
+            self._report(
+                2, task_id='4103', session_id='uuid-cc', role='reviewer',
+                stage='cli', restore=None,
+                archive_root='/srv/archive-cc', archive_path=None,
+                detail='CLI rejected the armed session after 1 fallback',
+            ),
+        ]
+        for report in reports:
+            harness.note_resume_failed(report)
+
+        assert harness._escalation_queue.has_open_l1.called, (
+            'the dedup must still be consulted — one open storm L1 at a time'
+        )
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'session-resume' in esc.summary.lower()
+        assert 'storm' in esc.summary.lower()
+
+        for report in reports:
+            for value in (report.task_id, report.session_id, report.role,
+                          report.stage, report.restore, report.archive_root,
+                          report.archive_path, report.detail):
+                if value is not None:
+                    assert value in esc.detail, f'{value!r} missing from detail'
+
+        # Three of the six archive fields above are absent; each says so.
+        assert esc.detail.count('none located') == 3
+        assert 'None' not in esc.detail, (
+            'a raw None reached the operator-facing detail'
+        )
+
+    async def test_storm_l1_never_sends_the_operator_to_ntp(self, harness: Harness):
+        """The misdirection task 3728 removed must not come back (INV-2).
+
+        Pinned two ways, deliberately. BEHAVIOURALLY: neither the detail nor
+        the suggested action of an actually-filed L1 may mention clock skew or
+        NTP — the streak's feeder is archive-restore failure, which has nothing
+        to do with either. MECHANICALLY: the literal that used to carry it is
+        absent from harness.py at all, so a regression fails a test here rather
+        than only the task's delivered-check gate.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        harness.note_resume_failed(self._report(0))
+
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        operator_text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
+        assert not re.search('clock skew|NTP', operator_text, re.IGNORECASE)
+
+        import inspect  # noqa: PLC0415
+
+        import orchestrator.harness as harness_mod  # noqa: PLC0415
+        assert 'clock skew (NTP)' not in inspect.getsource(harness_mod)
 
 
 @pytest.mark.asyncio
