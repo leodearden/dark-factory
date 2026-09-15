@@ -394,7 +394,7 @@ class TestProbeModelsStatusMappingAndDispatch:
         assert report.accounts['max-y']['sonnet'] == 'capped'
         assert report.accounts['max-y'][FABLE_CANDIDATE_MODEL] == 'error'
 
-        # accounts (2) x models (haiku, sonnet, claude-fable-5 = 3) == 6.
+        # accounts (2) x models (haiku, sonnet, the fable candidate = 3) == 6.
         assert len(cli.calls) == 6
         for call in cli.calls:
             assert call['model'] in {'haiku', 'sonnet', FABLE_CANDIDATE_MODEL}
@@ -592,8 +592,8 @@ class TestRenderProbeArtifact:
         for account_name, statuses in report.accounts.items():
             for model, status in statuses.items():
                 assert parsed['accounts'][account_name][model] == status
-            # The G3 gate content task xi consumes: a claude-fable-5 row
-            # present per account.
+            # The evidence an admission decision consumes: a fable-candidate
+            # row present per account.
             assert FABLE_CANDIDATE_MODEL in parsed['accounts'][account_name]
 
     def test_is_pure_and_deterministic(self):

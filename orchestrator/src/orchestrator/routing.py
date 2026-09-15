@@ -40,10 +40,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Claude-backend model aliases admitted by default (task beta). claude-fable-5
-# is deliberately NOT included here — task xi admits it to the runtime
-# allowlist once probe_models confirms availability across every pool account
-# (see FABLE_CANDIDATE_MODEL below).
+# The CODE-DEFAULT Claude-backend allowlist (task beta): what a config that
+# specifies no routing.allowed_models falls back to. It deliberately carries
+# no fable alias, because admission is a per-config operator decision rather
+# than a code default that would silently apply to every project the factory
+# operates. An operator config MAY admit one (dark-factory's own does), and
+# probe_models unions in FABLE_CANDIDATE_MODEL either way, so the candidate
+# is exercised even where a config has not admitted it.
 DEFAULT_ALLOWED_MODELS: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
 # Default model ladder (weakest -> strongest), used by the resolver (task
@@ -53,10 +56,16 @@ DEFAULT_ALLOWED_MODELS: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 # unordered admission set consulted at every resolution layer.
 DEFAULT_LADDER: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
-# Candidate model probed for availability even though it is not yet admitted
-# to the runtime allowlist — beta is the G3 gate that produces the
-# per-account fable-availability data task xi's admission gate consumes.
-FABLE_CANDIDATE_MODEL: str = 'claude-fable-5'
+# The ADMITTED Fable literal: the string the live evals dispatch
+# (orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO) and the
+# one a live routing.allowed_models now carries. probe_models unions it into
+# its target set so the per-(account, model) availability evidence an
+# admission decision consumes exists even for a config that has not admitted
+# it. Previously 'claude-fable-5', a string no admission ruling names -- so
+# the default probe set never exercised the model actually under
+# consideration, and the artifact reported it unavailable everywhere
+# (task 5404).
+FABLE_CANDIDATE_MODEL: str = 'claude-fable-5-1'
 
 # Default path for the committed probe-models artifact, sibling of
 # config/usage-accounts.yaml (the account-pool source of truth).
@@ -177,10 +186,11 @@ async def probe_models(
     """Probe every (account, model) pair for availability.
 
     The target model set defaults to ``dedup(allowed_models +
-    [FABLE_CANDIDATE_MODEL])``, order-preserving, so the probe always
-    exercises ``claude-fable-5`` even though it is not yet admitted to the
-    runtime allowlist (task xi's G3 gate; see this task's plan
-    design_decisions) -- pass *models* explicitly to override.
+    [FABLE_CANDIDATE_MODEL])``, so the probe always exercises the fable
+    candidate even where a config has not admitted it. The union is
+    order-preserving and deduplicated, so a config that already admits the
+    candidate probes it exactly once, with no trailing duplicate row. Pass
+    *models* explicitly to override.
 
     For each account, the OAuth token is resolved once via
     ``token_resolver(account.oauth_token_env)``. When unresolvable, every
