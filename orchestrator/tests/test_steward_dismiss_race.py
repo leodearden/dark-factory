@@ -391,12 +391,10 @@ class TestAnAgentDismissalWonTheRace:
         return channel
 
     @pytest.mark.parametrize(
-        ('arm', 'reason'),
-        [(_arm_attempt_cap, 'attempt_cap'), (_arm_timeout_cap, 'timeout')],
+        'arm', [_arm_attempt_cap, _arm_timeout_cap],
+        ids=['attempt_cap', 'timeout'],
     )
-    async def test_an_abandon_publishes_resolved_not_interrupted(
-        self, steward, arm, reason: str,
-    ):
+    async def test_an_abandon_publishes_resolved_not_interrupted(self, steward, arm):
         """Both wip-gated doors, because either can lose to the same abandon."""
         esc = _make_escalation()
         channel = await self._drive(
