@@ -842,7 +842,11 @@ retained verbatim as the design of record.** §11.5's corrected mechanism — de
 *adjacent* stack, truncate at the first file conflict, verify the built tip, in-order
 CAS-land the prefix — shipped as tasks 3183 (α, the `merge_deep.chain_cap` config knob),
 3184 (β, chain builder), 3185 (γ, deep-tip dispatch + halving), 3186 (δ, prefix landing)
-and 3188 (ε, telemetry), behind `merge_deep.chain_cap` (default `0`, the kill switch).
+and 3187 (ι, the two-way boundary/integration gate), behind `merge_deep.chain_cap`
+(default `0`, the kill switch). The observability leaf was the exception: as of
+2026-09-16, ε (3188 — the chain-depth histogram, items-per-verify and deep-fail reader)
+was still **pending**, though `--chains` in `scripts/merge_lane_throughput.py` already
+reports chain landings and observed lengths, so the mechanism is not unobserved.
 §11.5's prediction held: **no stack-selection or reordering controller was built**, and
 the PRD's decisions 1 and 4 *are* §11.5's truncate-at-conflict adjacent build. The
 operator view is OPERATIONS.md §5 "Deep merge-ahead chains".
