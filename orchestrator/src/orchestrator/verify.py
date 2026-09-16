@@ -5842,6 +5842,22 @@ async def run_verification(
                     **_scope_kw,
                     **_clock_kw,
                 )
+            # Both branches converge here, still INSIDE the slot and one
+            # statement after the command returned. The clock and the load
+            # window close at the SAME instant, so `duration_secs` and
+            # `load` describe the same interval — and that interval is the
+            # command's own, which is what `CheckRun.load` claims and what
+            # `load_start`'s placement above is for. Closing them at the
+            # `CheckRun` below instead put both ends past the slot release,
+            # and on a contended host the release is exactly when the next
+            # queued leg is admitted: the end reading would then include load
+            # this command did not run under, the same distortion `load_start`
+            # sits inside the slot to avoid, in the opposite direction. It
+            # also swept in the post-run DIAGNOSTICS below — a lint leg's
+            # `_report_ruff_config_escape` spawns a subprocess — which belong
+            # to no command's duration.
+            elapsed = time.monotonic() - t0
+            load_end = _load_sample()
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -5924,11 +5940,13 @@ async def run_verification(
             output=out,
             timed_out=timed_out_flag,
             started_at=started_at,
-            duration_secs=time.monotonic() - t0,
+            duration_secs=elapsed,
             segments=segment_dicts,
             # Paired with `duration_secs` deliberately: the same instant that
             # closes the clock closes the load window, so the two describe the
-            # same interval.
+            # same interval. Both are taken where the command returns, inside
+            # the slot — see the note at that site for why the pair may not
+            # close here.
             #
             # ONE assembly serves BOTH execution branches — unlike the `-n` cap
             # above, which genuinely needs two sites. Not an oversight, and the
@@ -5937,7 +5955,7 @@ async def run_verification(
             # `cmd`, so the rewrite misses them (the asymmetry task 3478
             # removed). The stamp attaches to the CheckRun, and both branches
             # return through this single construction.
-            load={'start': load_start, 'end': _load_sample(), 'xdist': xdist},
+            load={'start': load_start, 'end': load_end, 'xdist': xdist},
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate

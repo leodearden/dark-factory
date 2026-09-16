@@ -733,3 +733,139 @@ class TestTelemetryFailureDoesNotChangeTheVerdict:
 
         for entry in [c for c in summary['commands'] if c['cmd'] is not None]:
             assert set(entry['load']) == {'start', 'end', 'xdist'}
+
+
+class TestTheWindowClosesWhenTheCommandDoes:
+    """Both ends of the pair are drawn around the COMMAND, not around the leg.
+
+    `load_start` is sited inside the admission slot with an explicit rationale:
+    "the recorded load must be the load the command RAN under, not the load
+    while it queued for a slot — which on a busy host is a different number,
+    and the more flattering one." The closing end owes the same debt in the
+    opposite direction. Drawn at the `CheckRun`, it lands AFTER the slot is
+    released — and on a contended host the release is exactly the instant a
+    queued leg is admitted, so the reading can include load the command did not
+    run under — and after the lint leg's `_report_ruff_config_escape`, which
+    spawns a subprocess.
+
+    That is the distortion `load_start`'s placement exists to avoid, and
+    `CheckRun.load`'s own docstring asserts it does not happen: "``start``/
+    ``end`` are ``_load_sample()`` records taken around the command's own
+    execution". These two tests are what make that sentence checkable.
+    """
+
+    @staticmethod
+    def _slot_recorder(events):
+        import contextlib  # noqa: PLC0415
+
+        @contextlib.asynccontextmanager
+        async def recording_slot(role, config):
+            events.append('slot-enter')
+            try:
+                yield
+            finally:
+                events.append('slot-exit')
+
+        return recording_slot
+
+    @pytest.mark.asyncio
+    async def test_both_samples_are_drawn_while_the_slot_is_held(self, tmp_path):
+        """The ordering, observed through a fake slot rather than inferred.
+
+        A TEST leg only — lint and type are left unconfigured — so the events
+        are one leg's and cannot interleave with a concurrent leg's under the
+        gather.
+        """
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
+
+        events: list[str] = []
+        reader = _rising_reader()
+        # Bound BEFORE the patch below, for the same reason
+        # `_run_and_read_summary` does it: inside the `with`, the module
+        # attribute IS the mock, so calling through it re-enters this recorder.
+        real_load_sample = verify_mod._load_sample
+
+        def recording_load_sample():
+            events.append('load-sample')
+            return real_load_sample(read=reader)
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            events.append('command')
+            return 0, 'ok', False
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=True)
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+             patch('orchestrator.verify._load_sample', side_effect=recording_load_sample), \
+             patch('orchestrator.verify._admission_slot', self._slot_recorder(events)), \
+             patch('orchestrator.verify._verify_admission_active', return_value=True):
+            await verify_mod.run_verification(
+                tmp_path,
+                config,
+                ModuleConfig(
+                    prefix='__fallback__',
+                    test_command='uv run pytest tests/ -n 8',
+                    lint_command=None,
+                    type_check_command=None,
+                ),
+                attempt_id=1,
+                task_id='3353',
+                max_retries=0,
+            )
+
+        # A fresh tmp_path worktree has no `.venv`, so `is_cold` is True and
+        # the shared-venv pre-provision spawns its own `_run_cmd` before any
+        # leg starts. The assertion is scoped to the slot window rather than
+        # pinning that incidental spawn — and the sample COUNT below is what
+        # keeps the scoping from hiding a stray sample drawn outside it.
+        assert events.count('slot-enter') == 1, events
+        window = events[events.index('slot-enter'):]
+
+        assert window == [
+            'slot-enter', 'load-sample', 'command', 'load-sample', 'slot-exit',
+        ], (
+            'the load window must open and close INSIDE the slot: a sample '
+            'drawn after the release reads a host that has already admitted '
+            f'the next queued leg. Observed {events}'
+        )
+        assert events.count('load-sample') == 2, (
+            f'a sample was drawn outside the slot entirely: {events}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_clock_closes_with_the_command_not_after_the_diagnostics(
+        self, tmp_path,
+    ):
+        """`duration_secs` and the load window close together — so proving one
+        end moved without the other is what this pins.
+
+        Driven through `_report_ruff_config_escape`, the one post-run step that
+        genuinely blocks: it is gated to ruff-bearing LINT legs and spawns a
+        subprocess. Stubbed here with a 0.5s sleep against a command that
+        returns instantly, so a clock closed after it reads ~0.5s and one
+        closed with the command reads ~0. The 250x margin is deliberate —
+        this must not become a timing-sensitive test.
+        """
+        import asyncio  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        async def slow_escape_probe(worktree):
+            await asyncio.sleep(0.5)
+
+        with patch(
+            'orchestrator.verify._report_ruff_config_escape',
+            side_effect=slow_escape_probe,
+        ):
+            _result, summary = await _run_and_read_summary(
+                tmp_path, segmented=False, reader=_rising_reader(),
+            )
+
+        lint = next(c for c in summary['commands'] if c['label'] == 'lint')
+        assert lint['duration_secs'] < 0.25, (
+            'the lint leg spent 0.5s in a post-run DIAGNOSTIC that its '
+            'duration_secs must not describe; the command itself returned '
+            f"instantly. Measured {lint['duration_secs']}s"
+        )
