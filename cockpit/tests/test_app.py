@@ -677,6 +677,74 @@ class TestDecisionQueueRender:
             assert queue.virtual_size.width == queue.scrollable_content_region.width
 
 
+    @pytest.mark.timeout(10)
+    async def test_a_terminal_resize_reflows_the_question_column_both_ways(self, tmp_path):
+        """Narrowing the terminal reflows the question SHORTER rather than
+        overflowing, and widening it back reflows longer -- with the
+        operator's selection and the rendered ages untouched.
+
+        Textual's auto-width only ever grows, so giving cells BACK is the
+        half of this that a formatter-only cap cannot do. Widths: 200 - 26
+        fixed - 2 padding == 172, and 100 - 26 - 2 == 72.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                    manual_boost=boost,
+                ),
+                root=tmp_path,
+            )
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+
+            # park the operator on the second row, so a yanked cursor would show
+            assert queue.select_key('decision:dec-low')
+            assert queue.highlighted_key() == 'decision:dec-low'
+            _, wide_age, _, wide_question = queue.get_row('decision:dec-low')
+            assert len(wide_question) == 172
+
+            await pilot.resize_terminal(100, 40)
+            await pilot.pause()
+
+            _, narrow_age, _, narrow_question = queue.get_row('decision:dec-low')
+
+            # the column gave width back instead of ratcheting
+            assert len(narrow_question) == 72
+            assert len(narrow_question) < len(wide_question)
+
+            # nothing overflows and no gutter opens at the new width
+            assert queue.scrollable_content_region.width == 100
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
+
+            # a window drag is not a selection change, and not a clock read
+            assert queue.highlighted_key() == 'decision:dec-low'
+            assert narrow_age == wide_age
+
+            await pilot.resize_terminal(200, 40)
+            await pilot.pause()
+
+            _, rewide_age, _, rewide_question = queue.get_row('decision:dec-low')
+
+            assert len(rewide_question) == len(wide_question)
+            assert queue.virtual_size.width == queue.scrollable_content_region.width == 200
+            assert queue.highlighted_key() == 'decision:dec-low'
+            assert rewide_age == wide_age
+
+
 class TestSignalDontMove:
     @pytest.mark.timeout(10)
     async def test_awaiting_input_transition_sets_urgency_never_focus(self, tmp_path):
