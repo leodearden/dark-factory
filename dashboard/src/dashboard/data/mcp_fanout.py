@@ -1447,9 +1447,9 @@ class TTLCache(Generic[V, K]):
 
         Reads the roster through :meth:`_live_bypasses_for` so its sweep
         applies: a task that finished before its done-callback ran is dropped
-        rather than counted as reaped. Both maps are emptied first, so the
-        done-callbacks the cancellations trigger find nothing to unpick and
-        cannot mutate a roster being iterated.
+        rather than counted as reaped. Both maps are rebuilt before the first
+        cancellation, so the done-callbacks those cancellations trigger find
+        nothing of theirs to unpick and cannot mutate a roster being iterated.
 
         **Only tasks on the CALLING loop are touched**, because this cache
         outlives individual event loops while its tasks do not. The instances
@@ -1461,26 +1461,52 @@ class TTLCache(Generic[V, K]):
         loop is closed``, the same escape ``dashboard.app.lifespan``'s
         docstring attributes to task 3466.
 
-        The residual, named honestly: a foreign-loop task is UNREACHABLE, not
-        reaped. Its loop is gone, so nothing this process can do will advance,
-        finish or free it, and it is excluded from the returned count for that
-        reason. Its roster entry is still dropped — otherwise a dead loop's
-        residue counts against ``_MAX_LIVE_BYPASSES_PER_KEY`` forever, denying
-        the live loop bypasses it is entitled to.
+        The residual, named honestly: a task on a CLOSED foreign loop is
+        UNREACHABLE, not reaped. Its loop is gone, so nothing this process can
+        do will advance, finish or free it, and it is excluded from the
+        returned count for that reason. Its roster entry is dropped anyway —
+        otherwise a dead loop's residue counts against
+        ``_MAX_LIVE_BYPASSES_PER_KEY`` forever, denying the live loop bypasses
+        it is entitled to.
+
+        A task on a foreign loop that is still OPEN is a different state and
+        keeps BOTH its roster entries. It is someone else's in-flight work,
+        not residue: it still holds a connection, so it must still count
+        against that key's bound, and the loop running it will reach its own
+        shutdown, where this same method has to find it. Un-tracking it here
+        would reset the bound while the task runs on, and then lose the task
+        itself — recreating the very leak this reap exists to close. Only
+        ``is_closed()`` separates the two states; "not my loop" alone does
+        not, and overlapping app lifespans are routine in this project's own
+        test suite.
 
         Counts tasks, not keys — the caller wants to know how much work was
         still outstanding, and a key may hold up to
         ``_MAX_LIVE_BYPASSES_PER_KEY`` of it.
         """
         loop = asyncio.get_running_loop()
+
+        def _runs_on_another_live_loop(task: asyncio.Task[V]) -> bool:
+            task_loop = task.get_loop()
+            return task_loop is not loop and not task_loop.is_closed()
+
         reapable = [
             task
             for key in list(self._live_bypasses)
             for task in self._live_bypasses_for(key)
             if task.get_loop() is loop
         ]
-        self._bypass_tasks.clear()
-        self._live_bypasses.clear()
+        retained: dict[str, list[asyncio.Task[V]]] = {}
+        for key, tasks in self._live_bypasses.items():
+            elsewhere = [task for task in tasks if _runs_on_another_live_loop(task)]
+            if elsewhere:
+                retained[key] = elsewhere
+        self._live_bypasses = retained
+        self._bypass_tasks = {
+            key: entry
+            for key, entry in self._bypass_tasks.items()
+            if _runs_on_another_live_loop(entry[1])
+        }
         for task in reapable:
             task.cancel()
         await asyncio.gather(*reapable, return_exceptions=True)

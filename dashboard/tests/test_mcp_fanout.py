@@ -13,6 +13,7 @@ propagation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -2962,6 +2963,118 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
 
         await drain(caller)
 
+
+class TestTTLCacheSparesABypassRunningOnAnotherLiveLoop:
+    """A bypass some OTHER, still-open loop is running must stay tracked.
+
+    The loop-identity filter above decides what the reaper may CANCEL. What it
+    may FORGET is a separate question, and "not my loop" does not answer it: a
+    ``TTLCache`` is process-global, so a foreign-loop entry is either a dead
+    loop's residue or an app that simply shuts down later. Overlapping
+    lifespans are routine here — module-scoped ``TestClient(app)`` fixtures
+    coexist with the function-scoped ``client``, each with its own live loop in
+    its own thread.
+
+    Un-tracking the second kind costs twice. Its tasks still hold connections
+    while that key's ``_MAX_LIVE_BYPASSES_PER_KEY`` accounting resets to zero,
+    so a wedged key can exceed the bound; and they are then on no roster at
+    all, so the loop that owns them finds nothing to reap at its own shutdown
+    — the leak this whole change exists to close, reintroduced by the fix for
+    it.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _a_loop_running_in_another_thread():
+        """Yield a live loop running in its own thread — the ``TestClient`` shape.
+
+        Torn down by unwinding whatever is still pending ON that loop before
+        stopping it, so nothing is destroyed-while-pending and the cache is
+        left as any real shutdown would leave it.
+        """
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            yield loop
+        finally:
+
+            async def _unwind_everything():
+                others = [
+                    t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+                ]
+                for task in others:
+                    task.cancel()
+                await asyncio.gather(*others, return_exceptions=True)
+
+            asyncio.run_coroutine_threadsafe(_unwind_everything(), loop).result(
+                timeout=5.0
+            )
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+            loop.close()
+
+    @staticmethod
+    def _seed_bypass_on(loop, cache, key):
+        """Start one genuinely in-flight bypass for *key* on *loop*.
+
+        Through ``_start_bypass`` rather than the lock-timeout idiom, for the
+        reason the sibling class documents: an ``asyncio.Lock`` binds to the
+        first loop that acquires it, so driving the public path from here would
+        strand a foreign-loop lock in ``cache._locks``.
+        """
+
+        async def _seed():
+            refresh, entered = never_resolving_refresh()
+            task = cache._start_bypass(key, refresh, lambda v: True)
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            return task
+
+        return asyncio.run_coroutine_threadsafe(_seed(), loop).result(timeout=5.0)
+
+    async def test_a_live_foreign_loops_bypass_keeps_both_its_roster_entries(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with self._a_loop_running_in_another_thread() as foreign_loop:
+            # Mine first, theirs second: the wedging idiom needs the module
+            # bound monkeypatched down, and `_evict_expired` drops any
+            # `_bypass_tasks` entry older than that bound — so a foreign entry
+            # seeded FIRST would be aged out by my own `get_or_refresh` call
+            # for reasons that have nothing to do with the reap, and (d) below
+            # would assert against a map already emptied by policy.
+            mine, caller = await wedge_one_bypass(cache, 'my-key')
+            theirs = self._seed_bypass_on(foreign_loop, cache, 'their-key')
+
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+            # (a) this loop's own shutdown still does its own job.
+            assert reaped == 1 and mine.cancelled(), (
+                f'this loop\'s in-flight bypass must still be reaped; got {reaped}'
+            )
+            # (b) the other loop's task is untouched — it is still running.
+            assert not theirs.done(), (
+                'one app shutting down must not end a bypass another, still '
+                'running app is in the middle of'
+            )
+            # (c) and, the point of this class, still TRACKED.
+            assert cache._live_bypasses == {'their-key': [theirs]}, (
+                "a live foreign loop's in-flight bypass must keep its roster "
+                'entry: it still holds a connection, so it must still count '
+                "against that key's bound, and its own loop can only reap it "
+                f'at its own shutdown if it is still tracked; got '
+                f'{cache._live_bypasses}'
+            )
+            assert [entry[1] for entry in cache._bypass_tasks.values()] == [theirs], (
+                'the same holds for the join map: the next caller on that loop '
+                'should still join the refresh it already has in flight'
+            )
+
+            await drain(caller)
 
 class TestReapIsolatesEachCache:
     """One cache failing to reap must not cost every cache behind it.
