@@ -106,7 +106,21 @@ def _format_delivered_checks(checks: object) -> str:
     ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
     degrades to a VISIBLE partial bullet rather than being dropped — dropping it
     would reproduce this section's own reason for existing one level down, since
-    an unseen check still blocks mark-done. '' is reserved for "nothing to show".
+    an unseen check still blocks mark-done. An element that is not a dict at all
+    cannot be given a bullet, so it is COUNTED visibly instead and the section is
+    still emitted: ``parse_metadata`` preserves a wrong-shaped slice with only a
+    ``SchemaWarning``, ``run_delivered_check`` maps such an entry to ERRORED, and
+    the gate turns that into a withheld mark-done — so returning '' would block a
+    task from ever stamping done while showing its agent no gate at all. '' is
+    reserved for a value that is neither a dict nor a list/tuple, i.e. genuinely
+    nothing to show.
+
+    The gate's own arming is CONDITIONAL (``delivered_checks.enabled``,
+    green-tier hot-reloadable), and this renderer is pure with no view of
+    config — so the block states the mechanical claim conditionally rather than
+    asserting a gate that may be disarmed at dispatch time. The directive is
+    unconditional either way: the descriptors are the acceptance contract the
+    task was filed under, armed gate or not.
 
     The block carries its OWN reading directive rather than relying on the six
     consuming prompt bodies to explain it — the same co-location precedent
@@ -125,8 +139,7 @@ def _format_delivered_checks(checks: object) -> str:
         return ''
 
     entries = [check for check in checks if isinstance(check, dict)]
-    if not entries:
-        return ''
+    dropped = len(checks) - len(entries)
 
     shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
     lines = [_delivered_check_bullet(check) for check in shown]
@@ -136,20 +149,31 @@ def _format_delivered_checks(checks: object) -> str:
             f'- …and {hidden} more declared check(s) (not shown — read the full '
             f'list from this task\'s `metadata.delivered_checks`)'
         )
+    if dropped > 0:
+        noun = 'entry' if dropped == 1 else 'entries'
+        lines.append(
+            f'- ⚠ {dropped} malformed {noun} on this task\'s '
+            f'`metadata.delivered_checks` could not be rendered here — still '
+            f'evaluated by the gate, so read the raw list from the task record.'
+        )
     bullets = '\n'.join(lines)
 
     return f"""\
 ## Declared Capability Gate (metadata.delivered_checks)
 
-This task's own mark-done is gated on the capability checks below
+When the capability gate is enabled (the `delivered_checks.enabled` config leaf,
+which an operator can hot-reload), this task's OWN mark-done is gated on the
+capability checks below — not only its dependents'
 (`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`).
 
 {bullets}
 
 After this task lands, a `grep` check is re-run with `git grep -E` against the
-COMMITTED `main` tree and a `script` check against the working checkout. A FAILED
-check blocks mark-done; on the dependency path it also fires an escalation routed
-straight at a human.
+COMMITTED `main` tree and a `script` check against the working checkout. Under
+that gate a FAILED check blocks mark-done; on the dependency path it also fires
+an escalation routed straight at a human. Treat the checks as binding whether or
+not the gate is armed on this fleet: they are the acceptance contract this task
+was filed under.
 
 Deliver the BEHAVIOUR each capability names. Satisfying a pattern with a comment, a
 docstring, or a variable named after the thing is a defect, not a pass. If a

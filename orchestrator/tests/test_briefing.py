@@ -133,6 +133,17 @@ def _bullet_lines(rendered: str) -> list[str]:
     return [ln for ln in rendered.splitlines() if ln.startswith('- name:')]
 
 
+def _unwrapped(rendered: str) -> str:
+    """``rendered`` with its line wrapping collapsed to single spaces.
+
+    The block's prose is hard-wrapped in the f-string, so a pinned phrase
+    longer than the remaining line budget is split by a newline and a plain
+    ``in`` test fails for a reason that has nothing to do with the claim being
+    pinned. Use this for any phrase long enough to straddle the wrap.
+    """
+    return ' '.join(rendered.split())
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -268,6 +279,21 @@ class TestFormatDeliveredChecks:
         assert 'delivered_checks' in out
         assert 'main' in out
 
+    def test_block_states_the_gate_claim_conditionally(self):
+        """``delivered_checks.enabled`` short-circuits the gate to inert
+        (``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``)
+        and is green-tier hot-reloadable, so an unconditional "your mark-done IS
+        gated" would be a false mechanical claim on a disarmed fleet.
+        """
+        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        assert 'When the capability gate is enabled' in out
+        assert 'delivered_checks.enabled' in out
+
+    def test_block_binds_the_directive_regardless_of_the_gate(self):
+        """The anti-gaming directive must not be read as conditional too."""
+        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        assert 'whether or not the gate is armed on this fleet' in out
+
     def test_block_carries_the_anti_gaming_directive(self):
         """Positive-directive assertions — the prose names what to DO."""
         out = _format_delivered_checks([self.GREP_CHECK])
@@ -344,6 +370,33 @@ class TestFormatDeliveredChecksDegradesSafely:
         assert isinstance(out, str)
         assert 'cap-ok' in out
         assert len(_bullet_lines(out)) == 1
+
+    def test_non_dict_element_is_counted_visibly(self):
+        """A dropped element must leave a trace, not vanish."""
+        out = _format_delivered_checks(['nope', self.VALID])
+        assert '1 malformed entry' in out
+
+    def test_all_elements_malformed_still_renders_the_section(self):
+        """The failure this section exists to cure, one level down.
+
+        ``parse_metadata`` preserves a wrong-shaped ``delivered_checks`` slice
+        with only a ``SchemaWarning`` (shared/tests/test_capability_manifest.py),
+        and ``run_delivered_check`` maps such an entry to ERRORED — which
+        ``gate_mark_done_on_delivered_checks`` turns into a withheld mark-done.
+        Rendering '' would block the task from ever stamping done while showing
+        its agent no gate at all.
+        """
+        out = _format_delivered_checks(['cap-one'])
+        assert GATE_HEADING in out
+        assert '1 malformed entry' in out
+        assert 'metadata.delivered_checks' in out
+
+    def test_malformed_count_is_plural_for_several(self):
+        out = _format_delivered_checks(['a', 'b', 7])
+        assert '3 malformed entries' in out
+
+    def test_malformed_line_is_not_counted_as_a_descriptor_bullet(self):
+        assert _bullet_lines(_format_delivered_checks(['nope'])) == []
 
     def test_entry_missing_name_and_kind_still_renders_what_is_known(self):
         out = _format_delivered_checks([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
