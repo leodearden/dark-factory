@@ -1562,6 +1562,58 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         assert 'Could not resolve hostname' in result.reason
 
 
+#: Host name used by the task-4194 RunnerUnavailable-warning tests below.
+_RU_HOST = 'leo-laptop'
+
+
+async def _drive_runner_unavailable(tmp_path, caplog, reason):
+    """Raise RunnerUnavailable(*reason*) from a REMOTE lease; return (result, warning records).
+
+    Reuses ``TestRunInflightVerifyRunnerUnavailableReason``'s injection seam —
+    the same ``_run_post_merge_verify`` patch and lease construction that
+    already pins ``reason`` propagation — so the WARNING and the stored reason
+    are observed from one drive of the real handler.
+    """
+    from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+    from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+    git_ops = _make_git_ops_mock()
+    q: asyncio.Queue = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+    merge_result = MagicMock()
+    merge_result.merge_commit = 'abc123def456789abc1'
+    config = _make_config()
+    item = RealMergeItem(
+        request=_make_merge_request(config, task_files=[], worktree=tmp_path),
+        merge_result=merge_result,
+        merge_wt=tmp_path / 'merge-wt',
+        base_sha='base123',
+        speculative=False,
+    )
+
+    # REMOTE lease — the only kind that can raise RunnerUnavailable.
+    fake_runner = MagicMock()
+    fake_runner.name = _RU_HOST
+    fake_runner.is_local = False
+    lease = HostLease(name=_RU_HOST, runner=fake_runner, is_local=False)
+
+    async def _raise_unavailable(*args, **kwargs):
+        raise RunnerUnavailable(reason)
+
+    with (
+        patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+    ):
+        result = await worker._run_inflight_verify(item, lease)
+
+    records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'remote runner unavailable' in r.message
+    ]
+    return result, records
+
+
 @pytest.mark.asyncio
 class TestRunnerUnavailableWarningIsAttributable:
     """The remote-runner-unavailable WARNING names the host and carries the reason (task 4194).
@@ -1577,48 +1629,10 @@ class TestRunnerUnavailableWarningIsAttributable:
     the streak.  This WARNING is the only place the class becomes countable.
     """
 
-    HOST = 'leo-laptop'
+    HOST = _RU_HOST
 
     async def _drive_ru(self, tmp_path, caplog, reason):
-        """Raise RunnerUnavailable(*reason*) from a REMOTE lease; return (result, records)."""
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
-        from orchestrator.verify_runner import HostLease, RunnerUnavailable
-
-        git_ops = _make_git_ops_mock()
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-
-        merge_result = MagicMock()
-        merge_result.merge_commit = 'abc123def456789abc1'
-        config = _make_config()
-        item = RealMergeItem(
-            request=_make_merge_request(config, task_files=[], worktree=tmp_path),
-            merge_result=merge_result,
-            merge_wt=tmp_path / 'merge-wt',
-            base_sha='base123',
-            speculative=False,
-        )
-
-        # REMOTE lease — the only kind that can raise RunnerUnavailable.
-        fake_runner = MagicMock()
-        fake_runner.name = self.HOST
-        fake_runner.is_local = False
-        lease = HostLease(name=self.HOST, runner=fake_runner, is_local=False)
-
-        async def _raise_unavailable(*args, **kwargs):
-            raise RunnerUnavailable(reason)
-
-        with (
-            patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-        ):
-            result = await worker._run_inflight_verify(item, lease)
-
-        records = [
-            r for r in caplog.records
-            if r.levelno >= logging.WARNING and 'remote runner unavailable' in r.message
-        ]
-        return result, records
+        return await _drive_runner_unavailable(tmp_path, caplog, reason)
 
     async def test_warning_names_the_host(self, tmp_path, caplog):
         """The abandoned machine is named, so a re-dispatch is attributable to a host."""
@@ -1654,6 +1668,73 @@ class TestRunnerUnavailableWarningIsAttributable:
         assert 'watchdog_fire_trigger=heartbeat_starvation' in records[0].message
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.reason == reason
+
+
+@pytest.mark.asyncio
+class TestRunnerUnavailableWarningIsBounded:
+    """A huge remote stderr must not push the trigger token out of the line (task 4194).
+
+    ``verify_runner`` builds the reason as ``f'ssh {host} exited {rc}: {stderr}'``
+    with the FULL remote stderr, and the remote's stderr carries the whole
+    verify's INFO logging (a measured healthy run took 1370s).  Every
+    orchestrator unit sets ``StandardError=journal`` and journald's ``LineMax``
+    default is 48K, so an oversized WARNING is truncated by journald itself.
+    The ssh rc is at the HEAD of that string and ``watchdog_fire_trigger=`` at
+    the TAIL: logging it whole loses the trigger to journald, and a plain head
+    slice loses it too.  Only eliding the MIDDLE keeps both ends — which is
+    exactly what the user-observable signal requires.
+
+    Asserted through the log RECORD, never by calling the elision helper
+    directly: the formatted warning is the actual interface.
+    """
+
+    #: Size of the synthetic stderr flood standing in for a real verify's INFO log.
+    FLOOD = 200_000
+
+    async def test_oversized_reason_keeps_both_ends(self, tmp_path, caplog):
+        """The rc (head) and the trigger token (tail) both survive, inside journald's limit."""
+        from orchestrator.merge_queue import JOURNALD_LINE_MAX_BYTES
+
+        reason = f'ssh {_RU_HOST} exited 1: ' + 'x' * self.FLOOD + '\nwatchdog_fire_trigger=eof\n'
+        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+
+        assert len(records) == 1
+        message = records[0].message
+        assert 'exited 1' in message, 'the head, carrying the ssh rc, was dropped'
+        assert 'watchdog_fire_trigger=eof' in message, 'the tail, carrying the trigger, was dropped'
+        assert len(message.encode('utf-8')) < JOURNALD_LINE_MAX_BYTES
+
+        # The bound is confined to the log line — the escalation path downstream
+        # (_quarantine_unreachable_host, _alarm_verify_host_unreachable) must
+        # keep the complete evidence.
+        assert result.reason == reason
+
+    async def test_elision_is_visible(self, tmp_path, caplog):
+        """A truncated reason can never be mistaken for a complete one."""
+        import re
+
+        reason = f'ssh {_RU_HOST} exited 1: ' + 'x' * self.FLOOD + '\nwatchdog_fire_trigger=eof\n'
+        _result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+
+        message = records[0].message
+        marker = re.search(r'(\d+) chars elided', message)
+        assert marker, f'no elision marker in {message[:300]!r}'
+
+        # The count is honest about what was dropped: every flood character is
+        # either still in the line or accounted for by the marker.  ('x' appears
+        # nowhere else in the message or the marker.)
+        dropped = int(marker.group(1))
+        assert dropped > 0
+        assert dropped + message.count('x') == self.FLOOD
+
+    async def test_short_reason_is_passed_through_verbatim(self, tmp_path, caplog):
+        """The common case pays nothing: no marker, nothing dropped."""
+        reason = f'ssh {_RU_HOST} exited 255: connection reset by peer'
+        _result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+
+        message = records[0].message
+        assert reason in message
+        assert 'elided' not in message
 
 
 @pytest.mark.asyncio
