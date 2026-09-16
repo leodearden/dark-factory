@@ -375,16 +375,29 @@ async def run_dry_run_unblock(
         # at the call site — no task text in the prompt, and the task's
         # model_overrides['unblock_auto'] routing pin silently dropped — so it
         # is both logged and recorded on the entry rather than swallowed.
+        #
+        # The signal is the FALSY RESULT, not the exception: scheduler.py::
+        # get_task is documented to return None on failure or absence and
+        # catches its own exceptions, so an MCP timeout, a malformed reply and
+        # an absent task all arrive here as None. The `except` remains only for
+        # a scheduler implementation that does raise — this suite's
+        # non-awaitable MagicMock shape being the live example. Both causes
+        # converge on the one check below so the two surfaces an operator and
+        # the investigator read (the entry's flag and the prompt's
+        # _TASK_UNAVAILABLE_MARKER) can never disagree.
+        fetch_error: Exception | None = None
         try:
             task_doc = await scheduler.get_task(task_id)
         except Exception as exc:
+            fetch_error = exc
+            task_doc = None
+        if not task_doc:
+            task_context_unavailable = True
             logger.warning(
                 'dry_run_unblock: task fetch failed for task %s — investigating '
                 'without task text and with routing overrides dropped: %s',
-                task_id, exc,
+                task_id, fetch_error or 'scheduler returned no task record',
             )
-            task_doc = None
-            task_context_unavailable = True
         md = (task_doc or {}).get('metadata') or {}
 
         system_prompt = _load_skill_system_prompt()
