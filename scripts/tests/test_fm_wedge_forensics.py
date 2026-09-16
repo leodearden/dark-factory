@@ -20,7 +20,6 @@ magnitude, so the excerpts cannot manufacture — or hide — an episode.
 """
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # Episode 2 — 2026-09-16 12:04. The decisive one: fm did not service SIGTERM
 # for the full TimeoutStopSec and had to be SIGKILLed, and a `git` child was
