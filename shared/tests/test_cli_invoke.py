@@ -4851,6 +4851,10 @@ class TestBackendForwarding:
 
 _ESCAPE_NEEDLE = 'Transcript UNREADABLE'
 
+# One transcript read made to outlive the fake child, so the starvation the
+# class's poll-count preconditions depend on is reproduced on any host.
+_STARVATION_STALL_SECS = 0.5
+
 
 def _escape_records(caplog):
     """The storm-escape WARNINGs emitted during a driven watchdog run.
@@ -4947,6 +4951,52 @@ class TestUnreadableTranscriptEscapeWiring:
         # invariant the escape must not disturb.
         assert result.timed_out is False, 'the escape must not change the kill decision'
         return mock_turns
+
+    async def test_a_slow_read_cannot_starve_the_poll_count(self, tmp_path, caplog):
+        """One slow transcript read must not decide how many polls a test gets.
+
+        Every behavioural test below states a `call_count >= N` precondition, and
+        those preconditions used to be a RACE: the fake child lived a fixed
+        wall-clock span while `_drive` polls at millisecond cadence, so the count
+        was settled by how many times a contended loop got round the watchdog.
+        Measured in the low tail of 480 runs under 40-way process contention:
+        poll counts of 1, 1, 1 and 5 — `call_count == 1` being exactly the value
+        esc-5216-5 reported from the field.
+
+        The mechanism at that tail is ONE read outliving the whole child, so a
+        sleep inside the side_effect reproduces it deterministically instead of
+        probabilistically: the read is dispatched through `asyncio.to_thread`, so
+        the sleep stalls the loop's await exactly the way executor-queue
+        saturation does, with no host load required. Same principle the
+        stdin-starvation block below already states for its own gap injection —
+        the failure is not "load" per se, it is the gap, so the test injects
+        exactly the gap.
+        """
+        import time as _time
+
+        reads = itertools.count(1)
+
+        def _stalling_read(*a, **k):
+            if next(reads) == 1:
+                _time.sleep(_STARVATION_STALL_SECS)
+            return None
+
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=_stalling_read,
+                required_reads=3,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'a read slower than the child must not decide how many polls this '
+            f'class gets: the child has to stay pending until the watchdog has '
+            f'actually polled, not until a timer expires; got '
+            f'{mock_turns.call_count}'
+        )
 
     async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
         """A transcript still unreadable past grace fires the escape exactly once.
