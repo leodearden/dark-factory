@@ -504,7 +504,8 @@ class TestTheFullSuiteShapeFilter:
         selection = self._select(tmp_path, _leg())
 
         assert len(selection.legs) == 1
-        assert selection.rejected == {}
+        assert selection.rejected_entries == {}
+        assert selection.rejected_records == {}
 
     def test_whitespace_only_differences_are_tolerated(self, tmp_path):
         """A re-rendered command may differ in spacing and still be the suite."""
@@ -535,7 +536,7 @@ class TestTheFullSuiteShapeFilter:
         selection = self._select(tmp_path, _leg(cmd=cmd))
 
         assert selection.legs == (), f'{note} run was admitted'
-        assert selection.rejected == {'command_mismatch': 1}
+        assert selection.rejected_entries == {'command_mismatch': 1}
 
     def test_a_segmented_entry_is_rejected_with_its_own_reason(self, tmp_path):
         """A segmented leg's duration covers a DIFFERENT topology of the same
@@ -546,7 +547,7 @@ class TestTheFullSuiteShapeFilter:
         )
 
         assert selection.legs == ()
-        assert selection.rejected == {'segmented': 1}
+        assert selection.rejected_entries == {'segmented': 1}
 
     def test_a_non_test_leg_is_rejected(self, tmp_path):
         selection = self._select(
@@ -556,25 +557,52 @@ class TestTheFullSuiteShapeFilter:
         )
 
         assert selection.legs == ()
-        assert selection.rejected == {'label_mismatch': 2}
+        assert selection.rejected_entries == {'label_mismatch': 2}
 
     def test_a_null_cmd_is_rejected_rather_than_compared(self, tmp_path):
         """A skipped leg ran nothing, so there is no duration to census."""
         selection = self._select(tmp_path, _leg(cmd=None, duration_secs=0.0))
 
         assert selection.legs == ()
-        assert selection.rejected == {'no_cmd': 1}
+        assert selection.rejected_entries == {'no_cmd': 1}
 
     def test_every_entry_is_either_selected_or_counted(self, tmp_path):
-        """The reconciliation property again, at the selector."""
-        selection = self._select(
+        """The reconciliation property again, at the selector — in BOTH units.
+
+        The second record is what makes this falsifiable. Built from a single
+        record, the property cannot distinguish a counter that counts ENTRIES
+        from one that counts RECORDS — every record-level reason stays at zero,
+        so both unit systems produce the same total. A record skipped WHOLE and
+        carrying more than one entry is the only shape that separates them:
+        three entries leave the corpus and a per-record counter books one.
+
+        So the two counters are asserted against each other, not just summed.
+        Folding `prefix_mismatch` back into the entry counter — the mixed-unit
+        shape this replaced — makes the entry identity read 1 + 3 == 3 and
+        fails here.
+        """
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(
             tmp_path,
             _leg(),
             _leg(label='lint', cmd='uv run ruff check src/'),
             _leg(cmd='uv run --directory orchestrator pytest tests/test_foo.py'),
         )
+        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other.write_text(
+            json.dumps(_summary(_leg(), _leg(), _leg())), encoding='utf-8',
+        )
 
-        assert len(selection.legs) + sum(selection.rejected.values()) == 3
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        )
+
+        # Entries: only the matching record's three were ever READ.
+        assert len(selection.legs) + sum(selection.rejected_entries.values()) == 3
+        # Records: the other module's is accounted for exactly once, and its
+        # three entries are nowhere in the entry counter.
+        assert selection.rejected_records == {'prefix_mismatch': 1}
 
     def test_another_modules_record_is_rejected_on_prefix(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
@@ -588,7 +616,8 @@ class TestTheFullSuiteShapeFilter:
         )
 
         assert len(selection.legs) == 1
-        assert selection.rejected == {'prefix_mismatch': 1}
+        assert selection.rejected_records == {'prefix_mismatch': 1}
+        assert selection.rejected_entries == {}
 
     def test_a_role_filter_excludes_other_lanes(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
@@ -604,7 +633,8 @@ class TestTheFullSuiteShapeFilter:
         )
 
         assert len(selection.legs) == 1
-        assert selection.rejected == {'role_mismatch': 1}
+        assert selection.rejected_records == {'role_mismatch': 1}
+        assert selection.rejected_entries == {}
 
 
 class TestTheExpectedCommandHasOneHome:
@@ -1373,7 +1403,7 @@ class TestTheCliContract:
         report = json.loads(out)
 
         assert report['expected_command'] == _FULL_SUITE
-        assert 'no_declared_command' not in report['rejected']
+        assert 'no_declared_command' not in report['rejected_entries']
         assert report['overall']['durations']['n'] == 2, (
             'the legs were rejected against a command the report still printed'
         )
@@ -1399,7 +1429,7 @@ class TestTheCliContract:
         report = json.loads(out)
 
         assert report['expected_command'] is None
-        assert report['rejected']['no_declared_command'] == 1
+        assert report['rejected_entries']['no_declared_command'] == 1
         assert report['overall']['durations']['n'] == 0
 
         _rc, text, _err = _main(
@@ -1493,7 +1523,41 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
         report = json.loads(out)
         assert report['overall']['durations']['n'] == 0
         assert report['corpus']['records'] == 1
-        assert report['rejected']['prefix_mismatch'] == 1
+        assert report['rejected_records']['prefix_mismatch'] == 1
+
+    def test_the_two_rejection_units_stay_apart_in_the_text(self, tmp_path, capsys):
+        """The operator-facing half: a reader must not sum the two counters.
+
+        They answer different questions — "the shape filter stopped matching"
+        (entries) versus "most of this corpus is other modules" (records) — and
+        a single undifferentiated `rejected {...}` blob invites adding them,
+        which is how the mixed-unit counter this replaced read as reconcilable
+        when it was not. So each line names its own unit, and the reasons are
+        asserted to land on the right one rather than merely to appear.
+        """
+        _corpus_with(
+            tmp_path,
+            _leg(),
+            _leg(label='lint', cmd='uv run ruff check src/'),
+        )
+        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other.write_text(json.dumps(_summary(_leg(), _leg())), encoding='utf-8')
+
+        _rc, text, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        lines = {
+            word: line
+            for line in text.splitlines()
+            for word in ('entries', 'records')
+            if line.strip().startswith(word)
+        }
+        assert set(lines) == {'entries', 'records'}, text
+        assert 'prefix_mismatch' in lines['records']
+        assert 'prefix_mismatch' not in lines['entries']
+        assert 'label_mismatch' in lines['entries']
+        assert 'label_mismatch' not in lines['records']
 
 
 class TestTheReportCarriesItsOwnProvenance:
@@ -1535,7 +1599,8 @@ class TestTheReportCarriesItsOwnProvenance:
 
         report = json.loads(out)
         assert 'skipped' in report['corpus']
-        assert 'rejected' in report
+        assert 'rejected_entries' in report
+        assert 'rejected_records' in report
 
     def test_the_findings_ride_in_the_report(self, tmp_path, capsys):
         _corpus_with(tmp_path, _leg())

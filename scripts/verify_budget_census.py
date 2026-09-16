@@ -306,18 +306,39 @@ class Leg:
 
 @dataclass(frozen=True)
 class Selection:
-    """The selected legs, and why every other entry was not selected.
+    """The selected legs, and why everything else was not selected.
 
-    ``rejected`` is a reason -> count mapping so ``n`` is always reconcilable
-    against the corpus: ``len(legs) + sum(rejected.values())`` is the number of
-    ``commands[]`` entries considered. A selector that reported only its
-    positives could not distinguish "this module rarely runs the full suite"
-    from "the shape filter stopped matching" — and those call for opposite
-    responses.
+    TWO reason -> count mappings, because the corpus has two populations and
+    they are not interchangeable. ``rejected_entries`` counts ``commands[]``
+    ENTRIES the selector read and did not select. ``rejected_records`` counts
+    whole RECORDS skipped before their entries were read at all — another
+    module's summary, another lane's, or one carrying no ``commands[]`` array.
+
+    ONE mixed dict was itself the measurement error this script exists to end.
+    It documented ``len(legs) + sum(rejected.values())`` as the number of
+    entries considered while incrementing three of its reasons per RECORD, and
+    a real summary carries 2-3 entries — so every skipped record undercounted
+    the reconciliation by 1-2, silently, on the order of a thousand entries
+    fleet-wide. Splitting by unit makes both identities hold BY CONSTRUCTION
+    rather than by assertion:
+
+      - ``len(legs) + sum(rejected_entries.values())`` is the number of
+        ``commands[]`` entries read;
+      - every record in the corpus is either walked or counted exactly once in
+        ``rejected_records``.
+
+    Both are reported, because they answer different questions and neither
+    substitutes for the other. Entry counts are what distinguish "this module
+    rarely runs the full suite" from "the shape filter stopped matching" —
+    opposite responses. Record counts are the unit an operator reads the
+    corpus in ("572 of 914 summaries are other modules"); folding them into
+    entry counts would destroy that reading to buy a single number that was
+    never true anyway.
     """
 
     legs: tuple[Leg, ...]
-    rejected: dict[str, int]
+    rejected_entries: dict[str, int]
+    rejected_records: dict[str, int]
 
 
 def read_module_test_command(root: Path, prefix: str) -> str | None:
@@ -399,28 +420,31 @@ def select_full_suite_legs(
     default for the archive corpus, where the role is not knowable from the
     path at all (see ``RecordPath.role``).
 
-    Every considered entry is either selected or counted under a reason, so the
-    caller can always reconcile ``n`` against the corpus.
+    Every entry read is either selected or counted under a reason, and every
+    record not read is counted under one — in ``Selection``'s two separate
+    counters, whose units are its whole point. See that docstring before
+    summing them together.
     """
     wanted_infix = sanitise_prefix(prefix)
     legs: list[Leg] = []
-    rejected: Counter[str] = Counter()
+    rejected_entries: Counter[str] = Counter()
+    rejected_records: Counter[str] = Counter()
 
     for record in corpus.records:
         if record.where.module_prefix != wanted_infix:
-            rejected['prefix_mismatch'] += 1
+            rejected_records['prefix_mismatch'] += 1
             continue
         if role is not None and record.where.role != role:
-            rejected['role_mismatch'] += 1
+            rejected_records['role_mismatch'] += 1
             continue
         entries = record.payload.get('commands')
         if not isinstance(entries, list):
-            rejected['no_commands_array'] += 1
+            rejected_records['no_commands_array'] += 1
             continue
         for entry in entries:
             reason = _reject_reason(entry, expected, label)
             if reason is not None:
-                rejected[reason] += 1
+                rejected_entries[reason] += 1
                 continue
             legs.append(
                 Leg(
@@ -435,7 +459,11 @@ def select_full_suite_legs(
                 ),
             )
 
-    return Selection(legs=tuple(legs), rejected=dict(rejected))
+    return Selection(
+        legs=tuple(legs),
+        rejected_entries=dict(rejected_entries),
+        rejected_records=dict(rejected_records),
+    )
 
 
 def _reject_reason(entry: object, expected: str | None, label: str) -> str | None:
@@ -935,7 +963,8 @@ def build_report(
             'records': len(corpus.records),
             'skipped': dict(Counter(s.reason for s in corpus.skipped)),
         },
-        'rejected': selection.rejected,
+        'rejected_entries': selection.rejected_entries,
+        'rejected_records': selection.rejected_records,
         'selected_outside_window': len(selection.legs) - len(legs),
         'overall': summarise_legs(legs),
         'by_day': by_day(legs),
@@ -977,8 +1006,10 @@ def format_report(report: dict[str, Any]) -> str:
         '',
         f"  corpus   {report['corpus']['records']} records loaded, "
         f"skipped {report['corpus']['skipped'] or 'none'}",
-        f"  rejected {report['rejected'] or 'none'}"
+        f"  entries  rejected {report['rejected_entries'] or 'none'}"
         f"  (+{report['selected_outside_window']} selected outside the window)",
+        f"  records  skipped before their entries were read "
+        f"{report['rejected_records'] or 'none'}",
         '',
         'FULL-SUITE DURATIONS (seconds; timed-out and failed legs counted, not averaged)',
         _format_row('overall', report['overall']),
