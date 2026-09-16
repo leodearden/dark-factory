@@ -93,6 +93,20 @@ NORMAL_HARNESS_CADENCE_JOURNAL = """\
 2026-09-16T12:03:51+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:03:51 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
 """
 
+# A THIRD real stall, 2026-09-16 12:16:07 -> 12:18:47 = 160s, seven minutes
+# after episode 2's restart. Nothing stopped the unit: the loop simply resumed
+# on its own and systemd never acted. Six such stalls were measured in the
+# 12:10-18:00 window alone (160s, 100s, 113s, 106s, 116s, 136s), so this is
+# the COMMON outcome, not a curiosity — the two episodes the task was filed
+# for are the minority that the watchdog happened to catch.
+SELF_RECOVERED_STALL_JOURNAL = """\
+2026-09-16T12:16:02+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:02 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for solar_challenge_platform
+2026-09-16T12:16:06+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:06 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - shared.usage_gate - INFO - Account max-b: firing probe #1
+"""
+
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
 # emits hundreds of lines per second. Nothing here is near any threshold.
 DENSE_HEALTHY_JOURNAL = """\
@@ -184,3 +198,53 @@ def test_default_threshold_sits_between_the_cadence_and_the_shorter_stall():
     from fm_wedge_forensics import DEFAULT_STALL_THRESHOLD_SECONDS
 
     assert 61.0 < DEFAULT_STALL_THRESHOLD_SECONDS < 120.0
+
+
+# ---------------------------------------------------------------------------
+# What the loop was doing when systemd tried to stop it.
+#
+# asyncio signal handlers run ON the event loop, so a process that cannot
+# service SIGTERM for the whole stop timeout has a BLOCKED loop — not a merely
+# descheduled one, which would be scheduled and exit well inside it. That
+# distinction is the single most load-bearing observation in this diagnosis,
+# so it is a classification the analyzer reports rather than something a
+# reader has to re-derive from the systemd lines by eye.
+# ---------------------------------------------------------------------------
+
+def test_episode_2_never_serviced_sigterm_so_the_loop_was_still_blocked():
+    from fm_wedge_forensics import analyze
+
+    episode = analyze(EPISODE_2_JOURNAL)[0]
+
+    assert episode.outcome == "sigterm-unserviced"
+
+
+def test_episode_1_stopped_cleanly_so_the_loop_ran_its_signal_handler():
+    """Same stall signature, milder outcome: `Stopping` -> `Stopped` with no
+    stop-sigterm timeout, so the loop recovered enough to service the signal."""
+    from fm_wedge_forensics import analyze
+
+    episode = analyze(EPISODE_1_JOURNAL)[0]
+
+    assert episode.outcome == "stopped-on-signal"
+
+
+def test_a_stall_with_no_systemd_stop_at_all_is_self_recovered():
+    from fm_wedge_forensics import analyze
+
+    episode = analyze(SELF_RECOVERED_STALL_JOURNAL)[0]
+
+    assert episode.stall_seconds == 160.0
+    assert episode.outcome == "self-recovered"
+
+
+def test_every_stall_reports_the_watchdog_verdict_its_probe_would_have_returned():
+    """The process is up and its socket stays bound throughout a stall, so
+    scripts/orchestrator-watchdog.py's probe_port passes while the /alive fetch
+    served by the same blocked loop does not — which is its 'wedged' verdict.
+    Reported in the watchdog's own word so the output collates with its
+    journal lines instead of needing a translation step."""
+    from fm_wedge_forensics import analyze
+
+    for journal in (EPISODE_1_JOURNAL, EPISODE_2_JOURNAL, SELF_RECOVERED_STALL_JOURNAL):
+        assert analyze(journal)[0].watchdog_verdict == "wedged"
