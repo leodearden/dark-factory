@@ -172,6 +172,22 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # worst case is a low tens of connections even if every key wedged at once.
 _MAX_LIVE_BYPASSES_PER_KEY = 3
 
+# How long the shutdown reap waits for a cancelled bypass to actually unwind.
+#
+# Cancellation is a REQUEST: how long the coroutine takes to honour it is the
+# coroutine's business. A refresh whose cleanup awaits — a `finally` that
+# flushes, a shielded section, an anyio cancel scope exiting in the wrong task
+# — can take arbitrarily long, or never finish at all. Unbounded, that hangs
+# `dashboard.app.lifespan`'s teardown, and a process sitting in shutdown with
+# no diagnostic is strictly worse than what this reap replaced: the old
+# abandon-don't-cancel policy could leak a task but never DELAYED anything.
+#
+# So the wait degrades to the old leak plus a journal line naming the keys.
+# 5s is generous against what the reap actually waits for — a cancelled httpx
+# request unwinds in milliseconds — while staying far below any sensible
+# process-shutdown patience (systemd's stock TimeoutStopSec is 90s).
+_REAP_UNWIND_TIMEOUT_SECONDS = 5.0
+
 # ── the one fan-out failure tuple ───────────────────────────────────
 #
 # "This URL failed; log it, record it, invalidate its session and move on."
@@ -1435,6 +1451,16 @@ class TTLCache(Generic[V, K]):
         is AWAITED, so by the time this returns the task has actually unwound
         and released its connection rather than merely been asked to.
 
+        AWAITED FOR AT MOST ``_REAP_UNWIND_TIMEOUT_SECONDS``, because how long
+        a coroutine takes to honour a cancellation is the coroutine's business
+        and the thing being reaped is by hypothesis already wedged. A cleanup
+        that never finishes would otherwise hang ``dashboard.app.lifespan``'s
+        teardown outright — worse than the leak this reap exists to fix, since
+        abandon-don't-cancel never DELAYED a shutdown. Past the bound the task
+        is abandoned exactly as that older policy would have abandoned it,
+        with one WARNING naming the keys so the degradation is visible rather
+        than inferred.
+
         EVERY outcome of that unwind is consumed, not only ``CancelledError``
         — a refresh can finish by raising on its own account (an anyio/httpx
         cancel-scope ``RuntimeError``, a ``finally`` that blows up), and a
@@ -1480,9 +1506,11 @@ class TTLCache(Generic[V, K]):
         not, and overlapping app lifespans are routine in this project's own
         test suite.
 
-        Counts tasks, not keys — the caller wants to know how much work was
-        still outstanding, and a key may hold up to
-        ``_MAX_LIVE_BYPASSES_PER_KEY`` of it.
+        Counts tasks that actually ENDED, not keys and not tasks merely asked
+        to end: a key may hold up to ``_MAX_LIVE_BYPASSES_PER_KEY`` tasks, and
+        one still unwinding past the bound is a leak being reported, not work
+        reclaimed. A task that ended by RAISING is counted — it ended, so it
+        released its connection.
         """
         loop = asyncio.get_running_loop()
 
@@ -1491,7 +1519,7 @@ class TTLCache(Generic[V, K]):
             return task_loop is not loop and not task_loop.is_closed()
 
         reapable = [
-            task
+            (key, task)
             for key in list(self._live_bypasses)
             for task in self._live_bypasses_for(key)
             if task.get_loop() is loop
@@ -1507,10 +1535,23 @@ class TTLCache(Generic[V, K]):
             for key, entry in self._bypass_tasks.items()
             if _runs_on_another_live_loop(entry[1])
         }
-        for task in reapable:
+        for _key, task in reapable:
             task.cancel()
-        await asyncio.gather(*reapable, return_exceptions=True)
-        return len(reapable)
+        abandoned: set[asyncio.Task[V]] = set()
+        if reapable:  # asyncio.wait rejects an empty set; a clean cache is one
+            _ended, abandoned = await asyncio.wait(
+                [task for _key, task in reapable],
+                timeout=_REAP_UNWIND_TIMEOUT_SECONDS,
+            )
+        if abandoned:
+            logger.warning(
+                '%d detached cache refresh(es) did not unwind within %.1fs and '
+                'are abandoned (keys: %s); shutdown continues without them',
+                len(abandoned),
+                _REAP_UNWIND_TIMEOUT_SECONDS,
+                ', '.join(sorted({k for k, task in reapable if task in abandoned})),
+            )
+        return len(reapable) - len(abandoned)
 
     def clear(self) -> None:
         """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).

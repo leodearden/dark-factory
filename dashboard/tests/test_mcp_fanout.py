@@ -2862,6 +2862,93 @@ class TestTTLCacheReapSurvivesAHostileUnwind:
         await drain(hostile_caller, polite_caller)
 
 
+class TestTTLCacheReapDoesNotWaitForeverForACleanupThatWontUnwind:
+    """A cancellation that is never honoured must not hang shutdown.
+
+    ``Task.cancel()`` is a REQUEST; how long the coroutine takes to honour it
+    is the coroutine's business, and the thing being reaped here is by
+    hypothesis already wedged. A cleanup that itself awaits — a ``finally``
+    that flushes, a shielded section, an anyio cancel scope exiting in the
+    wrong task — can take arbitrarily long or never finish, and an unbounded
+    reap would then hold ``dashboard.app.lifespan``'s teardown open with no
+    diagnostic at all.
+
+    That would be a regression on the very policy this reap replaced:
+    abandon-don't-cancel could leak a task, but it never DELAYED a shutdown.
+    So past the bound the task is abandoned exactly as that policy would have
+    abandoned it — degrading to the old leak plus a journal line, which is
+    also why the returned count must report what actually ENDED rather than
+    what was asked to.
+    """
+
+    @staticmethod
+    def _refresh_that_refuses_to_unwind():
+        """Refresh stub that enters, parks, then IGNORES its cancellation.
+
+        The same shape as ``never_resolving_refresh`` — enters, signals, never
+        resolves — differing only in that its cleanup awaits something that
+        never completes, so the task is still PENDING after ``cancel()``.
+        Returns ``(refresh, entered_event)``.
+        """
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+
+        async def _refresh():
+            entered.set()
+            try:
+                await wedged.wait()  # never set
+            except asyncio.CancelledError:
+                await asyncio.Event().wait()  # a cleanup that never finishes
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered
+
+    async def test_a_cleanup_that_never_finishes_is_abandoned_not_waited_on(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, '_REAP_UNWIND_TIMEOUT_SECONDS', 0.2)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        stuck, stuck_caller = await wedge_one_bypass(
+            cache, 'stuck', self._refresh_that_refuses_to_unwind()
+        )
+        polite, polite_caller = await wedge_one_bypass(cache, 'polite')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+        # (a) the reap returned at all — unbounded, this test would run until
+        # pytest-timeout killed it rather than failing an assertion.
+        assert not stuck.done(), (
+            'precondition: this refresh genuinely ignores its cancellation, '
+            'so the reap returned while it was still unwinding'
+        )
+        # (b) its neighbour was still reaped, and is what the count reports: a
+        # task still unwinding past the bound is a leak being REPORTED, not
+        # work reclaimed.
+        assert polite.done(), 'a cancellation that is honoured still lands'
+        assert reaped == 1, (
+            f'the count must report what actually ended, not what was asked '
+            f'to end; got {reaped}'
+        )
+        # (c) and the leak is visible, naming the key whose refresh is wedged
+        # — a shutdown that silently abandons work is the failure this reap
+        # was added to fix, merely moved.
+        abandoned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'did not unwind' in r.getMessage()
+        ]
+        assert len(abandoned) == 1, f'expected one abandonment WARNING, got {abandoned}'
+        assert 'stuck' in abandoned[0].getMessage(), (
+            f'the WARNING must name the key that would not unwind; got '
+            f'{abandoned[0].getMessage()}'
+        )
+
+        await drain(stuck, stuck_caller, polite_caller)
+
 class TestTTLCacheReapIsScopedToTheRunningLoop:
     """The reaper must touch only tasks bound to the loop it is running on.
 
