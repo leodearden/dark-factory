@@ -13,9 +13,24 @@ registries -- nothing in refresh_registry, _rebuild_queue, or
 _update_attention (the C5b queue-build/reorder/set_urgency path) calls
 write_record/write_decision/update_decision_state/set_manual_boost. The
 cockpit's ONLY unconditional write target is its own cockpit-ui.json (via
-cockpit.ui_config); C5b's explicit-action keybindings (boost/drop) add
-sanctioned, action-only writes to a DECISION's manual_boost/state via C1's
-set_manual_boost/update_decision_state -- see test_app.py's
+cockpit.ui_config) -- and even that write is DEBOUNCED for the app's whole
+life: the session table's two selection seams (CockpitApp._sync_detail_pane
+on a cursor move, CockpitApp._resync_session_detail on a rebuild) only
+RECORD the live selection in _selected_slug, and CockpitApp._flush_ui_config
+writes from the poll timer (CockpitApp._poll_registry) only when that
+differs from what was last persisted, leaving CockpitApp.on_unmount as the
+single unconditional final write. So neither a keypress nor a table rebuild
+ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
+debounce reduces how OFTEN that synchronous mkdir + mkstemp + json.dump +
+os.replace runs, it does not move it off the event-loop thread the way
+esc-2303-1 threaded the registry scan, and the poll-tick flush still
+performs it inline. The only other event-path I/O is C5b's sanctioned
+decision writes: its explicit-action keybindings (boost/drop) add
+action-only writes to a DECISION's manual_boost/state via C1's
+set_manual_boost/update_decision_state, each of which runs synchronously on
+the event-loop thread and is followed there by a full
+list_decisions(self.fleet_root) re-scan (CockpitApp._apply_boost,
+CockpitApp.action_drop) -- see test_app.py's
 TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
@@ -271,6 +286,14 @@ class CockpitApp(App):
         # out-of-order _persist_ui_config call (before on_mount ever runs)
         # has a defined value rather than raising AttributeError.
         self._persisted_poll_interval: float = poll_interval
+        # Debounce baseline for cockpit-ui.json: the last selected_slug
+        # actually handed to save_ui_config, i.e. what the on-disk file
+        # holds. Re-seeded in on_mount from load_ui_config, advanced only in
+        # _persist_ui_config, and read by _flush_ui_config -- see that
+        # method for why this is a baseline and not a "changed" latch.
+        # Seeded here, like _persisted_poll_interval above, only so an early
+        # call has a defined value.
+        self._persisted_selected_slug: str | None = None
         # Keyed by resolved DisplayTarget, NOT by item key -- see
         # _update_attention's docstring: a decision and the AWAITING_INPUT
         # session it links to can resolve to the SAME target, so urgency
@@ -320,12 +343,20 @@ class CockpitApp(App):
         # 4054: no restore path / no CLI override for poll_interval).
         ui_config = load_ui_config(self.fleet_root)
         self._persisted_poll_interval = ui_config.poll_interval
+        # Seeded BEFORE refresh_registry(), so the baseline exists before any
+        # selection is recorded: a restore that succeeds leaves nothing for
+        # the first flush to write, one that fails soft onto row 0 leaves the
+        # stale file for it to correct.
+        self._persisted_selected_slug = ui_config.selected_slug
         self.refresh_registry()
         if ui_config.selected_slug is not None:
             self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
         self.set_interval(self.poll_interval, self._poll_registry)
 
     def on_unmount(self) -> None:
+        # Unconditional, not _flush_ui_config: an app mounted over an empty
+        # registry keeps both _selected_slug and its baseline at None, and
+        # would otherwise never create cockpit-ui.json at all.
         self._persist_ui_config()
 
     def _next_scan_seq(self) -> int:
@@ -483,20 +514,14 @@ class CockpitApp(App):
         owns the pane, never stealing it back from a queue row the
         operator moved to.
 
-        A CHANGED slug is persisted here and now, because the rebuild is
-        the one cursor move nothing else reports: suppressing the rebuild's
-        RowHighlighted reposts (see _rebuild_session_table) also suppressed
-        the _persist_ui_config call the handler made on their behalf, so
-        without this a cursor the rebuild moved itself -- the highlighted
-        session left the live view, say -- would live in memory only until
-        on_unmount, and a hard kill would restore the operator to a session
-        that is already gone. Gated on an actual change so the write stays
-        where it has always been (on a move), not on every poll tick.
+        Nothing is written here, even when the rebuild moved the cursor
+        itself (the highlighted session left the live view, say) and no
+        RowHighlighted reports it: recording the slug is enough, because
+        _flush_ui_config compares against what was last persisted rather
+        than waiting to be told of a move, so the next poll tick writes it
+        -- the same unpersisted window a keypress has.
         """
-        changed = slug != self._selected_slug
         self._selected_slug = slug
-        if changed:
-            self._persist_ui_config()
         if self._detail_owner is DetailOwner.SESSION_TABLE:
             self._show_session_detail(slug)
 
@@ -523,7 +548,19 @@ class CockpitApp(App):
         (main-thread-only, like the flag check above) and hands it to the
         worker, so a stale hand-off can be dropped once it lands -- see
         _apply_scan's stale-scan guard (esc-2517-1).
+
+        Doubles as the flush point for the cockpit-ui.json write debounce
+        (see _flush_ui_config), reusing this timer rather than adding a
+        second recurring wake-up. The flush must run BEFORE the
+        _scan_in_flight early return: a 10k+-session scan routinely outlasts
+        the poll interval, so a flush placed after it would be starved for
+        as long as scans keep overlapping -- the busy-fleet case where the
+        operator is most likely to be moving the cursor.
+        test_app.py::TestUIConfigWriteDebounce::
+        test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
+        placement.
         """
+        self._flush_ui_config()
         if self._scan_in_flight:
             return
         self._scan_in_flight = True
@@ -1434,6 +1471,13 @@ class CockpitApp(App):
         touches _selected_slug/cockpit-ui.json -- that restore seam is the
         session table's alone, and a decision has no session slug to
         restore to.
+
+        Runs once per cursor-move EVENT, so holding an arrow key down over a
+        large session table fires it continuously -- it must do NO I/O. The
+        selection is only RECORDED here (via _sync_detail_pane); the write
+        (cockpit/src/cockpit/ui_config.py::save_ui_config) is deferred to
+        _flush_ui_config, so a keypress burst costs at most one write per
+        poll interval.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         if event.data_table is queue:
@@ -1445,7 +1489,6 @@ class CockpitApp(App):
             return
         self._detail_owner = DetailOwner.SESSION_TABLE
         self._sync_detail_pane(event.row_key.value)
-        self._persist_ui_config()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Route a DecisionQueue selection (Enter, via DataTable's own
@@ -1470,6 +1513,33 @@ class CockpitApp(App):
             if slug is not None:
                 self._focus_slug(slug, self._records)
 
+    def _flush_ui_config(self) -> None:
+        """Debounced half of the cockpit-ui.json write path; called from _poll_registry.
+
+        Writes only when the live selection differs from what was last
+        persisted, so an idle cockpit does ZERO writes per tick rather than
+        merely trading one write per keypress for one per poll interval.
+
+        The gate asks "is the on-disk file stale", NOT "did the selection
+        change since the last flush", and that is what lets both selection
+        seams (_sync_detail_pane and _resync_session_detail) merely record
+        the slug with no marking: a rebuild that moves the cursor with no
+        RowHighlighted is caught the same way as a keypress, a burst that
+        returns to where it started writes nothing, and a restore at mount
+        that already matches the file writes nothing either.
+
+        There is nothing to retry on. _persist_ui_config advances the
+        baseline immediately after the fail-soft
+        cockpit/src/cockpit/ui_config.py::save_ui_config call, which logs
+        and swallows OSError and returns None either way, so a failed write
+        is dropped exactly as a highlight-time save failure used to be. The
+        next selection change makes the two values differ again, and
+        on_unmount's unconditional write gets one more attempt at shutdown.
+        """
+        if self._selected_slug == self._persisted_selected_slug:
+            return
+        self._persist_ui_config()
+
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
 
@@ -1478,6 +1548,18 @@ class CockpitApp(App):
         Never touches sessions/ or decisions/. Reads self._selected_slug
         (not the DataTable) so this is safe to call from on_unmount, after
         the table has already been torn down.
+
+        The only callers are _flush_ui_config (the debounced poll-tick
+        write) and on_unmount (unconditional, once at shutdown). A new
+        caller on any event path should go through _flush_ui_config
+        instead, so a keypress keeps costing a comparison rather than a
+        write.
+
+        This is also the SINGLE site where _persisted_selected_slug
+        advances, which is what makes _flush_ui_config's comparison mean
+        "the on-disk file is stale". It takes cfg.selected_slug -- what was
+        actually handed to the writer -- so the baseline can never disagree
+        with the bytes that were written.
 
         poll_interval is round-tripped from self._persisted_poll_interval
         (stashed once in on_mount from load_ui_config), NOT taken from
@@ -1494,6 +1576,7 @@ class CockpitApp(App):
             selected_slug=self._selected_slug, poll_interval=self._persisted_poll_interval
         )
         save_ui_config(cfg, self.fleet_root)
+        self._persisted_selected_slug = cfg.selected_slug
 
 
 def main() -> None:
