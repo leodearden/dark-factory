@@ -7259,28 +7259,32 @@ class TestResolveOutcomeOutParam:
             f'prior_resolved_by names WHO won: {out}'
         )
 
-    def test_outcome_is_keyword_only_with_a_none_default(self, tmp_path: Path):
-        """(d) Every existing call site stays byte-compatible.
+    def test_existing_call_sites_stay_byte_compatible(self, tmp_path: Path):
+        """(d) The out-param changed nothing for the callers that ignore it.
 
         `resolve()` has callers that pass positionally (`resolve(id, text,
         dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
         of which want the out-param.  Keyword-only with a None default is what
-        keeps them untouched.
+        keeps them untouched, asserted the way those callers experience it: a
+        third POSITIONAL argument still means `dismiss` (it would have meant
+        `outcome` had the new parameter been added positionally), and a call
+        that passes no out-param at all still resolves exactly as before.
         """
-        import inspect
-
-        param = inspect.signature(EscalationQueue.resolve).parameters['outcome']
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
-            f'outcome must be keyword-only, not {param.kind!r} — a positional '
-            'parameter would shift the meaning of existing positional args'
-        )
-        assert param.default is None, f'outcome must default to None, got {param.default!r}'
-
-        # And the no-out-param call still behaves exactly as before.
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_make_escalation('esc-1-1'))
-        result = queue.resolve('esc-1-1', 'Fixed', dismiss=True)
-        assert result is not None and result.status == 'dismissed'
+        queue.submit(_make_escalation('esc-1-2'))
+
+        positional = queue.resolve('esc-1-1', 'Fixed', True)
+        assert positional is not None and positional.status == 'dismissed', (
+            'the third positional argument must still bind to dismiss: '
+            f'{positional and positional.status!r}'
+        )
+
+        omitted = queue.resolve('esc-1-2', 'Fixed')
+        assert omitted is not None and omitted.status == 'resolved', (
+            'a call with no out-param must behave exactly as before: '
+            f'{omitted and omitted.status!r}'
+        )
 
 
 class TestResolveCapturesLateResolution:
