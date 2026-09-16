@@ -232,20 +232,27 @@ landings and observed chain lengths — see
 for the mechanism those numbers measure). `--json` emits the same numbers
 keyed by project root and nothing else on stdout.
 
-`--chains` reads exactly two event fields, and naming them is how you get
-from the report back to the raw `runs.db` rows:
-`merge_finalized.landed_via_chain` (an int **per landed item**, summed to
-give items-landed-via-chain — it is neither a boolean flag nor the chain
-size) and `merge_verify.chain_items` (the 1-indexed count of items in the
-verified tree, so a two-link chain reads `chain_items == 3`, and a
-non-chained verify is a chain of *one* rather than a missing measurement).
-Two readings `scripts/merge_lane_throughput.py::compute_chains` already
-encodes will otherwise catch you out: the mean chain length averages only
-the **deep** verifies (`chain_items > 1`), because including the chains of
-one would drag it toward 1 and hide how long real chains get; and a non-int
-`landed_via_chain` is counted in `n_unusable_landed_via_chain` rather than
-coerced. `chain_items` supersedes the probe-era `depth` label (PRD decision
-8) — historical `depth >= 2` events stay excluded from calibration.
+`--chains` reads three event fields, and naming them is how you get from
+the report back to the raw `runs.db` rows: `merge_finalized.state`, which
+defines a landing (`state == 'done'` — every other row is skipped outright)
+and so supplies the denominator in both the chain-landed share and the "of
+N" on the same report line; `merge_finalized.landed_via_chain` (an int **per
+landed item**, summed to give items-landed-via-chain — it is neither a
+boolean flag nor the chain size); and `merge_verify.chain_items` (the
+1-indexed count of items in the verified tree, so a two-link chain reads
+`chain_items == 3`, and a non-chained verify is a chain of *one* rather than
+a missing measurement). Two readings
+`scripts/merge_lane_throughput.py::compute_chains` already encodes will
+otherwise catch you out: the mean chain length averages only the **deep**
+verifies (`chain_items > 1`), because including the chains of one would drag
+it toward 1 and hide how long real chains get; and a non-numeric
+`landed_via_chain` — a bool included, deliberately, since a payload written
+as a flag would sum to a wrong number — is counted in
+`n_unusable_landed_via_chain` rather than coerced. A float *is* numeric and
+*is* coerced (truncated), so a non-zero unusable count means a bool or a
+non-number, never a fraction. `chain_items` supersedes the probe-era `depth`
+label (PRD decision 8) — historical `depth >= 2` events stay excluded from
+calibration.
 
 It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
 writes nothing, files nothing, escalates nothing and emits no events, so
