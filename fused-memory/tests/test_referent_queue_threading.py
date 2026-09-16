@@ -909,8 +909,10 @@ class TestAddEpisodeStampsDeclaredReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
+        # 'uuid' is deliberately absent: task 3561 removed it from the enqueue
+        # payload (a fresh uuid means "load this node" to graphiti_core).
         for key in (
-            'uuid', 'name', 'content', 'source', 'group_id', 'source_description',
+            'name', 'content', 'source', 'group_id', 'source_description',
             'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
             'temporal_context', 'unverified_claim', 'reference_time',
         ):
