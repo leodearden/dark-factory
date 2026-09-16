@@ -243,6 +243,12 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
+  # 1800 -> 3600 (Leo, 2026-09-16, cockpit decision
+  # recon-stale-run-threshold-marginal-2026-09-14). 14 stale-run recoveries
+  # since 08-26 landed at ~1802s, 13 of them remediation runs: routine
+  # overrun, not orphans. Still well under the 7200s lock-staleness TTL. Why
+  # remediation runs take that long is a separate investigation.
+  stale_run_recovery_seconds: 3600
   # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
   # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
   # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
