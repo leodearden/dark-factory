@@ -3073,6 +3073,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         )
         assert 'Deploy script exit code: rc=3' in esc.detail, esc.detail
         assert 'boom' in esc.detail, esc.detail
+        unit_inspector.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

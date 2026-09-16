@@ -471,6 +471,22 @@ class ScriptTimeout(Exception):
         )
 
 
+def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
+    """The sentence EVERY ``ScriptTimeout`` arm opens with: which budget was
+    overrun, and that the whole process group was SIGKILLed.
+
+    Shared by the deploy arms (via ``_script_timeout_fact_lines``) and by
+    ``_run_predicate``'s arm, which differ only in *subject* — so the
+    formatted budget expression has ONE definition to change rather than two
+    copies to keep in step (reviewer amendment).
+    """
+    return (
+        f'{subject} exceeded its own per-script timeout '
+        f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
+        f'process group was SIGKILLed.'
+    )
+
+
 def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
@@ -483,15 +499,15 @@ def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
     infra fault rather than a ``(rc, tail)`` return; it stays the single
     canonical explanation and this helper does not restate it.
 
-    Deliberately NOT extended to ``_run_predicate``'s own ``ScriptTimeout``
-    arm: all three predicate infra arms share one category, so their wording
-    is the only thing telling a human which guard fired, and that path's
-    summary is separately pinned.
+    ``_run_predicate``'s own ``ScriptTimeout`` arm shares only the budget
+    sentence above: the CONSEQUENCE differs (a predicate timeout produces no
+    milestone VERDICT, and that path's summary and category are separately
+    pinned), and all three predicate infra arms file the same category, so
+    their remaining wording is the only thing telling a human which guard
+    fired.
     """
     return [
-        f'Deploy script exceeded its own per-script timeout '
-        f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
-        f'process group was SIGKILLed.',
+        _script_timeout_budget_line(exc, 'Deploy script'),
         'No exit code was produced (the script never exited), and no output '
         'was captured — the merged stdout/stderr read was still in flight '
         'when the kill fired. The script DID run, so it may have applied '
@@ -2748,9 +2764,7 @@ class DeterministicRunner:
                 )
             inner_timeout_detail = '\n'.join([
                 description,
-                f'Predicate check script exceeded its own per-script timeout '
-                f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
-                f'process group was SIGKILLed.',
+                _script_timeout_budget_line(exc, 'Predicate check script'),
                 _no_verdict_sentence,
                 "Either the check is genuinely too slow for its configured "
                 "before_done['timeout_secs'] budget (raise it), or whatever it "
