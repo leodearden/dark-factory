@@ -122,6 +122,15 @@ class _QueueRowLike(Protocol):
     def question(self) -> str | None: ...
 
 
+# The four column labels, in render order, as the single source for both
+# DecisionQueue.on_mount's columns and question_width's per-column floors --
+# a label wider than every cell in its column (as 'project#task' usually is)
+# is what the column actually renders at, so the budget must measure it.
+_COLUMN_LABELS = ('score', 'age', 'project#task', 'question')
+# Floor for a derived question bound; see question_width.
+_QUESTION_MIN_WIDTH = 20
+# The bound used before the widget has a measurable width; see question_width.
+_UNMEASURED_QUESTION_WIDTH = 60
 _QUESTION_MAX_WIDTH = 60
 _QUESTION_PLACEHOLDER = '(no question)'
 
@@ -147,8 +156,13 @@ def _format_project_task(project: str, task_id: str | None) -> str:
     return f'{project}#{task_id}' if task_id else project
 
 
-def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str, str]:
-    """Render *item* as the PRD row shape: score / age / project#task / question.
+def _fixed_cells(item: _QueueRowLike, now: datetime) -> tuple[str, str, str]:
+    """Render *item*'s three fixed-content cells: score / age / project#task.
+
+    Split out of format_queue_row so the column-width derivation and the row
+    render share ONE definition of these cells: question_width measures the
+    exact strings add_row will later receive, rather than a second formatter
+    written for measuring that could drift from the one that renders.
 
     Reuses session_table.format_age for the age column (fed item.filed_at's
     isoformat -- format_age's contract is a string timestamp) so the queue's
@@ -158,8 +172,57 @@ def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str,
         f'{item.score:.1f}',
         format_age(item.filed_at.isoformat(), now),
         _format_project_task(item.project, item.task_id),
-        _one_line_question(item.question),
     )
+
+
+def question_width(
+    items: Sequence[_QueueRowLike],
+    now: datetime,
+    available_width: int,
+    *,
+    cell_padding: int = 1,
+) -> int:
+    """Cells the question column gets once the fixed columns have taken theirs.
+
+    The question bound is DERIVED from the width the column actually has
+    rather than hardcoded: each fixed column claims max(its label, its widest
+    cell across *items*) plus *cell_padding* on either side, and the question
+    column takes what is left of *available_width*. Feed the result to both
+    format_queue_row's question_width= and DataTable.add_column's width= so
+    the measured budget and the rendered text cannot disagree.
+
+    *available_width* <= 0 means "not laid out yet" -- NOT "no room". A
+    widget's content region reads 0 before its first layout and a rebuild is
+    genuinely reachable then, so that case returns
+    _UNMEASURED_QUESTION_WIDTH, retaining the pre-derivation bound for a
+    width nothing can measure yet.
+
+    The _QUESTION_MIN_WIDTH floor exists because the fixed columns can claim
+    more than a narrow terminal has: it keeps _one_line_question total (a
+    negative bound would silently become a negative slice rather than raise)
+    and keeps the column wider than both the 'question' label and the
+    '(no question)' placeholder, so neither is itself truncated. Below the
+    floor the table falls back to DataTable's own horizontal scrolling --
+    the pre-existing behaviour for a terminal too narrow to hold the row.
+    """
+    if available_width <= 0:
+        return _UNMEASURED_QUESTION_WIDTH
+    rows = [_fixed_cells(item, now) for item in items]
+    used = sum(
+        2 * cell_padding + max([len(label), *(len(row[index]) for row in rows)])
+        for index, label in enumerate(_COLUMN_LABELS[:-1])
+    )
+    return max(_QUESTION_MIN_WIDTH, available_width - used - 2 * cell_padding)
+
+
+def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str, str]:
+    """Render *item* as the PRD row shape: score / age / project#task / question.
+
+    The first three cells come from _fixed_cells -- the same helper
+    question_width measures -- so the derived column budget and the rendered
+    row can never disagree about what the row contains.
+    """
+    return (*_fixed_cells(item, now), _one_line_question(item.question))
 
 
 @dataclass(frozen=True)
