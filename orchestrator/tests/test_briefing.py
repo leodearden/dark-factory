@@ -140,6 +140,14 @@ def _unwrapped(rendered: str) -> str:
     longer than the remaining line budget is split by a newline and a plain
     ``in`` test fails for a reason that has nothing to do with the claim being
     pinned. Use this for any phrase long enough to straddle the wrap.
+
+    This normalizes LAYOUT, which is not part of any claim these tests make; it
+    does not weaken the assertion — the pinned phrase stays whole, never
+    shortened to a fragment or loosened into a regex. Re-flowing the prompt so
+    each phrase lands on one line works too, and is what the prior fix in this
+    file did, but it leaves the next editor of that paragraph a trap that fails
+    red for the wrong reason. Precedent for normalizing before matching:
+    ``fused-memory/tests/test_stage3_cross_project_routing_actionable.py``.
     """
     return ' '.join(rendered.split())
 
