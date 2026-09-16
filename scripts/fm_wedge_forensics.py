@@ -196,16 +196,16 @@ class StallEpisode:
     line before the silence and *stall_ended_at* the first line after it, so
     the duration is measured rather than inferred from any configured timeout.
 
-    *aftermath_times* is every timestamped line from the end of the stall up
-    to the next stall (or the end of the capture) — the evidence for how this
-    one resolved. *pre_stall_context* is the tail of what came before it.
+    *restart_sequence* is the systemd restart THIS stall triggered, and is
+    empty when it triggered none. *pre_stall_context* is the tail of what came
+    before the silence.
     """
 
     stall_started_at: dt.datetime
     stall_ended_at: dt.datetime
     last_line_before_stall: str
     pre_stall_context: tuple[str, ...]
-    aftermath_times: tuple[tuple[dt.datetime, str], ...]
+    restart_sequence: tuple[tuple[dt.datetime, str], ...]
     unit_process_names: frozenset[str]
     unit_process_pids: frozenset[int]
 
@@ -238,7 +238,7 @@ class StallEpisode:
 
     @property
     def aftermath(self) -> tuple[str, ...]:
-        return tuple(line for _, line in self.aftermath_times)
+        return tuple(line for _, line in self.restart_sequence)
 
     @property
     def costs(self) -> CostBreakdown:
@@ -255,7 +255,7 @@ class StallEpisode:
         )
 
     def _first_time(self, markers: tuple[str, ...]) -> dt.datetime | None:
-        for timestamp, line in self.aftermath_times:
+        for timestamp, line in self.restart_sequence:
             if any(marker in line for marker in markers):
                 return timestamp
         return None
@@ -321,6 +321,35 @@ def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
     return parsed
 
 
+def restart_sequence_after(lines: list[tuple[dt.datetime, str]], stall_end: int) -> tuple[tuple[dt.datetime, str], ...]:
+    """The systemd restart a stall triggered, or empty if it triggered none.
+
+    A restart belongs to the silence it ENDS, not to an earlier one. The
+    discriminator is that systemd's `Stopping` is itself the line that broke
+    the silence: the watchdog decided while the loop was still unresponsive.
+    Once the loop has resumed and is logging again, any later restart is a
+    separate event.
+
+    Without that bound, an episode's aftermath ran to the next stall — and on
+    the real 2026-09-16 12:10-18:00 capture that made the self-recovered 160s
+    stall at 12:16 swallow an unrelated restart 2h51m later, reporting it as
+    `stopped-on-signal` with a 3s teardown and a 10300s total: three wrong
+    numbers a reader had no way to doubt.
+
+    Errs toward under-attribution. A restart whose `Stopping` lands just after
+    the loop resumes reads as self-recovered, which understates a cost rather
+    than inventing one.
+    """
+    if not any(marker in lines[stall_end][1] for marker in _TEARDOWN_START):
+        return ()
+    sequence = []
+    for entry in lines[stall_end:]:
+        sequence.append(entry)
+        if any(marker in entry[1] for marker in _STARTUP_END):
+            break
+    return tuple(sequence)
+
+
 def _elapsed(start: dt.datetime | None, end: dt.datetime | None) -> float | None:
     """Seconds between two observed timestamps, or None if either never happened."""
     if start is None or end is None:
@@ -358,8 +387,7 @@ def analyze(
         if (lines[index][0] - lines[index - 1][0]).total_seconds() > stall_threshold_seconds
     ]
     episodes = []
-    for position, index in enumerate(starts):
-        next_stall = starts[position + 1] - 1 if position + 1 < len(starts) else len(lines)
+    for index in starts:
         episodes.append(
             StallEpisode(
                 stall_started_at=lines[index - 1][0],
@@ -368,7 +396,7 @@ def analyze(
                 pre_stall_context=tuple(
                     line for _, line in lines[max(0, index - context_lines):index]
                 ),
-                aftermath_times=tuple(lines[index:next_stall]),
+                restart_sequence=restart_sequence_after(lines, index),
                 unit_process_names=names,
                 unit_process_pids=pids,
             )

@@ -123,6 +123,23 @@ WATCHDOG_CAUGHT_STALL_JOURNAL = """\
 2026-09-16T16:18:44+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# The same 160s self-recovered stall, then an UNRELATED restart. Assembled
+# from two real, non-adjacent stretches of one capture: the ~2h49m of dense
+# logging between them is omitted, which is why this input shows two silences
+# where the capture shows one. That omission is also why this fixture can only
+# DOCUMENT correct attribution and cannot guard it — a faithful reduction of a
+# 2h51m separation is not expressible in a few lines. The guard for the defect
+# it describes is the real-capture verification recorded in the commit.
+SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL = """\
+2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
+2026-09-16T15:07:03+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 29min 6.600s CPU time, 2.7G memory peak, 628.5M memory swap peak.
+2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T15:07:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
 # emits hundreds of lines per second. Nothing here is near any threshold.
 DENSE_HEALTHY_JOURNAL = """\
@@ -392,3 +409,25 @@ def test_a_self_recovered_stall_has_no_teardown_or_startup_cost():
     assert costs.teardown_seconds is None
     assert costs.startup_seconds is None
     assert costs.dominant_recovery_term is None
+
+
+def test_a_later_unrelated_restart_is_not_attributed_to_a_self_recovered_stall():
+    """Found by running the analyzer over the real 12:10-18:00 capture rather
+    than the excerpts: the 160s stall at 12:16 self-recovered, and the next
+    restart was 2h51m later and unconnected. Attributing it produced a
+    'stopped-on-signal' verdict, a 3s teardown and a 10300s total — three
+    wrong numbers a reader would have had no way to doubt."""
+    from fm_wedge_forensics import analyze
+
+    episodes = analyze(SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL)
+
+    self_recovered, ended_by_restart = episodes
+    assert self_recovered.stall_seconds == 160.0
+    assert self_recovered.outcome == "self-recovered"
+    assert self_recovered.costs.teardown_seconds is None
+    assert self_recovered.costs.total_seconds is None
+    assert self_recovered.resources is None
+    # The restart belongs to the silence it ENDED, and to that one only.
+    assert ended_by_restart.outcome == "stopped-on-signal"
+    assert ended_by_restart.costs.teardown_seconds == 3.0
+    assert ended_by_restart.resources.cpu_seconds == 29 * 60 + 6.600
