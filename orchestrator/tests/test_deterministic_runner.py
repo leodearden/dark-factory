@@ -4154,20 +4154,21 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     of the merged stdout pipe.  Killing only the direct child (pre-2090
     behavior) leaves the tree alive and the pipe open forever.
 
-    Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
+    Task 4065 / 4252 amendment: the timeout branch RAISES ``ScriptTimeout``
     instead of returning ``(1, '<script timed out after Ns>')`` — see that
-    class's docstring for why.  The Layer-A teardown below is unchanged and
-    must still happen BEFORE the raise, so the grandchild-is-dead assertion
-    stays exactly as it was.
+    class's docstring for why — and that exception carries ONLY the overrun
+    budget it blew, no fabricated exit code and no stand-in output.  The
+    Layer-A teardown below is unchanged and must still happen BEFORE the
+    raise, so the grandchild-is-dead assertion stays exactly as it was.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
         """On timeout, a backgrounded grandchild must be killed too, not just
         the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        The raise carries the legacy ``rc``/``tail`` pair as structured data
-        so ``_invoke_run_fn_translating_timeout`` can hand the deploy
-        classifiers exactly what they saw before (task 4065).
+        The raise carries ONLY the overrun budget as structured data (task
+        4252): a SIGKILLed script produced no exit code and no captured
+        output, so there is nothing else honest to carry.
         """
         import asyncio
         import os
@@ -4207,9 +4208,23 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         assert exc.timeout_secs == 1, (
             f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
         )
-        assert exc.rc == 1, f'expected the legacy rc=1 on the exception, got {exc.rc}'
-        assert '<script timed out after 1s>' in exc.tail, (
-            f'expected the legacy timed-out marker on the exception, got {exc.tail!r}'
+        assert not hasattr(exc, 'rc'), (
+            f'a SIGKILLed script produced NO exit code, so the exception must '
+            f'not carry a fabricated one for a caller to re-report to a human '
+            f'(task 4252), got rc={getattr(exc, "rc", None)!r}'
+        )
+        assert not hasattr(exc, 'tail'), (
+            f'no output was captured either — communicate() was cancelled by '
+            f'the timeout — so the old marker string was a placeholder, not '
+            f'script output (task 4252), got tail='
+            f'{getattr(exc, "tail", None)!r}'
+        )
+        assert 'no exit code' in str(exc), (
+            f'the message must still say what did NOT happen, so a log line '
+            f'carrying only str(exc) is readable: {str(exc)!r}'
+        )
+        assert '1s' in str(exc), (
+            f'the message must still name the budget it overran: {str(exc)!r}'
         )
 
         grandchild_pid = int(pidfile.read_text().strip())
