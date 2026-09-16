@@ -9,8 +9,8 @@ discovery.
 This report carries the analysis and the cluster-level triage only; it does
 not restate the rows (INV-9, one-fact-one-home). There is deliberately no
 `.json` twin: the ratchet already requires that list to exist as code, and a
-second copy of the same machine-read rows would go stale the moment task 4201
-lands and removes two of them, with nothing reconciling the two homes.
+second copy of the same machine-read rows would have gone stale the moment task
+4201 landed and removed two of them, with nothing reconciling the two homes.
 
 **No generation timestamp appears anywhere in this report or in the ledger**,
 so re-running the scan and diffing is a meaningful reproducibility check
@@ -289,8 +289,8 @@ moment a task lands a fix for a blessed site **without deleting its row**,
 verify goes red for every subsequent task until somebody edits
 `shared/tests/loop_blocking_allowlist.py`.
 
-Six rows are `filed` against in-flight tasks 4201 and 3778, and neither task's
-author is otherwise editing `shared/tests`. So, as a rule:
+A `filed` row's owning task need not otherwise be editing `shared/tests`. So, as
+a rule:
 
 > **Deleting the ledger row is part of the fix, not follow-up work.** If you
 > offload a site (or otherwise remove it), delete its

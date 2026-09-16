@@ -1011,7 +1011,7 @@ class TestSweepIsNotVacuous:
     def test_finding_floor(self, tree_scan):
         """Floor deliberately BELOW the measured 60 findings at HEAD 6696f1ce0c.
 
-        Slack is the point.  Tasks 4201 and 3778 are in flight and will
+        Slack is the point.  The in-flight owners of ``filed`` rows
         legitimately REMOVE findings when they land; a floor set at the
         measured value would turn red on success.  The floor exists only to
         prove the detector still detects on the live tree, not to pin a count.
@@ -1175,8 +1175,8 @@ class TestRatchet:
         """A landed fix must DELETE its blessing, so the ledger self-corrects.
 
         This half is what stops the baseline becoming a comfortable lie: when
-        task 4201 lands and offloads its two sites, their rows go stale and
-        this test names them.
+        task 4201 landed and offloaded its two sites, their rows went stale and
+        this test named them.
         """
         _unblessed, stale = reconcile_against_allowlist(
             tree_scan.findings, ALLOWLIST_KEYS
