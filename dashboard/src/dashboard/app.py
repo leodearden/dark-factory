@@ -672,9 +672,12 @@ async def lifespan(app: FastAPI):
         for task in (collector_task, metrics_task):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        # After the loops above, so nothing can enqueue a fresh refresh behind
-        # the reaper; before http_client.aclose() below, so a cancelled refresh
-        # unwinds into a pool that still exists.
+        # After the loops above, so THIS app's two pollers cannot enqueue a
+        # fresh refresh behind the reaper; before http_client.aclose() below,
+        # so a cancelled refresh unwinds into a pool that still exists. One
+        # pass over a snapshot, not a barrier: any other caller still in
+        # flight can start a bypass behind it, which is the ordinary
+        # abandon-don't-cancel leak this reap narrows rather than abolishes.
         await reap_detached_refreshes()
     finally:
         await _close_each(
