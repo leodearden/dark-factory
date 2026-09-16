@@ -86,6 +86,14 @@ _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
 # unbound and a watchdog probe would have seen 'port-down' rather than 'wedged'.
 _UNIT_DOWN_MARKERS = ("Stopped fused-memory", "Main process exited", "with signal SIGKILL")
 
+# The observed boundaries of the two recovery terms. Teardown ends at
+# whichever came first of a clean stop and a SIGKILL, so an ignored SIGTERM
+# is measured rather than assumed away.
+_TEARDOWN_START = ("Stopping fused-memory",)
+_TEARDOWN_END = ("Stopped fused-memory", "with signal SIGKILL")
+_STARTUP_START = ("Starting fused-memory",)
+_STARTUP_END = ("Started fused-memory",)
+
 
 @dataclasses.dataclass(frozen=True)
 class ResourceTotals:
@@ -105,6 +113,55 @@ class ResourceTotals:
     cpu_seconds: float
     memory_peak_bytes: float
     swap_peak_bytes: float | None
+
+
+@dataclasses.dataclass(frozen=True)
+class CostBreakdown:
+    """What one episode cost, in intervals that actually elapsed.
+
+    Every term is measured off this capture's own timestamps — no constant is
+    read from the unit file or from scripts/orchestrator-watchdog.py, so
+    there is no second home for a number that drifts (heuristic 11), and an
+    ignored SIGTERM shows up as the 90s it really took instead of the clean
+    stop a config-derived estimate would have predicted.
+
+    Absent terms are None, never 0: a self-recovered stall was never torn
+    down or started, and zeros would read as an instantaneous restart.
+    """
+
+    stall_seconds: float
+    teardown_seconds: float | None
+    startup_seconds: float | None
+    total_seconds: float | None
+
+    @property
+    def detection_seconds(self) -> None:
+        """Always None: not witnessable from a fused-memory capture.
+
+        The watchdog's consecutive-failure streak is logged in the
+        orchestrator-watchdog journal, so the interval between its first
+        failed probe and its restart decision simply is not in this input.
+        Reported as a known absence rather than silently omitted, so a reader
+        totalling the terms knows one is missing and where to find it.
+        """
+        return None
+
+    @property
+    def dominant_recovery_term(self) -> str | None:
+        """Which of the two recovery terms cost more, or None if neither ran.
+
+        The stall itself is deliberately not a candidate: it is the outage
+        being recovered from, not part of the recovery.
+        """
+        terms = {
+            name: seconds
+            for name, seconds in (
+                ("teardown", self.teardown_seconds),
+                ("startup", self.startup_seconds),
+            )
+            if seconds is not None
+        }
+        return max(terms, key=terms.__getitem__) if terms else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,16 +196,16 @@ class StallEpisode:
     line before the silence and *stall_ended_at* the first line after it, so
     the duration is measured rather than inferred from any configured timeout.
 
-    *aftermath* is every line from the end of the stall up to the next stall
-    (or the end of the capture) — the evidence for how this one resolved.
-    *pre_stall_context* is the tail of what came before it.
+    *aftermath_times* is every timestamped line from the end of the stall up
+    to the next stall (or the end of the capture) — the evidence for how this
+    one resolved. *pre_stall_context* is the tail of what came before it.
     """
 
     stall_started_at: dt.datetime
     stall_ended_at: dt.datetime
     last_line_before_stall: str
     pre_stall_context: tuple[str, ...]
-    aftermath: tuple[str, ...]
+    aftermath_times: tuple[tuple[dt.datetime, str], ...]
     unit_process_names: frozenset[str]
     unit_process_pids: frozenset[int]
 
@@ -178,6 +235,30 @@ class StallEpisode:
         if any(marker in self.last_line_before_stall for marker in _UNIT_DOWN_MARKERS):
             return PORT_DOWN
         return WEDGED
+
+    @property
+    def aftermath(self) -> tuple[str, ...]:
+        return tuple(line for _, line in self.aftermath_times)
+
+    @property
+    def costs(self) -> CostBreakdown:
+        """Decompose this episode into the intervals its own journal witnesses."""
+        teardown_start = self._first_time(_TEARDOWN_START)
+        teardown_end = self._first_time(_TEARDOWN_END)
+        startup_start = self._first_time(_STARTUP_START)
+        recovered_at = self._first_time(_STARTUP_END)
+        return CostBreakdown(
+            stall_seconds=self.stall_seconds,
+            teardown_seconds=_elapsed(teardown_start, teardown_end),
+            startup_seconds=_elapsed(startup_start, recovered_at),
+            total_seconds=_elapsed(self.stall_started_at, recovered_at),
+        )
+
+    def _first_time(self, markers: tuple[str, ...]) -> dt.datetime | None:
+        for timestamp, line in self.aftermath_times:
+            if any(marker in line for marker in markers):
+                return timestamp
+        return None
 
     @property
     def resources(self) -> ResourceTotals | None:
@@ -240,6 +321,13 @@ def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
     return parsed
 
 
+def _elapsed(start: dt.datetime | None, end: dt.datetime | None) -> float | None:
+    """Seconds between two observed timestamps, or None if either never happened."""
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds()
+
+
 def journal_writers(lines: list[tuple[dt.datetime, str]]) -> tuple[frozenset[str], frozenset[int]]:
     """The identifiers and pids the capture attributes its own lines to.
 
@@ -280,7 +368,7 @@ def analyze(
                 pre_stall_context=tuple(
                     line for _, line in lines[max(0, index - context_lines):index]
                 ),
-                aftermath=tuple(line for _, line in lines[index:next_stall]),
+                aftermath_times=tuple(lines[index:next_stall]),
                 unit_process_names=names,
                 unit_process_pids=pids,
             )
