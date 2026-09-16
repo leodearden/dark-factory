@@ -184,6 +184,29 @@ imported anywhere under `fused-memory/src` (no `requests`, no `httpx`, no
 entries exist so the first sync client to land is a finding; neither enforces
 anything today.
 
+## 4b. 2026-09-16 refresh against a drifted main
+
+Task 4484 sat twelve days in a dead merge train and was re-dispositioned
+against main `cc191354dd` before re-landing. §4 and §6 above are the census as
+it stood on 09-04; where they now disagree with the ledger, the ledger wins.
+Per-row accounts are in the two `amend(4484)` commits dated 2026-09-16; the
+facts that change a reading of §4 and §6:
+
+- **4201 landed.** Both `TaskCurator._maybe_premise_refuted_drop` rows are gone.
+- **The `_escalate` cluster has 10 callers**, not 9 — task 4781's
+  phantom-citation storm alarm in `_maybe_remediate` added one — and every row
+  in it now reads `filed 5270` (its ticket became 5072, coalesced into 5270).
+- **The `_assemble_remediation_payload` cluster's premise was wrong at census
+  time.** At `de0773fb04` that row's only blocking reach was
+  `_build_live_workflow_section`, task 3778's probe; `_format_findings` is
+  pure. Its row is deleted, but not because anything was fixed: task 4708
+  routed every payload builder through `getattr(self, section.renderer)()`,
+  which the scanner cannot resolve, so those consumers still block on 3778's
+  probe invisibly. 3778 owns them.
+- **One site landed after the census**:
+  `_run_remediation_pass -> _file_finding_task_escalation` (task 4821), filed
+  to 5270 beside `_escalate`, whose offload it shares.
+
 ## 5. Headline finding: four same-shape sites in one file, two of them unfiled
 
 `fused-memory/src/fused_memory/middleware/task_curator.py` has **four**

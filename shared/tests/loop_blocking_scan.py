@@ -52,7 +52,11 @@ Deliberate limits (misses, not false alarms)
 --------------------------------------------
 * Only ``Name(...)``, ``self.attr(...)``/``cls.attr(...)`` and dotted-primitive
   calls resolve.  An arbitrary ``obj.method(...)`` does not: the receiver's type
-  is unknowable without inference, and guessing produces false REDs.
+  is unknowable without inference, and guessing produces false REDs.  The
+  same holds for dispatch through a runtime name, ``getattr(self, name)()``:
+  ``MemoryConsolidator._render_required_sections`` is a live instance on a
+  designed extension point, so a blocking renderer registered in its
+  ``REQUIRED_SECTIONS`` is invisible here.
 * Reachability walks each function shallowly, stopping at nested ``def`` /
   ``lambda`` / ``class`` boundaries (the ``silent_fallthrough_scan._shallow_nodes``
   idiom).  A nested helper is reached only when it is actually called.
