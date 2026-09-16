@@ -29,6 +29,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,6 +48,7 @@ from fused_memory.services.memory_service import (
     ReferentFinding,
     ReferentStats,
 )
+from fused_memory.services.write_journal import WriteJournal
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
@@ -3060,3 +3062,216 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
                 referents=(Referent(number='3127'),),
             )
 
+
+async def _wired_journal(service, data_dir) -> WriteJournal:
+    """A REAL journal over *data_dir*, wired the way `server/main.py` wires it.
+
+    Real rather than mocked because the property under test is DURABILITY: a
+    stub would prove only that a method was called, which is the one thing an
+    in-memory `ReferentStats` already did.
+    """
+    journal = WriteJournal(data_dir)
+    await journal.initialize()
+    service.set_write_journal(journal)
+    return journal
+
+
+def _episode_with_identity(result, uuid: str = 'ep-real'):
+    """Stamp the EpisodicNode graphiti_core actually minted onto *result*.
+
+    `MockAddEpisodeResult.episode` defaults to None, which `_episode_uuid_of`
+    correctly reads as `''`; a row that has to name its episode needs the real
+    thing.
+    """
+    result.episode = SimpleNamespace(uuid=uuid)
+    return result
+
+
+def _one_resolvable_one_unresolvable_episode() -> MockAddEpisodeResult:
+    """Two findings under ONE declared pair, split by each edge's own fact.
+
+    e1's fact names Task 10, so its candidate pool narrows to one and the
+    finding resolves; e2's fact names nothing, so both declared referents
+    survive and zeta refuses to guess between them.
+    """
+    return _episode(
+        edges=[_edge('e1', fact='Task 10 supersedes this',
+                     source='n-99', target='n-lane'),
+               _edge('e2', fact='the deploy pipeline was retried',
+                     source='n-98', target='n-x')],
+        nodes=[MockNode(name='Task 99', uuid='n-99'),
+               MockNode(name='Task 98', uuid='n-98'),
+               MockNode(name='merge lane', uuid='n-lane'),
+               MockNode(name='deploy pipeline', uuid='n-x')],
+    )
+
+
+class TestResolvableFindingsAreJournalledDurably:
+    """A diagnosis that does not outlive the process is one nobody can act on.
+
+    zeta's findings were returned in-process and then gone, so the census edges
+    it fully diagnosed and could not repair left nothing behind for a later
+    pass. The row is what phase-5 replay reads; the counters and the returned
+    `ReferentStats` are untouched by its presence or its absence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_finding_lands_one_row_carrying_the_full_payload(
+        self, service, tmp_path,
+    ):
+        """The payload is the SECOND-PASS finding. `new_endpoint_uuid` is
+        stamped by `dataclasses.replace` after the loop that builds the
+        findings, so a row written any earlier would persist a payload missing
+        the very target the replay pass exists to act on."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+        journal = await _wired_journal(service, tmp_path)
+
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(rows) == 1
+        assert rows[0]['payload'] == stats.findings[0].to_dict()
+        assert rows[0]['payload']['new_endpoint_uuid'] == 'n-3127'
+        assert rows[0]['payload']['uuid_lookup_degraded'] is False
+        assert rows[0]['payload']['group_id'] == 'dark_factory'
+        assert rows[0]['payload']['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_the_row_names_its_group_and_its_episode(
+        self, service, tmp_path,
+    ):
+        """A real episode uuid, not the `''` `_episode_uuid_of` fails closed to
+        — and filterable by the project discriminator the 2026-08-31 audit
+        lacked."""
+        journal = await _wired_journal(service, tmp_path)
+
+        await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        scoped = await journal.get_referent_findings(group_id='dark_factory')
+        elsewhere = await journal.get_referent_findings(group_id='reify')
+        await journal.close()
+
+        assert [r['group_id'] for r in rows] == ['dark_factory']
+        assert [r['episode_uuid'] for r in rows] == ['ep-real']
+        assert scoped == rows
+        assert elsewhere == []
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_finding_is_recorded_everywhere_but_here(
+        self, service, tmp_path,
+    ):
+        """PERSIST THE ACTIONABLE. The journal's only declared consumer is the
+        replay pass, which can act on nothing that names no intended referent —
+        an unresolvable row would be a backlog entry nothing could ever drain.
+        It costs no in-memory signal: the finding, its counter buckets and its
+        WARNING all stay exactly as they were."""
+        journal = await _wired_journal(service, tmp_path)
+
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_resolvable_one_unresolvable_episode()),
+            group_id='dark_factory',
+            referents=(Referent(number='10'), Referent(number='11')),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert [f.resolvable for f in stats.findings] == [True, False]
+        assert [r['payload']['edge_uuid'] for r in rows] == ['e1']
+        assert service.referent_finding_counts()['set-membership'] == 2
+        assert service.referent_finding_counts()['unresolvable'] == 1
+
+    @pytest.mark.asyncio
+    async def test_every_finding_is_journalled_even_past_the_warning_cap(
+        self, service, tmp_path, caplog,
+    ):
+        """`_REFERENT_FINDING_WARN_CAP` is a log-VOLUME policy, documented as
+        being on the log and on nothing else. A suppressed finding is still a
+        diagnosis that has to survive, so persistence sits outside the cap
+        exactly as the counters do — putting it inside would silently discard
+        the rows a storm makes most worth keeping."""
+        cap = _warn_cap()
+        journal = await _wired_journal(service, tmp_path)
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _episode_with_identity(_finding_storm_episode(cap + 5)),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert len(stats.findings) == cap + 5
+        assert {r['payload']['edge_uuid']: r['payload'] for r in rows} == {
+            f.edge_uuid: f.to_dict() for f in stats.findings
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_pass_is_unchanged_by_an_absent_or_failing_journal(
+        self, service, tmp_path,
+    ):
+        """DEGRADES, NEVER FAILS THE WRITE.
+
+        The episode write has already committed by the time this pass runs, so
+        a journal fault must cost a row and never a finding. The `None` case is
+        skipped SILENTLY — the counters remain the unconditional INV-4 escape,
+        and a per-finding warning for an unconfigured journal would be a storm
+        rather than a signal.
+        """
+        async def _findings() -> list[dict]:
+            stats = await service._verify_episode_referents(
+                _episode_with_identity(_one_membership_finding_episode()),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+            return [f.to_dict() for f in stats.findings]
+
+        assert service.write_journal is None
+        unwired = await _findings()
+
+        # Never initialized, so the REAL method's own fire-and-forget guard is
+        # what absorbs the fault — the call site deliberately has none.
+        failing = WriteJournal(tmp_path / 'never_initialized')
+        service.set_write_journal(failing)
+        faulted = await _findings()
+
+        working = await _wired_journal(service, tmp_path / 'working')
+        journalled = await _findings()
+        rows = await working.get_referent_findings()
+        await working.close()
+
+        assert unwired == faulted == journalled
+        assert len(unwired) == 1
+        assert [r['payload'] for r in rows] == journalled
+        assert failing.journal_drop_stats() == {
+            'dropped_total': 1, 'by_operation': {'referent_finding': 1},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_row_survives_a_service_restart(self, service, tmp_path):
+        """End to end, not merely the journal unit: the row this PASS wrote is
+        still readable by a process that never saw the episode."""
+        journal = await _wired_journal(service, tmp_path)
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        await journal.close()
+
+        reopened = WriteJournal(tmp_path)
+        await reopened.initialize()
+        rows = await reopened.get_referent_findings(group_id='dark_factory')
+        await reopened.close()
+
+        assert [r['payload'] for r in rows] == [
+            f.to_dict() for f in stats.findings
+        ]
