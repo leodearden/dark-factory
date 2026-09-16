@@ -878,6 +878,31 @@ class WatchdogTrigger(StrEnum):
 WATCHDOG_FIRE_TRIGGER_TOKEN: str = 'watchdog_fire_trigger'
 
 
+JOURNALD_LINE_MAX_BYTES: int = 48 * 1024
+"""journald's default ``LineMax``. Every orchestrator unit sets
+``StandardError=journal``, so a longer line is truncated by the journal itself
+— silently, and from the tail, which is exactly where
+:data:`WATCHDOG_FIRE_TRIGGER_TOKEN` lands in a relayed remote stderr."""
+
+
+def elide_middle(text: str, *, head: int = 200, tail: int = 800) -> str:
+    """Keep the first *head* and last *tail* characters, naming how many were dropped.
+
+    For strings whose two informative ends sit either side of an arbitrarily
+    large middle, where a plain head or tail slice would discard one of them.
+    A dead remote's relayed stderr is logged this way: the ssh rc is at its
+    head and :data:`WATCHDOG_FIRE_TRIGGER_TOKEN` at its tail, with a whole
+    verify's INFO logging in between.
+
+    The defaults sum to 1000 characters — at most 4 KiB of UTF-8, far below
+    :data:`JOURNALD_LINE_MAX_BYTES`, which is the number to check against
+    before widening either end.
+    """
+    if len(text) <= head + tail:
+        return text
+    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{text[-tail:]}'
+
+
 def run_stdin_watchdog(
     read_fd: int,
     on_fire,
