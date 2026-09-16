@@ -354,6 +354,85 @@ class TestFormatQueueRow:
         assert question_col != ''
 
 
+    def test_the_question_is_cut_to_the_supplied_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert question_col.endswith('\u2026')
+
+    def test_the_cut_tracks_the_bound_rather_than_a_constant(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=120)
+
+        assert len(question_col) == 120
+        assert question_col.endswith('\u2026')
+
+    def test_a_question_under_the_bound_passes_through_unmarked(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='Which port?')
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'Which port?'
+        assert '\u2026' not in question_col
+
+    def test_a_question_exactly_at_the_bound_is_not_truncated(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 40)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'x' * 40
+
+    def test_whitespace_still_collapses_before_the_bound_is_applied(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='word\n\nword   word  ' * 10)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert '\n' not in question_col
+        assert '  ' not in question_col
+        assert question_col == 'word word word word word\u2026'
+
+    def test_a_blank_question_degrades_to_the_placeholder_at_any_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for blank in ('', None, '   '):
+            _, _, _, question_col = format_queue_row(
+                _make_row_item(question=blank), now, question_width=25
+            )
+            assert question_col == '(no question)'
+
+    def test_omitting_the_bound_falls_back_to_the_unmeasured_width(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now)
+
+        assert len(question_col) == 60
+        assert question_col.endswith('\u2026')
+
+
 class TestFormatCopyPayload:
     """format_copy_payload(item) -- the copy affordance's clipboard text
     (task 2517). A pure QueueItem -> str transform, mirroring
