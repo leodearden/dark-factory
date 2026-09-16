@@ -1691,11 +1691,20 @@ class TestRunnerUnavailableWarningIsBounded:
     #: Size of the synthetic stderr flood standing in for a real verify's INFO log.
     FLOOD = 200_000
 
+    #: Filler character for that flood. Must appear NOWHERE else in the
+    #: formatted warning, so counting it measures exactly what survived
+    #: elision — 'x' does not qualify, the word "exited" carries one.
+    FLOOD_CHAR = 'Z'
+
     async def test_oversized_reason_keeps_both_ends(self, tmp_path, caplog):
         """The rc (head) and the trigger token (tail) both survive, inside journald's limit."""
         from orchestrator.merge_queue import JOURNALD_LINE_MAX_BYTES
 
-        reason = f'ssh {_RU_HOST} exited 1: ' + 'x' * self.FLOOD + '\nwatchdog_fire_trigger=eof\n'
+        reason = (
+            f'ssh {_RU_HOST} exited 1: '
+            + self.FLOOD_CHAR * self.FLOOD
+            + '\nwatchdog_fire_trigger=eof\n'
+        )
         result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1
@@ -1713,7 +1722,11 @@ class TestRunnerUnavailableWarningIsBounded:
         """A truncated reason can never be mistaken for a complete one."""
         import re
 
-        reason = f'ssh {_RU_HOST} exited 1: ' + 'x' * self.FLOOD + '\nwatchdog_fire_trigger=eof\n'
+        reason = (
+            f'ssh {_RU_HOST} exited 1: '
+            + self.FLOOD_CHAR * self.FLOOD
+            + '\nwatchdog_fire_trigger=eof\n'
+        )
         _result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
 
         message = records[0].message
@@ -1721,11 +1734,10 @@ class TestRunnerUnavailableWarningIsBounded:
         assert marker, f'no elision marker in {message[:300]!r}'
 
         # The count is honest about what was dropped: every flood character is
-        # either still in the line or accounted for by the marker.  ('x' appears
-        # nowhere else in the message or the marker.)
+        # either still in the line or accounted for by the marker.
         dropped = int(marker.group(1))
         assert dropped > 0
-        assert dropped + message.count('x') == self.FLOOD
+        assert dropped + message.count(self.FLOOD_CHAR) == self.FLOOD
 
     async def test_short_reason_is_passed_through_verbatim(self, tmp_path, caplog):
         """The common case pays nothing: no marker, nothing dropped."""

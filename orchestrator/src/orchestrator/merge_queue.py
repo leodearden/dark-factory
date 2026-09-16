@@ -765,6 +765,36 @@ def _verify_hit_enospc(verify: VerifyResult) -> bool:
     return any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
+JOURNALD_LINE_MAX_BYTES: int = 48 * 1024
+"""journald's default ``LineMax``. Every orchestrator unit sets
+``StandardError=journal``, so a longer line is truncated by the journal
+itself — silently, and from the tail. This is the ceiling any bound on a
+logged string has to sit under."""
+
+#: Head and tail kept of an oversized ``RunnerUnavailable`` reason in the
+#: WARNING below. The head holds the ``ssh <host> exited <rc>: `` prefix plus
+#: margin (sized to the ``reason[:200]`` escalation-summary convention); the
+#: tail holds the ``watchdog_fire_trigger=`` line plus any death-rattle stderr
+#: written during the remote's SIGTERM -> SIGKILL grace window. Their sum is
+#: the number to check against :data:`JOURNALD_LINE_MAX_BYTES` — the binding
+#: constraint — before widening either: 1000 characters is at most 4 KiB of
+#: UTF-8, far below the 48 KiB ceiling.
+_RU_REASON_LOG_HEAD = 200
+_RU_REASON_LOG_TAIL = 800
+
+
+def _elide_middle(text: str, *, head: int, tail: int) -> str:
+    """Keep the first *head* and last *tail* characters, naming how many were dropped.
+
+    Returned unchanged when nothing would be dropped. For strings whose two
+    informative ends sit either side of an arbitrarily large middle, where a
+    plain head or tail slice would discard one of them.
+    """
+    if len(text) <= head + tail:
+        return text
+    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{text[-tail:]}'
+
+
 _SPECULATION_RACE_MARKER = 'not something we can merge'
 """LOAD-BEARING exact substring match on git porcelain output.
 
@@ -18506,11 +18536,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _alarm_verify_host_unreachable — gated on a streak or 600s of
             # continuous unreachability that a single spurious self-kill never
             # crosses.  lease.name is the same field _quarantine_unreachable_host
-            # is handed as its `host`, so this names no second spelling.
+            # is handed as its `host`, so this names no second spelling.  The
+            # reason's MIDDLE is elided because the rc is at its head and the
+            # trigger token at its tail, with a whole verify's INFO logging in
+            # between; the `reason=` returned below stays full, since the
+            # escalation path it feeds is not a journald-shaped channel.
             logger.warning(
                 'Task %s: remote runner unavailable (merge=%s) on host %s — '
                 'will re-dispatch on another host: %s',
-                req.task_id, merge_commit[:8], lease.name, str(exc),
+                req.task_id, merge_commit[:8], lease.name,
+                _elide_middle(str(exc), head=_RU_REASON_LOG_HEAD, tail=_RU_REASON_LOG_TAIL),
             )
             # task 3003 amend (robustness): a dead remote transport is not lane
             # contention — this item is re-dispatched on another host, so close
