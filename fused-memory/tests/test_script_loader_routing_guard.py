@@ -63,21 +63,6 @@ HELPER_IMPORT = 'from _fm_helpers import load_script_module'
 # The AST nodes that contribute a segment to a qualified name.
 SCOPE_NODES = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
-# The uncached spelling of the shared parse. `_ast_guard.parse_python_module`
-# memoises for the whole session, which is right for the sibling guards' fixed
-# six-file sets and wrong here: this guard's scope is DISCOVERED, so routing it
-# through that memo would pin a tree for every one of the 365 modules under
-# tests/ for the rest of the run. Measured here, parsing all 365: through the
-# memo, 515 MB peak RSS and 24 s; releasing each tree, 68 MB and 6.5 s. Under
-# `-n auto` that cost is split per worker rather than avoided, and it grows with
-# every module added. The overlap a shared memo exists to exploit is two files
-# here, and this guard reads each tree exactly once, so the tree is released as
-# soon as the call sites have been read off it. Taken from the shared helper rather
-# than re-spelled locally so the parse semantics stay single-homed; if the memo
-# is ever removed there, this raises AttributeError at import rather than
-# quietly diverging.
-parse_without_retaining = parse_python_module.__wrapped__
-
 # Call sites that may keep a local loader, as (tests-root-relative module,
 # QUALIFIED function name) pairs. Qualified — ``Class.method``, not the bare
 # method name — because a bare name is not unique within a file: 148 of the 365
@@ -176,10 +161,29 @@ def _is_exempt(module_key, chain):
 def _unrouted_loader_lines(path):
     """The line of every non-exempt ``spec_from_file_location(...)`` call in *path*.
 
-    Returns lines rather than nodes so the parsed tree is released as soon as
-    this returns — see ``parse_without_retaining``.
+    A cheap text prefilter runs before any parse, the idiom
+    ``test_falkor_index_barrier_guard.py`` established for a discovered scope:
+    ``_ast_guard.parse_python_module`` memoises for the whole session, so
+    parsing all 365 modules under tests/ would pin every tree for the rest of
+    the run — measured here at 24 s and 475 MB of retained trees, paid per
+    xdist worker. Prefiltered, eight modules are parsed: 0.4 s and 25 MB.
+
+    The prefilter cannot hide a fork: ``calls_named`` matches a callee spelled
+    ``spec_from_file_location`` or ``….spec_from_file_location``, and neither
+    can exist without that identifier appearing literally in the source, so the
+    prefilter is a strict SUPERSET of the AST criterion. Every assertion stays
+    AST-based, which is what keeps the prose in ``conftest.py`` and
+    ``test_fm_helpers.py`` from tripping the guard.
+
+    It narrows the PARSE, deliberately not the discovered set the parametrize
+    walks — one visible test case per module, so a criterion that stopped
+    matching could not quietly leave the guard checking nothing. That is the
+    hazard the barrier guard answers with a hand-verified floor set; here the
+    shape of the parametrize answers it instead.
     """
-    tree = parse_without_retaining(path)
+    if LOADER_FACTORY not in path.read_text():
+        return []
+    tree = parse_python_module(path)
     chain_of = {id(node): chain for node, chain in _nodes_with_enclosing_scope(tree)}
     module_key = _module_key(path)
     return sorted(
@@ -218,7 +222,7 @@ def test_every_exemption_names_one_live_loader_site(module_key, qualname):
     """
     path = TESTS_ROOT / module_key
     assert path.exists(), f'{module_key}: exempted module does not exist'
-    tree = parse_without_retaining(path)
+    tree = parse_python_module(path)
     matches = [
         node
         for node, chain in _nodes_with_enclosing_scope(tree)
