@@ -362,7 +362,7 @@ def _normalise_command(cmd: str) -> str:
 def select_full_suite_legs(
     corpus: Corpus,
     *,
-    root: Path,
+    expected: str | None,
     prefix: str,
     label: str = 'test',
     role: str | None = None,
@@ -377,6 +377,24 @@ def select_full_suite_legs(
     A per-module duration census reading it would report a 4-second lint
     command as the suite.
 
+    *expected* is REQUIRED and is the command to compare against — resolved by
+    the caller, never re-read here. This function takes no ``root`` for that
+    reason: it used to accept one and call ``read_module_test_command`` itself,
+    which made the comparison basis a SECOND source of truth alongside the one
+    ``build_report`` resolves and prints. Under a repeatable ``--root`` whose
+    first entry did not declare the module yaml the two silently disagreed —
+    the report printed a command the selection had never compared against,
+    beside ``n=0`` and a ``no_declared_command`` rejection for every entry,
+    which reads exactly like "this module never ran the full suite". Passing
+    the value in makes that divergence unrepresentable rather than merely
+    fixed, and leaves this function a pure predicate over the corpus with no
+    filesystem access of its own.
+
+    ``None`` is a legitimate value — no root declared a command — and rejects
+    every entry under ``no_declared_command``. That is the honest outcome: the
+    report renders ``<none declared>`` beside it, so a reader can tell "nothing
+    to compare against" from "compared and found nothing".
+
     ``role=None`` means "do not filter by role", which is the only usable
     default for the archive corpus, where the role is not knowable from the
     path at all (see ``RecordPath.role``).
@@ -384,7 +402,6 @@ def select_full_suite_legs(
     Every considered entry is either selected or counted under a reason, so the
     caller can always reconcile ``n`` against the corpus.
     """
-    expected = read_module_test_command(root, prefix)
     wanted_infix = sanitise_prefix(prefix)
     legs: list[Leg] = []
     rejected: Counter[str] = Counter()
@@ -890,6 +907,13 @@ def build_report(
     a multi-root run is comparing one module's suite across checkouts, and a
     per-root command would make the durations incomparable, which is the very
     thing the shape filter exists to prevent.
+
+    That resolved value is then PASSED to ``select_full_suite_legs`` rather
+    than left for it to re-derive, so the ``expected_command`` this report
+    prints is by construction the one the selection compared against. The two
+    were separately resolved once — this one across every root, the selector's
+    from ``roots[0]`` alone — and disagreed whenever the first root did not
+    declare the module yaml, publishing a command that had never been used.
     """
     corpus = load_records(roots)
     expected = next(
@@ -897,7 +921,7 @@ def build_report(
         None,
     )
     selection = select_full_suite_legs(
-        corpus, root=roots[0], prefix=module, label=label, role=role,
+        corpus, expected=expected, prefix=module, label=label, role=role,
     )
     legs = within_window(selection.legs, window)
     return {

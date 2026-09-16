@@ -471,7 +471,7 @@ class TestTheSelectorReadsTheCommandsArray:
         _corpus_with(tmp_path, _leg(duration_secs=3300.0))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         )
 
         assert [leg.duration_secs for leg in selection.legs] == [3300.0]
@@ -483,7 +483,7 @@ class TestTheSelectorReadsTheCommandsArray:
         _corpus_with(tmp_path, _leg(rc=0))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         )
 
         assert [leg.rc for leg in selection.legs] == [0]
@@ -497,7 +497,7 @@ class TestTheFullSuiteShapeFilter:
 
         _corpus_with(tmp_path, *commands)
         return select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         )
 
     def test_the_verbatim_declared_command_is_selected(self, tmp_path):
@@ -584,7 +584,7 @@ class TestTheFullSuiteShapeFilter:
         other.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         )
 
         assert len(selection.legs) == 1
@@ -600,7 +600,7 @@ class TestTheFullSuiteShapeFilter:
         merge.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator', role='task',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator', role='task',
         )
 
         assert len(selection.legs) == 1
@@ -625,21 +625,29 @@ class TestTheExpectedCommandHasOneHome:
 
         assert read_module_test_command(tmp_path, 'orchestrator') == 'pytest tests/ -q'
 
-    def test_a_changed_yaml_changes_what_is_selected(self, tmp_path):
-        """The property a pasted literal would break — asserted, not asserted about."""
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+    def test_a_changed_yaml_changes_what_is_selected(self, tmp_path, capsys):
+        """The property a pasted literal would break — asserted, not asserted about.
 
+        Driven through the CLI rather than through ``select_full_suite_legs``,
+        because the selector no longer reads the yaml: ``build_report`` resolves
+        the command once and passes it down. The property under test is the
+        whole chain's (yaml -> resolve -> select), so exercising the chain is
+        what asserts it; calling the selector with a hand-passed ``expected``
+        would assert only that the selector compares strings.
+        """
         _corpus_with(tmp_path, _leg(cmd='pytest tests/ --brand-new-flag'))
         (tmp_path / 'orchestrator' / 'orchestrator.yaml').write_text(
             'test_command: "pytest tests/ --brand-new-flag"\n', encoding='utf-8',
         )
 
-        selection = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
+        report = json.loads(out)
 
-        assert len(selection.legs) == 1, (
-            'the selector must track the yaml, not a literal pasted into the script'
+        assert report['expected_command'] == 'pytest tests/ --brand-new-flag'
+        assert report['overall']['durations']['n'] == 1, (
+            'the census must track the yaml, not a literal pasted into the script'
         )
 
     def test_an_absent_module_yaml_is_reported_not_guessed(self, tmp_path):
@@ -733,7 +741,7 @@ class TestTimedOutAndFailedAreCountedApart:
 
         _corpus_with(tmp_path, *entries)
         return select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
 
     def test_a_timed_out_leg_is_counted_and_excluded(self, tmp_path):
@@ -914,7 +922,7 @@ class TestLegsAreFilteredToTheResolvedWindow:
             _leg(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
         )
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
 
         window = (
@@ -937,7 +945,7 @@ class TestLegsAreFilteredToTheResolvedWindow:
 
         _corpus_with(tmp_path, _leg(started_at='', duration_secs=3300.0))
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
 
         window = (
@@ -975,7 +983,7 @@ class TestPsiBanding:
 
         _corpus_with(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
         return by_load_band(legs)
 
@@ -1036,7 +1044,7 @@ class TestUnstampedIsItsOwnRow:
 
         _corpus_with(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
         return by_load_band(legs)
 
@@ -1108,7 +1116,7 @@ class TestColdSeparabilityIsReportedNotInferred:
 
         _corpus_with(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
         return cold_separability(legs)
 
@@ -1131,7 +1139,7 @@ class TestColdSeparabilityIsReportedNotInferred:
         second.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
 
         legs = select_full_suite_legs(
-            load_records([tmp_path]), root=tmp_path, prefix='orchestrator',
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
         ).legs
         finding = cold_separability(legs)
 
@@ -1332,6 +1340,73 @@ class TestTheCliContract:
         )
 
         assert json.loads(out)['overall']['durations']['n'] == 2
+
+    def test_a_first_root_without_the_module_yaml_still_selects(
+        self, tmp_path, capsys,
+    ):
+        """The command is resolved across ALL roots, and the selection uses it.
+
+        `_corpus_with` writes the module yaml into EVERY root it builds, which
+        is why `test_roots_are_repeatable` above cannot reach this: the two
+        resolutions agree whenever every root declares. Here only the SECOND
+        root declares, which is an ordinary shape — `--root` is repeatable
+        precisely so an archive path can be censused alongside a checkout, and
+        an archive carries records without carrying a module yaml.
+
+        The regression: `build_report` resolved `expected_command` from the
+        first root that DECLARES one while the selector re-resolved it from
+        `roots[0]` alone. With `roots[0]` not declaring, the selector compared
+        against None, rejected every entry as `no_declared_command`, and the
+        report printed the resolved command above `n=0` and the NOTE "no
+        full-suite run matched in this window" — telling a reader it had
+        compared against a command it had never used.
+        """
+        bare, declaring = tmp_path / 'bare', tmp_path / 'declaring'
+        _corpus_with(declaring, _leg(duration_secs=3300.0), lane='2')
+        _corpus_with(bare, _leg(duration_secs=3400.0), lane='1')
+        (bare / 'orchestrator' / 'orchestrator.yaml').unlink()
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(bare), '--root', str(declaring),
+            '--module', 'orchestrator', '--json',
+        )
+        report = json.loads(out)
+
+        assert report['expected_command'] == _FULL_SUITE
+        assert 'no_declared_command' not in report['rejected']
+        assert report['overall']['durations']['n'] == 2, (
+            'the legs were rejected against a command the report still printed'
+        )
+
+    def test_no_root_declaring_reports_none_rather_than_a_silent_zero(
+        self, tmp_path, capsys,
+    ):
+        """`expected=None` is honest, not a bug — and must render as such.
+
+        The sibling above fixes the case where a command WAS resolvable. This
+        pins the case where none was: the count is still 0, but the report says
+        `<none declared>` rather than naming a command, so "nothing to compare
+        against" stays distinguishable from "compared and found nothing". That
+        distinction is the whole reason `read_module_test_command` returns None
+        instead of guessing a default.
+        """
+        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        (tmp_path / 'orchestrator' / 'orchestrator.yaml').unlink()
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+        report = json.loads(out)
+
+        assert report['expected_command'] is None
+        assert report['rejected']['no_declared_command'] == 1
+        assert report['overall']['durations']['n'] == 0
+
+        _rc, text, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert '<none declared>' in text
 
 
 class TestTheExitCodeVocabulary:
