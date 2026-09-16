@@ -5976,6 +5976,7 @@ class MemoryService:
         temporal_context: str | None = None,
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
+        declared_referents: list[dict] | None = None,
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately.
 
@@ -6002,6 +6003,33 @@ class MemoryService:
         at enqueue time, and the real uuid does not exist until the queued
         write runs.  The two are tied together by an INFO log in
         ``_execute_graphiti_write``, which is the only record of the mapping.
+
+        ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
+        EXPLICIT statement of which referents this episode is about — the
+        strongest source in gamma's precedence chain. It arrives from the
+        ``entities`` parameter on the ``add_episode`` MCP tool, verbatim and
+        unparsed.
+
+        TRI-STATE, and all three states are distinct on the wire:
+        ``None`` = never considered (falls through to the derived scan);
+        ``[]`` = considered and none apply, HONOURED as a declaration and
+        stamped ``source='declared'`` with an empty set; ``[...]`` = declared.
+        The ``[]``/``None`` distinction is the "the agent considered referents
+        and none applied" versus "the agent never looked" signal leaf iota
+        counts, so nothing on this path may collapse one onto the other.
+
+        The chain is SHORTER here than at ``add_memory``, and by construction:
+        this method takes no ``metadata`` parameter at all, so the ladder is
+        ``declared > derived > none`` with the metadata rung absent rather than
+        merely unused. See the ``resolve_referents`` call below.
+
+        Deliberately UNVALIDATED here, exactly as at ``add_memory``: gamma's
+        ``_declared_referents`` owns the TOTAL ``InputValidationError``
+        contract, and a direct service caller that passes a malformed list gets
+        that raise — which is correct. A CONFLICTING declaration is likewise
+        legal at this layer: this is mechanism, and
+        ``server/entities_gate.py`` is the policy that refuses it at the tool
+        boundary.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         # task 3561: this id is minted HERE, at enqueue time, before the queued
@@ -6035,15 +6063,23 @@ class MemoryService:
         # InputValidationError on a structural wiring bug, and that must not be
         # absorbed by an enqueue-failure handler.
         #
-        # metadata=None is not an oversight: add_episode deliberately never
-        # persists a metadata argument — the same fact that forced task 3142's
-        # `unverified_claim` onto this payload channel — so the bridge has
-        # nothing to read and the derived scan is the only live source here.
+        # metadata=None is not an oversight, and it is not a choice this method
+        # could make differently: add_episode takes no `metadata` parameter at
+        # all — the same fact that forced task 3142's `unverified_claim` onto
+        # this payload channel — so the bridge has nothing to read. It stays
+        # None now that leaf delta has landed: adding one "for symmetry with
+        # add_memory" would hand this producer a rung whose value nothing
+        # persists. tests/test_referent_queue_threading.py pins that absence on
+        # the signature.
         #
-        # declared=None: leaf delta owns the `entities` parameter; this is the
-        # seam it fills.
+        # The seam leaf delta (task 3669) fills: `declared_referents` is the
+        # `entities` parameter on the add_episode MCP tool, forwarded verbatim.
+        # Its `entities_gate` has already rejected any declaration the content
+        # contradicts and any malformed entry, so neither can reach here FROM
+        # THAT PATH — a direct service caller still gets gamma's raise, which
+        # is the intended loud failure.
         resolution = resolve_referents(
-            declared=None,
+            declared=declared_referents,
             metadata=None,
             content=content,
             group_id=scope.graphiti_group_id,
@@ -6152,8 +6188,68 @@ class MemoryService:
         dual_write: bool = False,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        declared_referents: list[dict] | None = None,
     ) -> AddMemoryResponse:
-        """Lightweight classified write — skip extraction pipeline."""
+        """Lightweight classified write — skip extraction pipeline.
+
+        ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
+        EXPLICIT statement of which referents this write is about — the
+        strongest source in gamma's precedence chain, outranking the
+        ``metadata['task_id']`` bridge, the derived content scan and ``none``.
+        It arrives from the ``entities`` parameter on the ``add_memory`` MCP
+        tool, verbatim and unparsed.
+
+        TRI-STATE, and all three states are distinct on the wire:
+        ``None`` = never considered (falls through to the tiers below);
+        ``[]`` = considered and none apply, HONOURED as a declaration and
+        stamped ``source='declared'`` with an empty set; ``[...]`` = declared.
+        The ``[]``/``None`` distinction is the "the agent considered referents
+        and none applied" versus "the agent never looked" signal leaf iota
+        counts, so nothing on this path may collapse one onto the other.
+
+        SCOPED TO THE GRAPHITI LEG, and say it plainly because the three
+        sentences above read as if it were universal: a declaration is
+        RESOLVED, encoded and stamped only on a write that actually reaches
+        Graphiti — a ``GRAPHITI_PRIMARY`` category, or ``dual_write=True``. On
+        a Mem0-primary write (``procedural_knowledge``,
+        ``preferences_and_norms``, ``observations_and_summaries``) the
+        ``resolve_referents`` call below never runs, no referent set is
+        encoded, and ``_referent_source_counts`` never increments. The
+        declaration is accepted and then discarded.
+
+        That is deliberate, not an oversight, and it follows from where the
+        referent set LIVES: it is a field on the Graphiti queue payload, read
+        by ``_execute_graphiti_write`` and verified against the resulting edges
+        by leaf zeta. A Mem0-primary write produces no queue row and no edges,
+        so there is nothing to stamp it onto and nothing for zeta to check.
+        Resolving anyway would compute a set with no destination. The
+        consequence leaf iota must price in: its declaration-rate denominator
+        is "every Graphiti write", NOT "every add_memory call", so the
+        Mem0-primary share of traffic is outside the counter entirely rather
+        than counted as undeclared. Widening that denominator is iota's call to
+        make, and needs a second counting site — it is not a thing this method
+        can fix by moving one call.
+
+        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
+        run on this path (pinned by
+        ``tests/server/test_entities_gate_ingestion.py::...
+        test_the_gate_is_category_independent``), so a CONFLICTING declaration
+        on a Mem0-primary write is still rejected even though an agreeing one
+        would have been inert. That asymmetry is intended: the gate polices
+        whether the caller's stated referents match its own prose, which is a
+        fact about the caller and not about routing. It costs nothing an
+        undeclaring caller pays — absence is never rejected, so an agent that
+        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+
+        Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
+        TOTAL ``InputValidationError`` contract, and a direct service caller
+        that passes a malformed list gets that raise — which is correct. The
+        resolve sits OUTSIDE the enqueue ``try`` below precisely so a wiring
+        bug stays loud rather than degrading to a silently dropped Graphiti
+        write. A CONFLICTING declaration is likewise legal here: this layer is
+        mechanism, and ``server/entities_gate.py`` is the policy that refuses
+        it at the tool boundary.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
@@ -6241,11 +6337,14 @@ class MemoryService:
             # task_id to a scalar str, which is the contract gamma's metadata
             # bridge documents itself against.
             #
-            # declared=None: leaf delta owns the `entities` parameter and its
-            # `_entities_gate`, and THIS CALL is the single seam it fills. No
-            # declared referents can exist until it lands.
+            # The seam leaf delta (task 3669) fills: `declared_referents` is
+            # the `entities` parameter on the add_memory MCP tool, forwarded
+            # verbatim. Its `entities_gate` has already rejected any declaration
+            # the content contradicts and any malformed entry, so neither can
+            # reach here FROM THAT PATH — a direct service caller still gets
+            # gamma's raise, which is the intended loud failure.
             resolution = resolve_referents(
-                declared=None,
+                declared=declared_referents,
                 metadata=meta,
                 content=content,
                 group_id=scope.graphiti_group_id,
@@ -6779,8 +6878,11 @@ class MemoryService:
             # will want to verify.
             #
             # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
-            # record's own), so the bridge is live here. declared=None: leaf
-            # delta's seam, as at the other two producers.
+            # record's own), so the bridge is live here. declared=None STAYS
+            # None now that leaf delta (task 3669) has landed: this producer
+            # replays STORED Mem0 rows and has no caller to declare anything.
+            # Its two siblings take `declared_referents` from the tool boundary;
+            # there is no tool boundary here.
             #
             # add_system_record is deliberately NOT threaded — it is Mem0-only
             # and never routes to Graphiti.
