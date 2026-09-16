@@ -202,6 +202,20 @@ class TestGcRecordAgeBoundDoesNotUndercutTheCensus:
     side, a pydantic field on the other — which is exactly the situation
     ``lib_lane_state.sh`` solved for ``PROTECTED_PREFIXES`` with a machine-checked
     drift gate rather than a comment.  Same remedy here.
+
+    TWO LIMITS ON WHAT THIS GATE CLAIMS, both deliberate:
+
+    * It compares the pydantic field's DEFAULT against the bash default, so it
+      pins the STOCK pair only.  A deployment that raises
+      ``lane_stale_report_days`` past 14 in its own YAML is outside this gate's
+      reach and silently loses the ordering — reading an effective config here
+      would mean this test depended on whichever YAML the runner happened to
+      find, which is not a drift gate at all.
+    * ``_stale_lane_assignment_census`` skips any record whose backing task is
+      TERMINAL or unknown, so report-before-act is a claim about NON-TERMINAL
+      assignments.  A record stranded by an ENOSPC at release belongs to a task
+      that has since finished and is never censused; the gc bound acting on it
+      unreported is the intent, not a hole this ordering was meant to cover.
     """
 
     def test_the_gc_bound_is_a_non_negative_integer(self) -> None:

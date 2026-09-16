@@ -296,8 +296,8 @@
 #   - Safety-ranked order: reset lanes first (cheap), then remove orphans (destructive).
 #   - Stdout: machine-readable summary line only —
 #     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N
-#     preserved_assigned=N`. New fields are APPENDED so prefix-matching
-#     consumers keep working.
+#     preserved_assigned=N downgraded_assigned=N`. New fields are APPENDED so
+#     prefix-matching consumers keep working.
 #     Stderr: all diagnostics (info/ok/warn/err).
 
 set -euo pipefail
@@ -421,23 +421,21 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
             (A is the share of K held back by dark-factory's own durable lane
              record reading assigned/in_use — the only preserve reason that is
              AUTHORITATIVE rather than a probe. It self-clears only when the
-             release's DURABLE WRITE succeeds: WarmLanePool._note_released_durable
-             swallows OSError by design (fail-open release, invariant I3), so an
-             ENOSPC at release leaves \`assigned\` on disk while the in-memory
-             pool reads FREE. Such a record never clears itself, and composed
-             with an unbounded preserve it would hold the ENOSPC valve shut
-             with the very failure the valve responds to. TWO bounds stop that
-             composition, and they are orthogonal: --disk-pressure overrides
-             the gate for the whole pass (acute), and --max-record-age-days
-             overrides it for one over-old record in any pass (chronic). Both
-             land in D below.)
+             release's DURABLE WRITE succeeds, which a full disk can stop it
+             doing; --disk-pressure (acute) and --max-record-age-days (chronic)
+             are the two bounds that keep such a record from holding the ENOSPC
+             valve shut. Both land in D. Full account: README.md "Delta 10".)
             (D is the count of lanes whose assigned/in_use record was
              DOWNGRADED — read, believed, and then deliberately made
              non-decisive. Downgrade means the lane FALLS THROUGH to the
-             live-reference gate; it is not a reclaim. A lane counted in D is
-             therefore in exactly one of: reset, or preserved via
-             preserved_live_ref. D and A partition the assigned lanes a pass
-             saw, so A+D is that pass's assigned population.)
+             live-reference gate; it is NOT a reclaim, so a downgraded lane
+             ended the pass in one of THREE states: reset, preserved via
+             preserved_live_ref, or preserved because the reset itself failed
+             (either branch — the disk-pressure rm or the seed script).
+             A and D partition the assigned lanes that REACHED the Pass-1
+             record gate — an assigned lane the protect glob skipped in the
+             enumeration loop, or the flock gate preserved first, is in
+             NEITHER, so A+D is not the pass's whole assigned population.)
     stderr: all diagnostics.
 EOF
 }
@@ -631,12 +629,19 @@ fi
 # ── the Pass-1 record gate's staleness bound (task 5504) ──────────────────────
 # WHY 14. It is twice dark-factory's stock `lane_stale_report_days` (7.0), so
 # the daily digest's `## Stale lane assignments` census surfaces a lane for a
-# FORTNIGHT before this sweep acts on it. Report-before-act is the ordering that
-# matters, and it is machine-checked rather than merely documented:
+# FORTNIGHT before this sweep acts on it — FOR THE POPULATION THAT CENSUS
+# COVERS, which is not every record this bound reaches. The census skips any
+# record whose backing task is terminal or unknown, so report-before-act holds
+# exactly where destruction is riskiest (a lane whose task is still
+# pending/in-progress/blocked) and deliberately NOT for an ENOSPC-stranded
+# record whose task has since gone terminal — nothing in the tree ever reports
+# that one, and acting on it unreported is the INTENT rather than a gap.
+# The ordering is machine-checked rather than merely documented:
 # orchestrator/tests/test_harness_warm_lane_gc.py fails the build if the config
-# default ever rises past this one. It is also an enormous multiple of the
-# longest expected task (hours), so a genuinely live long-running task can never
-# trip it.
+# field's DEFAULT ever rises past this one (defaults are all it can see; a
+# deployment that raises lane_stale_report_days in YAML is outside its reach).
+# 14d is also an enormous multiple of the longest expected task (hours), so a
+# genuinely live long-running task can never trip it.
 #
 # The bound REUSES harness.py::_stale_lane_assignment_census's definition rather
 # than re-deriving one: same field (`updated_at`), same "age greater than a days
@@ -648,55 +653,36 @@ fi
 # sizing-lifecycle T1).
 [ -n "$MAX_RECORD_AGE_DAYS" ] || MAX_RECORD_AGE_DAYS=14
 
-# A MISCONFIGURED BOUND IS FATAL, not fail-open, and that is the one place in
-# this script where fail-open is the wrong answer. Every failure direction
-# below is INVISIBLE in the summary line, which is why none of them may be
-# tolerated:
-#   * silently DEFAULTED — an operator believes they widened the bound;
-#   * silently ZEROED    — the valve is off while `downgraded_assigned=0`
-#                          reads as "nothing was stale". Note the regex below
-#                          ACCEPTS an explicit `0`: that is the documented
-#                          escape hatch and it is not silent. What is forbidden
-#                          is ARRIVING at zero without typing it;
-#   * NEGATIVE           — `age > negative` is true for every record, so a
-#                          typo becomes a blanket downgrade of the whole pool;
-#   * LEADING ZERO       — `$(( … * 86400 ))` reads it as OCTAL. `08` dies
-#                          with a raw `value too great for base` that `set -e`
-#                          does NOT abort on, leaving MAX_RECORD_AGE_SECS
-#                          unset and aborting the sweep mid-pass under `set -u`
-#                          AFTER earlier lanes were already reclaimed; `010`
-#                          is worse because it is silent — it means 8 days;
-#   * OVERFLOW           — a value near 2^63 wraps the multiply to a negative,
-#                          which then fails the `-gt 0` test below and
-#                          disables the valve outright.
+# A MISCONFIGURED BOUND IS FATAL, not fail-open, and this is the one place in
+# this script where fail-open is the wrong answer: EVERY way of arriving at a
+# bound other than the one typed — silently defaulted, silently zeroed,
+# negative, a LEADING ZERO read as octal by `$(( … * 86400 ))`, or a magnitude
+# that wraps that multiply negative — is INVISIBLE in the summary line.
+# README.md "Delta 10" records each door and what it measurably did, and why
+# the `^[0-9]+$` first cut — copied from warm-lane-gc-sweep.sh's
+# --critical-free-gib guard, where the octal flaw is inert — rejected junk and
+# negatives and nothing else. `00`, `010` and `9223372036854775807` all sailed
+# through it.
 #
-# The first cut of this guard was `^[0-9]+$`, inherited from
-# warm-lane-gc-sweep.sh's --critical-free-gib guard, and it covers only the
-# first three. There the latent octal flaw is inert; HERE the value gates a
-# destructive branch, which is what made it load-bearing.
+# Three properties of `^(0|[1-9][0-9]{0,4})$` are load-bearing and must survive
+# any edit here:
+#   * `0|` is the DOCUMENTED disable hatch. Arriving at zero is forbidden;
+#     TYPING it is not, and the difference is that one is silent.
+#   * a leading `[1-9]` kills every leading-zero spelling in one class.
+#   * THE 5-DIGIT CAP IS NOT COSMETIC — do not "simplify" `{0,4}` back to `+`.
+#     It is what makes 64-bit overflow UNREACHABLE: the largest accepted
+#     product is 99999 * 86400 = 8639913600, ~9 orders of magnitude under 2^63,
+#     and 99999 days is ~273 years, so it constrains no real operator.
 #
-# `^(0|[1-9][0-9]{0,4})$` closes all five. `0|` preserves the documented
-# disable hatch exactly; a leading `[1-9]` kills every leading-zero spelling in
-# one character class. THE 5-DIGIT CAP IS NOT COSMETIC — do not "simplify"
-# `{0,4}` back to `+`. It is what makes 64-bit overflow UNREACHABLE: the
-# largest accepted product is 99999 * 86400 = 8639913600, ~9 orders of
-# magnitude under 2^63. 99999 days is ~273 years, so the cap cannot constrain
-# any real operator.
+# REJECTION, NOT NORMALIZATION. `$((10#$MAX_RECORD_AGE_DAYS))` would make `010`
+# mean 10 and is deliberately not used: the value is interpolated VERBATIM into
+# the downgrade reason below, so normalizing needs a second variable kept in
+# sync with the first, or the message names a different number than the one
+# applied.
 #
-# REJECTION, NOT NORMALIZATION. `MAX_RECORD_AGE_DAYS=$((10#$MAX_RECORD_AGE_DAYS))`
-# would make `010` mean 10, and is deliberately not used: the value is
-# interpolated VERBATIM into the operator-facing downgrade reason below (`past
-# the --max-record-age-days %s bound`), so normalizing would need a second
-# variable kept in sync with the first, or the message would name a different
-# number than the one applied. Two things to keep honest where one loud
-# rejection suffices. (`10#` is also a no-op once the regex rejects leading
-# zeros, while reading as if they were expected and tolerated.)
-#
-# The error names the ENV VAR as well as the flag — the env var is a real
-# second door into this same guard, and an operator who set it would otherwise
-# get an error naming only a flag they never passed. Same wording shape as
-# warm-lane-gc-sweep.sh's sibling guard. Exit 2, the usage/WIRING class:
-# nothing about the invocation could have avoided it.
+# The error names the ENV VAR as well as the flag — a real second door into
+# this same guard, and an operator who used it would otherwise get an error
+# naming only a flag they never passed. Exit 2, the usage/WIRING class.
 if ! printf '%s\n' "$MAX_RECORD_AGE_DAYS" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
     err "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS (or --max-record-age-days) must be a non-negative integer of at most 5 digits, with no leading zero (days); got: '$MAX_RECORD_AGE_DAYS'"
     err "Run '$(basename "$0") --help' for usage."
@@ -816,13 +802,16 @@ _record_gate_downgrade_reason() {
     fi
 
     # CHRONIC. A record whose last transition is older than the bound is not a
-    # claim about a live task any more; it is a claim nobody has rewritten. The
-    # producers are real and known: a release whose durable write hit ENOSPC and
-    # was swallowed (fail-open release, invariant I3), and a lane whose task is
-    # still pending/in-progress/blocked and so is skipped BY DESIGN by
-    # harness.py's terminal-status reclaim. Both are already visible in the
-    # digest's `## Stale lane assignments` census — this is the bound that lets
-    # the sweep act on what the census has been reporting for a fortnight.
+    # claim about a live task any more; it is a claim nobody has rewritten. Two
+    # producers, and the digest's `## Stale lane assignments` census covers only
+    # ONE of them. A lane whose task is still pending/in-progress/blocked is
+    # skipped BY DESIGN by harness.py's terminal-status reclaim, censused for a
+    # fortnight, and then finally acted on by this bound — report-before-act,
+    # exactly where destruction is riskiest. A release whose durable write hit
+    # ENOSPC and was swallowed (fail-open release, invariant I3) is NEVER
+    # censused: that census skips a record whose backing task is terminal, and
+    # a finished task's is. Acting unreported on that one is the intent —
+    # nothing else in the tree ever will.
     [ "$MAX_RECORD_AGE_SECS" -gt 0 ] || return 0   # 0 = bound disabled
 
     # FAIL SAFE — preserve, loudly — when the age cannot be judged: an absent
@@ -844,17 +833,13 @@ _record_gate_downgrade_reason() {
     #
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
     # producer (LaneLifecycle.transition) always stamps the field, so this
-    # fires only on a record something wrote wrong. It cannot train operators
-    # to ignore it the way a per-lane line on the ORDINARY reading would —
-    # the same asymmetry the unparseable-record vs no-readable-record comment
-    # above makes. Degrading SILENTLY would be worse than the bound not
-    # existing: the summary's downgraded_assigned=0 would read as "nothing was
-    # stale" when it actually means "nothing could be judged".
+    # fires only on a record something wrote wrong. Degrading SILENTLY would be
+    # worse than the bound not existing — `downgraded_assigned=0` would read as
+    # "nothing was stale" when it means "nothing could be judged".
     # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
-    # does not fail — it succeeds and answers TODAY. Handing an absent
-    # `updated_at` to date would therefore read a record with no timestamp as
-    # freshly stamped: preserved, but for a fabricated reason and with no warn,
-    # which is precisely the silent degradation this branch exists to prevent.
+    # does not fail — it succeeds and answers TODAY, so handing it an absent
+    # `updated_at` would read an unstamped record as freshly stamped:
+    # preserved, for a fabricated reason and with no warn.
     local record_epoch
     if [ -z "$LANE_STATE_UPDATED_AT" ] \
        || ! record_epoch="$(date -d "$LANE_STATE_UPDATED_AT" +%s 2>/dev/null)" \
@@ -894,23 +879,22 @@ _do_reclaim() {
     # would hide a permanently shielded pool behind ordinary business.
     #
     # "Usually", because the record self-clears only when the release's DURABLE
-    # WRITE succeeds. WarmLanePool._note_released_durable swallows OSError by
-    # design — release must always succeed (invariant I3), and a full disk must
-    # not fail releases — so an ENOSPC at release leaves `assigned` on disk
-    # while the in-memory pool reads FREE. That record is stranded: nothing
-    # rewrites it until the lane is acquired again, and this gate would preserve
-    # it forever. Composed with the gate's position BEFORE the --disk-pressure
-    # branch, that held the ENOSPC valve shut with the very failure it responds
-    # to (task 5504). The other producer needs no failure at all: a lane whose
-    # task is still pending/in-progress/blocked is skipped BY DESIGN by
-    # harness.py's terminal-status reclaim, so its record ages indefinitely.
-    # --disk-pressure (acute) and --max-record-age-days (chronic) are the two
-    # release valves; both land in downgraded_assigned_count below.
+    # WRITE succeeds — WarmLanePool._note_released_durable swallows OSError by
+    # design (fail-open release, invariant I3), so an ENOSPC at release strands
+    # `assigned` on disk — and because a lane whose backing task is still
+    # non-terminal is skipped BY DESIGN by harness.py's terminal-status reclaim.
+    # Either way nothing rewrites the record, and an unbounded preserve made
+    # that permanent (task 5504). --disk-pressure (acute) and
+    # --max-record-age-days (chronic) are the two bounds; both land in
+    # downgraded_assigned_count below. Full account: README.md "Delta 10".
     local preserved_assigned_count=0
     # Count of lanes whose assigned/in_use record was read, believed, and then
     # deliberately made NON-DECISIVE. Disjoint from preserved_assigned_count by
-    # construction — a lane takes one branch or the other — so the two partition
-    # the assigned lanes a pass saw and A+D is the assigned population.
+    # construction — a lane that REACHES this gate takes one branch or the other
+    # — so the two partition the assigned lanes that reached it. That is not the
+    # pass's whole assigned population: a lane the protect glob skipped in the
+    # enumeration loop, or the flock gate preserved first, reaches neither
+    # branch and is counted in neither.
     #
     # Counted separately rather than folded into reset_count because a downgrade
     # is not an outcome: a downgraded lane falls through to the live-reference
@@ -1173,7 +1157,11 @@ _do_reclaim() {
             # per run and APPENDS --disk-pressure below its critical floor, so
             # the unattended systemd path inherits the valve for free. The ε
             # path (git_ops.py::_run_warm_lane_gc_reclaim) never passes the
-            # flag, so steady-state reclaim behaviour is unchanged.
+            # flag, so this ACUTE valve stays sweep-and-operator-only. Do NOT
+            # read that as "task 5504 cannot reach ε": the CHRONIC bound is on
+            # by DEFAULT (--max-record-age-days 14, no wiring needed), so ε
+            # does downgrade an assigned record older than a fortnight — into
+            # the α reseed branch below, never into this rm.
             info "  resetting lane (disk-pressure): $name"
             local rm_err
             if rm_err="$(rm -rf "$lane/target" 2>&1)"; then

@@ -886,6 +886,21 @@ Four properties, none of them cosmetic:
   widening its gc margin for no reason). `0` is the documented escape hatch; a
   non-integer or negative value is a fatal usage error, because both silent
   directions are invisible in the summary line.
+
+  **Report-before-act is a claim about the population the census COVERS, and
+  that is narrower than the population this bound reaches.**
+  `_stale_lane_assignment_census` skips any record whose backing task status is
+  terminal or unknown (and excludes QUARANTINED), so the SECOND producer named
+  under **The defect** above — a lane whose task is still
+  pending/in-progress/blocked — is the one an operator sees in the digest for a
+  fortnight first. The FIRST, the ENOSPC-stranded record, is by construction a
+  record whose task has since FINISHED, so it is never censused at all; acting on it unreported is the INTENT, because nothing else
+  in the tree ever acts on it. The safety property therefore holds exactly where
+  destruction is riskiest — a lane whose task is still live — and does not
+  overreach beyond it. Note also what the drift gate can and cannot see: it
+  compares the pydantic field's DEFAULT against the bash default, so it pins the
+  STOCK pair. A deployment that raises `lane_stale_report_days` past 14 in its
+  own YAML is outside the gate's reach and loses the ordering it advertises.
 - **The bound's own VALIDATION took two cuts, and the enumeration of what it
   rejects is the point.** The first cut was `^[0-9]+$`, copied from the sibling
   `--critical-free-gib` guard in `warm-lane-gc-sweep.sh`. It rejects junk and
@@ -898,7 +913,9 @@ Four properties, none of them cosmetic:
   `MAX_RECORD_AGE_SECS` unset and aborting the sweep mid-Pass-1 under `set -u`
   — exit 1, no summary line, and lanes visited earlier already reclaimed.
   `010` was worse because it was SILENT: accepted, and quietly meaning 8 days
-  rather than 10. `9223372036854775807` was accepted too, wrapping the multiply
+  rather than 10. `00` was accepted as a second, undocumented spelling of the
+  disable hatch — the valve off without anyone typing the documented `0`.
+  `9223372036854775807` was accepted too, wrapping the multiply
   to `-86400`, which then failed the `-gt 0` test and disabled the valve while
   `downgraded_assigned=0` read as "nothing was stale". The shipped guard is
   `^(0|[1-9][0-9]{0,4})$`: `0|` preserves the escape hatch exactly, a leading
@@ -932,8 +949,18 @@ inherits the valve with ZERO changes. A separate manual-only `--force` flag
 would have left the finding open on that path and needed a second wiring change
 to close it. Dark-factory's own ε path
 (`git_ops.py::_run_warm_lane_gc_reclaim`) passes only
-`reclaim --mount [--seed-script]` and never the flag, so steady-state reclaim
-behaviour is unchanged.
+`reclaim --mount [--seed-script]` and never `--disk-pressure`, so the ACUTE
+valve stays sweep-and-operator-only.
+
+**The CHRONIC bound, by contrast, is ON BY DEFAULT on that same ε path**, and
+the sentence above must not be read as covering it. `--max-record-age-days`
+defaults to 14 with no wiring at all, so steady-state reclaim DOES now downgrade
+an assigned/in_use record whose `updated_at` is older than a fortnight — into
+the ordinary α reseed branch, never into the disk-pressure `rm`. That is the
+intended reach: the chronic leg exists precisely for the records no incident is
+ever going to arrive to clear. A reader asking "can this change affect
+production reclaim?" should read the two legs separately — acute: only when
+someone or the sweep passes the flag; chronic: every pass.
 
 **Deliberately out of scope.** `_note_released_durable`'s swallowed `OSError`
 stays: un-swallowing it would make a full disk fail releases, which is the
@@ -944,9 +971,9 @@ knob was added — gc.sh is project-agnostic, and its knobs are flags plus
 `REIFY_WARM_LANE_GC_*` env vars, per every sibling.
 
 **Pinned by** Blocks S-pressure, S-age, S-age-degrade, A11 and A11-boundary in
-`orchestrator/tests/warm-lane/test_warm_lane_gc.sh` — A11e-A11l pin the
-validation matrix above and A11-boundary pins that a misconfigured bound
-reclaims NOTHING rather than half a pool; the fourth global by
+`orchestrator/tests/warm-lane/test_warm_lane_gc.sh` — A11e-A11k pin the
+validation matrix above (A11l is its non-vacuity control) and A11-boundary pins
+that a misconfigured bound reclaims NOTHING rather than half a pool; the fourth global by
 `orchestrator/tests/test_lane_state_lib.py::TestLaneStateReadPublishesUpdatedAt`;
 the 14-vs-7.0 ordering by the drift gate named above. **Block K5 is the other
 half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS

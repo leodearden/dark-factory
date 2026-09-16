@@ -21,16 +21,15 @@
 #       contract for the new sibling scripts/lib_lane_state.sh, with
 #       lib_live_refs.sh PRESENT so A9's guard cannot account for it
 #       (A10, task 3075); --max-record-age-days is validated and a
-#       misconfiguration is FATAL — missing value, non-integer and negative all
-#       exit 2, because a silently-defaulted or silently-zeroed bound is
-#       invisible in the summary line (A11a-A11d, task 5504). A11e-A11l close
-#       the two doors that claim did NOT cover, both reached through a value
-#       the `^[0-9]+$` first cut ACCEPTED: a LEADING ZERO read as octal (`08`
-#       aborted the sweep mid-pass under `set -u`; `010` silently narrowed the
-#       bound to 8 days), and an OVERFLOWING magnitude that wrapped the
-#       multiply to a negative and silently disabled the valve. The env var is
-#       asserted as the second door into the same guard, and A11l is the
-#       non-vacuity case
+#       misconfiguration is FATAL, because EVERY wrong bound is invisible in
+#       the summary line: missing value, non-integer and negative all exit 2
+#       (A11a-A11d), and so do the two doors the `^[0-9]+$` first cut ACCEPTED
+#       — a LEADING ZERO read as octal and an OVERFLOWING magnitude that
+#       wrapped the multiply negative (A11e-A11k, which also pin the env var as
+#       the guard's second door). A11l is the non-vacuity case. What each door
+#       measurably did lives in orchestrator/scripts/warm-lane/README.md
+#       "Delta 10"; what is pinned HERE is only that the guard rejects it
+#       (task 5504)
 #   A11-boundary — the bound is validated BEFORE any lane is touched, which no
 #       Block A case can reach because A7's fixture has no lanes. Glob order
 #       puts a reclaimable lane ahead of the assigned one, so a boundary guard
@@ -498,15 +497,12 @@ assert "A11d: a NEGATIVE --max-record-age-days exits 2 (never a blanket downgrad
     test "$RC" -eq 2
 
 # A11e-A11k: the two doors A11b/A11d do not reach. `^[0-9]+$` rejects junk and
-# negatives, but a LEADING ZERO and an OVERFLOWING MAGNITUDE both sail through
-# it and then mean something other than what the operator typed — the exact
-# silent direction the guard's own comment declares must never happen.
-#
-# `08` is the LOUD-but-wrong door: accepted by the regex, then read as OCTAL by
-# `$(( … * 86400 ))`, which dies with a raw bash diagnostic that `set -e` does
-# not abort on, leaving MAX_RECORD_AGE_SECS UNSET for the rest of the pass.
-# `010` is the SILENT and more dangerous one: accepted, and quietly means 8
-# days instead of 10. Neither is discoverable from the summary line.
+# negatives, but a LEADING ZERO (`08` is the loud one — it dies in the octal
+# multiply, leaving MAX_RECORD_AGE_SECS unset mid-pass; `010` is the dangerous
+# one — it quietly means 8 days) and an OVERFLOWING MAGNITUDE both sail through
+# it and then mean something other than what the operator typed. Neither is
+# discoverable from the summary line, which is why the guard must reject rather
+# than normalize. The pinned property here is exactly that rejection.
 run_helper reclaim \
     --worktrees-dir "$A7_WORKTREES" \
     --base-target "$A7_BASE/target" \
@@ -627,8 +623,14 @@ assert "A11-boundary3: the reclaimable _lane-1 is INTACT (a mid-pass abort would
     test -f "$A11B_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
 assert "A11-boundary4: the assigned _lane-2 is likewise untouched" \
     test -f "$A11B_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER"
+# The LITERAL is load-bearing, and the obvious one is the wrong one:
+# `reclaim complete:` is `ok`'s wording and every log helper in warm-lane-gc.sh
+# writes to STDERR, so grepping $OUT for it would pass no matter what the script
+# did — including in the exact mid-pass abort this case exists to catch. The
+# stdout summary is the `reclaim: reset=…` printf, the line a consumer
+# prefix-matches; its ABSENCE is what says no pass was half-run.
 assert "A11-boundary5: NO reclaim: summary line on stdout (a misconfigured bound must not half-run a pass)" \
-    bash -c '! printf "%s\n" "$1" | grep -qF "reclaim complete:"' _ "$OUT"
+    bash -c '! printf "%s\n" "$1" | grep -qF "reclaim: reset="' _ "$OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — reset a divergent FREE lane
