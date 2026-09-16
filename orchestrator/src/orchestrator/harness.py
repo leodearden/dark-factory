@@ -836,7 +836,12 @@ class ResumeFailure:
 
     ``stage`` is ``'pre_flight'`` (we corroborated before dispatch and the
     transcript was not there) or ``'cli'`` (we armed ``--resume`` and the CLI
-    rejected the session). ``restore`` carries the four-valued outcome the
+    rejected the session) — the two the workflow sink produces. The harness's
+    own eligibility guard records ``'eligibility'``, a THIRD value for a
+    rejection that happens before a workflow exists at all; that branch is dead
+    by construction today (nothing the predicate can produce is unexplained)
+    and is kept on this one type so there is one streak and one renderer rather
+    than two. ``restore`` carries the four-valued outcome the
     pre_flight arm block produced, and is ``None`` at the cli stage — the
     restore happened a phase earlier, which is why every cli rejection is
     genuine by construction. ``archive_root``/``archive_path`` are best-effort:
@@ -7285,11 +7290,13 @@ class Harness:
     _POOL_STORAGE_ABSENT_SENTINEL: str = '__pool_storage_absent__'
     _POOL_STORAGE_ABSENT_ROLE: str = 'orchestrator-pool-storage-absent'
 
-    # Synthetic task_id + agent_role for the session-resume fallback-storm L1
+    # Synthetic task_id + agent_role for the session-resume storm L1
     # (task γ, INV-4).  PER-BOOT — one open L1 at a time, deduped via
     # has_open_l1.  Same class-level immutability guarantees as the sentinels
-    # above.  Fires only on a RUN of consecutive genuine resume fallbacks
-    # (suspected clock skew / wiped transcripts / mass reseed).
+    # above.  Fires only on a RUN of consecutive ELIGIBLE-BUT-FAILED resumes:
+    # since task ε/3733 that population is archive-restore failure and
+    # CLI rejection of a resume we armed, recorded in
+    # _eligible_but_failed_resumes and named individually on the L1.
     _SESSION_RESUME_STORM_SENTINEL: str = '__session_resume_storm__'
     _SESSION_RESUME_STORM_ROLE: str = 'orchestrator-harness'
 
@@ -7630,30 +7637,49 @@ class Harness:
                 getattr(report, 'task_id', None), exc_info=True,
             )
 
+    @staticmethod
+    def _render_resume_failure(failure: ResumeFailure) -> str:
+        """Render one recorded failure as operator-facing structured facts.
+
+        An absent archive root or path prints "none located" rather than being
+        dropped or printed as a bare ``None``: "the archive was checked and
+        held nothing" and "the lookup itself faulted" are different diagnoses,
+        and a silently missing line reads as the first one.
+        """
+        return (
+            f'  - task {failure.task_id} [{failure.role}] '
+            f'session {failure.session_id}\n'
+            f'      stage={failure.stage} restore={failure.restore or "n/a"}\n'
+            f'      archive root: {failure.archive_root or "none located"}\n'
+            f'      archive path: {failure.archive_path or "none located"}\n'
+            f'      how it failed: {failure.detail or "not recorded"}'
+        )
+
     def _file_session_resume_storm_escalation(self) -> None:
-        """File an L1 when session-resume fallbacks storm (task γ, INV-4).
+        """File an L1 when eligible-but-FAILED resumes storm (task γ/ε, INV-4).
 
-        Called from the _run_slot guard once the
-        ``_session_resume_fallback_streak`` reaches
-        ``session_resume.fallback_storm_threshold``. A single isolated
-        fallback never trips this — only a RUN does, which is the signature of
-        SYSTEMATIC breakage. Only UNEXPLAINED failures feed the streak: EVERY
-        by-design outcome is excluded by construction (task 3728 —
-        :data:`_BY_DESIGN_SESSION_RESUME_REASONS`), extending the exclusion
-        that ``capped`` and then ``reseeded`` already had to the whole
-        currently-producible vocabulary. Reaching the threshold therefore means
-        a reason OUTSIDE that vocabulary fired repeatedly. Deduped by
-        ``has_open_l1`` so the operator sees exactly one open storm L1 at a
-        time.
+        Called once ``_session_resume_fallback_streak`` reaches
+        ``session_resume.fallback_storm_threshold``. A single isolated failure
+        never trips this — only a RUN does, which is the signature of
+        SYSTEMATIC breakage. Only UNEXPLAINED failures feed the streak: every
+        by-design outcome is excluded by construction at BOTH seams that can
+        produce one — :data:`_BY_DESIGN_SESSION_RESUME_REASONS` for the
+        pre-dispatch eligibility predicate, :data:`_BY_DESIGN_RESTORE_OUTCOMES`
+        for the archive restore inside ``TaskWorkflow._invoke``. Reaching the
+        threshold therefore means something outside both vocabularies failed
+        repeatedly.
 
-        With today's vocabulary nothing can feed the streak, so this is
-        unreachable in production until PRD leaf ε (task 3733) installs the
-        archive-restore-failure feeder — a deliberate, waived window. The
-        mechanism is RETAINED rather than deleted precisely so ε re-arms a
-        tested path instead of rebuilding one.
+        ONE renderer for both feeders (SPOT). Whichever seam recorded a
+        failure appended it to ``_eligible_but_failed_resumes`` first, so this
+        reads that one deque rather than taking a payload: the streak that
+        decided to file and the evidence that explains it cannot disagree, and
+        a second feeder cannot arrive with a second escalation shape.
+
+        Deduped by ``has_open_l1`` so the operator sees exactly one open storm
+        L1 at a time.
 
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
-        failure is swallowed so filing never breaks the guard path (I3).
+        failure is swallowed so filing never breaks the caller (I3).
         """
         if not self._escalation_queue:        # bare-Harness unit tests stay green
             return
@@ -7662,6 +7688,10 @@ class Harness:
                 return                         # dedup: one open L1 at a time
             from escalation.models import Escalation  # noqa: PLC0415
             threshold = self.config.session_resume.fallback_storm_threshold
+            rendered = '\n'.join(
+                self._render_resume_failure(failure)
+                for failure in self._eligible_but_failed_resumes
+            )
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._SESSION_RESUME_STORM_SENTINEL),
                 task_id=self._SESSION_RESUME_STORM_SENTINEL,
@@ -7669,50 +7699,51 @@ class Harness:
                 severity='blocking',
                 category='infra_issue',
                 summary=(
-                    'Session-resume fallback storm — '
-                    f'{threshold}+ UNEXPLAINED resume failures in a row; '
+                    'Session-resume storm — '
+                    f'{threshold}+ eligible-but-FAILED resumes in a row; '
                     'resume degraded to fresh dispatch for all'
                 )[:200],
                 detail=(
-                    f'{threshold} or more session-resume eligibility failures '
-                    'occurred in a chained run — each within '
+                    f'{threshold} or more armed session resumes failed in a '
+                    'chained run — each within '
                     'session_resume.storm_window_secs of the previous, with no '
                     'intervening successful resume. Every recovered agent '
-                    'session was rejected and degraded to a fresh dispatch — '
-                    'safe, but a RUN this tight suggests a systematic cause.'
+                    'session was degraded to a fresh dispatch — safe, but a '
+                    'RUN this tight suggests a systematic cause.'
                     '\n\n'
+                    'THE RESUMES THAT FAILED, oldest first ("n/a" = the '
+                    'field does not apply at that stage):\n'
+                    f'{rendered}\n\n'
                     'EVERY by-design degradation is excluded from this streak '
-                    'by construction (harness.py::'
-                    '_BY_DESIGN_SESSION_RESUME_REASONS), so none of them can '
-                    'have contributed and none is worth investigating here. '
-                    'Reaching the threshold means a reason OUTSIDE that '
-                    'vocabulary fired repeatedly — read it off the events '
-                    'rather than guessing, since the set is exactly what the '
-                    'guard classified as unexplained:\n'
-                    "  select json_extract(data,'$.reasons'), count(*) from "
-                    "events where event_type='session_resume_fallback' "
-                    'group by 1 order by 2 desc;\n'
-                    'The list is sorted, so each distinct combination is its '
-                    'own row and a co-occurring by-design reason is visible '
-                    'beside the unexplained one rather than hiding it.\n\n'
+                    'by construction — harness.py::'
+                    '_BY_DESIGN_SESSION_RESUME_REASONS for the pre-dispatch '
+                    'eligibility predicate, harness.py::'
+                    '_BY_DESIGN_RESTORE_OUTCOMES for the archive restore '
+                    "('disabled', the kill switch, and 'miss', the "
+                    'archive-coverage signal) — so none of them appears above '
+                    'and none is worth investigating here. A low archive hit '
+                    'rate is a separate, rate-based question.'
+                    '\n\n'
                     'Fresh dispatch loses the in-flight agent context that '
                     'resume would have preserved, so throughput/cost is '
                     'degraded until the cause is fixed.'
                 ),
                 suggested_action=(
-                    'Run the query above and identify the unexplained reason '
-                    'driving the run, then investigate that specific failure '
-                    'mode — do not start from the by-design population, which '
-                    'is excluded and did not contribute. The streak resets on '
-                    'the next successful resume, or decays after a '
-                    'storm_window_secs gap, so resolve this L1 once the '
-                    'underlying cause is fixed.'
+                    'Start from the failures listed above, not from a census: '
+                    'check that each archive root is present, readable and has '
+                    'free space, then that the restore can write into the '
+                    "agent's config dir. A run whose archive roots are all "
+                    '"none located" is a config regression in '
+                    'transcript_archive.root or project_root rather than a '
+                    'disk fault. The streak resets on the next successful '
+                    'resume, or decays after a storm_window_secs gap, so '
+                    'resolve this L1 once the underlying cause is fixed.'
                 ),
                 level=1,
                 filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
-            logger.warning('Filed L1 session-resume fallback-storm escalation %s', esc.id)
+            logger.warning('Filed L1 session-resume storm escalation %s', esc.id)
         except Exception:
             logger.warning(
                 'Failed to file session-resume storm escalation', exc_info=True
@@ -9505,10 +9536,13 @@ class Harness:
                     self._last_session_resume_fallback_at is not None
                     and (now - self._last_session_resume_fallback_at) >= window
                 ):
-                    self._session_resume_fallback_streak = 0
-                    # Drop the comparison point too, so the next fallback opens
-                    # a fresh run instead of chaining off an expired stamp.
-                    self._last_session_resume_fallback_at = None
+                    # Drops the comparison point and the recorded failures too,
+                    # so the next fallback opens a fresh run instead of chaining
+                    # off an expired stamp, and a retired run's evidence can
+                    # never surface on a later L1 (task ε/3733 — one meaning of
+                    # "retired", one implementation, shared with the arm-seam
+                    # sink's identical decay).
+                    self._retire_session_resume_run()
                 # THE ONE LOOKUP (task 3730). Guarded on `enabled` so the kill
                 # switch keeps its zero-I/O property: with the feature off the
                 # predicate returns {'disabled'} alone without consulting the
@@ -9560,11 +9594,12 @@ class Harness:
                     'role': recovered_session.get('role'),
                 }
                 if not reasons:
-                    self._session_resume_fallback_streak = 0  # break any storm run
-                    # Drop the chain's comparison point too, so the next
-                    # fallback starts a fresh run instead of chaining off a
-                    # pre-reset stamp (task 3256).
-                    self._last_session_resume_fallback_at = None
+                    # Break any storm run: the streak, the chain's comparison
+                    # point and the recorded failures go together, so the next
+                    # fallback starts a fresh run rather than chaining off a
+                    # pre-reset stamp (task 3256) and no retired run's evidence
+                    # can surface on a later L1 (task 3733).
+                    self._retire_session_resume_run()
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,
@@ -9661,11 +9696,43 @@ class Harness:
                         genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
                         if genuine:
                             # The window was already applied above, so this
-                            # branch only EXTENDS the chain: refresh the
-                            # comparison stamp and count. The stamp is
-                            # refreshed ONLY here, by a genuine feeder — a drip
-                            # of by-design fallbacks must not keep a chain
+                            # branch only EXTENDS the chain: record the
+                            # evidence, refresh the comparison stamp, count. The
+                            # stamp is refreshed ONLY by a genuine feeder — a
+                            # drip of by-design fallbacks must not keep a chain
                             # alive across an arbitrarily long gap (task 3256).
+                            #
+                            # Recorded as a ResumeFailure so this seam and ε's
+                            # arm seam feed ONE streak read by ONE L1 renderer
+                            # (task 3733): whichever produced the run, the
+                            # operator gets the same named facts. This branch
+                            # stays dead by construction — the record is the
+                            # shape it WOULD take, not a live population.
+                            self._eligible_but_failed_resumes.append(
+                                ResumeFailure(
+                                    task_id=str(assignment.task_id),
+                                    # resume_event_data, NOT recovered_session:
+                                    # this else-branch nulls the latter before
+                                    # reaching here, which is exactly why the
+                                    # identity was captured above.
+                                    session_id=str(
+                                        resume_event_data['session_id']
+                                    ),
+                                    role=str(
+                                        resume_event_data['role'] or 'unknown'
+                                    ),
+                                    stage='eligibility',
+                                    restore=None,
+                                    archive_root=None,
+                                    archive_path=None,
+                                    detail=(
+                                        'ineligible before dispatch; '
+                                        'unexplained reasons: '
+                                        + ', '.join(sorted(genuine))
+                                        + f'; archive_available={archive_present}'
+                                    ),
+                                )
+                            )
                             self._last_session_resume_fallback_at = now
                             self._session_resume_fallback_streak += 1
                             if (
