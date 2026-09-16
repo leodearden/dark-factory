@@ -227,8 +227,25 @@ duration by runner, host occupancy, heartbeat queue depth, and the
 `merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
 `--speculation` (depth distributions, the chain-dead void rate, and a
 cross-project void-rate block) and `--chains` (deep merge-ahead chain
-landings and observed chain lengths). `--json` emits the same numbers
+landings and observed chain lengths — see
+[§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap)
+for the mechanism those numbers measure). `--json` emits the same numbers
 keyed by project root and nothing else on stdout.
+
+`--chains` reads exactly two event fields, and naming them is how you get
+from the report back to the raw `runs.db` rows:
+`merge_finalized.landed_via_chain` (an int **per landed item**, summed to
+give items-landed-via-chain — it is neither a boolean flag nor the chain
+size) and `merge_verify.chain_items` (the 1-indexed count of items in the
+verified tree, so a two-link chain reads `chain_items == 3`, and a
+non-chained verify is a chain of *one* rather than a missing measurement).
+Two readings `scripts/merge_lane_throughput.py::compute_chains` already
+encodes will otherwise catch you out: the mean chain length averages only
+the **deep** verifies (`chain_items > 1`), because including the chains of
+one would drag it toward 1 and hide how long real chains get; and a non-int
+`landed_via_chain` is counted in `n_unusable_landed_via_chain` rather than
+coerced. `chain_items` supersedes the probe-era `depth` label (PRD decision
+8) — historical `depth >= 2` events stay excluded from calibration.
 
 It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
 writes nothing, files nothing, escalates nothing and emits no events, so
