@@ -7,6 +7,9 @@ mix of pure helpers + the SessionTable(DataTable) widget in one module. The
 pure functions above DecisionQueue stay fast/deterministic to unit test
 directly (no pilot, no event loop) -- only DecisionQueue itself requires a
 running Textual app, and is covered by test_app.py's pilot tests instead.
+Column sizing follows the same split: question_width decides the question
+column's bound as a pure function of the rows and a measured width, and
+DecisionQueue only measures itself and applies the answer.
 
 Consumers import orchestrator.session_registry directly (mirrors
 registry_reader.py/session_table.py -- PRD §6 G5: consumers import the
@@ -505,6 +508,14 @@ class DecisionQueue(DataTable):
     live re-score (boost/defer/drop, or a poll pickup) never yanks the
     cursor away from the row an operator is looking at. Rows are keyed by
     QueueItem.key ('decision:<id>' / 'session:<slug>'), not by row position.
+
+    The question column takes whatever the other three leave (see
+    question_width), so a wide terminal spends the line on the question
+    rather than on a blank gutter. Every render re-declares all four columns
+    through clear(columns=True) plus an EXPLICIT question width, because
+    Textual's auto-width only ever grows: add_row raises a Column's
+    content_width and clear() does not reset it, so an auto-sized question
+    column could never give cells back when the terminal narrows.
     """
 
     DEFAULT_CSS = """
@@ -517,9 +528,35 @@ class DecisionQueue(DataTable):
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault('cursor_type', 'row')
         super().__init__(*args, **kwargs)
+        # The rows last handed to replace_rows, held so a width change can
+        # re-render them without re-scanning the registry, and the question
+        # width they were rendered at.
+        self._rendered: tuple[tuple[QueueItem, ...], datetime] | None = None
+        self._question_width = _UNMEASURED_QUESTION_WIDTH
 
     def on_mount(self) -> None:
-        self.add_columns('score', 'age', 'project#task', 'question')
+        # Columns must exist before the first render, which happens before
+        # there is any width to measure -- hence the unmeasured fallback.
+        self._add_columns(_UNMEASURED_QUESTION_WIDTH)
+
+    def _add_columns(self, question_width: int) -> None:
+        """Declare the four columns: three auto-sized, the question one explicit."""
+        self.add_columns(*_COLUMN_LABELS[:-1])
+        self.add_column(_COLUMN_LABELS[-1], width=question_width)
+
+    def _derive_question_width(self, items: Sequence[QueueItem], now: datetime) -> int:
+        """The question bound for *items* at the width this widget has right now.
+
+        scrollable_content_region excludes the border, the padding AND the
+        vertical scrollbar, so it is the width the columns actually get;
+        size.width would over-claim the scrollbar's cells and reintroduce
+        horizontal overflow, but only once the queue grew long enough to
+        scroll. It reads 0 before the first layout, which question_width
+        already handles as its "not laid out yet" case.
+        """
+        return question_width(
+            items, now, self.scrollable_content_region.width, cell_padding=self.cell_padding
+        )
 
     def highlighted_key(self) -> str | None:
         """Return the QueueItem.key of the currently-highlighted row, or None if empty."""
@@ -528,12 +565,31 @@ class DecisionQueue(DataTable):
         row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
         return row_key.value
 
-    def replace_rows(self, items: Sequence[QueueItem], now: datetime) -> None:
-        """Rebuild rows from *items* (already ordered), preserving the cursor by key."""
+    def _reflow(self) -> None:
+        """Re-render the cached rows at the width this widget currently has.
+
+        Re-declares the columns rather than mutating them: clear(columns=True)
+        plus _add_columns is the public way to change the question column's
+        explicit width, and it resets the three auto columns' stale
+        content_width for free -- so one freak-width 'project#task' cannot
+        keep stealing cells from the question column for the rest of the
+        session.
+
+        clear() also resets the cursor to row 0, so the previously-highlighted
+        key is re-located afterwards exactly as replace_rows has always done:
+        a rebuild must never yank the cursor off the row an operator is
+        reading.
+        """
+        if self._rendered is None:
+            return
+        items, now = self._rendered
+        width = self._derive_question_width(items, now)
         previous_key = self.highlighted_key()
-        self.clear()
+        self.clear(columns=True)
+        self._add_columns(width)
+        self._question_width = width
         for item in items:
-            self.add_row(*format_queue_row(item, now), key=item.key)
+            self.add_row(*format_queue_row(item, now, question_width=width), key=item.key)
         if not self.row_count:
             return
         if previous_key is not None:
@@ -541,6 +597,17 @@ class DecisionQueue(DataTable):
                 self.move_cursor(row=self.get_row_index(previous_key))
             except RowDoesNotExist:
                 self.move_cursor(row=0)
+
+    def replace_rows(self, items: Sequence[QueueItem], now: datetime) -> None:
+        """Rebuild rows from *items* (already ordered), preserving the cursor by key.
+
+        The question column is sized to what the other three leave at this
+        widget's current width. (*items*, *now*) are cached so a later width
+        change can re-render the same rows without re-scanning the registry
+        and without re-reading the clock.
+        """
+        self._rendered = (tuple(items), now)
+        self._reflow()
 
     def select_key(self, key: str) -> bool:
         """Move the cursor to *key*'s row if present. Returns whether it was found."""
