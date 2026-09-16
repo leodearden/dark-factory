@@ -56,6 +56,173 @@ def _snapshot_tree(base: Path) -> dict[str, tuple[int, bytes]]:
     }
 
 
+def _count_ui_config_writes(monkeypatch) -> list[str | None]:
+    """Record every save_ui_config call app.py makes, delegating to the real one.
+
+    Returns the live list of persisted selected_slug values, newest last.
+    The property under test in TestUIConfigWriteDebounce is a COUNT ("one
+    write per burst", "zero per idle rebuild"), and an mtime/bytes diff via
+    _snapshot_tree cannot tell one write from four when every write carries
+    identical content inside the same mtime granule -- exactly the shape of
+    the repeated-rebuild case. Patching the name in cockpit.app (not in
+    cockpit.ui_config) is what intercepts _persist_ui_config: app.py binds
+    the symbol at import time and resolves it from module globals at call
+    time. Delegating to the real function keeps the on-disk half genuine,
+    so a test can still assert load_ui_config(...).selected_slug.
+    """
+    import cockpit.app as app_module
+    from cockpit.ui_config import save_ui_config as _real
+
+    recorded: list[str | None] = []
+
+    def _counting(cfg, root=None):
+        recorded.append(cfg.selected_slug)
+        _real(cfg, root)
+
+    monkeypatch.setattr(app_module, 'save_ui_config', _counting)
+    return recorded
+
+
+def _debounce_running_records() -> list:
+    """Three RUNNING records with distinct, ascending start_ts (no ties).
+
+    order_sessions sorts within a state rank by oldest start_ts first, so
+    these keep a fixed relative row order however they are delivered to the
+    app -- seeded on disk by _seed_debounce_fleet, or returned straight from
+    an injected _CountingRecordsScanner.
+    """
+    return [
+        _make_record(
+            session_slug=f'debounce-run-{n}',
+            status=sr.Status.RUNNING,
+            start_ts=f'2026-07-07T0{n}:00:00+00:00',
+        )
+        for n in (1, 2, 3)
+    ]
+
+
+def _seed_debounce_fleet(tmp_path: Path) -> list:
+    """Seed one AWAITING_INPUT record plus three RUNNING ones; return the RUNNING records.
+
+    order_sessions ranks AWAITING_INPUT above RUNNING, so the blocked record
+    pins row 0 and the three RUNNING records occupy rows 1..3 in the
+    returned order. Every row index is therefore deterministic, which is
+    what lets TestUIConfigWriteDebounce park a cursor on a known NON-zero
+    row.
+    """
+    sr.write_record(
+        _make_record(session_slug='debounce-blocked', status=sr.Status.AWAITING_INPUT),
+        root=tmp_path,
+    )
+    running = _debounce_running_records()
+    for record in running:
+        sr.write_record(record, root=tmp_path)
+    return running
+
+
+async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, rounds, tag):
+    """Park a NON-row-0 cursor, force *rounds* real table rebuilds under it,
+    and assert the whole run costs exactly ONE cockpit-ui.json write.
+
+    Shared body for TestUIConfigWriteDebounce's two rebuild tests, which
+    differ only in how a rebuild is DRIVEN: *drive* is an async
+    ``(app, pilot)`` callable that lands one rebuild plus the flush a real
+    poll tick would have run. Everything else -- the seeding, the
+    non-zero-index parking, the registry rewrite that defeats the snapshot
+    short-circuit, the observability trick and the assertions -- is
+    identical between them, so it lives here once: a change to
+    registry_reader._SNAPSHOT_FIELDS or to which fields
+    session_table.format_title renders then lands in one place rather than
+    having to be mirrored in two ~90-line bodies.
+
+    *tag* distinguishes the escalation_id/title values each caller writes,
+    so a failure message names the driver it came from.
+
+    The closing ``recorded == [parked.session_slug]`` is itself the
+    non-vacuity guard, because it fails from both sides: a gate that
+    suppressed every write would leave ``[]``, and a write per rebuild would
+    leave one entry per round.
+    """
+    from cockpit.app import CockpitApp
+    from cockpit.panes.detail_pane import DetailPane
+    from cockpit.panes.session_table import SessionTable
+
+    running = _seed_debounce_fleet(tmp_path)
+    parked = running[0]
+
+    app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        table = app.query_one(SessionTable)
+        detail = app.query_one(DetailPane)
+
+        # A non-zero row index is what makes replace_rows' clear() +
+        # move_cursor a real away-and-back cursor excursion on every rebuild
+        # -- asserted BEFORE the cursor is moved there.
+        assert table.get_row_index(parked.session_slug) != 0
+        table.move_cursor(row=table.get_row_index(parked.session_slug))
+        await pilot.pause()
+        assert table.highlighted_slug() == parked.session_slug
+
+        # Installed after the parking move, so neither the mount's own
+        # initial RowHighlighted nor the parking one is counted -- the
+        # rebuilds are what's under test.
+        recorded = _count_ui_config_writes(monkeypatch)
+
+        for n in range(1, rounds + 1):
+            escalation_id = f'esc-{tag}-{n}'
+            # `title` and `escalation_id` are both
+            # registry_reader._SNAPSHOT_FIELDS members, so rewriting them
+            # defeats _apply_scan's snapshot-unchanged short-circuit;
+            # status/start_ts stay put so order_sessions keeps the row order
+            # -- and the parked cursor's non-zero index -- fixed across the
+            # rebuild. escalation_id is bumped alongside the title purely so
+            # the rebuild is OBSERVABLE below: session_table.format_title
+            # renders 'role:project#task_id' and ignores record.title, so a
+            # title change alone would show up nowhere and the sanity check
+            # would be vacuous.
+            sr.write_record(
+                _make_record(
+                    session_slug=parked.session_slug,
+                    status=parked.status,
+                    start_ts=parked.start_ts,
+                    title=f'{tag}-title-{n}',
+                    escalation_id=escalation_id,
+                ),
+                root=tmp_path,
+            )
+            await drive(app, pilot)
+
+            # sanity: the rebuild really landed in the UI, so this is not
+            # `rounds` short-circuited no-op refreshes.
+            assert escalation_id in detail.rendered_text
+            assert table.highlighted_slug() == parked.session_slug
+
+        # The first round's flush persists the parked cursor (it IS a real
+        # change against the empty on-disk baseline); every later flush
+        # finds the file already holding that selection.
+        assert recorded == [parked.session_slug]
+
+
+class _NoTempFiles:
+    """Stand-in for cockpit.ui_config's module-global `tempfile`, whose
+    mkstemp always raises -- the shape a full or read-only fleet_root has
+    from save_ui_config's point of view.
+
+    Patched as the NAME `tempfile` in cockpit.ui_config's globals rather
+    than as an attribute of the stdlib module, so the breakage is scoped to
+    the one module under test and every other importer's tempfile is
+    untouched. save_ui_config resolves the name from module globals at call
+    time, so the REAL function still runs and takes its real fail-soft
+    `except OSError` branch: logged, swallowed, returns None, no file
+    created -- exactly what _persist_ui_config sees in production.
+    """
+
+    @staticmethod
+    def mkstemp(*args, **kwargs):
+        raise OSError(28, 'No space left on device')
+
+
 class _BlockingScanner:
     """Fake SessionScanner for TestNonBlockingPoll: pins the exact moment a
     threaded poll scan is in-flight, deterministically and without needing
@@ -485,15 +652,16 @@ class TestSelectedSlugRestore:
             assert table.highlighted_slug() == 'target-1'
 
     @pytest.mark.timeout(10)
-    async def test_a_rebuild_that_moves_the_cursor_persists_the_new_slug_at_once(self, tmp_path):
+    async def test_a_rebuild_that_moves_the_cursor_persists_the_new_slug_on_the_next_tick(
+        self, tmp_path
+    ):
         """A hard kill must not restore the operator to a session that is gone.
 
         The rebuild suppresses its own RowHighlighted reposts (see
-        _rebuild_session_table) and those reposts used to carry the
-        _persist_ui_config call, so the rebuild has to persist a cursor move it
-        causes itself. Read back from disk INSIDE the app's lifetime -- after
-        on_unmount the value is written either way, which is exactly the gap
-        this pins.
+        _rebuild_session_table), so no event reports a cursor move it causes
+        itself; the next poll tick's flush must still persist it. Read back
+        from disk INSIDE the app's lifetime -- after on_unmount the value is
+        written either way, which is exactly the gap this pins.
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
@@ -513,8 +681,15 @@ class TestSelectedSlugRestore:
             await pilot.pause()
             table = app.query_one(SessionTable)
 
+            async def tick():
+                app._poll_registry()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
             table.move_cursor(row=table.get_row_index('session-b'))
             await pilot.pause()
+            await tick()
             assert load_ui_config(tmp_path).selected_slug == 'session-b'
 
             # session-b exits, so filter_live_sessions drops it from the default
@@ -533,6 +708,9 @@ class TestSelectedSlugRestore:
 
             assert table.highlighted_slug() == 'session-a'
             assert app._selected_slug == 'session-a'
+            # recorded, not written: the rebuild itself does no I/O
+            assert load_ui_config(tmp_path).selected_slug == 'session-b'
+            await tick()
             assert load_ui_config(tmp_path).selected_slug == 'session-a'
 
     @pytest.mark.timeout(10)
@@ -562,6 +740,401 @@ class TestSelectedSlugRestore:
             table = app.query_one(SessionTable)
             assert table.get_row_index('live-2') != 0
             assert table.highlighted_slug() == 'live-1'
+
+
+class TestUIConfigWriteDebounce:
+    """cockpit-ui.json is written on a DEBOUNCED schedule -- a poll tick
+    (CockpitApp._flush_ui_config) plus on_unmount's unconditional final
+    write -- never once per cursor move and never once per table rebuild.
+
+    Before this, on_data_table_row_highlighted called _persist_ui_config
+    directly, so holding an arrow key down over a large session table did a
+    full mkdir + mkstemp + json.dump + os.replace
+    (cockpit/src/cockpit/ui_config.py::save_ui_config) per keypress on the
+    event-loop thread, and CockpitApp._resync_session_detail wrote again
+    whenever a rebuild moved the cursor.
+
+    The gate these tests pin is CockpitApp._selected_slug vs
+    CockpitApp._persisted_selected_slug -- "is the on-disk file stale", not
+    "did the selection change since the last flush" -- so a selection that
+    moves and comes back between ticks nets to no write, whichever seam
+    recorded it.
+
+    The round trip these tests must not break is proven next door:
+    TestSelectedSlugRestore (a selection survives a remount) and
+    TestWriteDiscipline (cockpit-ui.json is still created, and is still the
+    ONLY file the cockpit writes). Both stay green because on_unmount's
+    write remains unconditional -- see CockpitApp.on_unmount.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_highlight_burst_writes_nothing_until_shutdown(self, tmp_path, monkeypatch):
+        """A burst of cursor moves does ZERO I/O while the app runs; the one
+        write that lands is on_unmount's, carrying the LAST slug."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config, ui_config_path
+
+        running = _seed_debounce_fleet(tmp_path)
+        slugs = [record.session_slug for record in running]
+
+        # A large poll_interval keeps on_mount's own set_interval timer from
+        # firing a flush tick mid-test (the idiom TestNonBlockingPoll and
+        # TestScanBackpressure use), so the ONLY thing that can resolve the
+        # debounce here is the unmount write below.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            # Installed AFTER the mount, so the mount's own initial
+            # RowHighlighted is never counted -- the burst is what's under test.
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            for slug in slugs:
+                table.move_cursor(row=table.get_row_index(slug))
+                await pilot.pause()
+                # sanity: the highlight really fired, so the empty-`recorded`
+                # assertion below is not vacuously true over a still cursor.
+                assert table.highlighted_slug() == slug
+
+            assert recorded == []
+            assert not ui_config_path(tmp_path).exists()
+
+        # Exactly one write for the whole run: on_unmount's unconditional one.
+        assert recorded == [slugs[-1]]
+        # The on-disk half -- localizes a future failure to save-side vs
+        # restore-side, same convention as TestSelectedSlugRestore.
+        assert load_ui_config(tmp_path).selected_slug == slugs[-1]
+
+    @pytest.mark.timeout(10)
+    async def test_rebuild_that_leaves_the_selection_unchanged_writes_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """However many rebuilds run under a parked NON-row-0 cursor,
+        exactly ONE write lands -- the flush that first persists the parked
+        cursor -- because every later flush finds the file already holding
+        that selection.
+
+        Each round FLUSHES rather than merely checking that a rebuild does
+        no I/O of its own: SessionTable.replace_rows' clear() resets the
+        cursor to row 0 before move_cursor puts it back, so a rebuild whose
+        cursor events ever reached a selection seam would move the live
+        selection away and back. Only a flush after the rebuild can tell a
+        comparison against what was last PERSISTED apart from a latch keyed
+        on "the slug changed", which that excursion would set.
+
+        This is the DETERMINISTIC variant: refresh_registry() rebuilds
+        in-thread, so a failure here is never a threading artefact.
+        test_rebuild_bearing_poll_ticks_write_once is the same assertion
+        through the real threaded poll path.
+        """
+
+        async def drive(app, pilot):
+            app.refresh_registry()
+            await pilot.pause()
+            # The flush a real poll tick would have run (this variant drives
+            # refresh_registry directly, so it must do it here).
+            app._flush_ui_config()
+
+        await _assert_rebuilds_cost_one_write(
+            tmp_path, monkeypatch, drive=drive, rounds=3, tag='rebuild'
+        )
+
+    @pytest.mark.timeout(10)
+    async def test_rebuild_bearing_poll_ticks_write_once(self, tmp_path, monkeypatch):
+        """The end-to-end busy-fleet case, through the real threaded poll
+        path: a live fleet churns, so most ticks DO rebuild the table (see
+        test_rebuild_that_leaves_the_selection_unchanged_writes_nothing for
+        the clear()/move_cursor excursion each one makes). Four rebuild-bearing ticks over
+        a selection the operator never touches cost exactly ONE write --
+        the one that persists the parked cursor -- not one per tick.
+
+        Unlike the deterministic variant above, nothing here calls
+        _flush_ui_config by hand: _poll_registry's own flush is what must
+        fire, so this also pins that the debounce resolves on the real
+        timer callback and not only when a test drives it.
+        """
+
+        async def drive(app, pilot):
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        await _assert_rebuilds_cost_one_write(
+            tmp_path, monkeypatch, drive=drive, rounds=4, tag='tick'
+        )
+
+    @pytest.mark.timeout(10)
+    async def test_burst_is_flushed_once_by_the_next_poll_tick(self, tmp_path, monkeypatch):
+        """The debounce resolves on the poll tick: a whole burst of cursor
+        moves collapses into ONE write carrying the LAST slug, and a further
+        tick over an unchanged selection writes nothing more -- so this is a
+        real debounce, not one-write-per-keypress traded for
+        one-write-per-interval forever."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        running = _seed_debounce_fleet(tmp_path)
+        slugs = [record.session_slug for record in running]
+
+        # poll_interval=60 keeps on_mount's own set_interval timer from
+        # firing: every tick in this test is an explicit _poll_registry()
+        # call, which is what makes the write COUNT exact rather than a race
+        # against the wall clock.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            for slug in slugs:
+                table.move_cursor(row=table.get_row_index(slug))
+                await pilot.pause()
+                assert table.highlighted_slug() == slug
+            assert recorded == []  # precondition: the burst is still debounced
+
+            # _poll_registry launches the real threaded scan worker, so drain
+            # it the way TestThreadedScanReachesUI/TestScanBackpressure do.
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == [slugs[-1]]
+            # The on-disk half, asserted while the app is still RUNNING --
+            # this is the timing change: the file now appears at the tick,
+            # not at the keypress.
+            assert load_ui_config(tmp_path).selected_slug == slugs[-1]
+
+            # A second tick with the registry left STATIC -- the simplest
+            # case: _apply_scan's snapshot-unchanged short-circuit means no
+            # rebuild at all. The flush compares the live selection against
+            # the persisted one, so a tick over an unchanged selection
+            # writes nothing. test_rebuild_bearing_poll_ticks_write_once is
+            # the counterpart that keeps the registry CHANGING.
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert recorded == [slugs[-1]]
+
+    @pytest.mark.timeout(10)
+    async def test_a_failed_write_advances_the_baseline_and_is_never_retried(
+        self, tmp_path, monkeypatch
+    ):
+        """A FAILED save still advances _persisted_selected_slug, so the same
+        selection is never retried. That is a deliberate trade-off, pinned
+        here rather than left implicit in _flush_ui_config's docstring.
+
+        cockpit/src/cockpit/ui_config.py::save_ui_config logs and swallows
+        OSError and returns None either way, so _persist_ui_config cannot
+        tell a failed write from a successful one and advances the baseline
+        regardless. The retry CADENCE did materially change when the write
+        left the highlight handler: a persistently unwritable fleet_root
+        used to be retried on every cursor move, and is now retried never.
+        Recovery is by CHANGE -- the next selection makes the two values
+        differ again -- plus on_unmount's one unconditional final attempt,
+        which fails the same way.
+
+        Deliberately not "fixed" by having save_ui_config report success and
+        gating the baseline on it: cockpit-ui.json is fail-soft UI state
+        whose total loss costs the operator one restored cursor position,
+        and a retry loop over a read-only fleet_root would put the
+        synchronous mkstemp back on every single tick -- reintroducing, in
+        the worst case, exactly the per-tick I/O this debounce removed.
+        """
+        from cockpit import ui_config as ui_config_module
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import ui_config_path
+
+        running = _seed_debounce_fleet(tmp_path)
+        parked, moved_to = running[0], running[1]
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            async def tick():
+                app._poll_registry()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+            table.move_cursor(row=table.get_row_index(parked.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == parked.session_slug
+
+            recorded = _count_ui_config_writes(monkeypatch)
+            # Break the REAL writer from here on. Everything below observes
+            # what production observes when fleet_root cannot be written.
+            monkeypatch.setattr(ui_config_module, 'tempfile', _NoTempFiles)
+
+            await tick()
+            # The flush ran and attempted the write ...
+            assert recorded == [parked.session_slug]
+            # ... the write really failed, fail-soft: no exception reached
+            # the event loop, and no file was created ...
+            assert not ui_config_path(tmp_path).exists()
+            # ... and the baseline advanced anyway. This is the whole point:
+            # "persisted" here means "handed to the writer", not "on disk".
+            assert app._persisted_selected_slug == parked.session_slug
+
+            # No retry. Further ticks over the same selection stay silent
+            # even though nothing was ever actually persisted.
+            await tick()
+            await tick()
+            assert recorded == [parked.session_slug]
+
+            # Recovery is by change: moving the cursor makes the live
+            # selection differ from the baseline again, so the flush
+            # attempts once more (and fails again, still fail-soft).
+            table.move_cursor(row=table.get_row_index(moved_to.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == moved_to.session_slug
+            await tick()
+            assert recorded == [parked.session_slug, moved_to.session_slug]
+            assert not ui_config_path(tmp_path).exists()
+
+        # on_unmount's unconditional final attempt is the only other write
+        # this selection ever gets, and it fails the same way -- so a
+        # cockpit run over an unwritable fleet_root leaves no file at all
+        # rather than crashing or spinning.
+        assert recorded == [
+            parked.session_slug,
+            moved_to.session_slug,
+            moved_to.session_slug,
+        ]
+        assert not ui_config_path(tmp_path).exists()
+
+    @pytest.mark.timeout(10)
+    async def test_flush_is_not_starved_by_the_scan_backpressure_drop(self, tmp_path, monkeypatch):
+        """Pins that the flush runs BEFORE _poll_registry's
+        `if self._scan_in_flight: return` drop-tick guard.
+
+        In production a full 10k+-session scan (~4.5s, esc-2303-1) routinely
+        outlasts the 1.5s poll interval, so for that scan's whole duration
+        every tick takes the early return. A flush placed after the guard
+        would be starved for as long as scans keep overlapping -- exactly
+        the busy-fleet case where the operator is most likely to be moving
+        the cursor -- and the selection would sit unpersisted until unmount.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        running = _debounce_running_records()
+        parked = running[1]  # row 1: a NON-zero index, so highlighting it fires
+        scanner = _CountingRecordsScanner(running)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # mount's synchronous scan
+            table = app.query_one(SessionTable)
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            assert table.get_row_index(parked.session_slug) != 0
+            table.move_cursor(row=table.get_row_index(parked.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == parked.session_slug
+            assert recorded == []
+
+            calls_before = scanner.calls
+            try:
+                # Stand in for a slow 10k-session scan still running. The
+                # flag is documented main-thread-only, and this file already
+                # drives _poll_registry/_apply_scan/_next_scan_seq directly,
+                # so setting it beats parking a real worker thread that a
+                # failed assertion could leave wedged.
+                app._scan_in_flight = True
+                app._poll_registry()
+                await pilot.pause()
+
+                # The tick really WAS dropped for scanning -- without this
+                # the test could silently degrade into exercising the
+                # ordinary, un-starved path.
+                assert scanner.calls == calls_before
+                # ... and the flush still ran anyway.
+                assert recorded == [parked.session_slug]
+            finally:
+                app._scan_in_flight = False
+
+    @pytest.mark.timeout(10)
+    async def test_mount_over_a_restored_selection_writes_nothing(self, tmp_path, monkeypatch):
+        """Mounting over a cockpit-ui.json whose selection restores verbatim
+        must not rewrite the file with the value just read off it. The flush
+        gate asks "is the on-disk file stale", not "did the selection
+        change", so a successful restore leaves the live selection already
+        equal to the persisted one and the first tick writes nothing."""
+        from cockpit.app import CockpitApp
+        from cockpit.ui_config import CockpitUIConfig, save_ui_config
+
+        running = _seed_debounce_fleet(tmp_path)
+        restored = running[0]
+        save_ui_config(
+            CockpitUIConfig(selected_slug=restored.session_slug, poll_interval=60), tmp_path
+        )
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            # sanity: the restore really happened. Without it this test
+            # would pass over a cockpit that simply landed on row 0 having
+            # never restored anything.
+            assert app._selected_slug == restored.session_slug
+
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == []
+
+    @pytest.mark.timeout(10)
+    async def test_a_stale_restored_selection_is_still_corrected_by_the_first_flush(
+        self, tmp_path, monkeypatch
+    ):
+        """Over-suppression guard -- green both before and after the flush
+        gate became a comparison against the persisted selection, and
+        deliberately so.
+
+        Gating on "does the live selection differ from what is on disk" must
+        still CORRECT a cockpit-ui.json naming a session that no longer
+        exists: the restore fails soft onto row 0, which differs from the
+        stale file, so the first flush rewrites it. Over-suppression is the
+        characteristic failure mode of that gate, and this pins it from the
+        opposite side to
+        test_mount_over_a_restored_selection_writes_nothing -- do not
+        "simplify" it away as a duplicate.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
+
+        _seed_debounce_fleet(tmp_path)
+        save_ui_config(CockpitUIConfig(selected_slug='ghost-gone', poll_interval=60), tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            # SessionTable.select_slug catches RowDoesNotExist and returns
+            # False without moving the cursor, so the cursor stays on row 0
+            # -- _seed_debounce_fleet's AWAITING_INPUT record, which
+            # order_sessions ranks above every RUNNING one.
+            assert app._selected_slug == 'debounce-blocked'
+
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == ['debounce-blocked']
+            assert load_ui_config(tmp_path).selected_slug == 'debounce-blocked'
 
 
 class TestDecisionQueueRender:
@@ -3193,15 +3766,17 @@ class TestRefreshWriteDiscipline:
         # Scoped to sessions/decisions -- unlike TestWriteDiscipline/
         # TestDeferResetsAge's whole-lifecycle before/after (taken pre-mount,
         # before cockpit-ui.json exists at all), this test's "before" is
-        # taken mid-lifecycle, after cockpit-ui.json already exists (from
-        # on_mount's own initial refresh_registry() call). cockpit-ui.json
-        # is the cockpit's own sanctioned, unconditional write target (PRD
-        # §2/§5) and may legitimately be rewritten by a table rebuild's
-        # RowHighlighted repost (see session_table.py) on every tick --
-        # that's a pre-existing C5a behavior this test doesn't police. The
-        # invariant under test here is narrower and exactly what step-25
-        # specifies: zero sessions/ or decisions/ writes from the automatic
-        # refresh/diff path.
+        # taken mid-lifecycle and may or may not already include
+        # cockpit-ui.json: the debounced flush writes it on a poll tick
+        # (CockpitApp._flush_ui_config), so with poll_interval=0.05 whether
+        # a tick has fired by then is not pinned here. It does not matter,
+        # because cockpit-ui.json is the cockpit's own sanctioned write
+        # target (PRD §2/§5) and this test does not police it either way; a
+        # table rebuild never rewrites it, which TestUIConfigWriteDebounce::
+        # test_rebuild_that_leaves_the_selection_unchanged_writes_nothing
+        # polices. The invariant under test here is narrower and exactly what
+        # step-25 specifies: zero sessions/ or decisions/ writes from the
+        # automatic refresh/diff path.
         for path, value in before.items():
             if path.startswith(('sessions/', 'decisions/')):
                 assert after.get(path) == value, (
@@ -3354,6 +3929,29 @@ class _RaisingThenOkScanner:
         if self.calls == 2:
             raise RuntimeError('boom')
         return []
+
+
+class _CountingRecordsScanner:
+    """Fake SessionScanner for TestUIConfigWriteDebounce's starvation case:
+    counts scan() calls and returns a fixed record list.
+
+    Unlike _BlockingCountingScanner above it never blocks and needs no
+    mount-call carve-out, because that test simulates an in-flight scan by
+    setting the documented main-thread-only _scan_in_flight flag directly
+    rather than by actually holding one -- the property under test there is
+    purely _poll_registry's statement ORDER relative to that flag, nothing
+    about threads. `calls` is what proves the tick really was dropped for
+    scanning, so the test cannot silently degrade into exercising the
+    ordinary path.
+    """
+
+    def __init__(self, records: list) -> None:
+        self.records = records
+        self.calls = 0
+
+    def scan(self) -> list:
+        self.calls += 1
+        return list(self.records)
 
 
 class TestScanBackpressure:
