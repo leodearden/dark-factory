@@ -3940,6 +3940,57 @@ class TestSessionResumeStorm:
         kwargs = harness._last_build_workflow_kwargs
         assert kwargs['resume_outcome_sink'] is harness
 
+    async def test_the_shipped_window_admits_the_population_that_exists(
+        self, harness: Harness,
+    ):
+        """At the SHIPPED defaults, a run arriving at the fleet's MEASURED
+        spacing still chains and files the L1 (task ε/3733).
+
+        The other storm rows all pick a small window and drive it, which proves
+        the mechanism but says nothing about whether the SHIPPED number can
+        ever fire. At the pre-ε 3600 s it could not: the smallest interval
+        between two eligible-but-FAILED resumes the fleet has ever produced is
+        5.82 h, so no two of them chained at ANY threshold and INV-4's escape
+        was green and unfireable.
+
+        The spacing is read from ``storm_window_bound.MEASURED_MIN_GAP_SECS``
+        rather than re-typed here, so this row and the derivation cannot drift
+        (SPOT), and the loop count is the shipped threshold — no arithmetic on
+        literals the test controls on both sides. Both halves run the REAL
+        rolling-window decay: the clock is advanced by rewinding the harness's
+        own monotonic stamp, β's idiom.
+        """
+        from orchestrator.storm_window_bound import (  # noqa: PLC0415
+            MEASURED_MIN_GAP_SECS,
+        )
+
+        config = SessionResumeConfig()   # SHIPPED defaults, no overrides
+        harness.config.session_resume = config
+        harness._escalation_queue = self._queue()
+
+        for i in range(config.fallback_storm_threshold):
+            if i:
+                harness._last_session_resume_fallback_at -= MEASURED_MIN_GAP_SECS
+            harness.note_resume_failed(self._report(i))
+
+        assert harness._session_resume_fallback_streak == (
+            config.fallback_storm_threshold
+        )
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # ...and the decay is still LIVE, not merely wide: the same run spaced
+        # a full window apart never chains, so the alarm did not become a
+        # cumulative per-boot counter on the way to being fireable.
+        harness.note_resume_succeeded()
+        harness._escalation_queue = self._queue()
+        for i in range(config.fallback_storm_threshold):
+            if i:
+                harness._last_session_resume_fallback_at -= config.storm_window_secs
+            harness.note_resume_failed(self._report(100 + i))
+
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
     async def test_storm_l1_names_every_recorded_failure(self, harness: Harness):
         """INV-2 structured-facts-at-failure: the L1 names what actually failed.
 
