@@ -2804,29 +2804,28 @@ class TestBeforeDoneTargetUnitlessDeploy:
 
 
 # ---------------------------------------------------------------------------
-# Task 4065 — DEPLOY-path parity pin for the default runner's INNER timeout.
+# Task 4252 — DEPLOY-path HONESTY pin for the default runner's INNER timeout.
 #
 # `_default_run_script`'s own per-subprocess `asyncio.wait_for` fires strictly
 # BEFORE the outer wall-clock guard (`timeout_secs + run_timeout_grace_secs`),
 # so on the production path (script_runner=None) the inner timeout is what the
-# deploy classifier actually sees.  Task 4065 changes how the PREDICATE path
-# classifies that event; the deploy path's handling must not move.
+# deploy classifier actually sees.  Task 4065 made that event a `ScriptTimeout`
+# and restored a synthetic (1, '<script timed out after Ns>') pair for the
+# deploy classifiers; task 4252 removes the restore so each branch reports the
+# SIGKILL for what it was.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestDefaultRunnerInnerTimeoutDeployParity:
-    """DeterministicRunner — the REAL default runner's inner timeout on the
-    deploy path stays classified exactly as it is today (task 4065).
+class TestDefaultRunnerInnerTimeoutDeployHonesty:
+    """DeterministicRunner — each deploy branch reports the REAL default
+    runner's inner per-script timeout honestly (task 4252).
 
-    Deliberate CHARACTERIZATION PIN, not a RED test: it is GREEN on arrival
-    and must stay green across task 4065's refactor.  Unlike the predicate
-    path — where a non-zero rc is a milestone VERDICT and the inner timeout
-    was therefore misclassified — the deploy classifiers have no verdict
-    semantics at all: every non-zero rc there already routes to
-    ``_file_infra_issue_and_block``.  So the legacy ``(1, '<script timed out
-    after Ns>')`` pair must still reach the deploy classifier byte-for-byte
-    after the fix, and this test is what proves the refactor did not disturb
-    it.
+    This class no longer pins the pre-4065 ``(rc=1, '<script timed out after
+    Ns>')`` characterization.  It pins that a script SIGKILLed by its own
+    per-script timeout is reported as what it was — a script that produced NO
+    exit code — and that each deploy branch reaches its OWN dedicated
+    ``except ScriptTimeout`` arm rather than degrading into ``run()``'s
+    'unexpected error' catch-all.
 
     Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
     existing hung-seam coverage all injects a custom ``script_runner`` and so
@@ -2835,9 +2834,13 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
     BOTH deploy branches are pinned — target_unit-less
     (``_run_deploy_script_guarded``) and named-target (``_RunFnProcShim`` ->
     ``RestartPlan.execute()``).  They share ONE
-    ``_invoke_run_fn_translating_timeout``, so a drift that pushed the
-    ``ScriptTimeout`` restore down into either call site would degrade only
-    the other one — a single-branch pin would not catch it.
+    ``_invoke_run_fn_translating_timeout``, which no longer catches
+    ``ScriptTimeout`` at all, so each branch's own arm is the only thing
+    standing between the timeout and a worse-diagnosed catch-all — and a
+    single-branch pin would not catch one of them losing its arm.
+
+    The third test is a green-on-arrival companion: only the TIMEOUT wording
+    moved, and a genuine non-zero exit code is still reported verbatim.
     """
 
     async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
@@ -2845,8 +2848,8 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
     ):
         """A real deploy script that overruns ``before_done['timeout_secs']``
         under the default runner must file exactly one born-at-L2
-        ``infra_issue`` whose detail still carries the legacy ``rc=1`` +
-        ``<script timed out after 1s>`` pair.
+        ``infra_issue`` naming the inner guard and the SIGKILL — and must NOT
+        report any exit code, because the process never exited.
 
         ``timeout_secs=1`` against a 30s sleep leaves the outer guard at
         ``1 + 30 = 31s``, so the INNER timeout provably wins (the 20s
@@ -2894,14 +2897,33 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert esc.agent_role == 'orchestrator-deterministic'
         assert esc.category == 'infra_issue', (
             f'the deploy path classifies a timed-out script as an infra fault; '
-            f'task 4065 must not change that: {esc.category!r}'
+            f'task 4252 changes the WORDING only, never the category: {esc.category!r}'
         )
-        assert 'rc=1' in esc.detail, (
-            f'the legacy rc=1 must still reach the deploy classifier: {esc.detail!r}'
+        assert esc.summary == 'Deploy script timed out (no exit code, no target_unit)', (
+            f'the target_unit-less branch must reach its own dedicated '
+            f'ScriptTimeout arm, not the rc≠0 ladder or the catch-all: '
+            f'{esc.summary!r}'
         )
-        assert '<script timed out after 1s>' in esc.detail, (
-            f'the legacy timed-out tail marker must still reach the deploy '
-            f'classifier verbatim: {esc.detail!r}'
+        assert 'per-script timeout (1s' in esc.detail, (
+            f'the detail must name the guard that fired and the budget it '
+            f'overran: {esc.detail!r}'
+        )
+        assert 'SIGKILLed' in esc.detail, (
+            f'the detail must say the script was killed mid-flight — that is '
+            f'what tells an operator the effect may be half-applied: '
+            f'{esc.detail!r}'
+        )
+        assert 'No exit code was produced' in esc.detail, (
+            f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
+        )
+        assert 'rc=' not in esc.detail, (
+            f'HONESTY PIN: the process never exited, so there is NO exit code '
+            f'to report — an rc of any value here is fabricated: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' not in esc.detail, (
+            f'HONESTY PIN: no output was captured (communicate() was cancelled '
+            f'by the timeout), so this marker was a placeholder printed where '
+            f'script output belongs: {esc.detail!r}'
         )
 
         done_calls = [
@@ -2911,22 +2933,17 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
         unit_inspector.assert_not_awaited()
 
-    async def test_named_target_deploy_default_runner_inner_timeout_is_restart_failed(
+    async def test_named_target_deploy_default_runner_inner_timeout_reports_no_exit_code(
         self, tmp_path: Path,
     ):
-        """Same parity pin for the OTHER deploy branch: a named ``target_unit``
-        routes the ``(rc, tail)`` pair through ``_RunFnProcShim`` into
-        ``RestartPlan.execute()``, which must classify it as
-        ``RESTART_FAILED`` -> the ``Deploy failed: <unit>`` infra_issue.
+        """Same honesty pin for the OTHER deploy branch.
 
-        This is the half of ``_invoke_run_fn_translating_timeout``'s anti-drift
-        claim the target_unit-less case cannot cover.  Both deploy branches go
-        through that ONE shared wrapper; if the ``ScriptTimeout`` catch were
-        ever moved down into ``_run_deploy_script_guarded``, THIS branch would
-        silently degrade — ``ScriptTimeout`` would escape ``plan.execute()``
-        into ``run()``'s catch-all and be reported as 'Deploy run_fn raised an
-        unexpected error', i.e. the same category with materially worse
-        diagnostics.
+        With the restore gone, a ``ScriptTimeout`` raised inside
+        ``_shim_runner`` propagates out of ``plan.execute()`` untouched, so
+        ``run()``'s own dedicated arm — placed BEFORE its ``except Exception``
+        — is the only thing keeping it out of the catch-all.  That ordering is
+        invisible in a diff review, which is why the summary is pinned against
+        the catch-all's wording as well as the old RESTART_FAILED one.
         """
         import asyncio
 
@@ -2948,8 +2965,8 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         scheduler = _mock_scheduler(task)
-        # Baseline inspect only: the script "fails" (rc=1), so execute() skips
-        # the post-deploy verify re-inspect entirely.
+        # Baseline inspect only: the script is killed mid-flight, so the
+        # post-deploy fresh-PID verify leg never runs.
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
 
         runner = DeterministicRunner(
@@ -2972,30 +2989,90 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert esc.severity == 'critical'
         assert esc.agent_role == 'orchestrator-deterministic'
         assert esc.category == 'infra_issue'
-        assert esc.summary == f'Deploy failed: {target_unit}', (
-            f'the restored (rc, tail) pair must reach RestartPlan.execute() and '
-            f'come back as RESTART_FAILED — NOT escape as a raw ScriptTimeout '
-            f"into run()'s catch-all ('Deploy run_fn failed (unexpected error): "
-            f"{target_unit}'): {esc.summary!r}"
+        assert esc.summary == f'Deploy script timed out (no exit code): {target_unit}', (
+            f'the named-target branch must reach its OWN dedicated ScriptTimeout '
+            f'arm — NOT the old RESTART_FAILED wording '
+            f"('Deploy failed: {target_unit}', which required a fabricated rc to "
+            f'exist) and NOT the catch-all '
+            f"('Deploy run_fn failed (unexpected error): {target_unit}', the real "
+            f'degradation risk now that ScriptTimeout escapes plan.execute()): '
+            f'{esc.summary!r}'
         )
-        assert 'rc=1' in esc.detail, (
-            f'the legacy rc=1 must still reach the named-target classifier: '
+        assert 'per-script timeout (1s' in esc.detail, (
+            f'the detail must name the guard that fired and the budget it '
+            f'overran: {esc.detail!r}'
+        )
+        assert 'SIGKILLed' in esc.detail, (
+            f'the detail must say the script was killed mid-flight — that is '
+            f'what tells an operator the effect may be half-applied: '
             f'{esc.detail!r}'
         )
-        assert '<script timed out after 1s>' in esc.detail, (
-            f'the legacy timed-out tail marker must survive the _RunFnProcShim '
-            f'round-trip verbatim: {esc.detail!r}'
+        assert 'No exit code was produced' in esc.detail, (
+            f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
+        )
+        assert 'rc=' not in esc.detail, (
+            f'HONESTY PIN: the process never exited, so there is NO exit code '
+            f"to report — this also proves proc_supervision's \"script exit code "
+            f'rc=1\" string was never built: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' not in esc.detail, (
+            f'HONESTY PIN: no output was captured (communicate() was cancelled '
+            f'by the timeout), so this marker was a placeholder printed where '
+            f'script output belongs: {esc.detail!r}'
         )
 
         assert unit_inspector.await_count == 1, (
-            f'baseline inspect only — a failed script skips the verify '
-            f're-inspect: {unit_inspector.await_count}'
+            f'baseline inspect only — the post-deploy verify leg never runs '
+            f'after the script is killed: {unit_inspector.await_count}'
         )
         done_calls = [
             c for c in scheduler.set_task_status.call_args_list
             if c.args[1] == 'done'
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+
+    async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(
+        self, tmp_path: Path,
+    ):
+        """Green-on-arrival companion pin: only the TIMEOUT wording moved.
+
+        An injected ``script_runner`` keeps the plain ``(rc, tail)`` contract,
+        so a genuine non-zero exit code is still reported VERBATIM as ``rc=N``
+        on the target_unit-less branch.  The named-target counterpart already
+        exists as
+        ``test_restart_failed_disposition_files_deploy_failed_infra_issue``;
+        this is the missing target_unit-less half, so both branches guard that
+        the new timeout arms did not hijack honest exit-code reporting.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4252c', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(3, 'boom')),
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4252c', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.summary == 'Deploy failed (no target_unit) (rc=3)', (
+            f'a genuine exit code is still reported verbatim: {esc.summary!r}'
+        )
+        assert 'Deploy script exit code: rc=3' in esc.detail, esc.detail
+        assert 'boom' in esc.detail, esc.detail
 
 
 # ---------------------------------------------------------------------------
