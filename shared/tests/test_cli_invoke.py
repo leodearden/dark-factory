@@ -4957,13 +4957,15 @@ class TestUnreadableTranscriptEscapeWiring:
         """Run the watchdog loop at millisecond cadence with a patched transcript read.
 
         `required_reads` is the caller's stated precondition: the fake child stays
-        pending until the watchdog has polled the transcript that many times. A
-        run that can never produce a read pre-sets the barrier.
+        pending until the watchdog has polled the transcript that many times, or
+        until the valve fires. A run that can never produce a read is bounded by
+        `release_timeout_secs` alone — pre-setting the barrier instead would end
+        the run before the first poll body ever executes, which silently makes
+        any `call_count` assertion over it unfalsifiable.
         """
+        assert required_reads >= 1, 'a pre-opened barrier makes call_count unfalsifiable'
         loop = asyncio.get_running_loop()
         release = asyncio.Event()
-        if required_reads <= 0:
-            release.set()
         proc = self._proc(release, release_timeout_secs)
 
         reads = itertools.count(1)
