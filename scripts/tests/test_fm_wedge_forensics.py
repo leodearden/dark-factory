@@ -107,6 +107,22 @@ SELF_RECOVERED_STALL_JOURNAL = """\
 2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - shared.usage_gate - INFO - Account max-b: firing probe #1
 """
 
+# A FOURTH real stall, 2026-09-16 16:15:05 -> 16:17:21 = 136s, the one the
+# watchdog did catch in that window. Carried here for its `Consumed` line,
+# which uses systemd's plain-`Ymin` CPU-time spelling rather than the two
+# episodes' `Xh Ymin` one — a real instance of the other form, not a
+# hand-written variant of it.
+WATCHDOG_CAUGHT_STALL_JOURNAL = """\
+2026-09-16T16:15:05+01:00 leo-MS-7C35 uv[3161215]: 2026-09-16 16:15:05 - mcp.server.streamable_http - INFO - Terminating session: None
+2026-09-16T16:15:05+01:00 leo-MS-7C35 uv[3161215]: 2026-09-16 16:15:05 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_solar_challenge/points/count "HTTP/1.1 200 OK"
+2026-09-16T16:17:21+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T16:17:43+01:00 leo-MS-7C35 uv[3161215]: 2026-09-16 16:17:43 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-16T16:18:03+01:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-09-16T16:18:03+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 20min 30.697s CPU time, 2.3G memory peak, 403.3M memory swap peak.
+2026-09-16T16:18:03+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T16:18:44+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
 # emits hundreds of lines per second. Nothing here is near any threshold.
 DENSE_HEALTHY_JOURNAL = """\
@@ -248,3 +264,72 @@ def test_every_stall_reports_the_watchdog_verdict_its_probe_would_have_returned(
 
     for journal in (EPISODE_1_JOURNAL, EPISODE_2_JOURNAL, SELF_RECOVERED_STALL_JOURNAL):
         assert analyze(journal)[0].watchdog_verdict == "wedged"
+
+
+# ---------------------------------------------------------------------------
+# The three pieces of evidence that made this diagnosis possible by hand.
+#
+# Each took a separate ad-hoc `journalctl | grep` pass to recover the first
+# time. Extracting them is most of why this script exists: episode 3 should
+# cost one command, not an afternoon.
+# ---------------------------------------------------------------------------
+
+def test_pre_stall_context_shows_what_the_loop_was_doing_when_it_went_quiet():
+    from fm_wedge_forensics import analyze
+
+    context = analyze(EPISODE_2_JOURNAL)[0].pre_stall_context
+
+    assert any("reconciliation.run_started" in line for line in context)
+    assert any("index_drift_escalation_suppressed" in line for line in context)
+    assert not any("Stopping fused-memory" in line for line in context)
+
+
+def test_consumed_line_is_parsed_into_separate_resource_fields():
+    """`Xh Ymin Z.Zs` CPU time plus G/M sizes, as structured numbers rather
+    than a string the reader has to re-parse."""
+    from fm_wedge_forensics import analyze
+
+    resources = analyze(EPISODE_2_JOURNAL)[0].resources
+
+    assert resources.cpu_seconds == 2 * 3600 + 29 * 60 + 21.259
+    assert resources.memory_peak_bytes == 3.2 * 1024**3
+    assert resources.swap_peak_bytes == 934.4 * 1024**2
+
+
+def test_consumed_line_parses_both_systemd_cpu_time_spellings():
+    """Episode 1 carries `1h 22min 57.690s`; the 16:15 stall carries systemd's
+    hourless `20min 30.697s`. Both are real lines, not constructed variants."""
+    from fm_wedge_forensics import analyze
+
+    with_hours = analyze(EPISODE_1_JOURNAL)[0].resources
+    without_hours = analyze(WATCHDOG_CAUGHT_STALL_JOURNAL)[0].resources
+
+    assert with_hours.cpu_seconds == 3600 + 22 * 60 + 57.690
+    assert with_hours.swap_peak_bytes == 529.9 * 1024**2
+    assert without_hours.cpu_seconds == 20 * 60 + 30.697
+    assert without_hours.memory_peak_bytes == 2.3 * 1024**3
+
+
+def test_a_stall_with_no_consumed_line_reports_absent_not_zero():
+    """A self-recovered stall never produced a `Consumed` line, and reporting
+    it as 0 would read as "consumed nothing" — the opposite of the truth."""
+    from fm_wedge_forensics import analyze
+
+    assert analyze(SELF_RECOVERED_STALL_JOURNAL)[0].resources is None
+
+
+def test_a_foreign_process_sigkilled_from_the_cgroup_is_reported_by_name():
+    """The `git` child still alive at teardown is the evidence that a
+    synchronous git subprocess was in flight on the blocked loop. It must not
+    be diluted by the unit's own `uv`/`python3` entries, which are expected."""
+    from fm_wedge_forensics import analyze
+
+    foreign = analyze(EPISODE_2_JOURNAL)[0].foreign_killed_processes
+
+    assert [(process.pid, process.name) for process in foreign] == [(1289425, "git")]
+
+
+def test_an_episode_that_killed_nothing_reports_no_foreign_processes():
+    from fm_wedge_forensics import analyze
+
+    assert analyze(EPISODE_1_JOURNAL)[0].foreign_killed_processes == ()
