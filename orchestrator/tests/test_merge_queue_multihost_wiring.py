@@ -1594,27 +1594,17 @@ class TestRunnerUnavailableWarningIsAttributable:
     the streak.  This WARNING is the only place the class becomes countable.
     """
 
-    HOST = _RU_HOST
-
-    async def _drive_ru(self, tmp_path, caplog, reason):
-        return await _drive_runner_unavailable(tmp_path, caplog, reason)
-
-    async def test_warning_names_the_host(self, tmp_path, caplog):
-        """The abandoned machine is named, so a re-dispatch is attributable to a host."""
-        reason = 'ssh leo-laptop exited 255: connection reset'
-        result, records = await self._drive_ru(tmp_path, caplog, reason)
+    async def test_warning_names_the_host_and_carries_the_rc(self, tmp_path, caplog):
+        """One drive pins all three: the machine, the rc that reached journald, the full reason."""
+        reason = f'ssh {_RU_HOST} exited 255: connection reset'
+        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1, f'expected exactly one warning; got {records!r}'
-        assert self.HOST in records[0].message
-        assert result.status == 'RUNNER_UNAVAILABLE'
-
-    async def test_warning_carries_the_ssh_rc(self, tmp_path, caplog):
-        """The rc-bearing reason reaches journald without waiting for the escalation threshold."""
-        reason = 'ssh leo-laptop exited 255: connection reset'
-        result, records = await self._drive_ru(tmp_path, caplog, reason)
-
-        assert len(records) == 1
+        # The abandoned machine is named, so a re-dispatch is attributable to a
+        # host, and the rc rides along without waiting for the escalation threshold.
+        assert _RU_HOST in records[0].message
         assert 'exited 255' in records[0].message
+        assert result.status == 'RUNNER_UNAVAILABLE'
         # The stored reason stays FULL — _quarantine_unreachable_host reads it.
         assert result.reason == reason
 
@@ -1623,10 +1613,10 @@ class TestRunnerUnavailableWarningIsAttributable:
     ):
         """A watchdog self-kill reads as one, end to end — the signal this task exists for."""
         reason = (
-            'ssh leo-laptop exited 1: [INFO] running cargo test\n'
+            f'ssh {_RU_HOST} exited 1: [INFO] running cargo test\n'
             'watchdog_fire_trigger=heartbeat_starvation\n'
         )
-        result, records = await self._drive_ru(tmp_path, caplog, reason)
+        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1
         assert 'exited 1' in records[0].message
