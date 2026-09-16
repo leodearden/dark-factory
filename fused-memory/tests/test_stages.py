@@ -2083,6 +2083,13 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2218,6 +2225,13 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
