@@ -131,23 +131,29 @@ _COLUMN_LABELS = ('score', 'age', 'project#task', 'question')
 _QUESTION_MIN_WIDTH = 20
 # The bound used before the widget has a measurable width; see question_width.
 _UNMEASURED_QUESTION_WIDTH = 60
-_QUESTION_MAX_WIDTH = 60
 _QUESTION_PLACEHOLDER = '(no question)'
 
 
-def _one_line_question(question: str | None) -> str:
-    """Collapse *question* to a single truncated line; empty/None -> a placeholder.
+def _one_line_question(question: str | None, max_width: int) -> str:
+    """Collapse *question* to a single line of at most *max_width* cells.
+
+    The bound belongs to the caller: DecisionQueue derives it from the width
+    its question column actually has (see question_width), which is what
+    lets a wide terminal show a long question and a narrow one reflow
+    shorter. Only the pre-layout fallback is a fixed number.
 
     Fail-soft (PRD §2): a view must degrade a bad question shape, not raise.
+    Empty/None/whitespace-only yields the placeholder, returned whole rather
+    than cut -- question_width's floor keeps *max_width* above its length.
     """
     if not question:
         return _QUESTION_PLACEHOLDER
     collapsed = ' '.join(question.split())
     if not collapsed:
         return _QUESTION_PLACEHOLDER
-    if len(collapsed) <= _QUESTION_MAX_WIDTH:
+    if len(collapsed) <= max_width:
         return collapsed
-    return collapsed[: _QUESTION_MAX_WIDTH - 1].rstrip() + '…'
+    return collapsed[: max_width - 1].rstrip() + '…'
 
 
 def _format_project_task(project: str, task_id: str | None) -> str:
@@ -215,14 +221,24 @@ def question_width(
     return max(_QUESTION_MIN_WIDTH, available_width - used - 2 * cell_padding)
 
 
-def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str, str]:
+def format_queue_row(
+    item: _QueueRowLike,
+    now: datetime,
+    *,
+    question_width: int = _UNMEASURED_QUESTION_WIDTH,
+) -> tuple[str, str, str, str]:
     """Render *item* as the PRD row shape: score / age / project#task / question.
 
-    The first three cells come from _fixed_cells -- the same helper
-    question_width measures -- so the derived column budget and the rendered
-    row can never disagree about what the row contains.
+    The first three cells come from _fixed_cells -- the same helper the
+    width derivation measures -- so the derived column budget and the
+    rendered row can never disagree about what the row contains.
+
+    *question_width* bounds the question cell and is the caller's to supply:
+    DecisionQueue derives it from its own measured width. The default is the
+    pre-layout fallback, for a caller with no width to measure yet -- not a
+    display bound anyone should rely on.
     """
-    return (*_fixed_cells(item, now), _one_line_question(item.question))
+    return (*_fixed_cells(item, now), _one_line_question(item.question, question_width))
 
 
 @dataclass(frozen=True)
