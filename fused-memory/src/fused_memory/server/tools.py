@@ -7521,6 +7521,21 @@ def create_mcp_server(
 
         * The top-level ``counts`` are the DURABLE WRITE queue — a separate
           subsystem that stays ~0 in steady state.
+        * ``dead_by_operation`` breaks that queue's ``dead`` count down by
+          operation name (always present; ``{}`` when nothing is dead, so you
+          never have to tell "no deaths" from "an older server"). A nonzero
+          entry means writes of that operation have been PERMANENTLY abandoned
+          after their caller was told they were accepted — which operation is
+          dying is the first thing triage needs, and ``counts['dead']`` alone
+          cannot say. This is the health-probe CONFIRMATION; the matching PUSH
+          signal is the ``durable_write_dead_letter`` escalation, which
+          survives cleanup. This counter reads the LIVE queue table, so it
+          returns to zero once ``delete_dead_letters`` sweeps the rows.
+          A ``project_id``-scoped call covers only that project's GRAPHITI
+          group: its Mem0 deaths (``mem0_classify_and_add``) sit in group
+          ``mem0_<project_id>``, so pass THAT as the ``project_id``, or call
+          unscoped, to see them. An alarm naming an operation the scoped
+          probe reports nothing for is that gap, not a contradiction.
         * ``reconciliation_backlog`` (present only when a ``project_id`` is
           supplied and a backlog policy is wired) is the reconciliation EVENT
           backlog = buffered events + event-queue depth + in-flight retries.
