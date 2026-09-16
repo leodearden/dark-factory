@@ -588,9 +588,12 @@ toward the bad item. **Any** pass resets the state. Each round recomputes
 re-derives the target from the queue as it is *now* rather than replaying a
 stale length. At the `d=1` floor no chain is built at all and the round
 takes today's adjacent verify — the floor is byte-identical **by
-construction**, not by careful mimicry. A failed tip lands nothing and
-mutates the queue not at all: its items stay queued and take their normal
-sequential path.
+construction**, not by careful mimicry. A failed tip lands nothing *via the
+chain* and mutates the queue not at all: its items stay queued and take
+their normal sequential path. The round is not therefore a zero-landing
+round — the head is never chained, so its own verify proceeds untouched and
+can still land in that same round; the head's verdict is discarded only on a
+tip **pass**, where the tip's tree strictly contains it.
 
 **What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
 and `reload_config`; that is the whole intervention, and it takes effect on
