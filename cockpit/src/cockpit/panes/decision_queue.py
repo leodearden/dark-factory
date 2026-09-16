@@ -628,6 +628,22 @@ class DecisionQueue(DataTable):
         backend.set_urgency calls on a window drag, and re-reading the clock
         would make the age column jump mid-drag.
 
+        The reflow's cursor events are suppressed because a window drag is not
+        an operator selection: _reflow re-enters the cursor through clear() +
+        move_cursor, and CockpitApp.on_data_table_row_highlighted reads a
+        RowHighlighted as the operator CLAIMING the detail pane for that
+        table. Measured: unsuppressed, a resize silently takes the pane off
+        the session row an operator parked on and hands it to the queue.
+        Nothing needs refreshing afterwards -- a resize changes column widths
+        only, never the underlying records, so leaving the pane exactly as it
+        was is the correct outcome, not a gap.
+
+        The suppression lives HERE rather than in _reflow or replace_rows on
+        purpose. app.py wraps its own replace_rows calls and re-syncs the pane
+        explicitly in the suppressed reposts' place, so that path's event
+        policy stays the caller's; only the resize path, which this widget
+        originates and no app code can wrap, suppresses for itself.
+
         DataTable defines its own private _on_resize; Textual dispatches both,
         so this handler augments the table's own resize handling rather than
         replacing it.
@@ -637,7 +653,8 @@ class DecisionQueue(DataTable):
         items, now = self._rendered
         if self._derive_question_width(items, now) == self._question_width:
             return
-        self._reflow()
+        with self.prevent(DataTable.RowHighlighted):
+            self._reflow()
 
     def select_key(self, key: str) -> bool:
         """Move the cursor to *key*'s row if present. Returns whether it was found."""
