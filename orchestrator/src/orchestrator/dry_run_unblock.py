@@ -16,7 +16,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
     AgentFailureKind,
@@ -175,6 +175,16 @@ _TASK_UNAVAILABLE_MARKER = (
     'or declared file scope. Judge scope creep conservatively.'
 )
 
+_TASK_EMPTY_MARKER = (
+    '**Task record:** fetched but empty — the task carries no title, '
+    'description, details or declared file scope, so this investigation is '
+    'running WITHOUT them. Judge scope creep conservatively.'
+)
+"""Distinct from _TASK_UNAVAILABLE_MARKER: the fetch SUCCEEDED and told us
+nothing.  Rendering a blank gap instead would read to the investigator as
+"this task has no description" when the truth is "we learned nothing" — the
+same ambiguity the marker exists to remove, one level in."""
+
 
 def _clip(value: str, label: str) -> str:
     """Cap one rendered field, marking the clip the way the repo marks clips."""
@@ -184,13 +194,32 @@ def _clip(value: str, label: str) -> str:
     return text[:_TASK_TEXT_FIELD_CHARS] + f'\n\n... [{label} truncated] ...'
 
 
-def _task_context_block(task: dict[str, Any] | None) -> str:
+class _TaskContext(NamedTuple):
+    """The blocked task as the investigator sees it, and whether that view is
+    degraded.
+
+    One value from one decision point: the prompt's block and the entry's
+    ``task_context_unavailable`` flag are decided together, so the surface the
+    investigator reads and the surface an operator reads cannot drift apart.
+    """
+
+    block: str
+    degraded: bool
+
+
+def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     """Render the blocked task's own text for the investigation prompt.
 
-    Labels and ordering mirror ``agents/briefing.py::_format_task`` so the two
-    agent-facing surfaces read alike; the code is deliberately not shared (that
-    renderer is an uncapped instance method serving a different purpose, and
-    this one exists to bound its output).
+    THREE states, not two.  A fetch that failed and a record that carries
+    nothing are both degradations, and both are marked; only a record with
+    something to say is healthy.
+
+    The label vocabulary is INDEPENDENT of ``agents/briefing.py::_format_task``
+    rather than a mirror of it.  That renderer is an uncapped instance method
+    serving a different purpose, and the two have already diverged exactly
+    where the purposes do — ``**Declared files:**`` here against ``**Files:**``
+    there, because this reader is asked to judge a fix against the scope the
+    architect DECLARED.  Nothing keeps the two aligned and nothing needs to.
 
     ``metadata.files`` IS included here even though ``build_architect_prompt``
     passes ``include_files=False`` to omit it.  Anti-anchoring applies to
@@ -201,7 +230,7 @@ def _task_context_block(task: dict[str, Any] | None) -> str:
     trigger.  It cannot apply that rule with no scope to compare against.
     """
     if not task:
-        return _TASK_UNAVAILABLE_MARKER
+        return _TaskContext(_TASK_UNAVAILABLE_MARKER, True)
     lines = []
     for label, value in (
         ('Title', task.get('title')),
@@ -210,13 +239,16 @@ def _task_context_block(task: dict[str, Any] | None) -> str:
     ):
         if value:
             lines.append(f'**{label}:** {_clip(value, label.lower())}')
-    files = (task.get('metadata') or {}).get('files')
+    metadata = task.get('metadata')
+    files = metadata.get('files') if isinstance(metadata, dict) else None
     if files:
         lines.append(
             f'**Declared files:** '
             f'{_clip(", ".join(str(f) for f in files), "declared files")}',
         )
-    return '\n'.join(lines)
+    if not lines:
+        return _TaskContext(_TASK_EMPTY_MARKER, True)
+    return _TaskContext('\n'.join(lines), False)
 
 
 # Read-only tools the dry-run agent is allowed to use.
@@ -391,14 +423,31 @@ async def run_dry_run_unblock(
         except Exception as exc:
             fetch_error = exc
             task_doc = None
+        # The flag is READ OFF the renderer, never computed a second time —
+        # a degraded prompt and a healthy-looking entry is the exact incoherence
+        # this pairing exists to prevent.  Two causes, two accurate messages,
+        # still exactly one warning per run.
+        task_context = _task_context(task_doc)
+        task_context_unavailable = task_context.degraded
         if not task_doc:
-            task_context_unavailable = True
             logger.warning(
                 'dry_run_unblock: task fetch failed for task %s — investigating '
                 'without task text and with routing overrides dropped: %s',
                 task_id, fetch_error or 'scheduler returned no task record',
             )
-        md = (task_doc or {}).get('metadata') or {}
+        elif task_context.degraded:
+            logger.warning(
+                'dry_run_unblock: task record for task %s carries no title, '
+                'description, details or declared files — investigating '
+                'without task text',
+                task_id,
+            )
+        # isinstance, not `or {}`: a non-dict metadata would otherwise flow
+        # into route resolution, and `.get` on it would raise past the outer
+        # handler — downgrading a working investigation to investigation_failed
+        # rather than degrading it.
+        raw_md = task_doc.get('metadata') if task_doc else None
+        md = raw_md if isinstance(raw_md, dict) else {}
 
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
@@ -406,7 +455,7 @@ async def run_dry_run_unblock(
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n\n'
-            f'{_task_context_block(task_doc)}\n\n'
+            f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
 
@@ -723,6 +772,20 @@ async def run_dry_run_unblock(
     # convention _failure_diagnostics sets, so a consumer never has to
     # distinguish an absent key from an old entry from a healthy one.
     entry['task_context_unavailable'] = task_context_unavailable
+    # DIAGNOSTIC ONLY, and deferred on purpose — not an oversight. Review asked
+    # why b3_gate fails closed on an undeterminable AGE (step 7b) while an
+    # undeterminable TASK still certifies FRESH. Both offered remedies conflict
+    # with something already pinned: clamping risk_label here, beside the
+    # MERGE_VERIFY_RED clamp above, contradicts
+    # test_clamp_scoped_to_merge_verify_red_agent_failure_untouched (which pins
+    # that clamp as scoped, on a bare-MagicMock scheduler that takes this
+    # degraded path incidentally), and it would flip every other low-risk
+    # assertion sharing that fixture; teaching check_proposal this key instead
+    # would pull a dry_run_unblock-specific field into a module kept
+    # deliberately dependency-light. Either is a policy change owed its own
+    # plan. Until then this flag tells an operator reading the entry that the
+    # investigation was blind — strictly more than the silent fallback it
+    # replaced, and the input any such gate would need.
 
     try:
         await scheduler.update_task(

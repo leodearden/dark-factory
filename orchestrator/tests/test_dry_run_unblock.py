@@ -2869,3 +2869,69 @@ class TestFalsyFetchIsAlsoLoud:
 
         assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
         assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 amendment: the THIRD state — a record that told us nothing
+# ---------------------------------------------------------------------------
+
+class TestContentlessTaskRecordIsAlsoDegraded:
+    """Between "full record" and "fetch failed" sits a record with nothing in it.
+
+    It used to render as the empty string: the prompt carried neither task text
+    nor a marker — just a blank gap the investigator would read as "this task
+    has no description" — while the entry stamped
+    ``task_context_unavailable: False``.  That is the same ambiguity
+    `TestFalsyFetchIsAlsoLoud` exists to eliminate, one level in.
+    """
+
+    _CONTENTLESS = {'id': '42', 'status': 'blocked'}
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_the_record_is_empty(self, tmp_path):
+        """The coherence invariant, extended to the third state."""
+        from orchestrator.dry_run_unblock import (
+            _TASK_EMPTY_MARKER,
+            _TASK_UNAVAILABLE_MARKER,
+        )
+
+        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_EMPTY_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+        # A DISTINCT marker: the fetch succeeded, so telling the investigator
+        # it failed would be a different lie from the one being fixed.
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_empty_record_warns_once_without_claiming_a_failed_fetch(
+        self, tmp_path, caplog,
+    ):
+        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.dry_run_unblock'
+        ]
+        assert len(messages) == 1, messages
+        assert '42' in messages[0], messages[0]
+        assert 'task fetch failed' not in messages[0], messages[0]
+
+    @pytest.mark.asyncio
+    async def test_non_dict_metadata_degrades_rather_than_losing_the_run(self, tmp_path):
+        """`(task.get('metadata') or {}).get('files')` raised AttributeError on a
+        non-dict, escaping to the outer handler and downgrading a WORKING
+        investigation to `investigation_failed`.  Degrading loudly is the whole
+        point of the surrounding change; crashing is the opposite of it."""
+        scheduler = _TaskDocScheduler(task_doc={**_TASK_DOC, 'metadata': 'not-a-dict'})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert entry.get('status') != 'investigation_failed', entry
+        assert entry['task_context_unavailable'] is False, entry
