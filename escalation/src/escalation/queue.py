@@ -348,8 +348,11 @@ def _is_late_resolution_worth_capturing(
       backstops (five call sites) and ``test_workflow_escalated_steward_stall``'s
       deliberate re-dismissals silent.
 
-    The ``'cascade'`` tier is deliberately NOT excluded alongside it, even
-    though it is equally automated.  ``resolve()``'s L2 member cascade forwards
+    - the incoming ``resolution`` is non-empty and DIFFERENT from the stored one
+      — an empty or byte-identical retry preserves nothing the record lacks.
+
+    The ``'cascade'`` tier is deliberately NOT excluded on the incoming side
+    alongside ``'reaper-sweep'``, even though it is equally automated.  ``resolve()``'s L2 member cascade forwards
     the L2's OWN resolution text to every member, so what reaches an
     already-swept member can be a human's substantive finding about the whole
     cluster — exactly the loss this capture exists to prevent, arriving through
@@ -358,9 +361,6 @@ def _is_late_resolution_worth_capturing(
     than at WARNING as a late arrival: the rarity the field's signal depends on
     is defended in the LOG, where the noise would otherwise be, not by dropping
     a finding on the floor.
-
-    - the incoming ``resolution`` is non-empty and DIFFERENT from the stored one
-      — an empty or byte-identical retry preserves nothing the record lacks.
 
     BOTH resolver-tier tests go through ``escalation.classify.classify_resolver_tier``
     rather than re-deriving an ``'auto-dismissed'`` literal here, so the
