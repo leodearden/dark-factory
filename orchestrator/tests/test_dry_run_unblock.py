@@ -2556,17 +2556,26 @@ class _TaskDocScheduler:
 
     ``_RecordingScheduler`` returns only ``{'metadata': ...}`` — enough for
     route resolution, which is all the fetch was ever used for.  Set
-    *get_task_error* to model a fused-memory hiccup on the fetch.
+    *get_task_error* to model a fused-memory hiccup that RAISES, or
+    *returns_none* to model the real ``scheduler.get_task``, which catches its
+    own exceptions and returns ``None`` on failure or absence.
+
+    *returns_none* is a separate flag rather than ``task_doc=None`` because the
+    ``task_doc if task_doc is not None else _TASK_DOC`` default makes ``None``
+    mean "use the default doc".
     """
 
-    def __init__(self, task_doc=None, *, get_task_error=None):
+    def __init__(self, task_doc=None, *, get_task_error=None, returns_none=False):
         self._task_doc = task_doc if task_doc is not None else _TASK_DOC
         self._get_task_error = get_task_error
+        self._returns_none = returns_none
         self.update_task = AsyncMock(return_value=True)
 
     async def get_task(self, task_id):
         if self._get_task_error is not None:
             raise self._get_task_error
+        if self._returns_none:
+            return None
         return dict(self._task_doc)
 
 
@@ -2791,4 +2800,75 @@ class TestTaskFetchFallbackIsLoud:
 
         entry = _persisted_entry(scheduler)
         assert 'task_context_unavailable' in entry, entry
+        assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-12: the DOMINANT degraded path is a falsy result, not a raise
+# ---------------------------------------------------------------------------
+
+class TestFalsyFetchIsAlsoLoud:
+    """`scheduler.get_task` is documented to return ``None`` on failure OR
+    absence, and it catches its own exceptions — so an MCP timeout, a
+    malformed reply and a deleted task all arrive as ``None``, never as a
+    raise.  Keying the loudness on the exception therefore left the dominant
+    degraded path exactly as silent as before: the prompt said
+    `_TASK_UNAVAILABLE_MARKER` while the entry said ``task_context_unavailable:
+    False``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(returns_none=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        assert '42' in matching[0].getMessage(), matching[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(returns_none=True)
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_degraded(self, tmp_path):
+        """THE COHERENCE INVARIANT — the durable form of this bug.
+
+        One investigation produces both surfaces, so they cannot disagree: if
+        the prompt tells the investigator the task record is unavailable, the
+        entry an operator reads must say the same thing.
+        """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler(returns_none=True)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_healthy(self, tmp_path):
+        """The other side of the invariant, so it cannot be satisfied by
+        stamping ``True`` unconditionally."""
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler()
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
         assert entry['task_context_unavailable'] is False, entry
