@@ -563,6 +563,22 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
+        '58434c3060da',
+        'filed',
+        'ROOT CAUSE: _file_finding_task_escalation, the orchestrator-queue '
+        'counterpart of _escalate that task 4821 added after this census '
+        'ran, is sync end to end on the loop thread -- the '
+        'is_orchestrator_live_for lock-file read, EscalationQueue\'s '
+        'mkdir, a pending-record read_text scan for the category fold, '
+        'then make_id\'s fcntl.flock and submit\'s fsync\'d write. The '
+        'flock wait is bounded only by another process\'s hold. OWNED BY '
+        'TASK 5270 -- do not file again: added to its scope 2026-09-16 '
+        'beside the _escalate cluster, whose fix shape (offload the '
+        'filer) it shares.',
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/harness.py',
+        'ReconciliationHarness._run_remediation_pass',
         'dbf8ae2eb1dc',
         'filed',
         'ROOT CAUSE (one defect, 10 rows): the sync '
