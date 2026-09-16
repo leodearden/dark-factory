@@ -886,6 +886,34 @@ Four properties, none of them cosmetic:
   widening its gc margin for no reason). `0` is the documented escape hatch; a
   non-integer or negative value is a fatal usage error, because both silent
   directions are invisible in the summary line.
+- **The bound's own VALIDATION took two cuts, and the enumeration of what it
+  rejects is the point.** The first cut was `^[0-9]+$`, copied from the sibling
+  `--critical-free-gib` guard in `warm-lane-gc-sweep.sh`. It rejects junk and
+  negatives and nothing else, and it carries a latent octal flaw that is inert
+  THERE — a bogus free-space floor makes a sweep compare against the wrong
+  number — but load-bearing HERE, because this value gates a destructive
+  branch. Measured against the first cut: `08` was ACCEPTED by the regex and
+  then read as octal by `$(( … * 86400 ))`, which dies with a raw
+  `value too great for base` that `set -e` does not abort on, leaving
+  `MAX_RECORD_AGE_SECS` unset and aborting the sweep mid-Pass-1 under `set -u`
+  — exit 1, no summary line, and lanes visited earlier already reclaimed.
+  `010` was worse because it was SILENT: accepted, and quietly meaning 8 days
+  rather than 10. `9223372036854775807` was accepted too, wrapping the multiply
+  to `-86400`, which then failed the `-gt 0` test and disabled the valve while
+  `downgraded_assigned=0` read as "nothing was stale". The shipped guard is
+  `^(0|[1-9][0-9]{0,4})$`: `0|` preserves the escape hatch exactly, a leading
+  `[1-9]` kills every leading-zero spelling, and the 5-digit cap makes 64-bit
+  overflow UNREACHABLE (largest accepted product `99999 * 86400 = 8639913600`,
+  ~9 orders of magnitude under 2^63; 99999 days is ~273 years, so the cap
+  constrains no operator). **Do not "simplify" `{0,4}` back to `+`.**
+  Rejection, not normalization: `$((10#$MAX_RECORD_AGE_DAYS))` would make `010`
+  mean 10, but the value is interpolated verbatim into the operator-facing
+  downgrade reason, so normalizing needs a second variable kept in sync or the
+  message names a different number than the one applied. A redundant backstop
+  after the multiply converts any residual arithmetic failure into exit 2 at
+  the BOUNDARY, before a lane is touched. The error names
+  `REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS` as well as the flag, because the env
+  var is a real second door into the same guard.
 - **`updated_at` reaches bash as a FOURTH global from the SAME single slurp**,
   not a second read and not the record file's mtime. `lib_lane_state.sh`'s
   header states why: the orchestrator rewrites these records on every acquire
@@ -915,8 +943,10 @@ CONSEQUENCE (the held-shut valve), not the producer. No orchestrator config
 knob was added — gc.sh is project-agnostic, and its knobs are flags plus
 `REIFY_WARM_LANE_GC_*` env vars, per every sibling.
 
-**Pinned by** Blocks S-pressure, S-age, S-age-degrade and A11 in
-`orchestrator/tests/warm-lane/test_warm_lane_gc.sh`; the fourth global by
+**Pinned by** Blocks S-pressure, S-age, S-age-degrade, A11 and A11-boundary in
+`orchestrator/tests/warm-lane/test_warm_lane_gc.sh` — A11e-A11l pin the
+validation matrix above and A11-boundary pins that a misconfigured bound
+reclaims NOTHING rather than half a pool; the fourth global by
 `orchestrator/tests/test_lane_state_lib.py::TestLaneStateReadPublishesUpdatedAt`;
 the 14-vs-7.0 ordering by the drift gate named above. **Block K5 is the other
 half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS

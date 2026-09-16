@@ -23,7 +23,20 @@
 #       (A10, task 3075); --max-record-age-days is validated and a
 #       misconfiguration is FATAL — missing value, non-integer and negative all
 #       exit 2, because a silently-defaulted or silently-zeroed bound is
-#       invisible in the summary line (A11, task 5504)
+#       invisible in the summary line (A11a-A11d, task 5504). A11e-A11l close
+#       the two doors that claim did NOT cover, both reached through a value
+#       the `^[0-9]+$` first cut ACCEPTED: a LEADING ZERO read as octal (`08`
+#       aborted the sweep mid-pass under `set -u`; `010` silently narrowed the
+#       bound to 8 days), and an OVERFLOWING magnitude that wrapped the
+#       multiply to a negative and silently disabled the valve. The env var is
+#       asserted as the second door into the same guard, and A11l is the
+#       non-vacuity case
+#   A11-boundary — the bound is validated BEFORE any lane is touched, which no
+#       Block A case can reach because A7's fixture has no lanes. Glob order
+#       puts a reclaimable lane ahead of the assigned one, so a boundary guard
+#       and a mid-pass abort are distinguishable from the first lane alone: a
+#       misconfigured bound must reclaim NOTHING and exit 2, not reclaim half a
+#       pool and die with exit 1 and no summary line (task 5504)
 #   B — reset a divergent FREE lane (seed-script invoked with resolved gen path)
 #   C — remove an orphaned-landed clean worktree
 #   D — always-reclaim (task 5326): a DIRTY POOL LANE is now RECLAIMED (reset),

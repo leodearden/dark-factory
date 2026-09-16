@@ -145,7 +145,8 @@ ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 265,  # 214 + 51 (S-pressure 17 + S-age 16 + S-age-degrade 14 + A11 4)
+    'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+                                 #           + A11 12 + A11-boundary 5)
     'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,

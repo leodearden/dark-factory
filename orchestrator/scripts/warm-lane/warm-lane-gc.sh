@@ -654,7 +654,10 @@ fi
 # tolerated:
 #   * silently DEFAULTED — an operator believes they widened the bound;
 #   * silently ZEROED    — the valve is off while `downgraded_assigned=0`
-#                          reads as "nothing was stale";
+#                          reads as "nothing was stale". Note the regex below
+#                          ACCEPTS an explicit `0`: that is the documented
+#                          escape hatch and it is not silent. What is forbidden
+#                          is ARRIVING at zero without typing it;
 #   * NEGATIVE           — `age > negative` is true for every record, so a
 #                          typo becomes a blanket downgrade of the whole pool;
 #   * LEADING ZERO       — `$(( … * 86400 ))` reads it as OCTAL. `08` dies
