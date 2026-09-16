@@ -131,8 +131,9 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      (B7a).
    - If the script overran its OWN ``before_done['timeout_secs']`` under the
      default runner (``ScriptTimeout``): file born-at-L2 ``infra_issue``, set
-     blocked — reported as a SIGKILLed script with no exit code, never as a
-     synthetic rc (task 4252).
+     blocked — reported as a SIGKILLed process group, carrying the script's
+     own exit code when the kill found it already exited and stating that
+     none was produced when it did not; never a synthetic rc (task 4252).
    - Re-inspect and verify freshness (B7b), delegated to
      ``proc_supervision.RestartPlan.execute()``'s ``FreshPidVerify`` check
      (task 2238/δ): when the pre-deploy baseline had a persistent MainPID
@@ -178,8 +179,9 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      unless ``always_escalates=True``, in which case fall through to the
      gate (act-then-ask) instead, since the script already ran.
    - ``rc != 0``, the default runner's own per-script timeout
-     (``ScriptTimeout`` — reported as a SIGKILLed script with no exit code,
-     never as a synthetic rc; task 4252), an outer wall-clock guard timeout,
+     (``ScriptTimeout`` — reported as a SIGKILLed process group, carrying an
+     exit code only when the script really produced one, never a synthetic
+     rc; task 4252), an outer wall-clock guard timeout,
      or an unexpected ``run_fn`` error: file born-at-L2 ``infra_issue``,
      return BLOCKED (parallel to B7a); ``before_done_ran_at`` is already
      stamped (I1), so the deploy is NOT re-run.
@@ -455,20 +457,40 @@ class ScriptTimeout(Exception):
     this exception TYPE — never on substring-matching the tail, which would
     misclassify any check script that merely PRINTS "timed out".
 
-    Carries the overrun budget and NOTHING else (task 4252): there is no
-    exit code and no captured output to carry, so it no longer ferries a
-    fabricated ``(rc, tail)`` pair for a caller to restore.  Every caller —
-    both deploy paths and the predicate path — owns a dedicated
-    ``except ScriptTimeout`` arm, each placed BEFORE its ``except Exception``
-    catch-all, and reports the timeout as what it was.
+    Carries the overrun budget, plus ``exit_code`` — the script's OWN exit
+    code if it had already exited before the kill, else ``None``.  Both are
+    MEASURED (task 4252 + reviewer amendment): nothing here is fabricated,
+    and no ``(rc, tail)`` pair is ferried for a caller to restore.
+    ``exit_code`` is non-``None`` in exactly the task-2090 shape —
+    ``communicate()`` waits on the merged stdout/stderr pipe, so a grandchild
+    holding its write end can time the read out AFTER the script itself
+    exited, and ``Process.returncode`` is populated by the child watcher
+    independently of ``communicate()``.  Claiming "no exit code" there would
+    be an affirmative falsehood about a script that in fact ran to
+    completion.  A signal death (negative ``returncode`` — normally the
+    teardown's own SIGKILL) and an incomplete reap both normalize to
+    ``None``: neither produced an exit code.  Captured output is never
+    carried in either case — that read was still in flight when the kill
+    fired.  Every caller — both deploy paths and the predicate path — owns a
+    dedicated ``except ScriptTimeout`` arm, each placed BEFORE its
+    ``except Exception`` catch-all, and reports the timeout as what it was.
     """
 
-    def __init__(self, timeout_secs: float) -> None:
+    def __init__(self, timeout_secs: float, exit_code: int | None = None) -> None:
         self.timeout_secs = timeout_secs
-        super().__init__(
-            f'script timed out after {timeout_secs}s and its process group '
-            f'was SIGKILLed — no exit code was produced'
-        )
+        self.exit_code = exit_code
+        if exit_code is None:
+            super().__init__(
+                f'script timed out after {timeout_secs}s and its process group '
+                f'was SIGKILLed — no exit code was produced'
+            )
+        else:
+            super().__init__(
+                f'script timed out after {timeout_secs}s: the script itself '
+                f'exited with code {exit_code}, but a process it spawned '
+                f'outlived it holding the output pipe open, so the whole '
+                f'process group was SIGKILLed'
+            )
 
 
 def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
@@ -506,14 +528,43 @@ def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
     their remaining wording is the only thing telling a human which guard
     fired.
     """
-    return [
+    lines = [
         _script_timeout_budget_line(exc, 'Deploy script'),
-        'No exit code was produced (the script never exited), and no output '
-        'was captured — the merged stdout/stderr read was still in flight '
-        'when the kill fired. The script DID run, so it may have applied '
-        'PART of its effect before being killed: inspect out-of-band before '
-        'resolving.',
     ]
+    if exc.exit_code is None:
+        lines.append(
+            'No exit code was produced — the script had not exited when the '
+            'timeout fired. No output was captured either: the merged '
+            'stdout/stderr read was still in flight when the kill fired. The '
+            'script DID run, so it may have applied PART of its effect before '
+            'being killed: inspect out-of-band before resolving.'
+        )
+    else:
+        lines.append(
+            f'The script ITSELF had already exited with code {exc.exit_code}: '
+            f'the timeout fired because a process it spawned outlived it, '
+            f'still holding the merged stdout/stderr pipe open, and that '
+            f'survivor was killed with the group. So the script ran to '
+            f'completion — but its exit code never reached the deploy '
+            f'classifier, so this deploy is NOT recorded as successful even '
+            f'when that code is 0, and no output was captured because the '
+            f'read was still in flight. Check out-of-band what the surviving '
+            f'child was and whether killing it left the effect half-applied.'
+        )
+    return lines
+
+
+def _script_timeout_summary_phrase(exc: ScriptTimeout) -> str:
+    """The parenthetical both deploy SUMMARIES carry for a ``ScriptTimeout``.
+
+    The summary is the headline a human reads first, so it must not assert
+    "no exit code" for the case where the script did produce one (see the
+    ``ScriptTimeout`` docstring).  Defined once so the two branch-distinct
+    summaries cannot come to characterise the same event differently.
+    """
+    if exc.exit_code is None:
+        return 'no exit code'
+    return f'script exited rc={exc.exit_code}, output pipe held open'
 
 
 # Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
@@ -1425,7 +1476,8 @@ class DeterministicRunner:
                 see the ``ScriptTimeout`` docstring for why it is deliberately
                 not a ``(1, tail)`` return.  Nothing translates it back into
                 one — every caller owns a dedicated ``except ScriptTimeout``
-                arm (task 4252).
+                arm (task 4252) — and it carries the script's OWN exit code
+                when the teardown found the direct child already exited.
         """
         script = before_done['script']
         args = before_done.get('args') or []
@@ -1467,10 +1519,25 @@ class DeterministicRunner:
             # dead before this frame unwinds.  `_terminate_process_tree` never
             # raises (see its docstring), so the raise below is always reached.
             await self._terminate_process_tree(proc, pgid)
+            # Reviewer amendment: the direct child may ALREADY have exited on
+            # its own.  This wait_for is on `communicate()`, which waits for
+            # the merged pipe to CLOSE, and a grandchild that inherited its
+            # write end (the case above) holds it open past the script's own
+            # exit — while the child watcher populates `returncode`
+            # independently of `communicate()`.  So an HONEST exit code can be
+            # in hand right here (measured on this tree), and discarding it to
+            # report "no exit code" would be an affirmative falsehood in
+            # exactly the scenario Layer A exists for.  A negative value is
+            # not an exit code (a signal death — normally the teardown just
+            # above), and None means the bounded reap did not complete.
+            rc = proc.returncode
             # `from None` suppresses the noisy asyncio.TimeoutError context —
-            # ScriptTimeout already carries the overrun budget as structured
-            # data (timeout_secs), so the chained cause adds nothing.
-            raise ScriptTimeout(timeout_secs) from None
+            # ScriptTimeout already carries the overrun budget and that exit
+            # code as structured data, so the chained cause adds nothing.
+            raise ScriptTimeout(
+                timeout_secs,
+                exit_code=rc if rc is not None and rc >= 0 else None,
+            ) from None
 
     async def _terminate_process_tree(
         self, proc: asyncio.subprocess.Process, pgid: int,
@@ -2964,7 +3031,10 @@ class DeterministicRunner:
             ])
             return await self._file_infra_issue_and_block(
                 task_id,
-                summary='Deploy script timed out (no exit code, no target_unit)',
+                summary=(
+                    f'Deploy script timed out '
+                    f'({_script_timeout_summary_phrase(exc)}, no target_unit)'
+                ),
                 detail=inner_timeout_detail,
                 metadata=metadata,
             )
@@ -4125,7 +4195,10 @@ class DeterministicRunner:
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
-                        summary=f'Deploy script timed out (no exit code): {target_unit}',
+                        summary=(
+                            f'Deploy script timed out '
+                            f'({_script_timeout_summary_phrase(exc)}): {target_unit}'
+                        ),
                         detail=inner_timeout_detail,
                         metadata=metadata,
                     )

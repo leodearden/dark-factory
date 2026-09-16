@@ -2822,8 +2822,9 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
 
     This class no longer pins the pre-4065 ``(rc=1, '<script timed out after
     Ns>')`` characterization.  It pins that a script SIGKILLed by its own
-    per-script timeout is reported as what it was — a script that produced NO
-    exit code — and that each deploy branch reaches its OWN dedicated
+    per-script timeout is reported as what it was — a process group killed
+    mid-read, carrying an exit code ONLY when the script actually produced
+    one — and that each deploy branch reaches its OWN dedicated
     ``except ScriptTimeout`` arm rather than degrading into ``run()``'s
     'unexpected error' catch-all.
 
@@ -2839,7 +2840,14 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
     standing between the timeout and a worse-diagnosed catch-all — and a
     single-branch pin would not catch one of them losing its arm.
 
-    The third test is a green-on-arrival companion: only the TIMEOUT wording
+    The third test covers the case the first two cannot reach: a script that
+    EXITS while a child it spawned keeps the merged output pipe open, so
+    ``communicate()`` times out with the script's REAL exit code already in
+    hand.  That is the very shape Layer A (task 2087/2090) exists for, and
+    reporting "no exit code was produced" there would swap a fabricated rc
+    for an affirmative falsehood (reviewer amendment).
+
+    The fourth is a green-on-arrival companion: only the TIMEOUT wording
     moved, and a genuine non-zero exit code is still reported verbatim.
     """
 
@@ -2917,8 +2925,11 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
         )
         assert 'rc=' not in esc.detail, (
-            f'HONESTY PIN: the process never exited, so there is NO exit code '
-            f'to report — an rc of any value here is fabricated: {esc.detail!r}'
+            f'HONESTY PIN: this script was still running when the kill fired, '
+            f'so there is NO exit code to report on THIS branch and any rc '
+            f'would be fabricated. The exited-script branch is pinned '
+            f'separately below, and does report the code it measured: '
+            f'{esc.detail!r}'
         )
         assert '<script timed out after 1s>' not in esc.detail, (
             f'HONESTY PIN: no output was captured (communicate() was cancelled '
@@ -3011,9 +3022,10 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
         )
         assert 'rc=' not in esc.detail, (
-            f'HONESTY PIN: the process never exited, so there is NO exit code '
-            f"to report — this also proves proc_supervision's \"script exit code "
-            f'rc=1\" string was never built: {esc.detail!r}'
+            f'HONESTY PIN: this script was still running when the kill fired, '
+            f'so there is NO exit code to report on THIS branch — which also '
+            f'proves proc_supervision\'s "script exit code rc=1" string was '
+            f'never built: {esc.detail!r}'
         )
         assert '<script timed out after 1s>' not in esc.detail, (
             f'HONESTY PIN: no output was captured (communicate() was cancelled '
@@ -3030,6 +3042,98 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             if c.args[1] == 'done'
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+
+    async def test_targetless_deploy_script_that_exited_reports_its_real_exit_code(
+        self, tmp_path: Path,
+    ):
+        """The reviewer-measured case: the SCRIPT exits, a child it spawned
+        keeps the merged output pipe open, and ``communicate()`` times out
+        anyway — with the script's real exit code already populated by the
+        child watcher.
+
+        This is exactly the shape Layer A (task 2087/2090) exists for:
+        ``restart-fused-memory.sh --drain`` forks grandchildren that inherit
+        the merged stdout pipe's write end.  The runner HAS an honest exit
+        code in hand here, so it must report that code rather than assert
+        "no exit code was produced" — which would replace the fabricated rc
+        this task removed with an affirmative falsehood about a script that
+        ran to completion.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'exits-but-child-lives.sh'
+        script.write_text('#!/bin/sh\nsleep 30 &\necho started\nexit 7\n')
+        script.chmod(0o755)
+
+        task = _deploy_task(
+            task_id='4252d',
+            target_unit=None,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4252d', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert esc.summary == (
+            'Deploy script timed out (script exited rc=7, output pipe held '
+            'open, no target_unit)'
+        ), (
+            f'the HEADLINE must not claim "no exit code" for a script that '
+            f'produced one — and must still be the timeout arm, not the rc\u22600 '
+            f'ladder (the exit code never reached the classifier): {esc.summary!r}'
+        )
+        assert 'per-script timeout (1s' in esc.detail, (
+            f'the detail must still name the guard that fired and the budget '
+            f'it overran: {esc.detail!r}'
+        )
+        assert 'SIGKILLed' in esc.detail, esc.detail
+        assert 'already exited with code 7' in esc.detail, (
+            f'the honest exit code is in hand at the raise site and must be '
+            f'reported, not discarded: {esc.detail!r}'
+        )
+        assert 'No exit code was produced' not in esc.detail, (
+            f'HONESTY PIN: the script DID exit and produced code 7, so this '
+            f'sentence would be an affirmative falsehood — the failure mode '
+            f'that replaces one lie with another: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' not in esc.detail, (
+            f'still no stand-in output: the read was in flight when the kill '
+            f'fired, so nothing was captured either way: {esc.detail!r}'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], (
+            'a timed-out deploy is never done, even when the script itself '
+            'exited 0 — its result never reached the classifier'
+        )
+        unit_inspector.assert_not_awaited()
 
     async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(
         self, tmp_path: Path,
@@ -4157,8 +4261,10 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
     Task 4065 / 4252 amendment: the timeout branch RAISES ``ScriptTimeout``
     instead of returning ``(1, '<script timed out after Ns>')`` — see that
-    class's docstring for why — and that exception carries ONLY the overrun
-    budget it blew, no fabricated exit code and no stand-in output.  The
+    class's docstring for why — and that exception carries only MEASURED
+    data: the overrun budget it blew, plus the script's own exit code when
+    the kill found it already exited (``None`` here, where the direct child
+    is still running).  No fabricated exit code, no stand-in output.  The
     Layer-A teardown below is unchanged and must still happen BEFORE the
     raise, so the grandchild-is-dead assertion stays exactly as it was.
     """
@@ -4167,9 +4273,12 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         """On timeout, a backgrounded grandchild must be killed too, not just
         the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        The raise carries ONLY the overrun budget as structured data (task
-        4252): a SIGKILLed script produced no exit code and no captured
-        output, so there is nothing else honest to carry.
+        The raise carries only MEASURED structured data (task 4252): the
+        overrun budget, and an ``exit_code`` that is ``None`` here because
+        this script's own process was still running when the kill fired.
+        (The exited-script case, where a surviving child holds the pipe open
+        and a real exit code IS in hand, is pinned by
+        ``TestDefaultRunnerInnerTimeoutDeployHonesty``.)
         """
         import asyncio
         import os
@@ -4208,6 +4317,12 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         exc = excinfo.value
         assert exc.timeout_secs == 1, (
             f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
+        )
+        assert exc.exit_code is None, (
+            f'the direct child was still running when the timeout fired, so '
+            f'it produced no exit code — the teardown signal that killed it '
+            f'(a negative returncode) is not one, and must normalize to None: '
+            f'{exc.exit_code!r}'
         )
         assert not hasattr(exc, 'rc'), (
             f'a SIGKILLed script produced NO exit code, so the exception must '
