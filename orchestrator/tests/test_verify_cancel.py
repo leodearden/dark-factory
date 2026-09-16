@@ -2148,6 +2148,100 @@ class TestFireWatchdogKillTriggerLine:
         assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
         assert events[-1] == ('exit', 1)
 
+    def test_default_stream_is_sys_stderr_resolved_at_call_time(self, monkeypatch):
+        """With no stderr= override the token lands on stderr — never on stdout.
+
+        The channel is load-bearing, not cosmetic: on a remote verify stdout is
+        the VerifyResult JSON transport ``verify_runner.result_from_json`` parses,
+        so a default that resolved to stdout would turn every self-kill into an
+        unparseable-result RunnerUnavailable.  Every other test here injects
+        ``stderr=``, which would leave that resolution unexecuted.  Patching
+        ``sys.stderr`` after import also pins the resolution to CALL time.
+        """
+        import sys
+
+        from orchestrator.verify_cancel import (
+            WATCHDOG_FIRE_TRIGGER_TOKEN,
+            WatchdogTrigger,
+            fire_watchdog_kill,
+        )
+
+        err_events, out_events = [], []
+        monkeypatch.setattr(sys, 'stderr', _RecordingStderr(err_events))
+        monkeypatch.setattr(sys, 'stdout', _RecordingStderr(out_events))
+
+        fire_watchdog_kill(
+            100,
+            trigger=WatchdogTrigger.EOF,
+            grace_secs=0.0,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+            sleep=lambda secs: None,
+            exit_fn=lambda code: None,
+        )
+
+        assert _written(err_events) == f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof\n'
+        assert out_events == [], f'the trigger line must never reach stdout; got {out_events!r}'
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 amend: elide_middle keeps exactly the two ends it is asked for
+#
+# ``text[-tail:]`` is ``text[0:]`` when tail is 0, so the "keep nothing from
+# this end" cell returned the WHOLE string behind a marker claiming characters
+# had been dropped — loud-over-silent inverted inside the helper that exists to
+# uphold it.  The sole call site takes the defaults, but the helper is public,
+# imported across modules, and its docstring invites tuning either end.  The
+# merge_queue tests reach it only through a formatted log record, so these are
+# the only assertions that touch the ends and the boundary directly.
+# ---------------------------------------------------------------------------
+
+
+class TestElideMiddle:
+    """elide_middle keeps the ends it is asked for and counts exactly what it dropped."""
+
+    def test_tail_zero_keeps_nothing_from_the_end(self):
+        """tail=0 is a count, not an offset: text[-0:] would keep everything."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=10, tail=0)
+
+        assert elided == 'A' * 10 + '…<90 chars elided>…'
+        assert len(elided) < 100
+
+    def test_head_zero_keeps_nothing_from_the_start(self):
+        """The other end has always been a plain forward slice; pin it so both stay honest."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=0, tail=10)
+
+        assert elided == '…<90 chars elided>…' + 'A' * 10
+
+    def test_marker_counts_exactly_the_dropped_characters(self):
+        """Everything is either kept at one end or accounted for by the marker."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('HH' + 'M' * 47 + 'TTT', head=2, tail=3)
+
+        assert elided == 'HH…<47 chars elided>…TTT'
+
+    def test_text_of_exactly_head_plus_tail_is_verbatim(self):
+        """The bound is inclusive: nothing is dropped, so no marker is added."""
+        from orchestrator.verify_cancel import elide_middle
+
+        text = 'A' * 30
+
+        assert elide_middle(text, head=10, tail=20) == text
+
+    def test_one_character_over_the_bound_elides_that_character(self):
+        """The first cell past the bound drops exactly one character and says so."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 31, head=10, tail=20)
+
+        assert elided == 'A' * 10 + '…<1 chars elided>…' + 'A' * 20
+
 
 # ---------------------------------------------------------------------------
 # Task 2308 γ step-5: start_stdin_watchdog — spawns a started daemon thread

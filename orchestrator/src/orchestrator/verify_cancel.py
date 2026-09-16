@@ -46,6 +46,18 @@ Cross-host rollout
 Both the server and the laptop host run the ``df`` checkout, so landing this
 module on ``main`` ships the cancellation contract to the laptop via its
 normal checkout sync — no separate deploy step required.
+
+Self-kill report
+----------------
+The stdin watchdog (:func:`start_stdin_watchdog`) cancels the same subtree
+when the *dispatch channel itself* dies, and — having no structured return
+path left after ``os._exit`` — reports why in one
+``WATCHDOG_FIRE_TRIGGER_TOKEN=<WatchdogTrigger>`` line on stderr.  That line
+is a wire format, so this module owns both ends of it: the tokens, and the
+:func:`elide_middle` / :data:`JOURNALD_LINE_MAX_BYTES` pair that keeps the
+token alive when the dispatcher relays a huge remote stderr into journald.
+``merge_queue.py``'s ``except RunnerUnavailable`` handler imports that pair
+from here rather than respelling the protocol at the receiving end.
 """
 
 from __future__ import annotations
@@ -60,6 +72,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
@@ -894,18 +907,23 @@ def elide_middle(text: str, *, head: int = 200, tail: int = 800) -> str:
     head and :data:`WATCHDOG_FIRE_TRIGGER_TOKEN` at its tail, with a whole
     verify's INFO logging in between.
 
+    *head* and *tail* are counts of characters to KEEP, so zero keeps nothing
+    from that end and a *text* no longer than their sum comes back verbatim.
+
     The defaults sum to 1000 characters — at most 4 KiB of UTF-8, far below
     :data:`JOURNALD_LINE_MAX_BYTES`, which is the number to check against
     before widening either end.
     """
     if len(text) <= head + tail:
         return text
-    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{text[-tail:]}'
+    # Not ``text[-tail:]``: at tail=0 that is ``text[0:]``, the whole string.
+    kept_tail = text[-tail:] if tail else ''
+    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{kept_tail}'
 
 
 def run_stdin_watchdog(
     read_fd: int,
-    on_fire,
+    on_fire: Callable[[WatchdogTrigger], None],
     *,
     heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     select_fn=select.select,
@@ -1035,7 +1053,7 @@ def start_stdin_watchdog(
     read_fd: int = 0,
     select_fn=select.select,
     read_fn=os.read,
-    fire=None,
+    fire: Callable[[WatchdogTrigger], None] | None = None,
 ) -> threading.Thread:
     """Spawn a started daemon thread running :func:`run_stdin_watchdog` against *read_fd*.
 
