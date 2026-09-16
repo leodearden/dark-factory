@@ -140,6 +140,42 @@ memory peak` and `20min 30.697s CPU time, 2.3G memory peak` — far below episod
 2's `2h 29min / 3.2G / 934.4M swap`. The wedge occurs at ordinary resource
 levels, not only in a long-lived process that has accumulated memory.
 
+### Co-factors, and why the count is not a rate
+
+`esc-5544-1` (filed by the architect after the plan froze) raises a caveat this
+frequency data needs, and it is a real one.
+
+Memory `a398ae1a` records that on 2026-08-19, **twelve concurrent `journalctl`
+processes** scanning this same unit over a 4.5GB journal burned 906% CPU — ~9
+of 32 cores, the largest single consumer on the box — several running 7-23
+minutes, driving host load 63 -> 94 -> 130. It attributes that storm to
+escalation triage by agent sessions independently re-deriving one
+investigation. Task 5544's own description notes the 12:04 episode "was
+observed live ... during the escalation drain that filed this task".
+
+This session corroborates the cost first-hand: a `--since 2026-09-13` scan of
+this unit ran **over 40 minutes at ~80% CPU and had to be abandoned**. The
+bounded 6h scan that produced the table above took 2m40s for 305,465 lines.
+
+`Hypothesis:` the blocking sites are filesystem- and subprocess-bound rather
+than CPU-bound-in-Python, so host I/O contention lengthens each one, and
+concurrent journal forensics during a drain could stretch a normally-survivable
+remediation pass into a multi-minute stall. If that holds, **episode count is
+not a stationary rate** — it is partly a function of agent triage activity, and
+the eight stalls above should be read as "at least eight on a day with triage
+activity", not as a baseline. Potentially self-reinforcing, too: diagnosing a
+wedge by streaming the unit's journal is itself load that can provoke one.
+
+What this does NOT change: the mechanism. Episode 2's SIGTERM went unserviced
+for the full 90s, which is a blocked loop regardless of host load, and a
+descheduled process would have been scheduled well inside that budget. Nor does
+it change the remedy — an I/O-bound site that is sensitive to host contention
+is an *additional* argument for getting it off the event loop.
+
+Worth noting the mitigation is already in the deliverable: the analyzer is
+stdin-driven and reads one extract rather than re-streaming the journal per
+question, which is exactly what memory `a398ae1a` recommends.
+
 ### Hypotheses disconfirmed
 
 - **Seven-orchestrator reconnect/notify load.** Episode 2 had no fleet restart
@@ -254,7 +290,9 @@ that term disappears on its own.
 
 The hardening is deliberately out of scope here (the task instructs that a
 hardening task follow only if the diagnosis finds something reproducible, and
-be scoped to what it actually shows). Filed as: **`FOLLOWUP_TICKET`**.
+be scoped to what it actually shows). Filed as ticket
+**task 5550** (ticket `tkt_0RTQQ7PT7P515J3D4FW1668RGH`, which the curator
+resolved to a created task).
 
 Scope: offload or bound the three blocking sites named above, using the remedy
 shape this codebase already establishes — `await asyncio.to_thread(...)`, as
@@ -268,3 +306,5 @@ this same class of work, and as the `NOTE (blocking I/O)` in
 - `esc-5544-2` — three plan steps stated stall magnitudes 1–2s off what the
   journal says; the tests assert the measured values.
 - `esc-5544-3` — the six additional stalls, filed when found.
+- `esc-5544-1` — the load-amplifier co-factor, weighed in “Co-factors, and why
+  the count is not a rate” above.
