@@ -5257,7 +5257,7 @@ class MemoryService:
                         tuple(reported)
                         if isinstance(reported, (list, tuple)) else ()
                     )
-            repair_stats.repairs.append(ReferentRepair(
+            record = ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,
                 outcome='repaired',
@@ -5277,7 +5277,45 @@ class MemoryService:
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
                 summaries_refreshed=refreshed,
-            ))
+            )
+            repair_stats.repairs.append(record)
+
+            if moved:
+                # THE CURE, SAID OUT LOUD. Every other disposition on this path
+                # already logs — zeta's finding, eta's refusal, its failure,
+                # the emptied-node delete — and the endpoint move, the one
+                # thing this pass exists to perform, did not. INFO matches that
+                # delete line (a strictly more destructive COMPLETED action,
+                # already at INFO), and `server/main.py` sets INFO as the
+                # deployed root level, so the line genuinely reaches syslog.
+                #
+                # GATED ON `moved` — the same discriminator
+                # `ReferentRepairStats.repaired` counts, because a `moved=False`
+                # result is `reassign_edge`'s corroborate-before-acting no-op:
+                # the edge was already correct and nothing was written, so
+                # there is no executed repair to announce. Sharing the ONE
+                # discriminator makes the line count and that property agree by
+                # construction rather than by two sites staying in lockstep.
+                #
+                # The two added keys are the only facts `record` does not hold:
+                # eta is told its scope by its CALLER (nine projects interleave
+                # in one log), and the old endpoint's NAME lives on the
+                # finding. There is deliberately no `new_endpoint_name` —
+                # `intended_referent` already IS that node's canonical
+                # `node_name`, so a second key would carry one value twice
+                # under two names. The payload is built AT the emission because
+                # `%s` defers the string rendering, never the `to_dict()` call;
+                # no `isEnabledFor` guard, unlike the verify pass's finding log,
+                # because that one runs per finding on the DOMINANT shape and
+                # this one at most once per executed repair.
+                logger.info(
+                    'Referent repair executed: %s',
+                    {
+                        **record.to_dict(),
+                        'group_id': group_id,
+                        'old_endpoint_name': finding.old_endpoint_name,
+                    },
+                )
 
     async def _backstop_endpoint_summaries(
         self, result: dict[str, Any], *, group_id: str
