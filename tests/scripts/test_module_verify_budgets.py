@@ -536,12 +536,19 @@ def test_module_carries_its_own_measured_verify_budget(
         through to ``config.verify_cold_command_timeout_secs``, NOT to the
         module's warm budget. This is exactly the misreading the sibling guard
         was written to make un-silent, and it is folded in here so every
-        parametrized module gets it for the cost of one assertion. Note what
-        that means for ``orchestrator`` specifically, whose warm budget is the
-        one sized ABOVE the root ceiling: its cold verify resolves to the ROOT
-        cold ceiling, which is BELOW its own warm budget. That is deliberate
-        and WARM-ONLY BY DESIGN — the full statement, including what it leaves
-        live, is in ``orchestrator/orchestrator.yaml``'s provenance block.
+        parametrized module gets it for the cost of one assertion. ONE module
+        is carved out of that fall-through contract: ``orchestrator`` now
+        DECLARES its own ``verify_cold_command_timeout_secs``, so for it this
+        assertion checks the RULED shape instead — that the RESOLVER returns
+        the declared value rather than the cascade shadowing it, and that the
+        value sits at or above BOTH the module's own warm budget and the fleet
+        cold ceiling, because a cold verify pays the warm cost plus
+        preprovision. Why it is declared rather than left to fall through —
+        commit 36c4c71eb4's revert condition would return the cold ceiling to
+        5400, below this module's warm budget — is stated at the definition
+        site in ``RULED_COLD_BUDGET_DECLARATIONS`` and in
+        ``orchestrator/orchestrator.yaml``'s provenance block. Every other
+        prefix keeps the fall-through contract in full.
 
     SCOPE, STATED HONESTLY — this guard's advertised reach must equal its real
     reach, because a guard that overstates itself is the same defect wearing a
