@@ -3463,11 +3463,9 @@ def create_mcp_server(
         # task 3669 / PRD leaf delta: reject a declaration the content itself
         # contradicts. Grouped with the structural argument validations above
         # and deliberately ahead of EVERY I/O-bearing gate below — the
-        # strip_markup_override pass, the recon-stage content gates, the
-        # `_premature_completion_block` live task-status lookup,
-        # `_completion_claim_gate`'s authority checks, the near-duplicate
-        # embedding round trip and write triage's judge call. This gate is a
-        # pure in-memory scan; a structurally invalid or self-contradictory
+        # `_premature_completion_block` live task-status lookup, write triage's
+        # judge call and the near-duplicate embedding round trip. This gate is
+        # a pure in-memory scan; a structurally invalid or self-contradictory
         # declaration should cost none of them.
         #
         # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
