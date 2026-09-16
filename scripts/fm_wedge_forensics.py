@@ -23,6 +23,18 @@ against a normal per-project reconciliation cadence of 61s (measured
 consecutive `Project reconciliation loop started for dark_factory` lines at
 11:58:46, 11:59:47, 12:00:48, 12:01:49, 12:02:50, 12:03:51).
 
+Usage — pipe a capture in:
+
+    journalctl --user -u fused-memory.service \\
+        --since "2026-09-16 12:03" --until "2026-09-16 12:10" \\
+        -o short-iso --no-pager | scripts/fm_wedge_forensics.py
+
+`--user` IS MANDATORY. fused-memory.service is a systemd --user unit, so a
+system-scope `journalctl -u fused-memory.service` prints "-- No entries --"
+and looks exactly like an absence of evidence. That mistake is why this
+failure went root-cause-unexamined twice, so an input in which nothing parses
+is a LOUD failure here, never a quiet "0 episodes".
+
 Read-only. Stdlib only, and deliberately importing nothing from
 `fused_memory`, `orchestrator` or `shared`: this runs in a mid-incident shell
 where fused-memory itself is the thing that is down, and must not depend on
@@ -30,9 +42,12 @@ a synced venv to say so.
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import datetime as dt
+import json
 import re
+import sys
 
 # Above the 61s normal per-project harness cadence, below the 120s shorter of
 # the two observed stalls — so it separates a stall from healthy idle with
@@ -402,3 +417,111 @@ def analyze(
             )
         )
     return episodes
+
+
+def as_dict(episode: StallEpisode) -> dict:
+    """The episode as plain JSON-able data, absences preserved as null."""
+    resources = episode.resources
+    costs = episode.costs
+    return {
+        "stall_started_at": episode.stall_started_at.isoformat(),
+        "stall_ended_at": episode.stall_ended_at.isoformat(),
+        "stall_seconds": episode.stall_seconds,
+        "outcome": episode.outcome,
+        "watchdog_verdict": episode.watchdog_verdict,
+        "pre_stall_context": list(episode.pre_stall_context),
+        "resources": dataclasses.asdict(resources) if resources else None,
+        "foreign_killed_processes": [
+            dataclasses.asdict(process) for process in episode.foreign_killed_processes
+        ],
+        "costs": {
+            **dataclasses.asdict(costs),
+            "detection_seconds": costs.detection_seconds,
+            "dominant_recovery_term": costs.dominant_recovery_term,
+        },
+    }
+
+
+def format_report(episodes: list[StallEpisode]) -> str:
+    """The same findings as --json, for a human mid-incident."""
+    if not episodes:
+        return "no stalls above the threshold in this window"
+    blocks = []
+    for number, episode in enumerate(episodes, start=1):
+        costs = episode.costs
+        lines = [
+            f"stall {number}: {episode.stall_seconds:.0f}s silent "
+            f"({episode.stall_started_at:%H:%M:%S} -> {episode.stall_ended_at:%H:%M:%S})",
+            f"  outcome          {episode.outcome} (watchdog would report "
+            f"{episode.watchdog_verdict})",
+            f"  teardown         {_show_seconds(costs.teardown_seconds)}",
+            f"  startup          {_show_seconds(costs.startup_seconds)}",
+            f"  total            {_show_seconds(costs.total_seconds)}",
+            "  detection        unavailable (logged in the orchestrator-watchdog journal)",
+        ]
+        if costs.dominant_recovery_term:
+            lines.append(f"  dominant term    {costs.dominant_recovery_term}")
+        if episode.resources:
+            lines.append(
+                f"  consumed         {episode.resources.cpu_seconds:.0f}s CPU, "
+                f"{episode.resources.memory_peak_bytes / 1024**3:.1f}G peak "
+                "(cumulative for the whole invocation, not this stall)"
+            )
+        for process in episode.foreign_killed_processes:
+            lines.append(
+                f"  still in cgroup  {process.name} (pid {process.pid}) SIGKILLed at teardown"
+            )
+        lines.append("  last lines before the silence:")
+        lines.extend(f"    {line}" for line in episode.pre_stall_context)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _show_seconds(seconds: float | None) -> str:
+    return "not measured" if seconds is None else f"{seconds:.0f}s"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Report fused-memory event-loop stalls from a journal capture on stdin. "
+            "Capture it with: journalctl --user -u fused-memory.service "
+            "--since ... --until ... -o short-iso --no-pager  "
+            "(--user is mandatory: system scope prints '-- No entries --')."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_STALL_THRESHOLD_SECONDS,
+        help="seconds of silence that count as a stall (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=DEFAULT_CONTEXT_LINES,
+        help="lines to keep from before each silence (default: %(default)s)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit the episode records as JSON")
+    args = parser.parse_args(argv)
+
+    journal_text = sys.stdin.read()
+    if not timestamped_lines(journal_text):
+        print(
+            "no journal lines parsed: every line lacked a leading short-iso timestamp. "
+            "Capture with `journalctl --user -u fused-memory.service -o short-iso` — "
+            "`--user` is mandatory, and system scope prints '-- No entries --'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    episodes = analyze(journal_text, args.threshold, args.context)
+    if args.json:
+        print(json.dumps({"episodes": [as_dict(episode) for episode in episodes]}, indent=2))
+    else:
+        print(format_report(episodes))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
