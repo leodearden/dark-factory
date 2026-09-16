@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -551,6 +551,41 @@ def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
     )
 
 
+async def _close_each(*closers: Callable[[], Awaitable[object]]) -> None:
+    """Await every *closer* in turn, then re-raise the first failure.
+
+    Independence is the entire point. These are the handles ``lifespan``
+    opened, and one that refuses to close must not take its neighbours with
+    it: the objects at stake are two writable WAL connections and a
+    ``DbPool``, and a stranded one's finaliser queues work onto a by-then
+    closed loop — the ``RuntimeError: Event loop is closed`` class
+    :func:`lifespan` documents. ``AsyncSqliteBase.close`` awaits
+    ``self._conn.close()``, so a raise here is that same incident class, not a
+    hypothetical.
+
+    Sequential rather than ``asyncio.gather``: nothing at shutdown needs the
+    concurrency, and gathering would quietly discard the order these closes
+    are written in.
+
+    ``Exception``, never ``BaseException``, matching
+    :func:`~dashboard.data.mcp_fanout.reap_detached_refreshes`: a
+    ``CancelledError`` here is the shutdown ITSELF being cancelled, and
+    carrying on through it would make teardown unkillable. Every failure is
+    logged and the first also propagates, for the reason ``lifespan`` lets a
+    failing reap propagate — a close that fails is a real defect, and out of
+    shutdown is its only route to an operator.
+    """
+    failures: list[Exception] = []
+    for closer in closers:
+        try:
+            await closer()
+        except Exception as exc:
+            logger.exception('shutdown close failed')
+            failures.append(exc)
+    if failures:
+        raise failures[0]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool.
@@ -584,14 +619,16 @@ async def lifespan(app: FastAPI):
     running event loop.
 
     **Whatever else shutdown does, the resources this lifespan OPENED are
-    closed on every exit path**, including one where a teardown step above
-    them raises.  The objects at stake are the two writable WAL connections
-    and the ``DbPool`` above: strand one and its finaliser queues work onto a
-    by-then-closed loop, the same ``RuntimeError`` this docstring already
-    describes — so a failure anywhere in teardown must not be able to cause
-    the very condition teardown exists to prevent.  Such a failure still
-    propagates: a reap that raises is a real defect, and out of shutdown is
-    its only route to an operator.
+    closed on every exit path** — one where a teardown step above them raises,
+    and equally one where an earlier CLOSE raises, which is why they go
+    through :func:`_close_each` rather than standing as a flat sequence.  The
+    objects at stake are the two writable WAL connections and the ``DbPool``
+    above: strand one and its finaliser queues work onto a by-then-closed
+    loop, the same ``RuntimeError`` this docstring already describes — so a
+    failure anywhere in teardown must not be able to cause the very condition
+    teardown exists to prevent.  Such a failure still propagates: a reap or a
+    close that raises is a real defect, and out of shutdown is its only route
+    to an operator.
     """
     # Config first: the shared client's pool bound is DERIVED from it (see
     # _build_http_limits above). DashboardConfig.from_env() has no dependency
@@ -640,10 +677,12 @@ async def lifespan(app: FastAPI):
         # unwinds into a pool that still exists.
         await reap_detached_refreshes()
     finally:
-        await burndown_store.close()
-        await metrics_store.close()
-        await pool.close_all()
-        await http_client.aclose()
+        await _close_each(
+            burndown_store.close,
+            metrics_store.close,
+            pool.close_all,
+            http_client.aclose,
+        )
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)

@@ -43,7 +43,7 @@ import pytest
 from _dashboard_helpers import apply_isolated_env, drain, wedge_one_bypass
 from fastapi import FastAPI
 
-from dashboard.app import lifespan
+from dashboard.app import _BurndownStore, lifespan
 from dashboard.data.mcp_fanout import TTLCache
 
 
@@ -192,3 +192,59 @@ class TestLifespanClosesItsResourcesEvenIfTheReapFails:
             'aclose() is LAST in that sequence, so this one observable stands '
             'for the burndown store, the metrics store and the DB pool too'
         )
+
+
+class TestLifespanClosesTheRestWhenOneCloseFails:
+    """A handle that refuses to close must not take its neighbours with it.
+
+    The ``finally`` above protects the closes from a failing REAP; it does not
+    protect them from EACH OTHER. Run as a flat sequence, a raising
+    ``burndown_store.close()`` skips the metrics store, the ``DbPool`` and the
+    shared client — and that is not a hypothetical shape:
+    ``AsyncSqliteBase.close()`` awaits ``self._conn.close()``, so a failure
+    there is the same aiosqlite/loop incident class this lifespan documents.
+    The invariant its docstring states — every resource this lifespan opened
+    is closed on every exit path — has to hold for that exit path too, or it
+    is a claim broader than the code behind it.
+    """
+
+    _CLOSE_BOOM = 'the burndown store refused to close'
+
+    async def test_a_failing_close_does_not_skip_the_closes_behind_it(
+        self, tmp_path, monkeypatch
+    ):
+        apply_isolated_env(monkeypatch, tmp_path)
+        app = FastAPI(lifespan=lifespan)
+
+        with (
+            # The FIRST close in the sequence, so every other one is behind it
+            # and a flat sequence would skip all three.
+            patch.object(
+                _BurndownStore,
+                'close',
+                autospec=True,
+                side_effect=RuntimeError(self._CLOSE_BOOM),
+            ),
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+            # Still a real defect, so it still reaches an operator.
+            pytest.raises(RuntimeError, match=self._CLOSE_BOOM),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert app.state.http_client.is_closed, (
+            'a close that raises must not skip the closes behind it. aclose() '
+            'is LAST in that sequence, so this one observable stands for the '
+            'metrics store and the DB pool too — both of which a flat '
+            'sequence would have stranded along with it'
+        )
+        # The patched-out close genuinely did not run, so this test owns the
+        # handle it left open: dropped instead, its finaliser is exactly the
+        # stranded writable WAL connection this module exists to keep out of
+        # the suite.
+        await app.state.burndown_store.close()
+
