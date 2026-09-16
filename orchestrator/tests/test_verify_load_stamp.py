@@ -614,12 +614,47 @@ class TestTheStampIsTakenOnTheRealPath:
 
     @pytest.mark.asyncio
     async def test_the_xdist_facts_ride_along(self, tmp_path, segmented):
+        """The VALUE that reached disk, not merely the key set.
+
+        The key set is satisfied by a record of two nulls, so it cannot see the
+        claim this deliverable actually rests on: that the facts are read off
+        the RENDERED command, post `-n` cap and PRE the governance wrap, so a
+        real `-n` survives. Moving `_xdist_workers(cmd, verify_env)` below
+        `_govern_cpu_str` — or resolving it at the `CheckRun`, where `cmd` is
+        already the opaque `<exec> -- /bin/bash -c '...'` string — would null
+        `n_flag` on every merge run and leave a shape assertion green. That is
+        the same seam whose `-n` cap, three lines away, WAS once silently
+        dropped.
+
+        The two labels differ for structural reasons, and both are asserted so
+        neither a blanket None nor a blanket '8' passes:
+          - test/unsegmented is `... pytest tests/ -n 8` -> '8'.
+          - test/segmented is an `&&` chain: not one pytest invocation, so
+            `_xdist_workers` rejects it rather than reporting an inner
+            segment's flag as the whole command's -> None.
+          - lint is `uv run ruff check src/`, not pytest at all -> None.
+
+        Only `n_flag` is asserted by VALUE. `auto_num_workers` is read from
+        `verify_env`, which inherits `PYTEST_XDIST_AUTO_NUM_WORKERS` from the
+        ambient environment — it is '8' on this host and absent on one that
+        does not export it — so pinning it here would assert a property of the
+        runner rather than of the code. `TestXdistWorkers` covers it against a
+        supplied env instead, which is where that value IS knowable.
+        """
         _result, summary = await _run_and_read_summary(
             tmp_path, segmented=segmented, reader=_rising_reader(),
         )
 
-        for entry in self._stamped(summary):
-            assert set(entry['load']['xdist']) == {'n_flag', 'auto_num_workers'}
+        n_flag_by_label = {'test': None if segmented else '8', 'lint': None}
+        entries = self._stamped(summary)
+        assert {e['label'] for e in entries} == set(n_flag_by_label)
+        for entry in entries:
+            xdist = entry['load']['xdist']
+            assert set(xdist) == {'n_flag', 'auto_num_workers'}
+            assert xdist['n_flag'] == n_flag_by_label[entry['label']], (
+                f"{entry['label']}: the flag on disk is not the one the "
+                f"rendered command carried"
+            )
 
     @pytest.mark.asyncio
     async def test_a_skipped_leg_contributes_no_entry(self, tmp_path, segmented):
