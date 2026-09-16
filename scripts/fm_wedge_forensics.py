@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import itertools
 
 # Above the 61s normal per-project harness cadence, below the 120s shorter of
 # the two observed stalls — so it separates a stall from healthy idle with
@@ -42,6 +41,30 @@ import itertools
 DEFAULT_STALL_THRESHOLD_SECONDS = 90.0
 
 
+# How a stall ENDED, and what it says about the loop.
+#
+# asyncio installs its signal handlers ON the event loop, so servicing SIGTERM
+# is itself proof the loop ran. A process that never services it for the whole
+# stop timeout therefore had a BLOCKED loop, not a merely descheduled one — a
+# descheduled process is scheduled and exits well inside that budget.
+SIGTERM_UNSERVICED = "sigterm-unserviced"
+STOPPED_ON_SIGNAL = "stopped-on-signal"
+SELF_RECOVERED = "self-recovered"
+
+# scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict's own words,
+# reused verbatim so this output collates with its journal lines instead of
+# needing a translation step. 'wedged' is port-open-but-/alive-unanswered;
+# 'port-down' is the socket gone.
+WEDGED = "wedged"
+PORT_DOWN = "port-down"
+
+_SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
+_STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
+# A stall that BEGINS here began with the unit already down, so its socket was
+# unbound and a watchdog probe would have seen 'port-down' rather than 'wedged'.
+_UNIT_DOWN_MARKERS = ("Stopped fused-memory", "Main process exited", "with signal SIGKILL")
+
+
 @dataclasses.dataclass(frozen=True)
 class StallEpisode:
     """One window in which the unit emitted nothing at all.
@@ -49,14 +72,42 @@ class StallEpisode:
     Bounded by real log lines on both sides: *stall_started_at* is the last
     line before the silence and *stall_ended_at* the first line after it, so
     the duration is measured rather than inferred from any configured timeout.
+
+    *aftermath* is every line from the end of the stall up to the next stall
+    (or the end of the capture) — the evidence for how this one resolved.
     """
 
     stall_started_at: dt.datetime
     stall_ended_at: dt.datetime
+    last_line_before_stall: str
+    aftermath: tuple[str, ...]
 
     @property
     def stall_seconds(self) -> float:
         return (self.stall_ended_at - self.stall_started_at).total_seconds()
+
+    @property
+    def outcome(self) -> str:
+        """Whether the loop was still blocked when systemd tried to stop it."""
+        if any(marker in line for line in self.aftermath for marker in _SIGKILL_MARKERS):
+            return SIGTERM_UNSERVICED
+        if any(marker in line for line in self.aftermath for marker in _STOP_MARKERS):
+            return STOPPED_ON_SIGNAL
+        return SELF_RECOVERED
+
+    @property
+    def watchdog_verdict(self) -> str:
+        """The verdict orchestrator-watchdog.py's probe would have returned
+        DURING this stall.
+
+        A stall that begins while the unit is running leaves the listening
+        socket bound, so the port probe passes and only the /alive fetch —
+        served by the same blocked loop — fails: that is 'wedged'. A gap that
+        begins after the unit is already down is 'port-down' instead.
+        """
+        if any(marker in self.last_line_before_stall for marker in _UNIT_DOWN_MARKERS):
+            return PORT_DOWN
+        return WEDGED
 
 
 def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
@@ -88,8 +139,20 @@ def analyze(
 ) -> list[StallEpisode]:
     """Report every silence longer than *stall_threshold_seconds*, in order."""
     lines = timestamped_lines(journal_text)
+    starts = [
+        index
+        for index in range(1, len(lines))
+        if (lines[index][0] - lines[index - 1][0]).total_seconds() > stall_threshold_seconds
+    ]
     episodes = []
-    for (before, _), (after, _) in itertools.pairwise(lines):
-        if (after - before).total_seconds() > stall_threshold_seconds:
-            episodes.append(StallEpisode(stall_started_at=before, stall_ended_at=after))
+    for position, index in enumerate(starts):
+        next_stall = starts[position + 1] - 1 if position + 1 < len(starts) else len(lines)
+        episodes.append(
+            StallEpisode(
+                stall_started_at=lines[index - 1][0],
+                stall_ended_at=lines[index][0],
+                last_line_before_stall=lines[index - 1][1],
+                aftermath=tuple(line for _, line in lines[index:next_stall]),
+            )
+        )
     return episodes
