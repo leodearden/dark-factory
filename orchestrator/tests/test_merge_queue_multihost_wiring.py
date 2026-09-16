@@ -1563,6 +1563,100 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
 
 @pytest.mark.asyncio
+class TestRunnerUnavailableWarningIsAttributable:
+    """The remote-runner-unavailable WARNING names the host and carries the reason (task 4194).
+
+    Today the line logs only task_id and merge_commit[:8] and discards
+    str(exc) — the only field separating `exited 1` (the remote watchdog
+    killed itself) from `exited 255` (the transport died) — even though the
+    same string is stored as ``reason`` on the returned result eight lines
+    later.  So a re-dispatch names neither the machine it abandoned nor why.
+    Nor does the escalation path cover for it: ``_alarm_verify_host_unreachable``
+    is gated on a streak or 600s of continuous unreachability, which a single
+    spurious self-kill never crosses — its 120s reprobe succeeds and resets
+    the streak.  This WARNING is the only place the class becomes countable.
+    """
+
+    HOST = 'leo-laptop'
+
+    async def _drive_ru(self, tmp_path, caplog, reason):
+        """Raise RunnerUnavailable(*reason*) from a REMOTE lease; return (result, records)."""
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        config = _make_config()
+        item = RealMergeItem(
+            request=_make_merge_request(config, task_files=[], worktree=tmp_path),
+            merge_result=merge_result,
+            merge_wt=tmp_path / 'merge-wt',
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — the only kind that can raise RunnerUnavailable.
+        fake_runner = MagicMock()
+        fake_runner.name = self.HOST
+        fake_runner.is_local = False
+        lease = HostLease(name=self.HOST, runner=fake_runner, is_local=False)
+
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable(reason)
+
+        with (
+            patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        ):
+            result = await worker._run_inflight_verify(item, lease)
+
+        records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'remote runner unavailable' in r.message
+        ]
+        return result, records
+
+    async def test_warning_names_the_host(self, tmp_path, caplog):
+        """The abandoned machine is named, so a re-dispatch is attributable to a host."""
+        reason = 'ssh leo-laptop exited 255: connection reset'
+        result, records = await self._drive_ru(tmp_path, caplog, reason)
+
+        assert len(records) == 1, f'expected exactly one warning; got {records!r}'
+        assert self.HOST in records[0].message
+        assert result.status == 'RUNNER_UNAVAILABLE'
+
+    async def test_warning_carries_the_ssh_rc(self, tmp_path, caplog):
+        """The rc-bearing reason reaches journald without waiting for the escalation threshold."""
+        reason = 'ssh leo-laptop exited 255: connection reset'
+        result, records = await self._drive_ru(tmp_path, caplog, reason)
+
+        assert len(records) == 1
+        assert 'exited 255' in records[0].message
+        # The stored reason stays FULL — _quarantine_unreachable_host reads it.
+        assert result.reason == reason
+
+    async def test_warning_distinguishes_a_self_kill_from_a_transport_death(
+        self, tmp_path, caplog
+    ):
+        """A watchdog self-kill reads as one, end to end — the signal this task exists for."""
+        reason = (
+            'ssh leo-laptop exited 1: [INFO] running cargo test\n'
+            'watchdog_fire_trigger=heartbeat_starvation\n'
+        )
+        result, records = await self._drive_ru(tmp_path, caplog, reason)
+
+        assert len(records) == 1
+        assert 'exited 1' in records[0].message
+        assert 'watchdog_fire_trigger=heartbeat_starvation' in records[0].message
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.reason == reason
+
+
+@pytest.mark.asyncio
 class TestRunInflightVerifyRunnerUnavailableSpecWarm:
     """The RU sentinel carries spec_warm, not just merge_wt (task 3251 amend).
 
