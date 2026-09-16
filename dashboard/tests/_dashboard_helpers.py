@@ -7,12 +7,13 @@ the same process.
 
 from __future__ import annotations
 
+import asyncio
 import html.parser
 import json
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,6 +161,80 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Detached bypass-refresh wedging (task 5185)
+#
+# ONE definition of "put a genuinely in-flight bypass refresh on a TTLCache",
+# shared by test_mcp_fanout.py (the reaper's own unit tests) and
+# test_app_lifespan_reap.py (the lifespan that calls the reaper).  The idiom
+# reaches into TTLCache's bypass bookkeeping -- ``_locks``, ``_bypass_tasks``
+# -- which is exactly why it is confined to one place: when that bookkeeping
+# moves there is a single definition to re-verify, not one copy per test
+# module drifting apart from the other.
+# ---------------------------------------------------------------------------
+
+
+def never_resolving_refresh() -> tuple[Callable[[], Awaitable[Any]], asyncio.Event]:
+    """Build a refresh stub that enters, signals, and then never resolves.
+
+    A genuinely unresolved ``asyncio.Event``, never a sleep: a sleeping stub
+    finishes on its own account and so proves nothing about whether the thing
+    under test ended it.  Returns ``(refresh, entered)``, where *entered*
+    fires once the refresh body is actually running.
+    """
+    entered = asyncio.Event()
+    wedged = asyncio.Event()
+
+    async def _refresh() -> Any:
+        entered.set()
+        await wedged.wait()  # never set -- genuinely unresolved
+        raise AssertionError('unreachable: the wedged event is never set')
+
+    return _refresh, entered
+
+
+async def wedge_one_bypass(
+    cache: Any,
+    key: str = 'k',
+    refresh_and_entered: tuple[Callable[[], Awaitable[Any]], asyncio.Event] | None = None,
+) -> tuple[asyncio.Task[Any], asyncio.Task[Any]]:
+    """Put exactly one genuinely in-flight bypass task on *cache* for *key*.
+
+    Holds *key*'s lock so the caller's bounded acquisition times out and it
+    takes the bypass path -- the REAL public route, through
+    ``TTLCache.get_or_refresh`` -- then waits until the bypass refresh has
+    actually been ENTERED, not merely scheduled, so the task is in flight by
+    construction rather than by timing luck.  Callers monkeypatch
+    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` down first so that bounded
+    wait is quick.
+
+    *refresh_and_entered* substitutes any other ``(refresh, entered)`` pair of
+    the same shape for the parked-forever default, which is how a test can
+    vary only how a refresh ENDS while reusing this wedging idiom rather than
+    re-deriving it.
+
+    Returns ``(bypass_task, caller_task)``.  The caller is parked on the
+    shielded bypass and never returns on its own; hand it to :func:`drain`
+    once the assertions are done.
+    """
+    refresh, entered = refresh_and_entered or never_resolving_refresh()
+    lock = cache._locks.setdefault(key, asyncio.Lock())
+    await lock.acquire()
+    try:
+        caller = asyncio.create_task(cache.get_or_refresh(key, refresh))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+    finally:
+        lock.release()
+    return cache._bypass_tasks[key][1], caller
+
+
+async def drain(*tasks: asyncio.Task[Any]) -> None:
+    """Cancel and await every still-pending task, swallowing its outcome."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------

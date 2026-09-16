@@ -40,7 +40,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import apply_isolated_env
+from _dashboard_helpers import apply_isolated_env, drain, wedge_one_bypass
 from fastapi import FastAPI
 
 from dashboard.app import lifespan
@@ -51,44 +51,7 @@ class TestLifespanReapsDetachedBypassRefreshes:
     """A bypass refresh must not survive the lifespan that spawned it."""
 
     @staticmethod
-    def _never_resolving_refresh():
-        """Refresh stub that enters, signals, and then never resolves.
-
-        The idiom ``test_mcp_fanout.py``'s bounded-acquisition classes use: a
-        genuinely unresolved ``asyncio.Event``, never a sleep — a sleeping stub
-        would eventually finish on its own and prove nothing about reaping.
-        """
-        entered = asyncio.Event()
-        wedged = asyncio.Event()
-
-        async def _refresh():
-            entered.set()
-            await wedged.wait()  # never set
-            raise AssertionError('unreachable: the wedged event is never set')
-
-        return _refresh, entered
-
-    @classmethod
-    async def _wedge_one_bypass(cls, cache, key='k'):
-        """Put one genuinely in-flight bypass on *cache*, via the real public path.
-
-        Holds *key*'s lock so the caller's bounded acquisition times out into
-        the bypass path, and waits until the refresh has actually been ENTERED
-        before returning. Returns ``(bypass_task, caller_task)``; the caller is
-        parked on the shielded bypass and never returns on its own.
-        """
-        refresh, entered = cls._never_resolving_refresh()
-        lock = cache._locks.setdefault(key, asyncio.Lock())
-        await lock.acquire()
-        try:
-            caller = asyncio.create_task(cache.get_or_refresh(key, refresh))
-            await asyncio.wait_for(entered.wait(), timeout=5.0)
-        finally:
-            lock.release()
-        return cache._bypass_tasks[key][1], caller
-
-    @classmethod
-    async def _run_lifespan_around_one_detached_bypass(cls, tmp_path, monkeypatch):
+    async def _run_lifespan_around_one_detached_bypass(tmp_path, monkeypatch):
         """Run one full lifespan with a wedged bypass in flight inside it.
 
         Returns ``(bypass_task, observed)``. ``observed`` records what was true
@@ -133,14 +96,13 @@ class TestLifespanReapsDetachedBypassRefreshes:
         ):
             cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
             async with lifespan(FastAPI(lifespan=lifespan)):
-                wedged['bypass'], caller = await cls._wedge_one_bypass(cache)
+                wedged['bypass'], caller = await wedge_one_bypass(cache)
                 assert not wedged['bypass'].done(), (
                     'precondition: the bypass is genuinely in flight when the '
                     'lifespan begins shutting down'
                 )
 
-        caller.cancel()
-        await asyncio.gather(caller, return_exceptions=True)
+        await drain(caller)
         assert observed, 'lifespan never closed the client it constructed'
         return wedged['bypass'], observed
 

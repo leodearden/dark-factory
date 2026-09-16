@@ -20,6 +20,7 @@ import types
 
 import httpx
 import pytest
+from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
 
 from dashboard.data.mcp_fanout import TTLCache, first_success
 
@@ -2719,59 +2720,14 @@ class TestTTLCacheDetachedRefreshReaping:
     when the next test file starts.
 
     These tests pin the shutdown hook the app's ``lifespan`` will call. They
-    build a genuinely in-flight bypass with the idiom
-    ``TestTTLCacheBoundedLockAcquisition`` established — the module bound
-    monkeypatched down plus a refresh parked on a never-set ``asyncio.Event``
-    — so no real network and no sleep-based timing is involved.
+    build a genuinely in-flight bypass with ``_dashboard_helpers``'
+    :func:`wedge_one_bypass` — the idiom ``TestTTLCacheBoundedLockAcquisition``
+    established, the module bound monkeypatched down plus a refresh parked on a
+    never-set ``asyncio.Event`` — so no real network and no sleep-based timing
+    is involved. It lives there rather than here because
+    ``test_app_lifespan_reap.py`` wedges the same way against the same
+    bookkeeping, and two copies of a reach into ``TTLCache``'s internals drift.
     """
-
-    @staticmethod
-    def _never_resolving_refresh():
-        """Refresh stub that enters, signals, and then never resolves."""
-        entered = asyncio.Event()
-        wedged = asyncio.Event()
-
-        async def _refresh():
-            entered.set()
-            await wedged.wait()  # never set — genuinely unresolved
-            raise AssertionError('unreachable: the wedged event is never set')
-
-        return _refresh, entered
-
-    @classmethod
-    async def _wedge_one_bypass(cls, cache, key='k', refresh_and_entered=None):
-        """Put exactly one genuinely in-flight bypass task on *cache* for *key*.
-
-        Holds *key*'s lock so the caller's bounded acquisition times out and
-        it takes the bypass path, then waits until the bypass refresh has
-        actually been ENTERED — not merely scheduled — before returning, so
-        the task is in flight by construction rather than by timing luck.
-
-        *refresh_and_entered* substitutes any other ``(refresh, entered)``
-        pair of the same shape for the parked-forever default, which is how
-        the hostile-unwind class below varies only how a reaped refresh ENDS
-        while reusing this wedging idiom rather than re-deriving it.
-
-        Returns ``(bypass_task, caller_task)``. The caller is parked on the
-        shielded bypass and never returns on its own; hand it to
-        :meth:`_drain` once the reaping assertions are done.
-        """
-        refresh, entered = refresh_and_entered or cls._never_resolving_refresh()
-        lock = cache._locks.setdefault(key, asyncio.Lock())
-        await lock.acquire()
-        try:
-            caller = asyncio.create_task(cache.get_or_refresh(key, refresh))
-            await asyncio.wait_for(entered.wait(), timeout=5.0)
-        finally:
-            lock.release()
-        return cache._bypass_tasks[key][1], caller
-
-    @staticmethod
-    async def _drain(*tasks):
-        """Cancel and await every still-pending task, swallowing its outcome."""
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_a_new_cache_is_reachable_from_the_module_registry(self):
         """Enrolment is automatic, so coverage cannot drift as caches are added.
@@ -2797,7 +2753,7 @@ class TestTTLCacheDetachedRefreshReaping:
 
         monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
-        bypass, caller = await self._wedge_one_bypass(cache, 'k')
+        bypass, caller = await wedge_one_bypass(cache, 'k')
         assert not bypass.done(), 'precondition: the bypass is genuinely in flight'
 
         reaped = await fanout_mod.reap_detached_refreshes()
@@ -2813,7 +2769,7 @@ class TestTTLCacheDetachedRefreshReaping:
         assert cache._live_bypasses == {}, 'the resource roster must be emptied'
         assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
 
-        await self._drain(caller)
+        await drain(caller)
 
     async def test_reap_is_a_no_op_when_nothing_is_in_flight(self):
         """The common case — an app that shuts down cleanly — must be silent."""
@@ -2848,7 +2804,7 @@ class TestTTLCacheReapSurvivesAHostileUnwind:
     def _refresh_that_raises_while_unwinding():
         """Refresh stub that enters, parks, then raises NON-cancellation on cancel.
 
-        Deliberately the same shape as ``_never_resolving_refresh`` — enters,
+        Deliberately the same shape as ``never_resolving_refresh`` — enters,
         signals, never resolves — differing only in how it ends once
         cancelled. Returns ``(refresh, entered_event)``.
         """
@@ -2872,15 +2828,14 @@ class TestTTLCacheReapSurvivesAHostileUnwind:
 
         monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
-        wedge = TestTTLCacheDetachedRefreshReaping._wedge_one_bypass
 
         # Hostile first: the roster is built in key-insertion order, so this
         # is the ordering under which a reaper that stops at the first raiser
         # abandons a neighbour it has already cancelled.
-        hostile, hostile_caller = await wedge(
+        hostile, hostile_caller = await wedge_one_bypass(
             cache, 'hostile', self._refresh_that_raises_while_unwinding()
         )
-        polite, polite_caller = await wedge(cache, 'polite')
+        polite, polite_caller = await wedge_one_bypass(cache, 'polite')
         assert not hostile.done() and not polite.done(), (
             'precondition: both bypasses are genuinely in flight'
         )
@@ -2903,7 +2858,7 @@ class TestTTLCacheReapSurvivesAHostileUnwind:
         assert cache._live_bypasses == {}, 'the resource roster must be emptied'
         assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
 
-        await TestTTLCacheDetachedRefreshReaping._drain(hostile_caller, polite_caller)
+        await drain(hostile_caller, polite_caller)
 
 
 class TestTTLCacheReapIsScopedToTheRunningLoop:
@@ -2948,9 +2903,7 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
 
         def _drive_a_short_lived_loop():
             async def _seed():
-                refresh, entered = (
-                    TestTTLCacheDetachedRefreshReaping._never_resolving_refresh()
-                )
+                refresh, entered = never_resolving_refresh()
                 task = cache._start_bypass(key, refresh, lambda v: True)
                 await asyncio.wait_for(entered.wait(), timeout=5.0)
                 return task
@@ -2982,9 +2935,7 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         foreign = self._seed_bypass_on_a_closed_loop(cache, 'from-a-dead-loop')
-        mine, caller = await TestTTLCacheDetachedRefreshReaping._wedge_one_bypass(
-            cache, 'on-this-loop'
-        )
+        mine, caller = await wedge_one_bypass(cache, 'on-this-loop')
         assert foreign.get_loop() is not asyncio.get_running_loop()
         assert not foreign.done(), 'precondition: the stranded task is still pending'
 
@@ -3009,7 +2960,7 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
         # The dead loop's residue must not pin the key against the live cap.
         assert cache._live_bypasses == {}
 
-        await TestTTLCacheDetachedRefreshReaping._drain(caller)
+        await drain(caller)
 
 
 class TestReapIsolatesEachCache:
@@ -3058,9 +3009,7 @@ class TestReapIsolatesEachCache:
             'precondition: the exploding subclass enrols through the same '
             'TTLCache.__init__ as any other cache'
         )
-        bypass, caller = await TestTTLCacheDetachedRefreshReaping._wedge_one_bypass(
-            healthy, 'k'
-        )
+        bypass, caller = await wedge_one_bypass(healthy, 'k')
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
             reaped = await fanout_mod.reap_detached_refreshes()
@@ -3095,4 +3044,4 @@ class TestReapIsolatesEachCache:
         )
         assert '1' in summaries[0].getMessage()
 
-        await TestTTLCacheDetachedRefreshReaping._drain(caller)
+        await drain(caller)
