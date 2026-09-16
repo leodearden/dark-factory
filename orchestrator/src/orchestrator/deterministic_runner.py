@@ -129,6 +129,10 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    - Run the deploy script to completion (``script_runner``, blocking).
    - If ``rc != 0``: file born-at-L2 ``infra_issue`` escalation, set blocked
      (B7a).
+   - If the script overran its OWN ``before_done['timeout_secs']`` under the
+     default runner (``ScriptTimeout``): file born-at-L2 ``infra_issue``, set
+     blocked — reported as a SIGKILLed script with no exit code, never as a
+     synthetic rc (task 4252).
    - Re-inspect and verify freshness (B7b), delegated to
      ``proc_supervision.RestartPlan.execute()``'s ``FreshPidVerify`` check
      (task 2238/δ): when the pre-deploy baseline had a persistent MainPID
@@ -173,10 +177,12 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      ``new_state``, ``pid=0`` — the same helper the named-target path uses)
      unless ``always_escalates=True``, in which case fall through to the
      gate (act-then-ask) instead, since the script already ran.
-   - ``rc != 0``, an outer wall-clock guard timeout, or an unexpected
-     ``run_fn`` error: file born-at-L2 ``infra_issue``, return BLOCKED
-     (parallel to B7a); ``before_done_ran_at`` is already stamped (I1), so
-     the deploy is NOT re-run.
+   - ``rc != 0``, the default runner's own per-script timeout
+     (``ScriptTimeout`` — reported as a SIGKILLed script with no exit code,
+     never as a synthetic rc; task 4252), an outer wall-clock guard timeout,
+     or an unexpected ``run_fn`` error: file born-at-L2 ``infra_issue``,
+     return BLOCKED (parallel to B7a); ``before_done_ran_at`` is already
+     stamped (I1), so the deploy is NOT re-run.
    Named-target genuine-wedge detection (the baseline/verify logic above)
    is entirely unchanged — this sub-path is reached only when
    ``target_unit`` itself is falsy.
@@ -449,10 +455,11 @@ class ScriptTimeout(Exception):
     this exception TYPE — never on substring-matching the tail, which would
     misclassify any check script that merely PRINTS "timed out".
 
-    ``rc``/``tail`` carry the legacy pair as structured data so the deploy
-    seam wrapper can restore the pre-4065 return value verbatim (the deploy
-    classifiers have no verdict semantics — every non-zero rc there already
-    routes to ``infra_issue``, so nothing there needed to change).
+    Nothing restores a legacy ``(rc, tail)`` pair any more (task 4252).
+    Both deploy paths report the timeout as what it was — a SIGKILLed script
+    that produced no exit code — from their own dedicated
+    ``except ScriptTimeout`` arms, each placed BEFORE its ``except Exception``
+    catch-all.  The ``rc``/``tail`` attributes below are consumed by nothing.
     """
 
     def __init__(self, timeout_secs: float) -> None:
@@ -460,6 +467,36 @@ class ScriptTimeout(Exception):
         self.rc = 1
         self.tail = f'<script timed out after {timeout_secs}s>'
         super().__init__(self.tail)
+
+
+def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
+    """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
+
+    Shared so the two deploy branches cannot come to say different things
+    about the same event — the anti-drift property
+    ``_invoke_run_fn_translating_timeout`` supplied for this case until it
+    stopped catching the exception (task 4252).
+
+    See the ``ScriptTimeout`` docstring for WHY a timed-out script is an
+    infra fault rather than a ``(rc, tail)`` return; it stays the single
+    canonical explanation and this helper does not restate it.
+
+    Deliberately NOT extended to ``_run_predicate``'s own ``ScriptTimeout``
+    arm: all three predicate infra arms share one category, so their wording
+    is the only thing telling a human which guard fired, and that path's
+    summary is separately pinned.
+    """
+    return [
+        f'Deploy script exceeded its own per-script timeout '
+        f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
+        f'process group was SIGKILLed.',
+        'No exit code was produced (the script never exited), and no output '
+        'was captured — the merged stdout/stderr read was still in flight '
+        'when the kill fired. The script DID run, so it may have applied '
+        'PART of its effect before being killed: inspect out-of-band before '
+        'resolving.',
+    ]
+
 
 # Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
 # call — a parallel latent-hang gap to task 2090, which only wraps the
@@ -1368,9 +1405,9 @@ class DeterministicRunner:
                 and its whole process group was SIGKILLed (task 2090 Layer A
                 runs FIRST, before the raise).  An infra fault, not a verdict;
                 see the ``ScriptTimeout`` docstring for why it is deliberately
-                not a ``(1, tail)`` return.  Deploy callers are unaffected —
-                ``_invoke_run_fn_translating_timeout`` restores the legacy pair
-                from ``exc.rc``/``exc.tail``.
+                not a ``(1, tail)`` return.  Nothing translates it back into
+                one — every caller owns a dedicated ``except ScriptTimeout``
+                arm (task 4252).
         """
         script = before_done['script']
         args = before_done.get('args') or []
@@ -2826,21 +2863,21 @@ class DeterministicRunner:
         direct invocation below) so the translation logic cannot drift
         between the two copies.
 
-        Task 4065: also converts the default runner's ``ScriptTimeout`` back
-        into the legacy ``(1, '<script timed out after Ns>')`` pair, so the
-        DEPLOY classifiers see byte-for-byte what they saw before that
-        exception existed.  Unlike the γ-predicate path they have no
-        milestone-verdict semantics to protect — every non-zero rc there
-        already routes to ``_file_infra_issue_and_block`` (target_unit-less)
-        or ``RESTART_FAILED`` -> the same (named target).  Restoring the pair
-        HERE, once, rather than at each deploy call site, keeps the anti-drift
-        property this helper exists for; both branches are pinned by
-        ``TestDefaultRunnerInnerTimeoutDeployParity``.
+        Task 4252: this wrapper must NOT catch the default runner's
+        ``ScriptTimeout``.  It used to convert it back into the legacy
+        ``(1, '<script timed out after Ns>')`` pair, which handed both deploy
+        classifiers an exit code the script never produced.  It now
+        propagates untouched (deliberately not a ``TimeoutError`` subclass,
+        so the translation below cannot swallow it) to a dedicated arm in
+        EACH deploy branch — the arm has to live where ``task_id`` /
+        ``description`` / ``metadata`` are in scope to file the escalation,
+        which is not here.  The anti-drift property this helper exists for is
+        preserved for the timeout case by the shared
+        ``_script_timeout_fact_lines``; both branches are pinned by
+        ``TestDefaultRunnerInnerTimeoutDeployHonesty``.
         """
         try:
             return await run_fn(before_done)
-        except ScriptTimeout as exc:
-            return exc.rc, exc.tail
         except TimeoutError as exc:
             raise RuntimeError(
                 f'run_fn raised TimeoutError internally (not the '
@@ -2857,8 +2894,10 @@ class DeterministicRunner:
         metadata: dict | None,
     ) -> tuple[int, str] | WorkflowOutcome:
         """Run a ``before_done`` deploy script under the Layer-B outer
-        wall-clock guard, mapping a timeout / unexpected error / non-zero
-        exit to an already-filed born-at-L2 ``infra_issue`` + ``BLOCKED``.
+        wall-clock guard, mapping an outer-guard timeout / the default
+        runner's own inner per-script timeout (``ScriptTimeout``) /
+        an unexpected error / a non-zero exit to an already-filed born-at-L2
+        ``infra_issue`` + ``BLOCKED``.
 
         Returns ``(rc, tail)`` ONLY on a successful (``rc == 0``) run — a
         caller never needs to re-check ``rc``.  Any other outcome returns
@@ -2894,6 +2933,23 @@ class DeterministicRunner:
                 task_id,
                 summary='Deploy run exceeded outer guard (no target_unit)',
                 detail=timeout_detail,
+                metadata=metadata,
+            )
+        except ScriptTimeout as exc:
+            # The default runner's own per-script guard fired (see the
+            # ScriptTimeout docstring for the classification).  MUST precede
+            # the catch-all below, which would otherwise mislabel it as an
+            # 'unexpected error' — same category, materially worse diagnostics.
+            inner_timeout_detail = '\n'.join([
+                description,
+                note,
+                *_script_timeout_fact_lines(exc),
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy script timed out (no exit code, no target_unit)',
+                detail=inner_timeout_detail,
                 metadata=metadata,
             )
         except Exception as exc:
@@ -3943,6 +3999,12 @@ class DeterministicRunner:
                     # here) instead of a local copy, so this branch and the
                     # target_unit-less branch's _run_deploy_script_guarded
                     # cannot drift apart (task 2632 review amendment).
+                    #
+                    # Task 4252: a ScriptTimeout from run_fn deliberately is
+                    # NOT translated here — it propagates out of this shim,
+                    # through plan.execute() (which wraps nothing), to run()'s
+                    # own dedicated arm below.  That is why the arm must
+                    # precede that try's `except Exception` catch-all.
                     rc, tail = await self._invoke_run_fn_translating_timeout(run_fn, before_done)
                     return _RunFnProcShim(rc, tail)
 
@@ -4027,6 +4089,28 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy run+verify exceeded outer guard: {target_unit}',
                         detail=timeout_detail,
+                        metadata=metadata,
+                    )
+                except ScriptTimeout as exc:
+                    # The default runner's own per-script guard fired inside
+                    # _shim_runner and propagated out of plan.execute()
+                    # untouched (see the ScriptTimeout docstring for the
+                    # classification).  MUST precede the catch-all below,
+                    # which would otherwise mislabel it as an 'unexpected
+                    # error' — same category, materially worse diagnostics.
+                    inner_timeout_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        *_script_timeout_fact_lines(exc),
+                        'The post-deploy fresh-PID verify never ran, so the unit state '
+                        'after the kill is unobserved — check it out-of-band (e.g. '
+                        'systemctl --user status) before resolving.',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy script timed out (no exit code): {target_unit}',
+                        detail=inner_timeout_detail,
                         metadata=metadata,
                     )
                 except Exception as exc:
