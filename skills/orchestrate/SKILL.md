@@ -347,6 +347,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
+| `merge_deep.chain_cap` — the deep merge-ahead chain cap; `0` is the shipped default and the kill switch (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 
