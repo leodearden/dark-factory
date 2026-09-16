@@ -219,7 +219,9 @@ def _rewind_chain(harness: Harness, secs: float) -> None:
     Rewinding the harness's stamp, never monkeypatching ``time.monotonic``: the
     rewind is deterministic and perturbs no unrelated timer.
     """
-    _set_chain_stamp(harness, _chain_stamp(harness) - secs)
+    stamp = _chain_stamp(harness)
+    assert stamp is not None, 'no chain in progress — nothing to rewind'
+    _set_chain_stamp(harness, stamp - secs)
 
 
 def _recorded_failures(harness: Harness) -> list:
@@ -261,7 +263,7 @@ async def _drive_session_slot(
         )
         MockWorkflow.return_value = mock_wf
         await harness._run_slot(assignment, sem)
-        harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs
+        harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs  # type: ignore[attr-defined]
         return MockWorkflow.call_args.kwargs['resume_session_id']
 
 
@@ -3995,7 +3997,7 @@ class TestSessionResumeStorm:
             harness, 'sink1', self._fresh_session('uuid-sink'), config_dir=cfg,
         )
 
-        kwargs = harness._last_build_workflow_kwargs
+        kwargs = harness._last_build_workflow_kwargs  # type: ignore[attr-defined]
         assert kwargs['resume_outcome_sink'] is harness
 
     async def test_the_shipped_window_admits_the_population_that_exists(

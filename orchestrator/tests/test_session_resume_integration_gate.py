@@ -485,8 +485,15 @@ def _arm_storm_queue(harness: Harness) -> MagicMock:
 
 
 def _filed(harness: Harness) -> list:
-    """Every escalation submitted to the harness's queue so far, in order."""
-    return [call.args[0] for call in harness._escalation_queue.submit.call_args_list]
+    """Every escalation submitted to the harness's queue so far, in order.
+
+    Reads the stand-in queue ``_arm_storm_queue`` installed, so the declared
+    ``EscalationQueue | None`` type carries neither the armed-ness nor the
+    MagicMock recording attributes — the same suppression this suite already
+    uses for ``harness.event_store.emit.call_args_list``.
+    """
+    submitted = harness._escalation_queue.submit.call_args_list  # type: ignore[attr-defined]
+    return [call.args[0] for call in submitted]
 
 
 def _streak(harness: Harness) -> int:
