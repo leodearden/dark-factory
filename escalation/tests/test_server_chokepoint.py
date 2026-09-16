@@ -4023,8 +4023,9 @@ class _ExplodingMetadata:
     Models a malformed task record reaching the degeneracy probe: the server
     reads ``task.get('metadata') or {}``, which passes any truthy non-dict
     straight through to ``branch_is_degenerate``, where ``.get`` blows up
-    INSIDE the probe rather than inside ``_git_authority_task_metadata``'s
-    own handler.  That is the only way to reach merge_request's outer
+    INSIDE the probe rather than inside
+    ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+    handler.  That is the only way to reach merge_request's outer
     fast-path ``except`` — see
     ``test_probe_fault_inside_the_guard_preserves_the_fast_path``.
     """
@@ -4327,7 +4328,8 @@ class TestMergeRequestDegenerateBranchFastPath:
 
         NOTE this does NOT reach merge_request's own fast-path ``except``: the
         RuntimeError is swallowed one level deeper, inside
-        ``_git_authority_task_metadata``'s handler, which returns ``{}`` — so
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s
+        handler, which returns an empty ``metadata`` — so
         the probe then runs normally and reads "no degeneracy signal".  The
         outer handler is covered by
         ``test_probe_fault_inside_the_guard_preserves_the_fast_path`` below.
@@ -4353,7 +4355,8 @@ class TestMergeRequestDegenerateBranchFastPath:
         malformed metadata record is the reachable way to trigger it: the
         server passes any truthy ``task['metadata']`` through verbatim, so a
         non-dict raises on ``.get`` inside the probe, PAST
-        ``_git_authority_task_metadata``'s own handler.
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+        handler.
 
         Fail-soft direction: the fault degrades the guard (treat as
         non-degenerate) and the legacy fast path answers, rather than the
