@@ -56,6 +56,7 @@ import os
 import re
 import select
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -933,6 +934,7 @@ def fire_watchdog_kill(
     sleep=time.sleep,
     exit_fn=os._exit,
     exit_code: int = 1,
+    stderr=None,
 ) -> None:
     """Kill the build subtree rooted at *pgid* and unconditionally self-terminate.
 
@@ -959,16 +961,20 @@ def fire_watchdog_kill(
       letting sshd reap it) even if some descendant could not be killed.
 
     *trigger* names the :func:`run_stdin_watchdog` branch that judged the
-    channel dead.  It is required and keyword-only so no call site can omit
-    the branch identity, and it is never acted on -- the kill sequence is
-    identical for both branches.  Reporting it is step-4's job; for now it is
-    accepted and carried.
+    channel dead.  It is REPORTED, never acted on -- the kill sequence is
+    identical for both branches -- and it is required and keyword-only so no
+    call site can omit the branch identity and make a self-kill
+    unattributable again.  *stderr* (default ``sys.stderr``, resolved at call
+    time) is the channel it is reported on: once ``exit_fn`` has run there is
+    no structured return path left, and on a remote verify this stderr is the
+    only thing the dispatcher still sees.
 
     Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
     (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
     a permission race is fine, this is a best-effort escalation), sleep
     *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), then ``exit_fn(exit_code)`` as the final action.
+    (same suppression), report the trigger on stderr, then
+    ``exit_fn(exit_code)`` as the final action.
     """
     ppid_map = ppid_map_provider()
     descendants = collect_descendants(pgid, ppid_map)
@@ -983,6 +989,15 @@ def fire_watchdog_kill(
     for pid in survivors:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             kill(pid, signal.SIGKILL)
+
+    # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
+    # buffered line would be dropped.  Suppress everything: a failed
+    # diagnostic (broken pipe on a dead ssh channel) must never prevent the
+    # self-exit that frees the flock and lets sshd reap the leader.
+    stream = stderr if stderr is not None else sys.stderr
+    with contextlib.suppress(Exception):
+        stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
+        stream.flush()
 
     exit_fn(exit_code)
 
