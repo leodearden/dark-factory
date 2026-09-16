@@ -7,9 +7,12 @@ mix of pure helpers + the SessionTable(DataTable) widget in one module. The
 pure functions above DecisionQueue stay fast/deterministic to unit test
 directly (no pilot, no event loop) -- only DecisionQueue itself requires a
 running Textual app, and is covered by test_app.py's pilot tests instead.
-Column sizing follows the same split: question_width decides the question
-column's bound as a pure function of the rows and a measured width, and
-DecisionQueue only measures itself and applies the answer.
+Column sizing follows the same split: derive_question_width decides the
+question column's bound as a pure function of the rows and a measured
+width, and DecisionQueue only measures itself and applies the answer.
+Widths throughout are CELLS, not characters -- Textual crops a column by
+rich's cell measurement, so a bound counted in characters would let
+double-width text overrun its column (and lose its ellipsis with it).
 
 Consumers import orchestrator.session_registry directly (mirrors
 registry_reader.py/session_table.py -- PRD §6 G5: consumers import the
@@ -30,6 +33,7 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
 )
+from rich.cells import cell_len, set_cell_size
 from textual.events import Resize
 from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
@@ -127,37 +131,54 @@ class _QueueRowLike(Protocol):
 
 
 # The four column labels, in render order, as the single source for both
-# DecisionQueue.on_mount's columns and question_width's per-column floors --
-# a label wider than every cell in its column (as 'project#task' usually is)
-# is what the column actually renders at, so the budget must measure it.
+# DecisionQueue.on_mount's columns and derive_question_width's per-column
+# floors -- a label wider than every cell in its column (as 'project#task'
+# usually is) is what the column actually renders at, so the budget must
+# measure it.
 _COLUMN_LABELS = ('score', 'age', 'project#task', 'question')
-# Floor for a derived question bound; see question_width.
+# Floor for a derived question bound; see derive_question_width.
 _QUESTION_MIN_WIDTH = 20
-# The bound used before the widget has a measurable width; see question_width.
+# The bound used before the widget has a measurable width; see
+# derive_question_width.
 _UNMEASURED_QUESTION_WIDTH = 60
 _QUESTION_PLACEHOLDER = '(no question)'
 
 
 def _one_line_question(question: str | None, max_width: int) -> str:
-    """Collapse *question* to a single line of at most *max_width* cells.
+    """Collapse *question* to a single line of at most *max_width* CELLS.
 
     The bound belongs to the caller: DecisionQueue derives it from the width
-    its question column actually has (see question_width), which is what
-    lets a wide terminal show a long question and a narrow one reflow
+    its question column actually has (see derive_question_width), which is
+    what lets a wide terminal show a long question and a narrow one reflow
     shorter. Only the pre-layout fallback is a fixed number.
 
+    Cells, not characters: the bound is spent against rich's cell
+    measurement -- the same measurement Textual crops the column by -- so a
+    CJK or emoji question is cut where it will actually be cut on screen
+    and the ellipsis always lands inside the column. Measured with len()
+    instead, a 172-character Japanese question renders 343 cells wide and
+    Textual crops it near its middle, ellipsis and all, leaving the operator
+    no sign the text was truncated at all.
+
     Fail-soft (PRD §2): a view must degrade a bad question shape, not raise.
-    Empty/None/whitespace-only yields the placeholder, returned whole rather
-    than cut -- question_width's floor keeps *max_width* above its length.
+    Empty/None/whitespace-only yields the placeholder. *max_width* is
+    clamped to the placeholder's own width here rather than trusted: this
+    function is total for every int its signature accepts, instead of only
+    for the ones derive_question_width happens to return, because
+    format_queue_row exposes the bound as a public keyword and an unclamped
+    non-positive one would silently become a negative slice.
     """
     if not question:
         return _QUESTION_PLACEHOLDER
     collapsed = ' '.join(question.split())
     if not collapsed:
         return _QUESTION_PLACEHOLDER
-    if len(collapsed) <= max_width:
+    bound = max(max_width, cell_len(_QUESTION_PLACEHOLDER))
+    if cell_len(collapsed) <= bound:
         return collapsed
-    return collapsed[: max_width - 1].rstrip() + '…'
+    # set_cell_size pads with a space when the cut splits a double-width
+    # character, so rstrip before appending the 1-cell ellipsis.
+    return set_cell_size(collapsed, bound - 1).rstrip() + '…'
 
 
 def _format_project_task(project: str, task_id: str | None) -> str:
@@ -170,9 +191,10 @@ def _fixed_cells(item: _QueueRowLike, now: datetime) -> tuple[str, str, str]:
     """Render *item*'s three fixed-content cells: score / age / project#task.
 
     Split out of format_queue_row so the column-width derivation and the row
-    render share ONE definition of these cells: question_width measures the
-    exact strings add_row will later receive, rather than a second formatter
-    written for measuring that could drift from the one that renders.
+    render share ONE definition of these cells: derive_question_width
+    measures the exact strings add_row will later receive, rather than a
+    second formatter written for measuring that could drift from the one
+    that renders.
 
     Reuses session_table.format_age for the age column (fed item.filed_at's
     isoformat -- format_age's contract is a string timestamp) so the queue's
@@ -185,7 +207,7 @@ def _fixed_cells(item: _QueueRowLike, now: datetime) -> tuple[str, str, str]:
     )
 
 
-def question_width(
+def derive_question_width(
     items: Sequence[_QueueRowLike],
     now: datetime,
     available_width: int,
@@ -201,6 +223,10 @@ def question_width(
     format_queue_row's question_width= and DataTable.add_column's width= so
     the measured budget and the rendered text cannot disagree.
 
+    Every width here is measured in CELLS (rich's cell_len), the unit
+    Textual lays a column out in -- a double-width project name claims two
+    cells per character on screen and must claim two here too.
+
     *available_width* <= 0 means "not laid out yet" -- NOT "no room". A
     widget's content region reads 0 before its first layout and a rebuild is
     genuinely reachable then, so that case returns
@@ -208,18 +234,19 @@ def question_width(
     width nothing can measure yet.
 
     The _QUESTION_MIN_WIDTH floor exists because the fixed columns can claim
-    more than a narrow terminal has: it keeps _one_line_question total (a
-    negative bound would silently become a negative slice rather than raise)
-    and keeps the column wider than both the 'question' label and the
-    '(no question)' placeholder, so neither is itself truncated. Below the
-    floor the table falls back to DataTable's own horizontal scrolling --
-    the pre-existing behaviour for a terminal too narrow to hold the row.
+    more than a narrow terminal has: it keeps the column wider than both the
+    'question' label and the '(no question)' placeholder, so neither is
+    itself truncated. Below the floor the table falls back to DataTable's
+    own horizontal scrolling -- the pre-existing behaviour for a terminal too
+    narrow to hold the row. _one_line_question clamps the bound it is handed
+    independently; the floor is a display choice, not that function's
+    safety net.
     """
     if available_width <= 0:
         return _UNMEASURED_QUESTION_WIDTH
     rows = [_fixed_cells(item, now) for item in items]
     used = sum(
-        2 * cell_padding + max([len(label), *(len(row[index]) for row in rows)])
+        2 * cell_padding + max([cell_len(label), *(cell_len(row[index]) for row in rows)])
         for index, label in enumerate(_COLUMN_LABELS[:-1])
     )
     return max(_QUESTION_MIN_WIDTH, available_width - used - 2 * cell_padding)
@@ -237,10 +264,11 @@ def format_queue_row(
     width derivation measures -- so the derived column budget and the
     rendered row can never disagree about what the row contains.
 
-    *question_width* bounds the question cell and is the caller's to supply:
-    DecisionQueue derives it from its own measured width. The default is the
-    pre-layout fallback, for a caller with no width to measure yet -- not a
-    display bound anyone should rely on.
+    *question_width* bounds the question cell in CELLS and is the caller's to
+    supply: DecisionQueue derives it from its own measured width (see
+    derive_question_width). The default is the pre-layout fallback, for a
+    caller with no width to measure yet -- not a display bound anyone should
+    rely on.
     """
     return (*_fixed_cells(item, now), _one_line_question(item.question, question_width))
 
@@ -511,7 +539,7 @@ class DecisionQueue(DataTable):
     QueueItem.key ('decision:<id>' / 'session:<slug>'), not by row position.
 
     The question column takes whatever the other three leave (see
-    question_width), so a wide terminal spends the line on the question
+    derive_question_width), so a wide terminal spends the line on the question
     rather than on a blank gutter. Every render re-declares all four columns
     through clear(columns=True) plus an EXPLICIT question width, because
     Textual's auto-width only ever grows: add_row raises a Column's
@@ -552,10 +580,10 @@ class DecisionQueue(DataTable):
         vertical scrollbar, so it is the width the columns actually get;
         size.width would over-claim the scrollbar's cells and reintroduce
         horizontal overflow, but only once the queue grew long enough to
-        scroll. It reads 0 before the first layout, which question_width
-        already handles as its "not laid out yet" case.
+        scroll. It reads 0 before the first layout, which
+        derive_question_width already handles as its "not laid out yet" case.
         """
-        return question_width(
+        return derive_question_width(
             items, now, self.scrollable_content_region.width, cell_padding=self.cell_padding
         )
 
