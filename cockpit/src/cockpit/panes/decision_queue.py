@@ -582,6 +582,11 @@ class DecisionQueue(DataTable):
         horizontal overflow, but only once the queue grew long enough to
         scroll. It reads 0 before the first layout, which
         derive_question_width already handles as its "not laid out yet" case.
+
+        The region is measured BEFORE a rebuild's rows land, so it cannot see
+        a vertical scrollbar that those rows are about to bring in. _reflow
+        re-measures after layout settles rather than predicting that here --
+        see _reflow_if_width_changed.
         """
         return derive_question_width(
             items, now, self.scrollable_content_region.width, cell_padding=self.cell_padding
@@ -594,8 +599,13 @@ class DecisionQueue(DataTable):
         row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
         return row_key.value
 
-    def _reflow(self) -> None:
-        """Re-render the cached rows at the width this widget currently has.
+    def _reflow(self, width: int | None = None) -> None:
+        """Re-render the cached rows at *width*, or at the width derived now.
+
+        *width* is an already-derived bound, so a caller that had to derive
+        one to decide whether to reflow at all does not pay for a second
+        pass over every row's fixed cells -- a resize drag reflows on many
+        consecutive frames.
 
         Re-declares the columns rather than mutating them: clear(columns=True)
         plus _add_columns is the public way to change the question column's
@@ -608,17 +618,28 @@ class DecisionQueue(DataTable):
         key is re-located afterwards exactly as replace_rows has always done:
         a rebuild must never yank the cursor off the row an operator is
         reading.
+
+        The trailing re-measure closes the measure-then-add gap: the bound is
+        chosen before these rows exist, so rows that push the queue past its
+        visible height bring in a vertical scrollbar the measurement could
+        not see, and the columns then overrun the narrowed content region.
+        Textual posts no Resize for a scrollbar appearing, so nothing else
+        would ever correct it. Re-measuring after layout settles converges in
+        one extra pass (measured) and covers the scrollbar LEAVING too,
+        without this widget having to predict Textual's scrollbar rules.
         """
         if self._rendered is None:
             return
         items, now = self._rendered
-        width = self._derive_question_width(items, now)
+        if width is None:
+            width = self._derive_question_width(items, now)
         previous_key = self.highlighted_key()
         self.clear(columns=True)
         self._add_columns(width)
         self._question_width = width
         for item in items:
             self.add_row(*format_queue_row(item, now, question_width=width), key=item.key)
+        self.call_after_refresh(self._reflow_if_width_changed)
         if not self.row_count:
             return
         if previous_key is not None:
@@ -626,6 +647,43 @@ class DecisionQueue(DataTable):
                 self.move_cursor(row=self.get_row_index(previous_key))
             except RowDoesNotExist:
                 self.move_cursor(row=0)
+
+    def _reflow_if_width_changed(self) -> None:
+        """Re-measure, and re-render only if the question bound actually moved.
+
+        The equality guard is the point: a reflow goes through
+        clear(columns=True), which resets the scroll position, so a
+        re-measure that changes nothing must cost nothing on screen.
+
+        The cached (items, now) are reused rather than re-scanned and
+        re-clocked: re-running the app's registry rebuild would fire real
+        backend.set_urgency calls on a window drag, and re-reading the clock
+        would make the age column jump mid-drag.
+
+        Cursor events are suppressed because neither trigger is an operator
+        selection: _reflow re-enters the cursor through clear() +
+        move_cursor, and CockpitApp.on_data_table_row_highlighted reads a
+        RowHighlighted as the operator CLAIMING the detail pane for that
+        table. Measured: unsuppressed, a resize silently takes the pane off
+        the session row an operator parked on and hands it to the queue.
+        Nothing needs refreshing afterwards -- a width change re-renders
+        column widths only, never the underlying records, so leaving the pane
+        exactly as it was is the correct outcome, not a gap.
+
+        The suppression lives HERE rather than in _reflow or replace_rows on
+        purpose. app.py wraps its own replace_rows calls and re-syncs the pane
+        explicitly in the suppressed reposts' place, so that path's event
+        policy stays the caller's; only the width-driven reflows, which this
+        widget originates and no app code can wrap, suppress for themselves.
+        """
+        if self._rendered is None:
+            return
+        items, now = self._rendered
+        width = self._derive_question_width(items, now)
+        if width == self._question_width:
+            return
+        with self.prevent(DataTable.RowHighlighted):
+            self._reflow(width)
 
     def replace_rows(self, items: Sequence[QueueItem], now: datetime) -> None:
         """Rebuild rows from *items* (already ordered), preserving the cursor by key.
@@ -646,43 +704,17 @@ class DecisionQueue(DataTable):
         layout), so replace_rows applies the unmeasured fallback and the
         first Resize is what replaces it with the measured bound.
 
-        The equality guard matters because Resize fires for layout changes
-        that leave the column budget alone, and a reflow goes through
-        clear(columns=True), which resets the scroll position -- a resize
-        that changes nothing must cost nothing on screen.
-
-        The cached (items, now) are reused rather than re-scanned and
-        re-clocked: re-running the app's registry rebuild would fire real
-        backend.set_urgency calls on a window drag, and re-reading the clock
-        would make the age column jump mid-drag.
-
-        The reflow's cursor events are suppressed because a window drag is not
-        an operator selection: _reflow re-enters the cursor through clear() +
-        move_cursor, and CockpitApp.on_data_table_row_highlighted reads a
-        RowHighlighted as the operator CLAIMING the detail pane for that
-        table. Measured: unsuppressed, a resize silently takes the pane off
-        the session row an operator parked on and hands it to the queue.
-        Nothing needs refreshing afterwards -- a resize changes column widths
-        only, never the underlying records, so leaving the pane exactly as it
-        was is the correct outcome, not a gap.
-
-        The suppression lives HERE rather than in _reflow or replace_rows on
-        purpose. app.py wraps its own replace_rows calls and re-syncs the pane
-        explicitly in the suppressed reposts' place, so that path's event
-        policy stays the caller's; only the resize path, which this widget
-        originates and no app code can wrap, suppresses for itself.
+        Resize fires for layout changes that leave the column budget alone --
+        a height-only drag, most obviously -- which is why the work is
+        _reflow_if_width_changed's re-measure-and-compare rather than an
+        unconditional reflow; see it for why a no-op must stay a no-op and
+        why this path suppresses its own cursor events.
 
         DataTable defines its own private _on_resize; Textual dispatches both,
         so this handler augments the table's own resize handling rather than
         replacing it.
         """
-        if self._rendered is None:
-            return
-        items, now = self._rendered
-        if self._derive_question_width(items, now) == self._question_width:
-            return
-        with self.prevent(DataTable.RowHighlighted):
-            self._reflow()
+        self._reflow_if_width_changed()
 
     def select_key(self, key: str) -> bool:
         """Move the cursor to *key*'s row if present. Returns whether it was found."""

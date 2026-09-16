@@ -744,6 +744,107 @@ class TestDecisionQueueRender:
             assert queue.highlighted_key() == 'decision:dec-low'
             assert rewide_age == wide_age
 
+    @pytest.mark.timeout(10)
+    async def test_a_queue_that_grows_past_its_height_pays_for_its_scrollbar(self, tmp_path):
+        """A rebuild that grows the queue past its visible height brings in a
+        vertical scrollbar, and the columns must give it back its two cells.
+
+        The bound is necessarily derived BEFORE the new rows land, so the
+        measurement cannot see a scrollbar those rows are about to cause --
+        and Textual posts no Resize for a scrollbar appearing, so the
+        overflow would stand until some later content change happened to
+        re-derive. Growing the queue (rather than seeding it full) is what
+        puts the measurement on the wrong side of the scrollbar: seeded full,
+        the rows are already in place when the first Resize measures.
+        Widths: 200 - 26 fixed - 2 padding == 172 with no scrollbar, 170 once
+        two cells go to one.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+
+        def write(index):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=f'dec-{index:02d}',
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                ),
+                root=tmp_path,
+            )
+
+        write(0)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test(size=(200, 20)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+
+            # one row in 20 lines: no scrollbar, so the question gets all 172
+            assert queue.scrollable_content_region.width == 200
+            assert len(queue.get_row('decision:dec-00')[3]) == 172
+
+            for index in range(1, 60):
+                write(index)
+            app.refresh_registry()
+            await pilot.pause()
+
+            # 60 rows in 20 lines: the scrollbar showed up, and was paid for
+            assert queue.row_count == 60
+            assert queue.scrollable_content_region.width == 198
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
+            assert len(queue.get_row('decision:dec-00')[3]) == 170
+
+    @pytest.mark.timeout(10)
+    async def test_a_height_only_resize_does_not_reflow_and_keeps_the_scroll(self, tmp_path):
+        """A resize that leaves the question bound alone must cost nothing on
+        screen: a reflow re-declares the columns through clear(columns=True),
+        which resets the scroll position, so an operator reading row 30 of a
+        long queue would be thrown back to the top by a height-only drag.
+
+        60 rows scroll at both heights, so the scrollbar -- and with it the
+        derived bound -- is identical before and after; only the guard keeps
+        the reflow from running anyway.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for index in range(60):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=f'dec-{index:02d}',
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                ),
+                root=tmp_path,
+            )
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 20)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            queue.scroll_to(y=10, animate=False)
+            await pilot.pause()
+            assert queue.scroll_y == 10
+
+            await pilot.resize_terminal(200, 15)
+            await pilot.pause()
+
+            # the bound did not move, so no reflow ran and the scroll survived
+            assert queue.scrollable_content_region.width == 198
+            assert len(queue.get_row('decision:dec-00')[3]) == 170
+            assert queue.scroll_y == 10
+
 
 class TestSignalDontMove:
     @pytest.mark.timeout(10)
