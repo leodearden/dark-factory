@@ -757,10 +757,16 @@ mechanical gate to check whether the at-block-time dry-run investigation found a
 Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remaining`,
 `already_attempted`, `head_sha`, `main_sha`, `age_seconds`, `age_state`.
 
-`age_state` (`parsed`|`unparseable`|`absent`|`no_clock`) says WHY `age_seconds` is `null`
-when it is. Any value other than `parsed` yields `verdict == "abort"` — the gate never
-certifies a proposal fresh without a parsed `investigated_at` — so the `abort` row in the
-table below already handles it and no extra branch is needed.
+`age_state` (`parsed`|`unparseable`|`absent`) says WHY `age_seconds` is `null` when it is.
+The implication runs ONE way: a non-`parsed` `age_state` can never accompany
+`verdict == "fresh"` — the gate never certifies a proposal fresh without a parsed
+`investigated_at` — but it does NOT imply `abort`. The age check is deliberately last, so an
+earlier, more specific check can return `drift` first: a proposal missing its sha anchor
+returns `drift` with `age_state: "absent"`. Branch on `verdict` alone; read `age_state` as the
+diagnostic explaining a null `age_seconds`, never as evidence of which verdict you got.
+
+> A fourth value, `no_clock`, exists in the gate for in-process callers that pass no clock.
+> `check` always resolves one, so the CLI documented here never emits it.
 
 **Decision table:**
 
@@ -824,7 +830,13 @@ anchor at re-investigation start:
 ```bash
 head_sha=$(git -C <worktree> rev-parse HEAD)
 main_sha=$(git -C <worktree> rev-parse main)
+investigated_at=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
 ```
+
+Take `investigated_at` from that command rather than writing one yourself. It MUST carry a UTC
+offset: the gate subtracts it from an aware clock, so a naive timestamp
+(`2026-09-16T12:00:00`) raises, yields `age_state: "unparseable"`, and hard-ABORTs the re-gate
+— dead-ending the very recovery path this section exists to complete.
 
 When the sub-agent returns `{proposal_text, files_referenced, risk_label}`, build a proposal
 entry mirroring `_build_entry` success-path keys and append it via
@@ -836,7 +848,7 @@ entry mirroring `_build_entry` success-path keys and append it via
   "risk_label":       "<from sub-agent>",
   "files_referenced": ["<from sub-agent>"],
   "block_reason":     "<original block reason>",
-  "investigated_at":  "<ISO now at re-investigation start>",
+  "investigated_at":  "<$investigated_at from above — UTC ISO-8601 WITH offset>",
   "timestamp":        "<ISO now>",
   "head_sha":         "<captured above>",
   "main_sha":         "<captured above>"

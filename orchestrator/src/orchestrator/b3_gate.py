@@ -45,6 +45,17 @@ ABORT = 'abort'
 # Closed domain for check_proposal's 'age_state' key — WHY a proposal's age is
 # or is not known.  Before task 5361 all four causes collapsed to a bare
 # 'age_seconds': None, indistinguishable to every consumer.
+#
+# THREE non-parsed states cover FOUR causes, not four states: an absent
+# timestamp and an absent clock each get their own, while BOTH awareness
+# mismatches — a naive investigated_at against an aware clock, and an aware
+# investigated_at against a naive operator-supplied --now — land on
+# AGE_UNPARSEABLE alongside a genuinely malformed string.  They are not split
+# because the fault is the PAIR, not one operand; _age_of's warning names both
+# so the shared state cannot misdirect an operator to the wrong one.
+#
+# AGE_NO_CLOCK is unreachable through the `check` CLI — _parse_now always
+# returns a datetime — and exists for in-process callers that pass now=None.
 AGE_PARSED = 'parsed'
 AGE_UNPARSEABLE = 'unparseable'
 AGE_ABSENT = 'absent'
@@ -301,14 +312,18 @@ def _age_of(
 ) -> tuple[float | None, str]:
     """Return ``(age_seconds, age_state)`` for a proposal entry's investigated_at.
 
-    The state names WHY an age is unavailable, so the four causes that used to
-    collapse into a single bare ``None`` stay distinguishable to a consumer:
-    no timestamp, no clock, an unreadable string, and a naive timestamp that
-    cannot be subtracted from an aware one.
+    The state names WHY an age is unavailable, replacing a bare ``None`` that
+    told a consumer nothing.  THREE non-parsed states cover FOUR causes:
+    ``AGE_ABSENT`` (no timestamp), ``AGE_NO_CLOCK`` (no clock), and
+    ``AGE_UNPARSEABLE`` for an unreadable string AND for either direction of an
+    awareness mismatch.  The two mismatch causes share one state because the
+    fault is the PAIR, not one operand — an aware ``investigated_at`` against a
+    naive operator-supplied ``--now`` is the operator's bug, not the producer's.
 
-    Warns on the unparseable path rather than swallowing it — a producer
-    writing a timestamp this gate cannot read is a bug worth surfacing, and
-    siting the warning here means no caller can silently drop it.
+    Warns rather than swallowing — a pair this gate cannot subtract is a bug
+    worth surfacing, and siting the warning here means no caller can silently
+    drop it.  The message names BOTH operands precisely because the state does
+    not say which one is at fault.
     """
     investigated_at = (entry or {}).get('investigated_at')
     if not investigated_at:
@@ -319,8 +334,10 @@ def _age_of(
         return (now - datetime.fromisoformat(investigated_at)).total_seconds(), AGE_PARSED
     except Exception as exc:
         logger.warning(
-            'check_proposal: unparseable investigated_at %r — treating age as '
-            'unknown: %s', investigated_at, exc,
+            'check_proposal: could not compute proposal age from investigated_at '
+            '%r against now %r — treating age as unknown; either operand may be '
+            'at fault (a naive --now fails against an aware timestamp): %s',
+            investigated_at, now, exc,
         )
         return None, AGE_UNPARSEABLE
 

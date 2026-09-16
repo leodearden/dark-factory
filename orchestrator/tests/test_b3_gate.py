@@ -629,8 +629,12 @@ class TestAgeStateThreeState:
 
     Four distinct causes previously all surfaced as a bare `age_seconds: None`,
     indistinguishable to every consumer: an absent timestamp, an unparseable
-    string (ValueError), a naive timestamp against an aware clock (TypeError),
-    and no clock supplied at all.  Each now gets its own `age_state`.
+    string (ValueError), an awareness mismatch between the two operands
+    (TypeError), and no clock supplied at all.  THREE states now cover those
+    four causes — hence this class's name.  The mismatch shares
+    `AGE_UNPARSEABLE` with the malformed string because the fault is the PAIR,
+    not one operand; `_age_of`'s warning names both so the shared state cannot
+    misdirect an operator.
     """
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
@@ -675,6 +679,42 @@ class TestAgeStateThreeState:
         )
         assert result['age_state'] == AGE_UNPARSEABLE, result
         assert result['age_seconds'] is None, result
+
+    def test_aware_timestamp_against_naive_clock_is_unparseable(self):
+        """The OPERATOR-side mismatch: `run_check._parse_now` passes any
+        `--now` string straight through `fromisoformat`, so a naive one fails
+        against a perfectly well-formed aware `investigated_at`.  Same
+        TypeError, same state, opposite culprit from the test above."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=datetime(2026, 6, 4, 12, 0, 0),
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_warning_names_both_operands_not_just_the_entry(self, caplog):
+        """The state cannot say which operand is at fault, so the message must
+        name both.  Blaming `investigated_at` alone points an operator at the
+        proposal when a naive `--now` of their own is the actual fault."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        naive_now = datetime(2026, 6, 4, 12, 0, 0)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+                run_git=_fake_git_fresh, now=naive_now,
+            )
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(messages) == 1, messages
+        assert _LOW_RISK_ENTRY['investigated_at'] in messages[0], messages[0]
+        assert repr(naive_now) in messages[0], messages[0]
 
     def test_missing_timestamp_key_is_absent(self):
         from orchestrator.b3_gate import AGE_ABSENT, check_proposal
