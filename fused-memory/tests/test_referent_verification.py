@@ -169,6 +169,102 @@ class TestReferentRecordVocabulary:
         assert _finding().to_dict()['intended_referent'] is None
 
 
+class TestReferentFindingCarriesItsProjectScope:
+    """A finding names the project it was diagnosed in, on the record itself.
+
+    One process serves nine projects, and the 2026-08-31 audit read findings
+    against the wrong one because the record carried no discriminator at all.
+    Both fields are REQUIRED rather than defaulted so that record — a finding
+    with no project scope — is unrepresentable instead of merely discouraged.
+
+    Constructs `ReferentFinding` DIRECTLY rather than through `_finding()`: the
+    requirement being pinned is the DATACLASS's, and routing through a helper
+    that fills the pair would hide a later default behind the fixture.
+    """
+
+    #: Every required field EXCEPT the scope pair, so the omission tests below
+    #: fail on exactly the two names they are about.
+    _BASE: dict = {
+        'edge_uuid': 'edge-1',
+        'which_end': 'source',
+        'check': 'set-membership',
+        'old_endpoint_uuid': 'node-1',
+        'old_endpoint_name': 'Task 2520',
+        'endpoint_referent': Referent(number='2520'),
+        'referent_set': ('Task 2519',),
+    }
+
+    def _scoped(self, **overrides) -> ReferentFinding:
+        fields = dict(self._BASE)
+        fields.update(group_id='dark_factory', project_id='dark_factory')
+        fields.update(overrides)
+        return ReferentFinding(**fields)
+
+    def test_omitting_the_scope_pair_raises_naming_both_fields(self):
+        with pytest.raises(TypeError) as excinfo:
+            ReferentFinding(**self._BASE)
+
+        message = str(excinfo.value)
+        assert 'group_id' in message
+        assert 'project_id' in message
+
+    def test_each_scope_field_is_required_on_its_own(self):
+        """Pinned per-field as well as pair-wise, so a later refactor that
+        silently defaults ONE of them cannot slip past the assertion above."""
+        with pytest.raises(TypeError, match='project_id'):
+            ReferentFinding(**self._BASE, group_id='dark_factory')
+
+        with pytest.raises(TypeError, match='group_id'):
+            ReferentFinding(**self._BASE, project_id='dark_factory')
+
+    def test_to_dict_emits_both_keys_with_the_constructed_values(self):
+        """DISTINCT values, even though `Scope.graphiti_group_id` returns
+        `self.project_id` today: the GRAPH written to and the SCOPE written
+        under are two dimensions that merely coincide, and a payload echoing
+        one into both would satisfy an equal-value assertion while losing that.
+        """
+        payload = self._scoped(
+            group_id='graph_scope', project_id='write_scope',
+        ).to_dict()
+
+        assert payload['group_id'] == 'graph_scope'
+        assert payload['project_id'] == 'write_scope'
+
+    def test_the_key_set_contract_still_holds_with_the_scope_pair(self):
+        """They are REAL FIELDS, not aliases injected into the payload — which
+        is what keeps the live `set(payload) == {field names}` assertions green
+        by construction rather than by each being widened by hand."""
+        payload = self._scoped(
+            intended_referent=Referent(number='2519'),
+            new_endpoint_uuid='node-2',
+            resolvable=True,
+        ).to_dict()
+
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+        assert {'group_id', 'project_id'} <= set(payload)
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_replace_carries_the_scope_pair_through_the_second_pass(self):
+        """`_verify_episode_referents`' second pass rebuilds every resolvable
+        finding with `dataclasses.replace` to stamp `new_endpoint_uuid`; a
+        field that did not survive that would be stamped and then dropped."""
+        finding = self._scoped(
+            group_id='graph_scope',
+            project_id='write_scope',
+            intended_referent=Referent(number='2519'),
+            resolvable=True,
+        )
+
+        replaced = dataclasses.replace(
+            finding, new_endpoint_uuid='node-2', uuid_lookup_degraded=True,
+        )
+
+        assert replaced.group_id == 'graph_scope'
+        assert replaced.project_id == 'write_scope'
+        assert replaced.to_dict()['group_id'] == 'graph_scope'
+        assert replaced.to_dict()['project_id'] == 'write_scope'
+
+
 class TestReferentStatsVocabulary:
     """Counts are DERIVED over `findings`, so they cannot drift from it."""
 
