@@ -2007,6 +2007,149 @@ class TestFireWatchdogKill:
 
 
 # ---------------------------------------------------------------------------
+# Task 4194 step-3: fire_watchdog_kill reports WHICH branch fired, on stderr
+#
+# The ssh stderr channel is the ONLY path from a self-killing remote back to
+# the dispatcher: stdout is deliberately suppressed on a fire (cli.py's
+# watchdog_fired gate never echoes a VerifyResult for a build it just killed),
+# and exit_fn is os._exit, which skips every structured return path AND skips
+# stdio flushing -- so the line must be written AND flushed before the exit or
+# it is silently lost.  It is written last, after the SIGKILL pass, so the
+# token survives a reader that keeps only a bounded tail.  And it is
+# best-effort: a diagnostic that could raise past exit_fn would strand the
+# abandoned verify-merge leader as exactly the setsid orphan the watchdog
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStderr:
+    """stderr double appending ('write', text) / ('flush',) to a shared ordered log."""
+
+    def __init__(self, events, *, raise_on_write=None, raise_on_flush=None):
+        self._events = events
+        self._raise_on_write = raise_on_write
+        self._raise_on_flush = raise_on_flush
+
+    def write(self, text):
+        self._events.append(('write', text))
+        if self._raise_on_write is not None:
+            raise self._raise_on_write
+        return len(text)
+
+    def flush(self):
+        self._events.append(('flush',))
+        if self._raise_on_flush is not None:
+            raise self._raise_on_flush
+
+
+def _fire_with_recording_stderr(trigger, events, *, stderr=None):
+    """Drive fire_watchdog_kill over a fixed 100 -> 200 -> 300 tree, recording onto *events*."""
+    import signal
+
+    from orchestrator.verify_cancel import fire_watchdog_kill
+
+    def fake_kill(pid, sig):
+        events.append(('term' if sig == signal.SIGTERM else 'kill', pid))
+
+    fire_watchdog_kill(
+        100,
+        trigger=trigger,
+        grace_secs=5.0,
+        ppid_map_provider=lambda: {200: 100, 300: 200, 999: 1},  # 999 is unrelated
+        kill=fake_kill,
+        killpg=lambda pgid, sig: events.append(('killpg', pgid)),
+        sleep=lambda secs: events.append(('sleep', secs)),
+        exit_fn=lambda code: events.append(('exit', code)),
+        stderr=stderr if stderr is not None else _RecordingStderr(events),
+    )
+    return events
+
+
+def _written(events):
+    """Everything the double was asked to write, in order."""
+    return ''.join(e[1] for e in events if e[0] == 'write')
+
+
+class TestFireWatchdogKillTriggerLine:
+    """fire_watchdog_kill writes one flushed, attributable trigger line before exiting."""
+
+    def test_writes_one_flushed_trigger_line_before_exit(self):
+        """One newline-terminated line naming the trigger, flushed, with exit_fn still last."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        written = _written(events)
+        assert written.endswith('\n')
+        assert written.count('\n') == 1, f'expected exactly one line; got {written!r}'
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=heartbeat_starvation' in written
+
+        kinds = [e[0] for e in events]
+        assert kinds.index('write') < kinds.index('flush') < kinds.index('exit')
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1), 'exit_fn must stay the final action'
+
+    def test_eof_trigger_is_reported_verbatim(self):
+        """The EOF branch is distinguishable from starvation by the line alone."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        written = _written(_fire_with_recording_stderr(WatchdogTrigger.EOF, []))
+
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof' in written
+        assert 'heartbeat_starvation' not in written
+
+    def test_trigger_line_is_emitted_after_the_kill_sequence(self):
+        """The line is written after the SIGKILL pass, so the token is last on the channel."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.EOF, [])
+
+        write_idx = [i for i, e in enumerate(events) if e[0] == 'write']
+        kill_idx = [i for i, e in enumerate(events) if e[0] == 'kill']
+        assert kill_idx, 'expected a SIGKILL pass'
+        assert min(write_idx) > max(kill_idx)
+
+    def test_kill_sequence_is_unchanged(self):
+        """NON-GOAL guard: reporting changed, fire behaviour did not."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        assert {e[1] for e in events if e[0] == 'term'} == {200, 300}  # descendants only
+        assert {e[1] for e in events if e[0] == 'kill'} == {200, 300}
+
+        sleep_idx = events.index(('sleep', 5.0))
+        assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
+        assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
+
+        assert [e for e in events if e[0] == 'killpg'] == []
+        assert len([e for e in events if e[0] == 'exit']) == 1
+
+    @pytest.mark.parametrize(
+        'raise_on_write,raise_on_flush',
+        [
+            (OSError('Broken pipe'), None),
+            (None, ValueError('I/O operation on closed file')),
+        ],
+        ids=['write-raises', 'flush-raises'],
+    )
+    def test_stderr_failure_never_prevents_exit(self, raise_on_write, raise_on_flush):
+        """A dead channel loses the diagnostic, never the self-exit that frees the flock."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = []
+        stderr = _RecordingStderr(
+            events, raise_on_write=raise_on_write, raise_on_flush=raise_on_flush
+        )
+
+        # Must not raise: the abandoned leader has to die even with no channel left.
+        _fire_with_recording_stderr(WatchdogTrigger.EOF, events, stderr=stderr)
+
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1)
+
+
+# ---------------------------------------------------------------------------
 # Task 2308 γ step-5: start_stdin_watchdog — spawns a started daemon thread
 # running run_stdin_watchdog, wired to fire on stdin EOF/starvation
 # ---------------------------------------------------------------------------
