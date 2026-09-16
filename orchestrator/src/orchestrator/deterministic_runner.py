@@ -455,18 +455,20 @@ class ScriptTimeout(Exception):
     this exception TYPE — never on substring-matching the tail, which would
     misclassify any check script that merely PRINTS "timed out".
 
-    Nothing restores a legacy ``(rc, tail)`` pair any more (task 4252).
-    Both deploy paths report the timeout as what it was — a SIGKILLed script
-    that produced no exit code — from their own dedicated
-    ``except ScriptTimeout`` arms, each placed BEFORE its ``except Exception``
-    catch-all.  The ``rc``/``tail`` attributes below are consumed by nothing.
+    Carries the overrun budget and NOTHING else (task 4252): there is no
+    exit code and no captured output to carry, so it no longer ferries a
+    fabricated ``(rc, tail)`` pair for a caller to restore.  Every caller —
+    both deploy paths and the predicate path — owns a dedicated
+    ``except ScriptTimeout`` arm, each placed BEFORE its ``except Exception``
+    catch-all, and reports the timeout as what it was.
     """
 
     def __init__(self, timeout_secs: float) -> None:
         self.timeout_secs = timeout_secs
-        self.rc = 1
-        self.tail = f'<script timed out after {timeout_secs}s>'
-        super().__init__(self.tail)
+        super().__init__(
+            f'script timed out after {timeout_secs}s and its process group '
+            f'was SIGKILLed — no exit code was produced'
+        )
 
 
 def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
