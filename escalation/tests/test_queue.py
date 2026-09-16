@@ -7429,6 +7429,160 @@ class TestResolveCapturesLateResolution:
         assert on_disk.late_resolutions[0]['resolution'] == self.LATE_TEXT
 
 
+class TestLateResolutionCaptureFailsClosed:
+    """The capture WRITE did not land — so nothing may be reported as captured.
+
+    `_write_late_resolution` is fail-closed by contract: a missing
+    `_locate_path` or a raising write returns False, and the capture then rolls
+    back FOUR pieces of in-memory state (the entry list, the truncation
+    counter, the elision counter and the corrected stamp) so the record the
+    caller gets back is what is actually on disk.  Nothing else pins that, and
+    every way it can break is silent: a reported capture that never reached
+    disk, a returned record disagreeing with disk on one un-rolled-back field,
+    or the exception escaping and killing the `resolve()` it rode in on — the
+    call whose real business (reporting the record's terminal state) is already
+    done.
+    """
+
+    #: Long enough to be ELIDED, so the elision counter's rollback is
+    #: observable, and prefixed so the fail-closed WARNING can be identified.
+    LATE_TEXT = 'UNPERSISTABLE FINDING: ' + 'detail. ' * 300
+
+    def _break_the_write(self, monkeypatch, mode: str) -> None:
+        """Install one of the two ways `_write_late_resolution` returns False.
+
+        `missing_path` lets the FIRST `_locate_path` call through — the one
+        `resolve()`'s in-lock `get()` makes to read the record — and loses the
+        file for every call after it, which is exactly the window the
+        fail-closed branch defends: another process moved or removed the
+        archived file between that read and the capture's write.  A blanket
+        None would instead make `get()` itself miss, and `resolve()` would
+        return None long before reaching the code under test.
+        """
+        if mode == 'write_raises':
+            def _boom(self, path: Path, content: str) -> None:
+                raise OSError(28, 'No space left on device')
+            monkeypatch.setattr(EscalationQueue, '_atomic_write_path', _boom)
+            return
+
+        real_locate = EscalationQueue._locate_path
+        seen: list[str] = []
+
+        def _vanishing(self, escalation_id: str) -> Path | None:
+            seen.append(escalation_id)
+            return real_locate(self, escalation_id) if len(seen) == 1 else None
+
+        monkeypatch.setattr(EscalationQueue, '_locate_path', _vanishing)
+
+    def _at_the_cap(self, tmp_path: Path) -> EscalationQueue:
+        """A dismissed record already holding a FULL `late_resolutions` list.
+
+        At the cap the next capture would BOTH trim (moving
+        `late_resolutions_truncated`) and correct the stamp, so a rollback that
+        forgot either is observable rather than merely theoretical.  The
+        fillers pass `resolution_class='benign'` explicitly — a candidate equal
+        to the stored stamp is not a correction, so the record keeps the
+        DERIVED 'benign' the sweep left and the failing capture below is still
+        one the correction would fire on.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        for i in range(_MAX_LATE_RESOLUTIONS):
+            queue.resolve(
+                'esc-3902-1', f'earlier finding {i}',
+                resolved_by='claude-task-3902-steward', resolution_class='benign',
+            )
+        return queue
+
+    @pytest.mark.parametrize('mode', ['write_raises', 'missing_path'])
+    def test_a_capture_that_never_reached_disk_is_not_reported_as_one(
+        self, tmp_path: Path, caplog, monkeypatch, mode: str,
+    ):
+        queue = self._at_the_cap(tmp_path)
+        before = queue.get('esc-3902-1')
+        assert before is not None
+        assert len(before.late_resolutions) == _MAX_LATE_RESOLUTIONS, 'setup: at the cap'
+        assert before.resolution_class == 'benign', f'setup: {before.resolution_class!r}'
+        self._break_the_write(monkeypatch, mode)
+
+        out: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': True, 'resolution_class_corrected': 'poison',
+        }
+        # The eight setup captures each logged a (correct) capture WARNING; this
+        # test asserts on what the FAILING one logs, so they are dropped first.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            returned = queue.resolve(
+                'esc-3902-1', self.LATE_TEXT,
+                resolved_by='claude-task-3902-steward', outcome=out,
+            )
+        # The failure is armed for the capture ONLY — every assertion below
+        # reads the record back through the real code.
+        monkeypatch.undo()
+
+        # --- the resolve itself survives: a capture failure must not crash the
+        # call it rode in on, whose real business is already done.
+        assert returned is not None, 'the capture failure killed the resolve'
+        assert returned.status == 'dismissed'
+        assert returned.resolution == 'Auto-dismissed: steward interrupted (attempt cap)'
+
+        # --- nothing is reported as captured or corrected.
+        assert out['late_resolution_captured'] is False, (
+            f'the write did not land, so nothing was captured: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'a rolled-back stamp was never corrected: {out}'
+        )
+        assert out['applied'] is False, f'the text still did not apply: {out}'
+        assert out['prior_resolved_by'] == 'auto-dismissed', (
+            f'the prior state is still reported exactly: {out}'
+        )
+
+        # --- all FOUR rolled-back fields, on the returned object AND on disk:
+        # a record that disagrees with disk is the silent half of this defect.
+        on_disk = queue.get('esc-3902-1')
+        assert on_disk is not None
+        for label, record in (('returned', returned), ('on-disk', on_disk)):
+            assert record.late_resolutions == before.late_resolutions, (
+                f'{label}: the unpersisted entry survived in memory: '
+                f'{record.late_resolutions!r}'
+            )
+            assert record.late_resolutions_truncated == 0, (
+                f'{label}: a trim that never reached disk was counted: '
+                f'{record.late_resolutions_truncated!r}'
+            )
+            assert record.late_resolutions_chars_elided == (
+                before.late_resolutions_chars_elided
+            ), (
+                f'{label}: an elision that never reached disk was counted: '
+                f'{record.late_resolutions_chars_elided!r}'
+            )
+            assert record.resolution_class == 'benign', (
+                f'{label}: the stamp was corrected for a capture that never '
+                f'landed: {record.resolution_class!r}'
+            )
+
+        # --- degraded to log-only, never silently lost.
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'esc-3902-1' in m and 'UNPERSISTABLE FINDING' in m for m in warnings
+        ), (
+            'the text that could not be persisted must survive in the log line '
+            f'that reports the failure; got: {warnings}'
+        )
+        assert not any('CAPTURED in late_resolutions' in m for m in warnings), (
+            f'nothing was captured, so no capture may be announced: {warnings}'
+        )
+
+
 class TestLateResolutionCapturePredicate:
     """The NEGATIVES: the capture stays narrow, so it cannot become noise.
 
