@@ -9656,14 +9656,26 @@ class Harness:
                         # by-design reason co-occurring with a genuine one
                         # cannot LAUNDER it — the difference is still non-empty.
                         #
-                        # G7/INV-4 WAIVER, recorded honestly: with today's
-                        # vocabulary `genuine` is ALWAYS empty, so nothing
-                        # increments the streak and this branch is dead until
-                        # PRD leaf ε (task 3733) installs the
-                        # archive-restore-failure feeder. That window is
-                        # deliberate and waived, not an oversight — do not read
-                        # the unreachable body as a bug, and do not "fix" it by
-                        # putting a by-design reason back on the feeder.
+                        # DEAD BY CONSTRUCTION, and no longer a waived gap.
+                        # With today's vocabulary `genuine` is ALWAYS empty, so
+                        # nothing here increments the streak. This used to be
+                        # recorded as a G7/INV-4 waiver that PRD leaf ε (task
+                        # 3733) would close; ε has LANDED and did not close it,
+                        # because its feeder is the ARM SEAM one process-phase
+                        # downstream (`TaskWorkflow._invoke` ->
+                        # :meth:`note_resume_failed`) rather than a new
+                        # predicate reason. This predicate runs BEFORE the
+                        # restore and takes `archive_available` as a bool
+                        # precisely so it acquires no filesystem dependency, so
+                        # it cannot report that a restore failed.
+                        #
+                        # INV-4's escape therefore HAS a live feeder — just not
+                        # this one. The branch is retained as the predicate-side
+                        # half of the SAME streak and the SAME L1 renderer, so a
+                        # future reason that is genuinely unexplained needs no
+                        # second mechanism. Do not read the unreachable body as
+                        # a bug, and do not "fix" it by putting a by-design
+                        # reason back on the feeder.
                         genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
                         if genuine:
                             # The window was already applied above, so this
