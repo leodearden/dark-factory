@@ -4353,12 +4353,17 @@ class MemoryService:
                 uuid_lookup_degraded=degraded,
             )
 
-        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
-        # `stats.findings` stay outside it entirely, so suppression costs leaf
-        # iota no rate signal and leaf eta no finding — see
-        # `_REFERENT_FINDING_WARN_CAP`.
+        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below, the
+        # durable row below them and `stats.findings` stay outside it entirely,
+        # so suppression costs leaf iota no rate signal, leaf eta no finding and
+        # the replay pass no diagnosis — see `_REFERENT_FINDING_WARN_CAP`.
         warned = 0
         suppressed = 0
+        # ONCE, outside the loop: every finding here belongs to this one
+        # episode, and `_episode_uuid_of` fails closed to `''` rather than
+        # raising on a malformed or MagicMock result — a row that cannot name
+        # its episode is still a diagnosis worth keeping.
+        episode_uuid = _episode_uuid_of(result)
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -4371,6 +4376,45 @@ class MemoryService:
                 # SUBTRACTS this axis from the membership rate, which needs the
                 # denominator to still be there. See REFERENT_FINDING_AXES.
                 self._referent_finding_counts['corroborated'] += 1
+            # THE THIRD INV-2 SURFACE, and the only one that outlives the
+            # process. The two above are in-memory: a finding fully diagnosed
+            # here and not repairable by eta left NOTHING a later pass could
+            # act on.
+            #
+            # ABOVE THE CAP, alongside the counters, because the cap is a log
+            # VOLUME policy; a suppressed finding is still a diagnosis that has
+            # to survive, and putting the write below it would discard exactly
+            # the rows a storm makes most worth keeping.
+            #
+            # AFTER THE SECOND PASS, because that pass rebuilds each resolvable
+            # finding by `dataclasses.replace` to stamp `new_endpoint_uuid` and
+            # `uuid_lookup_degraded`; a row written earlier would persist a
+            # payload missing the target the replay pass exists to act on.
+            #
+            # RESOLVABLE ONLY. The journal's sole declared consumer is the
+            # phase-5 replay pass, which can act on nothing that names no
+            # intended referent — an unresolvable row would be a permanent
+            # backlog entry nothing could ever drain, and that case is already
+            # served by the returned stats, the 'unresolvable' counter and the
+            # WARNING below. Widening it is a one-predicate change if phase 5
+            # ever wants the operator history.
+            #
+            # NO GUARD HERE: `log_referent_finding` is fire-and-forget by
+            # contract, so the already-committed episode write cannot be lost to
+            # a journal fault (one guard, at one site). A `None` journal is
+            # skipped silently because the counters remain the unconditional
+            # INV-4 escape — a per-finding warning for an unconfigured journal
+            # would be a storm, not a signal.
+            #
+            # COST: one sqlite WAL commit (~1-5 ms) inside the per-group
+            # identity lock, on the ~0.2%-of-edges finding path only. The
+            # ~99.8% clean path never reaches this loop at all.
+            if finding.resolvable and self._write_journal is not None:
+                await self._write_journal.log_referent_finding(
+                    payload=finding.to_dict(),
+                    group_id=group_id,
+                    episode_uuid=episode_uuid,
+                )
             # WARNING, not DEBUG — but NOT WARNING for every finding.
             #
             # WARNING is right for the shape this pass exists to catch. The task
