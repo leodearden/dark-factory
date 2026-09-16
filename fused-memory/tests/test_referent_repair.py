@@ -302,6 +302,12 @@ def _finding(**overrides) -> ReferentFinding:
         'intended_referent': Referent(number='3127'),
         'new_endpoint_uuid': 'n-3127',
         'resolvable': True,
+        # DELIBERATELY not the `group_id='dark_factory'` these tests pass to
+        # `_repair_episode_referents`: eta is told its scope by its caller, so
+        # anything that reads the scope off a FINDING instead reads 'reify'
+        # here and is visible rather than silently agreeing.
+        'group_id': 'reify',
+        'project_id': 'reify',
     }
     fields.update(overrides)
     return ReferentFinding(**fields)

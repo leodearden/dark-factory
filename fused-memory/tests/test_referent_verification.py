@@ -83,6 +83,10 @@ def _finding(**overrides) -> ReferentFinding:
         'old_endpoint_name': 'Task 2520',
         'endpoint_referent': Referent(number='2520'),
         'referent_set': ('Task 2519',),
+        # The group every test in this module drives the pass with, so a
+        # helper-built expectation and a production-built finding compare equal.
+        'group_id': 'dark_factory',
+        'project_id': 'dark_factory',
     }
     fields.update(overrides)
     return ReferentFinding(**fields)

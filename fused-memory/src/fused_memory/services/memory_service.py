@@ -1782,6 +1782,32 @@ class ReferentFinding:
     #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
     #: the identity of the finding — at most one finding per (edge, end).
     which_end: str
+    #: The project GRAPH this episode was written to — Graphiti's ``group_id``,
+    #: and the scope in which every uuid on this record resolves.
+    #:
+    #: REQUIRED, and repeated per-finding rather than deduped onto the enclosing
+    #: :class:`ReferentStats`, for exactly the reason
+    #: :func:`_store_failure_diagnostics`' ``project_id`` Args note gives for the
+    #: identical choice in this same module: an entry must be independently
+    #: self-describing, so a consumer reading ONE finding off a log payload or a
+    #: durable row never has to join back against the enclosing call to learn
+    #: which project it came from. One process serves nine projects, and a
+    #: finding read against the wrong one is not hypothetical — it produced a
+    #: false conclusion in the 2026-08-31 audit. That is why this is required
+    #: rather than defaulted: a finding with no project discriminator is the
+    #: record that failure was made of, and it is now unconstructible.
+    group_id: str
+    #: The project SCOPE the write ran under.
+    #:
+    #: Equal to :attr:`group_id` today, because
+    #: :attr:`~fused_memory.models.scope.Scope.graphiti_group_id` returns
+    #: ``self.project_id``. Recorded SEPARATELY anyway, because they are two
+    #: orthogonal dimensions that merely coincide — the graph written TO and the
+    #: scope written UNDER — and :meth:`MemoryService._reconcile_episode_identity`'s
+    #: own docstring already anticipates task 3335's cross-project split, after
+    #: which they need not agree. A record that collapsed them would have to be
+    #: re-audited then; one that carries both does not.
+    project_id: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
     #: The node the edge is attached to today — as THIS EPISODE'S in-memory
@@ -1928,14 +1954,22 @@ class ReferentFinding:
     def to_dict(self) -> dict[str, Any]:
         """A plain, JSON-safe dict keyed exactly by this record's field names.
 
-        The payload the operator warning carries. Referents render as their
+        The payload the operator warning carries, and the payload a durable
+        ``referent_findings`` row stores verbatim. Referents render as their
         canonical ``node_name`` rather than as a dataclass repr, so the log
-        line and any future durable row read as graph names — the same thing
-        an operator would type into a query.
+        line and the durable row read as graph names — the same thing an
+        operator would type into a query.
+
+        Because the key set IS the field names, :attr:`group_id` and
+        :attr:`project_id` travel with every payload automatically: no consumer
+        of a rendered finding can be handed one that does not say which project
+        it came from.
         """
         return {
             'edge_uuid': self.edge_uuid,
             'which_end': self.which_end,
+            'group_id': self.group_id,
+            'project_id': self.project_id,
             'check': self.check,
             'old_endpoint_uuid': self.old_endpoint_uuid,
             'old_endpoint_name': self.old_endpoint_name,
@@ -4263,6 +4297,12 @@ class MemoryService:
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
+                    # ONE value fills both: `Scope.graphiti_group_id` returns
+                    # `self.project_id`, so the graph written to and the scope
+                    # written under coincide today — see the field docs for why
+                    # the record keeps them apart anyway.
+                    group_id=group_id,
+                    project_id=group_id,
                     check=check,
                     old_endpoint_uuid=endpoint_uuid,
                     old_endpoint_name=endpoint_name,
