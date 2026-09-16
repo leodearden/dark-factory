@@ -1357,12 +1357,22 @@ class EscalationQueue:
                     # truth this aims at, and 'moot-terminal-subject' (task 2724)
                     # says something specific about WHY the record was closed
                     # that flattening would destroy — neither is touched.
+                    #
+                    # A candidate EQUAL to the stored stamp is not a correction
+                    # either, so it is reported as none: `corrected` means "the
+                    # stamp this call re-derived", and re-deriving the value
+                    # already there re-derived nothing.  Two live routes reach
+                    # that: an explicit `resolution_class='benign'` argument,
+                    # and the L2 member cascade (:1476) forwarding a
+                    # reaper-sweep L2's own 'benign' stamp onto a member that
+                    # was itself already auto-dismissed 'benign'.
                     corrected: str | None = None
                     if esc.resolution_class == 'benign':
                         # `resolution_class` was validated against
                         # RESOLUTION_CLASSES at the top of this method, so the
                         # incoming value is already known-legal here.
-                        corrected = resolution_class or 'actionable'
+                        candidate = resolution_class or 'actionable'
+                        corrected = candidate if candidate != esc.resolution_class else None
 
                     entry, chars_elided = _build_late_resolution(
                         resolution=resolution,
