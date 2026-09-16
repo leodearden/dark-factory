@@ -333,3 +333,62 @@ def test_an_episode_that_killed_nothing_reports_no_foreign_processes():
     from fm_wedge_forensics import analyze
 
     assert analyze(EPISODE_1_JOURNAL)[0].foreign_killed_processes == ()
+
+
+# ---------------------------------------------------------------------------
+# What an episode actually cost, decomposed from its own observed timestamps.
+#
+# Measured, never predicted from configuration: episode 2's 90s teardown is
+# an IGNORED-SIGTERM timeout, which only the observed
+# Stopping -> stop-sigterm-timed-out -> Killing sequence reveals. An estimate
+# derived from the unit file's TimeoutStopSec would have assumed a clean stop
+# and understated the dominant term by design.
+# ---------------------------------------------------------------------------
+
+def test_episode_2_cost_decomposes_into_teardown_startup_and_total():
+    from fm_wedge_forensics import analyze
+
+    costs = analyze(EPISODE_2_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds == 90.0
+    assert costs.startup_seconds == 41.0
+    assert costs.total_seconds == 302.0
+
+
+def test_episode_2_teardown_dominates_startup():
+    """The answerable form of "should the port-down streak be shortened?" —
+    with numbers rather than intuition."""
+    from fm_wedge_forensics import analyze
+
+    assert analyze(EPISODE_2_JOURNAL)[0].costs.dominant_recovery_term == "teardown"
+
+
+def test_episode_1_cost_decomposes_from_its_own_clean_stop():
+    from fm_wedge_forensics import analyze
+
+    costs = analyze(EPISODE_1_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds == 50.0
+    assert costs.startup_seconds == 39.0
+
+
+def test_detection_interval_is_reported_unavailable_not_fabricated():
+    """The watchdog's consecutive-failure streak is logged in the WATCHDOG's
+    journal, not fused-memory's, so no fm-only capture can witness it. Absent
+    rather than guessed."""
+    from fm_wedge_forensics import analyze
+
+    for journal in (EPISODE_1_JOURNAL, EPISODE_2_JOURNAL):
+        assert analyze(journal)[0].costs.detection_seconds is None
+
+
+def test_a_self_recovered_stall_has_no_teardown_or_startup_cost():
+    """Nothing was torn down or started, so those terms are absent — not zero,
+    which would read as an instantaneous restart that never happened."""
+    from fm_wedge_forensics import analyze
+
+    costs = analyze(SELF_RECOVERED_STALL_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds is None
+    assert costs.startup_seconds is None
+    assert costs.dominant_recovery_term is None
