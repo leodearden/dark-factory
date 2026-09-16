@@ -156,9 +156,9 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
         table = app.query_one(SessionTable)
         detail = app.query_one(DetailPane)
 
-        # A non-zero row index is what makes replace_rows' clear() +
-        # move_cursor a real away-and-back cursor excursion on every rebuild
-        # -- asserted BEFORE the cursor is moved there.
+        # A non-zero row, so every rebuild's clear() resets the cursor away
+        # from the parked selection before move_cursor restores it --
+        # asserted BEFORE the cursor is moved there.
         assert table.get_row_index(parked.session_slug) != 0
         table.move_cursor(row=table.get_row_index(parked.session_slug))
         await pilot.pause()
@@ -807,7 +807,7 @@ class TestUIConfigWriteDebounce:
         assert load_ui_config(tmp_path).selected_slug == slugs[-1]
 
     @pytest.mark.timeout(10)
-    async def test_rebuild_that_leaves_the_selection_unchanged_writes_nothing(
+    async def test_rebuild_that_leaves_the_selection_unchanged_writes_once(
         self, tmp_path, monkeypatch
     ):
         """However many rebuilds run under a parked NON-row-0 cursor,
@@ -844,7 +844,7 @@ class TestUIConfigWriteDebounce:
     async def test_rebuild_bearing_poll_ticks_write_once(self, tmp_path, monkeypatch):
         """The end-to-end busy-fleet case, through the real threaded poll
         path: a live fleet churns, so most ticks DO rebuild the table (see
-        test_rebuild_that_leaves_the_selection_unchanged_writes_nothing for
+        test_rebuild_that_leaves_the_selection_unchanged_writes_once for
         the clear()/move_cursor excursion each one makes). Four rebuild-bearing ticks over
         a selection the operator never touches cost exactly ONE write --
         the one that persists the parked cursor -- not one per tick.
@@ -979,12 +979,9 @@ class TestUIConfigWriteDebounce:
             # ... the write really failed, fail-soft: no exception reached
             # the event loop, and no file was created ...
             assert not ui_config_path(tmp_path).exists()
-            # ... and the baseline advanced anyway. This is the whole point:
-            # "persisted" here means "handed to the writer", not "on disk".
-            assert app._persisted_selected_slug == parked.session_slug
-
-            # No retry. Further ticks over the same selection stay silent
-            # even though nothing was ever actually persisted.
+            # ... and the baseline advanced anyway ("persisted" means handed
+            # to the writer, not on disk), so further ticks over the same
+            # selection stay silent: no retry.
             await tick()
             await tick()
             assert recorded == [parked.session_slug]
@@ -1098,9 +1095,7 @@ class TestUIConfigWriteDebounce:
     async def test_a_stale_restored_selection_is_still_corrected_by_the_first_flush(
         self, tmp_path, monkeypatch
     ):
-        """Over-suppression guard -- green both before and after the flush
-        gate became a comparison against the persisted selection, and
-        deliberately so.
+        """Over-suppression guard.
 
         Gating on "does the live selection differ from what is on disk" must
         still CORRECT a cockpit-ui.json naming a session that no longer
@@ -3773,7 +3768,7 @@ class TestRefreshWriteDiscipline:
         # because cockpit-ui.json is the cockpit's own sanctioned write
         # target (PRD §2/§5) and this test does not police it either way; a
         # table rebuild never rewrites it, which TestUIConfigWriteDebounce::
-        # test_rebuild_that_leaves_the_selection_unchanged_writes_nothing
+        # test_rebuild_that_leaves_the_selection_unchanged_writes_once
         # polices. The invariant under test here is narrower and exactly what
         # step-25 specifies: zero sessions/ or decisions/ writes from the
         # automatic refresh/diff path.
