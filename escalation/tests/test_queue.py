@@ -7683,6 +7683,113 @@ class TestLateResolutionCorrectsResolutionClass:
             f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
         )
 
+    def test_a_candidate_equal_to_the_stored_stamp_is_not_a_correction(
+        self, tmp_path: Path, caplog,
+    ):
+        """(a)(b)(c) Re-deriving the SAME stamp is not a correction, and is not reported as one.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' passes the capture predicate — the TEXT is a genuine late
+        finding — but nothing about the stamp changed.  Reporting a correction
+        here would contradict both documented contracts: `ResolveOutcome`'s
+        'the stamp this call re-derived, or None' (queue.py:301) and the
+        entry's `prior_resolution_class`, which names the stamp this capture
+        SUPERSEDED.  Nothing was superseded.
+        """
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+                resolution_class='benign', outcome=out,
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        # (a) nothing was re-derived, so nothing is reported as re-derived.
+        assert out['resolution_class_corrected'] is None, (
+            f'a candidate equal to the stored stamp is not a correction: {out}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+        # (b) capture and correction stay independent — the TEXT still lands.
+        assert out['late_resolution_captured'] is True, (
+            f'the text is still a genuine late finding: {out}'
+        )
+        assert len(record.late_resolutions) == 1, (
+            f'exactly one entry must be captured: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged, not re-written: {record.resolution_class!r}'
+        )
+        # (c) a log reader is not told about a change that did not happen.
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any('CAPTURED in late_resolutions' in m for m in messages), (
+            f'setup: the capture WARNING must have fired: {messages}'
+        )
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened, so none may be logged: {messages}'
+        )
+
+    def test_the_l2_member_cascade_reaches_the_no_op_correction_for_real(
+        self, tmp_path: Path, caplog,
+    ):
+        """(d) The same shape, driven end-to-end rather than via an explicit kwarg.
+
+        Resolving a reaper-sweep L2 forwards its OWN derived 'benign' stamp to
+        each member (queue.py:1476) under `resolved_by='l2-cascade:<id>'`, whose
+        tier is 'cascade' — so the incoming side of the capture predicate passes
+        and a member already auto-dismissed 'benign' gets a candidate identical
+        to its stored stamp.  This is how the no-op arises in production, with
+        no caller ever typing `resolution_class='benign'`.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        member = _make_escalation('esc-3902-member', task_id='3902', level=1)
+        queue.submit(member)
+        l2 = _make_escalation('esc-3902-l2', task_id='3902', level=2)
+        l2.members = ['esc-3902-member']
+        queue.submit(l2)
+        queue.resolve(
+            'esc-3902-member', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        seeded = queue.get('esc-3902-member')
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', f'setup: {seeded.resolution_class!r}'
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-l2', 'aged out', dismiss=True, resolved_by='auto-dismissed',
+            )
+
+        parent = queue.get('esc-3902-l2')
+        assert parent is not None
+        assert parent.resolution_class == 'benign', f'setup: {parent.resolution_class!r}'
+        record = queue.get('esc-3902-member')
+        assert record is not None
+        assert len(record.late_resolutions) == 1, (
+            f'the cascade text is still captured: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'the member stamp must be untouched: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened on the cascade path either: {messages}'
+        )
+
     def test_patch_resolution_metadata_preserves_the_capture_and_correction(
         self, tmp_path: Path,
     ):

@@ -8030,3 +8030,40 @@ class TestResolveIssueSurfacesLateResolution:
             f'a rejected call must not correct the stamp either: '
             f'{record.resolution_class!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_correction_is_not_announced_as_a_correction(
+        self, tmp_path: Path,
+    ):
+        """(e) The reason explains the CAPTURE, and claims a correction only when one happened.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' re-derives the same value — nothing was corrected, so the
+        human-readable reason must not say it was, while still reporting the
+        capture that DID happen.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='benign',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the text is still a genuine late finding: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'late_resolutions' in reason, f'the capture is still explained: {reason!r}'
+        assert 'resolution_class was corrected' not in reason, (
+            f'no correction happened, so none may be announced: {reason!r}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
