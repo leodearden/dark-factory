@@ -227,8 +227,32 @@ duration by runner, host occupancy, heartbeat queue depth, and the
 `merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
 `--speculation` (depth distributions, the chain-dead void rate, and a
 cross-project void-rate block) and `--chains` (deep merge-ahead chain
-landings and observed chain lengths). `--json` emits the same numbers
+landings and observed chain lengths — see
+[§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap)
+for the mechanism those numbers measure). `--json` emits the same numbers
 keyed by project root and nothing else on stdout.
+
+`--chains` reads three event fields, and naming them is how you get from
+the report back to the raw `runs.db` rows: `merge_finalized.state`, which
+defines a landing (`state == 'done'` — every other row is skipped outright)
+and so supplies the denominator in both the chain-landed share and the "of
+N" on the same report line; `merge_finalized.landed_via_chain` (an int **per
+landed item**, summed to give items-landed-via-chain — it is neither a
+boolean flag nor the chain size); and `merge_verify.chain_items` (the
+1-indexed count of items in the verified tree, so a two-link chain reads
+`chain_items == 3`, and a non-chained verify is a chain of *one* rather than
+a missing measurement). Two readings
+`scripts/merge_lane_throughput.py::compute_chains` already encodes will
+otherwise catch you out: the mean chain length averages only the **deep**
+verifies (`chain_items > 1`), because including the chains of one would drag
+it toward 1 and hide how long real chains get; and a non-numeric
+`landed_via_chain` — a bool included, deliberately, since a payload written
+as a flag would sum to a wrong number — is counted in
+`n_unusable_landed_via_chain` rather than coerced. A float *is* numeric and
+*is* coerced (truncated), so a non-zero unusable count means a bool or a
+non-number, never a fraction. `chain_items` supersedes the probe-era `depth`
+label (PRD decision 8) — historical `depth >= 2` events stay excluded from
+calibration.
 
 It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
 writes nothing, files nothing, escalates nothing and emits no events, so
@@ -528,6 +552,59 @@ worker for the same ref. Always go through `/merge-queue`:
    genuinely unreachable (orchestrator not running) — never as a shortcut
    when the queue is merely slow.
 
+### Deep merge-ahead chains (`merge_deep.chain_cap`)
+
+Ordinarily one merge verify covers one item. When the queue holds **two or
+more** mergeable items and `merge_deep.chain_cap > 0`, the second verify
+slot instead builds a **chain**: it claims one pooled `_spec-N` lane, merges
+the queued items onto the head in submission order inside that single lane
+(truncating at the first textual conflict), verifies only the resulting
+**tip**, and on a pass CAS-lands the whole verified prefix in submission
+order. One passing verify can therefore land k items — and it is not a
+statistical bet, because the suite that passed ran on the exact cumulative
+tree being landed.
+
+**The knob.** `merge_deep.chain_cap` bounds how many queued items one chain
+may contain. The shipped default is **`0`**, which is the **kill switch**:
+the gate can never open, so no chain code executes on any dispatch path and
+merging is byte-identical to pre-feature behaviour. Every `merge_deep` leaf
+is green-tier hot-reloadable (see [§6](#6-config-reload-vs-restart)), so
+enabling, retuning and killing the feature are each one `reload_config`
+away — no restart, no drained queue.
+
+**Cap staging is a plan, not a live value.** `plans/deep-merge-ahead-prd.md`
+decision 6 stages the cap `6` → `32` (the study-validated depth, then
+"uncapped in practice"), but that rollout is owned by tasks ζ (reify canary
+at 6), η1 (the 7-day predicate) and η2 (promote to 32), and the cap is
+per-project config. The stock default is still `0` everywhere. To learn
+whether chains are live on a unit, read that project's
+`dark-factory-orchestrator.yaml` — do not infer `6` from the PRD.
+
+**Failure policy: halve on fail, reset on pass.** A tip failure says nothing
+about *which* item broke, so the next round targets `max(1, ⌊d/2⌋)` against
+the depth actually built, and consecutive failures log-bisect (6 → 3 → 1)
+toward the bad item. **Any** pass resets the state. Each round recomputes
+`target_depth = min(queue_len, chain_cap, halving_state)` afresh, so a reset
+re-derives the target from the queue as it is *now* rather than replaying a
+stale length. At the `d=1` floor no chain is built at all and the round
+takes today's adjacent verify — the floor is byte-identical **by
+construction**, not by careful mimicry. A failed tip lands nothing *via the
+chain* and mutates the queue not at all: its items stay queued and take
+their normal sequential path. The round is not therefore a zero-landing
+round — the head is never chained, so its own verify proceeds untouched and
+can still land in that same round; the head's verdict is discarded only on a
+tip **pass**, where the tip's tree strictly contains it.
+
+**What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
+and `reload_config`; that is the whole intervention, and it takes effect on
+the next dispatch round. To judge whether to raise it, read the `--chains`
+report (see
+[§"Reading the merge-lane throughput baseline"](#reading-the-merge-lane-throughput-baseline)).
+The authoritative contract — the dispatch and landing invariants,
+truncate-at-conflict semantics, and the stale-CAS abort — is
+`plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
+it, not a second copy.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
@@ -699,6 +776,13 @@ takes no arguments: it always re-reads that process's own
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
   false-positive L2 can be cleared on a live unit)
+- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+  [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
+  `0` is the shipped default and the feature's kill switch). Green-tier on
+  purpose, for the reason the `config_key_census.*` bullet above and the
+  `mem0_update.enabled` bullet below both give: a kill switch you can only
+  pull by restarting the unit is not a kill switch. Enable, retune and
+  kill all land on the next dispatch round.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
