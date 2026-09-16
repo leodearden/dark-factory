@@ -119,6 +119,20 @@ def task_with_delivered_checks() -> dict:
     }
 
 
+def _bullet_lines(rendered: str) -> list[str]:
+    """The descriptor bullets of a capability-gate block, boilerplate excluded.
+
+    Every assertion about what the RENDERER produced must run against these
+    lines alone. The block's static prose necessarily repeats descriptor
+    vocabulary — it names a ``grep`` check, a ``script`` check, "Satisfying a
+    pattern with a comment", "each capability names" — so a substring test over
+    the whole block silently passes on ``pattern``, ``script``, ``name`` and
+    ``grep`` no matter what the bullets contain. Shared by both
+    ``_format_delivered_checks`` test classes so the filter is stated once.
+    """
+    return [ln for ln in rendered.splitlines() if ln.startswith('- name:')]
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -220,24 +234,24 @@ class TestFormatDeliveredChecks:
     }
 
     def test_grep_entry_renders_its_descriptor(self):
-        out = _format_delivered_checks([self.GREP_CHECK])
-        assert 'cap-one' in out
-        assert 'grep' in out
-        assert 'FooBar' in out
-        assert 'present' in out
-        assert 'orchestrator' in out
+        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.GREP_CHECK])))
+        assert 'cap-one' in bullet
+        assert 'grep' in bullet
+        assert 'FooBar' in bullet
+        assert 'present' in bullet
+        assert 'orchestrator' in bullet
 
     def test_script_entry_renders_its_descriptor(self):
-        out = _format_delivered_checks([self.SCRIPT_CHECK])
-        assert 'cap-two' in out
-        assert 'script' in out
-        assert 'scripts/check.py' in out
-        assert '--strict' in out
-        assert '30' in out
+        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK])))
+        assert 'cap-two' in bullet
+        assert 'script' in bullet
+        assert 'scripts/check.py' in bullet
+        assert '--strict' in bullet
+        assert '30' in bullet
 
     def test_two_entries_render_two_bullets_in_order(self):
         out = _format_delivered_checks([self.GREP_CHECK, self.SCRIPT_CHECK])
-        bullets = [ln for ln in out.splitlines() if ln.startswith('- name:')]
+        bullets = _bullet_lines(out)
         assert len(bullets) == 2
         assert out.index('cap-one') < out.index('cap-two')
 
@@ -277,10 +291,16 @@ class TestFormatDeliveredChecks:
         from every briefing. The grep and script field sets are mutually
         exclusive by ``kind``, so the union of the two renders is what must
         cover ``DeliveredCheckMeta.model_fields``.
+
+        Scoped to the BULLETS via ``_bullet_lines``: the block's static prose
+        contains the substrings ``pattern``, ``script`` and ``name`` on its
+        own, so a union taken over the whole block would keep passing after
+        those three fields were deleted from the renderer — pinning prose
+        instead of the thing that drifts.
         """
-        union = (
-            _format_delivered_checks([self.GREP_CHECK])
-            + _format_delivered_checks([self.SCRIPT_CHECK])
+        union = '\n'.join(
+            _bullet_lines(_format_delivered_checks([self.GREP_CHECK]))
+            + _bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK]))
         )
         missing = [f for f in DeliveredCheckMeta.model_fields if f not in union]
         assert not missing, f'renderer omits live DeliveredCheckMeta fields: {missing}'
@@ -300,10 +320,6 @@ class TestFormatDeliveredChecksDegradesSafely:
         'paths': [],
     }
 
-    @staticmethod
-    def _bullets(out: str) -> list[str]:
-        return [ln for ln in out.splitlines() if ln.startswith('- name:')]
-
     def test_bare_dict_is_accepted_as_a_one_element_list(self):
         """A dict supplied where a list belongs validates quietly through
         ``parse_metadata`` (shared/tests/test_capability_manifest.py), so a real
@@ -313,7 +329,7 @@ class TestFormatDeliveredChecksDegradesSafely:
             {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
         )
         assert isinstance(out, str)
-        assert len(self._bullets(out)) == 1
+        assert len(_bullet_lines(out)) == 1
         assert 'cap' in out
 
     def test_string_value_renders_nothing(self):
@@ -327,11 +343,11 @@ class TestFormatDeliveredChecksDegradesSafely:
         out = _format_delivered_checks(['nope', self.VALID])
         assert isinstance(out, str)
         assert 'cap-ok' in out
-        assert len(self._bullets(out)) == 1
+        assert len(_bullet_lines(out)) == 1
 
     def test_entry_missing_name_and_kind_still_renders_what_is_known(self):
         out = _format_delivered_checks([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
-        assert len(self._bullets(out)) == 1
+        assert len(_bullet_lines(out)) == 1
         assert 'OnlyAPattern' in out
         assert 'present' in out
 
@@ -339,7 +355,7 @@ class TestFormatDeliveredChecksDegradesSafely:
         out = _format_delivered_checks(
             [{'name': 'cap-weird', 'kind': 'telepathy', 'pattern': 'Z'}],
         )
-        assert len(self._bullets(out)) == 1
+        assert len(_bullet_lines(out)) == 1
         assert 'cap-weird' in out
         assert 'telepathy' in out
         assert 'Z' in out
@@ -347,7 +363,7 @@ class TestFormatDeliveredChecksDegradesSafely:
 
     def test_unrecognised_kind_does_not_suppress_a_sibling_entry(self):
         out = _format_delivered_checks([{'kind': 'telepathy'}, self.VALID])
-        assert len(self._bullets(out)) == 2
+        assert len(_bullet_lines(out)) == 2
         assert 'cap-ok' in out
 
     def test_non_string_paths_element_is_coerced(self):
@@ -369,13 +385,13 @@ class TestFormatDeliveredChecksDegradesSafely:
     def test_over_the_limit_truncates_visibly(self):
         checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT + 3)]
         out = _format_delivered_checks(checks)
-        assert len(self._bullets(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
         assert '…and 3 more' in out
 
     def test_exactly_at_the_limit_renders_no_truncation_line(self):
         checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT)]
         out = _format_delivered_checks(checks)
-        assert len(self._bullets(out)) == DELIVERED_CHECK_BULLET_LIMIT
+        assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
         assert '…and' not in out
 
 GATE_HEADING = '## Declared Capability Gate'
