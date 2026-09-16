@@ -4893,15 +4893,19 @@ class TestUnreadableTranscriptEscapeWiring:
     it blocks until the watchdog has read the transcript `required_reads` times,
     which each test states as the precondition its `call_count` assertion
     consumes. The wait is valve-bounded, so a watchdog that stops polling fails
-    that assertion instead of hanging the suite.
+    that assertion instead of hanging the suite. Four of the five behavioural
+    tests pin their poll count that way (3/3/1/6); the scope-bound one asserts
+    ZERO reads over a valve-bounded lifetime, which is what keeps that assertion
+    falsifiable rather than a no-op.
 
     The child used to live a fixed 0.25s while the watchdog polled at 5ms, which
     made every poll count a race: measured 33-46 polls standalone, but 4/480
     failures under 40-way process contention with counts down to 1 and 5 (task
     5112). Widening that lifetime was the rejected alternative — it buys a bigger
     constant on the same race, and this file's sibling wall-clock bound has been
-    widened four times already. Post-fix the same 480-run soak at loadavg 131-174
-    is 0 failures, with poll counts pinned at exactly 3/3/1/6/0.
+    widened four times already. Post-fix that soak is 0 failures over 1120 runs
+    at 40- and 80-way contention, loadavg to 151; the 160 instrumented of those
+    reported the same counts in every single run.
     """
 
     @staticmethod
