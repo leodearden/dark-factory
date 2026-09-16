@@ -4855,6 +4855,14 @@ _ESCAPE_NEEDLE = 'Transcript UNREADABLE'
 # class's poll-count preconditions depend on is reproduced on any host.
 _STARVATION_STALL_SECS = 0.5
 
+# How long the fake child waits for its poll-count barrier before giving up and
+# exiting anyway. ORDERING INVARIANT, stated here and nowhere else: well under
+# the 30s startup_grace_secs/absolute_cap_secs these tests pass, so a valve trip
+# can never manufacture a spurious escape record or kill, and far under the 300s
+# pytest timeout. 10s is ~7x this harness's measured worst case (~0.25s per poll
+# under 40-way contention x the 6 polls the largest required_reads needs).
+_CHILD_RELEASE_TIMEOUT_SECS = 10.0
+
 
 def _escape_records(caplog):
     """The storm-escape WARNINGs emitted during a driven watchdog run.
@@ -4883,12 +4891,18 @@ class TestUnreadableTranscriptEscapeWiring:
     """
 
     @staticmethod
-    def _proc(release: asyncio.Event):
+    def _proc(release: asyncio.Event, release_timeout_secs: float):
         """A process that stays pending until the watchdog has polled enough times.
 
         The child exits on `release`, which `_drive`'s read wrapper sets once
         `required_reads` polls have happened — not on a timer, so no amount of
         host contention can decide how many polls a test observes.
+
+        The wait is bounded, and the TimeoutError SUPPRESSED rather than raised:
+        a barrier that never opens must leave the child exiting NORMALLY, so
+        `_run_subprocess` takes its normal-exit path and the surviving failure is
+        the caller's poll-count assertion rather than a spurious `timed_out=True`
+        routed through the kill block.
         """
         payload = json.dumps({
             'result': 'ok',
@@ -4900,7 +4914,8 @@ class TestUnreadableTranscriptEscapeWiring:
         }).encode()
 
         async def _communicate(input=None):  # noqa: A002
-            await release.wait()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(release.wait(), timeout=release_timeout_secs)
             return (payload, b'')
 
         proc = MagicMock()
@@ -4923,6 +4938,7 @@ class TestUnreadableTranscriptEscapeWiring:
         startup_grace_secs=0.0,
         working_idle_secs=None,
         absolute_cap_secs=None,
+        release_timeout_secs: float = _CHILD_RELEASE_TIMEOUT_SECS,
     ):
         """Run the watchdog loop at millisecond cadence with a patched transcript read.
 
@@ -4934,7 +4950,7 @@ class TestUnreadableTranscriptEscapeWiring:
         release = asyncio.Event()
         if required_reads <= 0:
             release.set()
-        proc = self._proc(release)
+        proc = self._proc(release, release_timeout_secs)
 
         reads = itertools.count(1)
 
