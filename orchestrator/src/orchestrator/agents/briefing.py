@@ -1849,8 +1849,23 @@ A prior block-time investigation concluded the following; verify against the cur
         that cannot see it is measured against a contract it was never shown.
         Deliberately NOT suppressed by ``include_files=False``: C-A1 hides a
         queue-time GUESS, whereas this is an authored acceptance contract the
-        first derivation must plan against. The descriptor contract itself lives
-        in ``docs/task-authoring.md`` §3.3 — pointed at, never restated (INV-9).
+        first derivation must plan against.
+
+        That exemption knowingly covers a grep descriptor's ``paths``, which IS
+        a file footprint and so does overlap C-A1's subject — the overlap was
+        noticed, not missed. The two differ in what they BIND. ``metadata.files``
+        binds nothing: the architect is told to derive its own footprint, so
+        echoing the guess only anchors it. ``paths`` binds the capability: it is
+        the scope ``git grep -E`` will actually search at mark-done, so an
+        architect that plans the behaviour into a directory ``paths`` does not
+        name has failed a check it was never shown. Hiding it would hand the
+        first derivation a contract it cannot evaluate while still blocking the
+        task on it — strictly the failure this section exists to cure. The
+        residual anchoring cost (``paths`` does convey a location) is accepted
+        as the cheaper half of that trade.
+
+        The descriptor contract itself lives in ``docs/task-authoring.md`` §3.3
+        — pointed at, never restated (INV-9).
         """
         metadata = task.get('metadata') or {}
         lines = []

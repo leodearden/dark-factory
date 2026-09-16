@@ -502,10 +502,19 @@ class TestDeliveredChecksReachDispatchedRoles:
     ):
         """C-A1 suppresses the queue-time ``metadata.files`` GUESS only — never
         the authored acceptance contract the architect is measured against.
+
+        The fixture makes the overlap literal: ``metadata.files`` and the grep
+        descriptor's ``paths`` are the same list. ``paths`` is the scope
+        ``git grep -E`` searches at mark-done, so hiding it would show the
+        architect a check it cannot evaluate while still blocking the task on
+        it — the deliberate exemption ``_format_task``'s docstring records.
+        Asserted on the BULLETS: ``orchestrator`` also appears in the block's
+        prose (it names a file under ``orchestrator/src/``).
         """
         out = briefing._format_task(task_with_delivered_checks, include_files=False)
         assert '**Files:**' not in out
         self._assert_gate_delivered(out)
+        assert 'paths: orchestrator' in '\n'.join(_bullet_lines(out))
 
     def test_gate_survives_the_json_fallback(self, briefing: BriefingAssembler):
         """A task with no recognised top-level field falls through to
