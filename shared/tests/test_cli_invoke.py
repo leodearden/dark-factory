@@ -4883,8 +4883,13 @@ class TestUnreadableTranscriptEscapeWiring:
     """
 
     @staticmethod
-    def _proc(run_secs: float = 0.25):
-        """A process whose communicate() stays pending across many watchdog polls."""
+    def _proc(release: asyncio.Event):
+        """A process that stays pending until the watchdog has polled enough times.
+
+        The child exits on `release`, which `_drive`'s read wrapper sets once
+        `required_reads` polls have happened — not on a timer, so no amount of
+        host contention can decide how many polls a test observes.
+        """
         payload = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -4895,7 +4900,7 @@ class TestUnreadableTranscriptEscapeWiring:
         }).encode()
 
         async def _communicate(input=None):  # noqa: A002
-            await asyncio.sleep(run_secs)
+            await release.wait()
             return (payload, b'')
 
         proc = MagicMock()
@@ -4912,14 +4917,35 @@ class TestUnreadableTranscriptEscapeWiring:
         tmp_path,
         *,
         turns_side_effect,
+        required_reads: int,
         config_dir,
         session_id,
         startup_grace_secs=0.0,
         working_idle_secs=None,
         absolute_cap_secs=None,
     ):
-        """Run the watchdog loop at millisecond cadence with a patched transcript read."""
-        proc = self._proc()
+        """Run the watchdog loop at millisecond cadence with a patched transcript read.
+
+        `required_reads` is the caller's stated precondition: the fake child stays
+        pending until the watchdog has polled the transcript that many times. A
+        run that can never produce a read pre-sets the barrier.
+        """
+        loop = asyncio.get_running_loop()
+        release = asyncio.Event()
+        if required_reads <= 0:
+            release.set()
+        proc = self._proc(release)
+
+        reads = itertools.count(1)
+
+        def counted_read(*args, **kwargs):
+            value = turns_side_effect(*args, **kwargs)
+            # The read is dispatched through `asyncio.to_thread`, so this runs on
+            # a worker thread and must not touch the Event directly. Re-releasing
+            # on later reads is idempotent.
+            if next(reads) >= required_reads:
+                loop.call_soon_threadsafe(release.set)
+            return value
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4931,7 +4957,7 @@ class TestUnreadableTranscriptEscapeWiring:
             patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
             patch(
                 'shared.cli_invoke.count_transcript_turns',
-                side_effect=turns_side_effect,
+                side_effect=counted_read,
             ) as mock_turns,
         ):
             result = await _run_subprocess(
@@ -5012,6 +5038,7 @@ class TestUnreadableTranscriptEscapeWiring:
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
@@ -5040,9 +5067,10 @@ class TestUnreadableTranscriptEscapeWiring:
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: None,
+                required_reads=3,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
-                # The driven run lasts ~0.25s; nothing may fire inside 30s.
+                # The driven run is over in milliseconds; nothing may fire inside 30s.
                 startup_grace_secs=30.0,
             )
 
@@ -5059,14 +5087,19 @@ class TestUnreadableTranscriptEscapeWiring:
     async def test_no_escape_when_transcript_readable(self, tmp_path, caplog):
         """A readable transcript never fires the escape, even with grace at zero."""
         with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
-            await self._drive(
+            mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: 1,
+                required_reads=1,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
             )
 
+        assert mock_turns.call_count >= 1, (
+            f'a run that never read the transcript proves nothing about the escape; '
+            f'got {mock_turns.call_count} polls'
+        )
         records = _escape_records(caplog)
         assert not records, (
             f'a readable transcript must not fire; got {[r.getMessage() for r in records]}'
@@ -5079,13 +5112,14 @@ class TestUnreadableTranscriptEscapeWiring:
         latches on the first readable poll and the loop keeps reading every poll
         via the extension branch (without the extension it would short-circuit
         all further reads and the alternation would be untestable). The idle and
-        absolute bounds are far beyond the ~0.25s run, so no kill is in play.
+        absolute bounds are far beyond this run's length, so no kill is in play.
         """
         alternating = itertools.cycle([None, 1])
         with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: next(alternating),
+                required_reads=6,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
@@ -5120,6 +5154,7 @@ class TestUnreadableTranscriptEscapeWiring:
                 mock_turns = await self._drive(
                     tmp_path,
                     turns_side_effect=lambda *a, **k: None,
+                    required_reads=0,
                     config_dir=config_dir,
                     session_id=session_id,
                     startup_grace_secs=0.0,
