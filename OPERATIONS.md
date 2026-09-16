@@ -749,6 +749,13 @@ takes no arguments: it always re-reads that process's own
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
   false-positive L2 can be cleared on a live unit)
+- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+  [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
+  `0` is the shipped default and the feature's kill switch). Green-tier on
+  purpose, for the reason the `config_key_census.*` bullet above and the
+  `mem0_update.enabled` bullet below both give: a kill switch you can only
+  pull by restarting the unit is not a kill switch. Enable, retune and
+  kill all land on the next dispatch round.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
