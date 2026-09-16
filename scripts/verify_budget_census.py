@@ -1099,13 +1099,21 @@ def _census_budget_floor(worst: float) -> int | None:
     family's canonical-expression guard establishes for ``min_budget``.
 
     Returns ``None`` when the family module cannot be located, and the report
-    says "derivation unavailable" rather than falling back to a locally-written
-    multiple. That fallback is the one thing this function must not do: it
-    would agree today and drift the moment either side changed, which is
-    precisely the failure the shared expression prevents. The closing guard in
-    tests/scripts/test_verify_budget_census.py asserts against this file's
-    SOURCE that no such multiple appears here, so the phrasing above avoids
-    writing one even inside prose.
+    says the derivation is UNAVAILABLE. Recomputing ``1.5 * worst`` here as a
+    fallback is the one thing this function must not do: a second spelling
+    would agree with the family today and drift silently the moment either
+    side changed, which is the whole failure the shared expression prevents.
+
+    Both halves are held up by executable guards in
+    tests/scripts/test_verify_budget_census.py. The delegation guards patch
+    ``module_budget_family.census_budget_floor`` to a sentinel and assert the
+    floor this report prints — in the JSON document and in the text rendering
+    alike — follows it, which a locally-spelled multiple could not; a third
+    makes the family unreachable and asserts the floor comes back ``None``
+    rather than a number the gate never agreed to. The import below sits after
+    the ``sys.path`` insertion it depends on, inside the function body, and
+    resolving that name at call time is also what makes the delegation
+    observable.
     """
     if str(_FAMILY_DIR) not in sys.path:
         sys.path.insert(0, str(_FAMILY_DIR))
