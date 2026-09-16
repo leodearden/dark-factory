@@ -1475,6 +1475,15 @@ class TestTheReportCarriesItsOwnProvenance:
         assert 'unstamped' in report['by_load_band']
 
 
+# An unmistakable stand-in for the family's answer, used by the delegation
+# guards below. Deliberately BELOW `REFUSAL_CEILING` (7200) so the section under
+# test stays in its ordinary arm and the guards do not accidentally assert the
+# escalation branch, and deliberately not a value `census_budget_floor` would
+# ever return for the fixtures here (those derive 5700-7500), so agreement with
+# it cannot be a coincidence.
+_SENTINEL_FLOOR = 4242
+
+
 class TestTheCensusAndTheGuardShareOneDerivation:
     """INV-10, closing guard: the report and the gate cannot drift apart.
 
@@ -1557,22 +1566,87 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         assert '7000' in out
         assert 'ORCHESTRATOR_BUDGET_CENSUS' in out
 
-    def test_the_census_does_not_respell_the_derivation(self):
-        """The import is the mechanism, so its ABSENCE is the failure mode.
+    def test_the_floor_is_whatever_the_family_returns(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """Delegation asserted by BEHAVIOUR: patch the family, and the report
+        follows it anywhere.
 
-        Asserted against the module's source: a re-spelled `1.5 *` would pass
-        every numeric test above today and drift the moment either side
-        changed, which is exactly what the family's canonical-expression guard
-        exists to prevent for `min_budget`.
+        The import is the mechanism, so its absence is the failure mode — but
+        the absence is only observable by running the thing. `_census_budget_
+        floor` performs its `from module_budget_family import
+        census_budget_floor` INSIDE the function body, so the name is resolved
+        at CALL time and this patch is seen. A census that re-spelled the
+        multiple for itself — `1.5 * worst`, `worst * 1.5`, `3 * worst / 2`,
+        `Fraction(3, 2) * worst`, any of them — would keep returning the real
+        floor here and go red, which no source-text pattern over this file
+        reliably distinguishes.
         """
-        from pathlib import Path as _Path  # noqa: PLC0415
+        import module_budget_family  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            module_budget_family,
+            'census_budget_floor',
+            lambda _worst: _SENTINEL_FLOOR,
+        )
+
+        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+
+        assert report['budget_check']['derived_floor'] == _SENTINEL_FLOOR
+
+    def test_the_text_rendering_follows_the_family_too(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """`format_report` is a second consumer of the same key, and the
+        operator-facing one — the floor an operator copies out of the text
+        report has to be the family's number, not a second opinion."""
+        import module_budget_family  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            module_budget_family,
+            'census_budget_floor',
+            lambda _worst: _SENTINEL_FLOOR,
+        )
+        _corpus_with(tmp_path, _leg(duration_secs=4626.166946739017))
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+
+        assert str(_SENTINEL_FLOOR) in out
+
+    def test_an_unreachable_family_derives_nothing_rather_than_guessing(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """The `except ImportError` arm: no floor, and a note that says so.
+
+        A locally-recomputed fallback is the one thing that arm must not do,
+        so the ABSENCE of a number is the contract — a census run from a
+        partial checkout must report that it cannot derive the floor rather
+        than print one the gate never agreed to.
+
+        Evicting the module from `sys.modules` is not enough on its own:
+        `tests/scripts` sits on `sys.path` (conftest puts it there) and
+        `_census_budget_floor` re-inserts `_FAMILY_DIR` itself, so both have to
+        go for the import to actually fail.
+        """
+        import sys  # noqa: PLC0415
 
         import verify_budget_census as mod  # noqa: PLC0415
 
-        source = _Path(mod.__file__).read_text(encoding='utf-8')
+        no_family = tmp_path / 'no-family'
+        no_family.mkdir()
+        monkeypatch.setattr(mod, '_FAMILY_DIR', no_family)
+        monkeypatch.setattr(sys, 'path', [
+            entry for entry in sys.path
+            if not (Path(entry or '.') / 'module_budget_family.py').exists()
+        ])
+        monkeypatch.delitem(sys.modules, 'module_budget_family', raising=False)
 
-        assert 'census_budget_floor' in source
-        assert '1.5 *' not in source, (
-            'the census re-spells the derivation instead of importing '
-            'module_budget_family.census_budget_floor'
-        )
+        check = self._report(
+            tmp_path, capsys, _leg(duration_secs=4626.166946739017),
+        )['budget_check']
+
+        assert check['derived_floor'] is None
+        assert 'unavailable' in check['note'].lower()
+        assert check['exceeds_refusal_ceiling'] is False
