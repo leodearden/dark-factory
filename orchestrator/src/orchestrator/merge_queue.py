@@ -18498,10 +18498,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Disposal is deferred rather than done here so it cannot delay
             # quarantine_and_release, which _finalize_inflight runs first to
             # bench the dead remote before the re-dispatch.
+            #
+            # task 4194: the host and the reason are logged because the reason
+            # is the only field separating `exited 1` (the remote watchdog
+            # self-killed) from `exited 255` (the transport died), and the
+            # rc-bearing string otherwise reaches disk only through
+            # _alarm_verify_host_unreachable — gated on a streak or 600s of
+            # continuous unreachability that a single spurious self-kill never
+            # crosses.  lease.name is the same field _quarantine_unreachable_host
+            # is handed as its `host`, so this names no second spelling.
             logger.warning(
-                'Task %s: remote runner unavailable (merge=%s) — '
-                'will re-dispatch on another host',
-                req.task_id, merge_commit[:8],
+                'Task %s: remote runner unavailable (merge=%s) on host %s — '
+                'will re-dispatch on another host: %s',
+                req.task_id, merge_commit[:8], lease.name, str(exc),
             )
             # task 3003 amend (robustness): a dead remote transport is not lane
             # contention — this item is re-dispatched on another host, so close
