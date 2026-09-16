@@ -34,6 +34,13 @@ import dataclasses
 import datetime as dt
 import itertools
 
+# Above the 61s normal per-project harness cadence, below the 120s shorter of
+# the two observed stalls — so it separates a stall from healthy idle with
+# ~29s of margin on one side and ~30s on the other. Both endpoints are
+# measured, and the module docstring above records them; do not restate the
+# derivation anywhere else.
+DEFAULT_STALL_THRESHOLD_SECONDS = 90.0
+
 
 @dataclasses.dataclass(frozen=True)
 class StallEpisode:
@@ -75,7 +82,10 @@ def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
     return parsed
 
 
-def analyze(journal_text: str, stall_threshold_seconds: float = 90.0) -> list[StallEpisode]:
+def analyze(
+    journal_text: str,
+    stall_threshold_seconds: float = DEFAULT_STALL_THRESHOLD_SECONDS,
+) -> list[StallEpisode]:
     """Report every silence longer than *stall_threshold_seconds*, in order."""
     lines = timestamped_lines(journal_text)
     episodes = []
