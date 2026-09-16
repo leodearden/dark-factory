@@ -200,6 +200,12 @@ async def _drive_session_slot(
 ):
     """Populate recovered-session state and run ``_run_slot`` with
     ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
+
+    The FULL kwarg set is stashed on the harness as
+    ``_last_build_workflow_kwargs`` for the rows that need a different one (ε's
+    sink wiring). Stashed rather than returned because ~20 existing rows read
+    the return value as a session id, and per-harness rather than per-module
+    because the fixture is function-scoped, so nothing leaks between rows.
     """
     harness._recovered_sessions[task_id] = session
     if config_dir is not None:
@@ -219,6 +225,7 @@ async def _drive_session_slot(
         )
         MockWorkflow.return_value = mock_wf
         await harness._run_slot(assignment, sem)
+        harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs
         return MockWorkflow.call_args.kwargs['resume_session_id']
 
 
@@ -3908,6 +3915,30 @@ class TestSessionResumeStorm:
 
         harness.note_resume_failed(object())  # type: ignore[arg-type]
         harness.note_resume_succeeded()
+
+    async def test_run_slot_wires_the_harness_as_the_resume_outcome_sink(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The production dispatch path is CONNECTED, not merely connectable.
+
+        ``resume_outcome_sink`` is OPTIONAL on ``build_workflow`` — which is
+        what keeps eval dispatch unedited and un-drifted, and also what makes
+        "nobody ever passed one" a silent, fully-green failure mode: every
+        arm-seam report would be dropped on the floor and INV-4's escape would
+        be inert again while every other row in this class still passed.
+
+        So this pins the wiring itself: ``_run_slot`` passes the Harness
+        ITSELF, the object that owns the streak, the carve-outs and the
+        escalation queue.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        cfg = _make_transcript(tmp_path, 'uuid-sink')
+        await _drive_session_slot(
+            harness, 'sink1', self._fresh_session('uuid-sink'), config_dir=cfg,
+        )
+
+        kwargs = harness._last_build_workflow_kwargs
+        assert kwargs['resume_outcome_sink'] is harness
 
     async def test_storm_l1_names_every_recorded_failure(self, harness: Harness):
         """INV-2 structured-facts-at-failure: the L1 names what actually failed.
