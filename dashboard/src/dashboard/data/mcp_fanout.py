@@ -1524,7 +1524,7 @@ class TTLCache(Generic[V, K]):
             for task in self._live_bypasses_for(key)
             if task.get_loop() is loop
         ]
-        retained: dict[str, list[asyncio.Task[V]]] = {}
+        retained: dict[K, list[asyncio.Task[V]]] = {}
         for key, tasks in self._live_bypasses.items():
             elsewhere = [task for task in tasks if _runs_on_another_live_loop(task)]
             if elsewhere:
@@ -1549,7 +1549,7 @@ class TTLCache(Generic[V, K]):
                 'are abandoned (keys: %s); shutdown continues without them',
                 len(abandoned),
                 _REAP_UNWIND_TIMEOUT_SECONDS,
-                ', '.join(sorted({k for k, task in reapable if task in abandoned})),
+                ', '.join(sorted({repr(k) for k, task in reapable if task in abandoned})),
             )
         return len(reapable) - len(abandoned)
 
