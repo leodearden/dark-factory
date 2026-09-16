@@ -46,6 +46,10 @@ from fused_memory.services.memory_service import (
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
+#: The module logger the success-line assertions below scope their
+#: `caplog.at_level` to, so an unrelated logger's INFO cannot leak in.
+_MEMORY_SERVICE_LOGGER = 'fused_memory.services.memory_service'
+
 
 def _repair(**overrides) -> ReferentRepair:
     """A minimally-valid repair record; overrides tune whichever field a test pins."""
@@ -1728,6 +1732,220 @@ class TestPerFindingFailureContainment:
             await service._repair_episode_referents(
                 _stats(_finding()), group_id='dark_factory',
             )
+
+
+class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
+    """The thing this pass EXISTS to do was the one thing it never said.
+
+    zeta's findings are WARNINGs, and eta's refusals, failures and deletions
+    all log — but moving an endpoint, the cure itself, was silent, so 4 of 5
+    real repairs left zero trace and an operator reading syslog saw only the
+    diagnosis. INFO rather than WARNING, matching the emptied-node DELETE line
+    one arm over: a strictly more destructive COMPLETED action already at INFO,
+    and the level `server/main.py` sets as the deployed root, so the line
+    genuinely lands.
+    """
+
+    @staticmethod
+    def _success_lines(caplog) -> list[logging.LogRecord]:
+        """Keyed on the FORMAT STRING, never on the rendered message, so the
+        emptied-node delete — INFO, on this very path — cannot be miscounted
+        as a repair announcement."""
+        return [
+            r for r in caplog.records
+            if isinstance(r.msg, str)
+            and r.msg.startswith('Referent repair executed')
+        ]
+
+    @staticmethod
+    def _payload(record: logging.LogRecord) -> dict:
+        """The structured dict, read off `record.args` rather than parsed back
+        out of the message.
+
+        `logging` unwraps a lone non-empty Mapping argument onto `record.args`
+        directly instead of wrapping it in a 1-tuple, so this is the dict the
+        call site passed, byte for byte.
+        """
+        assert isinstance(record.args, dict)
+        return record.args
+
+    @pytest.mark.asyncio
+    async def test_one_info_line_carries_the_whole_repair_as_structured_data(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repaired == 1
+        lines = self._success_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        payload = self._payload(lines[0])
+
+        assert payload['edge_uuid'] == 'e1'
+        assert payload['which_end'] == 'source'
+        assert payload['old_endpoint_uuid'] == 'n-3129'
+        assert payload['old_endpoint_name'] == 'Task 3129'
+        assert payload['new_endpoint_uuid'] == 'n-3127'
+        assert payload['intended_referent'] == 'Task 3127'
+        assert payload['check'] == 'set-membership'
+        assert payload['minted'] is False
+        # THE SCOPE THE CALLER NAMED, not the one the finding happens to
+        # carry: nine projects interleave in one log, and eta is told its
+        # scope by its caller. `_finding()` stamps 'reify' precisely so a
+        # line that read scope off the record would be visible here.
+        assert payload['group_id'] == 'dark_factory'
+        assert _finding().group_id == 'reify'
+        # The payload IS the audit record plus exactly the two facts that
+        # record does not hold. Pinned as a key set rather than by value,
+        # because `deleted_emptied_node` is stamped onto the record AFTER
+        # this line is emitted.
+        assert set(payload) == set(stats.repairs[0].to_dict()) | {
+            'group_id', 'old_endpoint_name',
+        }
+        # `intended_referent` already IS the new endpoint's canonical
+        # `node_name`, so a `new_endpoint_name` key would be the same value
+        # twice in one payload under two names.
+        assert 'new_endpoint_name' not in payload
+
+    @pytest.mark.asyncio
+    async def test_the_old_endpoint_uuid_is_the_reread_not_the_findings_copy(
+        self, service, caplog,
+    ):
+        """`reassign_edge` re-reads the edge under the lock. The finding's copy
+        is this episode's PRE-NORMALIZATION view and can name a node that lost
+        a merge — so the line must say where the edge actually came FROM."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-reread'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _finding().old_endpoint_uuid == 'n-3129'
+        assert self._payload(self._success_lines(caplog)[0])[
+            'old_endpoint_uuid'
+        ] == 'n-reread'
+        assert stats.repairs[0].old_endpoint_uuid == 'n-reread'
+
+    @pytest.mark.asyncio
+    async def test_the_line_count_equals_repair_stats_repaired(
+        self, service, caplog,
+    ):
+        """Four records, ONE executed repair, one line.
+
+        The gate is `moved` — the same discriminator
+        `ReferentRepairStats.repaired` already uses — so "one line per executed
+        repair" and that property agree BY CONSTRUCTION rather than by two
+        sites staying in lockstep.
+        """
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=['n-3127', 'n-3127', RuntimeError('falkor down')],
+        )
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e-moved'),
+            _reassigned(uuid='e-noop', moved=False),
+        ])
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(
+                    _finding(edge_uuid='e-moved'),
+                    _finding(edge_uuid='e-noop'),
+                    _finding(edge_uuid='e-failed'),
+                    _finding(
+                        edge_uuid='e-unrepairable',
+                        intended_referent=None,
+                        new_endpoint_uuid=None,
+                        resolvable=False,
+                        reason='no candidate target could be determined',
+                    ),
+                ),
+                group_id='dark_factory',
+            )
+
+        assert [r.outcome for r in stats.repairs] == [
+            'repaired', 'repaired', 'failed', 'unrepairable',
+        ]
+        # The no-op is `reassign_edge`'s corroborate-before-acting arm: the
+        # edge was already correct and NOTHING was written, so it is not an
+        # executed repair and announces nothing.
+        assert [r.moved for r in stats.repairs] == [True, False, False, False]
+        assert stats.repaired == 1
+
+        lines = self._success_lines(caplog)
+        assert len(lines) == stats.repaired
+        assert self._payload(lines[0])['edge_uuid'] == 'e-moved'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('new_endpoint_uuid', 'expected_minted'),
+        [('n-3127', False), (None, True)],
+    )
+    async def test_minted_on_the_line_agrees_with_the_audit_record(
+        self, service, caplog, new_endpoint_uuid, expected_minted,
+    ):
+        """`minted` is the one field an operator cannot re-derive from the
+        graph afterwards, so the line must carry the RECORD's value rather than
+        re-compute a second one that can drift from it."""
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding(new_endpoint_uuid=new_endpoint_uuid)),
+                group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].minted is expected_minted
+        assert self._payload(
+            self._success_lines(caplog)[0],
+        )['minted'] is expected_minted
+
+    @pytest.mark.asyncio
+    async def test_a_failed_finding_warns_exactly_as_before_and_announces_nothing(
+        self, service, caplog,
+    ):
+        """ADDITIVE: the new line neither displaces nor duplicates the
+        existing failure WARNING."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.failed == 1
+        assert stats.repaired == 0
+        assert self._success_lines(caplog) == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'e1' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_committed_move_whose_backstop_failed_still_announces_itself(
+        self, service, caplog, monkeypatch,
+    ):
+        """BOTH lines, at their own levels: the WARNING that the summary
+        regeneration is in doubt, and the INFO that the move stands."""
+        async def _boom(*_a, **_kw):
+            raise TypeError('malformed reassign_edge result')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _boom)
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        assert stats.repaired == 1
+        assert len(self._success_lines(caplog)) == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'committed' in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
