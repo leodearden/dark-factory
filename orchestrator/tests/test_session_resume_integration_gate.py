@@ -594,7 +594,7 @@ def _resume_assignment(task_id: str) -> TaskAssignment:
 
 async def _make_resumed_workflow(
     config: OrchestratorConfig, git_ops: GitOps, task_assignment: TaskAssignment,
-    resume_session_id,
+    resume_session_id, resume_outcome_sink=None,
 ) -> tuple[TaskWorkflow, Path]:
     """Build a probe TaskWorkflow with a REAL on-disk TaskArtifacts + config_dir.
 
@@ -612,6 +612,7 @@ async def _make_resumed_workflow(
         briefing=FakeBriefing(),  # type: ignore[arg-type]
         mcp=FakeMcp(),  # type: ignore[arg-type]
         resume_session_id=resume_session_id,
+        resume_outcome_sink=resume_outcome_sink,
     )
     artifacts = TaskArtifacts(cwd)
     artifacts.init(task_assignment.task_id, 'X', 'Y')
@@ -629,6 +630,7 @@ async def _drive_resumed_invoke(
     slug: str = '',
     result_kwargs: dict | None = None,
     drop_config_dir: bool = False,
+    resume_outcome_sink=None,
 ) -> _InvokeCapture:
     """Feed *recovered_session* as ``resume_session_id`` into a REAL
     ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
@@ -643,6 +645,8 @@ async def _drive_resumed_invoke(
     ``result_kwargs`` overrides fields on the ``AgentResult`` the patched
     ``invoke_with_cap_retry`` returns — used to hand back the
     ``resume_fallbacks`` count the CLI-stage instrumentation reads.
+    ``resume_outcome_sink`` wires ε's reporting seam; it defaults to None, so
+    every pre-existing caller drives the un-instrumented path unchanged.
     ``drop_config_dir`` clears ``workflow._config_dir`` after construction,
     driving the arm site's third scoping arm: with no concrete directory there
     is nowhere correct to glob, so the corroboration must NOT veto.
@@ -664,6 +668,7 @@ async def _drive_resumed_invoke(
     assignment = _resume_assignment(task_id)
     workflow, cwd = await _make_resumed_workflow(
         config, git_ops, assignment, recovered_session,
+        resume_outcome_sink=resume_outcome_sink,
     )
     workflow.event_store = event_store
     if seed_transcript:
@@ -1976,3 +1981,289 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     assert rewritten.schema_version == 2
     assert rewritten.task_id == str(task_id)
     assert rewritten.session_id == session_id
+
+
+# ── ε (task 3733): eligible-but-FAILED feeds the storm streak ────────────────
+# Deliberately NOT a B-number: B8/B9 are already double-booked between 2775's
+# matrix and δ's rows (see the numbering-trap note above), so a third scheme
+# keyed on the leaf letter cannot collide with either.
+#
+# The seam these rows pin is ``TaskWorkflow._invoke``'s ARM SITE — the single
+# place BOTH resume producers converge (the harness crash-recovery arm and the
+# in-workflow progress-timeout re-arm at workflow.py:8444) and the only place
+# the archive restore actually happens. The harness eligibility predicate runs
+# a whole process-phase earlier and takes ``archive_available`` as a bool
+# precisely so it acquires no filesystem dependency, so it cannot report that a
+# restore failed; measurement says the same thing from the other side (10/10
+# live ``session_resume_failed`` rows, 2026-08-24..09-15, came from the
+# in-workflow producer while the harness producer emitted zero
+# ``session_resume`` events in that entire era).
+
+
+class _RecordingSink:
+    """Minimal ``ResumeOutcomeSink`` stand-in capturing what ``_invoke`` reports.
+
+    Modelled on ``_RecordingEventStore`` above: the two methods are the whole
+    surface, and a real ``Harness`` would drag its streak, config and
+    escalation queue into rows that are about the REPORTING half of the seam.
+    The composed end-to-end rows bind a real harness instead.
+    """
+
+    def __init__(self) -> None:
+        self.failures: list = []
+        self.successes: int = 0
+
+    def note_resume_failed(self, report) -> None:
+        self.failures.append(report)
+
+    def note_resume_succeeded(self) -> None:
+        self.successes += 1
+
+    def only_failure(self):
+        assert len(self.failures) == 1, (
+            f'expected exactly one reported failure, saw {self.failures}'
+        )
+        return self.failures[0]
+
+
+@pytest.mark.asyncio
+async def test_epsilon_internal_restore_fault_is_reported_with_its_archive(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """arm (a) of the task, end to end: a fault injected INSIDE the restore
+    path is reported to the sink, naming the archive it was reading.
+
+    ENOSPC at ``shutil.copyfile`` is the B1r idiom — past every early return in
+    ``restore_archived_transcript``, so this is the fault class that is the
+    majority of what really happens and that the caller cannot see unaided.
+
+    The report must carry the archive ROOT and the archive PATH, because that
+    is the whole operator-facing point: an L1 that says "a restore failed" and
+    an L1 that says "the restore of /srv/…/<sid>.jsonl out of /srv/… failed
+    with ENOSPC" are different escalations. The path is obtained through
+    ``durable_archive_path`` — the sanctioned sole session-id-keyed locator
+    (PRD §8 contract I-E) — not by globbing a second one.
+    """
+    task_id, session_id = '3733-a', 'uuid-eps-enospc'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink, store = _RecordingSink(), _RecordingEventStore()
+
+    with patch(
+        'shared.transcript_archive.shutil.copyfile',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, event_store=store, resume_outcome_sink=sink,
+        )
+
+    # Still a FRESH dispatch — instrumentation costs no dispatch.
+    assert cap.kwargs['resume_session_id'] is None
+    assert sink.successes == 0
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'fault'
+    assert report.task_id == task_id
+    assert report.session_id == session_id
+    assert report.role == IMPLEMENTER.name
+    assert report.archive_root is not None
+    assert report.archive_path is not None
+    assert session_id in report.archive_path
+    assert 'No space left on device' in (report.detail or '')
+    # The sink and the runs.db row are built from the SAME payload, so the
+    # census an operator queries and the escalation they are paged by cannot
+    # disagree.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['restore'] == report.restore
+    assert failed[0]['data']['stage'] == report.stage
+
+
+@pytest.mark.asyncio
+async def test_epsilon_archive_root_fault_reports_no_path_and_never_raises(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """A fault in the archive-root COMPOSITION leaves both lookups empty — and
+    the best-effort path lookup must neither raise nor invent one.
+
+    ``resolve_archive_root`` is not total (a ``None`` project_root, a
+    non-PathLike root from malformed YAML), and when it raises, ``archive_root``
+    is never bound at all. The report therefore carries ``None`` for both
+    fields, which the L1 renders as "none located" — materially different from
+    an archive that WAS located and held nothing, and the tell for a config
+    regression rather than a disk fault.
+    """
+    task_id, session_id = '3733-b', 'uuid-eps-rootfault'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    with patch(
+        'orchestrator.workflow.resolve_archive_root',
+        side_effect=TypeError("unsupported operand type(s) for /: 'NoneType' and 'str'"),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, resume_outcome_sink=sink,
+        )
+
+    assert cap.kwargs['resume_session_id'] is None
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'fault'
+    assert report.archive_root is None
+    assert report.archive_path is None
+    assert 'unsupported operand type' in (report.detail or '')
+
+
+@pytest.mark.asyncio
+async def test_epsilon_a_genuine_archive_miss_is_reported_as_a_miss(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """An archive that genuinely holds nothing reports ``'miss'``, which the
+    harness carves OUT of the streak.
+
+    This is the archive-COVERAGE signal, and task 3728's handoff note assigns
+    it to a future RATE watch — "a step change in the rate, not a run of them".
+    Putting it on the consecutive-run streak would answer a different question
+    with the wrong instrument, so the classification has to arrive at the
+    harness intact rather than being collapsed into "a restore failed".
+    """
+    task_id, session_id = '3733-c', 'uuid-eps-miss'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        resume_outcome_sink=sink,
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'miss'
+
+
+@pytest.mark.asyncio
+async def test_epsilon_cli_rejection_of_an_armed_resume_is_reported(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The CLI-stage half: we corroborated, armed ``--resume``, and the CLI
+    rejected the session anyway.
+
+    Genuine by construction — the restore ran a phase earlier and is not what
+    failed here, so the report carries no restore outcome. It must name the
+    session actually LOST, which ``session_id_val`` often is not: ``cli_invoke``
+    regenerates the pre-allocated id on a fresh retry, so the carrier's first
+    dropped id is the resume we adopted.
+    """
+    task_id, session_id = '3733-d', 'uuid-eps-cli'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, resume_outcome_sink=sink,
+        result_kwargs={
+            'resume_fallbacks': 1,
+            'resume_fallback_session_ids': (session_id,),
+        },
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert sink.successes == 0
+    report = sink.only_failure()
+    assert report.stage == 'cli'
+    assert report.restore is None
+    assert report.session_id == session_id
+    assert report.task_id == task_id
+    assert report.role == IMPLEMENTER.name
+
+
+@pytest.mark.asyncio
+async def test_epsilon_a_surviving_resume_is_reported_as_a_success(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """A resume that was adopted AND survived reports exactly one success and
+    no failure — the reset half of the circuit breaker.
+
+    Without this the streak would be a rolling burst count: the escape is meant
+    to fire on a RUN of failures with nothing working in between, so one
+    working resume is proof the systematic cause is not present.
+    """
+    task_id, session_id = '3733-e', 'uuid-eps-ok'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, resume_outcome_sink=sink,
+        result_kwargs={'resume_fallbacks': 0},
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert sink.failures == []
+    assert sink.successes == 1
+
+
+@pytest.mark.asyncio
+async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """With NO sink wired, ``_invoke`` does exactly what it did before ε.
+
+    That is what keeps eval dispatch un-drifted (``evals/runner.py`` passes no
+    sink and stays unedited) and what keeps every pre-existing row in this file
+    — the two B1r fault injections among them — passing unchanged, since
+    ``_drive_resumed_invoke`` wires no sink by default.
+
+    Asserted as a DIFFERENCE, not as a restatement of today's values: the same
+    fault is driven twice, once with a sink and once without, and the iwcr
+    kwargs and the emitted events must match. A row that re-listed the expected
+    kwargs would pass just as happily if both paths drifted together.
+    """
+    task_id, session_id = '3733-f', 'uuid-eps-nosink'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+
+    captures = {}
+    for label, sink in (('with', _RecordingSink()), ('without', None)):
+        store = _RecordingEventStore()
+        with patch(
+            'shared.transcript_archive.shutil.copyfile',
+            side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+        ):
+            cap = await _drive_resumed_invoke(
+                tmp_path, dict(rec.session or {}), IMPLEMENTER, caplog,
+                task_id=task_id, seed_archive=True, event_store=store,
+                resume_outcome_sink=sink, slug=f'nosink-{label}',
+            )
+        captures[label] = (cap, store)
+
+    (with_cap, with_store), (without_cap, without_store) = (
+        captures['with'], captures['without'],
+    )
+    # The session id is a fresh uuid per drive, so compare everything else.
+    volatile = {'session_id'}
+    assert {
+        k: v for k, v in with_cap.kwargs.items() if k not in volatile
+    } == {
+        k: v for k, v in without_cap.kwargs.items() if k not in volatile
+    }
+    assert [et for et, _ in with_store.emits] == [
+        et for et, _ in without_store.emits
+    ]
+    assert (
+        without_store.of_type(EventType.session_resume_failed)[0]['data']
+        == with_store.of_type(EventType.session_resume_failed)[0]['data']
+    )
