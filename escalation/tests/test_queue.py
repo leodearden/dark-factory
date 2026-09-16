@@ -7569,6 +7569,113 @@ class TestLateResolutionCapturePredicate:
         self._assert_nothing_written(queue, 'esc-3902-1', before)
 
 
+class TestCascadeForwardIsCapturedButNotReportedAsARace:
+    """An L2 member cascade is an ORDINARY close path — capture it, don't cry race.
+
+    `resolve()`'s cascade re-resolves every member of an L2 under
+    `l2-cascade:<id>`, so a member an automated sweep had already dismissed
+    passes the capture predicate.  That is deliberate: the text being forwarded
+    is the L2's own resolution, which can be a human's substantive finding about
+    the whole cluster — the same loss the capture exists to prevent, arriving
+    through a different door.  What must NOT happen is describing it as a late
+    arrival that beat a dismissal, at the WARNING level the genuine race owns:
+    the field's signal is defended in the LOG, not by dropping the finding.
+    """
+
+    MEMBER = 'esc-3902-member'
+    L2 = 'esc-3902-l2'
+
+    def _capture_lines(self, caplog) -> list[tuple[int, str]]:
+        """(level, message) for every queue log line reporting a capture."""
+        return [
+            (r.levelno, r.getMessage()) for r in caplog.records
+            if r.name == 'escalation.queue' and 'CAPTURED in late_resolutions' in r.getMessage()
+        ]
+
+    def _l2_over_an_auto_dismissed_member(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation(self.MEMBER, task_id='3902', level=1))
+        l2 = _make_escalation(self.L2, task_id='3902', level=2)
+        l2.members = [self.MEMBER]
+        queue.submit(l2)
+        queue.resolve(
+            self.MEMBER, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_cascade_forward_is_captured_and_logged_at_info(self, tmp_path: Path, caplog):
+        """(a) The human's cluster finding reaches the member — at INFO, as a forward."""
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.L2, 'root cause was a stale lockfile across the whole cluster',
+                resolved_by='interactive',
+            )
+
+        record = queue.get(self.MEMBER)
+        assert record is not None
+        # The finding is NOT dropped — that is what the cascade is carrying.
+        assert len(record.late_resolutions) == 1, (
+            f"the L2's resolution must reach the already-closed member: "
+            f'{record.late_resolutions!r}'
+        )
+        entry = record.late_resolutions[0]
+        assert entry['resolution'] == 'root cause was a stale lockfile across the whole cluster'
+        assert entry['resolved_by'] == f'l2-cascade:{self.L2}'
+        assert entry['prior_resolution_class'] == 'benign'
+        assert record.resolution_class == 'actionable', (
+            f'a human resolve cascading onto a swept member corrects the derived '
+            f'stamp like any other capture: {record.resolution_class!r}'
+        )
+
+        # …but it is reported as the routine forward it is.
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.INFO, (
+            f'a cascade forward is not a race and must not claim the WARNING the '
+            f'genuine race owns: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'CASCADE forward' in message, (
+            f'the line must name what actually happened: {message}'
+        )
+        assert 'arriving after that automated dismissal' not in message, (
+            f'no dismissal was beaten here — nothing raced: {message}'
+        )
+        assert self.MEMBER in message and f'l2-cascade:{self.L2}' in message, (
+            f'the line must name the member and the cascade it came from: {message}'
+        )
+
+    def test_a_genuine_late_arrival_still_warns(self, tmp_path: Path, caplog):
+        """(b) The race the field exists for keeps its WARNING, unchanged.
+
+        The INFO demotion is scoped to the cascade tier by
+        `classify_resolver_tier`; a direct resolve from an agent session is the
+        esc-3902-1 shape and must stay loud.
+        """
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.MEMBER, "the steward's real finding",
+                resolved_by='claude-task-3902-steward',
+            )
+
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.WARNING, (
+            f'a late arrival that beat nothing but the sweep is the reported harm '
+            f'and stays loud: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'arriving after that automated dismissal' in message, (
+            f'the line must name the race it is reporting: {message}'
+        )
+        assert 'CASCADE' not in message, f'nothing cascaded here: {message}'
+
+
 class TestLateResolutionCorrectsResolutionClass:
     """The reported harm: "recorded as resolution_class=benign instead of carrying
     the steward's actual finding".

@@ -348,6 +348,17 @@ def _is_late_resolution_worth_capturing(
       backstops (five call sites) and ``test_workflow_escalated_steward_stall``'s
       deliberate re-dismissals silent.
 
+    The ``'cascade'`` tier is deliberately NOT excluded alongside it, even
+    though it is equally automated.  ``resolve()``'s L2 member cascade forwards
+    the L2's OWN resolution text to every member, so what reaches an
+    already-swept member can be a human's substantive finding about the whole
+    cluster — exactly the loss this capture exists to prevent, arriving through
+    a different door.  A cascade is not a RACE, though, so
+    ``_capture_late_resolution`` logs it at INFO as a cascade forward rather
+    than at WARNING as a late arrival: the rarity the field's signal depends on
+    is defended in the LOG, where the noise would otherwise be, not by dropping
+    a finding on the floor.
+
     - the incoming ``resolution`` is non-empty and DIFFERENT from the stored one
       — an empty or byte-identical retry preserves nothing the record lacks.
 
@@ -1506,13 +1517,29 @@ class EscalationQueue:
             esc.resolution_class = prior_class
             return False, None
 
-        logger.warning(
-            'Escalation %s was already dismissed by %r; a LATE '
-            'resolution from %r arrived after that automated '
-            'dismissal and has been CAPTURED in late_resolutions '
+        # An L2 member cascade is an ORDINARY close path, not a race: resolving
+        # an L2 re-resolves every member under `l2-cascade:<id>`, and a member a
+        # sweep had already auto-dismissed captures that forwarded text.  The
+        # capture itself is still wanted (the L2's resolution can be a human's
+        # substantive finding — see _is_late_resolution_worth_capturing), but
+        # calling it a late arrival "after that automated dismissal" would
+        # describe a race that did not happen, and at WARNING it would dilute
+        # the signal the real thing is supposed to carry.  Same facts, honest
+        # framing, routine level.
+        via_cascade = classify_resolver_tier(resolved_by) == 'cascade'
+        logger.log(
+            logging.INFO if via_cascade else logging.WARNING,
+            'Escalation %s was already dismissed by %r; %s from %r has been '
+            'CAPTURED in late_resolutions '
             "(the record's terminal state is unchanged"
             '%s): %s',
-            escalation_id, esc.resolved_by, resolved_by,
+            escalation_id, esc.resolved_by,
+            (
+                'an L2 CASCADE forward'
+                if via_cascade else
+                'a LATE resolution arriving after that automated dismissal'
+            ),
+            resolved_by,
             (
                 f'; resolution_class corrected {prior_class!r} -> '
                 f'{corrected!r}'
