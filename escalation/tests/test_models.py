@@ -1413,7 +1413,6 @@ class TestEscalationLateResolutions:
             'timestamp': '2026-09-06T00:00:00+00:00',
             'resolution': "the steward's real finding",
             'resolved_by': 'claude-task-3902-steward',
-            'resolution_action': 'resume',
             'dismiss': False,
             'prior_resolution_class': 'benign',
         }
@@ -1484,7 +1483,6 @@ class TestEscalationLateResolutions:
             'timestamp': '2026-09-06T00:00:00+00:00',
             'resolution': 'mine alone',
             'resolved_by': 'claude-task-3902-steward',
-            'resolution_action': None,
             'dismiss': False,
             'prior_resolution_class': 'benign',
         })

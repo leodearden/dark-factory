@@ -370,8 +370,8 @@ def _is_late_resolution_worth_capturing(
 
 
 def _build_late_resolution(
-    *, resolution: str, resolved_by: str | None, resolution_action: str | None,
-    dismiss: bool, prior_resolution_class: str | None, timestamp: str,
+    *, resolution: str, resolved_by: str | None, dismiss: bool,
+    prior_resolution_class: str | None, timestamp: str,
 ) -> tuple[LateResolution, int]:
     """Build one :class:`~escalation.models.LateResolution`, size-bounded.
 
@@ -385,6 +385,12 @@ def _build_late_resolution(
     *timestamp* is passed in rather than read here so the queue's write
     chokepoint owns the clock — a caller can never backdate a capture.
 
+    The arguments are exactly the facts ``resolve()`` receives.  The finer C1
+    action is NOT among them and the entry carries no key for it: the action is
+    stamped onto the record by ``server.resolve_issue`` before the call, on a
+    path an already-terminal record never takes (see the ``LateResolution``
+    docstring).
+
     Returns ``(entry, chars_elided)``.
     """
     kept, lost = _elide(resolution, _MAX_LATE_RESOLUTION_CHARS, 'late-resolution')
@@ -392,7 +398,6 @@ def _build_late_resolution(
         'timestamp': timestamp,
         'resolution': kept,
         'resolved_by': resolved_by,
-        'resolution_action': resolution_action,
         'dismiss': dismiss,
         'prior_resolution_class': prior_resolution_class,
     }
@@ -1377,7 +1382,6 @@ class EscalationQueue:
                     entry, chars_elided = _build_late_resolution(
                         resolution=resolution,
                         resolved_by=resolved_by,
-                        resolution_action=None,
                         dismiss=dismiss,
                         # Preserved so the correction destroys nothing and the
                         # original derivation stays auditable.

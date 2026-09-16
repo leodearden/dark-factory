@@ -232,6 +232,14 @@ class LateResolution(TypedDict):
     ending in that marker is the HEAD of what was submitted, not all of it, and
     the record-level `late_resolutions_chars_elided` holds the running total.
 
+    `dismiss` is the only fact recorded about what the late caller WANTED, and
+    deliberately so: the finer C1 action (`resume` / `restart` / `park` / ...)
+    is not a `queue.resolve()` argument at all — `server.resolve_issue` stamps
+    it onto the record BEFORE calling, a path an already-terminal record never
+    takes — so a key for it could only ever hold None.  A field that structurally
+    cannot be populated states a fact the entry does not hold; the coarse
+    dismiss/resolve intent that `resolve()` genuinely receives is kept instead.
+
     Shape mirrors the Amendment / EvidenceEntry / TrainState TypedDicts.
     TypedDict at runtime is a plain dict; existing from_dict / to_dict /
     asdict() paths are unaffected — round-trip fidelity is unchanged.  Stored
@@ -242,7 +250,6 @@ class LateResolution(TypedDict):
     timestamp: str                        # ISO, stamped by queue.resolve() at write time
     resolution: str                       # the incoming free text that would have been lost
     resolved_by: str | None               # the incoming resolver attribution
-    resolution_action: str | None         # incoming C1 action (resume/restart/park/...)
     dismiss: bool                         # whether the incoming call asked to dismiss
     prior_resolution_class: str | None    # the stamp this capture superseded, or None
 
