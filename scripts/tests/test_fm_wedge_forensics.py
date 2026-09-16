@@ -20,6 +20,11 @@ magnitude, so the excerpts cannot manufacture — or hide — an episode.
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+from pathlib import Path
+
 # ---------------------------------------------------------------------------
 # Episode 2 — 2026-09-16 12:04. The decisive one: fm did not service SIGTERM
 # for the full TimeoutStopSec and had to be SIGKILLed, and a `git` child was
@@ -431,3 +436,80 @@ def test_a_later_unrelated_restart_is_not_attributed_to_a_self_recovered_stall()
     assert ended_by_restart.outcome == "stopped-on-signal"
     assert ended_by_restart.costs.teardown_seconds == 3.0
     assert ended_by_restart.resources.cpu_seconds == 29 * 60 + 6.600
+
+
+# ---------------------------------------------------------------------------
+# CLI (reads the journal from stdin) — driven via subprocess.run.
+#
+# Same shape as scripts/tests/test_recon_busy_check.py: SCRIPT resolved from
+# __file__, and a bounded per-subprocess budget with an env override, because
+# concurrent orchestrator agents can push interpreter startup past a tight one
+# even when the CLI is behaving. Written compactly rather than copied from
+# that file verbatim — a third copy of its 25-line resolver would be the SPOT
+# problem its own comment already records as an open shared-helper question.
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / "fm_wedge_forensics.py"
+_CLI_TIMEOUT = float(os.environ.get("FM_WEDGE_FORENSICS_TEST_TIMEOUT", "").strip() or 60.0)
+
+
+def _run_cli(stdin_text: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        timeout=_CLI_TIMEOUT,
+    )
+
+
+def test_cli_reports_the_stall_duration_and_its_classification():
+    result = _run_cli(EPISODE_2_JOURNAL)
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "171" in result.stdout
+    assert "sigterm-unserviced" in result.stdout
+
+
+def test_cli_json_carries_the_same_episode_records():
+    result = _run_cli(EPISODE_2_JOURNAL, "--json")
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    episodes = json.loads(result.stdout)["episodes"]
+    assert len(episodes) == 1
+    assert episodes[0]["stall_seconds"] == 171.0
+    assert episodes[0]["outcome"] == "sigterm-unserviced"
+    assert episodes[0]["costs"]["teardown_seconds"] == 90.0
+    assert episodes[0]["foreign_killed_processes"] == [{"pid": 1289425, "name": "git"}]
+
+
+def test_cli_threshold_flag_overrides_the_default():
+    result = _run_cli(NORMAL_HARNESS_CADENCE_JOURNAL, "--json", "--threshold", "30")
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert len(json.loads(result.stdout)["episodes"]) == 5
+
+
+def test_cli_reports_an_uneventful_window_as_zero_episodes_and_exits_0():
+    """A window with nothing in it is a legitimate answer, not an error."""
+    result = _run_cli(DENSE_HEALTHY_JOURNAL, "--json")
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert json.loads(result.stdout)["episodes"] == []
+
+
+def test_cli_fails_loudly_when_nothing_in_the_input_parses():
+    """The trap this exists to catch: system-scope `journalctl -u
+    fused-memory.service` prints "-- No entries --" because the unit is a
+    systemd --user unit. Reporting that as "0 episodes" would hand back a
+    clean bill of health for a capture that contains no evidence at all."""
+    result = _run_cli("-- No entries --\n")
+
+    assert result.returncode != 0
+    assert "--user" in result.stdout + result.stderr
+
+
+def test_cli_empty_stdin_also_fails_loudly():
+    result = _run_cli("")
+
+    assert result.returncode != 0
