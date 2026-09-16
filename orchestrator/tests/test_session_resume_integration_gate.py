@@ -471,6 +471,29 @@ def _storm_queue() -> MagicMock:
     return q
 
 
+def _arm_storm_queue(harness: Harness) -> MagicMock:
+    """Install the stand-in escalation queue on *harness* and return it.
+
+    One of three seams through which this suite touches the harness's storm
+    state — the `_reasons_for` convention test_crash_recovery.py applies to the
+    same fields. Naming each private attribute ONCE keeps a rename to one edit
+    and keeps the coupling a reader has to hold in their head to one line.
+    """
+    queue = _storm_queue()
+    harness._escalation_queue = queue
+    return queue
+
+
+def _filed(harness: Harness) -> list:
+    """Every escalation submitted to the harness's queue so far, in order."""
+    return [call.args[0] for call in harness._escalation_queue.submit.call_args_list]
+
+
+def _streak(harness: Harness) -> int:
+    """The current run of genuine session-resume failures."""
+    return harness._session_resume_fallback_streak
+
+
 # ── B1: clean SIGTERM mid-implementer, warm lane ─────────────────────────────
 @pytest.mark.asyncio
 async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
@@ -1509,7 +1532,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
         harness, task_id, session_id, role='implementer', with_transcript=True,
     )
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     await harness._recover_crashed_tasks()
 
@@ -1531,7 +1554,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reasons'] == ['reseeded']
-    assert harness._escalation_queue.submit.call_count == 0
+    assert _filed(harness) == []
 
 
 # ── B5: stale sidecar beyond the freshness window ────────────────────────────
@@ -1803,7 +1826,7 @@ async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
     counter, so it accumulates identically either way. Reuses ``_storm_queue``.
     """
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     # 1st stale dispatch — REAL recovery → adopt → stale fallback.
     _setup_warm_lane_session(harness, 'st0', 'uuid-st0', fresh=False)
@@ -1840,8 +1863,8 @@ async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
 
     # Three fallbacks, a streak that never moved, and NO escalation.
     assert len(_session_resume_emits(harness)) == 3
-    assert harness._session_resume_fallback_streak == 0
-    assert harness._escalation_queue.submit.call_count == 0
+    assert _streak(harness) == 0
+    assert _filed(harness) == []
 
 
 # ── B9: cold worktree, plan present — β widens the cold path too ─────────────
@@ -1991,14 +2014,19 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
 #
 # The seam these rows pin is ``TaskWorkflow._invoke``'s ARM SITE — the single
 # place BOTH resume producers converge (the harness crash-recovery arm and the
-# in-workflow progress-timeout re-arm at workflow.py:8444) and the only place
-# the archive restore actually happens. The harness eligibility predicate runs
-# a whole process-phase earlier and takes ``archive_available`` as a bool
-# precisely so it acquires no filesystem dependency, so it cannot report that a
-# restore failed; measurement says the same thing from the other side (10/10
-# live ``session_resume_failed`` rows, 2026-08-24..09-15, came from the
-# in-workflow producer while the harness producer emitted zero
-# ``session_resume`` events in that entire era).
+# in-workflow progress-timeout re-arm) and the only place the archive restore
+# actually happens. The harness eligibility predicate runs a whole
+# process-phase earlier and takes ``archive_available`` as a bool precisely so
+# it acquires no filesystem dependency, so it cannot report that a restore
+# failed.
+#
+# Measurement says the same thing from the other side. Measured 2026-09-16:
+# all 10 live ``session_resume_failed`` rows (2026-08-24..09-15) are
+# stage='cli', and not one of their session ids appears among the 8
+# ``session_resume`` rows the harness guard has ever emitted — whose nearest
+# neighbours in time, 2026-08-20 and 2026-09-16, fall outside the failure span
+# entirely. So the dense population is the in-workflow producer's, and a
+# predicate-keyed feeder would have run at ~0.1/day.
 
 
 class _RecordingSink:
@@ -2379,7 +2407,7 @@ async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
     """
     harness.config.session_resume = SessionResumeConfig()
     threshold = harness.config.session_resume.fallback_storm_threshold
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     specs = [(f'eps-{i}', f'uuid-eps-run-{i}') for i in range(threshold)]
     sessions = await _recover_cold_sessions(harness, specs)
@@ -2389,9 +2417,9 @@ async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
             harness, tmp_path, caplog, task_id, sessions[task_id],
         )
 
-    assert harness._session_resume_fallback_streak == threshold
-    assert harness._escalation_queue.submit.call_count == 1
-    esc = harness._escalation_queue.submit.call_args.args[0]
+    assert _streak(harness) == threshold
+    assert len(_filed(harness)) == 1
+    esc = _filed(harness)[-1]
     assert esc.level == 1
     for task_id, session_id in specs:
         assert task_id in esc.detail
@@ -2423,7 +2451,7 @@ async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
     transiently rise either.
     """
     base = SessionResumeConfig(fallback_storm_threshold=1)
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     # ── the HARNESS guard: one cold worktree per by-design reason ──
     day = 86400
@@ -2465,8 +2493,8 @@ async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
         # if recovery had adopted nothing at all and the guard never ran.
         assert cap.resume_session_id is None, reason
         seen = _assert_by_design_emit(cap.emits, seen, expected, reason)
-        assert harness._session_resume_fallback_streak == 0, reason
-        assert harness._escalation_queue.submit.call_count == 0, reason
+        assert _streak(harness) == 0, reason
+        assert _filed(harness) == [], reason
 
     # ── the ARM SITE: 'miss' (no archive seeded) and 'disabled' (kill switch) ──
     arm_cases = [
@@ -2488,8 +2516,8 @@ async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
         # not merely failed to report anything.
         failed = store.of_type(EventType.session_resume_failed)
         assert [row['data']['restore'] for row in failed] == [outcome]
-        assert harness._session_resume_fallback_streak == 0, outcome
-        assert harness._escalation_queue.submit.call_count == 0, outcome
+        assert _streak(harness) == 0, outcome
+        assert _filed(harness) == [], outcome
 
 
 @pytest.mark.asyncio
@@ -2507,7 +2535,7 @@ async def test_epsilon_end_to_end_a_surviving_resume_retires_the_run(
     """
     harness.config.session_resume = SessionResumeConfig()
     threshold = harness.config.session_resume.fallback_storm_threshold
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     fails = [(f'rst-f{i}', f'uuid-rst-f{i}') for i in range(2 * (threshold - 1))]
     ok = [('rst-ok', 'uuid-rst-ok')]
@@ -2518,7 +2546,7 @@ async def test_epsilon_end_to_end_a_surviving_resume_retires_the_run(
         await _drive_failing_restore(
             harness, tmp_path, caplog, task_id, sessions[task_id],
         )
-    assert harness._session_resume_fallback_streak == half
+    assert _streak(harness) == half
 
     # A resume that is corroborated and survives: zero resume_fallbacks.
     await _drive_resumed_invoke(
@@ -2526,12 +2554,12 @@ async def test_epsilon_end_to_end_a_surviving_resume_retires_the_run(
         seed_transcript=True, resume_outcome_sink=harness, slug='eps-rst-ok',
         result_kwargs={'resume_fallbacks': 0},
     )
-    assert harness._session_resume_fallback_streak == 0
+    assert _streak(harness) == 0
 
     for task_id, _ in fails[half:]:
         await _drive_failing_restore(
             harness, tmp_path, caplog, task_id, sessions[task_id],
         )
 
-    assert harness._session_resume_fallback_streak == half
-    assert harness._escalation_queue.submit.call_count == 0
+    assert _streak(harness) == half
+    assert _filed(harness) == []

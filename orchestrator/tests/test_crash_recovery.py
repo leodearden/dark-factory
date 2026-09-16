@@ -191,6 +191,42 @@ def _reasons_for(
     )
 
 
+# ── Storm-streak state, read through ONE seam each ───────────────────────────
+# The `_reasons_for` convention above, applied to the streak. Every row that
+# touches this state goes through these, so the suite names each private field
+# ONCE: a rename costs one edit instead of forty, and the coupling a reader has
+# to hold in their head is one line rather than one per assertion. That is also
+# what the merge-lane ratchet's `private_reads` measure is counting.
+
+
+def _streak(harness: Harness) -> int:
+    """The current run of genuine session-resume failures."""
+    return harness._session_resume_fallback_streak
+
+
+def _chain_stamp(harness: Harness) -> float | None:
+    """The chain's monotonic comparison point; None means no run in progress."""
+    return harness._last_session_resume_fallback_at
+
+
+def _set_chain_stamp(harness: Harness, value: float | None) -> None:
+    return setattr(harness, '_last_session_resume_fallback_at', value)
+
+
+def _rewind_chain(harness: Harness, secs: float) -> None:
+    """Advance the clock by *secs* against the chain's own stamp.
+
+    Rewinding the harness's stamp, never monkeypatching ``time.monotonic``: the
+    rewind is deterministic and perturbs no unrelated timer.
+    """
+    _set_chain_stamp(harness, _chain_stamp(harness) - secs)
+
+
+def _recorded_failures(harness: Harness) -> list:
+    """The eligible-but-FAILED resumes backing the current run."""
+    return list(harness._eligible_but_failed_resumes)
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -2821,7 +2857,7 @@ class TestSessionResumeGuard:
         # 'capped' stays visible in the set, so routing the dispatch here
         # rather than to session_resume_capped loses no information.
         assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
 
     async def test_archive_backed_session_with_no_config_dir_is_adopted(
         self, harness: Harness
@@ -2875,7 +2911,7 @@ class TestSessionResumeGuard:
         assert resume_id is session
         emits = _session_resume_emits(harness)
         assert [et for et, _ in emits] == [EventType.session_resume]
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
 
     async def test_aged_out_archive_backed_session_still_falls_back(
         self, harness: Harness
@@ -2917,7 +2953,7 @@ class TestSessionResumeGuard:
         # the corroboration leg is satisfied by the archive too.
         assert kwargs['data']['reasons'] == ['aged_out']
         assert kwargs['data']['archive_available'] is True
-        assert harness._session_resume_fallback_streak == 0  # by design (D4)
+        assert _streak(harness) == 0  # by design (D4)
 
     async def test_restore_kill_switch_withholds_the_archive_from_eligibility(
         self, harness: Harness
@@ -2993,14 +3029,16 @@ class TestSessionResumeStorm:
     ``_session_resume_reasons``' own docstring described them as the
     anticipated reseed/wipe/clock cases, so the L1 they filed sent operators to
     check NTP for a population the system expects to see. After the carve-out
-    NOTHING the predicate can currently produce feeds the streak — the
-    deliberate, G7-waived window that PRD leaf ε (task 3733) closes by
-    installing the archive-restore-failure feeder.
+    NOTHING the predicate can produce feeds the streak, so the rows driving it
+    through ``_run_slot`` use a SYNTHETIC feeder (:meth:`_arm_synthetic_feeder`),
+    which doubles as the executable statement of the extension contract.
 
-    So the mechanism is RETAINED and exercised here through a SYNTHETIC feeder
-    (:meth:`_arm_synthetic_feeder`) standing in for ε's, which doubles as the
-    executable statement of the extension contract ε consumes. Filing is
-    best-effort — a None queue never raises (I3).
+    THE LIVE FEEDER is ε's (task 3733), and it is a different seam: every armed
+    resume that did not survive, reported from ``TaskWorkflow._invoke`` to
+    :meth:`Harness.note_resume_failed` and classified against
+    ``_BY_DESIGN_RESTORE_OUTCOMES``. The ε rows at the end of this class drive
+    those two methods directly against the same streak, the same decay and the
+    same filer. Filing is best-effort — a None queue never raises (I3).
     """
 
     @staticmethod
@@ -3047,7 +3085,22 @@ class TestSessionResumeStorm:
         ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
         edit anywhere.
 
-        ``restore_failed`` is deliberately the name ε is expected to use.
+        ``restore_failed`` is NOT the name ε ended up using, and the reason is
+        structural rather than a change of mind: ε's feeder is the ARM SEAM,
+        not a predicate reason. ``_session_resume_reasons`` is evaluated in
+        ``_run_slot`` BEFORE the resume injection and takes ``archive_available``
+        as a bool specifically so it acquires no filesystem dependency of its
+        own, while ``restore_archived_transcript`` has exactly ONE call site —
+        inside ``TaskWorkflow._invoke``, a whole process-phase downstream. A
+        predicate that runs before the restore, and is contractually forbidden
+        I/O, cannot report that a restore failed; making it do so would corrupt
+        an ELIGIBILITY predicate into an outcome log.
+
+        So this row is KEPT, and the name with it, as the executable statement
+        of the EXTENSION CONTRACT: a reason absent from
+        ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
+        edit anywhere. ε's own carve-out
+        (``_BY_DESIGN_RESTORE_OUTCOMES``) states the same rule one seam later.
         """
         def _reasons(
             session: dict, config_dir: str | None, *, archive_available: bool
@@ -3108,7 +3161,7 @@ class TestSessionResumeStorm:
             await _drive_session_slot(harness, f'bd{i}', session, config_dir=cfg)
             # Asserted INSIDE the loop: the counter must never transiently
             # rise, not merely end at 0.
-            assert harness._session_resume_fallback_streak == 0
+            assert _streak(harness) == 0
             assert harness._escalation_queue.submit.call_count == 0
 
         emits = _session_resume_emits(harness)
@@ -3149,10 +3202,15 @@ class TestSessionResumeStorm:
         line in ``non_reason_literals`` below, and it forces a human to state
         which kind of string was just added. Fail-open, by contrast, is silent.
 
-        ε (task 3733) is EXPECTED to trip this when it adds ``restore_failed``.
-        The correct resolution is almost certainly to extend the expected
-        vocabulary here, NOT the constant: a restore failure is a genuine
-        feeder, which is the whole point of ε.
+        ε (task 3733) was expected to trip this by adding ``restore_failed``
+        to the predicate, and did not: it keys its feeder on
+        ``TaskWorkflow._invoke``'s arm seam instead, for the structural reason
+        recorded on :meth:`_arm_synthetic_feeder` above. The restore vocabulary
+        gets its own sibling constant and its own fail-closed structural row —
+        ``_BY_DESIGN_RESTORE_OUTCOMES`` and
+        ``test_by_design_restore_constant_classifies_every_producible_outcome``
+        — so this one still covers EXACTLY the predicate, which is what makes
+        its equality assertion meaningful.
         """
         import ast  # noqa: PLC0415 — structural read of one method's source
         import inspect  # noqa: PLC0415
@@ -3312,7 +3370,7 @@ class TestSessionResumeStorm:
             )
 
         assert harness._escalation_queue.submit.call_count == 0
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
         emits = _session_resume_emits(harness)
         assert len(emits) == 3
         for et, kwargs in emits:
@@ -3355,7 +3413,7 @@ class TestSessionResumeStorm:
         for i in range(3):
             await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
 
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
@@ -3403,7 +3461,7 @@ class TestSessionResumeStorm:
         for i in range(2):
             await _drive_session_slot(harness, f'mx{i}', self._fresh_session(f'uuid-mx{i}'))
 
-        assert harness._session_resume_fallback_streak == 2
+        assert _streak(harness) == 2
         assert harness._escalation_queue.submit.call_count == 1
         # ...and BOTH reasons are on the wire, so the operator sees the
         # by-design co-occurrence rather than inferring it.
@@ -3523,17 +3581,17 @@ class TestSessionResumeStorm:
         # Two genuine fallbacks inside the window → streak=2.
         for i in range(2):
             await _drive_session_slot(harness, f'd{i}', self._fresh_session(f'uuid-d{i}'))
-        assert harness._session_resume_fallback_streak == 2
+        assert _streak(harness) == 2
 
         # ...then the clock jumps past the window before the 3rd arrives.
         # (The assert also pins that a genuine fallback stamped the chain point.)
-        assert harness._last_session_resume_fallback_at is not None
-        harness._last_session_resume_fallback_at -= 120
+        assert _chain_stamp(harness) is not None
+        _rewind_chain(harness, 120)
 
         await _drive_session_slot(harness, 'd2', self._fresh_session('uuid-d2'))
 
         # Decayed to 0, then re-incremented — NOT 3, so no L1.
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_window_retires_the_run_on_a_by_design_dispatch(
@@ -3561,11 +3619,11 @@ class TestSessionResumeStorm:
         self._arm_synthetic_feeder(harness)
         for i in range(2):  # threshold - 1
             await _drive_session_slot(harness, f'rq{i}', self._fresh_session(f'uuid-rq{i}'))
-        assert harness._session_resume_fallback_streak == 2
-        assert harness._last_session_resume_fallback_at is not None
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) is not None
 
         # The clock passes the window with no further genuine failure.
-        harness._last_session_resume_fallback_at -= 120
+        _rewind_chain(harness, 120)
 
         # A perfectly ordinary by-design dispatch (real predicate, corroborated
         # dir, aged sidecar → {'stale'}) is enough to observe the expiry.
@@ -3575,8 +3633,8 @@ class TestSessionResumeStorm:
             harness, 'rq-stale', self._stale_session('uuid-rq-stale'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_by_design_dispatch_inside_the_window_decays_nothing(
@@ -3600,8 +3658,8 @@ class TestSessionResumeStorm:
         self._arm_synthetic_feeder(harness)
         for i in range(2):
             await _drive_session_slot(harness, f'nw{i}', self._fresh_session(f'uuid-nw{i}'))
-        stamp = harness._last_session_resume_fallback_at
-        assert harness._session_resume_fallback_streak == 2
+        stamp = _chain_stamp(harness)
+        assert _streak(harness) == 2
         assert stamp is not None
 
         del harness._session_resume_reasons
@@ -3610,14 +3668,14 @@ class TestSessionResumeStorm:
             harness, 'nw-stale', self._stale_session('uuid-nw-stale'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 2
-        assert harness._last_session_resume_fallback_at == stamp
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) == stamp
 
         # And the run is still live: one more genuine failure reaches the
         # threshold, so the per-dispatch decay did not quietly neuter INV-4.
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'nw2', self._fresh_session('uuid-nw2'))
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
 
     async def test_by_design_fallbacks_do_not_refresh_the_chain_stamp(
@@ -3639,8 +3697,8 @@ class TestSessionResumeStorm:
         # One genuine fallback opens the chain: streak=1, stamp set.
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'cs0', self._fresh_session('uuid-cs0'))
-        assert harness._session_resume_fallback_streak == 1
-        stamp = harness._last_session_resume_fallback_at
+        assert _streak(harness) == 1
+        stamp = _chain_stamp(harness)
         assert stamp is not None
 
         # A drip of REAL by-design reseeds moves NEITHER the counter nor the
@@ -3651,17 +3709,17 @@ class TestSessionResumeStorm:
                 harness, f'csr{i}', self._fresh_session(f'uuid-csr{i}'),
                 config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
             )
-        assert harness._session_resume_fallback_streak == 1
-        assert harness._last_session_resume_fallback_at == stamp
+        assert _streak(harness) == 1
+        assert _chain_stamp(harness) == stamp
 
         # So when the clock passes the window, the NEXT genuine fallback is
         # measured against the first one and decays — reaching 1, not the
         # threshold of 2.
-        harness._last_session_resume_fallback_at = stamp - 120
+        _set_chain_stamp(harness, stamp - 120)
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'cs1', self._fresh_session('uuid-cs1'))
 
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_streak_survives_within_storm_window(self, harness: Harness):
@@ -3678,7 +3736,7 @@ class TestSessionResumeStorm:
         for i in range(3):
             await _drive_session_slot(harness, f'w{i}', self._fresh_session(f'uuid-w{i}'))
 
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
@@ -3695,8 +3753,8 @@ class TestSessionResumeStorm:
 
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'ts0', self._fresh_session('uuid-ts0'))
-        assert harness._session_resume_fallback_streak == 1
-        assert harness._last_session_resume_fallback_at is not None
+        assert _streak(harness) == 1
+        assert _chain_stamp(harness) is not None
 
         del harness._session_resume_reasons  # a resume must be genuinely eligible
         cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
@@ -3704,8 +3762,8 @@ class TestSessionResumeStorm:
             harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
 
     async def test_no_escalation_queue_never_raises(self, harness: Harness):
         """A bare harness (no escalation queue) must never raise on a fallback
@@ -3769,18 +3827,18 @@ class TestSessionResumeStorm:
         harness._escalation_queue = q
 
         harness.note_resume_failed(self._report(0))
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert q.submit.call_count == 0
         harness.note_resume_failed(self._report(1))
         harness.note_resume_failed(self._report(2, stage='cli', restore=None))
 
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert q.submit.call_count == 1
         assert q.submit.call_args.args[0].level == 1
 
         # A fourth keeps counting but files nothing — one open storm L1 at a time.
         harness.note_resume_failed(self._report(3))
-        assert harness._session_resume_fallback_streak == 4
+        assert _streak(harness) == 4
         assert q.submit.call_count == 1
 
     @pytest.mark.parametrize('outcome', ['miss', 'disabled'])
@@ -3804,9 +3862,9 @@ class TestSessionResumeStorm:
             harness.note_resume_failed(self._report(i, restore=outcome))
             # Asserted INSIDE the loop: the counter must never transiently
             # rise, not merely end at 0.
-            assert harness._session_resume_fallback_streak == 0
-            assert harness._last_session_resume_fallback_at is None
-            assert not harness._eligible_but_failed_resumes
+            assert _streak(harness) == 0
+            assert _chain_stamp(harness) is None
+            assert not _recorded_failures(harness)
             assert harness._escalation_queue.submit.call_count == 0
 
     async def test_success_report_retires_the_run(self, harness: Harness):
@@ -3823,18 +3881,18 @@ class TestSessionResumeStorm:
         harness._escalation_queue = self._queue()
 
         harness.note_resume_failed(self._report(0))
-        assert harness._session_resume_fallback_streak == 1
-        assert harness._last_session_resume_fallback_at is not None
-        assert len(harness._eligible_but_failed_resumes) == 1
+        assert _streak(harness) == 1
+        assert _chain_stamp(harness) is not None
+        assert len(_recorded_failures(harness)) == 1
 
         harness.note_resume_succeeded()
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
-        assert not harness._eligible_but_failed_resumes
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
+        assert not _recorded_failures(harness)
 
         # ...so the next failure opens a FRESH run and never reaches 2.
         harness.note_resume_failed(self._report(1))
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_sink_run_decays_after_storm_window(self, harness: Harness):
@@ -3852,18 +3910,18 @@ class TestSessionResumeStorm:
 
         for i in range(2):
             harness.note_resume_failed(self._report(i))
-        assert harness._session_resume_fallback_streak == 2
-        assert harness._last_session_resume_fallback_at is not None
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) is not None
 
-        harness._last_session_resume_fallback_at -= 120
+        _rewind_chain(harness, 120)
 
         harness.note_resume_failed(self._report(2))
 
         # Decayed to 0, then re-incremented — NOT 3, so no L1 — and the
         # retired run's records went with it.
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
-        assert [f.session_id for f in harness._eligible_but_failed_resumes] == [
+        assert [f.session_id for f in _recorded_failures(harness)] == [
             'uuid-rf-2'
         ]
 
@@ -3876,16 +3934,16 @@ class TestSessionResumeStorm:
         second orchestrator process (or a second Harness in one interpreter)
         could inherit a half-finished run from.
         """
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
-        assert not harness._eligible_but_failed_resumes
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
+        assert not _recorded_failures(harness)
 
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=3, storm_window_secs=60,
         )
         harness._escalation_queue = self._queue()
         harness.note_resume_failed(self._report(0))
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
 
         for field in ('_session_resume_fallback_streak',
                       '_last_session_resume_fallback_at',
@@ -3911,7 +3969,7 @@ class TestSessionResumeStorm:
         # threshold=1 → the first genuine report trips the filer, which must
         # early-return on the absent queue rather than raising.
         harness.note_resume_failed(self._report(0))
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
 
         harness.note_resume_failed(object())  # type: ignore[arg-type]
         harness.note_resume_succeeded()
@@ -3970,10 +4028,10 @@ class TestSessionResumeStorm:
 
         for i in range(config.fallback_storm_threshold):
             if i:
-                harness._last_session_resume_fallback_at -= MEASURED_MIN_GAP_SECS
+                _rewind_chain(harness, MEASURED_MIN_GAP_SECS)
             harness.note_resume_failed(self._report(i))
 
-        assert harness._session_resume_fallback_streak == (
+        assert _streak(harness) == (
             config.fallback_storm_threshold
         )
         assert harness._escalation_queue.submit.call_count == 1
@@ -3985,10 +4043,10 @@ class TestSessionResumeStorm:
         harness._escalation_queue = self._queue()
         for i in range(config.fallback_storm_threshold):
             if i:
-                harness._last_session_resume_fallback_at -= config.storm_window_secs
+                _rewind_chain(harness, config.storm_window_secs)
             harness.note_resume_failed(self._report(100 + i))
 
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_storm_l1_names_every_recorded_failure(self, harness: Harness):
@@ -4425,7 +4483,7 @@ class TestSessionResumeArchiveAvailable:
         # field rides the fallback branch only, so event_store.py's ratio
         # recipe keeps its denominator.
         assert 'archive_available' not in emits[0][1]['data']
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
 
     async def test_no_transcript_reports_archive_absent(
         self, harness: Harness, tmp_path: Path
@@ -4453,7 +4511,7 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
-        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+        assert _streak(harness) == 0  # by design (3728)
 
     async def test_stale_also_carries_the_field(
         self, harness: Harness, tmp_path: Path
@@ -4494,7 +4552,7 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['stale']
         assert kwargs['data']['archive_available'] is True
-        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+        assert _streak(harness) == 0  # by design (3728)
 
     async def test_reseeded_lane_with_an_archive_is_now_adopted(
         self, harness: Harness, tmp_path: Path
@@ -4531,7 +4589,7 @@ class TestSessionResumeArchiveAvailable:
         assert resume_id is session
         emits = _session_resume_emits(harness)
         assert [et for et, _ in emits] == [EventType.session_resume]
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
 
     async def test_reseeded_reports_absent_archive(
         self, harness: Harness, tmp_path: Path

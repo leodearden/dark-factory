@@ -902,7 +902,7 @@
     "orchestrator/tests/test_concurrent_verify_boundary.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 25},
     "orchestrator/tests/test_config_reload_integration_gate.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_convert_to_blocked.py": {"patch_targets": ["_check_plan_files_touched_in_branch", "_emit_merge_attempt", "register_and_enqueue_merge_request"], "private_reads": 63},
-    "orchestrator/tests/test_crash_recovery.py": {"patch_targets": [], "private_reads": 284},
+    "orchestrator/tests/test_crash_recovery.py": {"patch_targets": [], "private_reads": 272},
     "orchestrator/tests/test_critical_gate.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_dry_run_unblock.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_ephemeral_worktree.py": {"patch_targets": [], "private_reads": 3},
