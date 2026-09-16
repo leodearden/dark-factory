@@ -4888,6 +4888,20 @@ class TestUnreadableTranscriptEscapeWiring:
 
     The escape must not change any kill decision — "NEVER kill on None" stays
     exactly as it is. It only makes the degrade observable.
+
+    DETERMINISM.  The fake child exits on a poll-count handshake, not a timer:
+    it blocks until the watchdog has read the transcript `required_reads` times,
+    which each test states as the precondition its `call_count` assertion
+    consumes. The wait is valve-bounded, so a watchdog that stops polling fails
+    that assertion instead of hanging the suite.
+
+    The child used to live a fixed 0.25s while the watchdog polled at 5ms, which
+    made every poll count a race: measured 33-46 polls standalone, but 4/480
+    failures under 40-way process contention with counts down to 1 and 5 (task
+    5112). Widening that lifetime was the rejected alternative — it buys a bigger
+    constant on the same race, and this file's sibling wall-clock bound has been
+    widened four times already. Post-fix the same 480-run soak at loadavg 131-174
+    is 0 failures, with poll counts pinned at exactly 3/3/1/6/0.
     """
 
     @staticmethod
