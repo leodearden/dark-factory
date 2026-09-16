@@ -5344,6 +5344,215 @@ class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
 
 
 # ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion): pairs with
+# TestFileInfraIssueSkipsRedundantEscalatedAdvance above — see
+# _file_milestone_gate_and_block's docstring for the full rationale.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
+    """On the rare crash-resume edge where deploy_state.phase is already
+    ESCALATED (or DONE) but a re-entrant always_escalates=True call site
+    reaches _file_milestone_gate_and_block again, the best-effort advance
+    must skip the illegal self-loop — while still stamping gate_escalated_at
+    so the task is not permanently denied the section-1 resume fork."""
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_no_illegal_transition_escalation_when_already_at_target(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # The milestone_gate itself is still filed — the skip only affects the
+        # redundant phase advance, not the loud gate signal.
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        # No spurious illegal_deploy_transition escalation was filed.
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        # No redundant deploy_state write was even attempted.
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls == []
+        assert task['metadata']['deploy_state']['phase'] == seeded_phase
+        # gate_escalated_at is still stamped — a stamp-only fallback, not a
+        # full skip — so the next resume still routes through section-1
+        # quiescence instead of being permanently denied it.
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1
+            and c.args[1].get('gate_escalated_at')
+            and 'deploy_state' not in c.args[1]
+        ]
+        assert len(stamp_calls) == 1
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
+        assert scheduler.update_task.call_count == 1
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+
+    async def test_legal_edge_still_advances_and_stamps(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): a legal
+        RAN->ESCALATED edge must still take the full advance, unaffected by
+        the new guard."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        payload = scheduler.update_task.call_args.args[1]
+        assert payload['deploy_state']['phase'] == 'escalated'
+        assert payload.get('gate_escalated_at')
+        assert task['metadata']['deploy_state']['phase'] == 'escalated'
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+
+    async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
+        (before_done=None) branch is byte-unchanged by this task's guard,
+        which is confined to the before_done-is-not-None deploy path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='4048')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        call = scheduler.update_task.call_args
+        assert call.args[0] == '4048'
+        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert call.args[1]['gate_escalated_at']
+        assert call.kwargs.get('metadata_mode') == 'merge'
+
+
+# ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion, part 2): the deploy-path
+# write in _file_milestone_gate_and_block — both the step-2 stamp-only skip
+# arm and the legal-edge full advance — must be best-effort, mirroring
+# _file_infra_issue_and_block's try/except around its own advance. A
+# transient failure (e.g. a severed fused-memory connection) must not
+# propagate out of run() as a raw exception (the "run() always returns
+# BLOCKED, never a raw exception" contract, deterministic_runner.py::
+# DeterministicRunner._file_infra_issue_and_block docstring).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateAdvanceIsBestEffort:
+    """A transient failure inside the deploy-path write (either arm of the
+    step-2 fork) must not propagate out of _file_milestone_gate_and_block —
+    the milestone_gate escalation filed above is already durable regardless."""
+
+    async def test_transient_advance_failure_on_legal_edge_does_not_propagate(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Legal RAN->ESCALATED edge: the full _advance_deploy_phase arm is
+        taken and its update_task fails."""
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        # Task 4048 amendment: message differentiated per arm (reviewer
+        # suggestion) — this is the full-advance arm's wording.
+        assert 'milestone_gate deploy_state ESCALATED advance failed' in warned
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_transient_stamp_failure_on_skip_path_does_not_propagate(
+        self, tmp_path: Path, seeded_phase: str, caplog,
+    ) -> None:
+        """Already-at-target phase: the step-2 stamp-only fallback arm is
+        taken and its update_task fails."""
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        # Task 4048 amendment (reviewer suggestion): the skip arm must also
+        # be observably logged, not silently swallowed — and its wording
+        # must be distinguishable from the full-advance arm's above.
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'milestone_gate gate_escalated_at stamp-only write failed' in warned
+
+
+# ---------------------------------------------------------------------------
 # Step-5: B7b — verify-fail: stale/missing PID or non-fresh timestamp
 # (RED until step-6 implements the verify-fail path)
 # ---------------------------------------------------------------------------

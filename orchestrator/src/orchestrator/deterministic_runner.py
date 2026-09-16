@@ -2299,6 +2299,43 @@ class DeterministicRunner:
         duplicate L2 escalations.  Stamps ``gate_escalated_at`` so the
         next resume routes through section-1 quiescence.
 
+        Task 4048 (recovered task-2240 review suggestion): on the DEPLOY
+        path (``before_done`` set), the ``gate_escalated_at`` stamp normally
+        rides along with a ``deploy_state.phase`` advance to ``ESCALATED``
+        (DS-1, ζ) — but that advance is SKIPPED when the CURRENT phase is
+        already ``ESCALATED`` or ``DONE``, e.g. the rare crash-resume edge
+        where a prior ``_file_infra_issue_and_block`` advanced phase to
+        ``ESCALATED`` without stamping ``gate_escalated_at`` and a later
+        ``always_escalates=True`` dispatch reaches this gate again. Both
+        ``ESCALATED->ESCALATED`` and ``DONE->ESCALATED`` are pinned-illegal
+        edges, so a bare re-advance would file a spurious born-at-L2
+        ``illegal_deploy_transition`` escalation on top of the
+        ``milestone_gate`` one just filed above. Unlike
+        ``_file_infra_issue_and_block``'s equivalent guard, the skip here
+        does NOT drop the write entirely — ``gate_escalated_at`` is still
+        stamped (stamp-only, no ``deploy_state`` payload), because that
+        stamp is what routes the next dispatch through section-1
+        quiescence/resolve-to-done; dropping it would permanently deny the
+        task that fork rather than merely delay it. This mirrors the
+        stamp-only fallback precedent in
+        ``deterministic_runner.py::DeterministicRunner._writeback_deploy_success``.
+
+        Consequence of that deploy-path write failing (task 4048, mirroring
+        ``_file_infra_issue_and_block``'s equivalent paragraph): both arms
+        above (the stamp-only skip and the legal-edge full advance) are
+        best-effort — a transient failure (e.g. the same severed connection
+        that might be the reason this gate is being filed at all) is caught
+        and logged rather than propagated. The ``milestone_gate`` escalation
+        filed above is already durable on local disk regardless, so a failed
+        write here simply means ``gate_escalated_at`` stays unset — which is
+        exactly the crash-safe file-before-stamp ordering already documented
+        above: the next dispatch finds no stamp, re-files the gate (the
+        dedup guard skips re-submitting since the escalation is still
+        pending) and retries the same write, rather than the exception
+        escaping ``run()`` and leaving the task neither done nor cleanly
+        blocked. Swallowing the exception here converts an escaped raise
+        into this already-designed recovery rather than adding a new one.
+
         Returns:
             ``WorkflowOutcome.BLOCKED``
         """
@@ -2350,11 +2387,56 @@ class DeterministicRunner:
         # (before_done=None) is not a deploy and gets no deploy_state.
         now_iso = datetime.now(UTC).isoformat()
         if metadata.get('before_done') is not None:
-            await self._advance_deploy_phase(
-                task_id, metadata, DeployPhase.ESCALATED,
-                evidence={'gate_escalated_at': now_iso},
-                phase_timestamp=now_iso,
-            )
+            # Task 4048 amendment: pre-bind so both names are defined on every
+            # path into `except` below, including one raised by the
+            # DeployState.from_metadata read itself (see next comment).
+            _already_at_target = False
+            try:
+                # Task 4048 amendment: the read lives inside this try (not
+                # before it) so a corrupted/hand-edited deploy_state slice
+                # (pydantic ValidationError from DeployState.from_metadata)
+                # is caught by the except below instead of escaping — the
+                # write is simply skipped entirely in that case.
+                _current_deploy_state = DeployState.from_metadata(metadata)
+                _already_at_target = (
+                    _current_deploy_state is not None
+                    and _current_deploy_state.phase in (DeployPhase.ESCALATED, DeployPhase.DONE)
+                )
+                if _already_at_target:
+                    assert _current_deploy_state is not None  # implied by _already_at_target (short-circuit `and` above)
+                    # Task 4048: stamp-only skip of a redundant ESCALATED
+                    # advance — see docstring above for the full rationale.
+                    logger.debug(
+                        'DeterministicRunner: task %s deploy_state already at '
+                        'phase=%s — skipping redundant ESCALATED advance, '
+                        'stamping gate_escalated_at only',
+                        task_id, _current_deploy_state.phase,
+                    )
+                    await self.scheduler.update_task(
+                        task_id, {'gate_escalated_at': now_iso}, metadata_mode='merge',
+                    )
+                else:
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.ESCALATED,
+                        evidence={'gate_escalated_at': now_iso},
+                        phase_timestamp=now_iso,
+                    )
+            except Exception as exc:
+                if _already_at_target:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate '
+                        'gate_escalated_at stamp-only write failed (deploy_state '
+                        'already at target phase) (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
+                else:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate deploy_state '
+                        'ESCALATED advance failed (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
         else:
             await self.scheduler.update_task(
                 task_id,
