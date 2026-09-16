@@ -1284,10 +1284,10 @@ class EscalationQueue:
         moved — downstream waiters have already consumed that terminal state —
         but when the stored close was an AUTOMATED sweep and the incoming call
         is a substantive human/agent resolution, the incoming text is appended to
-        ``late_resolutions`` and persisted IN PLACE at ``_locate_path`` (see
-        ``_write_late_resolution``), inside this same critical section so the
-        capture is atomic with the check-and-set it follows.  See
-        ``_is_late_resolution_worth_capturing`` for the predicate.
+        ``late_resolutions`` and persisted IN PLACE at ``_locate_path``, inside
+        this same critical section so the capture is atomic with the
+        check-and-set it follows.  ``_is_late_resolution_worth_capturing`` is the
+        predicate, ``_capture_late_resolution`` the capture itself.
 
         Callbacks and cascade run AFTER releasing the lock:
         - ``_resolve_callback`` fires after the lock is released, preventing
@@ -1349,107 +1349,20 @@ class EscalationQueue:
                 )
                 # NON-LOSSY no-op (task 4495): the incoming text is refused, not
                 # DISCARDED.  See _is_late_resolution_worth_capturing for why the
-                # predicate is narrow.  Still inside escalation_id_lock, so the
+                # predicate is narrow, and _capture_late_resolution for what the
+                # capture does.  Both run inside escalation_id_lock, so the
                 # capture is atomic with the check-and-set it follows.
                 if _is_late_resolution_worth_capturing(esc, resolution, resolved_by):
-                    prior_class = esc.resolution_class
-                    # Correct the stamp ONLY when it is the one the automated
-                    # dismissal DERIVED.  `default_resolution_class_for_resolver`
-                    # maps the reaper-sweep tier to 'benign' — i.e. the sweep
-                    # asserted "nothing actionable here" about a record whose
-                    # real resolution is the text we are capturing, which is the
-                    # esc-3902-1 harm.  An 'actionable' stamp is already the
-                    # truth this aims at, and 'moot-terminal-subject' (task 2724)
-                    # says something specific about WHY the record was closed
-                    # that flattening would destroy — neither is touched.
-                    #
-                    # A candidate EQUAL to the stored stamp is not a correction
-                    # either, so it is reported as none: `corrected` means "the
-                    # stamp this call re-derived", and re-deriving the value
-                    # already there re-derived nothing.  Two live routes reach
-                    # that: an explicit `resolution_class='benign'` argument,
-                    # and the L2 member cascade (:1476) forwarding a
-                    # reaper-sweep L2's own 'benign' stamp onto a member that
-                    # was itself already auto-dismissed 'benign'.
-                    corrected: str | None = None
-                    if esc.resolution_class == 'benign':
-                        # `resolution_class` was validated against
-                        # RESOLUTION_CLASSES at the top of this method, so the
-                        # incoming value is already known-legal here.
-                        candidate = resolution_class or 'actionable'
-                        corrected = candidate if candidate != esc.resolution_class else None
-
-                    entry, chars_elided = _build_late_resolution(
+                    captured, corrected = self._capture_late_resolution(
+                        escalation_id, esc,
                         resolution=resolution,
                         resolved_by=resolved_by,
                         dismiss=dismiss,
-                        # Preserved so the correction destroys nothing and the
-                        # original derivation stays auditable.
-                        prior_resolution_class=prior_class if corrected else None,
-                        timestamp=datetime.now(UTC).isoformat(),
+                        resolution_class=resolution_class,
                     )
-                    prior_list = list(esc.late_resolutions)
-                    prior_truncated = esc.late_resolutions_truncated
-                    prior_elided = esc.late_resolutions_chars_elided
-
-                    esc.late_resolutions.append(entry)
-                    esc.late_resolutions_chars_elided += chars_elided
-                    # Trim in the SAME critical section and the SAME single
-                    # write as the append, so no over-cap list is ever durable.
-                    # OLDEST-shed: these entries are strictly additional to the
-                    # record's own immutable terminal state, and a reader
-                    # triaging NOW wants the most recent finding.
-                    dropped_entries = 0
-                    if len(esc.late_resolutions) > _MAX_LATE_RESOLUTIONS:
-                        dropped_entries = len(esc.late_resolutions) - _MAX_LATE_RESOLUTIONS
-                        esc.late_resolutions = esc.late_resolutions[dropped_entries:]
-                        esc.late_resolutions_truncated += dropped_entries
-                    if corrected is not None:
-                        esc.resolution_class = corrected
-
-                    if self._write_late_resolution(escalation_id, esc):
-                        if outcome is not None:
-                            outcome['late_resolution_captured'] = True
-                            outcome['resolution_class_corrected'] = corrected
-                        logger.warning(
-                            'Escalation %s was already dismissed by %r; a LATE '
-                            'resolution from %r arrived after that automated '
-                            'dismissal and has been CAPTURED in late_resolutions '
-                            '(the record\'s terminal state is unchanged'
-                            '%s): %s',
-                            escalation_id, esc.resolved_by, resolved_by,
-                            (
-                                f'; resolution_class corrected {prior_class!r} -> '
-                                f'{corrected!r}'
-                            ) if corrected is not None else '',
-                            resolution[:200],
-                        )
-                        if dropped_entries:
-                            logger.warning(
-                                'resolve: %s shed %d oldest late resolution(s) at '
-                                'the _MAX_LATE_RESOLUTIONS=%d cap (running total '
-                                "truncated=%d); the record's own terminal state is "
-                                'unaffected',
-                                escalation_id, dropped_entries, _MAX_LATE_RESOLUTIONS,
-                                esc.late_resolutions_truncated,
-                            )
-                        if chars_elided:
-                            logger.warning(
-                                'resolve: %s elided %d char(s) from a captured late '
-                                'resolution at the _MAX_LATE_RESOLUTION_CHARS=%d cap '
-                                '(running total elided=%d); the kept text is the HEAD '
-                                'of what was submitted and says so in-band',
-                                escalation_id, chars_elided, _MAX_LATE_RESOLUTION_CHARS,
-                                esc.late_resolutions_chars_elided,
-                            )
-                    else:
-                        # The write did not land, so nothing may be reported as
-                        # captured — roll the in-memory record back to what is
-                        # actually on disk, bookkeeping counters included.
-                        esc.late_resolutions = prior_list
-                        esc.late_resolutions_truncated = prior_truncated
-                        esc.late_resolutions_chars_elided = prior_elided
-                        esc.resolution_class = prior_class
+                    if captured and outcome is not None:
+                        outcome['late_resolution_captured'] = True
+                        outcome['resolution_class_corrected'] = corrected
                 return esc
 
             if outcome is not None:
@@ -1501,6 +1414,130 @@ class EscalationQueue:
                     )
 
         return esc
+
+    def _capture_late_resolution(
+        self, escalation_id: str, esc: Escalation, *,
+        resolution: str, resolved_by: str | None, dismiss: bool,
+        resolution_class: str | None,
+    ) -> tuple[bool, str | None]:
+        """Preserve one late resolution on an already-terminal *esc*.
+
+        THE one caller is :meth:`resolve`'s already-terminal branch, which has
+        already applied :func:`_is_late_resolution_worth_capturing` and holds
+        ``escalation_id_lock`` — so *esc* is the record as it is inside that
+        critical section and the capture is atomic with the check-and-set that
+        refused the incoming text.
+
+        Extracted so ``resolve()`` reads as its own primary job (check-and-set,
+        then apply) rather than burying it between two halves of this
+        bookkeeping: the stamp-correction derivation, the entry build, the
+        append, the cap trim, the loud-loss WARNINGs, and the rollback.
+
+        Returns ``(captured, corrected)`` — whether the entry reached DISK, and
+        the ``resolution_class`` this call re-derived (None when it re-derived
+        nothing).  ``corrected`` is meaningful only when *captured*: a write
+        that did not land is rolled back in full, stamp included, so there is no
+        correction left to report.
+
+        Mutates *esc* in place on the success path; the caller returns that same
+        object, so what it hands back matches what is on disk either way.
+        """
+        prior_class = esc.resolution_class
+        # Correct the stamp ONLY when it is the one the automated
+        # dismissal DERIVED.  `default_resolution_class_for_resolver`
+        # maps the reaper-sweep tier to 'benign' — i.e. the sweep
+        # asserted "nothing actionable here" about a record whose
+        # real resolution is the text we are capturing, which is the
+        # esc-3902-1 harm.  An 'actionable' stamp is already the
+        # truth this aims at, and 'moot-terminal-subject' (task 2724)
+        # says something specific about WHY the record was closed
+        # that flattening would destroy — neither is touched.
+        #
+        # A candidate EQUAL to the stored stamp is not a correction
+        # either, so it is reported as none: `corrected` means "the
+        # stamp this call re-derived", and re-deriving the value
+        # already there re-derived nothing.  Two live routes reach
+        # that: an explicit `resolution_class='benign'` argument,
+        # and the L2 member cascade (see `resolve`) forwarding a
+        # reaper-sweep L2's own 'benign' stamp onto a member that
+        # was itself already auto-dismissed 'benign'.
+        corrected: str | None = None
+        if esc.resolution_class == 'benign':
+            # `resolution_class` was validated against RESOLUTION_CLASSES at
+            # the top of `resolve`, so the incoming value is known-legal here.
+            candidate = resolution_class or 'actionable'
+            corrected = candidate if candidate != esc.resolution_class else None
+
+        entry, chars_elided = _build_late_resolution(
+            resolution=resolution,
+            resolved_by=resolved_by,
+            dismiss=dismiss,
+            # Preserved so the correction destroys nothing and the
+            # original derivation stays auditable.
+            prior_resolution_class=prior_class if corrected else None,
+            timestamp=datetime.now(UTC).isoformat(),
+        )
+        prior_list = list(esc.late_resolutions)
+        prior_truncated = esc.late_resolutions_truncated
+        prior_elided = esc.late_resolutions_chars_elided
+
+        esc.late_resolutions.append(entry)
+        esc.late_resolutions_chars_elided += chars_elided
+        # Trim in the SAME critical section and the SAME single
+        # write as the append, so no over-cap list is ever durable.
+        # OLDEST-shed: these entries are strictly additional to the
+        # record's own immutable terminal state, and a reader
+        # triaging NOW wants the most recent finding.
+        dropped_entries = 0
+        if len(esc.late_resolutions) > _MAX_LATE_RESOLUTIONS:
+            dropped_entries = len(esc.late_resolutions) - _MAX_LATE_RESOLUTIONS
+            esc.late_resolutions = esc.late_resolutions[dropped_entries:]
+            esc.late_resolutions_truncated += dropped_entries
+        if corrected is not None:
+            esc.resolution_class = corrected
+
+        if not self._write_late_resolution(escalation_id, esc):
+            # The write did not land, so nothing may be reported as
+            # captured — roll the in-memory record back to what is
+            # actually on disk, bookkeeping counters included.
+            esc.late_resolutions = prior_list
+            esc.late_resolutions_truncated = prior_truncated
+            esc.late_resolutions_chars_elided = prior_elided
+            esc.resolution_class = prior_class
+            return False, None
+
+        logger.warning(
+            'Escalation %s was already dismissed by %r; a LATE '
+            'resolution from %r arrived after that automated '
+            'dismissal and has been CAPTURED in late_resolutions '
+            "(the record's terminal state is unchanged"
+            '%s): %s',
+            escalation_id, esc.resolved_by, resolved_by,
+            (
+                f'; resolution_class corrected {prior_class!r} -> '
+                f'{corrected!r}'
+            ) if corrected is not None else '',
+            resolution[:200],
+        )
+        if dropped_entries:
+            logger.warning(
+                'resolve: %s shed %d oldest late resolution(s) at '
+                'the _MAX_LATE_RESOLUTIONS=%d cap (running total '
+                "truncated=%d); the record's own terminal state is "
+                'unaffected',
+                escalation_id, dropped_entries, _MAX_LATE_RESOLUTIONS,
+                esc.late_resolutions_truncated,
+            )
+        if chars_elided:
+            logger.warning(
+                'resolve: %s elided %d char(s) from a captured late '
+                'resolution at the _MAX_LATE_RESOLUTION_CHARS=%d cap '
+                '(running total elided=%d); the kept text is the HEAD '
+                'of what was submitted and says so in-band',
+                escalation_id, chars_elided, _MAX_LATE_RESOLUTION_CHARS,
+                esc.late_resolutions_chars_elided,
+            )
+        return True, corrected
 
     def park(
         self,
