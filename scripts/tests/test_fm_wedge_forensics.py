@@ -79,6 +79,20 @@ EPISODE_1_JOURNAL = """\
 2026-09-15T23:58:42+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# The measured NORMAL quiet ceiling: fm's reconciliation harness logs one
+# `Project reconciliation loop started` line per project on a 61s cadence, so
+# an otherwise-idle fm legitimately goes 61s between lines. These are the six
+# real consecutive dark_factory lines from 2026-09-16 11:58-12:03, every gap
+# exactly 61s. This is the upper bound the default threshold has to clear.
+NORMAL_HARNESS_CADENCE_JOURNAL = """\
+2026-09-16T11:58:46+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 11:58:46 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+2026-09-16T11:59:47+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 11:59:47 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+2026-09-16T12:00:48+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:00:48 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+2026-09-16T12:01:49+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:01:49 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+2026-09-16T12:02:50+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:02:50 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+2026-09-16T12:03:51+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:03:51 - fused_memory.reconciliation.harness - INFO - Project reconciliation loop started for dark_factory
+"""
+
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
 # emits hundreds of lines per second. Nothing here is near any threshold.
 DENSE_HEALTHY_JOURNAL = """\
@@ -108,3 +122,65 @@ def test_analyze_reports_no_episode_for_a_dense_healthy_window():
     from fm_wedge_forensics import analyze
 
     assert analyze(DENSE_HEALTHY_JOURNAL) == []
+
+
+# ---------------------------------------------------------------------------
+# The default threshold, pinned against the three measurements that derive it.
+#
+# The bound is checkable here rather than merely asserted: it must sit ABOVE
+# the measured 61s normal harness cadence and BELOW the shorter (120s) of the
+# two observed stalls. These tests fail if either side of that margin is ever
+# eroded, whichever direction the constant is moved.
+# ---------------------------------------------------------------------------
+
+def test_default_threshold_clears_the_normal_61s_harness_cadence():
+    """An idle-but-healthy fm must not read as a stall."""
+    from fm_wedge_forensics import analyze
+
+    assert analyze(NORMAL_HARNESS_CADENCE_JOURNAL) == []
+
+
+def test_default_threshold_catches_the_shorter_episode_1_stall():
+    from fm_wedge_forensics import analyze
+
+    episodes = analyze(EPISODE_1_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 120.0
+
+
+def test_default_threshold_catches_the_longer_episode_2_stall():
+    from fm_wedge_forensics import analyze
+
+    episodes = analyze(EPISODE_2_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 171.0
+
+
+def test_threshold_is_a_parameter_not_baked_into_the_detection():
+    """Lowering the threshold below the harness cadence makes the same healthy
+    window register — proving the default is a tunable bound and the detection
+    logic carries no hidden magnitude of its own."""
+    from fm_wedge_forensics import analyze
+
+    episodes = analyze(NORMAL_HARNESS_CADENCE_JOURNAL, 30.0)
+
+    assert len(episodes) == 5
+    assert {episode.stall_seconds for episode in episodes} == {61.0}
+
+
+def test_default_threshold_sits_between_the_cadence_and_the_shorter_stall():
+    """The derivation itself, asserted directly on the constant.
+
+    The two behavioural tests above check the default's CONSEQUENCES on the
+    real captures; this checks the MARGIN, which is what a future tuner
+    actually needs to preserve. 61.0 is the measured normal per-project
+    harness cadence and 120.0 the shorter of the two observed stalls, so any
+    value strictly between them separates signal from healthy idle. Naming
+    both endpoints here means moving the constant toward either one fails
+    loudly at the boundary rather than silently eroding the margin.
+    """
+    from fm_wedge_forensics import DEFAULT_STALL_THRESHOLD_SECONDS
+
+    assert 61.0 < DEFAULT_STALL_THRESHOLD_SECONDS < 120.0
