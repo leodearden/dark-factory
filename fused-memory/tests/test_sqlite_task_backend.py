@@ -6036,7 +6036,10 @@ def test_reject_append_on_replace_only_fields_keys_on_identity_not_truthiness():
     truthy non-bool (e.g. ``1``) is not the sanctioned flag value and does not
     trip the guard, keeping the two sibling guards on this method consistent
     about what counts as append=True."""
-    assert _reject_append_on_replace_only_fields(1, description='x') is None, (
+    assert _reject_append_on_replace_only_fields(
+        1,  # pyright: ignore[reportArgumentType] - off-type BY DESIGN, see docstring
+        description='x',
+    ) is None, (
         'guard must key on `append is True`, not truthiness'
     )
 
