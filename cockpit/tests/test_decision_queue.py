@@ -202,6 +202,78 @@ class TestScoringAdapters:
         assert item.filed_at == _NOW
 
 
+class TestQuestionWidth:
+    """question_width(items, now, available_width) -- how many cells the
+    question column gets once the three fixed columns have taken theirs.
+
+    Pure: the widget supplies the measured width, this decides the bound.
+    With _make_row_item()'s defaults at available_width=200, cell_padding=1
+    the three fixed columns render 7 + 5 + 14 = 26 cells ('score' the label
+    beats '1.0', 'age' the label ties '10d', 'project#task' the label beats
+    'df#2085', each plus two padding cells), leaving 200 - 26 - 2 == 172.
+    """
+
+    def test_wide_terminal_leaves_the_question_everything_the_others_do_not_take(self):
+        from cockpit.panes.decision_queue import question_width
+
+        assert question_width([_make_row_item()], _NOW, 200) == 172
+
+    def test_a_column_label_wider_than_every_cell_sets_that_column_s_floor(self):
+        from cockpit.panes.decision_queue import question_width
+
+        item = _make_row_item(project='d', task_id=None)
+
+        assert question_width([item], _NOW, 200) == 172
+
+    def test_a_cell_wider_than_its_label_takes_the_excess_from_the_question(self):
+        from cockpit.panes.decision_queue import question_width
+
+        long_project = 'a-very-long-project-name-here'
+        item = _make_row_item(project=long_project, task_id=None)
+
+        excess = len(long_project) - len('project#task')
+
+        assert question_width([item], _NOW, 200) == 172 - excess
+
+    def test_the_bound_grows_one_for_one_with_the_available_width(self):
+        from cockpit.panes.decision_queue import question_width
+
+        items = [_make_row_item()]
+
+        wide = question_width(items, _NOW, 300)
+        narrow = question_width(items, _NOW, 200)
+
+        assert wide - narrow == 100
+
+    def test_zero_cell_padding_frees_two_cells_per_column(self):
+        from cockpit.panes.decision_queue import question_width
+
+        items = [_make_row_item()]
+
+        padded = question_width(items, _NOW, 200, cell_padding=1)
+        unpadded = question_width(items, _NOW, 200, cell_padding=0)
+
+        assert unpadded - padded == 8
+
+    def test_a_narrow_terminal_floors_rather_than_going_to_zero_or_negative(self):
+        from cockpit.panes.decision_queue import question_width
+
+        bound = question_width([_make_row_item()], _NOW, 30)
+
+        assert bound == 20
+        assert bound >= len('(no question)')
+
+    def test_an_unmeasured_width_returns_the_pre_layout_fallback(self):
+        from cockpit.panes.decision_queue import question_width
+
+        assert question_width([_make_row_item()], _NOW, 0) == 60
+
+    def test_no_items_still_reserves_the_three_column_labels(self):
+        from cockpit.panes.decision_queue import question_width
+
+        assert question_width([], _NOW, 200) == 172
+
+
 class TestFormatQueueRow:
     def test_renders_four_column_row(self):
         from cockpit.panes.decision_queue import format_queue_row
