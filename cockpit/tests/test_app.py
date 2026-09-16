@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -624,6 +624,57 @@ class TestDecisionQueueRender:
             high_index = queue.get_row_index('decision:dec-high')
             low_index = queue.get_row_index('decision:dec-low')
             assert high_index < low_index
+
+
+    @pytest.mark.timeout(10)
+    async def test_a_wide_terminal_gives_the_question_the_leftover_width(self, tmp_path):
+        """The question column is sized from the width the other three columns
+        leave, not from a hardcoded cap -- so a wide terminal shows a long
+        question instead of parking most of the line in a blank gutter.
+
+        At terminal width 200 the fixed columns render at their LABEL widths
+        ('score' 5, 'age' 3, 'project#task' 12 -- each wider than its cell
+        here), which with one padding cell either side is 26. The question
+        column takes the remaining 200 - 26 - 2 == 172.
+
+        filed_at is three days back rather than a fixed calendar date so the
+        age cell stays two characters forever: a fixed date would eventually
+        render '100d', widen the age column past its label and silently move
+        this arithmetic by one.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        assert len(long_question) > 300
+
+        decision = sr.DecisionRecord(
+            id='dec-wide',
+            project='df',
+            text=long_question,
+            filed_at=(datetime.now(UTC) - timedelta(days=3)).isoformat(),
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            question_cell = queue.get_row('decision:dec-wide')[3]
+
+            # far past the old hardcoded 60-cell cap, and exactly the leftover
+            assert len(question_cell) > 60
+            assert len(question_cell) == 172
+
+            # the formatting contract survived the wider bound
+            assert question_cell.endswith('\u2026')
+            assert '\n' not in question_cell
+
+            # no blank gutter and no overflow: the columns fill the width exactly
+            assert queue.scrollable_content_region.width == 200
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
 
 
 class TestSignalDontMove:
