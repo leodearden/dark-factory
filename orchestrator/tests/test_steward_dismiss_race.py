@@ -14,7 +14,11 @@ This module pins BOTH halves of the outcome:
   ``resolve()`` return value is discarded, so a lost race still logs
   ``gave up on <id> … dismissed the L0`` (a lie) and still publishes
   ``StewardInterrupted``, misreporting a genuine resolution as a benign
-  interruption on the outcome channel;
+  interruption on the outcome channel.  The winner can arrive through either
+  door: ``resume``/``restart`` leaves the record ``'resolved'``, while
+  ``abandon``/``close_only`` leaves it ``'dismissed'`` — the same terminal
+  state this steward's own dismissal produces, distinguished only by who is
+  attributed;
 * when the DISMISSAL wins, the late resolution must not be dropped on the floor
   — the queue captures it in ``late_resolutions`` and corrects the derived
   ``resolution_class='benign'`` stamp (group B, the end-to-end reproduction).
@@ -76,10 +80,10 @@ def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
 def _resolve_returns(steward, **fields) -> Escalation:
     """Make the steward's mock queue's ``resolve()`` return a record with *fields*.
 
-    The mock queue returns a bare ``MagicMock`` from ``resolve()`` today, and
-    ``MagicMock().status == 'resolved'`` is False — which is exactly why the
-    production branch reads the RETURNED RECORD rather than the
-    ``ResolveOutcome`` out-param: the 144 existing MagicMock-queue tests in
+    The stock mock queue returns a bare ``MagicMock`` from ``resolve()``, which
+    ``steward._dismissal_was_overtaken``'s status membership test rejects —
+    which is exactly why the production branch reads the RETURNED RECORD rather
+    than the ``ResolveOutcome`` out-param: the existing MagicMock-queue tests in
     ``test_steward.py`` keep their current behaviour with no churn.
     """
     rec = _make_escalation(**fields)
@@ -191,18 +195,31 @@ class TestDismissalWonTheRace:
         assert esc.id in steward._capped_escalations
         _assert_counters_popped(steward, esc.id)
 
-    async def test_mock_queue_resolve_return_is_not_a_resolved_record(self, steward):
-        """The load-bearing premise of branching on the RETURNED RECORD.
+    async def test_the_stock_mock_queue_keeps_the_interrupted_contract(self, steward):
+        """The premise the ~150 ``test_steward.py`` cases rest on, as BEHAVIOUR.
 
-        ``test_steward.py`` drives a ``MagicMock`` queue whose ``resolve()``
-        returns a bare ``MagicMock``.  If ``MagicMock().status == 'resolved'``
-        were ever True, every one of those tests would silently start taking
-        the race-lost branch.  Pinned here so the premise is checked rather
-        than remembered.
+        Those cases never configure ``resolve()``'s return value, so the
+        steward reads the stock queue's bare ``MagicMock``.  What has to hold
+        is not something about ``unittest.mock`` — it is that THIS steward
+        still publishes ``StewardInterrupted`` for that return, because if it
+        ever flipped, every one of those cases would silently start asserting a
+        different contract.  So the return value is deliberately left
+        unconfigured here and the OUTCOME is what is pinned.
         """
-        rec = steward.escalation_queue.resolve('esc-42-1', 'x', dismiss=True)
-        assert rec is not None
-        assert (rec.status == 'resolved') is False
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation()
+        _arm_timeout_cap(steward, esc.id)
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock):
+            await steward._handle_escalation(esc)
+
+        _assert_dismissed_own_l0(steward, esc.id)
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=True,
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
 
 
 @pytest.mark.asyncio
@@ -343,6 +360,109 @@ class TestInFlightResolveWonTheRace:
         text = '\n'.join(r.getMessage() for r in caplog.records)
         assert 'dismissed the L0' in text
         assert esc.id in text
+
+
+@pytest.mark.asyncio
+class TestAnAgentDismissalWonTheRace:
+    """``resolve()`` returned a DISMISSED record attributed to the AGENT.
+
+    ``resolve_issue``'s dismissing actions (``abandon`` / ``close_only``, see
+    ``server._DISMISS_ACTIONS``) close the record as ``'dismissed'`` — the SAME
+    terminal state the steward's own auto-dismiss produces, so only the
+    attribution tells the two apart.  Reading the status alone therefore missed
+    exactly half the race: the steward logged that it had dismissed an L0 whose
+    dismissal was an atomic no-op, and published ``StewardInterrupted``, telling
+    the workflow to resume the plan for a record an agent had deliberately
+    abandoned.
+    """
+
+    AGENT = 'claude-task-42-implementer'
+
+    async def _drive(self, steward, esc, arm, **stored_fields):
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        arm(steward, esc.id)
+        _resolve_returns(steward, **stored_fields)
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock):
+            await steward._handle_escalation(esc)
+
+        return channel
+
+    @pytest.mark.parametrize(
+        ('arm', 'reason'),
+        [(_arm_attempt_cap, 'attempt_cap'), (_arm_timeout_cap, 'timeout')],
+    )
+    async def test_an_abandon_publishes_resolved_not_interrupted(
+        self, steward, arm, reason: str,
+    ):
+        """Both wip-gated doors, because either can lose to the same abandon."""
+        esc = _make_escalation()
+        channel = await self._drive(
+            steward, esc, arm,
+            status='dismissed', resolved_by=self.AGENT,
+            resolution='abandoning: the premise is false, this needs a new task',
+        )
+
+        # The give-up contract is UNCHANGED: the dismissal is still attempted.
+        _assert_dismissed_own_l0(steward, esc.id)
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardResolved(
+            resolution_text='abandoning: the premise is false, this needs a new task',
+        ), (
+            'an agent that deliberately abandoned the record did not leave the '
+            'steward cut short — resuming the plan for it is the misreport this '
+            'task exists to fix, arriving through the dismiss door'
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
+        assert esc.id in steward._capped_escalations
+        _assert_counters_popped(steward, esc.id)
+
+    async def test_the_warning_names_the_agent_that_actually_closed_it(
+        self, steward, caplog,
+    ):
+        esc = _make_escalation()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            await self._drive(
+                steward, esc, _arm_timeout_cap,
+                status='dismissed', resolved_by=self.AGENT, resolution='abandoned',
+            )
+
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'dismissed the L0' not in text, (
+            'this steward dismissed nothing — its call was an atomic no-op'
+        )
+        assert self.AGENT in text, (
+            'the race warning must name who actually closed the record'
+        )
+        assert esc.id in text
+
+    async def test_another_automated_sweep_is_not_a_lost_race(self, steward, caplog):
+        """A reaper-sweep resolver winning is NOT a finding to publish.
+
+        ``harness-orphan-reaper`` closed the record the same way this steward
+        was about to, carrying no agent resolution — so the outcome stays
+        ``StewardInterrupted`` and the give-up WARNING stays true.  This is the
+        conjunct that keeps the broadened check from reading every dismissal as
+        a race.
+        """
+        esc = _make_escalation()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            channel = await self._drive(
+                steward, esc, _arm_timeout_cap,
+                status='dismissed', resolved_by='harness-orphan-reaper',
+            )
+
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=True,
+        )
+        assert channel.empty()
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'dismissed the L0' in text, (
+            'the record WAS dismissed by an equivalent automated sweep, so the '
+            'give-up warning is still the true one'
+        )
 
 
 # ---------------------------------------------------------------------------

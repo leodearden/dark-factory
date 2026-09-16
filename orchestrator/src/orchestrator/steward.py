@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from escalation.classify import classify_resolver_tier
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -1087,10 +1088,12 @@ class TaskSteward:
         OBSERVED, not fire-and-forget (task 4495) — ``resolve()``'s status
         check is an atomic check-and-set inside ``escalation_id_lock``, so a
         ``resolve_issue`` already in flight from the killed agent session can
-        win it and leave the returned record ``'resolved'`` rather than
-        ``'dismissed'``.  :meth:`_give_up_with_wip` is the sole caller and owns
-        that branch, including the give-up WARNING, which used to live here and
-        moved out because it is FALSE on the lost-race path.
+        win it and leave the returned record carrying the AGENT's close
+        (``'resolved'``, or ``'dismissed'`` for an ``abandon``) rather than this
+        steward's.  :meth:`_give_up_with_wip` is the sole caller and owns that
+        branch (see :func:`_dismissal_was_overtaken`), including the give-up
+        WARNING, which used to live here and moved out because it is FALSE on
+        the lost-race path.
         """
         stored = self.escalation_queue.resolve(
             escalation.id,
@@ -1137,19 +1140,29 @@ class TaskSteward:
         so exactly one side wins and the dismissal is correctly a no-op when it
         loses; what was wrong was that nothing LOOKED.  A lost race therefore
         published ``StewardInterrupted`` — telling the workflow to resume the
-        plan because the steward was cut short — for a record that had in fact
-        just been resolved, and logged that it had dismissed an L0 it had not.
+        plan because the steward was cut short — for a record an agent session
+        had in fact just closed, and logged that it had dismissed an L0 it had
+        not.
 
         Prevention cannot close this: the steward cannot observe a tool call
         that has left the agent process but has not yet reached the escalation
         server.  Reporting truthfully can, and does.
 
-        Branching on the RETURNED RECORD rather than ``resolve()``'s
-        ``ResolveOutcome`` out-param is load-bearing for the existing suite:
-        ``test_steward.py`` drives a ``MagicMock`` queue whose ``resolve()``
-        returns a bare ``MagicMock``, and ``MagicMock().status == 'resolved'``
-        is False, so every one of those tests keeps today's behaviour
-        unchanged.  ``test_steward_dismiss_race.py`` pins that premise.
+        WHICH side won is read off the RETURNED RECORD by
+        :func:`_dismissal_was_overtaken` — any terminal record not attributed to
+        an automated sweep is one this steward did not close, covering the
+        winner's ``'resolved'`` and ``'dismissed'`` outcomes alike (an
+        ``abandon``/``close_only`` ``resolve_issue`` wins the same check-and-set
+        and would otherwise be misreported as a steward interruption, telling
+        the workflow to resume a plan an agent deliberately abandoned).
+
+        Reading the record rather than ``resolve()``'s ``ResolveOutcome``
+        out-param is load-bearing for the existing suite: ``test_steward.py``
+        drives a ``MagicMock`` queue whose ``resolve()`` returns a bare
+        ``MagicMock``, which the predicate's status membership test rejects, so
+        every one of those tests keeps today's behaviour unchanged.
+        ``test_steward_dismiss_race.py`` pins that as a behaviour of this
+        steward, not of ``unittest.mock``.
 
         ``StewardMetrics`` is deliberately untouched on the race-lost path:
         this steward did not resolve the escalation — it lost to the agent
@@ -1158,14 +1171,14 @@ class TaskSteward:
         """
         stored = self._dismiss_capped_l0(escalation, outcome.reason)
 
-        if stored is not None and stored.status == 'resolved':
+        if stored is not None and _dismissal_was_overtaken(stored):
             logger.warning(
                 f'Steward for task {self.task_id}: gave up on {escalation.id} '
                 f'({outcome.reason}) with WIP present, but an in-flight resolve '
-                f'had ALREADY resolved the record (resolved_by='
-                f'{stored.resolved_by!r}) — the dismissal was an atomic no-op; '
-                f'publishing the resolution instead of a resume-plan '
-                f'interruption'
+                f'had ALREADY closed the record (status={stored.status!r}, '
+                f'resolved_by={stored.resolved_by!r}) — the dismissal was an '
+                f'atomic no-op; publishing that resolution instead of a '
+                f'resume-plan interruption'
             )
             self._publish_outcome(
                 StewardResolved(
@@ -1269,6 +1282,41 @@ class TaskSteward:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'
                 )
+
+
+def _dismissal_was_overtaken(stored: Escalation) -> bool:
+    """Did something OTHER than an automated dismissal close *stored* first?
+
+    The question :meth:`TaskSteward._give_up_with_wip` has to answer about the
+    record ``EscalationQueue.resolve`` handed back: did MY dismissal apply, or
+    did an in-flight ``resolve_issue`` from the killed agent session win the
+    atomic check-and-set?  The steward always dismisses with
+    ``resolved_by='auto-dismissed'``, so a terminal record attributed to
+    anything outside the ``'reaper-sweep'`` tier is one this steward did not
+    close — whichever terminal state the winner produced.
+
+    BOTH terminal states count.  A winning ``resolve_issue`` lands
+    ``'resolved'`` for ``resume``/``restart`` but ``'dismissed'`` for the
+    dismissing actions (``abandon`` / ``close_only``, ``server._DISMISS_ACTIONS``),
+    and the steward's own call was an atomic no-op either way — reading only
+    ``'resolved'`` would report a deliberate agent abandon as a steward
+    interruption and tell the workflow to resume the plan for it, the same
+    class of misreport task 4495 exists to fix, one door over.
+
+    ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
+    deliberately NOT a lost race: it closed the record the same way this
+    steward was about to, carrying no agent finding to publish.  The tier test
+    goes through ``escalation.classify`` rather than an inline
+    ``'auto-dismissed'`` literal so that membership stays single-sited (INV-5).
+
+    MagicMock-safe by construction, which is load-bearing for the ~150
+    ``test_steward.py`` cases whose mock queue returns a bare ``MagicMock``
+    from ``resolve()``: the status test is a membership check that a MagicMock
+    fails, and it short-circuits before the tier lookup ever sees one.
+    """
+    if stored.status not in ('resolved', 'dismissed'):
+        return False
+    return classify_resolver_tier(stored.resolved_by) != 'reaper-sweep'
 
 
 def _strip_hash_prefix(detail: str) -> str:
