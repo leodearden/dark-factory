@@ -48,19 +48,9 @@ DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
 REGROWTH_INJECTION_PATH = FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 
-def _load_module() -> types.ModuleType:
-    """Load bake_off_storage_shape.py from its file path.
-
-    The module is registered in sys.modules under its bare name so that
-    @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='bake_off_storage_shape')
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='bake_off_storage_shape')
 
 
 # ===========================================================================

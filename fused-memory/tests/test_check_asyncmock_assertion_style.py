@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -20,12 +19,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_asyncmock_assertion_style.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    return load_script_module(SCRIPT_PATH, mod_name='check_asyncmock_assertion_style')
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_asyncmock_assertion_style')
 find_violations = _checker.find_violations
 
 

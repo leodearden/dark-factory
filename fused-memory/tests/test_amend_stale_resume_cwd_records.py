@@ -7,7 +7,6 @@ test_tag_cgl_eta_rehome_scope.py / test_prune_recon_cycle_summaries.py.
 from __future__ import annotations
 
 import dataclasses
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -19,16 +18,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load amend_stale_resume_cwd_records.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='amend_stale_resume_cwd_records')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='amend_stale_resume_cwd_records')
 
 STALE_ID = '6403e96b-f1af-403a-9513-59f007ed6d39'
 WARNING_ID = 'd007aa46-5800-455c-af3c-32d8fd8445b2'

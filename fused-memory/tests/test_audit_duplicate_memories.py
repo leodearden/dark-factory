@@ -16,17 +16,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_duplicate_memories.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='audit_duplicate_memories')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_duplicate_memories')
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
 ann_scores_for_pairs = _mod.ann_scores_for_pairs

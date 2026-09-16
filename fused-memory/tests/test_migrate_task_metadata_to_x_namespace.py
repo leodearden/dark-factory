@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import re
-import types
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,12 +36,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load migrate_task_metadata_to_x_namespace.py from its file path."""
-    return load_script_module(SCRIPT_PATH, mod_name='migrate_task_metadata_to_x_namespace')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='migrate_task_metadata_to_x_namespace')
 plan_x_namespace_migration = _mod.plan_x_namespace_migration
 build_update_payload = _mod.build_update_payload
 build_parser = _mod.build_parser

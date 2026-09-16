@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -22,17 +21,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load clear_false_dependency_invalidations.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='clear_false_dependency_invalidations')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='clear_false_dependency_invalidations')
 
 
 @pytest.fixture(autouse=True)

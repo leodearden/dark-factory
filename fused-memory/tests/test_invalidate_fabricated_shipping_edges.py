@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import types
 from pathlib import Path
 
 import pytest
@@ -28,17 +27,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load invalidate_fabricated_shipping_edges.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='invalidate_fabricated_shipping_edges')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='invalidate_fabricated_shipping_edges')
 
 
 @pytest.fixture(autouse=True)

@@ -15,7 +15,6 @@ server or orchestrator harness required.
 from __future__ import annotations
 
 import json
-import types
 from pathlib import Path
 
 import httpx
@@ -27,16 +26,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cgl_eta_scheduler_gate
 SERVER_SID = 'srv-sid-123'
 
 
-def _load_module() -> types.ModuleType:
-    """Load cgl_eta_scheduler_gate.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='cgl_eta_scheduler_gate')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cgl_eta_scheduler_gate')
 
 
 def _session_not_found() -> httpx.Response:

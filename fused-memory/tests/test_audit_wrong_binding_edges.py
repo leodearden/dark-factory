@@ -18,7 +18,6 @@ from __future__ import annotations
 import ast
 import json
 import re
-import types
 from pathlib import Path
 from typing import Any
 
@@ -31,17 +30,7 @@ from fused_memory.utils.canonical_labels import Referent
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_wrong_binding_edges.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_wrong_binding_edges.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='audit_wrong_binding_edges')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_wrong_binding_edges')
 fact_referents = _mod.fact_referents
 endpoint_referent = _mod.endpoint_referent
 bare_id_present = _mod.bare_id_present

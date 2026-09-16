@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -20,17 +19,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load cleanup_count_snapshots.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='cleanup_count_snapshots')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cleanup_count_snapshots')
 EdgeMatch = _mod.EdgeMatch
 EntityScanResult = _mod.EntityScanResult
 

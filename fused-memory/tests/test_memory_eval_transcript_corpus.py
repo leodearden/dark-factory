@@ -29,12 +29,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_transcript
 FIXTURE_ARCHIVE = Path(__file__).parent / 'fixtures' / 'transcript_corpus'
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_transcript_corpus.py from its file path."""
-    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_transcript_corpus')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='memory_eval_transcript_corpus')
 
 SEARCH = 'mcp__fused-memory__search'
 

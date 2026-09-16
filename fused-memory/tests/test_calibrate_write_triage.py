@@ -45,19 +45,9 @@ CANONICAL_5626 = '70fd0700'
 EXCLUDED_IDS = ('8d79e0e4', '43a47400')
 
 
-def _load_module() -> types.ModuleType:
-    """Load calibrate_write_triage.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='calibrate_write_triage')
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='calibrate_write_triage')
 
 
 # ---------------------------------------------------------------------------

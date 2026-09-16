@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,16 +17,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load tag_cgl_eta_rehome_scope.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='tag_cgl_eta_rehome_scope')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='tag_cgl_eta_rehome_scope')
 
 
 @pytest.fixture(autouse=True)

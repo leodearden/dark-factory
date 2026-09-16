@@ -23,16 +23,7 @@ from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCate
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load census_memory_metadata.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='census_memory_metadata')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='census_memory_metadata')
 
 
 # ===========================================================================

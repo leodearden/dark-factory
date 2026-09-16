@@ -20,17 +20,7 @@ from fused_memory.utils.target_store_preflight import TargetStoreMissing
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_found_on_main_provenance.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='audit_found_on_main_provenance')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_found_on_main_provenance')
 TaskProvenanceAudit = _mod.TaskProvenanceAudit
 CITATION_PATTERN = _mod.CITATION_PATTERN
 select_found_on_main_tasks = _mod.select_found_on_main_tasks

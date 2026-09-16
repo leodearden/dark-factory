@@ -31,19 +31,9 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_retrieval_probe.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 # ---------------------------------------------------------------------------

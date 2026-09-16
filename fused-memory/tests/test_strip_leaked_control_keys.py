@@ -11,7 +11,6 @@ not unit-tested here — see the script's module docstring.
 """
 from __future__ import annotations
 
-import types
 from pathlib import Path
 
 from _fm_helpers import load_script_module
@@ -19,17 +18,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'strip_leaked_control_keys.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load strip_leaked_control_keys.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly (they call
-    sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='strip_leaked_control_keys')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='strip_leaked_control_keys')
 correct_task_metadata = _mod.correct_task_metadata
 
 

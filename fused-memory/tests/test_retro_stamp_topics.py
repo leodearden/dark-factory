@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -26,16 +25,7 @@ from fused_memory import topic_slug as topic_slug_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load retro_stamp_topics.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
 
 
 @pytest.fixture(autouse=True)

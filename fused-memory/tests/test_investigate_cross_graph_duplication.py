@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,16 +18,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'investigate_cross_graph_duplication.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load investigate_cross_graph_duplication.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='investigate_cross_graph_duplication')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='investigate_cross_graph_duplication')
 
 
 # ===========================================================================

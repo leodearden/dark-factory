@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -19,16 +18,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load prune_recon_cycle_summaries.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='prune_recon_cycle_summaries')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='prune_recon_cycle_summaries')
 
 
 @pytest.fixture(autouse=True)

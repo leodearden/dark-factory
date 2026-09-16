@@ -45,19 +45,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load build_corpus.py from its file path.
-
-    The module is registered in sys.modules under its name BEFORE
-    ``exec_module`` so that ``@dataclass`` and other reflection-based
-    decorators work correctly (they call ``sys.modules.get(cls.__module__)``),
-    and build_corpus.py defines frozen dataclasses. See the note at
-    test_memory_eval_retrieval_probe.py's copy of this helper.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
 
 
 # ===========================================================================

@@ -29,16 +29,7 @@ from fused_memory.maintenance.cross_graph_move import (
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load migrate_cross_graph_leak.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='migrate_cross_graph_leak')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='migrate_cross_graph_leak')
 
 
 @pytest.fixture(autouse=True)

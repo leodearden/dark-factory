@@ -17,16 +17,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load clear_malformed_empty_memory.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='clear_malformed_empty_memory')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='clear_malformed_empty_memory')
 
 
 # ===========================================================================

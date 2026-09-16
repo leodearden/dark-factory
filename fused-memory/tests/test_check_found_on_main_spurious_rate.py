@@ -25,11 +25,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    return load_script_module(SCRIPT_PATH, mod_name='check_found_on_main_spurious_rate')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='check_found_on_main_spurious_rate')
 parse_since = _mod.parse_since
 find_spurious_since = _mod.find_spurious_since
 format_summary = _mod.format_summary

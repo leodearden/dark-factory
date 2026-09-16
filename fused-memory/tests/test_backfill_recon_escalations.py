@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import types
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,17 +23,7 @@ from fused_memory.utils.target_store_preflight import TargetStoreMissing
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'backfill_recon_escalations.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load backfill_recon_escalations.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='backfill_recon_escalations')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='backfill_recon_escalations')
 finding_fingerprint = _mod.finding_fingerprint
 build_plan = _mod.build_plan
 apply_plan = _mod.apply_plan

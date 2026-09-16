@@ -53,16 +53,7 @@ MIGRATE_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load cgl_eta_auto_apply_impl.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='cgl_eta_auto_apply_impl')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cgl_eta_auto_apply_impl')
 
 
 def _load_migrate_from_this_tree(monkeypatch) -> types.ModuleType:

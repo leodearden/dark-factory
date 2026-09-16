@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import sys
-import types
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -20,16 +19,7 @@ from fused_memory.maintenance.cross_graph_move import SubgraphEdgeResult
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'consolidate_namespace_families.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load consolidate_namespace_families.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='consolidate_namespace_families')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='consolidate_namespace_families')
 
 
 @pytest.fixture(autouse=True)

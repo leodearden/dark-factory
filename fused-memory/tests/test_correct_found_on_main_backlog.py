@@ -20,17 +20,7 @@ from fused_memory.utils.target_store_preflight import TargetStoreMissing
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load correct_found_on_main_backlog.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    return load_script_module(SCRIPT_PATH, mod_name='correct_found_on_main_backlog')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='correct_found_on_main_backlog')
 Correction = _mod.Correction
 REOPEN_DISPOSITIONS = _mod.REOPEN_DISPOSITIONS
 BENIGN_DISPOSITIONS = _mod.BENIGN_DISPOSITIONS

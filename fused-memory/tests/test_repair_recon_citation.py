@@ -16,7 +16,6 @@ that must agree byte-for-byte with the real one and cannot be kept in agreement.
 from __future__ import annotations
 
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,11 +32,7 @@ DANGLING = 'beacf7fc-b76a-4c0b-876d-f4cf6d906d42'
 SUCCESSOR = '746b4ab9-ca3c-418b-982a-32b85bfcf94b'
 
 
-def _load_module() -> types.ModuleType:
-    return load_script_module(SCRIPT_PATH, mod_name='repair_recon_citation')
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='repair_recon_citation')
 
 
 def _parse(*argv: str):
