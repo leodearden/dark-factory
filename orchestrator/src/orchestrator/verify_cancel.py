@@ -59,6 +59,7 @@ import signal
 import threading
 import time
 from collections import deque
+from enum import StrEnum
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -852,6 +853,30 @@ WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
 WATCHDOG_KILL_GRACE_SECS: float = 5.0
 
 
+class WatchdogTrigger(StrEnum):
+    """Which :func:`run_stdin_watchdog` branch judged the dispatch channel dead.
+
+    The two branches have nothing in common but the kill they cause: ``EOF``
+    means the writing end closed the channel (the orchestrator died, or ssh
+    dropped), ``HEARTBEAT_STARVATION`` means no beat arrived inside the
+    window (a hard partition, or a timeout tuned too tight for this host).
+
+    The member *values* are the tokens that cross the ssh stderr channel back
+    to the dispatcher (see :func:`fire_watchdog_kill`), so this enum is their
+    single definition — emitter and operator grep cannot drift apart.
+    """
+
+    EOF = 'eof'
+    HEARTBEAT_STARVATION = 'heartbeat_starvation'
+
+
+#: Key of the ``<key>=<trigger>`` pair :func:`fire_watchdog_kill` writes to
+#: stderr just before self-terminating.  Named rather than inlined so the
+#: emitter and the tests that pin the operator's ``journalctl | grep`` cannot
+#: drift apart.
+WATCHDOG_FIRE_TRIGGER_TOKEN: str = 'watchdog_fire_trigger'
+
+
 def run_stdin_watchdog(
     read_fd: int,
     on_fire,
@@ -879,18 +904,20 @@ def run_stdin_watchdog(
       resets and the loop continues watching.
 
     *on_fire* is called at most once — the function returns immediately
-    afterward.  *select_fn* / *read_fn* are injectable (default
+    afterward — with the :class:`WatchdogTrigger` naming the branch taken, so
+    a self-kill stays attributable to one of those two very different causes
+    everywhere downstream.  *select_fn* / *read_fn* are injectable (default
     ``select.select`` / ``os.read``) so tests can script deterministic fd-0
     behavior without a real pipe or wall-clock waits.
     """
     while True:
         ready, _, _ = select_fn([read_fd], [], [], heartbeat_timeout)
         if not ready:
-            on_fire()
+            on_fire(WatchdogTrigger.HEARTBEAT_STARVATION)
             return
         data = read_fn(read_fd, read_size)
         if data == b'':
-            on_fire()
+            on_fire(WatchdogTrigger.EOF)
             return
         # Non-empty data: a heartbeat arrived -- window resets, keep watching.
 
@@ -898,6 +925,7 @@ def run_stdin_watchdog(
 def fire_watchdog_kill(
     pgid: int,
     *,
+    trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
     ppid_map_provider=read_ppid_map,
     kill=os.kill,
@@ -929,6 +957,12 @@ def fire_watchdog_kill(
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and
       letting sshd reap it) even if some descendant could not be killed.
+
+    *trigger* names the :func:`run_stdin_watchdog` branch that judged the
+    channel dead.  It is required and keyword-only so no call site can omit
+    the branch identity, and it is never acted on -- the kill sequence is
+    identical for both branches.  Reporting it is step-4's job; for now it is
+    accepted and carried.
 
     Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
     (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
@@ -973,12 +1007,13 @@ def start_stdin_watchdog(
     thread never blocks interpreter shutdown on its own.
 
     *fire* is injectable for tests (default: a closure over
-    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).
-    *select_fn* / *read_fn* / *read_fd* pass through to
-    :func:`run_stdin_watchdog`.
+    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).  It is
+    called with the :class:`WatchdogTrigger` naming the branch that fired,
+    which the default callback forwards on.  *select_fn* / *read_fn* /
+    *read_fd* pass through to :func:`run_stdin_watchdog`.
     """
     on_fire = fire if fire is not None else (
-        lambda: fire_watchdog_kill(pgid, grace_secs=grace_secs)
+        lambda trigger: fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
     )
     thread = threading.Thread(
         target=run_stdin_watchdog,

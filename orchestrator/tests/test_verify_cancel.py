@@ -1827,7 +1827,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1856,7 +1856,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1887,7 +1887,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1912,7 +1912,7 @@ class TestFireWatchdogKill:
         """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
         import signal
 
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         # ppid_map: P(100) -> A(200) -> B(300); unrelated 999 (ppid 1, not a descendant of P)
         ppid_map = {200: 100, 300: 200, 999: 1}
@@ -1941,6 +1941,7 @@ class TestFireWatchdogKill:
 
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=5.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -1973,7 +1974,7 @@ class TestFireWatchdogKill:
 
     def test_dead_descendant_process_lookup_error_tolerated(self):
         """(e): a descendant already dead (ProcessLookupError) is tolerated; exit_fn still fires."""
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         ppid_map = {200: 100}  # single descendant, already gone
         exit_calls = []
@@ -1993,6 +1994,7 @@ class TestFireWatchdogKill:
         # Must not raise despite kill() always raising ProcessLookupError.
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=0.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -2034,7 +2036,7 @@ class TestStartStdinWatchdog:
             read_fd=0,
             select_fn=fake_select,
             read_fn=fake_read,
-            fire=lambda: fire_calls.append(True),
+            fire=lambda trigger: fire_calls.append(True),
         )
 
         # (a) return value is a Thread with .daemon True; join() only succeeds if started

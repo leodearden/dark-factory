@@ -20,6 +20,7 @@ from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
+    WatchdogTrigger,
     acquire_merge_verify_flock,
     cancel_request,
     fire_watchdog_kill,
@@ -887,9 +888,9 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
         watchdog_fired = threading.Event()
 
-        def _on_watchdog_fire() -> None:
+        def _on_watchdog_fire(trigger: WatchdogTrigger) -> None:
             watchdog_fired.set()
-            fire_watchdog_kill(pgid, grace_secs=grace_secs)
+            fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
 
         watchdog_thread = start_stdin_watchdog(
             pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
