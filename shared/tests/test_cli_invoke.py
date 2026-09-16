@@ -5024,6 +5024,49 @@ class TestUnreadableTranscriptEscapeWiring:
             f'{mock_turns.call_count}'
         )
 
+    async def test_an_unreachable_read_count_releases_the_child_instead_of_hanging(
+        self, tmp_path, caplog
+    ):
+        """An unreachable `required_reads` must fail the assertion, not hang the suite.
+
+        The handshake is only safe if a watchdog that stops polling still ends
+        the run. shared/pyproject.toml's timeout block records what the
+        alternative costs: a pytest-timeout breach under
+        `timeout_method = "signal"` with `--max-worker-restart=0` degrades into
+        the "shifting victim" false red, failing whatever unrelated test was on
+        the killed xdist worker. A barrier that can hang converts a clean
+        per-test red into that, so the valve is what keeps the failure
+        attributable to the test that actually broke.
+
+        The barrier here provably cannot open: a readable transcript latches
+        `seen_turn` on the first read and the progress extension is off, so the
+        loop never reads again — one read, forever short of the five demanded.
+        """
+        import time as _time
+
+        started = _time.monotonic()
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                required_reads=5,
+                release_timeout_secs=0.05,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=30.0,
+            )
+        elapsed = _time.monotonic() - started
+
+        assert elapsed < 5.0, (
+            f'an unsatisfiable barrier must be released by the valve, not waited '
+            f'out at the 300s pytest timeout; the run took {elapsed:.2f}s'
+        )
+        assert mock_turns.call_count == 1, (
+            f'the valve must release the child WITHOUT the barrier being '
+            f'satisfied, so the surviving failure is the caller\'s own poll-count '
+            f'assertion; got {mock_turns.call_count} polls'
+        )
+
     async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
         """A transcript still unreadable past grace fires the escape exactly once.
 
