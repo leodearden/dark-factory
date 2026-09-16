@@ -216,28 +216,51 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
 #                 instead.
 #
-#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, and its presence does
-#                 not gate a min_budget(worst) floor — see
-#                 RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
+#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, in two ways, both
+#                 deliberate.
+#                 (i) Its presence does not gate a min_budget(worst) floor —
+#                 see RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
 #                 budget is actually justified. What this figure DOES gate is
 #                 the ruled-exception branch's own measurement floor: that
-#                 branch asserts the declared budget clears W (7200 > 5288
+#                 branch asserts the declared budget clears W (7200 > 4626.17
 #                 today), so the number here is load-bearing rather than
-#                 decorative.
-#                 PROVENANCE — esc-4211-6's 2026-09-08 FOLD AMENDMENT (filed
-#                 against task 4792), NOT the 2026-09-07 ruling itself: this
-#                 is a POST-ruling census maximum. That amendment records a
-#                 fleet census of the BYTE-IDENTICAL orchestrator verify
-#                 command across .worktrees/*/.task/verify/*.summary.json —
-#                 n=92 runs, 19 timed out, six GREEN completions above the
-#                 THEN-3600s budget at 5288 / 5269 / 5196 / 5093 / 4991 /
-#                 4708s, three of them on 2026-09-08 alone. W = 5288.0, the
-#                 max green, per this table's worst-RUN rule. RE-MEASURE BY
-#                 REPEATING THAT CENSUS over the same summary.json corpus, so
-#                 the next figure is a repeat rather than a re-derivation.
-#                 The census is LATER than, and larger than, the
-#                 864.83-3310.50s post-cap spread task 4902 recorded in
-#                 tests/scripts/test_fallback_verify_config.py's
+#                 decorative. Since D17 it is no longer the BINDING floor
+#                 there — census_budget_floor(W) = 7000 is, and is asserted
+#                 alongside it; the dict entry below records why refreshing W
+#                 DOWNWARD nonetheless leaves that branch strictly stronger.
+#                 (ii) IT IS REGIME-SCOPED, WHILE THE OTHER SIX ARE ALL-TIME
+#                 WORST-OBSERVED. This table's worst-RUN rule, applied
+#                 literally here, would take the largest run ever observed —
+#                 5288.0, which this table carried until 2026-09-14. That
+#                 figure and the 4991 still readable on disk both belong to
+#                 the retired 3-slot / 3600-ceiling regime, and D17 sizes
+#                 under the PREVAILING config, so W here is the worst GREEN
+#                 full-suite run WITHIN that regime. A DIFFERENT rule from the
+#                 other six, named here so the divergence reads as a decision
+#                 rather than an arithmetic slip.
+#                 ORCHESTRATOR_BUDGET_CENSUS.regime / regime_since carry the
+#                 scope, and its comment block lists all three regimes found.
+#                 THE CORPUS IS EPHEMERAL, which bounds what any re-measure
+#                 can recover: it is `.worktrees/*/.task/verify/*.summary.json`
+#                 and worktrees are reset. MEASURED 2026-09-16 — re-running
+#                 the census command below over the RETIRED regime's own
+#                 window reports max=4991, not the 5288.0 the 09-08 amendment
+#                 read from that same window (n=24 today vs n=26 then; p50
+#                 3090 unchanged). So an all-time worst cannot be recovered by
+#                 re-running the census, and a figure that drops between two
+#                 runs means records aged out, NOT that the suite got faster.
+#                 PROVENANCE — REFRESHED 2026-09-14 from
+#                 ORCHESTRATOR_BUDGET_CENSUS, superseding the 5288.0 this
+#                 table carried from esc-4211-6's 2026-09-08 fold amendment.
+#                 RE-MEASURE BY REPEATING
+#                 ``ORCHESTRATOR_BUDGET_CENSUS.census_command`` and replacing
+#                 that whole record — NOT by repeating the fold amendment's
+#                 hand-run census, which D17 superseded — so the next figure is
+#                 a repeat rather than a re-derivation. That record is the
+#                 single home for the method; nothing of it is restated here.
+#                 Its window is LATER than, and its max LARGER than, the
+#                 864.83-3310.50s post-cap spread (2026-08-22..08-28) task 4902
+#                 recorded in tests/scripts/test_fallback_verify_config.py's
 #                 POST_CAP_ORCHESTRATOR_GREEN_SECS (a different table, kept a
 #                 separate home per that file's own RAISE-TOGETHER rule).
 #                 Kept here rather than omitted so assertions (a)/(d)/(e)/(f)
