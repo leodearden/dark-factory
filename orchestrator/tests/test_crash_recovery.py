@@ -3729,7 +3729,7 @@ class TestSessionResumeStorm:
         RED phase fails only these rows instead of collection (the idiom
         ``_session_resume_emits`` already uses for EventType members).
         """
-        from orchestrator.harness import ResumeFailure  # noqa: PLC0415
+        from orchestrator.workflow import ResumeFailure  # noqa: PLC0415
         fields = {
             'task_id': f'task-{n}',
             'session_id': f'uuid-rf-{n}',

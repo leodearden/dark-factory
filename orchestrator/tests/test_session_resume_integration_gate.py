@@ -2236,7 +2236,32 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
     harness.config.session_resume = SessionResumeConfig()
     rec = await _recover(harness, task_id)
 
-    captures = {}
+    def _stable(cap, repo: Path) -> dict:
+        """The iwcr kwargs with the per-drive values neutralised.
+
+        Each drive builds its OWN tmp repo and mints its OWN fresh session
+        id, so a handful of values differ by construction: the two paths, the
+        config-dir handle (an object with no value equality) and everything
+        derived from the session id, the spawn parent slug included.
+        Neutralised rather than dropped, so every key stays in the comparison
+        and a real drift in any of them still shows up.
+        """
+        out = dict(cap.kwargs)
+        out['cwd'] = Path(out['cwd']).relative_to(repo)
+        out['config_dir'] = Path(out['config_dir'].path).relative_to(repo)
+        out['mcp_config'] = json.loads(
+            json.dumps(out['mcp_config']).replace(str(repo), '<repo>')
+        )
+        spawn = dict(out['spawn_env'])
+        # The spawn parent id is <task_id>-<slug of the session id>; only the
+        # slug is per-drive, so the task-id half stays in the comparison.
+        parent = spawn['CLAUDE_SPAWN_PARENT_ID']
+        spawn['CLAUDE_SPAWN_PARENT_ID'] = f'{parent.rsplit("-", 1)[0]}-<slug>'
+        out['spawn_env'] = spawn
+        out['session_id'] = '<sid>'
+        return out
+
+    stable, emits = [], []
     for label, sink in (('with', _RecordingSink()), ('without', None)):
         store = _RecordingEventStore()
         with patch(
@@ -2248,22 +2273,17 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
                 task_id=task_id, seed_archive=True, event_store=store,
                 resume_outcome_sink=sink, slug=f'nosink-{label}',
             )
-        captures[label] = (cap, store)
+        stable.append(_stable(cap, tmp_path / f'resume-repo-nosink-{label}'))
+        emits.append(store.emits)
 
-    (with_cap, with_store), (without_cap, without_store) = (
-        captures['with'], captures['without'],
-    )
-    # The session id is a fresh uuid per drive, so compare everything else.
-    volatile = {'session_id'}
-    assert {
-        k: v for k, v in with_cap.kwargs.items() if k not in volatile
-    } == {
-        k: v for k, v in without_cap.kwargs.items() if k not in volatile
-    }
-    assert [et for et, _ in with_store.emits] == [
-        et for et, _ in without_store.emits
+    assert stable[0] == stable[1]
+    assert [et for et, _ in emits[0]] == [et for et, _ in emits[1]]
+    # Every event's TYPE and order is compared above; the payloads are
+    # compared for the resume population only, since the routing_decision row
+    # riding alongside carries a wall-clock `decided_at` that differs per drive
+    # by construction and has nothing to do with this seam.
+    assert [
+        kw['data'] for et, kw in emits[0] if et is EventType.session_resume_failed
+    ] == [
+        kw['data'] for et, kw in emits[1] if et is EventType.session_resume_failed
     ]
-    assert (
-        without_store.of_type(EventType.session_resume_failed)[0]['data']
-        == with_store.of_type(EventType.session_resume_failed)[0]['data']
-    )

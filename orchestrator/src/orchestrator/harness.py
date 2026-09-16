@@ -159,7 +159,12 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
-from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
+from orchestrator.workflow import (
+    ResumeFailure,
+    TerminalReport,
+    WorkflowOutcome,
+    build_workflow,
+)
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
@@ -818,45 +823,11 @@ _BY_DESIGN_RESTORE_OUTCOMES: frozenset[str] = frozenset({'disabled', 'miss'})
 # filed L1 names every failure in the run that tripped it.
 _MAX_RECORDED_RESUME_FAILURES: int = 20
 
-
-@dataclass(frozen=True, slots=True)
-class ResumeFailure:
-    """One armed resume that did not survive — ε's unit of evidence (task 3733).
-
-    Reported by ``TaskWorkflow._invoke`` at the ARM SEAM: the single place both
-    resume producers converge (the harness crash-recovery arm and the
-    in-workflow progress-timeout re-arm at workflow.py:8444) and the only place
-    the archive restore actually happens. The eligibility predicate cannot
-    report this — it runs a whole process-phase earlier and takes
-    ``archive_available`` as a bool precisely so it acquires no filesystem
-    dependency of its own.
-
-    Immutable and slotted: it is evidence, read later by the L1 renderer, and
-    nothing downstream has any business editing it.
-
-    ``stage`` is ``'pre_flight'`` (we corroborated before dispatch and the
-    transcript was not there) or ``'cli'`` (we armed ``--resume`` and the CLI
-    rejected the session) — the two the workflow sink produces. The harness's
-    own eligibility guard records ``'eligibility'``, a THIRD value for a
-    rejection that happens before a workflow exists at all; that branch is dead
-    by construction today (nothing the predicate can produce is unexplained)
-    and is kept on this one type so there is one streak and one renderer rather
-    than two. ``restore`` carries the four-valued outcome the
-    pre_flight arm block produced, and is ``None`` at the cli stage — the
-    restore happened a phase earlier, which is why every cli rejection is
-    genuine by construction. ``archive_root``/``archive_path`` are best-effort:
-    ``None`` means the lookup itself faulted or was never reached, and the
-    renderer says so rather than implying an archive was checked.
-    """
-
-    task_id: str
-    session_id: str
-    role: str
-    stage: str
-    restore: str | None
-    archive_root: str | None
-    archive_path: str | None
-    detail: str | None
+# The payload itself — :class:`orchestrator.workflow.ResumeFailure` — is
+# defined beside the ``ResumeOutcomeSink`` protocol that names it, in the
+# module that PRODUCES it. harness imports workflow and never the reverse, so
+# the producer owning the interface is the direction that composes; only the
+# CLASSIFICATION (what is by design, above) belongs here.
 
 
 
