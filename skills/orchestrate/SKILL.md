@@ -263,6 +263,8 @@ The orchestrator will:
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. The shipped default `chain_cap=0` disables this entirely, leaving the pipeline exactly as described above. A tip failure lands nothing via the chain and leaves the queue untouched, and the next round halves its target depth (any pass resets it) — see OPERATIONS.md §5 "Deep merge-ahead chains" and `plans/deep-merge-ahead-prd.md` for the full contract.
+
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
 After merge, **post-merge verification** re-runs the full verification suite on main. If it fails, the merge is automatically reverted and the task blocks — this catches integration issues that only appear after combining with other tasks' changes.
