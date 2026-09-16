@@ -30,6 +30,7 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
 )
+from textual.events import Resize
 from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
 
@@ -607,6 +608,35 @@ class DecisionQueue(DataTable):
         and without re-reading the clock.
         """
         self._rendered = (tuple(items), now)
+        self._reflow()
+
+    def on_resize(self, event: Resize) -> None:
+        """Re-render at the new width, but only when the derived bound changed.
+
+        This is also how the widget first learns its real width: at mount
+        there is nothing to measure (scrollable_content_region reads 0 before
+        layout), so replace_rows applies the unmeasured fallback and the
+        first Resize is what replaces it with the measured bound.
+
+        The equality guard matters because Resize fires for layout changes
+        that leave the column budget alone, and a reflow goes through
+        clear(columns=True), which resets the scroll position -- a resize
+        that changes nothing must cost nothing on screen.
+
+        The cached (items, now) are reused rather than re-scanned and
+        re-clocked: re-running the app's registry rebuild would fire real
+        backend.set_urgency calls on a window drag, and re-reading the clock
+        would make the age column jump mid-drag.
+
+        DataTable defines its own private _on_resize; Textual dispatches both,
+        so this handler augments the table's own resize handling rather than
+        replacing it.
+        """
+        if self._rendered is None:
+            return
+        items, now = self._rendered
+        if self._derive_question_width(items, now) == self._question_width:
+            return
         self._reflow()
 
     def select_key(self, key: str) -> bool:
