@@ -5216,6 +5216,11 @@ class TestUnreadableTranscriptEscapeWiring:
         The watchdog never reads a transcript for such a role, so its Nones mean
         nothing — counting them would be noise, not signal. This is the scope
         bound from the amendment.
+
+        The child's lifetime here is bounded by the valve rather than by the
+        handshake: a run that can never read has nothing to hand the barrier, so
+        pre-setting it would end the run before the first poll body and take this
+        assertion's power with it.
         """
         for config_dir, session_id in (
             (None, 'sid'),
@@ -5227,7 +5232,8 @@ class TestUnreadableTranscriptEscapeWiring:
                 mock_turns = await self._drive(
                     tmp_path,
                     turns_side_effect=lambda *a, **k: None,
-                    required_reads=0,
+                    required_reads=1,
+                    release_timeout_secs=0.25,
                     config_dir=config_dir,
                     session_id=session_id,
                     startup_grace_secs=0.0,
