@@ -3966,6 +3966,88 @@ class TestDecisionQueueDetail:
             assert app._selected_slug == 'session-parked'
 
     @pytest.mark.timeout(10)
+    async def test_a_terminal_resize_does_not_steal_the_pane_from_the_session_table(
+        self, tmp_path
+    ):
+        """A window drag is not an operator selection, so it must not transfer
+        the pane -- the same contract as a rebuild, on the one path the widget
+        originates itself.
+
+        A resize reflow re-enters the cursor through clear(columns=True) +
+        move_cursor, so it posts RowHighlighted from inside DecisionQueue,
+        where app.py's own prevent() block cannot reach it. Left unsuppressed
+        that hands the pane to the queue mid-drag, off a session row the
+        operator deliberately parked on.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        sr.write_record(
+            _make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(
+                session_slug='session-parked',
+                start_ts='2026-07-07T00:01:00+00:00',
+                question=sr.Question(
+                    text='BBB parked session question?', asked_at='2026-07-07T00:01:00+00:00'
+                ),
+            ),
+            root=tmp_path,
+        )
+        long_question = 'ZZZ decision question? ' + ('padded out to overflow the column. ' * 8)
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                    manual_boost=boost,
+                ),
+                root=tmp_path,
+            )
+
+        # a large poll_interval keeps on_mount's own timer out of the resize
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            # claim the pane for the QUEUE first, from a row that is not row 0
+            assert queue.select_key('decision:dec-low')
+            await pilot.pause()
+            assert 'ZZZ decision question?' in detail.rendered_text
+
+            # then hand it back to the SESSION table -- this is where the
+            # operator is parked when the window gets dragged
+            table.move_cursor(row=table.get_row_index('session-parked'))
+            await pilot.pause()
+            assert 'BBB parked session question?' in detail.rendered_text
+            assert 'ZZZ decision question?' not in detail.rendered_text
+
+            wide_question = queue.get_row('decision:dec-low')[3]
+
+            await pilot.resize_terminal(100, 40)
+            await pilot.pause()
+
+            # the pane stayed where the operator put it
+            assert 'BBB parked session question?' in detail.rendered_text
+            assert 'ZZZ decision question?' not in detail.rendered_text
+
+            # ... and the reflow did run, and restored the cursor by key
+            assert len(queue.get_row('decision:dec-low')[3]) < len(wide_question)
+            assert queue.highlighted_key() == 'decision:dec-low'
+
+
+    @pytest.mark.timeout(10)
     async def test_a_queue_session_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
         """The pane belongs to whichever TABLE last moved, not to whichever record
         KIND is on screen.
