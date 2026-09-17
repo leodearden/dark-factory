@@ -60,6 +60,7 @@ loudly rather than silently if they move.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
@@ -255,3 +256,63 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
             pool._connections.remove(connection)
 
     return closed
+
+
+# How often the background sweep runs, and the arithmetic that sized it.
+#
+# THE LEAK RATE IS MEASURED, not assumed: ~1.9-2.4 orphans/hour in production,
+# against an `app.py::_HTTP_MIN_CONNECTIONS` ceiling of 100. The worst observed
+# burst was 6 at once, when an orchestrator restart FINned every ESTAB
+# connection on one escalation port.
+#
+# At 60s, expected steady-state occupancy from orphans is rate x interval =
+# 2.4/hour x 1/60 hour = ~0.04 connections — i.e. the pool is essentially never
+# holding one — and the worst burst is cleared inside a single tick, four
+# orders of magnitude below the ceiling either way.
+#
+# Sweeping this often costs nothing worth counting: a sweep is a synchronous
+# in-memory scan of at most `max_connections` objects with no I/O, and on the
+# overwhelmingly common empty result it logs nothing at all.
+#
+# THE CADENCE LIVES HERE, not in `app.py`. It is this module's concern — it
+# follows from this module's predicate and the leak rate that predicate
+# addresses — and `app.py` is ~2500 lines already.
+REAP_INTERVAL_SECONDS = 60.0
+
+
+async def reaper_loop(
+    client: httpx.AsyncClient, interval: float = REAP_INTERVAL_SECONDS
+) -> None:
+    """Sweep *client*'s pool for orphans forever, at *interval*.
+
+    Shaped like ``app.py``'s ``_burndown_loop`` and ``_metrics_loop``, and for
+    the same reason: a background task that dies on its first bad cycle is a
+    background task that silently stopped doing its job. Each cycle's
+    ``Exception`` is logged with its traceback and the next tick still runs.
+
+    ``CancelledError`` is NOT caught — it is a ``BaseException``, so the
+    ``except Exception`` below lets it through by construction. That is what
+    lets ``lifespan``'s ``task.cancel()`` then ``await task`` terminate rather
+    than hang.
+
+    Sleeps BEFORE its first sweep: a pool that has served no requests yet can
+    hold no orphans, so a sweep at startup could only ever find nothing.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            reaped = await reap_orphaned_connections(client)
+            if reaped:
+                # Loud on every reap, and it can afford to be: reaps run at
+                # roughly 2/hour, so one line each is a usable history of the
+                # defect rather than a flood. The census makes that one line
+                # answer the follow-up question too — whether the pool is
+                # actually healthy now, or filling faster than this sweep
+                # empties it.
+                logger.warning(
+                    'Reaped %d orphaned pool connection(s); pool now %s',
+                    reaped,
+                    census(client),
+                )
+        except Exception:
+            logger.warning('Orphan reaper sweep failed', exc_info=True)
