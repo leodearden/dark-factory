@@ -131,9 +131,13 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      (B7a).
    - If the script overran its OWN ``before_done['timeout_secs']`` under the
      default runner (``ScriptTimeout``): file born-at-L2 ``infra_issue``, set
-     blocked — reported as a SIGKILLed process group, carrying the script's
-     own exit code when the kill found it already exited and stating that
-     none was produced when it did not; never a synthetic rc (task 4252).
+     blocked — reporting the three facts the runner MEASURED and no others
+     (task 4252): the budget it overran, the script's own exit code when the
+     teardown found it already exited (else that none was produced), and
+     WHICH signal that teardown dispatched — which for the common
+     already-exited shape is none at all, leaving the script's children
+     running and the operator told to go find them.  Never a synthetic rc,
+     and never an assumed kill.
    - Re-inspect and verify freshness (B7b), delegated to
      ``proc_supervision.RestartPlan.execute()``'s ``FreshPidVerify`` check
      (task 2238/δ): when the pre-deploy baseline had a persistent MainPID
@@ -179,9 +183,10 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      unless ``always_escalates=True``, in which case fall through to the
      gate (act-then-ask) instead, since the script already ran.
    - ``rc != 0``, the default runner's own per-script timeout
-     (``ScriptTimeout`` — reported as a SIGKILLed process group, carrying an
-     exit code only when the script really produced one, never a synthetic
-     rc; task 4252), an outer wall-clock guard timeout,
+     (``ScriptTimeout`` — reported as which signal the teardown actually
+     dispatched, carrying an exit code only when the script really produced
+     one; never a synthetic rc and never an assumed kill; task 4252), an
+     outer wall-clock guard timeout,
      or an unexpected ``run_fn`` error: file born-at-L2 ``infra_issue``,
      return BLOCKED (parallel to B7a); ``before_done_ran_at`` is already
      stamped (I1), so the deploy is NOT re-run.
@@ -573,21 +578,48 @@ class ScriptTimeout(Exception):
 
 def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
     """The sentence EVERY ``ScriptTimeout`` arm opens with: which budget was
-    overrun, and that the whole process group was SIGKILLed.
+    overrun, and WHICH SIGNAL the teardown then dispatched.
 
     Shared by the deploy arms (via ``_script_timeout_fact_lines``) and by
     ``_run_predicate``'s arm, which differ only in *subject* — so the
     formatted budget expression has ONE definition to change rather than two
     copies to keep in step (reviewer amendment).
+
+    The trailing clause is ``exc.teardown.clause`` (task 4252), so all three
+    arms state what was actually signalled.  Every one of them previously
+    asserted a whole-group SIGKILL unconditionally, including on the branch
+    that dispatches nothing at all — centralising this sentence is precisely
+    what let one edit correct all three.
     """
     return (
         f'{subject} exceeded its own per-script timeout '
-        f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
-        f'process group was SIGKILLed.'
+        f"({exc.timeout_secs}s = before_done['timeout_secs']) and "
+        f'{exc.teardown.clause}.'
     )
 
 
-def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
+def _survivor_processes_line(script: str) -> str:
+    """The actionable sentence for a teardown that left the script's children
+    alive — printed by BOTH deploy arms whenever the whole-group kill was not
+    the signal dispatched (task 4252 reviewer finding).
+
+    Deliberately does NOT offer the pid or pgid as something to kill: the
+    runner declined to signal that id precisely because it may by now belong
+    to an unrelated group, so handing it to a human would be the task-845
+    footgun the guard exists to prevent.  The script path is the safe search
+    key, and is the one thing the operator needs that this text can supply.
+    """
+    return (
+        f'Whatever the script spawned was therefore NOT killed and may still be '
+        f'running — in particular whichever process held the output pipe open. '
+        f'It must be located and killed out-of-band before resolving: search by '
+        f'the script path ({script}), NOT by pid, since the pid the runner '
+        f'refused to signal may by now belong to an unrelated process group '
+        f'(task 845).'
+    )
+
+
+def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
     Shared so the two deploy branches cannot come to say different things
@@ -605,19 +637,40 @@ def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
     pinned), and all three predicate infra arms file the same category, so
     their remaining wording is the only thing telling a human which guard
     fired.
+
+    Args:
+        exc: the timeout, carrying the three measured facts these sentences
+            are built from — budget, the script's own exit code if it had
+            one, and which signal the teardown dispatched.
+        script: ``before_done['script']``, the search key the survivor
+            sentence hands the operator when that teardown left the script's
+            children running.  Not on ``exc``: it is the deploy's own
+            configuration, not something the timeout measured.
     """
+    group_killed = exc.teardown is ProcessTeardown.GROUP_KILLED
     lines = [
         _script_timeout_budget_line(exc, 'Deploy script'),
     ]
     if exc.exit_code is None:
+        if exc.teardown is ProcessTeardown.NOT_SIGNALLED:
+            # This cell is reachable only as a signal death, and the plain
+            # "had not exited" spelling below would be false in it:
+            # NOT_SIGNALLED means the script was ALREADY reaped when the
+            # teardown ran, and a reaped script with no exit code is one that
+            # died of a signal (a negative returncode is not an exit code).
+            why_no_code = (
+                'the script had already died of a SIGNAL rather than exiting, and '
+                'a signal death produces no exit code'
+            )
+        else:
+            why_no_code = 'the script had not exited when the timeout fired'
         lines.append(
-            'No exit code was produced — the script had not exited when the '
-            'timeout fired. No output was captured either: the merged '
-            'stdout/stderr read was still in flight when the kill fired. The '
-            'script DID run, so it may have applied PART of its effect before '
-            'being killed: inspect out-of-band before resolving.'
+            f'No exit code was produced — {why_no_code}. No output was captured '
+            f'either: the merged stdout/stderr read was still in flight. The '
+            f'script DID run, so it may have applied PART of its effect: inspect '
+            f'out-of-band before resolving.'
         )
-    else:
+    elif group_killed:
         lines.append(
             f'The script ITSELF had already exited with code {exc.exit_code}: '
             f'the timeout fired because a process it spawned outlived it, '
@@ -629,6 +682,18 @@ def _script_timeout_fact_lines(exc: ScriptTimeout) -> list[str]:
             f'read was still in flight. Check out-of-band what the surviving '
             f'child was and whether killing it left the effect half-applied.'
         )
+    else:
+        lines.append(
+            f'The script ITSELF had already exited with code {exc.exit_code}: '
+            f'the timeout fired because a process it spawned outlived it, '
+            f'still holding the merged stdout/stderr pipe open. So the script '
+            f'ran to completion — but its exit code never reached the deploy '
+            f'classifier, so this deploy is NOT recorded as successful even '
+            f'when that code is 0, and no output was captured because the read '
+            f'was still in flight.'
+        )
+    if not group_killed:
+        lines.append(_survivor_processes_line(script))
     return lines
 
 
@@ -2916,9 +2981,24 @@ class DeterministicRunner:
             # Both spellings carry the same two FACTS (no exit code -> no
             # verdict; no gate_escalated_at stamp -> simply re-attempted);
             # only the category claim differs.
+            # Task 4252: the opening clause asserted "No exit code was
+            # produced" unconditionally — an affirmative falsehood in the same
+            # shape the deploy arms had, whenever the script DID exit and only
+            # its surviving child held the pipe open.  The conclusion is
+            # unchanged either way (that code never reached the classifier, so
+            # there is still no verdict); only the claim about what happened
+            # is now measured.  The exit_code-None spelling is byte-identical
+            # to before, which its pins require.
+            if exc.exit_code is None:
+                _no_verdict_opening = 'No exit code was produced, so there is NO verdict'
+            else:
+                _no_verdict_opening = (
+                    f'The script itself exited with code {exc.exit_code}, but that '
+                    f'code never reached the classifier, so there is still NO verdict'
+                )
             if no_verdict_category == MILESTONE_CHECK_FAILED_CATEGORY:
                 _no_verdict_sentence = (
-                    'No exit code was produced, so there is NO verdict and NO '
+                    f'{_no_verdict_opening} and NO '
                     'gate_escalated_at stamp is written — this read-only check is '
                     'simply re-attempted on the next dispatch rather than latched '
                     'into the resolve-to-done path. It is filed under '
@@ -2931,7 +3011,7 @@ class DeterministicRunner:
                 )
             else:
                 _no_verdict_sentence = (
-                    'No exit code was produced, so there is NO verdict — this is an '
+                    f'{_no_verdict_opening} — this is an '
                     'INFRA fault, deliberately not milestone_check_failed ("the '
                     'invariant does not hold").\n'
                     'No gate_escalated_at stamp is written: this read-only check is '
@@ -3135,7 +3215,7 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *_script_timeout_fact_lines(exc),
+                *_script_timeout_fact_lines(exc, script=before_done['script']),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
             return await self._file_infra_issue_and_block(
@@ -4296,9 +4376,9 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *_script_timeout_fact_lines(exc),
+                        *_script_timeout_fact_lines(exc, script=before_done['script']),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
-                        'after the kill is unobserved — check it out-of-band (e.g. '
+                        'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',
                         'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
                     ])
