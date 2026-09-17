@@ -133,6 +133,67 @@ class PoolCensus:
     max_connections: int
 
 
+# Occupancy at which the sweep starts reporting, as a fraction of
+# `max_connections`.
+#
+# BELOW THE CEILING, DELIBERATELY. Degradation begins well before the pool is
+# full: the 2026-09-11 replication measured `/api/v2/dashboard/tasks` already
+# burning its entire 20s budget at 83 of 100 connections. An alarm armed AT the
+# ceiling would therefore fire only once the endpoint had been unusable for
+# some time, which is the same too-late signal that left the original incident
+# invisible for 32 hours.
+POOL_HIGH_WATER_FRACTION = 0.8
+
+# Has the saturation alarm already fired for the CURRENT episode? Unlike the
+# shape guard's latch this one re-arms — see :func:`_report_occupancy`.
+_saturation_warned = False
+
+
+def reset_saturation_guard() -> None:
+    """Re-arm the saturation alarm. For tests.
+
+    Companion to :func:`reset_shape_guard`, and separate from it on purpose:
+    the two latches answer different questions ("can this module still read the
+    pool?" and "is the pool filling up?"), so a test that wants one in a known
+    state should not have to disturb the other.
+    """
+    global _saturation_warned
+    _saturation_warned = False
+
+
+def _report_occupancy(reading: PoolCensus) -> None:
+    """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
+
+    Throttled like the shape guard — loud on the first sweep that crosses the
+    mark, DEBUG on the ones after — because a wedged pool STAYS wedged, and one
+    line a minute forever is not a signal.
+
+    It RE-ARMS on the way back down, which is the difference between the two
+    latches. A pool that saturates, recovers, and saturates again has had two
+    incidents, and the second matters at least as much as the first; a latch
+    that only ever fell one way would report the first episode a process saw
+    and nothing after it.
+
+    The whole census goes in the line, not just the ratio: "80 of 100" does not
+    say whether those are healthy in-flight requests or orphans this module
+    failed to reclaim, and that is the first question an operator asks.
+    """
+    global _saturation_warned
+    if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
+        _saturation_warned = False
+        return
+    message = (
+        'httpx connection pool at or above its high-water mark (%.0f%% of capacity): '
+        '%s. Sustained saturation ends in httpx.PoolTimeout, which the dashboard '
+        'renders as an "offline" pill on a healthy orchestrator.'
+    )
+    if _saturation_warned:
+        logger.debug(message, POOL_HIGH_WATER_FRACTION * 100, reading)
+        return
+    _saturation_warned = True
+    logger.warning(message, POOL_HIGH_WATER_FRACTION * 100, reading)
+
+
 def _resolve_pool(client: httpx.AsyncClient) -> httpcore.AsyncConnectionPool | None:
     """Return *client*'s underlying httpcore pool, or ``None`` if unrecognised.
 
@@ -302,6 +363,10 @@ async def reaper_loop(
         await asyncio.sleep(interval)
         try:
             reaped = await reap_orphaned_connections(client)
+            # One reading per sweep, taken AFTER the reap and shared by both
+            # reports below: post-reap occupancy is the number that actually
+            # predicts a wedge, and two separate readings could disagree.
+            reading = census(client)
             if reaped:
                 # Loud on every reap, and it can afford to be: reaps run at
                 # roughly 2/hour, so one line each is a usable history of the
@@ -312,7 +377,9 @@ async def reaper_loop(
                 logger.warning(
                     'Reaped %d orphaned pool connection(s); pool now %s',
                     reaped,
-                    census(client),
+                    reading,
                 )
+            if reading is not None:
+                _report_occupancy(reading)
         except Exception:
             logger.warning('Orphan reaper sweep failed', exc_info=True)
