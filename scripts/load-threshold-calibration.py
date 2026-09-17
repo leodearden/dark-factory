@@ -230,6 +230,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+# The two halves of a selector, as SEPARATE statements. Spelled
+# `WHERE metric = ? OR metric GLOB ?` they plan as MULTI-INDEX OR plus
+# USE TEMP B-TREE FOR ORDER BY, because one ORDER BY over the union has to be
+# sorted globally -- while the caller only ever needs ts order WITHIN a metric.
+# Apart, each is a bare index range scan with no sort at all. Measured on a
+# 700k-row probe of one stem (7 leaves x 100k ticks): 1,930 ms together against
+# 1,288 ms apart, byte-identical series. At the 30-day steady state the script's
+# docstring cites, the own_cpu_some10 stem alone is ~3.6M rows, so the temp sort
+# is the larger part of a read this gate makes on a 14-day clock.
+#
+# The sort is not the only cost avoided: a temp B-tree needs temp-file space,
+# and SQLite raises `unable to open database file` when it cannot get any --
+# turning a delivered analysis into a non-zero rc, which ε1/ε2 classify as an
+# infra fault. Observed while benchmarking this very change.
+#
+# `ORDER BY metric, ts` on the stem half, not `ORDER BY ts`: the leading column
+# is what lets the index supply the order, and the caller splits by metric
+# anyway. The cursor is iterated rather than .fetchall()'d so the row tuples do
+# not have to exist all at once alongside the Series they are copied into.
+_EXACT_SQL = 'SELECT metric, ts, value FROM samples WHERE metric = ? ORDER BY ts'
+_STEM_SQL = (
+    'SELECT metric, ts, value FROM samples WHERE metric GLOB ? ORDER BY metric, ts'
+)
+
+
 def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     """``{metric: [(ts, value) in ts order]}`` for every selector, one home.
 
@@ -238,13 +263,12 @@ def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     """
     series: Series = {}
     for selector in selectors:
-        rows = con.execute(
-            'SELECT metric, ts, value FROM samples'
-            ' WHERE metric = ? OR metric GLOB ? ORDER BY ts',
-            (selector, f'{selector}:*'),
-        ).fetchall()
-        for metric, ts, value in rows:
-            series.setdefault(metric, []).append((int(ts), float(value)))
+        for sql, param in (
+            (_EXACT_SQL, selector),
+            (_STEM_SQL, f'{selector}:*'),
+        ):
+            for metric, ts, value in con.execute(sql, (param,)):
+                series.setdefault(metric, []).append((int(ts), float(value)))
     return series
 
 
@@ -270,12 +294,13 @@ def read_series(
     ``_`` wildcard. Cost: LIKE is ASCII-case-INsensitive by default, so it
     cannot use a BINARY-collated index and this query planned as
     ``SCAN samples``; GLOB is always case-sensitive, so the prefix
-    optimisation applies and the plan becomes ``MULTI-INDEX OR`` over
-    ``SEARCH samples USING INDEX idx_samples_metric_ts (metric=?)`` plus
-    ``(metric>? AND metric<?)``. Measured on a 2.16M-row probe with this exact
-    schema. At the 30-day steady state the corpus is ~13M rows, so the LIKE
-    spelling was a full scan per selector — the same shape of cost regression
-    the dashboard's ``/api/load`` query carried before it was bounded.
+    optimisation applies and the stem half plans as
+    ``SEARCH samples USING INDEX idx_samples_metric_ts (metric>? AND
+    metric<?)``. Measured on a 2.16M-row probe with this exact schema. At the
+    30-day steady state the corpus is ~13M rows, so the LIKE spelling was a
+    full scan per selector — the same shape of cost regression the dashboard's
+    ``/api/load`` query carried before it was bounded. Why the two halves are
+    issued as separate statements is on ``_STEM_SQL``.
     """
     specs = (
         [ARM_METRIC_SELECTORS[arm]] if arm else list(ARM_METRIC_SELECTORS.values())
@@ -876,6 +901,40 @@ def _discover_repo(directory: Path) -> tuple[str | None, list[str]]:
     return proc.stdout.strip(), []
 
 
+def _unstage(repo: str, path: Path) -> list[str]:
+    """Restore the index after a failed commit; degrade if even that fails.
+
+    `git add` is genuinely required above -- `git commit --only` rejects an
+    untracked pathspec -- so a commit that fails after it leaves the report
+    STAGED. CLAUDE.md names leftover staged state in `project_root` as a live
+    hazard and not a tidiness question: that checkout is machine-operated, and
+    a concurrent bare `git commit` from the merge worker or a hook would sweep
+    this file into an unrelated commit. The realistic triggers are ordinary --
+    a pre-commit hook rejection, or `.git/index.lock` still held past the
+    grace window.
+
+    Scoped to this one path, so it cannot disturb anything another process
+    staged. A failure to unstage is itself named rather than swallowed: the
+    caller is already returning a degradation, and "the commit failed AND the
+    index is still dirty" is a different operator action from "the commit
+    failed".
+    """
+    try:
+        proc = subprocess.run(
+            ['git', '-C', repo, 'reset', '-q', '--', str(path)],
+            capture_output=True, text=True, check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f'report_unstage_failed: {path} ({exc})']
+    if proc.returncode != 0:
+        return [
+            f'report_unstage_failed: {path} is still staged in {repo} '
+            f'({proc.stderr.strip()[:200]})'
+        ]
+    return []
+
+
 def commit_report(path: Path, stamp: str) -> list[str]:
     """`git add --` then `git commit --only <path>`; degrade named on failure.
 
@@ -910,9 +969,9 @@ def commit_report(path: Path, stamp: str) -> list[str]:
                 return [
                     f'report_commit_failed: {" ".join(argv[:4])} exited '
                     f'{proc.returncode} ({proc.stderr.strip()[:200]})'
-                ]
+                ] + _unstage(repo, path)
     except (OSError, subprocess.SubprocessError) as exc:
-        return [f'report_commit_failed: {exc}']
+        return [f'report_commit_failed: {exc}'] + _unstage(repo, path)
     return []
 
 

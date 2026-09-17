@@ -2,8 +2,17 @@
 plans/load-throttle-harmonisation-prd.md; the gate ε1/ε2 run).
 
 Every input is INJECTED — a seeded temp DB, temp yaml files, a defaults
-mapping — so no test reads the live corpus, either project's committed
-config, or the orchestrator's code. Nothing here imports `sampler`: this suite
+mapping — so no test reads the live corpus, and the two defaults that DO reach
+outside this worktree (the peer project's config, and the uv that fetches the
+orchestrator's code defaults by running it) are redirected at absent paths
+unless a test names them. ``load_script`` and ``run_script`` do that
+redirecting and explain it; exactly two tests opt out, and both say so in
+their docstrings. That claim used to be aspirational — ~25 tests that merely
+omitted `--uv-bin` spawned `uv run --project orchestrator` against the MAIN
+checkout, ~20 more read the real /home/leo/src/reify config, and the suite
+took 37 s to say so.
+
+Nothing here imports `sampler`: this suite
 runs under `--project shared`, where a probe showed sibling workspace members
 can be absent from the venv, and the script under test must itself run under
 the system python3 where none of them exist.
@@ -52,20 +61,45 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
-def load_script():
-    """Load the hyphen-named script as a module.
+# The script's two defaults that reach OUTSIDE this worktree: the peer
+# project's committed config, and the uv that fetches the orchestrator's code
+# defaults by running it. Absent paths, because "absent" is a contract this
+# script already handles by name (`peer_config_missing`,
+# `code_defaults_unavailable`) — so redirecting them costs a test nothing but
+# the degradation it was already free to ignore.
+_ABSENT_PEER_CONFIG = Path('/nonexistent/hermetic-peer/dark-factory-orchestrator.yaml')
+_ABSENT_UV_BIN = Path('/nonexistent/hermetic-uv/uv')
+
+REAL_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
+
+
+def load_script(*, real_host_defaults: bool = False):
+    """Load the hyphen-named script as a module, hermetic by default.
 
     This must work under a STDLIB-ONLY module body: at ε1/ε2 time the
     `#!/usr/bin/env python3` shebang resolves to /usr/bin/python3, which has
     neither `shared` nor `sampler` nor `orchestrator`. A top-level first-party
     import would crash the gate on import fourteen days after this lands, in a
     born-at-L2 escalation path, with no earlier signal.
+
+    The two host-reaching argparse defaults are redirected at absent paths
+    unless *real_host_defaults* asks for the shipped ones. Without that, a
+    test that merely omits `--peer-config` reads /home/leo/src/reify and one
+    that omits `--uv-bin` spawns `uv run --project orchestrator` against the
+    MAIN checkout — neither of which the test asked for, both of which the
+    module docstring above promises do not happen, and together ~1 s of every
+    such test. `parse_args` reads both through the module globals at call
+    time, so patching the loaded module IS the production seam rather than a
+    parallel one.
     """
     spec = importlib.util.spec_from_file_location('load_threshold_calibration', SCRIPT)
     assert spec is not None, f'Could not build spec from {SCRIPT}'
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore[union-attr]
+    if not real_host_defaults:
+        module.DEFAULT_PEER_CONFIG = _ABSENT_PEER_CONFIG
+        module.DEFAULT_UV_BIN = _ABSENT_UV_BIN
     return module
 
 
@@ -88,11 +122,26 @@ def seed_db(path: Path, series: dict[str, list[float]], *, start_ts: int = 1_000
 
 
 def run_script(*argv: str):
-    """Run the script as a subprocess, the way the gate will."""
+    """Run the script as a subprocess, the way the gate will — hermetically.
+
+    A subprocess cannot inherit the loader's redirected defaults, so the same
+    two flags are supplied here instead, and only when the caller has not
+    named them itself. See ``load_script`` for why they are redirected at all.
+    """
     return subprocess.run(
-        [sys.executable, str(SCRIPT), *argv],
+        [sys.executable, str(SCRIPT), *hermetic(argv)],
         capture_output=True, text=True, timeout=120,
     )
+
+
+def hermetic(argv) -> list[str]:
+    """*argv* with the two host-reaching flags defaulted to absent paths."""
+    out = list(argv)
+    for flag, absent in (('--peer-config', _ABSENT_PEER_CONFIG),
+                         ('--uv-bin', _ABSENT_UV_BIN)):
+        if flag not in out:
+            out += [flag, str(absent)]
+    return out
 
 
 def trailing_json(stdout: str) -> dict:
@@ -207,11 +256,11 @@ def test_every_documented_flag_is_accepted(tmp_path: Path):
 
 
 def test_peer_config_defaults_to_the_reify_checkout():
-    module = load_script()
+    module = load_script(real_host_defaults=True)
 
     args = module.parse_args(['--no-report'])
 
-    assert str(args.peer_config) == '/home/leo/src/reify/dark-factory-orchestrator.yaml'
+    assert args.peer_config == REAL_PEER_CONFIG
 
 
 def test_db_defaults_to_the_dark_factory_root_seam(monkeypatch):
@@ -955,6 +1004,12 @@ psi_admission:
 def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
     """The real committed yaml is found, PARSES, and the analysis runs on it.
 
+    ONE of the two tests here that deliberately reads outside this worktree,
+    and it names both configs explicitly rather than inheriting a default —
+    everything else runs against injected paths (see ``load_script``). If the
+    peer checkout is absent the peer half degrades by name and the local
+    assertions below, which are what this test is for, still hold.
+
     Neither project's current values are pinned — those are operator decisions
     that change, and a test that froze them would go red on an ordinary tuning
     commit. Nor is the report's PROSE pinned: a heading substring goes red on a
@@ -970,6 +1025,7 @@ def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
     result = run_script(
         '--db', str(db),
         '--config', str(REPO_ROOT / 'dark-factory-orchestrator.yaml'),
+        '--peer-config', str(REAL_PEER_CONFIG),
         '--no-report')
 
     assert result.returncode == 0, result.stderr
@@ -1142,6 +1198,40 @@ def test_the_defaults_shell_degrades_named_on_a_missing_binary(tmp_path: Path):
     assert [d.split(':', 1)[0] for d in degradations] == ['code_defaults_unavailable']
 
 
+@pytest.mark.skipif(
+    not Path('/home/leo/.local/bin/uv').exists(),
+    reason='the shipped uv is absent on this host',
+)
+def test_the_real_defaults_shell_answers_on_this_host():
+    """The one test that deliberately runs the real `uv run --project orchestrator`.
+
+    Every branch of the defaults shell is covered above with an injected
+    command, and `default_defaults_command` pins the argv — but nothing
+    checked that the argv, run for real, still answers. Detail (D)'s whole
+    premise is that the script owns NO copy of the defaults, so if the model
+    moved or the flags stopped working the check would silently degrade to
+    `code_defaults_unavailable` on the gate's 14-day clock with nobody the
+    wiser.
+
+    This used to be covered by accident, by ~25 tests that merely omitted
+    `--uv-bin`; they are hermetic now (see ``load_script``), so the coverage is
+    deliberate here instead — one spawn rather than twenty-five, and named for
+    what it checks. It reads the MAIN checkout, which is the point.
+    """
+    module = load_script(real_host_defaults=True)
+
+    defaults, degradations = module.fetch_code_defaults(
+        command=module.default_defaults_command(module.DEFAULT_UV_BIN),
+        cwd=module.default_project_root(),
+    )
+
+    assert degradations == [], degradations
+    assert defaults is not None
+    # The three leaves PRD §6.2 writes that are already the shipped default —
+    # the comparison detail (D) exists to make.
+    assert {'mem_some_avg10', 'mem_full_avg10', 'io_some_avg10'} <= set(defaults)
+
+
 def test_the_whole_report_is_still_produced_when_defaults_are_unavailable(tmp_path: Path):
     """Exit 0 with the degradation named, and every other section intact."""
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
@@ -1232,9 +1322,11 @@ def test_every_this_checkout_default_follows_the_seam_together(monkeypatch):
     cannot be added while quietly skipping the seam.
 
     --peer-config is excluded on purpose and pinned by its own test above: it
-    names the OTHER project, which is the entire point of the comparison.
+    names the OTHER project, which is the entire point of the comparison —
+    which is also why this is one of the two tests that ask the loader for the
+    SHIPPED defaults rather than the hermetic ones.
     """
-    module = load_script()
+    module = load_script(real_host_defaults=True)
     monkeypatch.setenv('DARK_FACTORY_ROOT', '/somewhere/else')
 
     args = module.parse_args([])
@@ -1245,7 +1337,7 @@ def test_every_this_checkout_default_follows_the_seam_together(monkeypatch):
         Path('/somewhere/else/dark-factory-orchestrator.yaml'),
         Path('/somewhere/else/plans'),
     }
-    assert str(args.peer_config).startswith('/home/leo/src/reify/')
+    assert args.peer_config == REAL_PEER_CONFIG
 
 
 # ── the --report-dir / --no-report / --commit trio ──────────────────────────
@@ -1277,8 +1369,16 @@ def git_out(repo: Path, *args: str) -> str:
 
 
 def test_the_report_is_written_with_a_dated_name_and_announced_on_stderr(
-    tmp_path: Path
+    tmp_path: Path, capsys
 ):
+    """The announcement's CHANNEL is the contract, and it was never checked.
+
+    The module docstring promises stdout's last line is the single-line JSON,
+    which is how ε1/ε2 read the run; the report path therefore goes to stderr.
+    Moving that print to stdout left every test green, because it is emitted
+    BEFORE the JSON and `splitlines()[-1]` still parsed — so the name of this
+    test was the only thing asserting the channel.
+    """
     module = load_script()
     db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
     report_dir = tmp_path / 'plans'
@@ -1291,6 +1391,13 @@ def test_the_report_is_written_with_a_dated_name_and_announced_on_stderr(
     assert len(written) == 1, written
     assert written[0].name.count('-') == 5, written[0].name
     assert written[0].read_text().strip(), 'the report file was created but empty'
+
+    captured = capsys.readouterr()
+    assert f'report: {written[0]}' in captured.err, captured.err
+    assert str(written[0]) not in captured.out, (
+        'the report path reached STDOUT, where the gate reads JSON'
+    )
+    assert json.loads(captured.out.strip().splitlines()[-1])['db'] == str(db)
 
 
 def test_the_filename_heading_and_commit_subject_share_one_clock_read(tmp_path: Path,
@@ -1433,6 +1540,37 @@ def test_no_report_with_commit_commits_nothing(tmp_path: Path):
     assert rc == 0
     assert git_out(repo, 'rev-parse', 'HEAD').strip() == before
     assert list((repo / 'plans').iterdir()) == []
+
+
+def test_a_rejected_commit_leaves_nothing_staged_behind_it(tmp_path: Path):
+    """The index must come back, because the repo this runs in is shared.
+
+    `git add` is unavoidable — `git commit --only` rejects an untracked
+    pathspec — so a commit that fails AFTER it leaves the report staged in a
+    checkout the merge worker and the hooks act on directly, where a
+    concurrent bare `git commit` would sweep it into an unrelated commit. A
+    rejecting pre-commit hook is the realistic trigger and the one used here;
+    `.git/index.lock` held past the grace window is the other.
+    """
+    module = load_script()
+    repo = make_repo(tmp_path)
+    hook = repo / '.git' / 'hooks' / 'pre-commit'
+    hook.write_text('#!/bin/sh\necho "nope" >&2\nexit 1\n')
+    hook.chmod(0o755)
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0]})
+
+    rc = module.main([
+        '--db', str(db), '--report-dir', str(repo / 'plans'), '--commit',
+    ])
+
+    assert rc == 0
+    assert git_out(repo, 'diff', '--cached', '--name-only').strip() == '', (
+        'the rejected commit left the report staged in a machine-operated '
+        'checkout, where a concurrent bare `git commit` would sweep it up'
+    )
+    assert list((repo / 'plans').glob('load-threshold-calibration-*.md')), (
+        'unstaging must not delete the analysis it failed to commit'
+    )
 
 
 def test_a_failing_commit_does_not_take_the_report_down_with_it(tmp_path: Path):
