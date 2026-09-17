@@ -37,7 +37,16 @@ of the whole escalation package.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
+
+# The lane vocabulary spelled as a TYPE.  ``MERGE_LANES`` stays the single
+# runtime source of truth — every check in this module keys on it — but it is
+# ``tuple[str, ...]``, so it carries no static information.  Orchestrator
+# spells the same Literal inline at ``merge_types.py::MergeRequest.lane`` and
+# ``merge_queue.py::lane_for_task_metadata``; matching it here is what lets a
+# resolved lane reach ``MergeRequest(lane=...)`` without a cast at the call
+# site.
+MergeLane = Literal['normal', 'high']
 
 
 class InvalidMergeLane(ValueError):
@@ -77,11 +86,11 @@ class LaneChoice:
     trail for a ``'high'`` submission.
     """
 
-    lane: str
+    lane: MergeLane
     source: str
 
 
-def validate_requested_lane(requested: Any) -> str | None:
+def validate_requested_lane(requested: Any) -> MergeLane | None:
     """Check a CALLER-supplied lane, or pass ``None`` through unchanged.
 
     ``None`` means "no argument supplied" and is not an error — it is what
@@ -101,11 +110,14 @@ def validate_requested_lane(requested: Any) -> str | None:
 
     if not isinstance(requested, str) or requested not in MERGE_LANES:
         raise InvalidMergeLane(requested, tuple(MERGE_LANES))
-    return requested
+    # A membership test against a ``tuple[str, ...]`` cannot narrow to the
+    # Literal, so the cast RECORDS the invariant the line above just
+    # established rather than asserting an unchecked one.
+    return cast(MergeLane, requested)
 
 
 def resolve_merge_lane(
-    *, requested: str | None, task_metadata: dict | None
+    *, requested: MergeLane | None, task_metadata: dict | None
 ) -> LaneChoice:
     """Apply ``requested > task_metadata['merge_lane'] > 'normal'``.
 
