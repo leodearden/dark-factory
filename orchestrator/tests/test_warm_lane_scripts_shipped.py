@@ -10,9 +10,9 @@ are syntactically valid — independently of the *resolution* half
 (``test_warm_lane_script_resolution.py``), which pins how ``GitOps`` chooses
 between a project override and these copies.
 
-The sibling-wiring class is the load-bearing one.  Three of the seven source a
+The sibling-wiring class is the load-bearing one.  Four of the seven source a
 lib that is not itself one of the seven, so a seven-file-only relocation would
-ship three scripts that cannot execute:
+ship four scripts that cannot execute:
 
 * ``warm-lane-gc.sh`` and ``warm-lane-gc-sweep.sh`` source
   ``$SCRIPT_DIR/lib_live_refs.sh`` and deliberately ``exit 2`` when it is
@@ -33,9 +33,15 @@ ship three scripts that cannot execute:
   it holds the facts only dark-factory owns (the ``.lane-state`` record format
   and ``PROTECTED_PREFIXES``), which is why the audit's ``assigned`` column can
   no longer be produced without it.
+* ``warm-lane-degenerate-ref-check.sh`` sources ``$SCRIPT_DIR/lib_task_citation.sh``
+  since dark-factory task 5566, behind the same ``exit 2`` guard.  That lib is
+  the single copy of the "cites task N" grammar the classifier consults; a
+  silently-absent one cannot degrade gracefully, because a ref whose citation
+  cannot be read is reported ``degenerate`` — which dark-factory reads as "zero
+  task work" and acts on by reverting and re-dispatching.
 
 Running each with ``--help`` from the new directory is the executable proof
-that all three libs actually travelled along.
+that all four libs actually travelled along.
 """
 from __future__ import annotations
 
@@ -79,6 +85,13 @@ SOURCED_LIBS = (
     # In SOURCED_LIBS rather than a parallel test class so it inherits the
     # exists / owner-execute-bit / `bash -n` coverage already written here.
     'lib_lane_state.sh',
+    # A reify relocation (UNLIKE lib_lane_state.sh), vendored verbatim by
+    # dark-factory task 5566.  It is the single copy of the "cites task N"
+    # grammar warm-lane-degenerate-ref-check.sh consults, and it is normative
+    # across the reify/dark-factory seam — which is why it is vendored rather
+    # than re-inlined into its one consumer.  Here for the same reason as the
+    # entry above: exists / owner-execute-bit / `bash -n` coverage for free.
+    'lib_task_citation.sh',
 )
 
 ALL_SHIPPED = RELOCATED_SCRIPTS + SOURCED_LIBS
