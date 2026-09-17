@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
+
 # ---------------------------------------------------------------------------
 # Step-1: pgid-file path & lifecycle
 # ---------------------------------------------------------------------------
@@ -1903,18 +1905,19 @@ class TestRunStdinHeartbeat:
         assert closed == [7]
 
 
-#: Deliberately longer than the join ceiling below: an implementation whose
-#: timer is ``time.sleep(interval)`` cannot return inside the ceiling, so the
-#: pair is what discriminates it from the ``Event.wait(interval)`` one.
-HEARTBEAT_SLOW_INTERVAL_SECS = 10.0
+#: Wedge detector for the writer's stop, not a performance budget — paid only
+#: when the test is already failing.  Taken FROM production rather than
+#: re-pinned here: the number and the whole argument for it have one home, at
+#: verify_runner.HEARTBEAT_STOP_JOIN_SECS (SPOT, docs/code-quality.md #11), and
+#: these tests are cheaper the closer they stay to what production actually
+#: waits.
+HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 
-#: Wedge detector, not a performance budget — paid only when the test is
-#: already failing (same rationale as ROW_TREE_KILL_CEILING_SECS at
-#: test_laptop_warm_verify_boundary.py::ROW_TREE_KILL_CEILING_SECS).  Sized
-#: ~6x above the ~0.85s worst single-gap additive scheduling delay measured at
-#: loadavg 113-178 and recorded in that file's HeartbeatWriter comment, so it
-#: cannot reproduce the flake class described there.
-HEARTBEAT_STOP_JOIN_CEILING_SECS = 5.0
+#: Deliberately longer than that ceiling, and DERIVED from it so the pair keeps
+#: discriminating however production is retuned: an implementation whose timer
+#: is ``time.sleep(interval)`` cannot return inside the ceiling, where the
+#: ``Event.wait(interval)`` one returns at once.
+HEARTBEAT_SLOW_INTERVAL_SECS = 2 * HEARTBEAT_STOP_JOIN_CEILING_SECS
 
 
 class TestStartStdinHeartbeat:
@@ -1939,6 +1942,36 @@ class TestStartStdinHeartbeat:
 
             assert not handle.thread.is_alive()
             assert closed == [w_fd]
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_the_write_end_is_left_non_blocking(self):
+        """The spawner establishes O_NONBLOCK; callers do not have to know to.
+
+        Two documented guarantees rest on it and neither is checkable where it
+        is stated: run_stdin_heartbeat's BlockingIOError arm (a full pipe skips
+        one beat) and verify_runner.HEARTBEAT_STOP_JOIN_SECS's bound (os.write
+        can never park, so the join is a wedge detector rather than a wait).  A
+        caller that handed over a blocking fd would void both SILENTLY — the
+        writer parks forever on a full pipe and the join just expires — so the
+        mode belongs to the module that owns the writer, not to one call site.
+        """
+        from orchestrator.verify_cancel import start_stdin_heartbeat
+
+        closed: list[int] = []
+        r_fd, w_fd = os.pipe()
+        try:
+            assert os.get_blocking(w_fd) is True  # os.pipe()'s default
+
+            handle = start_stdin_heartbeat(
+                w_fd, interval=HEARTBEAT_SLOW_INTERVAL_SECS, close_fn=closed.append
+            )
+            try:
+                assert os.get_blocking(w_fd) is False
+            finally:
+                handle.stop()
+                handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
         finally:
             os.close(r_fd)
             os.close(w_fd)
@@ -2664,18 +2697,39 @@ class TestWatchdogTimeoutDerivedFromTransport:
 
         assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS >= 2 * HEARTBEAT_INTERVAL_SECS
 
-    def test_ssh_keepalive_constants_are_single_sourced(self):
-        """verify_runner re-exports these; it does not keep a second copy (SPOT).
+    def test_the_ssh_argv_and_the_watchdog_deadline_read_the_same_pair(self):
+        """The flags the dispatcher SENDS and the deadline the remote ENFORCES agree.
 
-        A second copy is precisely the silent drift the derivation exists to
-        close: the dispatcher's ssh argv and the remote's deadline would stop
-        following from the same two numbers.
+        This is the honest form of the SPOT property, and the honesty matters.
+        Identity (``is``) does NOT enforce single-sourcing here: 15 and 4 both
+        sit inside CPython's small-int cache, so two independently written
+        literals compare identical and a re-introduced ``SSH_SERVER_ALIVE_
+        INTERVAL = 15`` in verify_runner would leave such a test green — it
+        would regain its strength only if some future retune happened to push a
+        value past 256.
+
+        What is enforced instead is the consequence a second copy actually has:
+        the moment it DRIFTS, the argv rendered into every ssh site and the
+        deadline derived for the watchdog stop following from the same two
+        numbers, and that is caught here rather than in production.
         """
         from orchestrator import verify_cancel, verify_runner
 
+        assert verify_runner.SSH_SERVER_ALIVE_INTERVAL == verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+        assert verify_runner.SSH_SERVER_ALIVE_COUNT_MAX == verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
+
+        # What every ssh site sends on the wire...
         assert (
-            verify_runner.SSH_SERVER_ALIVE_INTERVAL is verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+            f'ServerAliveInterval={verify_cancel.SSH_SERVER_ALIVE_INTERVAL}'
+            in verify_runner._SSH_BASE_OPTS
         )
         assert (
-            verify_runner.SSH_SERVER_ALIVE_COUNT_MAX is verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
+            f'ServerAliveCountMax={verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX}'
+            in verify_runner._SSH_BASE_OPTS
+        )
+        # ...and the deadline the remote waits out, from those same two names.
+        assert verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS == (
+            verify_cancel.WATCHDOG_TRANSPORT_HEADROOM
+            * verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+            * verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
         )

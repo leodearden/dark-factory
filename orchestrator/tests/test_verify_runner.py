@@ -14,6 +14,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
     RemoteRunner,
@@ -6781,19 +6782,38 @@ class TestRemoteRunnerPassSummaryArchival:
 # lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
 # The discriminator survives any such widening, because the pre-4195 producer
 # delivers exactly ZERO beats for the whole hog.
-#: How long the wedged-writer thread stays parked: comfortably longer than
-#: _default_ssh_heartbeat_run's own join bound, so the dispatch can only return
-#: by giving up on it rather than by outlasting it.
-WEDGED_WRITER_PARK_SECS = 30.0
+#: The three sizings below are all MULTIPLES of production's teardown bound,
+#: verify_runner.HEARTBEAT_STOP_JOIN_SECS, rather than independent literals:
+#: that constant is the single home of both the number and the argument for it
+#: (SPOT, docs/code-quality.md #11), and each relationship these comments claim
+#: stays true through any retune of it.
+#:
+#: How long the wedged-writer thread stays parked: comfortably longer than that
+#: bound, so the dispatch can only return by giving up on it rather than by
+#: outlasting it.
+WEDGED_WRITER_PARK_SECS = 6 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Budget for that test.  A regression to an unbounded join() must fail HERE as
-#: a timeout rather than wedging the suite; sized under WEDGED_WRITER_PARK_SECS
-#: so it fires before the parked thread expires on its own.
-WEDGED_WRITER_TEST_TIMEOUT_SECS = 20
+#: a timeout rather than wedging the suite; sized above the bound it is meant to
+#: observe and under WEDGED_WRITER_PARK_SECS, so it fires before the parked
+#: thread expires on its own.
+WEDGED_WRITER_TEST_TIMEOUT_SECS = 4 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Join ceiling for the parked thread's own cleanup once released — a wedge
 #: detector, paid only if that thread is already stuck.
-HEARTBEAT_STOP_JOIN_CEILING_SECS = 5.0
+HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
+
+#: Cadence of that test's loop-responsiveness ticker, and how many of its ticks
+#: must land inside the teardown join.  The discriminator is EXACT in the
+#: failing direction — a synchronous join lets precisely ZERO ticks run between
+#: stop() and the dispatch returning, since nothing else runs on a blocked loop
+#: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
+#: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
+#: single-gap scheduling delay measured at loadavg 113-178
+#: (test_laptop_warm_verify_boundary.py's HeartbeatWriter comment) rather than
+#: this cadence, that window still fits five.
+LOOP_TICK_SECS = 0.05
+LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2
 
 
 BEATS_REQUIRED = 5
@@ -6957,14 +6977,81 @@ class TestDefaultSshHeartbeatRun:
         assert closed == [write_fd]  # closed exactly once, by its owner
         assert [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD_NAME] == []
 
-    @pytest.mark.timeout(WEDGED_WRITER_TEST_TIMEOUT_SECS)
-    async def test_a_wedged_writer_does_not_block_the_dispatch_forever(self):
-        """A writer that ignores stop() costs one teardown, not the merge lane.
+    @pytest.mark.skipif(not Path('/proc/self/fd').exists(), reason='needs procfs')
+    async def test_a_failed_spawn_leaks_neither_the_writer_nor_its_pipe(self, tmp_path):
+        """The ordering comment above os.pipe(), made executable.
 
-        The join is BOUNDED, so the dispatch still returns its rc and stdout.
-        Regressing to a bare join() fails this as a timeout — the very failure
-        class (one stuck dispatch halting the lane) this task exists to remove.
+        The writer is started BEFORE the spawn so that exactly one owner exists
+        for write_fd on every path — and the failed-spawn path is the only one
+        where that claim carries weight, because nothing else there stops the
+        thread or closes either end of the pipe. It is also an ordinary
+        condition rather than a hypothetical: a missing ssh binary or a worktree
+        reaped out from under the cwd raises FileNotFoundError here, which
+        callers already convert to RunnerUnavailable. Moving start_heartbeat
+        after the spawn, or dropping the inner try/finally that closes read_fd,
+        would leak descriptors per failed dispatch with every other test in this
+        class — all of which take the happy spawn path — still green.
         """
+        import os
+        import threading
+
+        from orchestrator.verify_cancel import HEARTBEAT_THREAD_NAME, start_stdin_heartbeat
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        handles = []
+        closed = []
+
+        def closing_spy(fd):
+            closed.append(fd)
+            os.close(fd)
+
+        def spy_start(write_fd, **kw):
+            handle = start_stdin_heartbeat(write_fd, **{**kw, 'close_fn': closing_spy})
+            handles.append((write_fd, handle))
+            return handle
+
+        argv = [str(tmp_path / 'no-such-ssh-binary'), 'irrelevant']
+
+        async def failed_dispatch():
+            with pytest.raises(FileNotFoundError):
+                await _default_ssh_heartbeat_run(
+                    argv, heartbeat_interval=0.01, start_heartbeat=spy_start
+                )
+
+        # The first failed spawn on a loop can allocate asyncio machinery (child
+        # watcher, self-pipe) that legitimately outlives it, so the count is
+        # taken around the SECOND one: this stays an fd-LEAK assertion instead of
+        # an asyncio-warm-up one.
+        await failed_dispatch()
+        before = len(os.listdir('/proc/self/fd'))
+        await failed_dispatch()
+        after = len(os.listdir('/proc/self/fd'))
+
+        assert after == before, f'a failed spawn leaked {after - before} descriptor(s)'
+        assert closed == [write_fd for write_fd, _ in handles]  # each fd closed once, by its owner
+        assert all(not handle.thread.is_alive() for _, handle in handles)
+        assert [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD_NAME] == []
+
+    @pytest.mark.timeout(WEDGED_WRITER_TEST_TIMEOUT_SECS)
+    async def test_a_wedged_writer_costs_one_teardown_and_not_the_loop(self):
+        """A writer that ignores stop() costs its own dispatch's teardown — and nothing else.
+
+        Two properties, and the bound means what it says only if both hold.
+
+        BOUNDED: the dispatch still returns its rc and stdout. Regressing to a
+        bare join() fails this as a timeout — the failure class (one stuck
+        dispatch halting the merge lane) this task exists to remove.
+
+        PAID OFF THE LOOP: a synchronous join in the coroutine's finally would
+        freeze the orchestrator's shared loop — scheduler, agent dispatch, merge
+        worker, uvicorn escalation server — for that whole bound, re-creating on
+        the teardown side exactly the stall the beat was moved to a thread to
+        survive. The ticker counts loop iterations between ``stop()`` (the last
+        thing to run before the join) and the dispatch returning; a blocking
+        join admits exactly zero, because nothing else can run on a loop that is
+        blocked.
+        """
+        import os
         import sys
         import threading
 
@@ -6977,19 +7064,53 @@ class TestDefaultSshHeartbeatRun:
         )
         parked.start()
 
-        rc, stdout, stderr = await _default_ssh_heartbeat_run(
-            [sys.executable, '-c', 'print("DONE")'],
-            heartbeat_interval=0.02,
-            start_heartbeat=lambda write_fd, **kw: HeartbeatHandle(
-                stop=lambda: None, thread=parked
-            ),
-        )
+        ticks = 0
+        ticks_at_stop: list[int] = []
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(LOOP_TICK_SECS)
+                ticks += 1
+
+        ticker_task = asyncio.create_task(ticker())
+        write_fds: list[int] = []
+
+        def wedged_start(write_fd, **kw):
+            # No writer is started, so nothing else owns write_fd and this test
+            # closes it below. Production delegates that close to the writer
+            # thread (verify_cancel.run_stdin_heartbeat) — saying so here is how
+            # this test states the ownership contract it is standing in for.
+            write_fds.append(write_fd)
+            return HeartbeatHandle(stop=lambda: ticks_at_stop.append(ticks), thread=parked)
+
+        try:
+            rc, stdout, stderr = await _default_ssh_heartbeat_run(
+                [sys.executable, '-c', 'print("DONE")'],
+                heartbeat_interval=LOOP_TICK_SECS,
+                start_heartbeat=wedged_start,
+            )
+            ticks_at_return = ticks
+            still_parked = parked.is_alive()  # the call returned without waiting it out
+        finally:
+            ticker_task.cancel()
+            await asyncio.gather(ticker_task, return_exceptions=True)
+            never_set.set()
+            parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            for fd in write_fds:
+                os.close(fd)
 
         assert rc == 0
         assert 'DONE' in stdout
-        assert parked.is_alive()  # the call returned without waiting it out
-        never_set.set()
-        parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+        assert still_parked
+
+        (stopped_at,) = ticks_at_stop
+        assert ticks_at_return - stopped_at >= LOOP_TICKS_REQUIRED_DURING_TEARDOWN, (
+            f'the loop ran {ticks_at_return - stopped_at} times while the dispatch waited out '
+            f'its {HEARTBEAT_STOP_JOIN_SECS}s join bound. Zero means the join is synchronous '
+            f'again and the shared event loop — scheduler, merge worker, escalation server — '
+            f'is frozen for that whole bound by every wedged writer.'
+        )
 
 
 # ---------------------------------------------------------------------------
