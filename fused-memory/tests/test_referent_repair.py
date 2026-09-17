@@ -33,7 +33,11 @@ import pytest
 from _fm_helpers import install_identity_mocks
 from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
 
-from fused_memory.backends.graphiti_client import ActiveEdgesError, EdgeNotFoundError
+from fused_memory.backends.graphiti_client import (
+    ActiveEdgesError,
+    AmbiguousEntityError,
+    EdgeNotFoundError,
+)
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -2709,3 +2713,121 @@ class TestEndToEndThroughTheWritePath:
             'ensure_entity_node ran OUTSIDE the per-group identity lock — '
             "alpha's contract is violated by placement"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-3/4: a no-merge refusal lands as 'unrepairable', never 'failed'
+# ---------------------------------------------------------------------------
+
+class TestTheDuplicateNameRefusal:
+    """Guard (c) at the repair pass: a >=2-match target is REFUSED, not merged.
+
+    The repair pass passes `merge_duplicates=False`, so the backend raises
+    AmbiguousEntityError rather than collapsing a duplicate-name group into a
+    survivor.  A collapse is irreversible and is only ever a deliberate act,
+    never a side effect of a repair (Ratified Decision 1).
+
+    The disposition is a THIRD position beside 'failed' and the NEVER-GUESS
+    'unrepairable': we did not refuse to guess — a target WAS determined — and
+    the backend did not fail.  It REFUSED an irreversible collapse this path is
+    not licensed to trigger.  Booking that as 'failed' would put a refusal in
+    the same bucket as a FalkorDB outage and feed leaf iota's rate a fault that
+    never happened.
+    """
+
+    @staticmethod
+    def _ambiguous() -> AmbiguousEntityError:
+        return AmbiguousEntityError(
+            "Multiple entities found with name 'Task 3127': ['u-a', 'u-b']",
+            name='Task 3127', group_id='dark_factory', uuids=('u-a', 'u-b'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_forbids_the_collapse_at_the_call(self, service):
+        """(1) The refusal is WIRED, not merely available: merge_duplicates=False
+        is on the awaited call."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        _, kwargs = service.graphiti.ensure_entity_node.await_args
+        assert kwargs['merge_duplicates'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_recorded_as_unrepairable_naming_the_group(self, service):
+        """(2) The record names the duplicate-name group — both uuids and the
+        name — so an operator can adjudicate it by hand without the log."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert record.intended_referent == 'Task 3127'
+        assert 'Task 3127' in record.reason
+        assert 'u-a' in record.reason and 'u-b' in record.reason
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_writes_absolutely_nothing(self, service):
+        """(2) No edge moved, nothing merged, no summary touched."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_it_counts_as_flagged_unrepairable_not_failed(self, service):
+        """(3) The disposition must read as "we refused", so a FalkorDB outage
+        and a duplicate-name group stay distinguishable in leaf iota's rate."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.flagged_unrepairable == 1
+        assert stats.failed == 0
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_contains_to_that_finding(self, service):
+        """(4) Per-finding containment, not a batch abort: a sibling finding on
+        a DIFFERENT edge still repairs."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[self._ambiguous(), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+
+    @pytest.mark.asyncio
+    async def test_any_other_exception_still_records_failed(self, service):
+        """(5) The new arm narrowed NOTHING: a backend fault is still 'failed'."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'failed'
+        assert 'falkor down' in stats.repairs[0].reason
+        assert stats.failed == 1
+        assert stats.flagged_unrepairable == 0
