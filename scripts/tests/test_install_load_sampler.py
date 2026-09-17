@@ -179,6 +179,17 @@ def main(argv):
 
     if verb == "start":
         _save(state)
+        if os.environ.get("FAKE_SYSTEMCTL_FAIL_START") == "1":
+            print("Job for dark-factory-load-sampler.service failed.",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    if verb == "show":
+        # `show -p WorkingDirectory --value <unit>` is how the installer asks
+        # which directory the UNIT runs in, and therefore which DB to verify.
+        _save(state)
+        print(os.environ.get("FAKE_SYSTEMCTL_WORKDIR", ""))
         return 0
 
     if verb == "list-timers":
@@ -231,21 +242,25 @@ def _systemctl_calls(tmp_path: Path) -> list[list[str]]:
     return json.loads(state_path.read_text())['calls']
 
 
-def _seed_db(root: Path, *, rows: bool = True) -> Path:
-    """Build a DB with the real schema at the DARK_FACTORY_ROOT-derived path."""
+def _seed_db(root: Path, *, rows: bool = True, ts_offset: int = 60) -> Path:
+    """Build a DB with the real schema where the installed UNIT would write it.
+
+    *ts_offset* is seconds relative to now. The default is in the FUTURE on
+    purpose: the installer records a high-water ts before the kick and then
+    looks for a row at or after it, and the fake systemctl's `start` does not
+    actually run the sampler, so a row dated "now" would race the script's own
+    clock. A NEGATIVE offset plants the row the high-water mark exists to
+    reject -- a leftover from an earlier install.
+    """
     db_path = root / 'data' / 'load-samples.db'
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     try:
         conn.executescript(_SCHEMA)
         if rows:
-            # Dated slightly in the FUTURE on purpose. The installer records a
-            # high-water ts before the kick and then looks for a row at or
-            # after it; the fake systemctl's `start` does not actually run the
-            # sampler, so a row dated "now" would race the script's own clock.
             conn.execute(
                 'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
-                (int(time.time()) + 60, 'runqueue_ratio', 4.06),
+                (int(time.time()) + ts_offset, 'runqueue_ratio', 4.06),
             )
         conn.commit()
     finally:
@@ -269,9 +284,19 @@ def _run_script(tmp_path: Path, *, env=None, reset_state=True):
 
 
 def _install_env(tmp_path: Path, root: Path) -> dict[str, str]:
+    """Env for one install run: where units go, and where the UNIT will run.
+
+    The DB the installer verifies is derived from the service's effective
+    WorkingDirectory, asked of systemd -- so the seam that redirects it at a
+    tmp tree is the fake systemctl's answer, not an environment variable the
+    real unit never sees. `DARK_FACTORY_ROOT` is deliberately NOT set here:
+    the installer must not follow it, and
+    test_the_verified_db_follows_the_unit_not_the_invoking_shell holds it to
+    that.
+    """
     return {
         'XDG_CONFIG_HOME': str(tmp_path / 'xdg-config'),
-        'DARK_FACTORY_ROOT': str(root),
+        'FAKE_SYSTEMCTL_WORKDIR': str(root),
     }
 
 
@@ -306,9 +331,10 @@ def test_install_copies_both_units_verbatim_and_enables_the_timer(tmp_path: Path
 def test_the_timer_is_verified_before_the_service_is_kicked(tmp_path: Path):
     """The ordering lesson scripts/install-flag-marker-sweep-timer.sh documents.
 
-    Under `set -euo pipefail` a failing kick ABORTS the script, so a kick
-    placed first means the install's stated guarantee -- the timer IS armed --
-    never gets checked at all.
+    A failing kick ends the run -- by the explicit `exit 1` inside the
+    `if ! systemctl ...` wrapper, not by `set -e`, which that wrapper
+    suppresses -- so a kick placed first means the install's stated guarantee,
+    that the timer IS armed, never gets checked at all.
     """
     root = tmp_path / 'root'
     _seed_db(root)
@@ -371,6 +397,79 @@ def test_an_absent_db_fails_the_row_check_naming_the_path(tmp_path: Path):
 
     assert result.returncode != 0
     assert str(root / 'data' / 'load-samples.db') in result.stderr, result.stderr
+
+
+def test_the_verified_db_follows_the_unit_not_the_invoking_shell(tmp_path: Path):
+    """The installer must check the file the UNIT writes, not the operator's env.
+
+    sampler/__main__.py resolves <DARK_FACTORY_ROOT or CWD>/data and the unit
+    sets no Environment=, so under systemd the root is WorkingDirectory. An
+    installer that read DARK_FACTORY_ROOT from its own shell agreed with the
+    unit only while the variable was UNSET -- exported (a worktree, the case
+    its comment claimed to protect) it verified a file nothing writes, and
+    exited 1 saying "the sampler wrote nothing" about a healthy install.
+
+    Here the shell variable names a root holding a perfectly good DB and the
+    unit's directory holds none. Following the variable passes; following the
+    unit fails, naming the path the sampler would actually have written.
+    """
+    unit_root = tmp_path / 'unit-root'
+    unit_root.mkdir()
+    decoy_root = tmp_path / 'decoy-root'
+    _seed_db(decoy_root)
+
+    result = _run_script(tmp_path, env={
+        **_install_env(tmp_path, unit_root),
+        'DARK_FACTORY_ROOT': str(decoy_root),
+    })
+
+    assert result.returncode != 0, result.stdout
+    assert str(unit_root / 'data' / 'load-samples.db') in result.stderr, result.stderr
+
+
+def test_a_leftover_row_from_an_earlier_install_does_not_pass_the_kick_check(
+    tmp_path: Path
+):
+    """What `pre_kick_ts` is FOR, and nothing exercised it.
+
+    Every other row-check test seeds a row dated after the high-water mark, so
+    rewriting the query to `SELECT COUNT(*) FROM samples` -- dropping the
+    high-water clause entirely -- left all of them green. Then a re-install on
+    a host where the sampler had stopped would report success on rows a
+    previous install wrote, which is exactly the "the timer is armed but the
+    tick wrote nothing" case the check exists to catch.
+    """
+    root = tmp_path / 'root'
+    db_path = _seed_db(root, ts_offset=-3600)
+
+    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+
+    assert result.returncode != 0, result.stdout
+    assert str(db_path) in result.stderr, result.stderr
+
+
+def test_a_failed_kick_stops_the_install_naming_the_service(tmp_path: Path):
+    """The kick-failure branch, unreachable until the fake could refuse to start.
+
+    It carries the install's most useful sentence -- the timer IS armed even
+    though the tick failed -- and the row check below it must not run, because
+    a kick that never happened cannot have written a row and the DB message
+    would misdirect an operator onto the sampler's writes.
+    """
+    root = tmp_path / 'root'
+    _seed_db(root)
+
+    result = _run_script(tmp_path, env={
+        **_install_env(tmp_path, root),
+        'FAKE_SYSTEMCTL_FAIL_START': '1',
+    })
+
+    assert result.returncode != 0, result.stdout
+    assert SERVICE_NAME in result.stderr, result.stderr
+    assert 'load-samples.db' not in result.stderr, (
+        'the row check ran after a kick that never happened: '
+        f'{result.stderr}'
+    )
 
 
 def test_running_twice_is_idempotent(tmp_path: Path):

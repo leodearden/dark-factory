@@ -6,8 +6,13 @@ After=network.target
 Type=oneshot
 # %h expands to the user home directory (systemd user-unit specifier), making
 # the username non-hardcoded.  Adjust "src/dark-factory" if your checkout path
-# differs.  Alternatively set DARK_FACTORY_ROOT=<repo-root> in an
-# EnvironmentFile= to override the DB path without editing this unit.
+# differs: this is the ONE knob for where the corpus lives.  The sampler
+# resolves <DARK_FACTORY_ROOT or CWD>/data/load-samples.db and this unit sets
+# no Environment=, so the CWD below IS the root, and
+# scripts/install-load-sampler.sh asks systemd for this very directory to
+# decide which DB to verify.  An EnvironmentFile= carrying DARK_FACTORY_ROOT
+# would still work but splits that into two knobs the installer cannot see
+# agree -- edit this line instead.
 WorkingDirectory=%h/src/dark-factory
 # --no-sync is load-bearing, not cosmetic.  There is ONE shared root .venv per
 # checkout with every workspace member installed editable into it, and a plain

@@ -23,11 +23,11 @@
 # The self-verify runs BEFORE the one-time kick, not after -- the ordering
 # scripts/install-flag-marker-sweep-timer.sh's header documents as the
 # corrected one. The kick starts a `Type=oneshot` unit, so `systemctl start`
-# blocks until the tick finishes and propagates its exit status; under
-# `set -e` an ordering with the verify last would abort the script right
-# there, skipping the self-verify even though the timer is already installed
-# and enabled. Verifying first means the install's stated guarantee (the timer
-# IS armed) is always checked.
+# blocks until the tick finishes and propagates its exit status, and a failing
+# kick ends the run: not via `set -e` (the `if ! systemctl ...` wrapper below
+# catches the status so the message can name the unit) but by an explicit
+# exit 1. Verifying first means the install's stated guarantee -- the timer IS
+# armed -- is checked even on a host where the tick itself cannot run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # scripts/
@@ -36,14 +36,6 @@ TEMPLATES_DIR="$REPO_ROOT/dashboard"                          # unit files live 
 
 SERVICE_NAME="dark-factory-load-sampler.service"
 TIMER_NAME="dark-factory-load-sampler.timer"
-
-# The DB the sampler actually writes is resolved through the SAME env seam
-# sampler/src/sampler/__main__.py honours, so operator, installer, sampler and
-# calibration script cannot disagree about which file is the corpus. The
-# unit's WorkingDirectory is %h/src/dark-factory, so a repo-relative path here
-# would make the installer verify a file nothing writes when run from a
-# worktree.
-SAMPLE_DB="${DARK_FACTORY_ROOT:-$HOME/src/dark-factory}/data/load-samples.db"
 
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$UNIT_DIR"
@@ -54,6 +46,29 @@ cp "$TEMPLATES_DIR/$TIMER_NAME" "$UNIT_DIR/"
 echo "install-load-sampler.sh: installing units into $UNIT_DIR"
 systemctl --user daemon-reload
 systemctl --user enable --now "$TIMER_NAME"
+
+# The DB to verify is the one THE INSTALLED UNIT will write, asked of systemd
+# rather than assumed -- `show --value` answers with the effective directory,
+# %h already expanded and any drop-in applied.
+#
+# This deliberately does NOT read $DARK_FACTORY_ROOT. sampler/__main__.py
+# resolves <DARK_FACTORY_ROOT or CWD>/data/load-samples.db, and the unit sets
+# no Environment=, so under systemd the root is the CWD -- i.e. exactly
+# WorkingDirectory. Reading the variable from the INVOKING shell instead made
+# the two disagree precisely when it was set: run from a worktree with
+# DARK_FACTORY_ROOT exported, the sampler still wrote $HOME/src/dark-factory
+# while the installer checked the worktree and exited 1 with the misleading
+# "the sampler wrote nothing". Propagating the variable INTO the unit was the
+# other way to make them agree and is worse: the corpus is a 30-day artifact
+# and a worktree is deleted when its task lands, so the collector would be
+# aimed at a directory that disappears. Relocate the checkout by editing
+# WorkingDirectory -- one knob, honoured by unit, sampler and this check.
+unit_workdir="$(systemctl --user show -p WorkingDirectory --value "$SERVICE_NAME")"
+if [ -z "$unit_workdir" ]; then
+    echo "ERROR: systemd reported no WorkingDirectory for ${SERVICE_NAME}; cannot tell which DB the sampler writes. Inspect with: systemctl --user cat ${SERVICE_NAME}" >&2
+    exit 1
+fi
+SAMPLE_DB="$unit_workdir/data/load-samples.db"
 
 echo "install-load-sampler.sh: verifying ${TIMER_NAME} is listed..."
 # Capture the full listing first, THEN grep the captured text. Piping
