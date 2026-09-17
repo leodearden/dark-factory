@@ -47,19 +47,18 @@ this class to the same LLM caller that asserts the defect: nothing here can
 corroborate *this memory does not back this finding*. (1) and (3) are
 mechanical; (2) is free prose the caller writes about its own claim, never
 parsed, and a non-blank string is trivially satisfied. So on the in-agent path
-the binding control is ``caller_project_id`` — the rewrite is confined to a
-completed run the caller's OWN project owns — plus the fact that the removal is
-self-incriminating: the record names who did it and what they claimed. That is
+the binding control is ``caller_project_id``: the journal holds runs for every
+project this process reconciles, and the rewrite is confined to one the
+caller's OWN project owns — plus the fact that the removal is
+self-incriminating, the record naming who did it and what they claimed. That is
 the deliberate trade, not an oversight. A CROSS-project correction has no such
 owning caller and is refused with ``project_mismatch``; it goes through the
 out-of-band ``repair_recon_citation`` operator script, which a human runs.
 
 Unchanged by all of this: the replacement must still resolve, so no caller can
-install a second unresolvable id; and for an in-agent caller
-``caller_project_id`` still confines the repair to runs the caller owns, since
-the journal is shared across every project the process reconciles. It reuses
-``citation_verifier``'s lookup primitive and its found/None/raised branching so
-the two halves cannot disagree about what a backend timeout means.
+install a second unresolvable id. And the lookup primitive is
+``citation_verifier``'s own, found/None/raised branching included, so the two
+halves cannot disagree about what a backend timeout means.
 """
 
 from __future__ import annotations
