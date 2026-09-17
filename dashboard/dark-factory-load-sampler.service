@@ -14,10 +14,24 @@ WorkingDirectory=%h/src/dark-factory
 # `uv run --project <member>` was measured UNINSTALLING a sibling from it.  At
 # this unit's 5s cadence that is 17,280 env re-syncs a day against the main
 # checkout's venv -- i.e. it would intermittently break running orchestrators
-# and verify runs.  --frozen additionally pins the lockfile, so a genuinely
-# unsynced venv now fails loudly in the journal instead of silently repairing
-# itself by damaging the venv.
-ExecStart=%h/.local/bin/uv run --frozen --no-sync --project sampler python -m sampler
+# and verify runs.
+#
+# --no-sync is also the ONLY flag here, and that is a measured conclusion, not
+# an omission.  A lockfile flag looks tempting beside it; neither does anything
+# once --no-sync is present, because --no-sync skips the lock step along with
+# the sync.  Measured on uv 0.11.6 against a probe project with deliberate
+# lockfile drift:
+#
+#     uv run --locked            -> rc=2, "the lockfile needs to be updated"
+#     uv run --locked --no-sync  -> rc=0, silent
+#     uv run --frozen --no-sync  -> rc=0, lockfile untouched (== --no-sync alone)
+#
+# So --frozen was a no-op, and --locked would be one too: do not "fix" this by
+# reaching for it.  Making drift loud here would mean dropping --no-sync, which
+# is the hazard above.  A 5 s monitoring collector is the wrong place to fail
+# closed on unrelated lockfile drift anyway -- it would take the calibration
+# corpus dark 17,280 times a day.
+ExecStart=%h/.local/bin/uv run --no-sync --project sampler python -m sampler
 
 # Logging goes to journalctl --user -u dark-factory-load-sampler
 StandardOutput=journal

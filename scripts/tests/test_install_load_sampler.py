@@ -11,8 +11,8 @@ The units live in dashboard/ rather than scripts/, which is the only way this
 installer differs in shape from its siblings.
 
 WHY THE UNIT FILES ARE PINNED HERE. The installer copies them BYTE FOR BYTE,
-so for the two properties this task actually turns on -- the `--frozen
---no-sync` flags on ExecStart, and the 5 s cadence every sizing number in the
+so for the two properties this task actually turns on -- the `--no-sync` flag
+on ExecStart, and the 5 s cadence every sizing number in the
 plan rests on -- the committed file IS the behaviour. There is nothing else
 to test.
 """
@@ -75,22 +75,28 @@ def _values(directives, section: str, key: str) -> list[str]:
 
 
 def test_execstart_pins_the_venv_against_mutation():
-    """--frozen --no-sync, and the reason is not cosmetic.
+    """--no-sync, and the reason is not cosmetic.
 
     There is ONE shared root .venv per checkout with every workspace member
     installed editable into it, and a plain `uv run --project <member>` was
     measured UNINSTALLING a sibling from it. At this unit's 5 s cadence an
     un-flagged ExecStart performs 17,280 env re-syncs a day against the MAIN
     checkout's venv -- i.e. it would intermittently break running
-    orchestrators and verify runs. `--no-sync` is the flag that prevents the
-    mutation; `--frozen` additionally pins the lockfile, so a genuinely
-    unsynced venv fails loudly in the journal instead of silently repairing
-    itself by damaging the venv.
+    orchestrators and verify runs. `--no-sync` is the flag that prevents it.
+
+    The ABSENCE of a lockfile flag is asserted too, and is the more fragile
+    half: `--frozen` and `--locked` both read as strengthening the line, and
+    both are no-ops once --no-sync is present (measured on uv 0.11.6 -- see the
+    unit's own comment for the three rcs). A no-op flag that looks load-bearing
+    is worse than no flag, so the seam that would let one back in is pinned.
     """
     exec_start, = _values(_directives(SERVICE_NAME), 'Service', 'ExecStart')
 
-    assert '--frozen' in exec_start.split(), exec_start
     assert '--no-sync' in exec_start.split(), exec_start
+    assert not {'--frozen', '--locked'} & set(exec_start.split()), (
+        'a lockfile flag is a no-op alongside --no-sync; it buys nothing and '
+        f'reads as a guarantee the unit does not have: {exec_start}'
+    )
     assert exec_start.endswith('--project sampler python -m sampler'), exec_start
 
 
