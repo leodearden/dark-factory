@@ -65,6 +65,26 @@ markers = [
 # deselect.
 addopts = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this file declared neither key, so a
+# bare root-bound `pytest` — and any arg set whose rootdir resolves here, e.g.
+# `pytest escalation/tests` from the repo root — ran with NO per-test wall-clock
+# cap at all. The mirroring rule above is why: pytest reads exactly ONE inifile,
+# so a member's `timeout` does nothing for a run rooted here.
+#
+# `signal`, not `thread`, because runs rooted here are SERIAL — the addopts
+# above carries no `-n`, and tests/scripts/test_merge_gate_parallelism_config.py
+# ::test_root_addopts_never_leaks_the_parallel_flags forbids it acquiring one —
+# and signal is the only method that interrupts a blocking main-thread wait.
+# Same choice, for the same reason, as the workspace's other serial member.
+#
+# The VALUE's provenance is
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md; the RATIONALE for the
+# setting existing at all is shared/pyproject.toml's block. Neither is restated
+# here. Every pytest config in the repo carries the same value — enforced by
+# tests/scripts/test_pytest_per_test_timeout_policy.py.
+timeout = 540
+timeout_method = "signal"
 
 # ── ruff: the rule set for everything OUTSIDE a workspace member ──────────────
 #
