@@ -60,6 +60,7 @@ loudly rather than silently if they move.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import cast
 
@@ -149,3 +150,60 @@ def census(client: httpx.AsyncClient) -> PoolCensus | None:
         orphaned=len(_orphaned(pool)),
         max_connections=pool._max_connections,
     )
+
+
+async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
+    """Close and unpool *client*'s orphaned connections. Returns how many closed.
+
+    THREE PHASES, AND THE ORDER IS LOAD-BEARING.
+
+    1. SYNCHRONOUS — resolve the pool and decide the doomed set. There is no
+       ``await`` between reading ``_requests`` and fixing that set, so httpcore
+       cannot assign a queued request to one of these connections in between.
+       Without that, the reaper would race live traffic rather than avoid it.
+
+    2. AWAIT — close each doomed connection. ``Exception`` is suppressed per
+       connection so one bad close cannot strand the rest; ``BaseException``
+       (notably ``CancelledError``) is deliberately allowed to propagate,
+       because the only caller that delivers one is shutdown, where the
+       process is going away and every remaining connection is either already
+       closed or still pooled — both safe.
+
+    3. SYNCHRONOUS — drop the now-closed connections from ``_connections``, so
+       the slot is free immediately instead of at the pool's next use. This is
+       the half that actually ends the wedge: a connection marked closed but
+       still listed keeps counting against ``max_connections``.
+
+    CLOSING BEFORE REMOVING is what makes a cancellation mid-sweep harmless.
+    An already-closed connection still in ``_connections`` satisfies httpcore's
+    own ``is_closed()`` branch and is reclaimed by the pool on its next use, so
+    the worst case is a delayed slot. Remove-then-close would instead leak the
+    file descriptor outright, with nothing left holding a reference to close.
+
+    The ``ValueError`` suppressed in phase 3 is that same benign race seen from
+    the other side: across phase 2's awaits, a request completing elsewhere can
+    run ``_assign_requests_to_connections``, which removes a connection this
+    sweep has just closed. Already gone is the outcome this phase wanted.
+    """
+    pool = _resolve_pool(client)
+    if pool is None:
+        return 0
+
+    doomed = _orphaned(pool)
+
+    closed = 0
+    for connection in doomed:
+        with contextlib.suppress(Exception):
+            await connection.aclose()
+            closed += 1
+
+    # Every doomed connection is unpooled, including any whose close raised:
+    # ``aclose`` sets CLOSED before releasing the stream, so such a connection
+    # is closed as far as the pool is concerned and holding its slot would help
+    # nobody. Hence ``closed`` can read lower than the number removed — it
+    # counts clean closes, which is the number worth seeing in the log.
+    for connection in doomed:
+        with contextlib.suppress(ValueError):
+            pool._connections.remove(connection)
+
+    return closed
