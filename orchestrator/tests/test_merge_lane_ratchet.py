@@ -2909,6 +2909,110 @@ class TestWriteBaselineCli:
         )
 
 
+class TestAuthorizeRaiseCli:
+    """The authorized-raise flags, and the exit ladder the refusal lands on.
+
+    Every case drives `stub_measurement`, so the new surface adds zero
+    build_report calls to the orchestrator verify leg.
+    """
+
+    @staticmethod
+    def _seeded(stub: dict, tmp_path: Path) -> tuple[Path, Path, dict]:
+        """A destination holding the stubbed report, and a report that RAISES."""
+        target = tmp_path / 'b.json'
+        metrics.write_baseline(target, stub)
+        raised = copy.deepcopy(stub)
+        raised['files'][_MQ]['lines'] += 103
+        return target, tmp_path / 'ledger.json', raised
+
+    def test_an_authorized_raise_is_written_and_recorded(
+        self, stub_measurement: dict, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target, ledger, raised = self._seeded(stub_measurement, tmp_path)
+        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(raised))
+
+        assert metrics.main([
+            '--write-baseline', str(target),
+            '--authorize-raise', '5342',
+            '--reason', 'net-additive bug fix',
+            '--ledger', str(ledger),
+        ]) == 0
+
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(raised)
+        entries = metrics.load_ledger(ledger)['raises']
+        assert len(entries) == 1
+        assert entries[0]['task_id'] == '5342'
+        out = capsys.readouterr().out
+        assert str(ledger) in out
+        assert '5342' in out
+        assert str(len(entries[0]['measures'])) in out
+
+    def test_a_refusal_exits_one_not_two_and_leaves_the_bytes(
+        self, stub_measurement: dict, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # BOTH codes in one test, because the split is the thing: 1 is "a
+        # measure rose" -- at write time here rather than at check time -- and 2
+        # stays reserved for a broken instrument. Collapsing them would send a
+        # reader to the wrong file.
+        target, ledger, raised = self._seeded(stub_measurement, tmp_path)
+        before = target.read_text(encoding='utf-8')
+        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(raised))
+
+        assert metrics.main(['--write-baseline', str(target)]) == 1
+
+        err = capsys.readouterr().err
+        assert _MQ in err
+        assert metrics.RAISE_REMEDY in err
+        assert target.read_text(encoding='utf-8') == before
+        assert not ledger.exists()
+
+        def explode(root: Path) -> dict:
+            raise metrics.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
+
+        monkeypatch.setattr(metrics, 'build_report', explode)
+        assert metrics.main(['--write-baseline', str(target)]) == 2
+
+    @pytest.mark.parametrize(
+        'argv',
+        [
+            pytest.param(
+                ['--write-baseline', 'x.json', '--authorize-raise', '5342'],
+                id='authorize-without-reason',
+            ),
+            pytest.param(
+                ['--write-baseline', 'x.json', '--reason', 'because'],
+                id='reason-without-authorize',
+            ),
+            pytest.param(
+                ['--check', '--authorize-raise', '5342', '--reason', 'because'],
+                id='with-check',
+            ),
+            pytest.param(
+                ['--report', '--authorize-raise', '5342', '--reason', 'because'],
+                id='with-report',
+            ),
+            pytest.param(
+                ['--json', '--authorize-raise', '5342', '--reason', 'because'],
+                id='with-json',
+            ),
+        ],
+    )
+    def test_authorization_is_a_modifier_of_the_write_and_nothing_else(
+        self, argv: list[str]
+    ) -> None:
+        # A flag that silently does nothing is worse than a rejected one: it
+        # reads, to the agent who typed it, exactly like an authorization that
+        # was granted.
+        with pytest.raises(SystemExit):
+            metrics.main(argv)
+
+    def test_ledger_defaults_to_the_committed_path(self) -> None:
+        args = metrics._build_parser().parse_args(['--check'])
+        assert Path(args.ledger).name == 'merge_lane_ratchet_authorized_raises.json'
+
+
 class TestCliContract:
     @pytest.mark.parametrize(
         'argv',
