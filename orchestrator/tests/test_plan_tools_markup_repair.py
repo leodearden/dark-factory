@@ -3267,23 +3267,31 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
     def _read_back(artifacts, value: str):
         """Seed ``design_decisions[0].rationale`` = *value*, then read-repair.
 
-        Returns ``(on_disk_value, facts, bytes_before)`` — the value as
+        Returns ``(on_disk_value, facts, bytes_before)``. The value as
         PERSISTED, not merely as returned, since durability is the half of the
-        contract a returned dict cannot show.
+        contract a returned dict cannot show; the facts because on this surface
+        the RECORD is the other half — every row below reads one or the other,
+        and several read both.
         """
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = value
         artifacts.write_plan(copy.deepcopy(plan))
         before = (artifacts.root / 'plan.json').read_bytes()
 
-        plan_tools._read_plan_repaired(artifacts)
+        _plan, facts = plan_tools._read_plan_repaired(artifacts)
 
-        return _on_disk(artifacts)['design_decisions'][0]['rationale'], before
+        return (
+            _on_disk(artifacts)['design_decisions'][0]['rationale'],
+            facts,
+            before,
+        )
 
     def test_the_field_is_truncated_to_its_prose_and_persisted_that_way(
         self, plan_artifacts
     ):
-        on_disk, _before = self._read_back(plan_artifacts, _ACCEPTED_TRUNCATION)
+        on_disk, _facts, _before = self._read_back(
+            plan_artifacts, _ACCEPTED_TRUNCATION
+        )
 
         assert on_disk == _SELF_NAME_RATIONALE_PROSE
 
@@ -3294,18 +3302,18 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
         goes too. Stating it here keeps the contract from being read as "the
         tag is stripped" when it is "the value is cut at the tag".
         """
-        on_disk, _before = self._read_back(plan_artifacts, _ACCEPTED_TRUNCATION)
+        on_disk, _facts, _before = self._read_back(
+            plan_artifacts, _ACCEPTED_TRUNCATION
+        )
 
         assert not on_disk.endswith(('\n', ' '))
         assert _ACCEPTED_TRUNCATION[len(on_disk):] == closer('rationale') + '\n  '
 
     def test_the_fact_is_a_repair_that_recovered_NOTHING(self, plan_artifacts):
         """PRD boundary row B4's last-parameter shape: nothing was absorbed."""
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _ACCEPTED_TRUNCATION
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+        _on_disk_value, facts, _before = self._read_back(
+            plan_artifacts, _ACCEPTED_TRUNCATION
+        )
 
         (fact,) = facts
         assert fact['outcome'] == 'repaired'
@@ -3321,15 +3329,12 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
         and which holds no authored content — every CHARACTER OF TEXT the
         truncation removed is named by ``misclose``.
         """
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _ACCEPTED_TRUNCATION
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+        on_disk, facts, _before = self._read_back(
+            plan_artifacts, _ACCEPTED_TRUNCATION
+        )
 
         (fact,) = facts
         assert fact['misclose'] == closer('rationale')
-        on_disk = _on_disk(plan_artifacts)['design_decisions'][0]['rationale']
         assert on_disk + fact['misclose'] == _ACCEPTED_TRUNCATION.rstrip()
 
     def test_the_CROSS_FIELD_counterpart_is_refused_byte_identically(
@@ -3342,18 +3347,18 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
         sibling's closer is not, and the census puts that population at zero —
         so the same empty tail is refused, reported, and left alone.
         """
-        on_disk, before = self._read_back(plan_artifacts, _REFUSED_TRUNCATION)
+        on_disk, _facts, before = self._read_back(
+            plan_artifacts, _REFUSED_TRUNCATION
+        )
 
         assert on_disk == _REFUSED_TRUNCATION
         assert (plan_artifacts.root / 'plan.json').read_bytes() == before
 
     def test_the_refusal_is_reported_rather_than_swallowed(self, plan_artifacts):
         """Byte-identical must not mean invisible, or the asymmetry hides."""
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _REFUSED_TRUNCATION
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+        _on_disk_value, facts, _before = self._read_back(
+            plan_artifacts, _REFUSED_TRUNCATION
+        )
 
         (fact,) = facts
         assert fact['outcome'] == 'unrepairable'
