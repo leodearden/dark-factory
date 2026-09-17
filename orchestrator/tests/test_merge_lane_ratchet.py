@@ -1816,6 +1816,10 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     71-second measurement.
     """
 
+    _AUTHORIZATION = metrics.RaiseAuthorization(
+        task_id='5406', reason='net-additive: a new guard, not a failed refactor'
+    )
+
     @staticmethod
     def _seeded(tmp_path: Path) -> Path:
         """A destination already holding the seed baseline, byte-for-byte."""
@@ -1936,6 +1940,117 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # main() maps every MetricsError to 2, so a refusal that subclassed it
         # would report a real regression as a broken tool.
         assert not issubclass(metrics.UnauthorizedRaise, metrics.MetricsError)
+
+    # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
+    # ceilings apply only to keys ABSENT from the baseline. So a blind
+    # regeneration puts the oversized new file INTO the baseline, and every run
+    # after that exempts it forever. Regeneration absorbed ceiling breaches
+    # exactly as silently as it absorbed rises, which is why the write gate runs
+    # the full comparator rather than the four rise arms.
+
+    _NEW_PATH = 'orchestrator/src/orchestrator/merge_new.py'
+
+    def test_a_new_file_over_the_line_ceiling_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][self._NEW_PATH] = _blank_file_entry(
+            lines=metrics.FILE_LINE_CEILING + 1
+        )
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        breaches = [
+            v for v in excinfo.value.violations
+            if v.measure == 'new_file_over_ceiling'
+        ]
+        assert [v.key for v in breaches] == [self._NEW_PATH]
+
+    def test_a_new_function_over_the_cognitive_ceiling_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['functions'][f'{_MQ}::brand_new'] = (
+            metrics.NEW_FUNCTION_COGNITIVE_CEILING + 1
+        )
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        breaches = [
+            v for v in excinfo.value.violations
+            if v.measure == 'new_function_over_ceiling'
+        ]
+        assert [v.key for v in breaches] == [f'{_MQ}::brand_new']
+
+    def test_a_new_file_exactly_at_the_line_ceiling_is_no_ceiling_breach(
+        self, tmp_path: Path
+    ) -> None:
+        # A ceiling is a ceiling, not a floor -- mirrors
+        # TestCeilingsApplyOnlyToNewKeys::test_a_new_file_exactly_at_the_line_ceiling_is_allowed.
+        #
+        # It is asserted as "no ceiling violation" rather than "the write
+        # succeeds" because it cannot be the latter: 1,500 new lines raise
+        # total:lines by 1,500, so this write is refused by the TOTALS arm
+        # whatever the ceiling says. Contriving the fixture to net the totals to
+        # zero would only hide which arm fired.
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][self._NEW_PATH] = _blank_file_entry(
+            lines=metrics.FILE_LINE_CEILING
+        )
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        assert 'new_file_over_ceiling' not in {
+            v.measure for v in excinfo.value.violations
+        }
+
+    def test_the_git_ops_size_exemption_holds_on_the_write_path(
+        self, tmp_path: Path
+    ) -> None:
+        # SIZE_CEILING_EXEMPT is scoped to the CEILING, not to the ratchet, so
+        # re-adding git_ops.py as a new key at its real size may still be
+        # refused for a totals rise -- but never as a ceiling breach.
+        target = self._seeded(tmp_path)
+        seed = _ratchet_baseline()
+        current = copy.deepcopy(seed)
+        del current['files'][_GIT_OPS]
+        metrics.write_baseline(target, current)  # dropping it only LOWERS
+        restored = copy.deepcopy(seed)
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, restored)
+
+        assert not [
+            v for v in excinfo.value.violations
+            if v.measure == 'new_file_over_ceiling' and v.key == _GIT_OPS
+        ]
+
+    def test_an_authorized_ceiling_breach_is_recorded(self, tmp_path: Path) -> None:
+        # The discriminator pair, completed for ceilings.
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'ledger.json'
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][self._NEW_PATH] = _blank_file_entry(
+            lines=metrics.FILE_LINE_CEILING + 1
+        )
+
+        metrics.write_baseline(
+            target, current, authorization=self._AUTHORIZATION, ledger=ledger
+        )
+
+        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        breach = next(
+            row for row in measures if row['measure'] == 'new_file_over_ceiling'
+        )
+        assert breach['key'] == self._NEW_PATH
+        assert breach['baseline'] == metrics.FILE_LINE_CEILING
+        assert breach['current'] == metrics.FILE_LINE_CEILING + 1
 
 
 class TestAuthorizedRaise:
