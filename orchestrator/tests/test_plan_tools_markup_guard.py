@@ -45,11 +45,9 @@ tool-call argument, which reproduces the very over-consumption defect under
 test — the Write/Edit argument terminates early, truncating this file and
 silently dropping that call's sibling arguments.
 
-So every specimen is assembled from :func:`_close` / :func:`_open_param`, which
-build their angle bracket from ``chr(60)``, and
-:func:`_assert_no_raw_sentinels` enforces that on this module's OWN BYTES at
-import — checked against ``shared.toolcall_markup.ENVELOPE_LITERALS``, the
-single owner of the literal set (INV-5), plus the two structural prefixes.
+So every specimen is assembled from ``_markup_helpers``' builders, which build
+their angle bracket from ``chr(60)``, and its ``assert_no_raw_sentinels``
+enforces that on this module's OWN BYTES at import.
 """
 
 from __future__ import annotations
@@ -61,64 +59,28 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _markup_helpers import (
+    INVOKE_CLOSER,
+    assert_no_raw_sentinels,
+    closer,
+    param_opener,
+    type_alternatives,
+)
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import (
-    ENVELOPE_LITERALS,
-    MARKUP_OVERRIDE_KEY,
-    detect,
-    repair,
-)
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_tools
 from orchestrator.workflow import _is_gating_escalation
 
-# ---------------------------------------------------------------------------
-# Sentinel BUILDERS — the only way markup enters this module.
-# ---------------------------------------------------------------------------
-
-#: The opening angle bracket, spelled so it never appears verbatim in the file.
-_LT = chr(60)
-
-
-def _close(name: str) -> str:
-    """Build the closing tag for *name* (the mis-close shape the harness emits)."""
-    return _LT + '/' + name + '>'
-
-
-def _open_param(name: str) -> str:
-    """Build the canonical opening tag for parameter *name*."""
-    return _LT + 'parameter name="' + name + '">'
-
-
-#: The bare invoke closer — the terminator that trails a last-parameter leak.
-_INVOKE_CLOSER = _close('invoke')
-
-
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal.
-
-    Checked against ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single
-    owner of the literal set, INV-5) plus the two structural prefixes every
-    built specimen uses, so a builder output spelled out by hand is caught even
-    when it is not itself one of the enumerated literals.
-    """
-    source = Path(__file__).read_text(encoding='utf-8')
-    forbidden = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
-    for sequence in forbidden:
-        if sequence in source:
-            raise AssertionError(
-                f'{Path(__file__).name} contains a RAW envelope sentinel '
-                f'({sequence!r}). Build it from _close()/_open_param() instead '
-                '— a verbatim literal here corrupts the tool call that writes '
-                'this file. See the module docstring.'
-            )
-
-
-_assert_no_raw_sentinels()
+# The sentinel builders and the import-time self-scan live in
+# ``_markup_helpers``: three suites in this package need them and none may hold
+# a second copy (INV-5). Imported under this module's own local spellings so
+# every specimen below still reads as it always did.
+assert_no_raw_sentinels(__file__)
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +105,13 @@ _ANALYSIS_PROSE = 'The registration site is create_server, which owns the declar
 #: ``rationale`` parameter into it; the final opener is UNTERMINATED because its
 #: closer was consumed as the terminator.
 ABSORBED_RATIONALE = (
-    _DECISION_PROSE + _close('decision') + '\n' + _open_param('rationale') + _RATIONALE_PROSE
+    _DECISION_PROSE + closer('decision') + '\n' + param_opener('rationale') + _RATIONALE_PROSE
 )
 
 #: The same shape on ``create_plan.title``, absorbing ``analysis``. This is the
 #: tool ``_create_plan``'s own comment delegates to the write-time middleware.
 ABSORBED_ANALYSIS = (
-    _TITLE_PROSE + _close('title') + '\n' + _open_param('analysis') + _ANALYSIS_PROSE
+    _TITLE_PROSE + closer('title') + '\n' + param_opener('analysis') + _ANALYSIS_PROSE
 )
 
 #: TRAILING RESIDUE on a STORED ``design_decisions[].rationale`` — the dominant
@@ -157,13 +119,13 @@ ABSORBED_ANALYSIS = (
 #: absorbed: the parameter was last in the call, so only the mis-close and the
 #: invoke closer trail it.
 STORED_TRAILING_RATIONALE = (
-    _RATIONALE_PROSE + _close('rationale') + '\n' + _INVOKE_CLOSER + '\n'
+    _RATIONALE_PROSE + closer('rationale') + '\n' + INVOKE_CLOSER + '\n'
 )
 
 #: Prose that QUOTES the literals deliberately — a plan about this very leak
 #: (worktree 2939 is the live specimen). The escape hatch, not a leak.
 QUOTED_DECISION = (
-    'The harness emits ' + _close('decision') + ' mid-value and then ' + _INVOKE_CLOSER
+    'The harness emits ' + closer('decision') + ' mid-value and then ' + INVOKE_CLOSER
     + ', which is what the guard matches on.'
 )
 
@@ -301,7 +263,7 @@ class TestAbsorbedSiblingIsRejected:
         assert payload['outcome'] == 'rejected'
         assert payload['tool'] == 'add_design_decision'
         assert payload['field'] == 'decision'
-        assert payload['misclose'] == _close('decision')
+        assert payload['misclose'] == closer('decision')
         assert payload['recovered_params'] == ['rationale']
 
     @pytest.mark.asyncio
@@ -690,7 +652,7 @@ class TestDeliberateQuotingOverride:
 #: ``repair`` now qualifies a ``metadata`` closer as a mis-close candidate and
 #: can recover a tail into it.
 METADATA_TAIL_DECISION = (
-    _DECISION_PROSE + _close('decision') + '\n' + _open_param('metadata')
+    _DECISION_PROSE + closer('decision') + '\n' + param_opener('metadata')
     + 'swallowed tail'
 )
 
@@ -791,25 +753,6 @@ class TestTheWidenedRepairVocabularyStaysContained:
 # ---------------------------------------------------------------------------
 
 
-def _type_alternatives(schema: dict[str, Any]) -> set[str]:
-    """The JSON-Schema type names *schema* accepts, however it spells them.
-
-    ``anyOf`` branches and a list-valued ``type`` are the two renderings a
-    ``dict | None`` annotation can produce, and which one a given fastmcp
-    emits is its business, not this contract's. Reading both keeps the row
-    asserting what the schema MEANS rather than how the library formats it.
-    """
-    if isinstance(schema.get('anyOf'), list):
-        branch_types = (
-            branch.get('type') for branch in schema['anyOf'] if isinstance(branch, dict)
-        )
-        return {name for name in branch_types if isinstance(name, str)}
-    declared = schema.get('type')
-    if isinstance(declared, list):
-        return {name for name in declared if isinstance(name, str)}
-    return {declared} if isinstance(declared, str) else set()
-
-
 class TestEveryToolDeclaresTheOverrideParameter:
     """``metadata`` must be part of the ADVERTISED contract of every tool here.
 
@@ -878,7 +821,7 @@ class TestEveryToolDeclaresTheOverrideParameter:
         for name, schema in listing.items():
             declared = schema.get('properties', {}).get('metadata')
             assert isinstance(declared, dict), name
-            assert _type_alternatives(declared) == {'object', 'null'}, (
+            assert type_alternatives(declared) == {'object', 'null'}, (
                 f'{name} declares metadata as {declared!r}'
             )
 
@@ -1159,7 +1102,7 @@ class TestUnrepairableResidueIsPreserved:
         assert record['level'] == 2
         assert record['tool'] == 'add_design_decision'
         assert record['field'] == 'decision'
-        assert record['matched_pattern'] == _close('decision')
+        assert record['matched_pattern'] == closer('decision')
         assert record['raw_value'] == UNREPAIRABLE_DECISION
 
     @pytest.mark.asyncio
@@ -1345,7 +1288,7 @@ class TestUnrepairableResidueIsPreserved:
         )
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['matched_pattern'] == _close('decision')
+        assert payload['matched_pattern'] == closer('decision')
         assert payload['escalation_id'] is None, (
             'the caller is better told nothing than pointed at a record that '
             'was never written'

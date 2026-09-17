@@ -32,10 +32,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _markup_helpers import LT, assert_no_raw_sentinels, closer, type_alternatives
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, verdict_tools
@@ -78,38 +79,11 @@ def specimen(tool_use_id: str) -> dict[str, Any]:
     raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
 
 
-# ---------------------------------------------------------------------------
-# Sentinel BUILDERS — how markup enters this module OTHER than via the corpus.
-# ---------------------------------------------------------------------------
-#
-# The corpus escapes every literal as ``\u003c``, which is why this file could
-# carry specimens without ever spelling one. A hand-authored specimen has to
-# earn the same property: a raw envelope literal here would corrupt the very
-# tool call that edits this file (the rationale recorded at
-# ``shared/src/shared/toolcall_markup.py`` lines 52-62), so it is BUILT from
-# ``chr(60)`` exactly as the three sibling suites build theirs.
-
-_LT = chr(60)
-
-
-def _close(name: str) -> str:
-    """Build the closing tag for *name* — the mis-close shape the harness emits."""
-    return _LT + '/' + name + '>'
-
-
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal."""
-    source = Path(__file__).read_text(encoding='utf-8')
-    for sequence in (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter '):
-        if sequence in source:
-            raise AssertionError(
-                f'{Path(__file__).name} contains a RAW envelope sentinel '
-                f'({sequence!r}). Build it from _close() instead — a verbatim '
-                'literal here corrupts the tool call that writes this file.'
-            )
-
-
-_assert_no_raw_sentinels()
+# The corpus escapes every literal as ``\u003c``, which is why this file can
+# carry specimens without ever spelling one. A hand-authored specimen earns the
+# same property through ``_markup_helpers``, which owns the builders and the
+# import-time self-scan for every markup suite in this package.
+assert_no_raw_sentinels(__file__)
 
 
 #: Recovers the REQUIRED list-typed ``issues`` — PRD boundary row B14's shape.
@@ -685,24 +659,6 @@ _ROLE_TOOL = {
 }
 
 
-def _type_alternatives(schema: dict[str, Any]) -> set[str]:
-    """The JSON-Schema type names *schema* accepts, however it spells them.
-
-    ``anyOf`` branches and a list-valued ``type`` are the two renderings a
-    ``dict | None`` annotation can produce; which one a given fastmcp emits is
-    its business, not this contract's.
-    """
-    if isinstance(schema.get('anyOf'), list):
-        branch_types = (
-            branch.get('type') for branch in schema['anyOf'] if isinstance(branch, dict)
-        )
-        return {name for name in branch_types if isinstance(name, str)}
-    declared = schema.get('type')
-    if isinstance(declared, list):
-        return {name for name in declared if isinstance(name, str)}
-    return {declared} if isinstance(declared, str) else set()
-
-
 class TestEveryRoleToolDeclaresTheOverrideParameter:
     """FORWARD_REPAIR still bounces a caller, so the hatch must exist here too.
 
@@ -760,7 +716,7 @@ class TestEveryRoleToolDeclaresTheOverrideParameter:
         declared = schema.get('properties', {}).get('metadata')
 
         assert isinstance(declared, dict)
-        assert _type_alternatives(declared) == {'object', 'null'}
+        assert type_alternatives(declared) == {'object', 'null'}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('role', ALL_BRANCHES)
@@ -782,8 +738,8 @@ class TestEveryRoleToolDeclaresTheOverrideParameter:
 #: finding IS about this leak. Unrepairable by construction: the tail after the
 #: first closer is ordinary prose, so no candidate parses.
 QUOTED_SUMMARY = (
-    'The reviewed diff emits ' + _close('summary') + ' mid-value and then '
-    + _close('invoke') + ', which is what the guard matches on.'
+    'The reviewed diff emits ' + closer('summary') + ' mid-value and then '
+    + closer('invoke') + ', which is what the guard matches on.'
 )
 
 #: The same field with nothing to quote. The byte-comparison row needs two runs
@@ -895,8 +851,8 @@ class TestTheDeliberateQuotingOverrideOnThisServer:
 #: made ``metadata`` a recovery TARGET here — which nothing about "make the
 #: hatch schema-legal" would lead a reader to expect.
 METADATA_TAIL_SUMMARY = (
-    'The reviewed diff leaks its own envelope.' + _close('summary') + '\n'
-    + _LT + 'parameter name="metadata">swallowed tail'
+    'The reviewed diff leaks its own envelope.' + closer('summary') + '\n'
+    + LT + 'parameter name="metadata">swallowed tail'
 )
 
 
