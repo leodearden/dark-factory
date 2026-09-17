@@ -957,6 +957,26 @@ def run_stdin_heartbeat(
     double close can close an unrelated descriptor that has since reused the
     number.
 
+    A failed beat never raises out of this loop and never alters the
+    dispatch's returned ``(rc, stdout, stderr)``, for three separately benign
+    reasons:
+
+    * ``BrokenPipeError`` / ``ConnectionResetError`` — the child is already
+      gone (EPIPE).  The existing transport-failure handling (non-zero rc or
+      unparseable stdout -> ``RunnerUnavailable`` -> re-dispatch or local
+      fallback) already covers the dead-channel outcome, so a beat losing the
+      race to that teardown is not news.
+    * ``BlockingIOError`` — the write end is non-blocking and the pipe is
+      full.  Skipping the beat is the correct answer: a full pipe proves the
+      channel is alive but undrained, which is not the condition the watchdog
+      exists to detect, and blocking here instead would park this thread
+      indefinitely and wedge the dispatch's teardown join.
+
+    The tuple is deliberately narrow.  Any other ``OSError`` — EBADF, ENOSPC
+    — propagates and ends the thread, because none of them has a benign
+    reading and a thread dying loudly into the journal beats a producer that
+    silently stops beating while the dispatch believes it is covered.
+
     *write_fn* / *close_fn* are injectable (default ``os.write`` /
     ``os.close``) so tests can script deterministic behavior without a real
     pipe or wall-clock waits, mirroring the watchdog's *select_fn* /
@@ -964,7 +984,8 @@ def run_stdin_heartbeat(
     """
     try:
         while not stop_event.wait(interval):
-            write_fn(write_fd, HEARTBEAT_TOKEN)
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, BlockingIOError):
+                write_fn(write_fd, HEARTBEAT_TOKEN)
     finally:
         with contextlib.suppress(OSError):
             close_fn(write_fd)
