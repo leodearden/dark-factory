@@ -141,9 +141,20 @@ SCRIPT_COVERAGE = {
 #: no python3: its whole point is that the pin prevents the render, and it is
 #: NON-VACUOUS by construction — removing the pin from ``run_sweep`` flips Y2/Y3
 #: to ``88 passed, 2 failed`` (task 3655's negative control).
+#:
+#: Dark-factory task 5566 then ported reify's K1–K6 block (esc-7244-16), which
+#: pins the conventional-commit arm of the citation grammar
+#: ``warm-lane-degenerate-ref-check.sh`` now sources from
+#: ``lib_task_citation.sh``, so the degenerate-ref floor moved 70 → 81.
+#: RE-MEASURED both sides: ``Results: 70 passed, 0 failed`` before the port, and
+#: ``Results: 81 passed, 0 failed`` after the script was rewired.  The block
+#: carries no skip guard, so 81 is both floor and measured count on any host
+#: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
+#: by construction: against the pre-port inline predicate the same block reports
+#: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 70,
+    'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
     'test_thin_warm_lane.sh': 45,
     'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5)
