@@ -626,8 +626,12 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its four seed entries against the REAL fused-memory source
-    root — not a tmp_path fixture.
+    and re-verifies its entries against the REAL fused-memory source root — not
+    a tmp_path fixture.
+
+    The COUNT is deliberately not stated here: it lives in exactly one place,
+    `test_shipped_registry_has_five_entries`, which reds when the registry grows
+    rather than going quietly stale the way a prose count does.
 
     Confirmed base-branch facts (see task-1972 analysis):
     - src/fused_memory/services/memory_service.py contains "invalid_at".
@@ -649,6 +653,15 @@ class TestSeedRegistryRealSource:
       wired into the stage that files remediation tasks. It rides along with
       the shared escalation-store boundary note (rendered as a subsection of
       it), so that render call is the wiring token, not the constant name.
+
+    Confirmed facts for the expired_at entry (task 4984):
+    - src/fused_memory/backends/graphiti_client.py contains
+      "_ALL_VALID_EDGES_MATCH", "def get_valid_edges_for_node" and
+      "WHERE e.invalid_at IS NULL", and does NOT contain "e.expired_at IS NULL"
+      — the absence being what makes the premise refuted AND self-correcting.
+    - src/fused_memory/services/memory_service.py contains
+      "_restore_falsely_superseded_sibling_edges" and "clear_invalid_at=True" —
+      the restore hooks an expired_at filter would re-hide the edges of.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/

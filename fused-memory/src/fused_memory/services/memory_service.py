@@ -4359,11 +4359,9 @@ class MemoryService:
         # the replay pass no diagnosis — see `_REFERENT_FINDING_WARN_CAP`.
         warned = 0
         suppressed = 0
-        # ONCE, outside the loop: every finding here belongs to this one
-        # episode, and `_episode_uuid_of` fails closed to `''` rather than
-        # raising on a malformed or MagicMock result — a row that cannot name
-        # its episode is still a diagnosis worth keeping.
-        episode_uuid = _episode_uuid_of(result)
+        # Collected here, written ONCE below the loop — see the journal block
+        # further down for why the batch and not a row per finding.
+        to_journal: list[dict[str, Any]] = []
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -4399,22 +4397,11 @@ class MemoryService:
             # WARNING below. Widening it is a one-predicate change if phase 5
             # ever wants the operator history.
             #
-            # NO GUARD HERE: `log_referent_finding` is fire-and-forget by
-            # contract, so the already-committed episode write cannot be lost to
-            # a journal fault (one guard, at one site). A `None` journal is
-            # skipped silently because the counters remain the unconditional
-            # INV-4 escape — a per-finding warning for an unconfigured journal
-            # would be a storm, not a signal.
-            #
-            # COST: one sqlite WAL commit (~1-5 ms) inside the per-group
-            # identity lock, on the ~0.2%-of-edges finding path only. The
-            # ~99.8% clean path never reaches this loop at all.
+            # COLLECTED HERE, COMMITTED ONCE below the loop. The payload is
+            # built only when there is a journal to take it, so the unwired
+            # path allocates nothing.
             if finding.resolvable and self._write_journal is not None:
-                await self._write_journal.log_referent_finding(
-                    payload=finding.to_dict(),
-                    group_id=group_id,
-                    episode_uuid=episode_uuid,
-                )
+                to_journal.append(finding.to_dict())
             # WARNING, not DEBUG — but NOT WARNING for every finding.
             #
             # WARNING is right for the shape this pass exists to catch. The task
@@ -4486,6 +4473,32 @@ class MemoryService:
                     level, 'Referent verification finding: %s',
                     finding.to_dict(),
                 )
+
+        if to_journal and self._write_journal is not None:
+            # ONE COMMIT PER EPISODE, not one per finding. Every commit is a
+            # `synchronous=FULL` fsync (~1-5 ms, and up to the journal's 5000 ms
+            # busy_timeout under contention) taken while the per-group identity
+            # lock serializes same-group writes, and the loop above has NO
+            # ceiling on its findings — the warn cap is a log policy. Per
+            # finding, a storm episode of 50-100 misattached ends would hold
+            # that lock for 50-500 ms of fsyncs; batched, the whole episode
+            # costs one. The ~99.8% clean path never reaches this line at all.
+            #
+            # NO GUARD HERE: `log_referent_findings` is fire-and-forget by
+            # contract, so the already-committed episode write cannot be lost to
+            # a journal fault (one guard, at one site). A `None` journal is
+            # skipped silently because the counters remain the unconditional
+            # INV-4 escape — a warning for an unconfigured journal would be a
+            # storm, not a signal.
+            #
+            # `_episode_uuid_of` fails closed to `''` rather than raising on a
+            # malformed or MagicMock result: a row that cannot name its episode
+            # is still a diagnosis worth keeping.
+            await self._write_journal.log_referent_findings(
+                to_journal,
+                group_id=group_id,
+                episode_uuid=_episode_uuid_of(result),
+            )
 
         if suppressed:
             # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply

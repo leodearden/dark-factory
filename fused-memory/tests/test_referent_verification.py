@@ -3217,6 +3217,41 @@ class TestResolvableFindingsAreJournalledDurably:
         }
 
     @pytest.mark.asyncio
+    async def test_a_storm_episode_costs_one_commit_not_one_per_finding(
+        self, service, tmp_path, monkeypatch,
+    ):
+        """This loop runs INSIDE the per-group identity lock, which serializes
+        same-group writes, and every journal commit is a `synchronous=FULL`
+        fsync. Since the finding count has no ceiling here — the cap above is
+        log-only — a row-at-a-time write would make a storm episode hold that
+        lock for the sum of its fsyncs. One episode, one commit.
+
+        Counts commits on the connection because the commit count IS the
+        property under test: the rows it produces are identical either way.
+        """
+        cap = _warn_cap()
+        journal = await _wired_journal(service, tmp_path)
+        commits = 0
+        real_commit = journal._db.commit
+
+        async def _counting_commit():
+            nonlocal commits
+            commits += 1
+            await real_commit()
+
+        monkeypatch.setattr(journal._db, 'commit', _counting_commit)
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_finding_storm_episode(cap + 5)),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(stats.findings) == cap + 5
+        assert len(rows) == cap + 5
+        assert commits == 1
+
+    @pytest.mark.asyncio
     async def test_the_pass_is_unchanged_by_an_absent_or_failing_journal(
         self, service, tmp_path,
     ):

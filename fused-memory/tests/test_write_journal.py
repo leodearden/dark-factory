@@ -1739,3 +1739,132 @@ async def test_referent_findings_do_not_disturb_the_existing_schema(tmp_path):
 
     assert [o['id'] for o in ops] == [op_id]
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_one_episode_is_one_commit_however_many_findings_it_carries(
+    journal, monkeypatch,
+):
+    """Every commit here is a `synchronous=FULL` fsync taken while the caller
+    holds the per-group identity lock, and an episode's finding count has no
+    ceiling — the verify pass's warn cap is documented as capping the log and
+    nothing else. A row at a time, a storm episode of 50-100 misattached ends
+    would hold that lock for 50-500 ms of fsyncs.
+
+    Counts commits on the connection because the commit count IS the property:
+    the rows, the order and the payloads are all identical either way, so no
+    public surface distinguishes one transaction from N.
+    """
+    commits = 0
+    real_commit = journal._db.commit
+
+    async def _counting_commit():
+        nonlocal commits
+        commits += 1
+        await real_commit()
+
+    monkeypatch.setattr(journal._db, 'commit', _counting_commit)
+    payloads = [_finding_payload(edge_uuid=f'e{n}') for n in range(10)]
+
+    await journal.log_referent_findings(
+        payloads, group_id='reify', episode_uuid='ep-1',
+    )
+
+    assert commits == 1
+    rows = await journal.get_referent_findings()
+    assert [r['payload'] for r in rows] == payloads
+
+
+@pytest.mark.asyncio
+async def test_a_batch_keeps_its_order_despite_sharing_one_timestamp(journal):
+    """One batch is one episode's diagnosis taken at one moment, so its rows
+    deliberately share a `created_at` — which makes the timestamp useless as an
+    ordering key. `seq` (the rowid, assigned at INSERT) is what orders them,
+    and it keeps ordering them across batches too."""
+    first = [_finding_payload(edge_uuid=f'a{n}') for n in range(3)]
+    second = [_finding_payload(edge_uuid=f'b{n}') for n in range(2)]
+
+    await journal.log_referent_findings(
+        first, group_id='reify', episode_uuid='ep-1',
+    )
+    await journal.log_referent_findings(
+        second, group_id='reify', episode_uuid='ep-2',
+    )
+
+    rows = await journal.get_referent_findings()
+    assert [r['payload']['edge_uuid'] for r in rows] == [
+        'a0', 'a1', 'a2', 'b0', 'b1',
+    ]
+    assert [r['seq'] for r in rows] == sorted(r['seq'] for r in rows)
+    assert len({r['created_at'] for r in rows[:3]}) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reader_pages_forward_instead_of_re_reading_the_oldest_page(
+    journal,
+):
+    """The table has no status column to mark a row handled and no prune path,
+    so `limit` alone hands a consumer the SAME oldest page forever once the
+    table outgrows it. `after_seq` is the only thing that advances a reader."""
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid=f'e{n}') for n in range(5)],
+        group_id='reify', episode_uuid='ep-1',
+    )
+    await journal.log_referent_finding(
+        payload=_finding_payload(edge_uuid='other', group_id='dark_factory'),
+        group_id='dark_factory', episode_uuid='ep-2',
+    )
+
+    pages = []
+    cursor = None
+    while True:
+        page = await journal.get_referent_findings(
+            group_id='reify', after_seq=cursor, limit=2,
+        )
+        if not page:
+            break
+        pages.append([r['payload']['edge_uuid'] for r in page])
+        cursor = page[-1]['seq']
+
+    assert pages == [['e0', 'e1'], ['e2', 'e3'], ['e4']]
+    # Without the cursor the same oldest page comes back every time.
+    assert [
+        r['payload']['edge_uuid']
+        for r in await journal.get_referent_findings(group_id='reify', limit=2)
+    ] == ['e0', 'e1']
+    # The cursor does not leak rows across the project discriminator.
+    assert await journal.get_referent_findings(
+        group_id='reify', after_seq=0, limit=100,
+    ) == await journal.get_referent_findings(group_id='reify', limit=100)
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_batch_counts_every_row_it_lost(tmp_path):
+    """`journal_drop_stats` reports rows LOST, not calls failed — a batch that
+    counted 1 would under-report a storm episode by two orders of magnitude."""
+    uninitialized = WriteJournal(tmp_path / 'never_initialized')
+
+    await uninitialized.log_referent_findings(
+        [_finding_payload() for _ in range(3)],
+        group_id='reify', episode_uuid='ep-1',
+    )
+
+    assert uninitialized.journal_drop_stats() == {
+        'dropped_total': 3, 'by_operation': {'referent_finding': 3},
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_empty_batch_touches_nothing(journal, tmp_path):
+    """The common case for a clean episode. It must cost no transaction, and
+    must not be counted as a loss — on an unusable journal either."""
+    await journal.log_referent_findings(
+        [], group_id='reify', episode_uuid='ep-1',
+    )
+    uninitialized = WriteJournal(tmp_path / 'never_initialized')
+    await uninitialized.log_referent_findings(
+        [], group_id='reify', episode_uuid='ep-1',
+    )
+
+    assert await journal.get_referent_findings() == []
+    assert uninitialized.journal_drop_stats()['dropped_total'] == 0
