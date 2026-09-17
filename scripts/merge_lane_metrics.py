@@ -1053,6 +1053,14 @@ def derive_totals(report: dict) -> dict[str, int]:
 # asserted by a test rather than left to formatting habit -- see
 # ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
 
+# The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
+# baseline holds the frozen measures; its sidecar ledger holds the provenance of
+# every raise that was ever authorized against them. Both paths are named here,
+# above the README that cites them, because the remedy text an agent reads when
+# the gate goes red is composed from them.
+BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
+LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
+
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
@@ -1465,9 +1473,6 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
 # CLI, in the house shape of scripts/scan_task_toolcall_leaks.py: _build_parser()
 # / _render_table() / main(argv) -> int, with the exit ladder documented in the
 # module docstring above (0 clean, 1 ratchet violations, 2 instrument failure).
-
-#: Where the committed baseline lives, relative to the repo root.
-BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
 
 
 def repo_root() -> Path:
