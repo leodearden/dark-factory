@@ -668,6 +668,61 @@ class TestEmitRecoveryVetoStreakEscalation:
         # operator can retune or silence a noisy detector without a restart.
         assert 'recovery_emission' in esc.suggested_action
 
+    def test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated(self, tmp_path):
+        """Pin the ``Pinning escalations:`` detail line — a REMOTE consumer parses it.
+
+        The root_cause rule under "Recovery veto-streak sentinel L1s" in
+        ``skills/escalation-watcher-auto/SKILL.md`` reads this ONE line out of
+        ``detail`` to mint the promote key
+        ``recovery-veto-streak-noise-from-pending-l2-pin:<ids joined with +>``.
+        That consumer is a prompt, so it cannot fail loudly: a reformat of the
+        ``detail`` f-string in
+        ``orchestrator/src/orchestrator/recovery_emission.py::emit_recovery_veto_streak_escalation``
+        would silently degrade the rule back into the single over-folded bucket
+        that key exists to split.  This test is what makes such a reformat
+        visible to whoever makes it.
+
+        Two properties the rule leans on, and therefore must not drift.  (1) The
+        ids arrive SORTED and DEDUPED across buckets — ``_flatten_ids`` returns
+        ``sorted(set(...))`` — so the minted key is stable whatever order the
+        caller passed them in, and the rule can say "read them in the order
+        given" rather than asking a rotation to sort.  (2) Each id carries a
+        trailing parenthetical age, so extraction must strip a trailing
+        ``  (...)`` per entry rather than taking a comma-split token whole.
+
+        Characterization guard, GREEN on arrival: the emitter is already correct.
+        Its job is to lock a currently-unpinned contract, not to drive a
+        red-to-green cycle.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(**_streak_kwargs(
+            queue,
+            # Deliberately unsorted, with esc-1000-2 in TWO buckets.
+            escalation_ids={
+                'queue_handoff': ['esc-9999-1', 'esc-1000-2'],
+                'dead_l0': ['esc-5000-3', 'esc-1000-2'],
+                'non_pinning': [],
+            },
+            ages_secs={'esc-9999-1': 7200.0},
+        )) is True
+
+        esc = queue.get_by_task(_streak_sentinel('3535'), status='pending')[0]
+        lines = [l for l in esc.detail.splitlines() if l.startswith('Pinning escalations: ')]
+        assert len(lines) == 1, f'the rule reads ONE whole line, got {lines}'
+        assert lines[0] == (
+            'Pinning escalations: esc-1000-2 (age unknown), '
+            'esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)'
+        )
+
+        # Exactly the extraction the SKILL.md rule documents, run for real.
+        ids = [e.split(' (')[0] for e in lines[0].split(': ', 1)[1].split(', ')]
+        assert ids == ['esc-1000-2', 'esc-5000-3', 'esc-9999-1'], (
+            'ids must reach the rule sorted and deduped across buckets, so the '
+            'key it mints does not depend on bucket iteration order'
+        )
+
     def test_dedups_against_a_still_open_sentinel_l1(self, tmp_path):
         """Boundary #17 — no storm.
 
