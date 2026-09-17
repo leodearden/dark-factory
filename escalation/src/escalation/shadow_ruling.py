@@ -33,12 +33,14 @@ it is not a design to build on.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import sys
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
@@ -435,3 +437,129 @@ def agreement_report(
         unresolved=unresolved,
         resolver_tiers=MappingProxyType(dict(sorted(tiers.items()))),
     )
+
+
+#: How far back ``main`` looks when no window is given — "weekly", per
+#: ``docs/escalation-standing-policy.md``.
+_DEFAULT_WINDOW = timedelta(days=7)
+
+_ROW = '{cls:<40} {agreed:>7} {diverged:>9} {not_comparable:>15} {comparable:>11} {rate:>8}'
+
+
+def _as_json(report: AgreementReport) -> str:
+    return json.dumps(
+        {
+            'since': report.since.isoformat(),
+            'until': report.until.isoformat(),
+            'classes': [
+                {
+                    'class': c.ruling_class,
+                    'agreed': c.agreed,
+                    'diverged': c.diverged,
+                    'not_comparable': c.not_comparable,
+                    'comparable': c.comparable,
+                    'total': c.total,
+                    'agreement_rate': c.agreement_rate,
+                }
+                for c in report.classes
+            ],
+            'gated_stamps': report.gated_stamps,
+            'self_resolved': report.self_resolved,
+            'unresolved': report.unresolved,
+            'resolver_tiers': dict(report.resolver_tiers),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _as_table(report: AgreementReport) -> str:
+    """Render the report so an operator can paste it and a reader can decide.
+
+    Every number the adoption threshold needs is on the page: the comparable
+    DENOMINATOR beside the rate, and the three excluded buckets — always, even
+    at zero. A class whose stamps were mostly thrown out for self-agreement is
+    not a class with a small sample, and the output must not let the two look
+    alike.
+    """
+    lines = [
+        f'shadow ruling agreement — window {report.since.isoformat()} .. '
+        f'{report.until.isoformat()}',
+        '',
+    ]
+    if report.classes:
+        lines.append(_ROW.format(
+            cls='class', agreed='agreed', diverged='diverged',
+            not_comparable='not_comp', comparable='comparable', rate='rate',
+        ))
+        for c in report.classes:
+            rate = 'n/a' if c.agreement_rate is None else f'{c.agreement_rate * 100:.1f}%'
+            lines.append(_ROW.format(
+                cls=c.ruling_class, agreed=c.agreed, diverged=c.diverged,
+                not_comparable=c.not_comparable, comparable=c.comparable, rate=rate,
+            ))
+    else:
+        lines.append('no shadow rulings in window')
+    lines.extend([
+        '',
+        f'gated_stamps={report.gated_stamps} self_resolved={report.self_resolved} '
+        f'unresolved={report.unresolved}',
+        'resolver_tiers: ' + (
+            ' '.join(f'{tier}={n}' for tier, n in report.resolver_tiers.items()) or '(none)'
+        ),
+    ])
+    return '\n'.join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ``python -m escalation.shadow_ruling``.
+
+    Invoked from the repo root as::
+
+        uv run --directory escalation python -m escalation.shadow_ruling \\
+            --queue-dir <project_root>/data/escalations
+
+    Read-only: it opens escalation JSON and prints. It never resolves, stamps or
+    moves anything.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'Weekly shadow-ruling agreement count: how often a stamped proposal '
+            'matched what actually happened. Measurement only — grants no authority.'
+        ),
+    )
+    parser.add_argument(
+        '--queue-dir', required=True, type=Path,
+        help='Path to the escalation queue directory (parent of archive/).',
+    )
+    parser.add_argument(
+        '--since', default=None,
+        help='ISO-8601 window start on resolved_at (default: 7 days ago).',
+    )
+    parser.add_argument(
+        '--until', default=None,
+        help='ISO-8601 window end on resolved_at (default: now).',
+    )
+    parser.add_argument(
+        '--json', action='store_true', default=False,
+        help='Emit machine-readable JSON instead of the table.',
+    )
+    args = parser.parse_args(argv)
+
+    # LOUD, not an all-zero table: an empty report and a misconfigured path must
+    # not look identical, or a typo'd path reads back as a clean measurement.
+    if not args.queue_dir.is_dir():
+        print(f'queue-dir is not a directory: {args.queue_dir}', file=sys.stderr)
+        return 2
+
+    now = datetime.now(UTC)
+    until = datetime.fromisoformat(args.until) if args.until else now
+    since = datetime.fromisoformat(args.since) if args.since else until - _DEFAULT_WINDOW
+
+    report = agreement_report(args.queue_dir, since=since, until=until)
+    print(_as_json(report) if args.json else _as_table(report))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
