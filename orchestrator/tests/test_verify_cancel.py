@@ -1850,6 +1850,57 @@ class TestRunStdinHeartbeat:
         assert writes == []
         assert closed == [7]
 
+    @pytest.mark.parametrize(
+        'benign_error', [BrokenPipeError, ConnectionResetError, BlockingIOError]
+    )
+    def test_swallows_a_dead_or_full_channel_and_keeps_beating(self, benign_error):
+        """A failed beat is swallowed and the loop beats on; the fd is still closed.
+
+        BrokenPipeError / ConnectionResetError are today's deliberate
+        suppression (the child is already gone — the transport-failure path
+        handles that outcome).  BlockingIOError is the non-blocking write
+        end's full-pipe signal, which proves the channel is alive but
+        undrained — not the condition the watchdog exists to detect.
+        """
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        attempts: list[int] = []
+        succeeded: list[int] = []
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            attempts.append(fd)
+            if len(attempts) <= 2:
+                raise benign_error('channel dead or full')
+            if len(attempts) == 3:
+                succeeded.append(fd)
+                return len(data)
+            stop.set()
+            return len(data)
+
+        run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert len(attempts) == 4  # a failed beat does NOT end the loop
+        assert succeeded == [7]
+        assert closed == [7]
+
+    def test_an_unexpected_error_ends_the_loop_but_still_closes_the_fd(self):
+        """EBADF has no benign reading: it propagates — and the finally still closes the fd."""
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            raise OSError(errno.EBADF, 'bad fd')
+
+        with pytest.raises(OSError) as excinfo:
+            run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert excinfo.value.errno == errno.EBADF
+        assert closed == [7]
+
 
 # ---------------------------------------------------------------------------
 # Task 2308 γ step-1: run_stdin_watchdog — fd-0 trigger loop
