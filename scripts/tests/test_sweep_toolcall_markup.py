@@ -1133,31 +1133,37 @@ def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
     assert [o.action for o in again_outcomes].count(sweep.ACTION_REPAIRED) == 0
 
 
+def _never_converges(value, param, schema_params, supplied):
+    """A ``repair`` stub that always "repairs", so no document reaches a fixed point.
+
+    Module-level rather than nested in one test: two rows now need a
+    non-converging document and they must drive the loop bound the SAME way,
+    or "the sweep stalled" means something subtly different in each.
+
+    Stubbing ``repair`` rather than hand-building a document is deliberate.
+    With the real repairer no document can reach the bound — a recovered value
+    can never contain a further mis-close (B5 refuses the parse) — so the only
+    honest way to exercise the bound is at the seam. Only a value the per-field
+    ``detect_for`` gate already flagged ever gets here, so a clean document is
+    unaffected by the stub.
+    """
+    return sweep.Repair(
+        clean_value=value,
+        recovered={'root_cause': 'restored by the stub'},
+        pattern=INVOKE_CLOSER,
+        misclose=INVOKE_CLOSER,
+    )
+
+
 def test_a_non_converging_document_reports_did_not_converge(monkeypatch):
     """Case (b): the bound truncates the LOOP, never a repair.
 
-    Driven through a stubbed ``repair`` rather than a hand-built document, and
-    deliberately so: with the real repairer no document can reach the bound —
-    a recovered value can never contain a further mis-close (B5 refuses the
-    parse), so one round always converges on every shape repair() accepts. That
-    is exactly why the loop is INSURANCE rather than routine machinery, and why
-    its bound has to be tested at the seam instead of through a fixture that
-    cannot exist today.
-
-    What must hold when the bound is hit: the document is still valid, every
-    repair already applied is INTACT, and the failure is reported loudly with
-    the path that was still changing — never silently truncated into a
-    plausible-looking clean result.
+    Driven through :func:`_never_converges`, which records why the bound can
+    only be reached at that seam. What must hold when it IS reached: the
+    document is still valid, every repair already applied is INTACT, and the
+    failure is reported loudly with the path that was still changing — never
+    silently truncated into a plausible-looking clean result.
     """
-    def _never_converges(value, param, schema_params, supplied):
-        # Always "repairs", never reaching a fixed point.
-        return sweep.Repair(
-            clean_value=value,
-            recovered={'root_cause': 'restored by the stub'},
-            pattern=INVOKE_CLOSER,
-            misclose=INVOKE_CLOSER,
-        )
-
     monkeypatch.setattr(sweep, 'repair', _never_converges)
     record = make_escalation('esc-8-2', 'resolved', 'detail ' + INVOKE_CLOSER)
 
@@ -2511,6 +2517,83 @@ def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
     assert summary.skipped_with_markup == 1, (
         'green exit, and the report still says corruption was seen'
     )
+
+
+def test_a_non_converging_plan_under_a_live_lane_cannot_redden_the_status(
+    tmp_path, monkeypatch
+):
+    """(b3) The other half of (b2): the scan now sees STALLS it cannot act on.
+
+    THE DEFECT THE ROW ABOVE LEFT BEHIND. Moving the scan ahead of the write
+    gates made every counter it feeds reachable for a file the sweep then
+    REFUSES — and ``did_not_converge`` is the one residue counter
+    :meth:`Summary.exit_code` reads FIRST. A non-converging plan under a LIVE
+    lane would therefore have exited 3 on every periodic run forever, with no
+    action available: this sweep declines to write that file BY DESIGN, so no
+    re-run and no ``--apply`` could ever clear it. That directly contradicts
+    the module docstring's own promise that nothing observed about a refused
+    file can redden the status.
+
+    THE FIX IS THE SAME ONE (b2) ALREADY MADE for ``skipped_with_markup``:
+    bank the observation into a report-only counter of its own. The tree here
+    is a SINGLE live lane, so the stub cannot reach a writable file and the
+    green exit below is about the refusal rather than about an empty corpus.
+    """
+    root = tmp_path / 'repo'
+    write_plan(
+        root / '.worktrees' / '.task-meta' / '7002' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    (root / '.worktrees' / '7002').mkdir(parents=True, exist_ok=True)
+    before = _fingerprint(root)
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+
+    summary, diffs = sweep.run_sweep(root, lane=sweep.LANE_META_PLANS)
+
+    # (a) the refusal is what it always was, and the stall is REPORTED.
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.skipped_did_not_converge == 1, (
+        'the operator must still be told the document stalled'
+    )
+    assert summary.skipped_with_markup == 1
+
+    # (b) ...and it is reported through a channel the STATUS does not read.
+    assert summary.did_not_converge == 0, (
+        'a stall on a file this sweep refuses to write is not dead-lane work'
+    )
+    assert summary.exit_code() == sweep.EXIT_CLEAN, (
+        'exit 3 here would be permanent: there is no action that clears it'
+    )
+
+    # (c) and scanning it still writes nothing.
+    assert diffs == []
+    assert summary.pending == 0
+    assert _fingerprint(root) == before
+
+
+def test_a_non_converging_plan_the_sweep_MAY_write_still_reddens_the_status(
+    tmp_path, monkeypatch
+):
+    """The positive control for the row above: the tripwire still fires.
+
+    Same stub, same specimen, one difference — no ``.worktrees/<id>`` beside
+    the meta-root, so the plan belongs to a DEAD lane and this sweep owns it.
+    Without this row, ``skipped_did_not_converge`` could be implemented by
+    never counting a stall at all and (b3) would still pass.
+    """
+    root = tmp_path / 'repo'
+    write_plan(
+        root / '.worktrees' / '.task-meta' / '7001' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+
+    summary, _diffs = sweep.run_sweep(root, lane=sweep.LANE_META_PLANS)
+
+    assert summary.skipped == {}
+    assert summary.did_not_converge == 1
+    assert summary.skipped_did_not_converge == 0
+    assert summary.exit_code() == sweep.EXIT_DID_NOT_CONVERGE
 
 
 def test_never_touch_still_fires_for_a_meta_plans_shaped_target(meta_plans_root):
