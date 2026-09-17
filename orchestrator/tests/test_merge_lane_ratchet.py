@@ -2091,6 +2091,111 @@ class TestAuthorizedRaise:
             authorization.task_id = '9999'  # type: ignore[misc]
 
 
+class TestAuthorizedRaiseLedger:
+    """The ledger file's own contract, and the polarity split it makes deliberate."""
+
+    @staticmethod
+    def _record(task_id: str) -> dict:
+        return metrics.authorization_record(
+            metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
+            [metrics._violation('lines', _MQ, 21550, 21653)],
+        )
+
+    def test_absence_is_empty_here_and_fatal_for_the_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        # THE ASYMMETRY, asserted side by side so it reads as deliberate rather
+        # than as one of the two having been overlooked. An absent BASELINE would
+        # compare clean against every measure -- a silent disarming, so it is a
+        # hard failure (INV-11). An absent LEDGER means no raise was ever
+        # authorized, which is the fail-CLOSED state: it permits nothing.
+        missing = tmp_path / 'nope.json'
+
+        assert metrics.load_ledger(missing)['raises'] == []
+
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.load_baseline(missing)
+        assert 'nope.json' in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ('content', 'why'),
+        [
+            pytest.param('{"raises": ', 'invalid JSON', id='truncated'),
+            pytest.param('[]', 'a JSON array at top level', id='array'),
+            pytest.param('{"raises": {}}', 'a non-list raises', id='raises-not-list'),
+            pytest.param('{}', 'no raises key at all', id='raises-missing'),
+        ],
+    )
+    def test_a_malformed_ledger_is_a_named_hard_failure(
+        self, tmp_path: Path, content: str, why: str
+    ) -> None:
+        # A ledger that cannot be parsed is one whose entries cannot be audited.
+        # Reading it as empty would hide history, so corruption -- unlike
+        # absence -- fails hard and names the file.
+        target = tmp_path / 'ledger.json'
+        target.write_text(content, encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.load_ledger(target)
+        assert 'ledger.json' in str(excinfo.value), why
+
+    def test_render_round_trips_without_dropping_an_entry(self) -> None:
+        ledger = metrics.empty_ledger()
+        ledger['raises'] = [self._record('5342'), self._record('5500')]
+        assert json.loads(metrics.render_ledger(ledger))['raises'] == ledger['raises']
+
+    def test_rendering_is_idempotent(self) -> None:
+        ledger = metrics.empty_ledger()
+        ledger['raises'] = [self._record('5342')]
+        once = metrics.render_ledger(ledger)
+        assert metrics.render_ledger(json.loads(once)) == once
+
+    def test_leads_with_a_readme_and_ends_with_one_newline(self) -> None:
+        text = metrics.render_ledger(metrics.empty_ledger())
+        assert text.splitlines()[1].lstrip().startswith('"_README":')
+        assert text.endswith('\n') and not text.endswith('\n\n')
+
+    def test_append_preserves_prior_entries_in_order(self, tmp_path: Path) -> None:
+        # APPEND-ONLY means history is never rewritten: a reviewer reading the
+        # file reads every raise the baseline has ever absorbed.
+        target = tmp_path / 'ledger.json'
+        written = [self._record(task_id) for task_id in ('5342', '5500', '5600')]
+        for record in written:
+            metrics.append_authorization(target, record)
+
+        stored = metrics.load_ledger(target)['raises']
+        assert [entry['task_id'] for entry in stored] == ['5342', '5500', '5600']
+        assert stored[:2] == written[:2]
+
+    def test_append_on_a_missing_path_creates_a_legible_file(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'ledger.json'
+        metrics.append_authorization(target, self._record('5342'))
+
+        loaded = metrics.load_ledger(target)
+        assert loaded['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
+        assert '--authorize-raise' in loaded['_README']
+
+    def test_the_committed_ledger_is_present_and_legible(self) -> None:
+        # ANTI-VACUITY for the artifact a human actually opens. Its day-one
+        # `raises` list is empty, which is a legible state -- not an absent one,
+        # and not a file whose only copy of the rule is in a docstring.
+        path = _REPO_ROOT / metrics.LEDGER_RELPATH
+        # EXISTENCE is asserted on the PATH, not inferred from load_ledger:
+        # absence reads as the empty ledger by design (the polarity pinned
+        # above), so every other assertion here would pass just as happily with
+        # nothing committed at all -- and the file a reader opens next to the
+        # baseline would not exist.
+        assert path.exists(), path
+        committed = metrics.load_ledger(path)
+        assert committed['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
+        assert '--authorize-raise' in committed['_README']
+        assert isinstance(committed['raises'], list)
+        # Written by the module's own writer, so the committed bytes stay a
+        # no-op round trip rather than drifting into a hand-edited shape.
+        assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
+
+
 # ---------------------------------------------------------------------------
 # The ratchet comparator, and INV-10 tier 1.
 #
