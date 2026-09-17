@@ -51,7 +51,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
-from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS, start_stdin_heartbeat
+from orchestrator.verify_cancel import (
+    HEARTBEAT_INTERVAL_SECS,
+    SSH_SERVER_ALIVE_COUNT_MAX,
+    SSH_SERVER_ALIVE_INTERVAL,
+    start_stdin_heartbeat,
+)
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 if TYPE_CHECKING:
@@ -996,22 +1001,12 @@ class LocalRunner:
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
 
-# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
-# connect, not a mid-session stall — if the TCP session goes silently dead
-# (NAT/conntrack timeout, network partition, wedged remote process producing
-# no output), an ssh child with no keepalive can block indefinitely. These
-# ServerAlive probes ride the live TCP session (independent of stdout cadence),
-# so ssh itself detects a dead peer and exits non-zero within
-# SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX seconds ->
-# RunnerUnavailable -> existing re-dispatch / local-fallback path (incident
-# 5111). A long-but-progressing remote verify keeps the session alive and is
-# unaffected. Values are chosen well inside the remote verify timeout budget.
-SSH_SERVER_ALIVE_INTERVAL = 15
-SSH_SERVER_ALIVE_COUNT_MAX = 4
-
 # Shared base ssh options for all four RemoteRunner ssh argv sites (health,
 # run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
-# so the keepalive flags can't drift apart across sites.
+# so the keepalive flags can't drift apart across sites. The two keepalive
+# values themselves are imported from verify_cancel, which derives the remote
+# watchdog's deadline from them (task 4195), so the transport's dead-peer
+# verdict and the watchdog's cannot drift apart either.
 _SSH_BASE_OPTS = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',

@@ -63,7 +63,8 @@ def _env_float(name: str, default: float) -> float:
     timing constants (flock wait, watchdog heartbeat timeout/grace) are
     module-level and otherwise untunable from outside the spawned
     ``verify-merge`` child, making an integration gate wall-clock-bound on
-    the 10-15s production windows. Unset, unparseable, or non-positive
+    the production windows (since task 4195, a 90.0s heartbeat timeout plus a
+    5.0s kill grace). Unset, unparseable, or non-positive
     values fall back to *default* so production behavior is byte-identical
     when the env var is absent. The non-positive guard matters beyond
     "byte-identical": every current caller feeds a timing window

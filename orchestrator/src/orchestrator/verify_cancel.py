@@ -853,6 +853,38 @@ def remove_lock_holder_pgid(worktree_base: Path) -> None:
 # contract churn.
 # ---------------------------------------------------------------------------
 
+# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
+# connect, not a mid-session stall — if the TCP session goes silently dead
+# (NAT/conntrack timeout, network partition, wedged remote process producing
+# no output), an ssh child with no keepalive can block indefinitely. These
+# ServerAlive probes ride the live TCP session (independent of stdout cadence),
+# so ssh itself detects a dead peer and exits non-zero within
+# SSH_TRANSPORT_DEAD_PEER_SECS -> RunnerUnavailable -> existing re-dispatch /
+# local-fallback path (incident 5111). A long-but-progressing remote verify
+# keeps the session alive and is unaffected. Values are chosen well inside the
+# remote verify timeout budget.
+#
+# They live HERE, rather than beside ``_SSH_BASE_OPTS`` in verify_runner.py
+# where they were defined until task 4195, because this module now derives the
+# watchdog's deadline from them — and verify_runner imports one-way from here
+# (the direction named in this module's §"Self-kill report"), so deriving in
+# the other direction would be a circular import. verify_runner re-exports both
+# names and keeps interpolating them into ``_SSH_BASE_OPTS``, so all four ssh
+# argv sites are unaffected.
+SSH_SERVER_ALIVE_INTERVAL: int = 15
+SSH_SERVER_ALIVE_COUNT_MAX: int = 4
+
+#: When ssh itself declares the peer dead and exits non-zero.
+SSH_TRANSPORT_DEAD_PEER_SECS: float = SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX
+
+#: How far past the transport's own verdict the watchdog waits before reaching
+#: its own.  Must stay ABOVE 1.0: at or below it the watchdog re-enters the band
+#: where it out-votes ssh on a question ssh is the authority for.  1.5 is the
+#: smallest conventional margin clear of that, and it clears every measured loop
+#: stall by a wide factor.
+WATCHDOG_TRANSPORT_HEADROOM: float = 1.5
+
+
 #: Heartbeat cadence (seconds) the dispatcher writes down the ssh child's
 #: stdin for the full verify span.  A module constant rather than a config
 #: leaf (PRD §11 Q2: "small constant first"; promote later only if
@@ -862,9 +894,30 @@ def remove_lock_holder_pgid(worktree_base: Path) -> None:
 HEARTBEAT_INTERVAL_SECS: float = 5.0
 
 #: The watchdog fires if no heartbeat (or EOF) arrives within this window.
-#: 2x the heartbeat cadence tolerates a single missed/delayed beat before
-#: declaring the dispatch channel dead.
-WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
+#: DERIVED from the transport rather than pinned independently of it, because
+#: the watchdog's purpose is to stop a setsid'd remote outliving a dead
+#: connection — not to reach that verdict FIRST.  ssh already declares the peer
+#: dead at SSH_TRANSPORT_DEAD_PEER_SECS (60s) and exits non-zero into the
+#: dispatcher's existing re-dispatch path, so the independently-pinned 10.0s
+#: this replaces (2x the heartbeat cadence) opened a 10-60s band in which the
+#: remote killed healthy builds on links ssh would have ridden through.
+#:
+#: Measured 2026-08-12: the orchestrator's shared event loop stalled to MAX
+#: 16.1s against that 10.0s budget, and ~53.8% of reify's remote dispatches
+#: died without unwinding — their local re-runs then passed at 78.7%, i.e. the
+#: builds had been healthy.  The derived 90.0s is 18 heartbeat periods wide
+#: where the old value was 2.
+#:
+#: OPERATOR FOLLOW-UP (task 4195): leo-laptop's /usr/local/bin/orchestrator shim
+#: has exported ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS=90 since 2026-09-14T10:27Z
+#: as the interim mitigation (backup ~/orchestrator-shim.bak-2026-09-14).  This
+#: derivation lands at that same 90.0 in code, so the export is now redundant
+#: and must be removed, or the two halves can drift apart silently.  Acceptance
+#: for 4195 must be measured against the 09-05..09-14 window (71 dispatches / 0
+#: verdicts), never against a window in which the override was live.
+WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = (
+    WATCHDOG_TRANSPORT_HEADROOM * SSH_TRANSPORT_DEAD_PEER_SECS
+)
 
 #: Grace period between the SIGTERM and SIGKILL passes when the watchdog
 #: fires and kills the build subtree (see :func:`fire_watchdog_kill`).
