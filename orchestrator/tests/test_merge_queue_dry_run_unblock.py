@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -872,7 +873,7 @@ class TestMergeVerifyRedProducesGateableProposal:
 
         verdict = check_proposal(
             entry, worktree=str(req.worktree), category='task_failure',
-            run_git=_fake_run_git,
+            run_git=_fake_run_git, now=datetime.now(UTC),
         )
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
