@@ -313,6 +313,7 @@ def test_consumed_line_is_parsed_into_separate_resource_fields():
 
     resources = analyze(EPISODE_2_JOURNAL)[0].resources
 
+    assert resources is not None
     assert resources.cpu_seconds == 2 * 3600 + 29 * 60 + 21.259
     assert resources.memory_peak_bytes == 3.2 * 1024**3
     assert resources.swap_peak_bytes == 934.4 * 1024**2
@@ -326,6 +327,7 @@ def test_consumed_line_parses_both_systemd_cpu_time_spellings():
     with_hours = analyze(EPISODE_1_JOURNAL)[0].resources
     without_hours = analyze(WATCHDOG_CAUGHT_STALL_JOURNAL)[0].resources
 
+    assert with_hours is not None and without_hours is not None
     assert with_hours.cpu_seconds == 3600 + 22 * 60 + 57.690
     assert with_hours.swap_peak_bytes == 529.9 * 1024**2
     assert without_hours.cpu_seconds == 20 * 60 + 30.697
@@ -435,6 +437,7 @@ def test_a_later_unrelated_restart_is_not_attributed_to_a_self_recovered_stall()
     # The restart belongs to the silence it ENDED, and to that one only.
     assert ended_by_restart.outcome == "stopped-on-signal"
     assert ended_by_restart.costs.teardown_seconds == 3.0
+    assert ended_by_restart.resources is not None
     assert ended_by_restart.resources.cpu_seconds == 29 * 60 + 6.600
 
 
