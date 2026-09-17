@@ -40,6 +40,7 @@ from escalation.canonical import canonical_root_cause
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
+from escalation.merge_lane_resolution import InvalidMergeLane, validate_requested_lane
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -3057,6 +3058,7 @@ def create_server(
         wait_secs: int = 0,
         verified_green: bool = False,
         retry_failed_only: bool = False,
+        lane: str | None = None,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
@@ -3097,6 +3099,41 @@ def create_server(
         (``_run_post_merge_verify``).  Default ``False`` is a strict no-op —
         the retry-set primitive that consumes this flag ships separately
         (reify, PRD task D2), so today every value leaves behavior unchanged.
+
+        *lane* — which merge-queue priority lane this submission belongs in:
+        ``'high'`` or ``'normal'``.  Omit it (the default ``None``) to inherit
+        the submitting task's ``metadata.merge_lane``.  Precedence is
+        **``lane`` > ``metadata.merge_lane`` > ``'normal'``**, and an explicit
+        argument wins even when it EQUALS the default — passing
+        ``lane='normal'`` deliberately holds a ``metadata.merge_lane='high'``
+        task back to the normal lane.
+
+        Named ``lane``, not ``merge_lane``, because that is the word the whole
+        merge-queue boundary already uses: ``MergeRequest.lane``,
+        ``orchestrator/src/orchestrator/merge_queue.py::MERGE_LANES``, and the
+        ``lane`` field ``get_merge_queue`` emits per queue item.  The TASK
+        METADATA key stays ``merge_lane`` because task metadata is one flat
+        global namespace in which a bare ``lane`` would collide with the warm,
+        offline and merge-worktree lanes this repo also has.
+
+        An unrecognised value here is REJECTED — ``{error,
+        code='invalid_lane', hint}``, nothing enqueued — while an unrecognised
+        ``metadata.merge_lane`` still normalises silently to ``'normal'``.
+        The asymmetry is deliberate: an inherited value was written by another
+        actor at another time and must never be able to fail a merge
+        submission, whereas this argument is live caller intent and silently
+        downgrading a main-health hotfix to the normal lane is exactly the
+        defect this parameter exists to remove.
+
+        NOT separately access-gated, and deliberately so.
+        ``mcp__escalation__merge_request`` appears in exactly ONE agent role's
+        allow-list — ``orchestrator/src/orchestrator/agents/roles.py::STEWARD``
+        — which the SDK enforces as a ceiling, so no rank-and-file agent role
+        can reach this parameter to self-declare urgency.  Task 1689's
+        anti-starvation constraint (``'high'`` is for the rare, gated
+        hotfix/main-health class) is carried by that existing restriction plus
+        the ``lane``/``lane_source`` audit echo on the response below, rather
+        than by a second gate over an already-restricted set.
 
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
@@ -3152,6 +3189,11 @@ def create_server(
           supersede a live verify.  ``existing_mr``/``existing_sha`` identify the
           in-flight entry's request_id/tip (D8); ``verify_age_secs`` is how long
           that verify has been running.  Cancel it (merge_cancel) then resubmit.
+        - Invalid-lane reject (task 4888): ``{error, code='invalid_lane',
+          hint}``.  Returned when *lane* is not a ``MERGE_LANES`` member.
+          Nothing is enqueued, no future is created, and no git or task-metadata
+          work is done — validation is pure and runs first, so a typo costs the
+          caller only the round-trip that told them about it.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main AND the branch is not degenerate — i.e.
@@ -3173,6 +3215,29 @@ def create_server(
             return {'error': 'Merge queue not available — orchestrator not running'}
         if orch_config is None:
             return {'error': 'Merge queue available but no orchestrator config — cannot verify'}
+
+        # Lane validation, ordered FIRST among this tool's real work: before
+        # git_ops_for_scan is resolved and before any await, so a typo'd lane
+        # pays no ref read and no Taskmaster get_task round-trip (task 4888,
+        # pinned by test_merge_request_lane.py).  It sits just BELOW the two
+        # availability guards rather than above them because it needs the
+        # orchestrator-side MERGE_LANES vocabulary, and a non-None merge_queue
+        # is what proves the orchestrator package is importable here — above
+        # them, a standalone server would raise ImportError instead of
+        # returning its 'not available' answer.
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            # Same {error, code, hint} envelope as the duplicate_in_verify
+            # reject below; callers branch on `code`, never on the prose.  The
+            # hint renders the vocabulary carried on the exception, so it can
+            # never drift from the tuple the check keyed on.
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid} (omit it to inherit metadata.merge_lane)',
+            }
 
         # Runtime-only reverse import: orchestrator depends on escalation, not
         # vice versa, so this lazy import deliberately avoids a static cycle. It
@@ -3376,6 +3441,7 @@ def create_server(
             result=future,
             snapshot_tip=resolved_tip,
             retry_failed_only=retry_failed_only,
+            lane=validated_lane or 'normal',
         )
 
         # Build a live_snapshot provider from the live worker handle so the
