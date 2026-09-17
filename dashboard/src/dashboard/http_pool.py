@@ -61,15 +61,60 @@ loudly rather than silently if they move.
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import cast
 
 import httpcore
 import httpx
 
+logger = logging.getLogger(__name__)
+
 # The pool attributes this module reads. Named once, here, so the shape guard
 # and the failure message it produces cannot drift apart.
 _REQUIRED_POOL_ATTRIBUTES = ('_connections', '_requests', '_max_connections')
+
+# Has the shape guard already announced itself in this process? See
+# :func:`_report_unresolved` for why announcing once is the requirement.
+_shape_guard_warned = False
+
+
+def reset_shape_guard() -> None:
+    """Re-arm the once-per-process shape WARNING. For tests.
+
+    Part of this module's interface rather than a private global for tests to
+    poke — the same role ``memory.reset_sessions()`` plays for the session
+    cache. The latch is state this module owns, so clearing it is this
+    module's operation to offer, and a test asserting on the WARNING can do so
+    without depending on whether some other test ran first.
+    """
+    global _shape_guard_warned
+    _shape_guard_warned = False
+
+
+def _report_unresolved(path: str) -> None:
+    """Announce a pool attribute this module can no longer find.
+
+    LOUD ONCE, THEN QUIET, and both halves matter. Silence would be the worst
+    outcome available: the reaper would become a permanent no-op while a
+    module in the tree still looked like it was handling the problem — the
+    original incident again, now harder to find. But a WARNING on every sweep
+    is its own kind of silence: on the reaper's loop that is ~1400 identical
+    lines a day, and the line that opened the diagnosis is buried under its
+    own repeats. Demoted, never discarded: the repeat stays at DEBUG.
+    """
+    global _shape_guard_warned
+    message = (
+        'httpx connection pool is not where this module expects it: cannot resolve '
+        'client.%s. The orphan reaper is INERT until this is repaired — see '
+        'dashboard/src/dashboard/http_pool.py for the attributes it reads and the '
+        'httpx/httpcore versions they were verified against.'
+    )
+    if _shape_guard_warned:
+        logger.debug(message, path)
+        return
+    _shape_guard_warned = True
+    logger.warning(message, path)
 
 
 @dataclass(frozen=True)
@@ -103,12 +148,15 @@ def _resolve_pool(client: httpx.AsyncClient) -> httpcore.AsyncConnectionPool | N
     """
     transport = getattr(client, '_transport', None)
     if transport is None:
+        _report_unresolved('_transport')
         return None
     pool = getattr(transport, '_pool', None)
     if pool is None:
+        _report_unresolved('_transport._pool')
         return None
     for attribute in _REQUIRED_POOL_ATTRIBUTES:
         if not hasattr(pool, attribute):
+            _report_unresolved(f'_transport._pool.{attribute}')
             return None
     return cast(httpcore.AsyncConnectionPool, pool)
 
