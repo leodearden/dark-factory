@@ -126,6 +126,123 @@ class TestJudgeVerdictVocabulary:
         assert JUDGE_VERDICTS[word] == outcome
 
 
+# ---------------------------------------------------------------------------
+# the worked examples that teach the vocabulary
+# ---------------------------------------------------------------------------
+
+#: The committed curator corpus the judge is MEASURED against. Named here so
+#: the leakage guard below can ask whether an exemplar was drawn from it.
+CALIBRATION_FIXTURE_PATH = (
+    Path(__file__).parent.parent / 'fixtures' / 'write_triage_calibration.jsonl'
+)
+
+
+@pytest.fixture(scope='module')
+def records() -> list[dict]:
+    """The committed curator corpus, parsed with the stdlib.
+
+    Parsed here rather than through the eval script's loader, so a loader bug
+    cannot mask a data defect (and vice versa) — the discipline the sibling
+    suite's own ``records`` fixture states.
+    """
+    assert CALIBRATION_FIXTURE_PATH.exists(), (
+        f'fixture missing: {CALIBRATION_FIXTURE_PATH}'
+    )
+    return [
+        json.loads(line)
+        for line in CALIBRATION_FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+class TestJudgeExemplars:
+    """The vocabulary's worked examples, held as DATA rather than as prose.
+
+    Four words with no worked example is what the 2026-08-27 measurement
+    indicts: 31 of 75 duplicates were answered ``stored`` with the correct
+    canonical sitting in the slate, i.e. ``restates``/``amends`` were
+    under-produced. A vocabulary word the model has never seen USED is the one
+    it under-produces, so full verdict coverage is the invariant that targets
+    the defect rather than a tidiness rule.
+
+    Structured records, not a pre-formatted blob (heuristic 12): declaring
+    ``entry``/``candidate``/``verdict`` as separate fields is what lets
+    vocabulary closure, verdict coverage and corpus disjointness be CHECKED
+    here instead of grepped for in a string. The renderer owns the formatting.
+    """
+
+    def test_the_exemplars_are_structured_records(self) -> None:
+        """Three separate fields per record — the data carries no formatting.
+
+        A pre-formatted blob would reduce every assertion below to substring
+        grepping, and would move the prompt's layout out of the renderer and
+        into the data, where two exemplars can disagree about it.
+        """
+        exemplars = judge_module.JUDGE_EXEMPLARS
+        assert isinstance(exemplars, tuple), 'exemplars are an ordered, frozen tuple'
+        assert exemplars, 'an empty exemplar tuple teaches nothing'
+        for exemplar in exemplars:
+            fields = (exemplar.entry, exemplar.candidate, exemplar.verdict)
+            for field in fields:
+                assert isinstance(field, str) and field.strip(), (
+                    f'every field is a non-empty string: {exemplar!r}'
+                )
+                assert '\n' not in field, (
+                    f'line breaks are the renderer\'s business, not the data\'s: '
+                    f'{exemplar!r}'
+                )
+            assert len(set(fields)) == len(fields), (
+                f'the three fields are distinct values, not one blob repeated: '
+                f'{exemplar!r}'
+            )
+
+    def test_every_exemplar_verdict_is_in_the_closed_vocabulary(self) -> None:
+        """An out-of-vocabulary exemplar teaches a word the parser REJECTS.
+
+        ``parse_judge_verdict`` raises on anything outside ``JUDGE_VERDICTS``
+        and ``write_triage`` counts that raise as a fail-open — so the damage
+        surfaces as a storm escalation describing an outage, not as a bad
+        verdict anyone would trace back to a typo in a prompt example.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert exemplar.verdict in JUDGE_VERDICTS, (
+                f'{exemplar.verdict!r} is not one of {sorted(JUDGE_VERDICTS)}'
+            )
+
+    def test_every_verdict_has_at_least_one_worked_example(self) -> None:
+        """Coverage is the invariant aimed at the measured defect.
+
+        Derived from ``JUDGE_VERDICTS`` rather than spelled as four literals,
+        so a fifth word added to the vocabulary arrives here already demanding
+        its example instead of shipping unexemplified.
+        """
+        covered = {exemplar.verdict for exemplar in judge_module.JUDGE_EXEMPLARS}
+        assert covered == set(JUDGE_VERDICTS), (
+            f'verdicts with no worked example: {sorted(set(JUDGE_VERDICTS) - covered)}'
+        )
+
+    def test_no_exemplar_text_is_drawn_from_the_eval_corpus(
+        self, records: list[dict],
+    ) -> None:
+        """Exemplars are prompt content; fixture records are a MEASUREMENT.
+
+        Hand-writing an exemplar is ordinary prompt engineering — nothing is
+        scored against it. Drawing one from the corpus the judge is scored on
+        is training on the test set, and would make the accuracy report
+        unreadable as evidence. This is the one way an exemplar can corrupt a
+        measurement, so it is asserted rather than remembered.
+        """
+        corpus = '\n'.join(str(record.get('content', '')) for record in records)
+        assert corpus.strip(), 'the corpus parsed empty — the guard would be vacuous'
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in corpus, (
+                    f'exemplar {field_name} is drawn from the eval corpus — '
+                    f'that is training on the test set: {text!r}'
+                )
+
+
 class TestParseJudgeVerdict:
     """Parsing is where the closed output is ENFORCED (D3).
 
