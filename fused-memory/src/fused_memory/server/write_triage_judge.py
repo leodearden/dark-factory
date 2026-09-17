@@ -284,11 +284,26 @@ _ELIDED_MARKER = '…[elided]'
 #: budgeted, made where C1 is cited, rather than a number quietly relaxed in a
 #: test until it stops failing.
 #:
-#: The char/token ratio is a convention, not a measurement, and it is
-#: CONSERVATIVE for the case that matters: the worst case is built from
-#: repeated filler, which BPE packs far denser than 4 chars/token, so a
-#: rendering at this ceiling costs fewer real tokens than the figure implies.
-_PROMPT_CHAR_BUDGET = 2_500 * 4
+#: THE TOLERANCE TERM IS NOT PADDING. Both inputs to the headline figure are
+#: approximations: C1 writes "~2.5k", and 4 chars/token is a convention, NOT a
+#: measurement — this package does not depend on a tokenizer, so nothing here
+#: has counted the real tokens and no claim is made about them. Multiplying
+#: two approximations and then treating the product as a hard wall is a false
+#: precision, and it bites asymmetrically: a rendering 0.5% over would read as
+#: a C1 violation when it is inside "~2.5k" on any reading.
+#:
+#: The tolerance is SIZED, not chosen for comfort: 200 chars is less than one
+#: further worked example costs (~176), so the next addition to the system
+#: prompt still has to either make room or make its case here. A ceiling that
+#: admitted another example would have stopped bounding anything.
+#:
+#: Measured at task 4811, with the elision marker counted: the true worst case
+#: is 10_051 chars — system 2_312, plus a 7_739-char render of six fields each
+#: OVER `_FIELD_CHARS`. Note "over", not "at": `_elide` returns a field of
+#: exactly `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS`
+#: plus `_ELIDED_MARKER`, so the widest render is 54 chars wider than a slate
+#: built at the cap.
+_PROMPT_CHAR_BUDGET = 2_500 * 4 + 200
 
 
 def _elide(text: object) -> str:
@@ -413,9 +428,8 @@ entry is correct, and you do not merge, rewrite or rank them.
 
 Answer with exactly one of these four words:
 
-- "distinct" — the new entry is about something the candidates do not cover. \
-Overlapping vocabulary is not enough; the new entry has to be making \
-substantially the same claim as a candidate to be anything else.
+- "distinct" — no candidate makes the same core claim as the new entry. \
+Shared wording alone neither makes a match nor rules one out.
 - "restates" — the new entry asserts what a candidate already asserts, adding \
 nothing new. A paraphrase restates.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
@@ -429,9 +443,11 @@ are not in conflict. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
-When more than one word fits, prefer the earlier one in that list: \
-"distinct" over "restates", "restates" over "amends", "amends" over \
-"contests".
+Decide in this order. First ask whether ANY candidate makes the same core \
+claim as the new entry. If one does, the answer is "restates" or "amends", \
+never "distinct"; answer "distinct" only when none does. Between "amends" \
+and "contests", prefer "amends" — a genuine incompatibility is a last \
+resort, not a default reading.
 
 Worked examples:
 

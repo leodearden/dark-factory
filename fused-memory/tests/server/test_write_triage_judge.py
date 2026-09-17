@@ -320,22 +320,34 @@ class TestJudgeExemplars:
     def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
         """PRD C1 bounds the whole call, and the exemplars spend against it.
 
-        The worst case is not hypothetical: ``_FIELD_CHARS`` is exactly how
-        much of a long record survives ``_elide``, so a full slate of maximal
-        candidates plus a maximal entry is what a real call looks like when
-        the corpus is at its largest. Built rather than arithmetic, so the
-        scaffolding between the fields is counted too.
+        The worst case is not hypothetical: the calibration fixture holds a
+        ~9k-char canonical, so a full slate of over-long candidates plus an
+        over-long entry is what a real call looks like when the corpus is at
+        its largest. Built rather than arithmetic, so the scaffolding between
+        the fields is counted too.
+
+        THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
+        field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
+        ``_FIELD_CHARS`` PLUS ``_ELIDED_MARKER`` — so the input that elides
+        renders 9 chars wider per field, 54 across a full slate, than the
+        input that merely fills. A worst case built at the cap is therefore
+        not the worst case; it is the widest input that never trips the
+        behaviour this budget exists to bound.
 
         The ceiling is a module constant, not a literal here, so the budget
         has one home — raising it is an edit to the thing being budgeted,
         made next to the C1 rationale, rather than a number quietly relaxed in
         a test.
         """
-        maximal = 'x' * _FIELD_CHARS
+        maximal = 'x' * (_FIELD_CHARS + 1)
         candidates = [
             _result(f'mem-{i}', 0.9, content=maximal)
             for i in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
         ]
+        assert _ELIDED_MARKER in build_judge_prompt(maximal, candidates), (
+            'the worst case must be an ELIDED render — otherwise it misses '
+            'the marker _elide appends, and under-measures the real ceiling'
+        )
         worst_case = len(JUDGE_SYSTEM_PROMPT) + len(
             build_judge_prompt(maximal, candidates),
         )
