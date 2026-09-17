@@ -921,6 +921,55 @@ def elide_middle(text: str, *, head: int = 200, tail: int = 800) -> str:
     return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{kept_tail}'
 
 
+HEARTBEAT_TOKEN: bytes = b'\n'
+"""What one beat looks like on the wire, defined once for both ends.
+
+:func:`run_stdin_watchdog` only requires a *non-empty* read to reset its
+window, so this token's CONTENT is not load-bearing — its single-sourcing is,
+and this is the end that writes it."""
+
+
+def run_stdin_heartbeat(
+    write_fd: int,
+    stop_event: threading.Event,
+    *,
+    interval: float = HEARTBEAT_INTERVAL_SECS,
+    write_fn=os.write,
+    close_fn=os.close,
+) -> None:
+    """Blocking producer loop: write one :data:`HEARTBEAT_TOKEN` per *interval* to *write_fd*.
+
+    The counterpart of :func:`run_stdin_watchdog`, and hardened the same way
+    for the same reason.  Intended to run in a dedicated daemon OS thread (see
+    :func:`start_stdin_heartbeat`) whose timer is a ``threading.Event`` timed
+    wait — rather than as an asyncio task sharing the dispatcher's event loop
+    — so the cadence means what it says however saturated or wedged that loop
+    is.  A consumer that fires on a blocking ``select`` is no use if the
+    producer feeding it is itself scheduled behind whatever stalled the loop.
+
+    The same *stop_event* is both the timer and the stop signal: the loop
+    waits on it BEFORE each write (so the first beat lands at t=*interval*),
+    and setting it ends the loop within one GIL switch instead of waiting out
+    a full beat.
+
+    This function OWNS *write_fd* and closes it on every exit path, which is
+    what delivers EOF to the remote's watchdog.  No caller may close it too: a
+    double close can close an unrelated descriptor that has since reused the
+    number.
+
+    *write_fn* / *close_fn* are injectable (default ``os.write`` /
+    ``os.close``) so tests can script deterministic behavior without a real
+    pipe or wall-clock waits, mirroring the watchdog's *select_fn* /
+    *read_fn*.
+    """
+    try:
+        while not stop_event.wait(interval):
+            write_fn(write_fd, HEARTBEAT_TOKEN)
+    finally:
+        with contextlib.suppress(OSError):
+            close_fn(write_fd)
+
+
 def run_stdin_watchdog(
     read_fd: int,
     on_fire: Callable[[WatchdogTrigger], None],
