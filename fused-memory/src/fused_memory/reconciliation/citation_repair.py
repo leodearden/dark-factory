@@ -5,9 +5,8 @@ declares: *a cited memory id must resolve*. Its two halves both act on the
 CURRENT run — ``verify_cited_memories`` drops phantoms from the in-flight
 report, and the ``repoint_*`` helpers rewrite live task metadata before a
 delete. Neither can touch a finding whose owning run already closed, and that
-is exactly the case this module handles: re-point (or drop) a
-confirmed-dangling citation on a finding filed by a **prior, already-completed**
-run.
+is exactly the case this module handles: re-point (or drop) a **defective**
+citation on a finding filed by a **prior, already-completed** run.
 
 **Why the recon-report tools cannot serve this.** Every ``cite_*`` tool resolves
 through ``ReconReportState._resolve_entry(run_id)``, which requires the run to
@@ -23,14 +22,31 @@ durable home of a closed run's findings, and it is what this module reads and
 rewrites, through the journal's existing ``get_run`` / ``update_run_stage_reports``
 accessors — no new table, no new SQL.
 
-**The repair can only ever fix provenance, never rewrite a live claim.** The
-victim citation must be CONFIRMED absent and the replacement must resolve; a
-raised backend read is *unknown*, not *absent*, and never licenses a mutation.
-Those gates are what keep this from being a provenance-falsification surface —
-the worst it can do is retarget a claim that already had no backing, and (for an
-in-agent caller) only within its own project: the journal is shared across every
-project the process reconciles, so ``caller_project_id`` confines the repair to
-runs the caller actually owns. It reuses ``citation_verifier``'s lookup primitive and its found/None/raised branching so
+**Two defect classes, and the corroboration each one owes.** ``reason`` names
+which, and this module CHECKS it rather than trusting it: ``memory_not_found``
+requires the cited id to be confirmed ABSENT, ``wrong_memory`` requires it to
+RESOLVE — it exists, it simply does not back the finding. Naming the wrong class
+is a refusal pointing at the other one, never a silent reclassification. Under
+either, a raised backend read is *unknown* rather than an answer, and never
+licenses a mutation.
+
+``wrong_memory`` (task 5552) gives up the structural property the dangling-only
+design had — that the worst this could do was retarget a claim which already had
+no backing. Three checkable gates replace it, and this module is the single site
+that enforces all three; the MCP tool and the operator script only forward.
+(1) The ``reason`` enum turns the class from a caller's say-so into an assertion
+the corroboration read checks. (2) A non-blank ``justification`` is REQUIRED for
+``wrong_memory`` and is recorded in the durable ``citation_repairs`` entry, which
+is then the only surviving account of why a still-resolving citation was removed.
+(3) ``replacement_is_victim`` refuses a swap whose replacement IS the victim —
+unreachable while the victim had to be absent, and once it may be present, a
+no-op that would report ``repaired`` and write a record claiming a repair.
+
+Unchanged by all of this: the replacement must still resolve, so no caller can
+install a second unresolvable id; and for an in-agent caller
+``caller_project_id`` still confines the repair to runs the caller owns, since
+the journal is shared across every project the process reconciles. It reuses
+``citation_verifier``'s lookup primitive and its found/None/raised branching so
 the two halves cannot disagree about what a backend timeout means.
 """
 
@@ -248,8 +264,8 @@ def build_citation_repair_record(
     Declared in exactly one function, mirroring
     ``citation_verifier.build_citation_tombstone``: a durable rewrite of a
     historical audit record must say what it changed and why, or the repaired
-    blob becomes indistinguishable from a report that never carried the dangling
-    id. ``replacement_memory_id`` is None for a drop-only repair.
+    blob becomes indistinguishable from a report that never carried the
+    defective id. ``replacement_memory_id`` is None for a drop-only repair.
 
     ``reason`` is the CHECKED defect class; ``justification`` is its
     human-readable companion, stored verbatim and never parsed. The two split
@@ -753,7 +769,7 @@ async def repair_memory_citation(
                 'replacement_memory_id': replacement_memory_id,
                 'hint': (
                     f'{replacement_memory_id} does not resolve in mem0 for '
-                    f'project {run.project_id!r}; omit it to DROP the dangling '
+                    f'project {run.project_id!r}; omit it to DROP the defective '
                     'citation instead of re-pointing it.'
                 ),
             }
@@ -771,8 +787,8 @@ async def repair_memory_citation(
     if replacement_memory_id is not None:
         if any(_is_citation_of(entry, replacement_memory_id) for entry in kept):
             # Already cited — appending again would leave the finding claiming
-            # the same evidence twice. The repair is still real: the dangling
-            # entry is gone.
+            # the same evidence twice. The repair is still real: the
+            # defective entry is gone.
             deduped = True
         else:
             kept.append(

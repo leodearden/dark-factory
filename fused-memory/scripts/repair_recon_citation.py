@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""One-shot repair: re-point (or drop) a dangling cited memory id on a finding
-owned by an already-COMPLETED reconciliation run (task 3065).
+"""One-shot repair: re-point (or drop) a defective cited memory id on a finding
+owned by an already-COMPLETED reconciliation run (task 3065, task 5552).
 
 Why a script exists at all
 --------------------------
@@ -27,12 +27,26 @@ run's findings, so that is what gets rewritten.
 
 What it cannot do
 -----------------
-It can only repair provenance, never rewrite a live claim. The victim citation
-must be CONFIRMED absent from Mem0 (else ``citation_not_dangling``) and the
-replacement must resolve (else ``replacement_not_found``); a backend read that
-RAISES is ``verification_error``, never a repair — unknown is not absent. A run
-that is still live is refused outright, because the harness rewrites the whole
-``stage_reports`` blob at each stage end and would silently clobber the repair.
+It cannot decide which defect class you are repairing — ``--reason`` asserts
+that, and the repair CHECKS the assertion rather than trusting it. With
+``--reason memory_not_found`` (the default) the victim must be CONFIRMED absent
+from Mem0, else ``citation_not_dangling``. With ``--reason wrong_memory`` it
+must RESOLVE, else ``citation_not_resolving``; each refusal names the other
+class, so a misclassification costs a dry run rather than a bad write. Either
+way a backend read that RAISES is ``verification_error``, never a repair —
+unknown is neither absent nor present.
+
+It cannot remove a still-resolving citation silently: ``--reason wrong_memory``
+without a non-blank ``--justification`` is ``justification_required``. The
+``citation_repairs`` record is the only surviving account of the change, so the
+prose you pass is what a later reader of the audit record will have.
+
+It cannot report a repair that changed nothing. The replacement must resolve
+(else ``replacement_not_found``) and must not be the victim itself (else
+``replacement_is_victim`` — that swap strips the citation and re-appends it).
+And a run that is still live is refused outright, because the harness rewrites
+the whole ``stage_reports`` blob at each stage end and would silently clobber
+the repair.
 
 Journal I/O that raises is reported too, not thrown: ``journal_error`` carries
 the ``phase`` that failed (read / write / verify) and a hint saying whether
@@ -42,8 +56,8 @@ read-after-write check (another writer rewrote the whole blob in between) is
 reported as ``repair_clobbered`` rather than a false ``repaired``. Every one of
 those exits 1; only ``status: repaired`` / ``status: dry_run`` exits 0.
 
-The incident this was written for
----------------------------------
+The incident this was written for (task 3065 — ``memory_not_found``)
+--------------------------------------------------------------------
 Run ``06a4466d-cdc0-49ac-8e99-e6723be39392`` (project ``reify``, completed
 2026-07-26), finding ``5e85117e-51fc-4a7f-8ca7-e26078dbd3f2``, whose two cited
 memories were both destroyed by a Stage-1 supersession. The surviving successor
@@ -100,6 +114,45 @@ Rollback artifact (the pre-repair blob) is at
 across a reboot. Run 1 before 2 was and remains the required order: after 1
 the successor is already cited, which is why 2 is drop-only rather than a
 second re-point.
+
+The incident that added ``--reason wrong_memory`` (task 5552)
+-------------------------------------------------------------
+Run ``cd2af61a-fe12-4222-b58c-9eb5a2070c44`` (project
+``solar_challenge_platform``, status ``completed``, completed
+2026-09-17T04:10:27Z), stage ``task_knowledge_sync``, finding
+``7750fd64-f862-4ad8-8b1f-a9a08b1494d0``. The finding reports that task 182
+gained its missing structural dependency on task 173 — Stage 2 called
+``add_dependency(182, depends_on=173)`` and confirmed it with a follow-up
+``get_task(182)``. Its single cited memory
+``8505f9b0-dbfd-44c0-ac32-7352a85bfb6f`` RESOLVES (measured: ``get_memory_by_id``
+returns ``found: true``) but is the task-168 index_health rolling summary
+(``kind: index_health_confirmation_rollup``, ``task_id: 168``), which says
+nothing about task 182, task 173, or any dependency. Wrong memory, not a
+missing one — so the task-3065 path refuses it with ``citation_not_dangling``
+and there is nothing to re-point to, because the claim's evidence is a TASK
+read rather than a memory. A detach is the whole repair:
+
+    python scripts/repair_recon_citation.py \\
+        --data-dir /home/leo/src/dark-factory/data/reconciliation \\
+        --target-run-id cd2af61a-fe12-4222-b58c-9eb5a2070c44 \\
+        --finding-id 7750fd64-f862-4ad8-8b1f-a9a08b1494d0 \\
+        --memory-id 8505f9b0-dbfd-44c0-ac32-7352a85bfb6f \\
+        --reason wrong_memory \\
+        --justification 'cites the task-168 index_health rollup, which makes no claim about the task-182 dependency; the claim itself was confirmed by Stage 2 via get_task(182)' \\
+        --apply
+
+Note this run is CROSS-PROJECT relative to this repo, which is why it is the
+script's example and not the MCP tool's: the tool passes its own
+``caller_project_id`` and would refuse with ``project_mismatch``. The script
+passes none — that bypass exists for exactly this correction.
+
+Status of that repair: NOT APPLIED as of task 5552 landing. It is retained as
+the worked example of the ``wrong_memory`` flag shape, and the ids above were
+read from the live journal, so a dry run (drop ``--apply``) should report the
+gates green. Applying it needs write access to ``data/`` in the main checkout,
+which a task agent does not have — see the task-3065 note above for the
+``sqlite3.OperationalError: attempt to write a readonly database`` this raises
+from a task worktree.
 """
 
 from __future__ import annotations

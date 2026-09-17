@@ -3397,19 +3397,28 @@ Ledger write (Stage 2 ONLY):
 
 Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
 12. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
-                  replacement_memory_id=None) — re-point (or, with no
-                  replacement, drop) a citation that no longer resolves, on a
-                  finding owned by a PRIOR, ALREADY-COMPLETED run. The cite_*
-                  tools cannot reach such a finding at all: they require the
-                  owning run to have a live active stage, and a closed run's
-                  report state is TTL-evicted within minutes.
+                  replacement_memory_id=None, reason='memory_not_found',
+                  justification=None) — re-point (or, with no replacement,
+                  drop) a citation that does not back its finding, on a finding
+                  owned by a PRIOR, ALREADY-COMPLETED run. The cite_* tools
+                  cannot reach such a finding at all: they require the owning
+                  run to have a live active stage, and a closed run's report
+                  state is TTL-evicted within minutes.
                   run_id stays YOUR current run; target_run_id is the run that
                   OWNS the finding — these are two different things, and
                   passing the target's id as run_id will just fail with
                   run_id_unknown.
-                  The cited memory must be CONFIRMED dangling and the
-                  replacement must resolve, so this repairs provenance only; it
-                  can never rewrite a live claim.
+                  reason names the DEFECT CLASS and is CHECKED, not trusted, so
+                  naming the wrong one is a refusal pointing at the other:
+                  'memory_not_found' (the default) requires the cited memory to
+                  be CONFIRMED ABSENT; 'wrong_memory' requires it to RESOLVE
+                  but not back the finding, and then a non-blank justification
+                  is REQUIRED — it is the only surviving account of removing a
+                  citation that was still live. Drop vs re-point is a separate
+                  axis, chosen by replacement_memory_id.
+                  The replacement must resolve and must not be the cited memory
+                  itself, so this can never install a second unresolvable id
+                  and never report a repair that changed nothing.
 """
 
 
