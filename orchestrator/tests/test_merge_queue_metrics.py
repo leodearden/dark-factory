@@ -30,10 +30,14 @@ from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, hangs_until, passes
-from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    wait_responsive,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.ports import VerifyPort
 from orchestrator.merge_queue import MergeMetrics, MergeRequest
@@ -146,6 +150,12 @@ class _MergeGatedGitOps(GitOps):
     ``at_gate`` being set is proof the base has already been stashed, so a
     test can hold the gated request there for as long as it needs while it
     drives another request all the way to a landing.
+
+    The override mirrors the parent signature EXACTLY rather than absorbing
+    a ``**kwargs``: a true substitution keeps a future positional
+    ``base_sha`` caller binding here as it does in production, and the
+    declared ``MergeResult`` return lets pyright catch a fake that stops
+    handing back a merge result at this seam instead of downstream.
     """
 
     def __init__(self, config: GitConfig, root: Path, *, branch: str) -> None:
@@ -154,11 +164,13 @@ class _MergeGatedGitOps(GitOps):
         self.at_gate = asyncio.Event()
         self.release_merge = asyncio.Event()
 
-    async def merge_to_main(self, worktree: Path, branch: str, **kwargs: Any) -> Any:
+    async def merge_to_main(
+        self, worktree: Path, branch: str, base_sha: str | None = None,
+    ) -> MergeResult:
         if branch == self._gated_branch:
             self.at_gate.set()
             await self.release_merge.wait()
-        return await super().merge_to_main(worktree, branch, **kwargs)
+        return await super().merge_to_main(worktree, branch, base_sha=base_sha)
 
 
 @contextlib.asynccontextmanager
@@ -476,13 +488,17 @@ class TestDriftBaseIsolation:
             )
 
             await queue.put(lander)
-            await asyncio.wait_for(
-                verifier.await_entry(1), timeout=MERGE_RESULT_TIMEOUT,
+            await wait_responsive(
+                verifier.await_entry(1),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='lander: verify entered',
             )
 
             await queue.put(blocked)
-            await asyncio.wait_for(
-                git_ops.at_gate.wait(), timeout=MERGE_RESULT_TIMEOUT,
+            await wait_responsive(
+                git_ops.at_gate.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='blocked request parked inside merge_to_main',
             )
             # Load-bearing precondition: the blocked request is parked INSIDE
             # merge_to_main, so its drift base was stashed while main_position
@@ -493,7 +509,11 @@ class TestDriftBaseIsolation:
             )
 
             verify_gate.set()
-            outcome_lander = await wait_responsive(lander.result, label='lander lands')
+            outcome_lander = await wait_responsive(
+                lander.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='lander lands',
+            )
             assert outcome_lander.status == 'done', (
                 f'expected the lander to land, got {outcome_lander!r}'
             )
@@ -501,13 +521,17 @@ class TestDriftBaseIsolation:
                 while lane.snapshot()['metrics']['landings_total'] < 1:
                     await asyncio.sleep(0.01)
 
-            await asyncio.wait_for(
-                _lander_counted(), timeout=MERGE_RESULT_TIMEOUT,
+            await wait_responsive(
+                _lander_counted(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='lander counted on the public landings_total',
             )
 
             git_ops.release_merge.set()
             outcome_blocked = await wait_responsive(
-                blocked.result, label='blocked request conflicts',
+                blocked.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='blocked request conflicts',
             )
             assert outcome_blocked.status == 'conflict', (
                 f'expected the blocked request to conflict, got {outcome_blocked!r}'
