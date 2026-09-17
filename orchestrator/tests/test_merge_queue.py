@@ -8522,7 +8522,11 @@ class TestMergeWorkerCasRetryEmitsMergeQueued:
 
 
 class TestWorkflowSubmitUsesEnqueueHelper:
-    """_submit_to_merge_queue delegates to enqueue_merge_request, and rebinds the branch first."""
+    """_submit_to_merge_queue delegates to enqueue_merge_request, and rebinds the branch first.
+
+    Both halves are pinned: the delegation by the enqueue call assertions,
+    and "first" by the recorded relative order of the two calls.
+    """
 
     @pytest.mark.asyncio
     async def test_submit_to_merge_queue_calls_enqueue_helper(self, tmp_path: Path):
@@ -8600,6 +8604,16 @@ class TestWorkflowSubmitUsesEnqueueHelper:
 
         mock_helper = AsyncMock(side_effect=_mock_enqueue)
 
+        # The rebind's ORDER is load-bearing, not merely its occurrence: the
+        # named ref must already match the worktree HEAD when the worker
+        # resolves it, which is why the rebind sits immediately BEFORE the
+        # enqueue in production.  A shared parent records both mocks' calls in
+        # one sequence, so a refactor that moved the rebind after the enqueue --
+        # reopening the stale-ref race it closes -- fails here.
+        call_recorder = MagicMock()
+        call_recorder.attach_mock(workflow.git_ops.rebind_branch_to_head, 'rebind')
+        call_recorder.attach_mock(mock_helper, 'enqueue')
+
         # Patch the source module so both local and module-level imports get the mock.
         with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
             await workflow._submit_to_merge_queue('42')
@@ -8618,6 +8632,12 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         # resolve_queued_branch_ref), so dropping this rebind is silent.
         workflow.git_ops.rebind_branch_to_head.assert_awaited_once_with(
             workflow.worktree, 'task/42',
+        )
+        assert [entry[0] for entry in call_recorder.mock_calls] == [
+            'rebind', 'enqueue',
+        ], (
+            'the rebind must precede the enqueue, or the worker can resolve a '
+            f'stale named ref: saw {call_recorder.mock_calls!r}'
         )
 
 
