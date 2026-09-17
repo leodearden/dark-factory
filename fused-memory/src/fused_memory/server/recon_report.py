@@ -3039,10 +3039,15 @@ class ReconReportState:
             # so what may still be written has ONE definition in this class.
             #
             # The window this narrowing gives up — the harness calling
-            # complete() BEFORE its trailing update_run_stage_reports() — is
-            # already covered in depth by citation_repair's read-after-write
-            # check, which turns a clobbered repair into a loud repair_clobbered
-            # rather than a false 'repaired'.
+            # complete() BEFORE its trailing update_run_stage_reports() — stops
+            # being a pre-write refusal and becomes a post-write DETECTOR:
+            # citation_repair's read-after-write check answers repair_clobbered
+            # instead of a false 'repaired'. That narrows the exposure, it does
+            # not close it — the residual race is stated at
+            # citation_repair.py::_repair_is_persisted — and the trade is
+            # deliberate: the resident-entry set refused EVERY in-agent repair
+            # of any run this process had touched in the last 300s, terminal
+            # row or not, which is the refusal this narrowing exists to lift.
             live_run_ids=frozenset(
                 rid
                 for (rid, _stage), entry in self._state.items()

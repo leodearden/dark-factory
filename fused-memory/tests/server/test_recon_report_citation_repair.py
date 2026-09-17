@@ -380,21 +380,30 @@ class TestRepairLivenessIsPerEntry:
     mean "this process holds any report state for the run", which keeps a run
     live for the whole ``recon_report_state_ttl_seconds`` window (300s by
     default) after its last stage completed and its journal row already reads
-    ``completed`` — the refusal that blocked the incident this task came from.
+    ``completed``.
 
     ``completed_at is None`` is not a new discriminator: it is exactly what
     ``tick()`` uses to decide what may be evicted, and an in-progress entry is
     immortal by design. So the narrowed set is precisely the set of runs a stage
     can still write through.
+
+    Scope of what this changes, so the tests below are not read as saying more
+    than they do: this wrapper is the ONLY caller that supplies a non-empty
+    ``live_run_ids``. The operator script passes none at all, so no repair run
+    from a human's shell has ever reached this gate — including the
+    cross-project one task 5552 came from, which the MCP tool refuses on
+    ``project_mismatch`` well before liveness is considered.
     """
 
     @pytest.mark.asyncio
     async def test_completed_entry_not_yet_evicted_no_longer_blocks(self, tmp_path):
-        """The incident's own shape: row says completed, entry lingers, repair runs.
+        """Row says completed, entry lingers, repair runs.
 
         ``clock=lambda: 0.0`` means no TTL has elapsed, so ``tick()`` has not
         swept the entry — the entry is resident and completed, which is the
-        state every finished run passes through for minutes.
+        state every finished run passes through for minutes. That is the window
+        the old resident-entry set refused blanket, for every same-project
+        in-agent caller, whatever the journal row said.
         """
         journal = await _seeded_journal(tmp_path, status='completed')
         try:

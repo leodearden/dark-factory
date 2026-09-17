@@ -42,6 +42,18 @@ is then the only surviving account of why a still-resolving citation was removed
 unreachable while the victim had to be absent, and once it may be present, a
 no-op that would report ``repaired`` and write a record claiming a repair.
 
+What those three do NOT establish, said plainly because the MCP tool offers
+this class to the same LLM caller that asserts the defect: nothing here can
+corroborate *this memory does not back this finding*. (1) and (3) are
+mechanical; (2) is free prose the caller writes about its own claim, never
+parsed, and a non-blank string is trivially satisfied. So on the in-agent path
+the binding control is ``caller_project_id`` — the rewrite is confined to a
+completed run the caller's OWN project owns — plus the fact that the removal is
+self-incriminating: the record names who did it and what they claimed. That is
+the deliberate trade, not an oversight. A CROSS-project correction has no such
+owning caller and is refused with ``project_mismatch``; it goes through the
+out-of-band ``repair_recon_citation`` operator script, which a human runs.
+
 Unchanged by all of this: the replacement must still resolve, so no caller can
 install a second unresolvable id; and for an in-agent caller
 ``caller_project_id`` still confines the repair to runs the caller owns, since
@@ -408,6 +420,14 @@ def _repair_is_persisted(
     ``_ERR_REPAIR_CLOBBERED``). Cheap — one point read on a path that already
     did two Mem0 reads and a write — and it converts "reported repaired, then
     silently overwritten" into a loud refusal.
+
+    A DETECTOR, not a guarantee, and the difference is load-bearing for a caller
+    deciding how wide to make ``live_run_ids``: the sequence is write → re-read
+    → compare, so a clobbering write that lands AFTER the re-read still returns
+    ``repaired`` for a repair that did not survive. It shrinks that exposure to
+    one gap rather than removing it. Refusing BEFORE the write is the only thing
+    that closes it outright, which is why the run-status allowlist stays an
+    allowlist rather than leaning on this check.
 
     Identity, not shape: ``repair_record`` carries this call's own
     ``repaired_at``, so a look-alike record written by a CONCURRENT repair does
