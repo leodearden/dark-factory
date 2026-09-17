@@ -31,6 +31,7 @@ from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.shadow_ruling import (
+    COMPARABLE_ACTIONS,
     DETECTABLE_GATES,
     FIRST_TRANCHE_CLASSES,
     GATED_CATEGORIES,
@@ -802,3 +803,18 @@ class TestSweepRobustness:
             report.gated_stamps = 5  # type: ignore[misc]
         with pytest.raises(dataclasses.FrozenInstanceError):
             klass.agreed = 5  # type: ignore[misc]
+
+
+def test_comparable_actions_stay_in_lockstep_with_the_c1_vocabulary():
+    """COMPARABLE_ACTIONS is a local copy, so it needs a pin.
+
+    `escalation.server` is not importable from `escalation.shadow_ruling`
+    without inverting the layer direction (a pure archive reader would drag in
+    fastmcp), so the identity is held here by a cross-module TEST import — the
+    convention `escalation/src/escalation/authority.py` already uses for the
+    watcher identity string. Add a C1 action to the reversible list and this
+    fails rather than silently reporting the new action as `not_comparable`.
+    """
+    from escalation.server import RESOLVE_ACTIONS
+
+    assert REVERSIBLE_ACTIONS & frozenset(RESOLVE_ACTIONS) == COMPARABLE_ACTIONS

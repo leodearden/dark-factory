@@ -35,10 +35,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from types import MappingProxyType
 
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
+from escalation.queue import iter_all_escalation_paths
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +107,19 @@ DETECTABLE_GATES: frozenset[str] = frozenset({'milestone_gate', 'deterministic_r
 #: for free, and replacing either binding with a literal fails the guard.
 GATED_CATEGORIES: frozenset[str] = L2_AUTO_CLOSE_DENY_CATEGORIES
 GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
+
+#: The reversible actions that are ALSO C1 ``resolution_action`` values, so an
+#: observed outcome can be checked against the proposal. The rest of
+#: :data:`REVERSIBLE_ACTIONS` is task-side and leaves ``resolution_action``
+#: unset, which is what the report's ``not_comparable`` bucket counts.
+#:
+#: Must equal ``REVERSIBLE_ACTIONS & set(escalation.server.RESOLVE_ACTIONS)``,
+#: and is pinned in lockstep by a cross-module TEST import rather than derived
+#: by a production one — importing the MCP server here would invert the layer
+#: direction and pull fastmcp into every reader of the archive. This mirrors the
+#: convention ``escalation/src/escalation/authority.py`` already uses for the
+#: watcher identity string and ``action_effects.py`` for its target statuses.
+COMPARABLE_ACTIONS: frozenset[str] = frozenset({'close_only', 'resume'})
 
 #: Wire keys of the JSON payload. ``class`` rather than ``ruling_class`` because
 #: that is what a reader of the note sees; the Python attribute cannot be
@@ -239,3 +259,179 @@ def mechanically_gated(record: Escalation) -> str | None:
     if record.agent_role in GATED_ROLES:
         return 'deterministic_runner_filing'
     return None
+
+
+@dataclass(frozen=True)
+class ClassAgreement:
+    """How one shadowed class fared over the report window.
+
+    ``agreed`` and ``diverged`` are the COMPARABLE outcomes: the stamped
+    proposal was a C1 action, so the record's observed ``resolution_action``
+    could be checked against it. ``not_comparable`` counts proposals whose
+    action is task-side and leaves no C1 trace — kept as its own number rather
+    than folded into either side, so the denominator the adoption threshold is
+    read off is one a reader can see.
+    """
+
+    ruling_class: str
+    agreed: int
+    diverged: int
+    not_comparable: int
+
+    @property
+    def comparable(self) -> int:
+        """The denominator of :attr:`agreement_rate`."""
+        return self.agreed + self.diverged
+
+    @property
+    def total(self) -> int:
+        return self.agreed + self.diverged + self.not_comparable
+
+    @property
+    def agreement_rate(self) -> float | None:
+        """Agreement over the comparable subset, or ``None`` when there is none.
+
+        ``None`` rather than 0.0 or 1.0: a class whose proposals are all
+        task-side is NOT YET MEASURABLE, and reporting either extreme would make
+        it look decided.
+        """
+        return self.agreed / self.comparable if self.comparable else None
+
+
+@dataclass(frozen=True)
+class AgreementReport:
+    """The weekly count over one window. Every field is a decided number.
+
+    The three non-rate buckets are findings, not noise: each counts a stamp that
+    must not contribute to any class's rate, and each is reported so a reader
+    can tell a small sample from a thrown-away one.
+    """
+
+    since: datetime
+    until: datetime
+    classes: tuple[ClassAgreement, ...]
+    gated_stamps: int
+    self_resolved: int
+    unresolved: int
+    resolver_tiers: Mapping[str, int]
+
+    def for_class(self, ruling_class: str) -> ClassAgreement | None:
+        """The row for *ruling_class*, or ``None`` when it had no counted record."""
+        return next((c for c in self.classes if c.ruling_class == ruling_class), None)
+
+
+def _resolved_at(record: Escalation) -> datetime | None:
+    """*record*'s resolution instant as an aware datetime, or ``None``.
+
+    Parsed, never string-compared: ``resolved_at`` is written by several call
+    sites and an offset-bearing timestamp sorts differently as text than it does
+    as an instant.
+    """
+    if record.resolved_at is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(record.resolved_at)
+    except ValueError:
+        logger.warning('unparsable resolved_at %r on %s', record.resolved_at, record.id)
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def agreement_report(
+    escalations_dir: Path | str, *, since: datetime, until: datetime,
+) -> AgreementReport:
+    """Count how often the shadow proposals matched what actually happened.
+
+    Sweeps the queue root and its archive through
+    ``escalation/src/escalation/queue.py::iter_all_escalation_paths``, which
+    already handles root-wins-on-collision, archive-only multi-date duplicates
+    and a missing directory (yields nothing rather than raising). Records with
+    no parsable shadow ruling are skipped — the overwhelming majority carry
+    none.
+
+    THE ORDER OF CHECKS IS PART OF THE CONTRACT: gated -> self_resolved ->
+    unresolved -> out-of-window -> non-human resolver -> not_comparable ->
+    agreed/diverged. The first five are all "this record must not contribute to
+    a rate at all"; putting any of them later would let an in-window matching
+    close fall through to ``agreed`` first.
+
+    ``self_resolved`` — ``triaged_by is not None and triaged_by ==
+    resolved_by`` — is the bucket task 5361 made necessary.
+    ``escalation/src/escalation/classify.py::_HUMAN_RESOLVERS`` contains
+    ``escalation-watcher``, so a watcher that stamps a proposal and then closes
+    the record itself under that standing rule would otherwise be read back as
+    a human agreeing with itself, inflating the very ``design_concern`` class
+    this measurement exists to judge, toward its own adoption threshold.
+
+    The limit of that check, stated honestly: attribution is server-enforced
+    only for a header-bearing identity —
+    ``escalation/src/escalation/server.py::stamp_triage`` overrides
+    ``triaged_by`` from ``X-Escalation-Identity`` ONLY when the header is
+    present — so for the header-less interactive channel this is a backstop over
+    a convention rather than a guarantee. That is why
+    ``skills/escalation-watcher/SKILL.md`` forbids the stamp in the first place
+    and this bucket only makes a violation visible.
+    """
+    agreed: Counter[str] = Counter()
+    diverged: Counter[str] = Counter()
+    not_comparable: Counter[str] = Counter()
+    tiers: Counter[str] = Counter()
+    gated_stamps = 0
+    self_resolved = 0
+    unresolved = 0
+
+    for path in iter_all_escalation_paths(Path(escalations_dir)):
+        try:
+            record = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning('skipping unparsable escalation at %s: %s', path, exc)
+            continue
+
+        ruling = parse_shadow_ruling(record.triage_note)
+        if ruling is None:
+            continue
+
+        if mechanically_gated(record) is not None:
+            gated_stamps += 1
+            continue
+        if record.triaged_by is not None and record.triaged_by == record.resolved_by:
+            self_resolved += 1
+            continue
+        if record.status == 'pending':
+            unresolved += 1
+            continue
+
+        resolved_at = _resolved_at(record)
+        if resolved_at is None or not since <= resolved_at <= until:
+            continue
+
+        tier = classify_resolver_tier(record.resolved_by)
+        tiers[tier] += 1
+        if tier != 'human':
+            continue
+
+        if ruling.proposed_action not in COMPARABLE_ACTIONS:
+            not_comparable[ruling.ruling_class] += 1
+        elif record.resolution_action == ruling.proposed_action:
+            agreed[ruling.ruling_class] += 1
+        else:
+            diverged[ruling.ruling_class] += 1
+
+    counted = sorted(set(agreed) | set(diverged) | set(not_comparable))
+    return AgreementReport(
+        since=since,
+        until=until,
+        classes=tuple(
+            ClassAgreement(
+                ruling_class=slug,
+                agreed=agreed[slug],
+                diverged=diverged[slug],
+                not_comparable=not_comparable[slug],
+            )
+            for slug in counted
+        ),
+        gated_stamps=gated_stamps,
+        self_resolved=self_resolved,
+        unresolved=unresolved,
+        resolver_tiers=MappingProxyType(dict(sorted(tiers.items()))),
+    )
