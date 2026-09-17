@@ -2922,3 +2922,159 @@ class TestImplausibleTargetReason:
             known_projects={},
             target_node_exists=False,
         ) != ''
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-9/10: guard (b) wired into the repair pass
+# ---------------------------------------------------------------------------
+
+class TestTheTargetPlausibilityGuard:
+    """The repair pass refuses an implausible target BEFORE any write.
+
+    Applies ONLY on the whole-set-fallback arm (`not finding.target_cited`).
+    The discrimination is exact and needs no new state: the pool is
+    `cited & referents` whenever that is non-empty, so the fallback was taken
+    iff the chosen target is NOT among the fact's citations.
+
+    zeta is UNCHANGED — it still records these findings as `resolvable=True`.
+    eta is what refuses, at the one place a mint can actually happen.
+    """
+
+    @pytest.fixture
+    def service(self, service):
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
+        return service
+
+    @staticmethod
+    def _junk(**overrides) -> ReferentFinding:
+        """ROUTE 1: the whole-set fallback with a junk target — the live defect.
+
+        A paraphrased fact citing no task number at all, a derived referent set
+        holding only 'redis:6379', and an edge on a 'Task 1251' node.
+        """
+        fields = {
+            'old_endpoint_uuid': 'n-1251',
+            'old_endpoint_name': 'Task 1251',
+            'endpoint_referent': Referent(number='1251'),
+            'cited': (),
+            'referent_set': ('redis:6379',),
+            'intended_referent': Referent(number='6379', project_id='redis'),
+            'new_endpoint_uuid': None,
+            'resolvable': True,
+        }
+        fields.update(overrides)
+        return _finding(**fields)
+
+    @pytest.mark.asyncio
+    async def test_route_1_a_junk_fallback_target_mints_nothing(self, service):
+        """(1) THE HEADLINE. Nothing is minted, nothing is moved, no summary is
+        touched, and the refusal is recorded naming the target."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert 'redis:6379' in record.reason
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert stats.nodes_minted == 0
+        assert stats.flagged_unrepairable == 1
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_route_2_the_intersection_arm_still_repairs(self, service):
+        """(2) A fact that NAMES the target is materially stronger evidence than
+        the whole declared set, and that arm is out of scope by ratified
+        decision. It must repair exactly as it does today."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(cited=('Task 3127',), intended_referent=Referent(number='3127'))),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        service.graphiti.reassign_edge.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_plus_a_registered_qualifier_still_repairs(self, service):
+        """(3) Condition (i): the fallback arm is not closed wholesale — a
+        qualified target whose project IS registered is a real cross-project
+        reference."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(
+                referent_set=('reify:132',),
+                intended_referent=Referent(number='132', project_id='reify'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_fallback_plus_a_bare_own_project_target_still_repairs(self, service):
+        """(4) Condition (ii). THE DOMINANT LIVE SHAPE — this is what the
+        referent-fidelity PRD exists to repair, and it must not regress."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(
+                referent_set=('Task 3127',),
+                intended_referent=Referent(number='3127'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_fallback_onto_an_existing_node_still_repairs(self, service):
+        """(5) Condition (iii): zeta found exactly one node already carrying
+        that name, so repointing onto it mints nothing."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(new_endpoint_uuid='n-redis')),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].minted is False
+
+    @pytest.mark.asyncio
+    async def test_the_guard_runs_ahead_of_the_write_guard(self, service):
+        """(6) A junk target produces no 'failed' record even when the write
+        would have raised — because the write is never reached."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(self._junk()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert 'redis:6379' in stats.repairs[0].reason
+        assert 'falkor down' not in stats.repairs[0].reason
+        assert stats.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_the_never_guess_arm_is_untouched(self, service):
+        """(7) The new guard ADDED a disposition; it did not re-route the old
+        one. An unresolvable finding still carries zeta's own reason verbatim."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(
+                resolvable=False,
+                intended_referent=None,
+                reason="zeta's own words",
+            )),
+            group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert stats.repairs[0].reason == "zeta's own words"
+        assert stats.repairs[0].intended_referent == ''
