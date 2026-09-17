@@ -50,6 +50,27 @@ SUCCESSOR_RECORD: dict[str, Any] = {
 }
 
 
+# The victim's OWN live record. The wrong-but-resolving class is the exact
+# inverse of the dangling one: the cited id resolves perfectly well, it simply
+# is not the memory that backs the finding.
+LIVE_VICTIM_RECORD: dict[str, Any] = {
+    'id': DANGLING,
+    'content': 'a live entry that does not back this finding',
+    'metadata': {
+        'category': 'observations_and_summaries',
+        'agent_id': 'recon-stage-memory_consolidator',
+        'created_at': '2026-07-18T11:02:44Z',
+    },
+}
+
+# The prose account a ``wrong_memory`` repair must carry, taken from the
+# incident: the durable ``citation_repairs`` record is the only surviving
+# statement of why a still-resolving citation was removed.
+WHY_WRONG = (
+    'mis-cites task 168 rolling summary; claim independently confirmed '
+    'via get_task(182)'
+)
+
 # A raw, non-StageReport ``stage_reports`` entry, shaped like the ones
 # ``harness`` actually writes. Note it carries ``failed_stage``, NOT ``stage``:
 # ``journal.get_run`` discriminates on ``'stage' in v`` to decide whether to
@@ -92,6 +113,30 @@ def _dump(run: Any) -> dict[str, Any]:
         for key, value in run.stage_reports.items()
     }
     return json.loads(json.dumps(serialized, sort_keys=True, default=str))
+
+
+def _assert_only_the_target_finding_moved(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Nothing outside ``items_flagged[0]``'s two citation keys changed.
+
+    The sibling finding, the raw non-StageReport entry and every stat/summary
+    field must survive a repair untouched, so the run's flagged_count and the
+    judge's stat verification stay exactly as the original run reported them.
+    """
+    assert after['_error'] == before['_error']
+    assert after['memory_consolidator']['items_flagged'][1] == (
+        before['memory_consolidator']['items_flagged'][1]
+    )
+    assert after['memory_consolidator']['stats'] == (
+        before['memory_consolidator']['stats']
+    )
+    moved = {'cited_memories', 'citation_repairs'}
+    assert {
+        k: v for k, v in after['memory_consolidator']['items_flagged'][0].items()
+        if k not in moved
+    } == {
+        k: v for k, v in before['memory_consolidator']['items_flagged'][0].items()
+        if k not in moved
+    }
 
 
 class TestRepairHappyPath:
@@ -166,25 +211,136 @@ class TestRepairHappyPath:
             assert utc_offset is not None
             assert utc_offset.total_seconds() == 0
 
-            # Nothing but the target finding moved: the sibling finding, the raw
-            # non-StageReport entry, and every stat/summary field are untouched,
-            # so the run's flagged_count and the judge's stat verification stay
-            # exactly as the original run reported them.
-            assert after['_error'] == before['_error']
-            assert after['memory_consolidator']['items_flagged'][1] == (
-                before['memory_consolidator']['items_flagged'][1]
+            _assert_only_the_target_finding_moved(before, after)
+        finally:
+            await journal.close()
+
+
+class TestRepairWrongButResolving:
+    """``reason='wrong_memory'``: the cited id RESOLVES but is the wrong memory.
+
+    The two defect classes corroborate opposite facts. ``memory_not_found``
+    requires the victim to be confirmed ABSENT; ``wrong_memory`` requires it to
+    be confirmed PRESENT, because the claim being repaired is "this id is real
+    and it does not back this finding". Both spellings of the repair — detach
+    (``replacement_memory_id=None``) and swap — are the same two already-working
+    code paths; only the corroboration gate differs.
+
+    A non-blank ``justification`` is the compensating control for the structural
+    property this class gives up ("the worst it can do is re-point a claim that
+    already had no backing"), so every case here supplies one and asserts it
+    reaches the durable provenance record.
+    """
+
+    @pytest.mark.asyncio
+    async def test_detaches_a_citation_that_still_resolves(self, tmp_path):
+        """``replacement_memory_id=None`` DROPS a live-but-wrong citation."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status='completed',
+            findings=[
+                _finding('f-1', [_citation(DANGLING)]),
+                _finding('f-2', [_citation(SUCCESSOR)]),
+            ],
+            extra_stage_reports={'_error': RAW_ERROR_ENTRY},
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
             )
-            assert after['memory_consolidator']['stats'] == (
-                before['memory_consolidator']['stats']
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=None,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
             )
-            untouched_keys = {
-                k: v for k, v in repaired.items()
-                if k not in {'cited_memories', 'citation_repairs'}
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['removed_count'] == 1
+            assert outcome['replacement_memory_id'] is None
+            # ``reason`` is echoed so a caller reading only the outcome knows
+            # which corroboration was asserted, without re-reading the blob.
+            assert outcome['reason'] == 'wrong_memory'
+            assert 'error' not in outcome
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == []
+
+            record = repaired['citation_repairs'][-1]
+            assert record['memory_id'] == DANGLING
+            assert record['replacement_memory_id'] is None
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+
+            _assert_only_the_target_finding_moved(before, after)
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_swaps_a_citation_that_still_resolves(self, tmp_path):
+        """A supplied replacement re-points a live-but-wrong citation."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status='completed',
+            findings=[
+                _finding('f-1', [_citation(DANGLING)]),
+                _finding('f-2', [_citation(SIBLING)]),
+            ],
+            extra_stage_reports={'_error': RAW_ERROR_ENTRY},
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['removed_count'] == 1
+            assert outcome['reason'] == 'wrong_memory'
+            assert outcome['deduped'] is False
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            # The replacement's fingerprint is the REAL one, read off the record
+            # the corroboration already fetched — same as the dangling class.
+            assert repaired['cited_memories'][0]['metadata_fingerprint'] == {
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'created_at': '2026-07-26T04:34:05Z',
             }
-            assert untouched_keys == {
-                k: v for k, v in before['memory_consolidator']['items_flagged'][0].items()
-                if k not in {'cited_memories', 'citation_repairs'}
-            }
+
+            record = repaired['citation_repairs'][-1]
+            assert record['memory_id'] == DANGLING
+            assert record['replacement_memory_id'] == SUCCESSOR
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+
+            _assert_only_the_target_finding_moved(before, after)
         finally:
             await journal.close()
 
