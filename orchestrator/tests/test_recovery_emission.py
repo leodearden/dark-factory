@@ -723,6 +723,54 @@ class TestEmitRecoveryVetoStreakEscalation:
             'key it mints does not depend on bucket iteration order'
         )
 
+    def test_the_pinning_escalations_line_names_no_id_when_nothing_pins(self, tmp_path):
+        """Pin the NO-PIN branch of that same line — the one that mints a garbage key.
+
+        This branch is REACHABLE: the streak alarm is generic over veto shapes,
+        not only the escalation-pinned one.  ``unmapped_shape`` below is a real
+        ``LeaveReason`` — the ``_RECOVERY`` table has no row for the shape, so
+        the task is held with NOTHING pinning it and ``escalation_ids`` is
+        genuinely empty.
+
+        It matters because it is the input on which a naive extraction of the
+        ``Pinning escalations:`` line mints
+        ``recovery-veto-streak-noise-from-pending-l2-pin:(none`` — a key that is
+        stable and wrong, and would quietly become a NEW over-fold bucket, the
+        same defect wearing a different name.  The fallback that forbids this
+        (drop to the bare stem, never interpolate the sentinel text) is
+        documented under "Recovery veto-streak sentinel L1s" in
+        ``skills/escalation-watcher-auto/SKILL.md``; this test is what keeps the
+        rendered text that fallback keys on from being dropped or reshaped.
+
+        The negative assertion is stronger than it looks: the default kwargs
+        still carry ``ages_secs`` for an id that is NOT in the (empty) pin set,
+        so it also proves a stale age entry cannot leak an id onto the line.
+
+        Characterization guard, GREEN on arrival — like its sibling above.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.recovery_emission import LeaveReason
+
+        queue = EscalationQueue(tmp_path)
+        # Both empty shapes `_flatten_ids` accepts, on distinct task ids so the
+        # sentinel dedup cannot swallow the second filing.
+        empty_shapes = (('3535', {'queue_handoff': [], 'dead_l0': []}), ('3536', []))
+        for task_id, escalation_ids in empty_shapes:
+            assert _file_streak(**_streak_kwargs(
+                queue, task_id=task_id, escalation_ids=escalation_ids,
+                reason=LeaveReason.unmapped_shape,
+            )) is True
+
+            esc = queue.get_by_task(_streak_sentinel(task_id), status='pending')[0]
+            lines = [l for l in esc.detail.splitlines() if l.startswith('Pinning escalations: ')]
+            assert lines == ['Pinning escalations: (none recorded)'], (
+                f'{escalation_ids!r} must render the no-pin sentinel, got {lines}'
+            )
+            assert 'esc-' not in lines[0], (
+                'nothing on this line may be mistakable for a pinning escalation id'
+            )
+
     def test_dedups_against_a_still_open_sentinel_l1(self, tmp_path):
         """Boundary #17 — no storm.
 
