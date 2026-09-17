@@ -258,13 +258,25 @@ class TestReconSuccessRateWiring:
             'drives the rate, the tone drives the Recent Runs badges.'
         )
 
-    def test_counts_are_derived_exactly_once(self, recon_tab_code):
-        """ReconTab must call reconRunCounts once and bind it to `counts`.
+    def test_counts_are_derived_once_over_the_unfiltered_window(self, recon_tab_code):
+        """ReconTab must call reconRunCounts once, bind it to `counts`, and
+        hand it the UNFILTERED `r.runs`.
 
         ONE derivation feeding every tile is the structural point: this file
         previously held two independent status filters that disagreed with
         each other (the tile's 'success' and the badge ternary's
         'success' || 'completed'), and a second call site is how that returns.
+
+        The window is `r.runs`, not the `runs` local — which is r.runs
+        narrowed by projectFilter and search. The tile strip reports the
+        store, matching its three untouched neighbours (Buffered events,
+        Active agents, Last full run); the Recent runs table below reports
+        the filter the operator set and headlines itself "N matching". Two
+        deliberately different questions, which is exactly why the ARGUMENT
+        has to be pinned here: swapping it switches every tile to the
+        filtered population in one word, invisibly to every other assertion
+        in this module. Measured, not inferred — with the call mutated to
+        `reconRunCounts(runs)`, all 20 tests passed.
         """
         calls = re.findall(r'reconRunCounts\s*\(', recon_tab_code)
         assert len(calls) == 1, (
@@ -272,38 +284,23 @@ class TestReconSuccessRateWiring:
             'must read the SAME counts object, or two tiles can disagree '
             'about the same window.'
         )
-        assert re.search(r'const\s+counts\s*=\s*reconRunCounts\s*\(', recon_tab_code), (
+        bound = re.search(
+            r'const\s+counts\s*=\s*reconRunCounts\s*\(\s*(.*?)\s*\)', recon_tab_code
+        )
+        assert bound is not None, (
             'ReconTab does not bind reconRunCounts(...) to `const counts`.'
         )
-
-    def test_each_run_derived_tile_declares_the_window_it_counts(
-        self, recon_tab_code
-    ):
-        """The tiles count the store; the table below counts a filter. Say so.
-
-        `runs` is r.runs narrowed by projectFilter and search, and the Recent
-        runs table headlines it as "N matching" — so with a filter active a
-        tile and the table describe different populations, and "3 in
-        progress" sitting above "4 matching" reads as a contradiction.
-
-        The tiles stay store-wide: that is what the acceptance wording asks
-        for ("with N runs in status 'running' IN THE STORE, the tab displays
-        N"), and the three tiles beside them — Buffered events, Active
-        agents, Last full run — are all store-wide already, the last of them
-        over the very watermarks the filtered table below it narrows. What
-        must hold instead is that a run-derived tile never lets its number be
-        mistaken for the table's: each one names its scope in the hint.
-        """
-        for label in ('In progress', 'Run success rate'):
-            tile = _extract_stat_tile(recon_tab_code, label)
-            hint = re.search(r'hint=\{(.*?)\}\s*\n', tile, re.DOTALL)
-            assert hint is not None, f'the {label} tile has no hint: {tile!r}'
-            assert 'all projects' in hint.group(1), (
-                f'the {label} tile counts the whole store but its hint does '
-                f'not say so: {hint.group(1)!r} — an operator who filtered to '
-                f'one project reads it as disagreeing with the "N matching" '
-                f'table below.'
-            )
+        window = bound.group(1)
+        assert re.search(r'\br\.runs\b', window), (
+            f'the counts are derived over {window!r}, not the store-wide '
+            'r.runs — the tile strip would report a narrowed population while '
+            'standing beside three neighbours that report the store.'
+        )
+        assert not re.search(r'(?<![\w.])runs\b', window), (
+            f'the counts are derived over the filtered `runs` local '
+            f'({window!r}) — that is the window of the Recent runs table, '
+            'headlined "N matching", not the window of the tile strip.'
+        )
 
     def test_success_rate_tile_value_comes_from_recon_success_pct(self, recon_tab_code):
         """The rate the tile renders must be the module's, traced in two hops.
