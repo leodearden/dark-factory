@@ -46,6 +46,16 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` because this suite declares no addopts and so runs SERIAL, and signal
+# is the only method that interrupts a blocking main-thread wait.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 540
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [
