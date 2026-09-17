@@ -37,6 +37,9 @@ import json
 import logging
 from dataclasses import dataclass
 
+from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.models import Escalation
+
 logger = logging.getLogger(__name__)
 
 #: The fixed token that opens a shadow-ruling line inside a ``triage_note``.
@@ -84,6 +87,19 @@ HUMAN_FOREVER_GATES: frozenset[str] = frozenset({
     'spend_or_eval_launch',
     'post_breaker_resume_scheduler',
 })
+
+#: The two gate slugs :func:`mechanically_gated` can return. A PROPER subset of
+#: :data:`HUMAN_FOREVER_GATES` — the remaining five gates are semantic and have
+#: no record-level signal at all.
+DETECTABLE_GATES: frozenset[str] = frozenset({'milestone_gate', 'deterministic_runner_filing'})
+
+#: The categories and roles the detector matches against — THE IMPORTED
+#: ``escalation.authority`` tables, bound under local names, never copies of
+#: their literals. Re-exported so the SPOT property is assertable without
+#: reaching into a private name: a member added to authority.py propagates here
+#: for free, and replacing either binding with a literal fails the guard.
+GATED_CATEGORIES: frozenset[str] = L2_AUTO_CLOSE_DENY_CATEGORIES
+GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
 
 #: Wire keys of the JSON payload. ``class`` rather than ``ruling_class`` because
 #: that is what a reader of the note sees; the Python attribute cannot be
@@ -186,4 +202,40 @@ def parse_shadow_ruling(triage_note: str) -> ShadowRuling | None:
         except ValueError as exc:
             logger.warning('rejected %s payload: %s', SHADOW_RULING_MARKER, exc)
             return None
+    return None
+
+
+def mechanically_gated(record: Escalation) -> str | None:
+    """Return the human-forever gate slug *record* trips, or ``None``.
+
+    ``None`` means **no MECHANICAL gate was detected**, NEVER "not gated". Five
+    of the seven gates in :data:`HUMAN_FOREVER_GATES` — model admission,
+    physical operator actions, irreversible deletions, spend/eval launches and a
+    post-breaker ``resume_scheduler`` — are semantic judgements with no signal
+    on the record at all. ``docs/escalation-standing-policy.md`` remains the
+    authority for the full list; this function covers only its detectable
+    subset, and a caller that treats a ``None`` here as clearance is reading it
+    wrong.
+
+    Category and role are checked independently, mirroring the defence in depth
+    ``escalation/src/escalation/authority.py`` already relies on: neither benign
+    half can mask the other.
+
+    THE ``design_concern`` TENSION, stated rather than hidden. The set this
+    matches is authority.py's auto-close denylist, and ``design_concern`` is a
+    member of it — so every ``design_concern`` shadow stamp lands in the weekly
+    count's ``gated_stamps`` bucket, including one filed under the
+    ``design_concern_semantic_collision`` first-tranche candidate. That is why
+    the candidate is shadow-only. It is ALSO why adoption is a question about
+    the INTERACTIVE arm rather than the auto arm: per authority.py's own
+    docstring these tables constrain only identified callers in
+    ``ROLE_LEVEL_ALLOWLIST`` — whose sole member is the auto-watcher identity —
+    and a header-less interactive connection is never narrowed by that module.
+    Extending a class to the AUTO watcher would need an authority.py change;
+    adopting one for the interactive session would not.
+    """
+    if record.category in GATED_CATEGORIES:
+        return 'milestone_gate'
+    if record.agent_role in GATED_ROLES:
+        return 'deterministic_runner_filing'
     return None
