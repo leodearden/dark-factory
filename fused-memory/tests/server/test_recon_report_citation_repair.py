@@ -288,6 +288,123 @@ class TestStateRepairMemoryCitation:
             await journal.close()
 
 
+class TestRepairLivenessIsPerEntry:
+    """A run is live iff it holds an IN-PROGRESS entry — not merely a resident one.
+
+    The caller, not ``citation_repair``, decides what "live" means. It used to
+    mean "this process holds any report state for the run", which keeps a run
+    live for the whole ``recon_report_state_ttl_seconds`` window (300s by
+    default) after its last stage completed and its journal row already reads
+    ``completed`` — the refusal that blocked the incident this task came from.
+
+    ``completed_at is None`` is not a new discriminator: it is exactly what
+    ``tick()`` uses to decide what may be evicted, and an in-progress entry is
+    immortal by design. So the narrowed set is precisely the set of runs a stage
+    can still write through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_entry_not_yet_evicted_no_longer_blocks(self, tmp_path):
+        """The incident's own shape: row says completed, entry lingers, repair runs.
+
+        ``clock=lambda: 0.0`` means no TTL has elapsed, so ``tick()`` has not
+        swept the entry — the entry is resident and completed, which is the
+        state every finished run passes through for minutes.
+        """
+        journal = await _seeded_journal(tmp_path, status='completed')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.start_report(
+                run_id=TARGET_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.complete(run_id=TARGET_RUN, summary='done')
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert 'error' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_in_progress_entry_still_blocks(self, tmp_path):
+        """A stage that has NOT completed can still rewrite the whole blob.
+
+        The narrowing must not become a blanket removal: this is the case the
+        guard exists for, and the refusal has to fire before any Mem0 read.
+        """
+        journal = await _seeded_journal(tmp_path, status='completed')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.start_report(
+                run_id=TARGET_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
+            # The journal row is terminal, so the in-process half is the ONLY
+            # thing refusing — which is what the hint has to say.
+            assert outcome['run_status'] == 'completed'
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_row_is_refused_with_no_entry_at_all(self, tmp_path):
+        """The row-status allowlist is independent and still has to pass.
+
+        Narrowing the in-process half must not weaken the other half: a
+        ``running`` row is refused even when this process holds no state for
+        that run whatsoever.
+        """
+        journal = await _seeded_journal(tmp_path, status='running')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['run_status'] == 'running'
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+
 class TestRepairToolViaFastMCP:
     """The MCP surface: registration, boundary validation, end-to-end call, docs."""
 
