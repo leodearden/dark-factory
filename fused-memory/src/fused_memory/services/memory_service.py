@@ -2606,8 +2606,17 @@ class ReferentStats:
 #:   inside this outcome is ``reassign_edge``'s own corroborate-before-acting
 #:   no-op (the edge was ALREADY correct), which is why the streak counts
 #:   ``moved=True`` records rather than this outcome alone.
-#: * ``'unrepairable'``— zeta could not determine a correct target and eta
-#:   REFUSED TO GUESS. Working as designed.
+#: * ``'unrepairable'``— the edge was LEFT ALONE, and that was the right
+#:   answer. THREE refusals share this outcome, because they share what the
+#:   operator needs to know — nothing was written and nothing is broken:
+#:   (i) zeta could not determine a correct target and eta REFUSED TO GUESS;
+#:   (ii) zeta determined one from the whole-set fallback and eta found it
+#:   IMPLAUSIBLE (:func:`_implausible_target_reason`); (iii) the target name
+#:   resolves to a DUPLICATE-NAME group, which the repair path is not
+#:   licensed to collapse (``AmbiguousEntityError``). ``reason`` is the field
+#:   that distinguishes them, which is why the vocabulary is NOT widened to
+#:   three members every consumer would then have to re-unify. All three are
+#:   working as designed.
 #: * ``'degenerate'``  — both ends of one edge would land on one node; the edge
 #:   was skipped WHOLE. Also a refusal, which is why it shares
 #:   ``flagged_unrepairable`` with the row above.
@@ -2734,10 +2743,20 @@ class ReferentRepair:
     #: The uuid of an emptied node this pass deleted, when the narrow
     #: three-condition cleanup fired. ``''`` when nothing was deleted.
     deleted_emptied_node: str = ''
-    #: Why, for the outcomes that did not repair. Carried VERBATIM from
-    #: ``ReferentFinding.reason`` on the ``'unrepairable'`` arm — the operator
-    #: must see zeta's own explanation, not an eta-authored paraphrase — and
-    #: carrying the exception text on the ``'failed'`` arm.
+    #: Why, for the outcomes that did not repair — and on ``'unrepairable'``
+    #: also WHICH of that outcome's three refusals fired
+    #: (:data:`REFERENT_REPAIR_OUTCOMES`). Its AUTHOR therefore differs per
+    #: arm, under one rule: whoever actually holds the fact says it.
+    #:
+    #: * NEVER-GUESS — carried VERBATIM from ``ReferentFinding.reason``. The
+    #:   operator must see zeta's own explanation, not an eta paraphrase.
+    #: * IMPLAUSIBLE TARGET — :func:`_implausible_target_reason`'s sentence.
+    #:   zeta recorded this finding as RESOLVABLE, so its ``reason`` is empty
+    #:   and there is nothing to carry: the refusal is eta's, so is the wording.
+    #: * DUPLICATE-NAME REFUSAL — composed from ``AmbiguousEntityError``'s
+    #:   STRUCTURED fields, a fact neither pass held until the write attempt.
+    #:
+    #: On the ``'failed'`` arm it carries the exception text.
     reason: str = ''
 
     def __post_init__(self) -> None:
