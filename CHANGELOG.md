@@ -10,6 +10,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `merge_request` gained a `lane` parameter, and `merge_lane` is blessed into Tier-A (task 4888)
+
+**`metadata.merge_lane` was inert for every MCP-submitted merge.** Exactly one
+`MergeRequest(...)` construction in the repo passed `lane=` — the orchestrator's own
+submit path, `workflow.py::TaskWorkflow::_submit_to_merge_queue`. The one in
+`escalation/src/escalation/server.py::merge_request` omitted it and took the dataclass
+default `'normal'`, so a main-health fix task carrying `merge_lane='high'` was silently
+enqueued behind every routine merge whenever its merge came through the MCP tool.
+`merge_request` now honours the key, and gained an explicit `lane` parameter to set one
+directly. Precedence is **`lane` > `metadata.merge_lane` > `'normal'`**, and the argument
+wins even when it EQUALS the default — `lane='normal'` deliberately holds a `'high'` task
+back to the normal lane, the case a truthiness-based implementation gets wrong.
+
+**The parameter is `lane`; the metadata key stays `merge_lane`.** Two namespaces, two
+right answers. At the merge-queue boundary every existing name for this concept is the
+bare word — `MergeRequest.lane`, `MERGE_LANES`, the `lane` field `get_merge_queue` emits
+per queue item — so a submitter correlating its request against the queue would otherwise
+have to translate. Task metadata is one flat global dict shared by every subsystem, and
+this repo has at least three other things called lanes (warm, offline, merge-worktree); a
+bare `lane` there would be ambiguous on sight. Renaming the metadata key to match was
+rejected — it is machine-written at three live sites and buys nothing but a migration.
+
+**An invalid CALLER-supplied lane is rejected loudly; an invalid INHERITED one still
+normalises silently.** `lane='higgh'` returns `{error, code='invalid_lane', hint}` and
+enqueues nothing; the same spelling in `metadata.merge_lane` still becomes `'normal'`.
+The asymmetry is the point: an inherited value was written by another actor at another
+time and a lane resolution must never be able to FAIL a merge submission, whereas the
+argument is live operator intent and silently downgrading a main-health hotfix is exactly
+the defect the parameter exists to remove. The caller-supplied check is deliberately NOT
+routed through `_normalize_lane`, whose defining behaviour — map anything unrecognised to
+`'normal'` — would reproduce that defect one level up; both halves still key on the same
+`MERGE_LANES` tuple, so there is one vocabulary and no second normaliser.
+
+**The parameter is not separately access-gated, because the tool carrying it already is.**
+Measured, not assumed: `mcp__escalation__merge_request` appears in exactly ONE agent
+role's `allowed_tools` — `roles.py::STEWARD` — which the SDK enforces as a ceiling, so no
+rank-and-file agent role can reach the parameter to self-declare urgency. Task 1689's
+anti-starvation reservation of `'high'` for the rare, gated hotfix/main-health class is
+carried by that existing restriction plus attribution: the resolved lane and the source
+that won it are echoed back as `lane`/`lane_source` on both the queued and the attached
+submit response, and `get_merge_queue` already shows the lane per queue item. That echo is
+what closes the loop for a caller who passed no argument — without it there was no way to
+learn whether the task's own `merge_lane` had been honoured, which is half of why the key
+could sit inert unnoticed. It lands on the RESPONSE rather than on the `merge_queued`
+event because `merge_queue.py` is frozen by the merge-lane quality PRD's ratchet
+(`orchestrator/tests/test_merge_lane_ratchet.py`) against a line/prose/cognitive baseline
+that one added line — or one added comment — would break.
+
+Cost is bounded: the submit path's degeneracy probe and the new lane fallback share ONE
+memoized task-metadata read, so the count per `merge_request` call is 0 or 1 and 2 is
+unreachable; an explicit `lane=` skips it entirely, and a rejected typo pays nothing
+because validation is pure and runs before any git or metadata work. The remaining single
+read on a no-explicit-lane submission is accepted rather than engineered away — it is
+unavoidable if the precedence rule exists at all, and it can degrade a lane to `'normal'`
+but never fail a submission. The rule itself lives in a new pure module,
+`escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
+server, a queue, a registry and a fake worker.
+
+**`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
+`code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
+means and why `'high'` stays reserved. Blessed rather than promoted to a typed
+`Literal['normal', 'high']`, despite the vocabulary being closed and tiny — which is the
+fork `execution_class` (task 3780) is already recorded in that same §8 as the worked
+example for. A `Literal` raises on
+every metadata write to an out-of-vocabulary carrier under `direction='write',
+enforce=True`, permanently, since terminal tasks are unrepairable under the
+`done_provenance` write-authority floor; this task deliberately GROWS the carrier
+population via the new parameter, so the form that cannot strand a future carrier is the
+conservative one, and blessing can be tightened later where a raising `Literal` cannot be
+loosened. The typo the stronger form would have caught is caller intent — and that path is
+now guarded where it actually lives. The carrier census at blessing time (four tasks,
+measured 2026-08-20) is recorded once, in the frozenset annotation itself, which also
+records why the blessing ground here is LOAD-BEARING plus STABLE rather than corpus volume.
+
 #### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
 
 Replaces the hand-rolled write-then-delete choreography that made consolidation a
