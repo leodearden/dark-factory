@@ -1287,8 +1287,9 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # catch is caller intent, and that path is now guarded where it
         # actually lives: `merge_request` rejects an unknown CALLER-supplied
         # lane loudly with `code='invalid_lane'`, while an inherited metadata
-        # value still normalises silently so a lane resolution can never fail
-        # a merge submission.
+        # value still normalises silently.  Why those two differ is stated
+        # once, in `escalation/src/escalation/merge_lane_resolution.py`, on
+        # the same one-place rule as the census figures above.
         'merge_lane',
     }
 )

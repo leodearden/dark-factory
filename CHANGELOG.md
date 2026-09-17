@@ -41,7 +41,10 @@ argument is live operator intent and silently downgrading a main-health hotfix i
 the defect the parameter exists to remove. The caller-supplied check is deliberately NOT
 routed through `_normalize_lane`, whose defining behaviour — map anything unrecognised to
 `'normal'` — would reproduce that defect one level up; both halves still key on the same
-`MERGE_LANES` tuple, so there is one vocabulary and no second normaliser.
+`MERGE_LANES` tuple, so there is one vocabulary and no second normaliser. (This entry is a
+dated release note and states the reasoning in full for a reader who has only the release
+notes; the LIVE copy every in-tree surface cites is the module docstring of
+`escalation/src/escalation/merge_lane_resolution.py`.)
 
 **The parameter is not separately access-gated, because the tool carrying it already is.**
 Measured, not assumed: `mcp__escalation__merge_request` appears in exactly ONE agent

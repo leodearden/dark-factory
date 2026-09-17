@@ -13,9 +13,8 @@ enqueued ``MergeRequest``); neither reaches into internals to check the
 other's job.
 
 The asymmetry these tests pin is the point of the module: an INHERITED
-metadata value normalises silently (a lane resolution must never fail a merge
-submission), while a CALLER-SUPPLIED one is rejected loudly (silently
-discarding live operator intent is the defect task 4888 exists to fix).
+metadata value normalises silently, while a CALLER-SUPPLIED one is rejected
+loudly.  Why, once, in that module's own docstring.
 """
 from __future__ import annotations
 

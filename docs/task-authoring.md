@@ -1167,8 +1167,9 @@ task's *metadata* is silently normalised to `'normal'` by
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The
-asymmetry is deliberate: an inherited value must never be able to fail a
-merge submission, and live caller intent must never be silently discarded.
+asymmetry is deliberate; the reason for it is stated once, in
+`escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
+rule this section applies to the carrier census below.
 
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
 (task 1689) — its three machine writers are all of that shape. Routine work

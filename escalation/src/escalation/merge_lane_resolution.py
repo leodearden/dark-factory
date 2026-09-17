@@ -7,13 +7,22 @@ won.  Pure — no I/O, no awaits, no server capture — so the server does only
 wiring and the rule is testable without building a server, a queue, a
 registry and a fake worker.
 
-**The asymmetry is the point.**  An INHERITED ``metadata.merge_lane`` fails
-OPEN: it was written by a different actor at a different time, possibly by a
-machine writer, so an unrecognised value normalises silently to ``'normal'``
-and a lane resolution can never fail a merge submission.  A CALLER-SUPPLIED
-lane fails LOUD: it is live operator intent, the caller is present to be
-told, and silently discarding it is the defect this module exists to fix —
-``lane='higgh'`` must not quietly downgrade a main-health hotfix.
+**The asymmetry is the point, and this paragraph is its SINGLE in-repo
+statement.**  An INHERITED ``metadata.merge_lane`` fails OPEN: it was written
+by a different actor at a different time, possibly by a machine writer, so an
+unrecognised value normalises silently to ``'normal'`` and a lane resolution
+can never fail a merge submission.  A CALLER-SUPPLIED lane fails LOUD: it is
+live operator intent, the caller is present to be told, and silently
+discarding it is the defect this module exists to fix — ``lane='higgh'`` must
+not quietly downgrade a main-health hotfix.
+
+Every other surface carrying this behaviour — ``escalation/src/escalation/
+server.py::merge_request``'s docstring, ``docs/task-authoring.md`` §8, the
+``'merge_lane'`` entry in ``shared/src/shared/task_metadata.py``, and both
+test modules — states the CONTRACT and cites this paragraph rather than
+restating the reason, on the same one-place rule that frozenset entry already
+applies to its carrier census.  Eight copies of an argument drift; one does
+not.
 
 Both halves key on the SAME vocabulary.  ``MERGE_LANES`` and
 ``lane_for_task_metadata`` are imported from ``orchestrator.merge_queue``,
@@ -128,8 +137,8 @@ def resolve_merge_lane(
     ``metadata.merge_lane='high'`` back to the normal lane.
 
     The metadata arm delegates to ``orchestrator.merge_queue::
-    lane_for_task_metadata``, so an inherited value is normalised by the same
-    code the orchestrator's own submit path uses.  ``source`` is
+    lane_for_task_metadata`` — see the module docstring for why that, and not
+    ``_normalize_lane``, is the right normaliser here.  ``source`` is
     ``'task_metadata'`` iff the ``'merge_lane'`` key is PRESENT — presence,
     not truthiness, and not "the result differs from ``'normal'``" — because
     a task that asked for ``'normal'`` and a task that asked for nothing are

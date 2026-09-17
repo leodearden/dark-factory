@@ -3131,11 +3131,11 @@ def create_server(
         An unrecognised value here is REJECTED — ``{error,
         code='invalid_lane', hint}``, nothing enqueued — while an unrecognised
         ``metadata.merge_lane`` still normalises silently to ``'normal'``.
-        The asymmetry is deliberate: an inherited value was written by another
-        actor at another time and must never be able to fail a merge
-        submission, whereas this argument is live caller intent and silently
-        downgrading a main-health hotfix to the normal lane is exactly the
-        defect this parameter exists to remove.
+        That asymmetry is deliberate — live caller intent must not be silently
+        discarded; an inherited value must never be able to fail a submission
+        — and the reason is stated once, in ``escalation/src/escalation/
+        merge_lane_resolution.py``, which the other surfaces carrying this
+        behaviour cite rather than restate.
 
         NOT separately access-gated, and deliberately so.
         ``mcp__escalation__merge_request`` appears in exactly ONE agent role's
