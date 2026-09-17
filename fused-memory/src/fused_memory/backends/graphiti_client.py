@@ -424,9 +424,19 @@ class AmbiguousEntityError(Exception):
     disambiguate and call refresh_entity_summary with a specific UUID. The
     same facts are also carried as STRUCTURED fields — ``.name``,
     ``.group_id``, ``.uuids`` — so a consumer can name the duplicate-name
-    group without an ad-hoc parse of the message. Both raise sites populate
-    them: a structured field present at one site and empty at another is not
-    an invariant a consumer can key off.
+    group without an ad-hoc parse of the message.
+
+    THEY ARE REQUIRED KEYWORD ARGUMENTS, NOT DEFAULTED ONES. A structured
+    field present at one raise site and empty at another is not an invariant
+    a consumer can key off, and this one HAS a consumer that keys off it:
+    ``MemoryService._repair_edge_findings`` composes its whole refusal record
+    out of these three. Permissive defaults would let a future raise site —
+    or any construction from a bare message — book a structurally valid
+    ``'unrepairable'`` reading ``Repair target '' names a duplicate-name
+    group in '': []``: a record that passes every check while carrying no
+    evidence at all, which is the silent degradation INV-4 exists to prevent.
+    Requiring them costs nothing (both raise sites already pass all three)
+    and turns the invariant from documented into enforced.
 
     ``uuids`` is stored as a tuple: the error is the EVIDENCE for a refusal
     and must not be mutable.
@@ -436,9 +446,9 @@ class AmbiguousEntityError(Exception):
         self,
         message: str,
         *,
-        name: str = '',
-        group_id: str = '',
-        uuids: Iterable[str] = (),
+        name: str,
+        group_id: str,
+        uuids: Iterable[str],
     ) -> None:
         super().__init__(message)
         self.name = name
