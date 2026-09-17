@@ -91,6 +91,17 @@ REPAIRABLE_RUN_STATUSES = frozenset(
 # coincide — the gate deliberately does not rest on that coincidence.
 _REPAIRABLE_STATUS_VALUES = frozenset(status.value for status in REPAIRABLE_RUN_STATUSES)
 
+
+# The citation's DEFECT CLASS — a closed enum, because it is written verbatim
+# into the durable ``citation_repairs`` record and is therefore a factual claim
+# about the citation, not a mode switch. Each value names a fact about the
+# victim that the corroboration read then CHECKS, so the two are symmetric:
+# one asserts confirmed absence, the other confirmed presence.
+REASON_MEMORY_NOT_FOUND = 'memory_not_found'
+REASON_WRONG_MEMORY = 'wrong_memory'
+
+REPAIRABLE_REASONS = frozenset({REASON_MEMORY_NOT_FOUND, REASON_WRONG_MEMORY})
+
 # --------------------------------------------------------------------------- #
 # Structured error branches (INV-2: structured facts, never a bare failure)
 # --------------------------------------------------------------------------- #
@@ -188,7 +199,8 @@ def build_citation_repair_record(
     replacement_memory_id: str | None,
     store: str,
     repaired_by: str,
-    reason: str = 'memory_not_found',
+    reason: str = REASON_MEMORY_NOT_FOUND,
+    justification: str | None = None,
 ) -> dict[str, Any]:
     """Build the one provenance record a repair appends to a finding.
 
@@ -197,12 +209,21 @@ def build_citation_repair_record(
     historical audit record must say what it changed and why, or the repaired
     blob becomes indistinguishable from a report that never carried the dangling
     id. ``replacement_memory_id`` is None for a drop-only repair.
+
+    ``reason`` is the CHECKED defect class; ``justification`` is its
+    human-readable companion, stored verbatim and never parsed. The two split
+    the labour heuristic 12 asks for: the enum is the control value, the prose
+    is payload. ``justification`` is None for a ``memory_not_found`` repair
+    whose caller supplied none — the confirmed absence is its own account —
+    and is always present for ``wrong_memory``, where the removed citation
+    resolved perfectly well and nothing else in the blob would say why it went.
     """
     return {
         'memory_id': memory_id,
         'replacement_memory_id': replacement_memory_id,
         'store': store,
         'reason': reason,
+        'justification': justification,
         'repaired_by': repaired_by,
         'repaired_at': datetime.now(UTC).isoformat(),
     }
@@ -431,6 +452,8 @@ async def repair_memory_citation(
     store: str,
     replacement_memory_id: str | None,
     repaired_by: str,
+    reason: str = REASON_MEMORY_NOT_FOUND,
+    justification: str | None = None,
     caller_project_id: str | None = None,
     live_run_ids: frozenset[str] = frozenset(),
     apply: bool = True,
@@ -570,11 +593,11 @@ async def repair_memory_citation(
         victim_record = await memory_service.get_memory_by_id(run.project_id, memory_id)
     except Exception as exc:
         return _verification_error(memory_id, 'victim', exc)
-    if victim_record:
-        # Still alive — this is a valid claim, not a dangling one. Refusing here
-        # is what makes the path structurally incapable of retargeting live
-        # provenance; the worst it can ever do is re-point a claim that already
-        # had no backing.
+    if reason == REASON_MEMORY_NOT_FOUND and victim_record:
+        # Still alive — so this is not the defect class the caller asserted.
+        # ``memory_not_found`` claims the id has no backing at all; stamping it
+        # on a live id would put a false statement into the one durable record
+        # of the repair.
         return _ERR_CITATION_NOT_DANGLING | {
             'target_run_id': target_run_id,
             'finding_id': finding_id,
@@ -644,6 +667,9 @@ async def repair_memory_citation(
         'replacement_memory_id': replacement_memory_id,
         'deduped': deduped,
         'store': store,
+        # Echoed so a caller that reads only the outcome knows which
+        # corroboration was asserted, without re-reading the durable record.
+        'reason': reason,
         'cited_memories': kept,
     }
     if not apply:
@@ -655,7 +681,7 @@ async def repair_memory_citation(
         return outcome
 
     repair_record = build_citation_repair_record(
-        memory_id, replacement_memory_id, store, repaired_by
+        memory_id, replacement_memory_id, store, repaired_by, reason, justification
     )
     finding['cited_memories'] = kept
     finding.setdefault(CITATION_REPAIRS_KEY, []).append(repair_record)
