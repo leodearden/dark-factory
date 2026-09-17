@@ -55,7 +55,11 @@ Exit codes
 ----------
 0  clean -- measures taken, and (under ``--check``) no ratchet violation.
 1  ratchet violations -- one or more measures rose above the baseline, or a new
-   file/function exceeded a ceiling. Violations are printed to stderr.
+   file/function exceeded a ceiling. Violations are printed to stderr. This
+   covers BOTH faces of the gate: ``--check`` finding a raise, and
+   ``--write-baseline`` REFUSING to absorb one for want of an
+   ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
+   subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
 2  instrument failure (``MetricsError``) -- an unparseable cluster file,
    complexipy missing or out of range, a missing/malformed baseline, or a
    baseline whose recorded parameters no longer match this tree. Deliberately
@@ -1879,9 +1883,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         '--write-baseline', metavar='PATH',
-        help='Measure and write a baseline to PATH. Regenerating the committed '
-        'baseline merely to make a test pass silently widens the ratchet for '
-        'every downstream task -- see the file\'s own _README.',
+        help='Measure and write a baseline to PATH. REFUSES (exit 1) to absorb '
+        'a measure that rose unless --authorize-raise names the task doing it, '
+        'so a regeneration can never silently widen the ratchet for every '
+        'downstream task -- see the file\'s own _README.',
     )
     parser.add_argument(
         '--root', default=str(repo_root()),
@@ -1893,12 +1898,88 @@ def _build_parser() -> argparse.ArgumentParser:
         '--baseline', default=str(repo_root() / BASELINE_RELPATH),
         help='Baseline JSON for --check (default: %(default)s).',
     )
+    parser.add_argument(
+        '--authorize-raise', metavar='TASK_ID',
+        help='Permit --write-baseline to absorb the raises in THIS measurement, '
+        'recording them in --ledger against this task id. Requires --reason. '
+        'Authorization is an act, not a standing entry: a recorded raise never '
+        'permits a later one.',
+    )
+    parser.add_argument(
+        '--reason', metavar='TEXT',
+        help='Why this raise is net-additive work rather than a refactor that '
+        'failed. Requires --authorize-raise; recorded verbatim in the ledger.',
+    )
+    parser.add_argument(
+        '--ledger', default=str(repo_root() / LEDGER_RELPATH),
+        help='Authorized-raise ledger appended by --authorize-raise (default: '
+        '%(default)s). Pair it with --write-baseline when writing outside this '
+        'checkout; on its own it would append to THIS checkout\'s ledger.',
+    )
     return parser
+
+
+def _resolve_authorization(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> RaiseAuthorization | None:
+    """Validate the authorization flags against each other, or exit 2 saying why.
+
+    argparse cannot express "these two imply each other, and both require that
+    mode", so it is done here rather than left unchecked. A flag that silently
+    did nothing would read, to the agent who typed it, exactly like an
+    authorization that was granted.
+    """
+    if (args.authorize_raise is None) != (args.reason is None):
+        parser.error(
+            '--authorize-raise and --reason require each other: a raise with no '
+            'recorded reason is not an authorized raise, it is an unattributed '
+            'one'
+        )
+    if args.authorize_raise is None:
+        return None
+    if not args.write_baseline:
+        parser.error(
+            '--authorize-raise is a modifier of --write-baseline, which is the '
+            'only mode that can absorb a raise. --check reports raises; it '
+            'never records them'
+        )
+    return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
+
+
+def _write(
+    args: argparse.Namespace, report: dict, authorization: RaiseAuthorization | None
+) -> int:
+    """The --write-baseline arm, reporting what an authorized raise recorded.
+
+    Without an authorization the ledger is not read at all, so a plain
+    regeneration never depends on that file's health.
+    """
+    if authorization is None:
+        print(f'wrote {write_baseline(Path(args.write_baseline), report)}')
+        return 0
+    ledger = Path(args.ledger)
+    # Counted BEFORE the write so what is printed is exactly what THIS
+    # invocation appended. An authorization over a report that raises nothing
+    # records nothing, and the operator's log must never claim a raise the
+    # committed file does not carry.
+    already_recorded = len(load_ledger(ledger)['raises'])
+    target = write_baseline(
+        Path(args.write_baseline), report, authorization=authorization, ledger=ledger
+    )
+    print(f'wrote {target}')
+    for record in load_ledger(ledger)['raises'][already_recorded:]:
+        print(
+            f'recorded {len(record["measures"])} authorized raise(s) for task '
+            f'{record["task_id"]} in {ledger}'
+        )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. See the module docstring for the exit-code contract."""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    authorization = _resolve_authorization(parser, args)
     root = Path(args.root)
     try:
         report = build_report(root)
@@ -1909,9 +1990,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_render_table(report, root))
             return 0
         if args.write_baseline:
-            target = write_baseline(Path(args.write_baseline), report)
-            print(f'wrote {target}')
-            return 0
+            return _write(args, report, authorization)
         violations = check_against_baseline(report, load_baseline(Path(args.baseline)))
         if not violations:
             return 0
@@ -1922,15 +2001,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         for violation in violations:
             print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
+        return 1
+    except UnauthorizedRaise as exc:
+        # Exit 1, not 2: a refused regeneration is a measure that ROSE, found at
+        # write time instead of at check time. Exit 2 stays reserved for a
+        # broken instrument, and both faces of the gate print the same lines.
         print(
-            'A task that legitimately LOWERS a measure regenerates the baseline '
-            'in the SAME commit. A task may never raise one.',
+            f'{len(exc.violations)} merge-lane ratchet violation(s) would be '
+            f'absorbed by writing {args.write_baseline}:',
             file=sys.stderr,
         )
+        for violation in exc.violations:
+            print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
         return 1
     except MetricsError as exc:
         print(f'merge_lane_metrics: {exc}', file=sys.stderr)
         return 2
+
+
 
 
 if __name__ == '__main__':
