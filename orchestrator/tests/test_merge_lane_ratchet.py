@@ -10,17 +10,23 @@ Ratchet contract
 ----------------
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` freezes every measure at
 its value on the commit that introduced it. The gate FAILS on any measure that
-rises above its baseline (ratchet semantics): raising a measure is not allowed;
-only lowering one is. Equality is permitted -- this is a ratchet, not a day-one
-gate, and on the introducing commit 62 lane functions already exceed cognitive
-15 and ``merge_queue.py`` is 21,550 lines. The two CEILINGS (1,500 lines per
-file, cognitive 15 per function) therefore apply only to paths and qualnames
-ABSENT from the baseline, so the grandfathering can only ever shrink.
+rises above its baseline (ratchet semantics). Equality is permitted -- this is a
+ratchet, not a day-one gate, and on the introducing commit 62 lane functions
+already exceed cognitive 15 and ``merge_queue.py`` is 21,550 lines. The two
+CEILINGS (1,500 lines per file, cognitive 15 per function) therefore apply only
+to paths and qualnames ABSENT from the baseline, so the grandfathering can only
+ever shrink.
 
 A task that legitimately LOWERS a measure regenerates the baseline in the SAME
 commit (``python scripts/merge_lane_metrics.py --write-baseline
-orchestrator/tests/merge_lane_ratchet_baseline.json``). A task may never raise
-one. Do not regenerate the baseline merely to make this test pass.
+orchestrator/tests/merge_lane_ratchet_baseline.json``). A raise is a different
+matter but not a forbidden one: it must be AUTHORIZED, never silent. Adding
+``--authorize-raise <task-id> --reason <text>`` to that same command records the
+per-measure delta in ``merge_lane_ratchet_authorized_raises.json``; without
+those flags ``--write-baseline`` refuses to absorb a raise at all, so
+regenerating the baseline cannot make this test pass by widening the ratchet.
+``metrics.RAISE_REMEDY`` is the one copy of that rule, and every failure message
+here composes it.
 
 Why the instrument fails HARD where its neighbours fail soft
 ------------------------------------------------------------

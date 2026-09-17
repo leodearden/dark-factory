@@ -9,11 +9,16 @@ from tests. The committed baseline lives at
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
 enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
-Ratchet contract: the gate FAILS on any measure that rises above its baseline;
-raising a measure is not allowed, only lowering one is. Equality is permitted --
-this is a ratchet, not a day-one gate. The two ceilings (``FILE_LINE_CEILING``,
-``NEW_FUNCTION_COGNITIVE_CEILING``) apply only to paths and qualnames ABSENT
-from the baseline, so the grandfathering can only ever shrink.
+Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
+``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
+absorbed by regenerating the file that would have caught it. An AUTHORIZED one
+is permitted and recorded -- ``--authorize-raise <task-id> --reason <text>``
+appends the exact per-measure delta to ``LEDGER_RELPATH``, so net-additive work
+lands as a reviewed diff rather than as a number nobody saw move. Lowering needs
+no ceremony and equality is permitted -- this is a ratchet, not a day-one gate.
+The two ceilings (``FILE_LINE_CEILING``, ``NEW_FUNCTION_COGNITIVE_CEILING``)
+apply only to paths and qualnames ABSENT from the baseline, so the
+grandfathering can only ever shrink.
 
 INV-11, no silent fail-soft -- and note the polarity
 ----------------------------------------------------
