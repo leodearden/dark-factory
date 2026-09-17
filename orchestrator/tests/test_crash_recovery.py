@@ -4057,7 +4057,9 @@ class TestSessionResumeStorm:
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=5, storm_window_secs=60,
         )
-        harness._escalation_queue = self._queue()
+        # No escalation queue is armed: the threshold sits well above the run
+        # this builds, so nothing here can reach the filer. What the row is
+        # about is the run STATE, and a queue would be scenery.
         for i in range(2):
             harness.note_resume_failed(self._report(i))
         run_before = (
