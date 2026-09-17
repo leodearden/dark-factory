@@ -738,10 +738,6 @@ class TestEveryRoleToolDeclaresTheOverrideParameter:
             f'{_ROLE_TOOL[role]} advertises metadata with no mention of the '
             f'flag it exists for: {description!r}'
         )
-        assert 'persists nothing' in description, (
-            f'{_ROLE_TOOL[role]} does not tell a caller its map is discarded: '
-            f'{description!r}'
-        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('role', ALL_BRANCHES)

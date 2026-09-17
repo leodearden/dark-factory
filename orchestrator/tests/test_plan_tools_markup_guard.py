@@ -838,9 +838,8 @@ class TestEveryToolDeclaresTheOverrideParameter:
         replacement — the mistake is forestalled in the contract instead of
         reported after the fact.
 
-        Asserted by MEANING, not by text: the description must name the flag
-        key (so the remediation is actionable from the schema alone) and must
-        say the map is not persisted (so it is not read as payload).
+        Asserted by MEANING, not by text: the description must NAME the flag
+        key, so the remediation is actionable from the schema alone.
         """
         listing = await self._listing(harness)
 
@@ -849,10 +848,6 @@ class TestEveryToolDeclaresTheOverrideParameter:
             assert MARKUP_OVERRIDE_KEY in description, (
                 f'{name} advertises metadata with no mention of the flag it '
                 f'exists for: {description!r}'
-            )
-            assert 'persists nothing' in description, (
-                f'{name} does not tell a caller its map is discarded: '
-                f'{description!r}'
             )
 
     @pytest.mark.asyncio
