@@ -448,7 +448,7 @@ class ProcessTeardown(Enum):
     #: The whole-group signal was refused as unsafe
     #: (``shared.proc_group._unsafe_pgid_reason``) or the ``killpg`` itself
     #: raised, so ONLY the direct child was signalled — anything it spawned
-    #: SURVIVES (the log line in that branch already says as much).
+    #: SURVIVES (the refusal branch's own log line already says as much).
     DIRECT_KILLED = (
         'only its direct child process was signalled — the whole-group signal '
         'was refused or failed, so nothing the script spawned was killed'
@@ -611,11 +611,10 @@ def _survivor_processes_line(script: str) -> str:
     """
     return (
         f'Whatever the script spawned was therefore NOT killed and may still be '
-        f'running — in particular whichever process held the output pipe open. '
-        f'It must be located and killed out-of-band before resolving: search by '
-        f'the script path ({script}), NOT by pid, since the pid the runner '
-        f'refused to signal may by now belong to an unrelated process group '
-        f'(task 845).'
+        f'running — including anything still holding the output pipe open. It '
+        f'must be located and killed out-of-band before resolving: search by the '
+        f'script path ({script}), NOT by pid, since the pid the runner refused '
+        f'to signal may by now belong to an unrelated process group (task 845).'
     )
 
 
