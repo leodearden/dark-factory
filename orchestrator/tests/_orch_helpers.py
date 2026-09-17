@@ -29,7 +29,10 @@ from shared.psi import PsiSample
 from shared.usage_gate import AccountState, UsageGate
 
 if TYPE_CHECKING:
+    from shared.prompt_artifact import PromptArtifactStore
+
     from orchestrator.harness import Harness
+    from orchestrator.workflow import TaskWorkflow
 
 _log = logging.getLogger(__name__)
 
@@ -2119,4 +2122,43 @@ def require_orchestrator_inifile(pytestconfig, *, subject: str) -> None:
         f'{ORCH_PYPROJECT} — {subject} lives in the latter and pytest reads '
         f'exactly one inifile (never merging across workspace members), so '
         f'this is an invocation artifact (e.g. a root-bound run), not drift'
+    )
+
+
+def make_prompt_resolution_workflow(
+    *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
+) -> TaskWorkflow:
+    """Minimal TaskWorkflow builder for ``_resolve_role_system_prompt`` tests.
+
+    ``_resolve_role_system_prompt`` only touches ``self._prompt_store`` and
+    the ``role``/``model`` passed to it -- git_ops/scheduler/briefing are
+    never invoked -- so this intentionally skips the real-git-repo
+    ``_make_workflow`` convention used by ``_invoke``-exercising tests (e.g.
+    ``test_invoke_role_config_resolution.py``) and passes bare ``MagicMock``s
+    for the collaborators this helper never calls.
+
+    The three orchestrator imports are function-local to keep this module's
+    standing property that importing it costs no orchestrator import —
+    ``orchestrator.workflow`` is the heaviest module in the package and every
+    orchestrator test imports ``_orch_helpers``. This is a collection-cost
+    choice, NOT a cycle break.
+    """
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.scheduler import TaskAssignment
+    from orchestrator.workflow import TaskWorkflow as _TaskWorkflow
+
+    assignment = TaskAssignment(
+        task_id='2493',
+        task={'id': '2493', 'title': 'X', 'status': 'pending', 'metadata': {}},
+        modules=[],
+    )
+    config = OrchestratorConfig(project_root=tmp_path)
+    return _TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=MagicMock(),
+        scheduler=MagicMock(),
+        briefing=MagicMock(),
+        mcp=None,
+        prompt_store=prompt_store,
     )
