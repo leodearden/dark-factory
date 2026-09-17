@@ -254,17 +254,45 @@ Episode 2, from the two journals, decomposing **exactly** to the 302s total:
 | startup | 12:08:22 → 12:09:03 | 41s |
 | **total silence to recovery** | 12:04:01 → 12:09:03 | **302s** |
 
-Episode 1 decomposes the same way: 68s + 105s + 39s = 212s
-(23:55:10 → 23:58:42).
+Episode 1 does **not** decompose the same way — the terms differ in kind, not
+just in size, so it gets its own table rather than a one-line echo of the one
+above. Non-overlapping, to a 212s total:
 
-The detection streak is the **largest single term**, at 121s against the
-teardown's 90s. (This corrects the plan's own summary, which quoted the 121s
-figure while asserting the teardown was largest.)
+| term | interval | cost |
+|---|---|---|
+| stall (silence, start to `Stopping`) | 23:55:10 → 23:57:10 | **120s** |
+| teardown (SIGTERM serviced, clean stop) | 23:57:10 → 23:58:00 | 50s |
+| stopped → restart issued | 23:58:00 → 23:58:03 | 3s |
+| startup | 23:58:03 → 23:58:42 | 39s |
+| **total silence to recovery** | 23:55:10 → 23:58:42 | **212s** |
+
+Two differences from episode 2, both real rather than presentational:
+
+- **There is no detection term at all.** The watchdog's streak did not drive
+  this restart: it reached 3/3 only at 23:58:03, three seconds *after*
+  fused-memory was already `Stopped` — which is exactly why that third verdict
+  reads `port-down` and not `wedged` (see (b): the actor is unreconciled). The
+  whole 120s silence is therefore stall, not stall-plus-detection.
+- **The stopped → restart gap is visible here and 0s in episode 2**, where
+  systemd's `Starting` lands in the same second as the SIGKILL. That is why
+  episode 2's table has four terms and this one has five.
+
+Both tables are checkable against the tool: run
+`scripts/fm_wedge_forensics.py` over either window and its teardown and startup
+terms are the same numbers (episode 1, 50s and 39s; episode 2, 90s and 41s),
+measured from fused-memory's journal alone. Only the detection term needs the
+watchdog's journal, which is why the analyzer reports it as unavailable rather
+than guessing it.
+
+In **episode 2** the detection streak is the largest single term, at 121s
+against the teardown's 90s. (This corrects the plan's own summary, which quoted
+the 121s figure while asserting the teardown was largest.) Episode 1 has no
+detection term at all, so its largest term is the 120s stall.
 
 ### Recommendation: do NOT shorten the port-down streak
 
-The streak is the largest term, so shortening it is the obvious move. The
-measurements say it is the wrong one.
+In the one episode the streak actually drove, it is the largest term — so
+shortening it is the obvious move. The measurements say it is the wrong one.
 
 1. **It would convert self-recovery into restarts.** Five of the six stalls
    above self-recovered, in the 100–136s band — precisely the range a shorter
