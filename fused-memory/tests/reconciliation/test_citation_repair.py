@@ -682,6 +682,147 @@ class TestRepairReasonGate:
             await journal.close()
 
 
+class TestRepairJustificationGate:
+    """``wrong_memory`` must SAY WHY; ``memory_not_found`` need not.
+
+    The dangling-only design had a structural safety property — the worst a
+    repair could do was re-point a claim that already had no backing — and this
+    class deliberately gives it up. A required justification is what takes its
+    place: without one, a live and correct-looking citation could be stripped
+    from a historical audit record with nothing in the blob saying why. The
+    durable ``citation_repairs`` record is the only surviving account of the
+    change.
+
+    Absence is its own account, so ``memory_not_found`` stays optional — which
+    is also what keeps every existing caller working unchanged.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'justification',
+        [None, '', '   ', '\n\t'],
+        ids=['omitted', 'empty', 'spaces', 'whitespace'],
+    )
+    async def test_blank_justification_refuses_wrong_memory_before_any_io(
+        self, tmp_path, justification
+    ):
+        """Blank-after-strip is not an account, and is refused ahead of both reads."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'justification_required'
+            assert outcome['error_type'] == 'ReconCitationJustificationRequired'
+            assert 'status' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_surrounding_whitespace_is_stripped_before_recording(self, tmp_path):
+        """One normalisation, applied once: the record stores the stripped text.
+
+        Emptiness-after-strip is what the gate checks, so the same stripped
+        value is what gets stored — otherwise the blob could carry padding the
+        gate had already decided was not part of the account.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=None,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification='  real reason  ',
+            )
+
+            assert outcome['status'] == 'repaired'
+            repaired = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            assert repaired['citation_repairs'][0]['justification'] == 'real reason'
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('justification', 'recorded'),
+        [(None, None), ('found deleted by the 2026-07 sweep', 'found deleted by the 2026-07 sweep')],
+        ids=['omitted', 'supplied'],
+    )
+    async def test_memory_not_found_never_requires_one_but_records_it(
+        self, tmp_path, justification, recorded
+    ):
+        """The confirmed absence IS the account — but a supplied one is kept.
+
+        Requiring prose here would break every existing caller, and absence is
+        already self-evidencing. An operator who supplies one anyway must still
+        see it survive into the durable record.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='memory_not_found',
+                justification=justification,
+            )
+
+            assert outcome['status'] == 'repaired'
+            record = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]['citation_repairs'][0]
+            assert record['reason'] == 'memory_not_found'
+            assert record['justification'] == recorded
+        finally:
+            await journal.close()
+
+
 class TestRepairProjectScoping:
     """``caller_project_id`` confines a repair to the caller's own project.
 
