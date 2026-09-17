@@ -5331,16 +5331,31 @@ class MemoryService:
         degenerate predicate reads as a gate on the whole edge rather than as
         another branch inside the per-finding loop.
 
+        THREE PRE-WRITE DISPOSITIONS, in order, all recording
+        ``outcome='unrepairable'`` and all refusing before anything is written:
+
+        1. ZETA-UNRESOLVABLE — no target was determined at all. Carries zeta's
+           own ``reason`` verbatim (NEVER GUESS, the structural default).
+        2. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
+           fallback, and it is not one this pass may mint a node for. See
+           :func:`_implausible_target_reason`.
+        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
+           nodes, and collapsing them is not this path's act to make.
+
+        They are distinguishable by ``reason``, which is the field that exists
+        to say why; the outcome vocabulary is deliberately not widened.
+
         TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
         wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
         fail with NOTHING written — and its generic ``except`` records
-        ``'failed'``; an ``AmbiguousEntityError`` is peeled off AHEAD of that
-        one, because a refusal is not a fault (see the arm's own comment). The
-        second guard wraps only the post-write summary backstop, whose failures
-        cannot un-write the move that already landed and therefore must not be
-        able to book it as ``'failed'``. Sharing one ``except`` across the
-        commit point is what would let a cosmetic post-write problem report an
-        episode's real repair as an infrastructure fault that did nothing.
+        ``'failed'``; disposition 3's ``AmbiguousEntityError`` is peeled off
+        AHEAD of that one, because a refusal is not a fault (see the arm's own
+        comment). The second guard wraps only the post-write summary backstop,
+        whose failures cannot un-write the move that already landed and
+        therefore must not be able to book it as ``'failed'``. Sharing one
+        ``except`` across the commit point is what would let a cosmetic
+        post-write problem report an episode's real repair as an infrastructure
+        fault that did nothing.
         """
         for finding in findings:
             intended = finding.intended_referent
@@ -5380,6 +5395,65 @@ class MemoryService:
                     reason=finding.reason,
                 ))
                 continue
+
+            if not finding.target_cited:
+                # TARGET PLAUSIBILITY, and it must refuse BEFORE the write
+                # below — that ordering is the whole user-observable signal.
+                # `ensure_entity_node` resolves-or-MINTS, so reaching it with an
+                # implausible target is how a phantom node gets created with a
+                # real edge repointed onto it. Refusing here means it is never
+                # minted at all, rather than minted and then regretted.
+                #
+                # THE GATE IS `not finding.target_cited` because the target came
+                # from `_candidate_pool`'s whole-set FALLBACK exactly when the
+                # fact does not cite it — the pool is `cited & referents`
+                # whenever that intersection is non-empty, so a fallback target
+                # can never be in `cited` and an intersection target always is.
+                # See that property's docstring for the derivation. The
+                # intersection arm is deliberately untouched: a fact that NAMES
+                # the target is materially stronger evidence than the whole
+                # declared set.
+                #
+                # `target_node_exists` READS `finding.new_endpoint_uuid` rather
+                # than issuing a fresh `get_nodes_by_exact_name`. zeta's lookup
+                # was made under the SAME `_identity_lock_for(group_id)`
+                # critical section a few statements earlier with no intervening
+                # writer, and this method ALREADY reads that same field at this
+                # same site for `minted=` — so this is a second read of an
+                # existing dependency, not a new one, and it costs no round-trip
+                # inside the lock where every query serializes same-group
+                # writes. A stale `None` can only ever REFUSE: it covers absent,
+                # duplicate-name group AND a degraded lookup, and in all three
+                # cases the direction is fail-closed. (The duplicate-name case
+                # is refused twice over — guard (c) below would refuse it too.)
+                # This is EVIDENCE, not the repair TARGET: the target still
+                # comes from `ensure_entity_node`'s return, so the standing
+                # objection to branching on `new_endpoint_uuid` — "a SECOND site
+                # that can disagree about what the edge should point at" — does
+                # not apply.
+                reason = _implausible_target_reason(
+                    intended,
+                    known_projects=self._known_projects,
+                    target_node_exists=finding.new_endpoint_uuid is not None,
+                )
+                if reason:
+                    logger.warning(
+                        'Referent repair REFUSED for edge %s (%s end, endpoint '
+                        '%r): the nominated target %r is not plausible, so the '
+                        'edge is left unrepaired and recorded as such. %s',
+                        finding.edge_uuid, finding.which_end,
+                        finding.old_endpoint_name, intended.node_name, reason,
+                    )
+                    repair_stats.repairs.append(ReferentRepair(
+                        edge_uuid=finding.edge_uuid,
+                        which_end=finding.which_end,
+                        outcome='unrepairable',
+                        old_endpoint_uuid=finding.old_endpoint_uuid,
+                        check=finding.check,
+                        intended_referent=intended.node_name,
+                        reason=reason,
+                    ))
+                    continue
 
             # PER-FINDING containment, not per-pass: each finding names a
             # distinct (edge, end), so one failure carries NO information about
