@@ -6827,15 +6827,16 @@ print('BEATS_OK')
 
 @pytest.mark.asyncio
 class TestDefaultSshHeartbeatRun:
-    """_default_ssh_heartbeat_run opens the child with stdin=PIPE and writes a
-    heartbeat newline every heartbeat_interval seconds while awaiting completion.
-    A heartbeat write against an already-closed child stdin (EPIPE) is swallowed
-    and never surfaces as an exception."""
+    """_default_ssh_heartbeat_run opens the child on the read end of a pipe it
+    owns and writes a heartbeat token every heartbeat_interval seconds, from a
+    dedicated OS thread, while awaiting completion.  A heartbeat write against
+    an already-closed child stdin (EPIPE) is swallowed and never surfaces as an
+    exception."""
 
     async def test_delivers_heartbeats(self):
         """A child blocked reading 2 stdin lines only prints its marker and exits
         once the heartbeat writer has fed it 2 newlines — proving heartbeats are
-        actually written to the child's stdin=PIPE while the run is in flight."""
+        actually written to the child's stdin while the run is in flight."""
         import sys
 
         from orchestrator.verify_runner import _default_ssh_heartbeat_run
