@@ -505,6 +505,38 @@ class TestMainDegradesEachGroupIndependently:
 
         assert set(FAKE_PSI) <= _metrics_written(db_path)
 
+    def test_a_healthy_tick_also_drives_the_vacuum_gate(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """``main()`` is the SOLE caller of maybe_vacuum, so it is the only guard.
+
+        ``sampler.sampler``'s module docstring records the split deliberately:
+        run_tick enforces retention, and the compaction is wired one level up
+        in ``__main__.main`` — which means deleting the call here leaves
+        nothing red and a 30-day corpus that is never compacted again.
+
+        The stamp is read back against the TICK's own ts rather than merely
+        asserted present: ``__main__`` reads the clock once and hands the same
+        ``now`` to run_tick and maybe_vacuum, so the two agreeing is what says
+        the vacuum gate ran as part of THIS tick.
+        """
+        db_path = _run_main(monkeypatch, tmp_path)
+
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(db_path)
+        stamped = store._get_meta('last_vacuum_ts')
+        assert stamped is not None, (
+            'main() left the vacuum clock unset, so maybe_vacuum was never called'
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tick_ts = conn.execute('SELECT MAX(ts) FROM samples').fetchone()[0]
+        finally:
+            conn.close()
+        assert int(stamped) == tick_ts
+
     def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
         """An operator watching journalctl must be able to see the new group."""
         with caplog.at_level(logging.INFO):

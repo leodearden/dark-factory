@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -189,6 +189,15 @@ class TestTrailingWindow:
         assert mx == pytest.approx(5.0)
 
     def test_caps_at_window_minus_one_prior_rows(self, tmp_path: Path):
+        """The span is left to the DEFAULT on purpose.
+
+        ``_TRAILING_WINDOW_SAMPLES`` is the single home for the 60-sample span
+        and every other value-sensitive test here passes ``window=``
+        explicitly or seeds at most two prior rows — so the default was free
+        to change with nothing going red, silently reshaping every
+        ``window_mean``/``window_max`` in the calibration corpus. This
+        fixture's 80 rows discriminate 60 from any other span.
+        """
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
@@ -201,7 +210,7 @@ class TestTrailingWindow:
         # Values 0..79 inserted; most recent 59 are values 21..79 (59 rows)
         # current_value = 100.0
         # window = [21.0, 22.0, ..., 79.0, 100.0] = 59 + 1 = 60 values
-        mean, mx = store.trailing_window('metric_x', 100.0, window=60)
+        mean, mx = store.trailing_window('metric_x', 100.0)
         expected_values = [float(i) for i in range(21, 80)] + [100.0]
         expected_mean = sum(expected_values) / len(expected_values)
         expected_max = max(expected_values)
@@ -616,6 +625,46 @@ class TestCleanupIsIntervalGated:
 
         assert _count_at(db_path, planted_after) == 0
 
+    def test_a_stamp_from_the_future_does_not_disable_the_sweep(self, tmp_path: Path):
+        """The clock steps forward, one tick stamps it, and the skew must heal.
+
+        A plain ``elapsed >= interval`` gate reads a future stamp as "not due"
+        for the whole skew, which is the one case where the suppression is
+        self-sealing: the rows preserved are exactly the future-dated ones
+        ``cleanup_old``'s symmetric cutoff exists to prune, so the corpus
+        cannot recover from the condition that disabled its recovery. Both
+        gates are checked here because ``maybe_vacuum`` is suppressed by the
+        same arithmetic on its own key, and a 30-day corpus that stops being
+        pruned is also one that stops being compacted.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        a_year = 365 * DAY
+
+        # ONE tick during the skew, through the public path that stamps both
+        # clocks — not a hand-planted meta row, so what is under test is the
+        # state a real forward step leaves behind.
+        store.cleanup_old(now + a_year)
+        store.maybe_vacuum(now + a_year)
+
+        assert store.should_cleanup(now) is True
+        assert store.should_vacuum(now) is True
+
+        stale = now - THIRTY_DAYS - 60
+        from_the_future = now + THIRTY_DAYS + 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+        store.insert_sample(from_the_future, 'runqueue_ratio', 2.0)
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, stale) == 0
+        assert _count_at(db_path, from_the_future) == 0, (
+            'the future-dated row survived, so the corpus is still anchored '
+            'forward with no sweep that can reach it'
+        )
+
     def test_interval_override_is_honoured(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
 
@@ -850,27 +899,55 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
 # ---------------------------------------------------------------------------
 
 
-def _connect_spy(monkeypatch) -> list[str]:
-    """Accumulate one entry per connection the store opens.
+class _CountingConnection:
+    """A connection that records its commits and forwards everything else.
+
+    A proxy and not a patched method: ``sqlite3.Connection`` is a C type, so
+    its instances accept no attribute assignment and ``commit`` cannot be
+    wrapped in place.
+    """
+
+    def __init__(self, conn, commits: list[str]):
+        self._conn = conn
+        self._commits = commits
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        self._commits.append('commit')
+        self._conn.commit()
+
+
+class _ConnectionSpy(NamedTuple):
+    opened: list[str]
+    commits: list[str]
+
+
+def _connect_spy(monkeypatch) -> _ConnectionSpy:
+    """Accumulate one entry per connection the store opens, and per commit.
 
     The seam is the module's ``sqlite3`` attribute, as ``_vacuum_spy`` above
-    already uses. Counting CONNECTIONS rather than timing the tick is
-    deliberate: the cost being bought back is one connect + five durability
+    already uses. Counting CONNECTIONS and COMMITS rather than timing the tick
+    is deliberate: the cost being bought back is one connect + five durability
     pragmas + one ``synchronous=FULL`` fsync per row, and a wall-clock
     assertion would be flaky on a loaded host while measuring the same thing
-    indirectly.
+    indirectly. The two counts are kept apart because they pin different
+    properties — one connection is the pragma cost, one commit is the fsync
+    cost AND the atomicity — and a per-row ``execute(); commit()`` loop on a
+    single connection satisfies the first while destroying the second.
     """
     import sampler.store as store_module
 
     real_connect = store_module.sqlite3.connect
-    opened: list[str] = []
+    spy = _ConnectionSpy(opened=[], commits=[])
 
     def counting_connect(*args, **kwargs):
-        opened.append(str(args[0]) if args else '')
-        return real_connect(*args, **kwargs)
+        spy.opened.append(str(args[0]) if args else '')
+        return _CountingConnection(real_connect(*args, **kwargs), spy.commits)
 
     monkeypatch.setattr(store_module.sqlite3, 'connect', counting_connect)
-    return opened
+    return spy
 
 
 class TestWriteTickIsOneConnectionAndOneTransaction:
@@ -910,13 +987,13 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
-        opened = _connect_spy(monkeypatch)
+        spy = _connect_spy(monkeypatch)
 
         self._tick(store, 1_000_000)
 
-        assert len(opened) == 1, (
-            f'one tick opened {len(opened)} connections; the point of write_tick '
-            'is that it opens exactly one'
+        assert len(spy.opened) == 1, (
+            f'one tick opened {len(spy.opened)} connections; the point of '
+            'write_tick is that it opens exactly one'
         )
 
     def test_the_cost_of_a_tick_does_not_scale_with_its_metric_count(
@@ -934,17 +1011,51 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
 
-        opened = _connect_spy(monkeypatch)
+        spy = _connect_spy(monkeypatch)
         self._tick(store, 1_000_000, leaves=1)
-        few = len(opened)
+        few = len(spy.opened)
 
-        opened.clear()
+        spy.opened.clear()
         self._tick(store, 1_000_005, leaves=100)
-        many = len(opened)
+        many = len(spy.opened)
 
+        # The floor its sibling in test_load_sampler.py already carries: an
+        # equality between two counts holds trivially at 0 == 0 if the spy ever
+        # detaches from the seam, and would then pin nothing at all.
+        assert few >= 1, 'the connect spy never fired'
         assert few == many, (
             f'a 4-metric tick opened {few} connections and a 103-metric tick '
             f'opened {many} — the write path still scales with metric count'
+        )
+
+    def test_a_tick_commits_exactly_once_whatever_it_carries(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Atomicity and fsync cost, measured where they live: the commit count.
+
+        Its failure-injection sibling below raises inside the row-BUILDING
+        loop, before any INSERT is issued, so it only witnesses "an exception
+        before the first write leaves no rows". A per-row ``execute();
+        commit()`` loop passes that test AND the one-connection test above,
+        while destroying both properties ``write_tick`` exists for: the tick
+        lands whole or not at all, and its fsync cost is flat in the metric
+        count rather than linear in it.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        spy = _connect_spy(monkeypatch)
+        self._tick(store, 1_000_000, leaves=1)
+        few = len(spy.commits)
+
+        spy.commits.clear()
+        self._tick(store, 1_000_005, leaves=100)
+        many = len(spy.commits)
+
+        assert (few, many) == (1, 1), (
+            f'a 4-metric tick committed {few} times and a 103-metric tick '
+            f'{many} — one tick is meant to be one transaction'
         )
 
     def test_a_tick_that_raises_partway_leaves_no_rows_at_all(

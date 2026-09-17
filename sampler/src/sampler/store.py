@@ -305,16 +305,37 @@ class LoadSampleStore:
     # Retention
     # ------------------------------------------------------------------
 
-    def should_cleanup(self, now: int, *, interval_seconds: int = 86400) -> bool:
-        """Return True when a cleanup is due (no prior record or interval elapsed).
+    def _is_due(self, key: str, now: int, interval_seconds: int) -> bool:
+        """Return True when the interval clock at *key* has run out.
 
-        Same semantics as ``should_vacuum``, deliberately: absent record means
-        due, so a fresh store prunes on its first tick.
+        One home for both gates (heuristic 11): ``should_cleanup`` and
+        ``should_vacuum`` differ only in which meta key they read, and a second
+        copy of this arithmetic was free to drift from the first.
+
+        An ABSENT record means due, so a fresh store prunes and compacts on its
+        first tick.
+
+        A record in the FUTURE also means due, and that is the non-obvious
+        half. ``now`` is ``int(time.time())`` with no monotonicity guard
+        (``sampler/src/sampler/__main__.py``), and the stamp is whatever
+        ``now`` the stamping tick carried — so one tick during a forward clock
+        step writes a stamp no later tick can reach with a plain
+        ``elapsed >= interval``. That reading would suppress BOTH the retention
+        sweep and the VACUUM for the entire skew, and the rows it would
+        preserve are exactly the future-dated ones ``cleanup_old``'s symmetric
+        cutoff exists to prune: the corpus could not heal itself from the very
+        condition that disabled the healing. Elapsed time outside
+        ``[0, interval)`` is therefore due, which reads "the clock is either
+        spent or nonsense, and running the sweep is cheap either way".
         """
-        last_str = self._get_meta('last_cleanup_ts')
+        last_str = self._get_meta(key)
         if last_str is None:
             return True
-        return (now - int(last_str)) >= interval_seconds
+        return not 0 <= now - int(last_str) < interval_seconds
+
+    def should_cleanup(self, now: int, *, interval_seconds: int = 86400) -> bool:
+        """Return True when a cleanup is due (no prior record or interval elapsed)."""
+        return self._is_due('last_cleanup_ts', now, interval_seconds)
 
     def cleanup_old(
         self,
@@ -414,10 +435,7 @@ class LoadSampleStore:
 
     def should_vacuum(self, now: int, *, interval_seconds: int = 86400) -> bool:
         """Return True when a VACUUM is due (no prior record or interval elapsed)."""
-        last_str = self._get_meta('last_vacuum_ts')
-        if last_str is None:
-            return True
-        return (now - int(last_str)) >= interval_seconds
+        return self._is_due('last_vacuum_ts', now, interval_seconds)
 
     def reclaimable_fraction(self) -> float:
         """Free pages as a fraction of the file — what a VACUUM would reclaim.
