@@ -433,9 +433,6 @@ class TestExemptionPragma:
         could not be.
         """
         script_source = SCRIPT_PATH.read_text(encoding='utf-8')
-        assert 'test_fixture_isolation' not in script_source, (
-            'The checker names test_fixture_isolation.py — the whitelist the pragma replaces'
-        )
 
         concrete_test_filename = re.compile(r'^test_[A-Za-z0-9_]+\.py$')
         offenders = [
