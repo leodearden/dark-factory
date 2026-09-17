@@ -3076,8 +3076,8 @@ def create_server(
         - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
-          queue_depth, eta_seconds, lane, lane_source}``, where ``position``
-          is ``int | None`` (see the Queued shape below).
+          queue_depth, eta_seconds, lane, lane_source, lane_applied}``, where
+          ``position`` is ``int | None`` (see the Queued shape below).
         - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
           wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
           Resolves within clamp → terminal outcome shape.
@@ -3168,21 +3168,32 @@ def create_server(
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
         - Queued: ``{status='queued', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, lane, lane_source}``.  Branch was
+          position, queue_depth, eta_seconds, lane, lane_source,
+          lane_applied}``.  Branch was
           freshly dispatched (or wait_secs timeout expired).  ``lane`` is the
           resolved merge lane and ``lane_source`` names which input won it —
           ``'argument'``, ``'task_metadata'`` or ``'default'`` (task 4888).
+          ``lane_applied`` is True here: the lane rode the enqueued request.
           ``position`` is ``int | None``;
           ``None`` means the live merge-worker snapshot was unavailable, so
           render it as "unknown" — NEVER as front-of-queue (task 5368).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, lane, lane_source,
+          position, queue_depth, eta_seconds, lane, lane_source, lane_applied,
           inflight_task_id, source, inflight_request_id, poll_by, pollable}``.
           Branch is
           already in-flight; request_id is the *existing* entry's id (D8), not
           the submitting call's id.  ``lane``/``lane_source`` describe THIS
           submission's resolution, not the in-flight entry's own lane —
-          attaching does not move that entry between lanes.
+          attaching does not move that entry between lanes, so
+          ``lane_applied`` is **False** here and the resolution is audit only.
+          Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
+          hotfix that coalesced is riding a possibly-``'normal'`` in-flight
+          entry.  To actually get the high lane, ``merge_cancel`` the
+          in-flight entry and resubmit, or wait for it and resubmit after.
+          The in-flight entry's OWN lane is not echoed here — this arm can
+          reach a foreign or pre-restart merger for which no in-process entry
+          exists at all (``poll_by='branch'``), so it is not knowable
+          uniformly; read it from ``get_merge_queue`` instead.
           ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
           ``source`` names which coalesce arm attached (``'registry'`` /
@@ -3651,10 +3662,21 @@ def create_server(
             captured from the enclosing call rather than taken as a parameter
             because one ``merge_request`` call resolves exactly ONE lane —
             unlike ``status``/``req``, which genuinely differ between the
-            queued and attached call sites.  On an ``'attached'`` response
-            they describe THIS submission's resolution, not the in-flight
-            entry it coalesced onto: attaching does not move that entry
-            between lanes.
+            queued and attached call sites.
+
+            ``lane_applied`` says whether that resolution took EFFECT, and is
+            what makes the queued/attached difference BRANCHABLE rather than
+            merely documented.  True on ``'queued'``: the lane rode the
+            enqueued ``MergeRequest``.  False on ``'attached'``: the
+            submission coalesced onto an in-flight entry which keeps its own
+            lane and is never moved between lanes, so the resolution is
+            reported for audit and changes nothing.  Without it the bare word
+            ``lane`` invites the natural and wrong reading "the lane my merge
+            is in", and an operator's ``lane='high'`` on a hotfix could
+            evaporate while the response appeared to confirm it — the same
+            silent-loss-of-lane-intent defect this parameter exists to
+            remove, one level up.  Derived from ``status`` rather than passed,
+            so neither call site can forget it or disagree with it.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
             worker = _get_merge_worker(harness)
@@ -3695,6 +3717,7 @@ def create_server(
                 'eta_seconds': eta,
                 'lane': lane_choice.lane,
                 'lane_source': lane_choice.source,
+                'lane_applied': status == 'queued',
             }
 
         if dispatch.rejected:

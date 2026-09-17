@@ -431,14 +431,27 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'default', result
 
-    async def test_attached_response_carries_the_same_two_keys(self, tmp_path: Path):
+    async def test_queued_response_reports_the_lane_as_applied(self, tmp_path: Path):
+        """On the dispatched arm the echo IS the effective lane."""
+        result = await _submit_nonblocking(
+            tmp_path, _make_harness(metadata={'merge_lane': 'high'})
+        )
+        assert result.get('status') == 'queued', result
+        assert result.get('lane_applied') is True, result
+
+    async def test_attached_response_reports_the_lane_as_not_applied(
+        self, tmp_path: Path
+    ):
         """A coalesced submission never becomes its own queue item.
 
         So this response is the only place its lane resolution is ever
         observable: ``get_merge_queue`` lists the in-flight entry, not the
-        submission that attached to it.  The two keys report what THIS
-        submission resolved to; attaching does not move the in-flight entry
-        between lanes.
+        submission that attached to it.  The keys report what THIS submission
+        resolved to; attaching does not move the in-flight entry between
+        lanes, and ``lane_applied`` is the MACHINE-READABLE statement of that
+        — without it a steward reading ``{status:'attached', lane:'high'}``
+        is told their hotfix is high-lane when it is in fact riding a
+        possibly-``'normal'`` in-flight entry.
         """
         registry = InFlightMergeRegistry()
         never: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -450,10 +463,12 @@ class TestSubmitResponseEchoesTheResolvedLane:
                 tmp_path,
                 _make_harness(metadata={'merge_lane': 'high'}),
                 registry=registry,
+                lane='high',
             )
         finally:
             never.cancel()
 
         assert result.get('status') == 'attached', result
         assert result.get('lane') == 'high', result
-        assert result.get('lane_source') == 'task_metadata', result
+        assert result.get('lane_source') == 'argument', result
+        assert result.get('lane_applied') is False, result

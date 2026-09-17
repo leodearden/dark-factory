@@ -50,7 +50,11 @@ rank-and-file agent role can reach the parameter to self-declare urgency. Task 1
 anti-starvation reservation of `'high'` for the rare, gated hotfix/main-health class is
 carried by that existing restriction plus attribution: the resolved lane and the source
 that won it are echoed back as `lane`/`lane_source` on both the queued and the attached
-submit response, and `get_merge_queue` already shows the lane per queue item. That echo is
+submit response, and `get_merge_queue` already shows the lane per queue item. A third key,
+`lane_applied`, makes the queued/attached difference machine-branchable: it is `True` on
+the queued arm, where the lane rode the enqueued request, and `False` on the attached arm,
+where the submission coalesced onto an in-flight entry that keeps its own lane — so a
+`lane='high'` hotfix that coalesced cannot read as confirmed high-lane. That echo is
 what closes the loop for a caller who passed no argument — without it there was no way to
 learn whether the task's own `merge_lane` had been honoured, which is half of why the key
 could sit inert unnoticed. It lands on the RESPONSE rather than on the `merge_queued`
