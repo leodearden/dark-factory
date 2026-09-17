@@ -44,10 +44,12 @@ differently. ``unreadable`` (both halves, by name) and ``complete`` travel in
 the report AND in the committed baseline, as do the cluster's ``requested`` and
 ``resolved`` paths -- that is the named manifest where a path the instrument
 cannot read IS the finding. The test tree's breadth travels as ``test_tree``'s
-two counts in the report ONLY: it is reported by ``--report`` and ``--json``,
-never ratcheted, because ``check_against_baseline`` reads completeness from the
-CURRENT report and freezing a number nothing enforces would only churn the file
-on every unrelated test file the repo gains (esc-5021-7).
+two counts in the report ONLY: both reach ``--json`` verbatim and both are
+legible under ``--report`` -- the numerator under its own ``test suite --``
+label, since it is ``len(tests)`` and one number gets one place -- but neither
+is ever ratcheted, because ``check_against_baseline`` reads completeness from
+the CURRENT report and freezing a number nothing enforces would only churn the
+file on every unrelated test file the repo gains (esc-5021-7).
 
 Exit codes
 ----------
@@ -1520,11 +1522,15 @@ def _render_table(report: dict, root: Path) -> str:
     # not only in a log line. A partial sweep measures LOW, so a reader who
     # cannot see this row cannot tell an improvement from a skipped file.
     #
-    # THE TEST-TREE COUNTS ARE ONLY HERE. They are reported, never ratcheted --
+    # THE TEST-TREE DENOMINATOR IS ONLY HERE. It is reported, never ratcheted --
     # the same call this function already makes for `mi` -- so the committed
     # baseline carries no test-tree number at all and this row is the one place
-    # the sweep's breadth is visible. `.get` is tolerant on purpose: a stored
-    # baseline block has no `test_tree` key, and rendering one must not raise.
+    # the sweep's breadth is visible. Its NUMERATOR is deliberately absent: that
+    # is ``len(report['tests'])``, already rendered under a better label by the
+    # "test suite --" line above, and two copies of one number in one table only
+    # invite a reader to wonder whether they can disagree (SPOT). `.get` is
+    # tolerant on purpose: a stored baseline block has no `test_tree` key, and
+    # rendering one must not raise.
     enumeration = report.get('enumeration', {})
     unreadable = list(enumeration.get('unreadable', ()))
     test_tree = enumeration.get('test_tree', {})
@@ -1532,8 +1538,7 @@ def _render_table(report: dict, root: Path) -> str:
         f'enumeration: complete={enumeration.get("complete")}  '
         f'cluster requested={len(enumeration.get("requested", ()))} '
         f'resolved={len(enumeration.get("resolved", ()))}  '
-        f'test tree requested={test_tree.get("requested")} '
-        f'resolved={test_tree.get("resolved")}  '
+        f'test tree requested={test_tree.get("requested")}  '
         f'unreadable={len(unreadable)}'
     )
     if unreadable:

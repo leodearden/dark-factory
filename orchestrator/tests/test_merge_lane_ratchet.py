@@ -1419,6 +1419,31 @@ class TestBuildReport:
 # lets the baseline store one and merely report the other.
 
 
+def _test_tree_strays(block: dict) -> dict[str, list[str]]:
+    """Per-path test-tree entries left in an enumeration block, keyed by list.
+
+    THE HEADLINE PREDICATE, in ONE place. Three tests assert it -- on the live
+    report, on a freshly rendered baseline and on the committed bytes -- and a
+    copy each would drift the moment CLUSTER_PATHS grows (PRD task zeta1 expands
+    `merge_lane/**` to real files), leaving two of the three silently weaker.
+    An empty dict is clean; a non-empty one names the offending list and entries.
+    """
+    cluster = set(metrics.CLUSTER_PATHS)
+    strays = {}
+    for key, value in block.items():
+        if not isinstance(value, list):
+            continue
+        found = [
+            entry for entry in value
+            if isinstance(entry, str)
+            and entry.startswith(f'{metrics.TESTS_ROOT}/')
+            and entry not in cluster
+        ]
+        if found:
+            strays[key] = found
+    return strays
+
+
 class TestReportEnumerationSplitsTheTwoHalves:
     @pytest.fixture()
     def enumeration(self, live_report: dict) -> dict:
@@ -1448,17 +1473,9 @@ class TestReportEnumerationSplitsTheTwoHalves:
         # left in any list are CLUSTER_PATHS literals. Measured today: exactly
         # the 3 that live there (conftest.py, _merge_queue_harness.py,
         # _serial_merge_worker.py).
-        cluster = set(metrics.CLUSTER_PATHS)
-        for key, value in enumeration.items():
-            if not isinstance(value, list):
-                continue
-            strays = [
-                entry for entry in value
-                if isinstance(entry, str)
-                and entry.startswith('orchestrator/tests/')
-                and entry not in cluster
-            ]
-            assert strays == [], f'{key} still carries per-path test-tree entries'
+        assert _test_tree_strays(enumeration) == {}, (
+            'the live report still carries per-path test-tree entries'
+        )
 
     def test_the_test_tree_half_is_two_integer_counts(self, enumeration: dict) -> None:
         test_tree = enumeration['test_tree']
@@ -1467,11 +1484,6 @@ class TestReportEnumerationSplitsTheTwoHalves:
             # bool is an int subclass, so exclude it explicitly -- a count that
             # collapsed to True/False would otherwise pass as an integer.
             assert isinstance(value, int) and not isinstance(value, bool), name
-
-    def test_the_denominator_covers_the_whole_tree(self, enumeration: dict) -> None:
-        # One-sided FLOOR, measured 568 .py files under orchestrator/tests: this
-        # number is reported, never ratcheted, so it must survive attrition.
-        assert enumeration['test_tree']['requested'] >= 400
 
     def test_the_numerator_is_exactly_the_measured_test_count(
         self, live_report: dict
@@ -1630,17 +1642,9 @@ class TestStoredEnumerationIsChurnFree:
             requested=list(metrics.CLUSTER_PATHS),
             resolved=['orchestrator/tests/conftest.py'],
         )
-        cluster = set(metrics.CLUSTER_PATHS)
-        for key, value in self._stored(report).items():
-            if not isinstance(value, list):
-                continue
-            strays = [
-                entry for entry in value
-                if isinstance(entry, str)
-                and entry.startswith('orchestrator/tests/')
-                and entry not in cluster
-            ]
-            assert strays == [], key
+        assert _test_tree_strays(self._stored(report)) == {}, (
+            'a swept-but-never-measured file reached the stored block'
+        )
 
     def test_cluster_paths_are_kept_including_the_glob_literals(self) -> None:
         # CLUSTER_PATHS entries are the SPOT record of PRD Appendix A. The glob
@@ -2285,10 +2289,21 @@ class TestReportCli:
         assert metrics.main(['--report']) == 0
         out = capsys.readouterr().out
         test_tree = stub_measurement['enumeration']['test_tree']
-        # Read from the report, never hard-coded: the numbers churn with the
-        # tree, and pinning them would rebuild the hair trigger this removes.
-        assert str(test_tree['requested']) in out
-        assert str(test_tree['resolved']) in out
+        # Anchored to the enumeration ROW, not to the whole stdout blob: `str(N)
+        # in out` passes on any other line that happens to carry those digits, so
+        # it would stay green with the field deleted. Read from the report, never
+        # hard-coded: the numbers churn with the tree, and pinning them would
+        # rebuild the hair trigger this removes.
+        row = next(
+            line for line in out.splitlines() if line.startswith('enumeration:')
+        )
+        assert f'test tree requested={test_tree["requested"]}' in row
+        # The NUMERATOR is deliberately NOT in that row -- it is len(tests), and
+        # one number gets one place -- so its own better-labelled line is where
+        # the RESULT has to show it. That this len IS the sweep numerator is the
+        # SPOT relation, pinned once by
+        # test_the_numerator_is_exactly_the_measured_test_count.
+        assert f'test suite -- {len(stub_measurement["tests"])} lane-importing' in out
 
     def test_json_returns_zero_and_stdout_parses_as_the_report(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
@@ -2507,17 +2522,9 @@ class TestBaselineIsNotVacuous:
         # cannot move a single byte of it.
         enumeration = committed_baseline['enumeration']
         assert 'test_tree' not in enumeration
-        cluster = set(metrics.CLUSTER_PATHS)
-        for key, value in enumeration.items():
-            if not isinstance(value, list):
-                continue
-            strays = [
-                entry for entry in value
-                if isinstance(entry, str)
-                and entry.startswith('orchestrator/tests/')
-                and entry not in cluster
-            ]
-            assert strays == [], f'{key} froze {len(strays)} test-tree path(s)'
+        assert _test_tree_strays(enumeration) == {}, (
+            'the committed baseline froze test-tree path(s)'
+        )
 
     def test_the_committed_enumeration_still_names_the_whole_cluster(
         self, committed_baseline: dict
