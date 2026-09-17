@@ -2548,11 +2548,19 @@ class ReferentStats:
     silently skipped. A skipped endpoint is a check that did not run, and a
     verification pass that cannot say how often it declined to look is not a
     verification pass.
+
+    :attr:`endpoints_unregistered_qualifier` is the MACHINE half of that same
+    principle for the OTHER deliberate skip: how many endpoints this pass
+    declined to check for set membership because their project qualifier names
+    no project the registry knows. :attr:`endpoints_checked` counts a skipped
+    endpoint too, so without this field a skip would be indistinguishable from
+    an endpoint that AGREED — a silent drop wearing a clean pass's clothes.
     """
 
     edges_scanned: int = 0
     endpoints_checked: int = 0
     endpoints_unresolved: int = 0
+    endpoints_unregistered_qualifier: int = 0
     findings: list[ReferentFinding] = field(default_factory=list)
 
     @property
@@ -4127,6 +4135,14 @@ class MemoryService:
         dominant measured live shape, whose defining signature is that the
         landed-on number is never named by the fact at all.
 
+        This arm carries ONE GUARD of its own: an endpoint whose project
+        qualifier names no project ``set_known_projects`` registered is skipped
+        rather than checked, and counted in
+        :attr:`ReferentStats.endpoints_unregistered_qualifier` so the skip is
+        legible as a skip and never as an agreement. The guard is fail-closed on
+        an empty registry and does not apply to the pairing arm; the reasoning
+        is at the guard itself.
+
         PER-EDGE PAIRING: if the edge's own FACT cites at least one task
         referent and the endpoint's referent is not among them, the fact talks
         about ``Task M`` while the edge landed on ``Task N``. This is what
@@ -4417,6 +4433,58 @@ class MemoryService:
                 # site (INV-5) — see `_candidate_pool` for why the dominant
                 # `source='metadata'` write shape depends on it.
                 if endpoint_referent not in referent_set:
+                    if (
+                        endpoint_referent.project_id
+                        and endpoint_referent.project_id
+                        not in self._known_projects
+                    ):
+                        # RESTORES cancelled task 3335's guard-3 protection
+                        # class in zeta's own idiom. Guard 3 died silently in
+                        # the 3666 cherry-pick, and it is NOT portable: it asked
+                        # whether the episode touched a node named 'Task N',
+                        # while zeta inverts the direction and starts FROM an
+                        # endpoint. So the class is restored, not the code.
+                        #
+                        # A qualified name whose project this instance has never
+                        # heard of is far likelier to be a host:port, a version
+                        # string or some other colon-shaped literal than a
+                        # genuine cross-project reference — and this arm's
+                        # target comes from the DECLARED set, so acting on one
+                        # repoints a real edge onto a name nothing corroborates.
+                        # The permissive scan is currently the ONLY thing
+                        # protecting the live reify node 'localhost:3939';
+                        # narrowing the producer (task 3881) would convert it
+                        # from protected to repairable, which is why this guard
+                        # is prerequisite to that narrowing.
+                        #
+                        # FAIL-CLOSED ON AN EMPTY REGISTRY, on purpose, matching
+                        # `ReferentFinding.resolvable` defaulting to False:
+                        # MemoryService is constructed before
+                        # `build_known_projects_map` runs, so `{}` is a real
+                        # window, and "permissive until populated" would leave
+                        # exactly that window open. The registry arrives via
+                        # `set_known_projects`, which is the injection point to
+                        # look at if this ever skips more than expected.
+                        #
+                        # CONFINED TO THE MEMBERSHIP ARM. The pairing arm fires
+                        # only when the endpoint IS declared, where the write
+                        # itself vouched for the qualifier and it therefore
+                        # carries no such signal. An own-project endpoint can
+                        # never reach here at all: `local_referent` reclassifies
+                        # a SELF-qualified spelling to the bare local referent,
+                        # so its project_id is '' by the time this reads it.
+                        stats.endpoints_unregistered_qualifier += 1
+                        logger.info(
+                            'Referent verification skipped an endpoint whose '
+                            'project qualifier is not a known project: %s',
+                            {
+                                'edge_uuid': edge_uuid,
+                                'which_end': which_end,
+                                'endpoint_name': endpoint_name,
+                                'qualifier': endpoint_referent.project_id,
+                            },
+                        )
+                        continue
                     check = 'set-membership'
                 elif cited_declared and endpoint_referent not in cited:
                     check = 'per-edge-pairing'
