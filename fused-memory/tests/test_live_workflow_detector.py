@@ -2488,11 +2488,35 @@ class TestWorktreeIndexFor:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_timeout(self, tmp_path):
-        with patch(
-            'subprocess.run',
-            side_effect=subprocess.TimeoutExpired(cmd=['git'], timeout=10),
-        ):
+        """A timeout is RETURNED as a flagged result, so only the rc check catches it.
+
+        `run_git` hands back `GitResult(returncode=TIMEOUT_RETURNCODE,
+        timed_out=True)` rather than raising, so the `returncode != 0` leg is
+        the ONLY thing standing between a timed-out probe and a `{}` that would
+        read as "no worktrees exist" — the exact false negative the
+        `None`-vs-`{}` sentinel contract exists to prevent.
+
+        The call tally is load bearing: this test previously patched the
+        retired `subprocess.run` seam, which intercepted nothing, forked a REAL
+        `git worktree list --porcelain` child, and passed incidentally via the
+        non-zero-rc leg because `tmp_path` sits outside a git repo. A future
+        seam move now fails loudly here instead of silently reverting to
+        real-subprocess passthrough.
+        """
+        calls = 0
+        timing_out = _as_async_run_git(subprocess.TimeoutExpired(cmd=['git'], timeout=10))
+
+        async def counting_run_git(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return await timing_out(*args, **kwargs)
+
+        with patch.object(detector_module, 'run_git', counting_run_git):
             assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+        assert calls == 1, (
+            'the run_git seam did not intercept — the probe reached a real git child'
+        )
 
     @pytest.mark.asyncio
     async def test_returns_none_on_nonzero_returncode(self, tmp_path):
