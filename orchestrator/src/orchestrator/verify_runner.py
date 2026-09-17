@@ -1072,11 +1072,31 @@ async def _default_subprocess_run(
     )
 
 
+#: Ceiling on the teardown join of the stdin-heartbeat writer thread in
+#: :func:`_default_ssh_heartbeat_run`.  A WEDGE DETECTOR, not a cadence: the
+#: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
+#: ends within one GIL switch, and its write end is non-blocking so ``os.write``
+#: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
+#: additive scheduling delay measured at loadavg 113-178 (recorded in
+#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
+#: never reached in practice.
+#:
+#: Bounded at all, rather than a bare ``join()``, because an unbounded one would
+#: let a single pathological writer hold a merge-lane dispatch open forever —
+#: the failure class this protocol exists to remove, re-introduced at the other
+#: end.  Giving up is safe: the thread is ``daemon=True`` so it cannot block
+#: interpreter shutdown, and it still closes its own fd in its own ``finally``
+#: whenever it does finish, so that fd can never be closed out from under a
+#: reused descriptor.
+HEARTBEAT_STOP_JOIN_SECS: float = 5.0
+
+
 async def _default_ssh_heartbeat_run(
     argv: list[str],
     *,
     cwd: str | Path | None = None,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECS,
+    start_heartbeat=start_stdin_heartbeat,
 ) -> tuple[int, str, str]:
     """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
     plus a stdin heartbeat (connection-death protocol, PRD §8.1).
@@ -1104,6 +1124,13 @@ async def _default_ssh_heartbeat_run(
     A failed beat never raises out of the writer nor alters the returned
     ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
     suppressed error and why it is benign.
+
+    The writer is stopped and joined before this returns, so it can never
+    outlive its dispatch; the join is bounded by
+    :data:`HEARTBEAT_STOP_JOIN_SECS`.  *start_heartbeat* is injectable
+    (default ``verify_cancel.start_stdin_heartbeat``) so tests can observe the
+    writer's lifetime, mirroring this module's ``run`` / ``ssh_run`` /
+    ``id_factory`` seams.
 
     Deliberately does NOT use ``proc.communicate()`` (task 2309 boundary gate,
     SS9 Row 6): ``communicate()`` unconditionally calls its internal
@@ -1136,7 +1163,7 @@ async def _default_ssh_heartbeat_run(
     # join below.
     read_fd, write_fd = os.pipe()
     os.set_blocking(write_fd, False)
-    heartbeat = start_stdin_heartbeat(write_fd, interval=heartbeat_interval)
+    heartbeat = start_heartbeat(write_fd, interval=heartbeat_interval)
     try:
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1166,7 +1193,7 @@ async def _default_ssh_heartbeat_run(
         # The writer owns write_fd and closes it as it exits; that close is what
         # delivers EOF to the remote's watchdog.
         heartbeat.stop()
-        heartbeat.thread.join()
+        heartbeat.thread.join(timeout=HEARTBEAT_STOP_JOIN_SECS)
 
     return (
         proc.returncode or 0,
