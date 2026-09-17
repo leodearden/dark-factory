@@ -6781,6 +6781,21 @@ class TestRemoteRunnerPassSummaryArchival:
 # lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
 # The discriminator survives any such widening, because the pre-4195 producer
 # delivers exactly ZERO beats for the whole hog.
+#: How long the wedged-writer thread stays parked: comfortably longer than
+#: _default_ssh_heartbeat_run's own join bound, so the dispatch can only return
+#: by giving up on it rather than by outlasting it.
+WEDGED_WRITER_PARK_SECS = 30.0
+
+#: Budget for that test.  A regression to an unbounded join() must fail HERE as
+#: a timeout rather than wedging the suite; sized under WEDGED_WRITER_PARK_SECS
+#: so it fires before the parked thread expires on its own.
+WEDGED_WRITER_TEST_TIMEOUT_SECS = 20
+
+#: Join ceiling for the parked thread's own cleanup once released — a wedge
+#: detector, paid only if that thread is already stuck.
+HEARTBEAT_STOP_JOIN_CEILING_SECS = 5.0
+
+
 BEATS_REQUIRED = 5
 BEAT_INTERVAL_SECS = 0.05
 CHILD_DEADLINE_SECS = 2.5
@@ -6900,6 +6915,80 @@ class TestDefaultSshHeartbeatRun:
 
         assert rc == 0, f'child exited {rc} (3=heartbeat starved, 4=EOF): {stderr!r}'
         assert 'BEATS_OK' in stdout
+
+    async def test_writer_does_not_outlive_the_dispatch(self):
+        """The writer is stopped and joined before the call returns; its fd closed once.
+
+        Stated against the thread NAME as well as the handle, so it also catches
+        a writer leaked by some OTHER concurrently-finished dispatch in the same
+        interpreter — which is the production shape, since the orchestrator runs
+        many dispatches on one process.
+        """
+        import os
+        import sys
+        import threading
+
+        from orchestrator.verify_cancel import HEARTBEAT_THREAD_NAME, start_stdin_heartbeat
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        handles = []
+        closed = []
+
+        def closing_spy(fd):
+            closed.append(fd)
+            os.close(fd)
+
+        def spy_start(write_fd, **kw):
+            handle = start_stdin_heartbeat(write_fd, **{**kw, 'close_fn': closing_spy})
+            handles.append((write_fd, handle))
+            return handle
+
+        rc, stdout, stderr = await _default_ssh_heartbeat_run(
+            [sys.executable, '-c', 'print("DONE")'],
+            heartbeat_interval=0.02,
+            start_heartbeat=spy_start,
+        )
+
+        assert rc == 0
+        assert 'DONE' in stdout
+        ((write_fd, handle),) = handles
+        assert not handle.thread.is_alive()  # joined before the call returned
+        assert closed == [write_fd]  # closed exactly once, by its owner
+        assert [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD_NAME] == []
+
+    @pytest.mark.timeout(WEDGED_WRITER_TEST_TIMEOUT_SECS)
+    async def test_a_wedged_writer_does_not_block_the_dispatch_forever(self):
+        """A writer that ignores stop() costs one teardown, not the merge lane.
+
+        The join is BOUNDED, so the dispatch still returns its rc and stdout.
+        Regressing to a bare join() fails this as a timeout — the very failure
+        class (one stuck dispatch halting the lane) this task exists to remove.
+        """
+        import sys
+        import threading
+
+        from orchestrator.verify_cancel import HeartbeatHandle
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        never_set = threading.Event()
+        parked = threading.Thread(
+            target=never_set.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True
+        )
+        parked.start()
+
+        rc, stdout, stderr = await _default_ssh_heartbeat_run(
+            [sys.executable, '-c', 'print("DONE")'],
+            heartbeat_interval=0.02,
+            start_heartbeat=lambda write_fd, **kw: HeartbeatHandle(
+                stop=lambda: None, thread=parked
+            ),
+        )
+
+        assert rc == 0
+        assert 'DONE' in stdout
+        assert parked.is_alive()  # the call returned without waiting it out
+        never_set.set()
+        parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
