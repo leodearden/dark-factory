@@ -875,6 +875,15 @@ that replacing all of them is what you wanted.
 # neighbour would collapse the discrimination it exists to draw; neither
 # block may be deleted as redundant with the other.
 #
+# THE PROSE DEPENDS ON THE PLACEMENT PIN. _GREP_ENGINE_LIMITS draws its
+# discrimination by pointing at "the section just above", which is true only
+# because every splice site abuts ERROR_REMEDY_HINT_GUIDANCE. That abutment is
+# machine-checked by
+# orchestrator/tests/test_roles_grep_lookaround.py::test_variant_placement_is_structural;
+# moving this block elsewhere in a prompt silently turns that pointer into a
+# reference to whatever now precedes it, so reword the sentence if the pin ever
+# has to change.
+#
 # TWO VARIANTS, because two orthogonal capability dimensions decide who
 # needs what. All 9 roles hold `Grep`, so every role can hit the rejection
 # and needs the LIMITATION; but the `grep -P` escape hatch is gated on the
@@ -958,10 +967,10 @@ names a flag of the WRAPPED BINARY that the tool does not expose, so no
 re-issue of `Grep` can ever succeed and you must change approach instead.
 
 FIRST-LINE RECOVERY, needing no other tool: express the intent without
-look-around — match broadly, then exclude from the results. The rejected
-pattern above meant "every `config.<key>` except git, project_root and
-verify_env"; the working form is `Grep` for `config\\.[a-z_]+` with `-o`,
-then drop those three names from what comes back. "Not followed by", "not
+look-around — match broadly, then exclude from the results. A rejected
+`config\\.(?!git|project_root|verify_env)[a-z_]+` means "every `config.<key>`
+except those three names"; the working form is `Grep` for `config\\.[a-z_]+`
+with `-o`, then drop the three from what comes back. "Not followed by", "not
 preceded by" and "the same capture twice" are all this one shape: the engine
 cannot express them, and a second pass over the matches can.
 """
@@ -1308,7 +1317,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -1420,7 +1429,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1484,7 +1493,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1687,7 +1696,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
@@ -1753,7 +1762,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -2116,7 +2125,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -2393,7 +2402,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -2513,7 +2522,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
