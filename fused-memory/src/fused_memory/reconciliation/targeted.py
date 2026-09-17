@@ -21,6 +21,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationRun,
     RunStatus,
     RunType,
+    VerificationVerdict,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -72,6 +73,30 @@ _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 # _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
 # and the fast-path write can't drift out of sync (task 1984).
 _ECHO_SOURCE = 'targeted_reconciliation'
+
+# Per-verdict framing for the codebase-verification memory written by
+# _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
+# completion-framed template, so a `contradicted` verdict — the codebase
+# saying the claim is NOT supported — was recorded in permanent project
+# memory as a completion, with the refutation demoted to a trailing clause
+# after the colon.  Semantic search then returns that record as evidence FOR
+# completion: the retrieval-time reading inverts the finding.  A memory
+# record is read standing alone, months later, by someone without the
+# verdict in hand, so the framing has to carry the verdict itself.
+#
+# This mapping doubles as the branch condition in _on_task_done ("which
+# verdicts write memory" is the same fact as "what each one says", so a
+# tuple plus a separate lookup could drift into either a KeyError or a
+# silently memory-silent verdict).  Keyed by VerificationVerdict members —
+# pydantic already coerces the field, so the key type is guaranteed and
+# pyright can see it.  `inconclusive`'s ABSENCE here IS the rule that it
+# stays memory-silent; there is no finding to record.
+_VERDICT_MEMORY_TEMPLATES: dict[VerificationVerdict, str] = {
+    VerificationVerdict.confirmed:
+        "Verified completion of task '{title}' against the codebase: {summary}",
+    VerificationVerdict.contradicted:
+        "Codebase evidence CONTRADICTS the completion claim of task '{title}': {summary}",
+}
 
 # Cap on the authoritative-memory pre-check query in _on_task_done's hot
 # path (task 1984 review: hot_path_efficiency).  That query runs on EVERY
@@ -760,9 +785,46 @@ class TargetedReconciler:
                         'type': 'verification_agent_failed',
                         'failure_token': verification.failure_token,
                     })
-                elif verification.verdict in ('confirmed', 'contradicted'):
+                elif verification.verdict in _VERDICT_MEMORY_TEMPLATES:
+                    # The mapping IS the branch condition — see its definition
+                    # at the top of this module.  Membership answers "does this
+                    # verdict write a memory", and the same entry answers "what
+                    # does it say", so the two cannot drift apart.
+                    if verification.verdict == VerificationVerdict.contradicted:
+                        # Task 4723 / PRD D7.  Ordered BEFORE the memory write
+                        # deliberately: a Mem0/Qdrant outage must never suppress
+                        # the human alert.  (The reverse independence — a broken
+                        # escalation queue not suppressing the memory write — is
+                        # the containment inside _escalate_contradicted_l1.)
+                        #
+                        # No second `not verification.agent_failed` check is
+                        # needed: the `if verification.agent_failed:` branch
+                        # above already claims that case, so this arm is only
+                        # reachable when the agent really produced a verdict.
+                        esc_action = await self._escalate_contradicted_l1(
+                            task_id=task_id,
+                            run_id=run_id,
+                            project_root=scope.project_root,
+                            title=title,
+                            confidence=verification.confidence,
+                            evidence=verification.evidence,
+                        )
+                        if esc_action is not None:
+                            result['actions'].append(esc_action)
+                        # Deliberately NO add_run_action(run_id, 'verify',
+                        # 'codebase', ...) row here: task 4343's contract is
+                        # exactly ONE outcome row per invocation of this
+                        # branch, which is what makes the operator census
+                        # truthful by construction.  A second verify row would
+                        # double-count it.  The escalation's durable records
+                        # are its own JSON file plus the outcome row already
+                        # written above; the run-level signal is the
+                        # result['actions'] entry.  _sweep_escalate_l1 sets the
+                        # same precedent — it journals nothing.
                     written = await self._fenced_add_memory(
-                        content=f"Completed task '{title}': {verification.summary}",
+                        content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
+                            title=title, summary=verification.summary,
+                        ),
                         category='observations_and_summaries',
                         project_id=scope.project_id,
                         metadata={
@@ -1635,6 +1697,163 @@ class TargetedReconciler:
             'escalation_id': esc_id,
         }
 
+    async def _escalate_contradicted_l1(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        project_root: ProjectRoot,
+        title: str,
+        confidence: float,
+        evidence: list,
+    ) -> dict | None:
+        """File an L1 escalation for a codebase-contradicted completion claim.
+
+        Task 4723 / PRD D7.  A `contradicted` verdict means the codebase does
+        not support a claim the task record already asserts as done.  Until
+        now that finding lived only in a memory record and an audit row —
+        both PULL-only surfaces nobody polls — so in practice nobody saw it.
+        An L1 goes to the escalation watcher, which triages it.
+
+        Deliberate non-features, each an upstream decision this must not
+        relitigate:
+        - NO confidence threshold and NO `has_open_l1` dedup read (PRD Open
+          Q2).  Volume is gate-bounded — this branch only opens for
+          sparse-memory `done` tasks, ~17 events/month fleet-wide, and
+          `contradicted` is historically rare — so the watcher triages
+          instead of a tuned cutoff, and a per-file archive scan on the hot
+          path buys nothing.  `_sweep_escalate_l1` files without one too.
+        - `risk_identified` is EXISTING category vocabulary.  Do NOT mint a
+          new one: the `Escalation` model's own comment makes the NEXT
+          category addition an enum promotion (task 3709), which this must
+          not trigger.
+        - NO task-status mutation anywhere (INV-3, esc-3105-3).  Nothing
+          auto-closes or auto-reopens on an LLM verdict; this is an alert
+          for a human, not an action.
+        - NO `is_orchestrator_live_for` gate, deliberately UNLIKE the
+          `_sweep_escalate_l1` call site in `_sweep_cancelled_descendants`,
+          which files an L1 only when the target project's orchestrator
+          holds a live lock.  That gate is a CHOICE BETWEEN TWO DURABLE
+          ACTIONS — escalate when a watcher can see it, else
+          `_sweep_block_orphan`, which records the same finding in-band as a
+          status transition — so nothing is lost on either arm.  Here there
+          is no second arm to fall back to, because the bullet above forbids
+          the status mutation that would be it: gating on liveness would
+          simply DISCARD a contradiction whenever the target project's
+          orchestrator happened to be down.  Liveness is a point-in-time
+          read of a lock file, while the escalation queue is a durable
+          on-disk queue precisely so a watcher that starts later still
+          drains it.  Accepted cost, stated so it is a recorded decision and
+          not an omission: a project that never runs a watcher accumulates
+          pending L1 JSON files (one per contradicted re-done task, since
+          there is no dedup).  Bounded by the same volume gate as above, and
+          preferred over silently dropping the finding.
+
+        Returns the action dict for `result['actions']`, or None when the
+        escalation package is unavailable.
+        """
+        # is-None narrows the optional types for pyright (mirrors
+        # _sweep_escalate_l1). _HAS_ESCALATION is informational.
+        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+            logger.debug(
+                'verify: escalation pkg unavailable; cannot file L1 for '
+                'contradicted task %s',
+                task_id,
+            )
+            return None
+        # Rebound to locals because pyright's narrowing above does NOT reach
+        # into the nested `_file` scope below: a module-level global could be
+        # reassigned between closure capture and call, so reading
+        # `Escalation`/`EscalationQueue` there re-widens to `... | None` and
+        # trips reportOptionalCall.  These locals are never reassigned, so the
+        # narrowed types survive into the closure.
+        esc_cls, queue_cls = Escalation, EscalationQueue
+
+        # One line, and a free-text title must not be what breaks that
+        # contract — hence both the newline scrub and the bounded truncate.
+        flat_title = ' '.join(str(title).split())
+        summary = (
+            f'Codebase evidence contradicts the completion claim of task '
+            f'{task_id}: {_truncate_clean(flat_title, 120)}'
+        )
+        # POINTERS ONLY (INV-9): no verifier summary, no evidence snippets.
+        # The finding already has two homes; this says where they are so the
+        # escalation can never drift from the record it describes.
+        # `:.2f` rather than the default float repr: `confidence` is an
+        # unconstrained [0,1] float parsed out of agent JSON, so a value like
+        # 0.8500000000000001 would render verbatim into the one-screen alert a
+        # human reads.  Two decimals is all the precision a triage decision uses.
+        detail_lines = [
+            f'Task {task_id} was marked done, but codebase verification returned '
+            f'verdict=contradicted (confidence {confidence:.2f}).',
+            f'Reconciliation run: {run_id}',
+        ]
+        paths = _evidence_paths(evidence)
+        if paths:
+            detail_lines.append('Evidence cited by the verifier:')
+            detail_lines.extend(f'  - {p}' for p in paths)
+        detail_lines.extend([
+            'Nothing was auto-changed: the task status is unchanged and no task '
+            'was reopened (INV-3) — this is an alert for a human, not an action.',
+            'Full finding: the verification memory for this task '
+            "(metadata.verification_verdict == 'contradicted'), and the "
+            f'verify|codebase|contradicted audit row for run {run_id}.',
+        ])
+        detail = '\n'.join(detail_lines)
+
+        def _file() -> str:
+            # Constructed HERE, not hoisted: EscalationQueue.__init__ does
+            # mkdir(parents=True, exist_ok=True), so building it outside the
+            # contradicted branch would create data/escalations/ in every
+            # target project as a side effect of an unrelated done
+            # transition — the trap _escalation_pin_index_for documents.
+            queue = queue_cls(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            esc = esc_cls(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='reconciler',
+                severity='info',
+                category='risk_identified',
+                summary=summary,
+                detail=detail,
+                suggested_action='reopen_task|create_followup_task|dismiss',
+                level=1,
+            )
+            return queue.submit(esc)
+
+        # Offloaded because EscalationQueue is synchronous blocking filesystem
+        # I/O and _on_task_done runs on the shared fused-memory event loop
+        # (INV-8) — following _escalation_pin_index_for's precedent, not
+        # _sweep_escalate_l1's older un-offloaded inline call.
+        #
+        # Contained HERE rather than at the call site, and this placement is
+        # the whole point rather than a stylistic choice.  The call site sits
+        # inside _on_task_done's broad verify `except`, so an escaping raise
+        # would (a) skip the contradiction memory write entirely, costing the
+        # corpus its record over a filesystem outage, (b) emit a spurious
+        # `post_verify_error` row that both double-counts task 4343's verify
+        # census and blames the verifier for a queue failure, and (c) log the
+        # misleading generic 'Verification failed for task' message.  A broken
+        # escalation store must cost the escalation and nothing else — which is
+        # also why this is a warn-and-return-None arm (_sweep_escalate_l1's
+        # precedent) and not a silent `except Exception: pass`: the failure
+        # still has to be visible to an operator.
+        # asyncio.to_thread re-raises in the awaiting coroutine, so this one
+        # try covers construction, make_id and submit alike.
+        try:
+            esc_id = await asyncio.to_thread(_file)
+        except Exception as e:
+            logger.warning(
+                'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
+                task_id, project_root, e,
+            )
+            return None
+        return {
+            'type': 'verification_contradicted_escalated',
+            'task_id': task_id,
+            'escalation_id': esc_id,
+        }
+
     async def _sweep_unblock_dependents(
         self,
         *,
@@ -2309,6 +2528,63 @@ def _truncate_clean(text: str, limit: int) -> str:
     )
     head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
     return head.rstrip() + '…'
+
+
+# Bounds on the evidence pointers carried by the contradicted-verdict L1
+# escalation (task 4723).  Small on purpose: the escalation is a one-screen
+# alert a human triages, not a copy of the finding.
+_ESCALATION_EVIDENCE_PATH_LIMIT = 5      # at most N pointers in the detail
+_ESCALATION_EVIDENCE_PATH_MAXLEN = 200   # per-path char cap
+
+
+def _evidence_paths(
+    evidence: object,
+    *,
+    limit: int = _ESCALATION_EVIDENCE_PATH_LIMIT,
+    maxlen: int = _ESCALATION_EVIDENCE_PATH_MAXLEN,
+) -> list[str]:
+    """Bounded, deduped, sanitized ``file_path`` pointers from verifier evidence.
+
+    Feeds the contradicted-verdict L1 escalation's detail, which carries
+    POINTERS, not copies (INV-9).  The finding itself already has two homes —
+    the verification memory for the task and the ``verify|codebase|contradicted``
+    audit row for the run — so duplicating the verifier's summary or its
+    evidence snippets into the escalation would fork the record and let the
+    copy drift from the original.  What the triager needs is *where to look*.
+
+    Every read is defensive rather than trusting: ``evidence`` is agent-supplied
+    and ``verify.py``'s ``verification_complete`` tool schema does not mark
+    ``file_path`` required, so entries that are not dicts, that lack the key, or
+    whose value is not a non-blank ``str`` are SKIPPED rather than raising.  A
+    malformed entry costs its own pointer and nothing else — a garbled evidence
+    list must never be what suppresses a human alert.
+
+    De-duplication is on the truncated value and preserves first-seen order, so
+    a verdict citing one file at three line ranges yields one pointer.
+    """
+    if not isinstance(evidence, list):
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in evidence:
+        if len(paths) >= limit:
+            break
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get('file_path')
+        if not isinstance(raw, str):
+            continue
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # _truncate_clean (task 2080) rather than a raw slice: a naive cut
+        # garbles a dense path mid-segment the same way it garbled a CSV note.
+        path = _truncate_clean(stripped, maxlen)
+        if path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
 
 
 def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:

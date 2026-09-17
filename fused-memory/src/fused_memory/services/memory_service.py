@@ -37,6 +37,9 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
+from fused_memory.middleware.dead_letter_escalator import (
+    emit_dead_letter_escalation,
+)
 from fused_memory.middleware.entity_mint_storm_escalator import (
     emit_entity_mint_storm_escalation,
 )
@@ -76,7 +79,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.server.storm_counter import StormCounter
-from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
     emit_schema_warnings,
@@ -128,6 +131,13 @@ _T = TypeVar('_T')
 # outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
 # must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
+
+# The durable-queue group_id prefix that distinguishes a project's Mem0 writes
+# from its Graphiti ones, whose group_id is the bare project_id
+# (``Scope.graphiti_group_id``). Written by ``_dual_write_callback`` and read
+# back by ``_project_id_from_queue_group_id``; one constant so the two can
+# never drift apart.
+_MEM0_GROUP_PREFIX = 'mem0_'
 
 # Reciprocal Rank Fusion constant for the cross-store merge in
 # MemoryService.search (task 3658, PRD D4 — deliberately a module constant, not
@@ -1772,6 +1782,46 @@ class ReferentFinding:
     #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
     #: the identity of the finding — at most one finding per (edge, end).
     which_end: str
+    #: The project GRAPH this episode was written to — Graphiti's ``group_id``,
+    #: and the scope in which every uuid on this record resolves.
+    #:
+    #: REQUIRED, and repeated per-finding rather than deduped onto the enclosing
+    #: :class:`ReferentStats`, for exactly the reason
+    #: :func:`_store_failure_diagnostics`' ``project_id`` Args note gives for the
+    #: identical choice in this same module: an entry must be independently
+    #: self-describing, so a consumer reading ONE finding off a log payload or a
+    #: durable row never has to join back against the enclosing call to learn
+    #: which project it came from. One process serves nine projects, and a
+    #: finding read against the wrong one is not hypothetical — it produced a
+    #: false conclusion in the 2026-08-31 audit. That is why this is required
+    #: rather than defaulted: a finding with no project discriminator is the
+    #: record that failure was made of, and it is now unconstructible.
+    group_id: str
+    #: The project SCOPE the write ran under.
+    #:
+    #: A KNOWN-ALIASED PAIR TODAY — said plainly here so nobody reads a
+    #: guarantee into it. ``_verify_episode_referents`` is handed a ``group_id``
+    #: and no :class:`~fused_memory.models.scope.Scope`, so the ONE production
+    #: construction site fills this field from that same value, and no live
+    #: payload has ever carried a pair that disagrees. There is nothing for it
+    #: to disagree with yet:
+    #: :attr:`~fused_memory.models.scope.Scope.graphiti_group_id` returns
+    #: ``self.project_id``.
+    #:
+    #: Kept as its own field anyway, for a reason that is about the DURABLE row
+    #: rather than the in-memory record: this payload is written verbatim to
+    #: ``write_journal``'s ``referent_findings`` table and read back by a later
+    #: process. :meth:`MemoryService._reconcile_episode_identity`'s own
+    #: docstring already anticipates task 3335's cross-project split, after
+    #: which the two need not agree — and a row that had carried only
+    #: ``group_id`` would by then be permanently ambiguous about which of the
+    #: two it meant, with no back-fill possible for rows already on disk. The
+    #: cost is one string per finding on the ~0.2%-of-edges path.
+    #:
+    #: What the tests pin is accordingly that the RECORD can carry a distinct
+    #: pair — that neither field is derived from or collapsed into the other —
+    #: never that the system today produces one.
+    project_id: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
     #: The node the edge is attached to today — as THIS EPISODE'S in-memory
@@ -1918,14 +1968,22 @@ class ReferentFinding:
     def to_dict(self) -> dict[str, Any]:
         """A plain, JSON-safe dict keyed exactly by this record's field names.
 
-        The payload the operator warning carries. Referents render as their
+        The payload the operator warning carries, and the payload a durable
+        ``referent_findings`` row stores verbatim. Referents render as their
         canonical ``node_name`` rather than as a dataclass repr, so the log
-        line and any future durable row read as graph names — the same thing
-        an operator would type into a query.
+        line and the durable row read as graph names — the same thing an
+        operator would type into a query.
+
+        Because the key set IS the field names, :attr:`group_id` and
+        :attr:`project_id` travel with every payload automatically: no consumer
+        of a rendered finding can be handed one that does not say which project
+        it came from.
         """
         return {
             'edge_uuid': self.edge_uuid,
             'which_end': self.which_end,
+            'group_id': self.group_id,
+            'project_id': self.project_id,
             'check': self.check,
             'old_endpoint_uuid': self.old_endpoint_uuid,
             'old_endpoint_name': self.old_endpoint_name,
@@ -2874,6 +2932,7 @@ class MemoryService:
             transient_max_attempts=qcfg.transient_max_attempts,
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
+            on_dead_letter=self._report_queue_dead_letter,
         )
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
@@ -3040,6 +3099,116 @@ class MemoryService:
             terminal_status=terminal_status,
             terminal_error=error,
         )
+
+    def _project_id_from_queue_group_id(self, group_id: str) -> str:
+        """Resolve a durable-queue ``group_id`` to the project it belongs to.
+
+        The ORDER is the whole content of this method:
+
+        1. An EXACT match against ``self._known_projects`` wins. A project
+           literally named ``mem0_thing`` has a Graphiti group_id of
+           ``mem0_thing``, which is indistinguishable by shape from the Mem0
+           group of a project named ``thing``; the injected registry is the
+           only evidence that settles it, so it outranks the prefix strip.
+        2. Otherwise a ``mem0_`` prefix strips — the shape
+           ``_dual_write_callback`` writes — WHETHER OR NOT the remainder is
+           itself in the registry. The map may be empty or stale, and a prefix
+           this codebase itself writes is better evidence than none, so there
+           is deliberately no membership test on the stripped remainder.
+        3. Otherwise the group_id is returned UNCHANGED, so the caller reaches
+           its unresolvable-root WARNING rather than filing into a project it
+           guessed.
+
+        A pure function of injected data: no I/O, and deliberately no fallback
+        to ``config.taskmaster.project_root``, which defaults to ``'.'`` — a
+        fallback would file into the server's cwd where no operator watches,
+        and report success while doing it.
+        """
+        if group_id in self._known_projects:
+            return group_id
+        if group_id.startswith(_MEM0_GROUP_PREFIX):
+            return group_id[len(_MEM0_GROUP_PREFIX):]
+        return group_id
+
+    async def _report_queue_dead_letter(self, event: DeadLetterEvent) -> None:
+        """Escalate a permanently-abandoned durable write to the operator queue.
+
+        Passed to ``DurableWriteQueue(on_dead_letter=...)`` in ``initialize()``.
+        Because it lives at the queue seam, every enqueue site inherits the
+        alarm — ``add_episode``, ``add_memory``'s Graphiti leg, and each derived
+        ``mem0_classify_and_add`` alike — including the ones carrying no
+        ``_write_op_id``, which the terminal-outcome hook beside this one
+        correctly skips.
+
+        A BOUND METHOD for the same call-time-resolution reason
+        ``_record_queue_terminal_outcome``'s docstring gives: ``server/main.py``
+        calls ``initialize()`` (which constructs the queue) BEFORE
+        ``set_known_projects()``, so ``_known_projects`` is still empty when the
+        hook is wired and must be read at call time.
+
+        PROJECT ROOT resolution has NO FALLBACK, exactly as in
+        ``_record_entity_mint``. Falling back to
+        ``config.taskmaster.project_root`` is forbidden: it defaults to ``'.'``,
+        so the fallback would file into the server's cwd, where no operator
+        watches, and report success while doing it — a silent misfile is
+        strictly worse than a logged refusal, because it also destroys the
+        evidence that the alarm ever fired.
+        """
+        project_id = self._project_id_from_queue_group_id(event.group_id)
+        project_root = self._known_projects.get(project_id)
+        if not project_root:
+            logger.warning(
+                'durable write dead-letter for operation=%r in project_id=%r '
+                '(group_id=%r, queue_item_id=%s, attempts=%s) could NOT be '
+                'escalated: the project is absent from `_known_projects`, so '
+                'no project queue can be resolved. Wire '
+                'MemoryService.set_known_projects(build_known_projects_map(...)) '
+                'at server startup to restore this alarm. error=%r',
+                event.operation, project_id, event.group_id, event.item_id,
+                event.attempts, event.error,
+            )
+            return
+
+        payload = event.payload or {}
+        content_preview = payload.get('content') or payload.get('fact_text') or ''
+        # The id the caller was HANDED and is holding — `add_episode`'s
+        # correlation id. NOT `payload['uuid']`: task 3561 removed that key,
+        # because graphiti_core reads a caller-supplied uuid as "LOAD this
+        # existing episode" and every add_episode write failed while it was
+        # present. See esc-3583-5.
+        caller_reference = payload.get('correlation_id')
+
+        try:
+            # to_thread is LOAD-BEARING, not stylistic: EscalationQueue.submit
+            # is a synchronous fsync-flushed filesystem write and this hook runs
+            # on the event loop inside the durable queue's worker, so calling it
+            # directly would stall the pool that is draining every other group.
+            # Same call-site discipline as _record_entity_mint.
+            await asyncio.to_thread(
+                emit_dead_letter_escalation,
+                project_root,
+                project_id=project_id,
+                operation=event.operation,
+                group_id=event.group_id,
+                item_id=event.item_id,
+                attempts=event.attempts,
+                error=event.error,
+                post_execute=event.post_execute,
+                content_preview=content_preview,
+                write_op_id=event.write_op_id,
+                caller_reference=caller_reference,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # The escalator is itself never-raise; this is the belt to its
+            # braces. The item is already committed dead, and the queue worker
+            # must keep draining whatever happens here.
+            logger.exception(
+                'durable write dead-letter escalation failed for operation=%r '
+                'in project_id=%r (queue_item_id=%s)',
+                event.operation, project_id, event.item_id,
+            )
 
     @staticmethod
     def _mem0_payload_digest(
@@ -4142,6 +4311,14 @@ class MemoryService:
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
+                    # ONE value fills both, and this is the ONLY site that
+                    # constructs a finding: this pass is handed a group_id and
+                    # no Scope, so the pair is ALIASED here by construction.
+                    # See the `project_id` field docs for why the record keeps
+                    # them apart anyway — the argument is about the durable row,
+                    # not about this call.
+                    group_id=group_id,
+                    project_id=group_id,
                     check=check,
                     old_endpoint_uuid=endpoint_uuid,
                     old_endpoint_name=endpoint_name,
@@ -4192,12 +4369,15 @@ class MemoryService:
                 uuid_lookup_degraded=degraded,
             )
 
-        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
-        # `stats.findings` stay outside it entirely, so suppression costs leaf
-        # iota no rate signal and leaf eta no finding — see
-        # `_REFERENT_FINDING_WARN_CAP`.
+        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below, the
+        # durable row below them and `stats.findings` stay outside it entirely,
+        # so suppression costs leaf iota no rate signal, leaf eta no finding and
+        # the replay pass no diagnosis — see `_REFERENT_FINDING_WARN_CAP`.
         warned = 0
         suppressed = 0
+        # Collected here, written ONCE below the loop — see the journal block
+        # further down for why the batch and not a row per finding.
+        to_journal: list[dict[str, Any]] = []
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -4210,6 +4390,34 @@ class MemoryService:
                 # SUBTRACTS this axis from the membership rate, which needs the
                 # denominator to still be there. See REFERENT_FINDING_AXES.
                 self._referent_finding_counts['corroborated'] += 1
+            # THE THIRD INV-2 SURFACE, and the only one that outlives the
+            # process. The two above are in-memory: a finding fully diagnosed
+            # here and not repairable by eta left NOTHING a later pass could
+            # act on.
+            #
+            # ABOVE THE CAP, alongside the counters, because the cap is a log
+            # VOLUME policy; a suppressed finding is still a diagnosis that has
+            # to survive, and putting the write below it would discard exactly
+            # the rows a storm makes most worth keeping.
+            #
+            # AFTER THE SECOND PASS, because that pass rebuilds each resolvable
+            # finding by `dataclasses.replace` to stamp `new_endpoint_uuid` and
+            # `uuid_lookup_degraded`; a row written earlier would persist a
+            # payload missing the target the replay pass exists to act on.
+            #
+            # RESOLVABLE ONLY. The journal's sole declared consumer is the
+            # phase-5 replay pass, which can act on nothing that names no
+            # intended referent — an unresolvable row would be a permanent
+            # backlog entry nothing could ever drain, and that case is already
+            # served by the returned stats, the 'unresolvable' counter and the
+            # WARNING below. Widening it is a one-predicate change if phase 5
+            # ever wants the operator history.
+            #
+            # COLLECTED HERE, COMMITTED ONCE below the loop. The payload is
+            # built only when there is a journal to take it, so the unwired
+            # path allocates nothing.
+            if finding.resolvable and self._write_journal is not None:
+                to_journal.append(finding.to_dict())
             # WARNING, not DEBUG — but NOT WARNING for every finding.
             #
             # WARNING is right for the shape this pass exists to catch. The task
@@ -4281,6 +4489,32 @@ class MemoryService:
                     level, 'Referent verification finding: %s',
                     finding.to_dict(),
                 )
+
+        if to_journal and self._write_journal is not None:
+            # ONE COMMIT PER EPISODE, not one per finding. Every commit is a
+            # `synchronous=FULL` fsync (~1-5 ms, and up to the journal's 5000 ms
+            # busy_timeout under contention) taken while the per-group identity
+            # lock serializes same-group writes, and the loop above has NO
+            # ceiling on its findings — the warn cap is a log policy. Per
+            # finding, a storm episode of 50-100 misattached ends would hold
+            # that lock for 50-500 ms of fsyncs; batched, the whole episode
+            # costs one. The ~99.8% clean path never reaches this line at all.
+            #
+            # NO GUARD HERE: `log_referent_findings` is fire-and-forget by
+            # contract, so the already-committed episode write cannot be lost to
+            # a journal fault (one guard, at one site). A `None` journal is
+            # skipped silently because the counters remain the unconditional
+            # INV-4 escape — a warning for an unconfigured journal would be a
+            # storm, not a signal.
+            #
+            # `_episode_uuid_of` fails closed to `''` rather than raising on a
+            # malformed or MagicMock result: a row that cannot name its episode
+            # is still a diagnosis worth keeping.
+            await self._write_journal.log_referent_findings(
+                to_journal,
+                group_id=group_id,
+                episode_uuid=_episode_uuid_of(result),
+            )
 
         if suppressed:
             # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply
@@ -5096,7 +5330,7 @@ class MemoryService:
                         tuple(reported)
                         if isinstance(reported, (list, tuple)) else ()
                     )
-            repair_stats.repairs.append(ReferentRepair(
+            record = ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,
                 outcome='repaired',
@@ -5116,7 +5350,61 @@ class MemoryService:
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
                 summaries_refreshed=refreshed,
-            ))
+            )
+            repair_stats.repairs.append(record)
+
+            if moved:
+                # THE CURE, SAID OUT LOUD. Every other disposition on this path
+                # already logs — zeta's finding, eta's refusal, its failure,
+                # the emptied-node delete — and the endpoint move, the one
+                # thing this pass exists to perform, did not. INFO matches that
+                # delete line (a strictly more destructive COMPLETED action,
+                # already at INFO), and `server/main.py` sets INFO as the
+                # deployed root level, so the line genuinely reaches syslog.
+                #
+                # GATED ON `moved` — the same discriminator
+                # `ReferentRepairStats.repaired` counts, because a `moved=False`
+                # result is `reassign_edge`'s corroborate-before-acting no-op:
+                # the edge was already correct and nothing was written, so
+                # there is no executed repair to announce. Sharing the ONE
+                # discriminator makes the line count and that property agree by
+                # construction rather than by two sites staying in lockstep.
+                #
+                # The two added keys are the only facts `record` does not hold:
+                # eta is told its scope by its CALLER (nine projects interleave
+                # in one log), and the old endpoint's NAME lives on the
+                # finding. There is deliberately no `new_endpoint_name` —
+                # `intended_referent` already IS that node's canonical
+                # `node_name`, so a second key would carry one value twice
+                # under two names. The payload is built AT the emission because
+                # `%s` defers the string rendering, never the `to_dict()` call;
+                # no `isEnabledFor` guard, unlike the verify pass's finding log,
+                # because that one runs per finding on the DOMINANT shape and
+                # this one at most once per executed repair.
+                #
+                # SETTLED FACTS ONLY, which is why `deleted_emptied_node` is
+                # dropped rather than carried. `_cleanup_emptied_nodes` stamps
+                # it onto the record by `dataclasses.replace` strictly AFTER
+                # this loop, so here it is `''` for EVERY repair — including
+                # the ones whose old endpoint is about to be deleted. Reporting
+                # it would hand an aggregating consumer a value that is
+                # constant by construction and that contradicts the `deleted
+                # emptied node` INFO line the cleanup emits moments later. The
+                # deletion has its own line; this one says only what is true
+                # when it is emitted.
+                settled = {
+                    key: value
+                    for key, value in record.to_dict().items()
+                    if key != 'deleted_emptied_node'
+                }
+                logger.info(
+                    'Referent repair executed: %s',
+                    {
+                        **settled,
+                        'group_id': group_id,
+                        'old_endpoint_name': finding.old_endpoint_name,
+                    },
+                )
 
     async def _backstop_endpoint_summaries(
         self, result: dict[str, Any], *, group_id: str
@@ -5915,7 +6203,7 @@ class MemoryService:
 
         if edges:
             project_id = payload.get('project_id', 'main')
-            group_id = f'mem0_{project_id}'
+            group_id = f'{_MEM0_GROUP_PREFIX}{project_id}'
 
             batch = [
                 {
@@ -5976,6 +6264,7 @@ class MemoryService:
         temporal_context: str | None = None,
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
+        declared_referents: list[dict] | None = None,
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately.
 
@@ -6002,6 +6291,33 @@ class MemoryService:
         at enqueue time, and the real uuid does not exist until the queued
         write runs.  The two are tied together by an INFO log in
         ``_execute_graphiti_write``, which is the only record of the mapping.
+
+        ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
+        EXPLICIT statement of which referents this episode is about — the
+        strongest source in gamma's precedence chain. It arrives from the
+        ``entities`` parameter on the ``add_episode`` MCP tool, verbatim and
+        unparsed.
+
+        TRI-STATE, and all three states are distinct on the wire:
+        ``None`` = never considered (falls through to the derived scan);
+        ``[]`` = considered and none apply, HONOURED as a declaration and
+        stamped ``source='declared'`` with an empty set; ``[...]`` = declared.
+        The ``[]``/``None`` distinction is the "the agent considered referents
+        and none applied" versus "the agent never looked" signal leaf iota
+        counts, so nothing on this path may collapse one onto the other.
+
+        The chain is SHORTER here than at ``add_memory``, and by construction:
+        this method takes no ``metadata`` parameter at all, so the ladder is
+        ``declared > derived > none`` with the metadata rung absent rather than
+        merely unused. See the ``resolve_referents`` call below.
+
+        Deliberately UNVALIDATED here, exactly as at ``add_memory``: gamma's
+        ``_declared_referents`` owns the TOTAL ``InputValidationError``
+        contract, and a direct service caller that passes a malformed list gets
+        that raise — which is correct. A CONFLICTING declaration is likewise
+        legal at this layer: this is mechanism, and
+        ``server/entities_gate.py`` is the policy that refuses it at the tool
+        boundary.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         # task 3561: this id is minted HERE, at enqueue time, before the queued
@@ -6035,15 +6351,23 @@ class MemoryService:
         # InputValidationError on a structural wiring bug, and that must not be
         # absorbed by an enqueue-failure handler.
         #
-        # metadata=None is not an oversight: add_episode deliberately never
-        # persists a metadata argument — the same fact that forced task 3142's
-        # `unverified_claim` onto this payload channel — so the bridge has
-        # nothing to read and the derived scan is the only live source here.
+        # metadata=None is not an oversight, and it is not a choice this method
+        # could make differently: add_episode takes no `metadata` parameter at
+        # all — the same fact that forced task 3142's `unverified_claim` onto
+        # this payload channel — so the bridge has nothing to read. It stays
+        # None now that leaf delta has landed: adding one "for symmetry with
+        # add_memory" would hand this producer a rung whose value nothing
+        # persists. tests/test_referent_queue_threading.py pins that absence on
+        # the signature.
         #
-        # declared=None: leaf delta owns the `entities` parameter; this is the
-        # seam it fills.
+        # The seam leaf delta (task 3669) fills: `declared_referents` is the
+        # `entities` parameter on the add_episode MCP tool, forwarded verbatim.
+        # Its `entities_gate` has already rejected any declaration the content
+        # contradicts and any malformed entry, so neither can reach here FROM
+        # THAT PATH — a direct service caller still gets gamma's raise, which
+        # is the intended loud failure.
         resolution = resolve_referents(
-            declared=None,
+            declared=declared_referents,
             metadata=None,
             content=content,
             group_id=scope.graphiti_group_id,
@@ -6152,8 +6476,68 @@ class MemoryService:
         dual_write: bool = False,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        declared_referents: list[dict] | None = None,
     ) -> AddMemoryResponse:
-        """Lightweight classified write — skip extraction pipeline."""
+        """Lightweight classified write — skip extraction pipeline.
+
+        ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
+        EXPLICIT statement of which referents this write is about — the
+        strongest source in gamma's precedence chain, outranking the
+        ``metadata['task_id']`` bridge, the derived content scan and ``none``.
+        It arrives from the ``entities`` parameter on the ``add_memory`` MCP
+        tool, verbatim and unparsed.
+
+        TRI-STATE, and all three states are distinct on the wire:
+        ``None`` = never considered (falls through to the tiers below);
+        ``[]`` = considered and none apply, HONOURED as a declaration and
+        stamped ``source='declared'`` with an empty set; ``[...]`` = declared.
+        The ``[]``/``None`` distinction is the "the agent considered referents
+        and none applied" versus "the agent never looked" signal leaf iota
+        counts, so nothing on this path may collapse one onto the other.
+
+        SCOPED TO THE GRAPHITI LEG, and say it plainly because the three
+        sentences above read as if it were universal: a declaration is
+        RESOLVED, encoded and stamped only on a write that actually reaches
+        Graphiti — a ``GRAPHITI_PRIMARY`` category, or ``dual_write=True``. On
+        a Mem0-primary write (``procedural_knowledge``,
+        ``preferences_and_norms``, ``observations_and_summaries``) the
+        ``resolve_referents`` call below never runs, no referent set is
+        encoded, and ``_referent_source_counts`` never increments. The
+        declaration is accepted and then discarded.
+
+        That is deliberate, not an oversight, and it follows from where the
+        referent set LIVES: it is a field on the Graphiti queue payload, read
+        by ``_execute_graphiti_write`` and verified against the resulting edges
+        by leaf zeta. A Mem0-primary write produces no queue row and no edges,
+        so there is nothing to stamp it onto and nothing for zeta to check.
+        Resolving anyway would compute a set with no destination. The
+        consequence leaf iota must price in: its declaration-rate denominator
+        is "every Graphiti write", NOT "every add_memory call", so the
+        Mem0-primary share of traffic is outside the counter entirely rather
+        than counted as undeclared. Widening that denominator is iota's call to
+        make, and needs a second counting site — it is not a thing this method
+        can fix by moving one call.
+
+        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
+        run on this path (pinned by
+        ``tests/server/test_entities_gate_ingestion.py::...
+        test_the_gate_is_category_independent``), so a CONFLICTING declaration
+        on a Mem0-primary write is still rejected even though an agreeing one
+        would have been inert. That asymmetry is intended: the gate polices
+        whether the caller's stated referents match its own prose, which is a
+        fact about the caller and not about routing. It costs nothing an
+        undeclaring caller pays — absence is never rejected, so an agent that
+        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+
+        Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
+        TOTAL ``InputValidationError`` contract, and a direct service caller
+        that passes a malformed list gets that raise — which is correct. The
+        resolve sits OUTSIDE the enqueue ``try`` below precisely so a wiring
+        bug stays loud rather than degrading to a silently dropped Graphiti
+        write. A CONFLICTING declaration is likewise legal here: this layer is
+        mechanism, and ``server/entities_gate.py`` is the policy that refuses
+        it at the tool boundary.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
@@ -6241,11 +6625,14 @@ class MemoryService:
             # task_id to a scalar str, which is the contract gamma's metadata
             # bridge documents itself against.
             #
-            # declared=None: leaf delta owns the `entities` parameter and its
-            # `_entities_gate`, and THIS CALL is the single seam it fills. No
-            # declared referents can exist until it lands.
+            # The seam leaf delta (task 3669) fills: `declared_referents` is
+            # the `entities` parameter on the add_memory MCP tool, forwarded
+            # verbatim. Its `entities_gate` has already rejected any declaration
+            # the content contradicts and any malformed entry, so neither can
+            # reach here FROM THAT PATH — a direct service caller still gets
+            # gamma's raise, which is the intended loud failure.
             resolution = resolve_referents(
-                declared=None,
+                declared=declared_referents,
                 metadata=meta,
                 content=content,
                 group_id=scope.graphiti_group_id,
@@ -6779,8 +7166,11 @@ class MemoryService:
             # will want to verify.
             #
             # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
-            # record's own), so the bridge is live here. declared=None: leaf
-            # delta's seam, as at the other two producers.
+            # record's own), so the bridge is live here. declared=None STAYS
+            # None now that leaf delta (task 3669) has landed: this producer
+            # replays STORED Mem0 rows and has no caller to declare anything.
+            # Its two siblings take `declared_referents` from the tool boundary;
+            # there is no tool boundary here.
             #
             # add_system_record is deliberately NOT threaded — it is Mem0-only
             # and never routes to Graphiti.

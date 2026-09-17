@@ -1382,6 +1382,14 @@ class ReconciliationConfig(BaseModel):
         return data
 
     enabled: bool = Field(default=True)
+    # data_dir MAY be RELATIVE, and the default is (task 4592).  Nothing
+    # absolutizes it, so a standalone/systemd launch anchors it at the PROCESS
+    # cwd; every in-process consumer shares that anchor and so agrees by
+    # construction.  The per-run CLI config dir derived from it does NOT get to
+    # inherit the relativity — it crosses a process boundary as
+    # CLAUDE_CONFIG_DIR — and is absolutized exactly once, at
+    # reconciliation/cli_stage_runner.py::recon_config_base_dir, which carries
+    # the full deployment story and rationale.
     data_dir: str = Field(default='./data/reconciliation')
 
     # Buffer triggers
@@ -1526,6 +1534,15 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Entries MUST be ABSOLUTE paths.  A relative entry is DROPPED rather than
+    #   honoured — from the containment verdict AND from the --writable grant
+    #   alike, with a logger.warning naming it — by
+    #   reconciliation/sandbox_guard.py::_absolute_writable_extras, because the
+    #   parent verifies it in its own cwd while landlock-exec / bwrap resolve the
+    #   granted token in the child's.  See that function, and
+    #   reconciliation/cli_stage_runner.py::recon_config_base_dir for the
+    #   parent/child cwd divergence it comes from (task 4592).
     #
     #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
     #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which
@@ -2151,11 +2168,15 @@ class CuratorConfig(BaseModel):
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
-    # any success or on a non-ZOT failure — the batch path's missing reset
-    # was fixed in task 4143).
+    # any successful LLM call; a non-ZOT failure neither increments nor
+    # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
-    # before allowing a half-open probe.
+    # before allowing a half-open probe; a successful LLM call (including a
+    # concurrent batch round-trip) closes the breaker early rather than
+    # waiting out the cooldown — see
+    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)

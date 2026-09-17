@@ -243,6 +243,13 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
+  # 1800 -> 3600 (Leo, 2026-09-16) was ruled on a premise that later proved
+  # false: that remediation runs routinely overran the cutoff. In fact every
+  # age-reaped remediation run was the orphan of a fused-memory service stop.
+  # Live runs are protected by the lock-identity guard at any cutoff, so this
+  # value only sets how long an orphan row lingers. Whether to revert is
+  # pending; task 5545 terminalises the orphaned child on cancellation.
+  stale_run_recovery_seconds: 3600
   # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
   # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
   # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
@@ -476,9 +483,10 @@ summary_rebuild:
 #   storm_window_seconds: 3600.0
 
 write_triage:
-  # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
-  # keys in this block a human is meant to edit; everything below the fence is
-  # derived. Both are green-tier hot-reloadable, and
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
+  # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
+  # and the six judge knobs below them; everything below the fence is
+  # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
   #

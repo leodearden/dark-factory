@@ -250,6 +250,13 @@ function OrchTab({ projectFilter, search }) {
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
+            {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
+                them sends an operator to restart a healthy service. Invariant:
+                dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts.
+                The !o.offline guard states the precedence here rather than trusting the
+                producer, so a malformed entry with both set reads as the stronger, proven one. */}
+            {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
+            {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
             <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{o.summary.done}/{total}</span>
             {o.summary.in_progress > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{o.summary.in_progress} active</span>}
             {o.summary.blocked > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{o.summary.blocked} blocked</span>}

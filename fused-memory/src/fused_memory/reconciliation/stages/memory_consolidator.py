@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -218,6 +219,15 @@ class MemoryConsolidator(BaseStage):
     # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
     _fetch_degraded_sources: list
 
+    # Count of episode/Mem0 records excluded from the "new" lists in the current
+    # cycle because their timestamp was missing, empty, or unparseable (task 4574).
+    # Reset at the top of assemble_payload and _format_assembled_payload, mirroring
+    # _fetch_degraded_sources; copied to report.stats['stage1_undatable_freshness_records']
+    # in run(). These records are excluded (never re-surfaced forever like 894fbe90)
+    # but counted and logged at the failure point rather than silently dropped —
+    # design invariant INV-2 structured-facts-at-failure.
+    _undatable_freshness_records: int
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-instance initialisation: avoids shared-mutable-default hazard.
@@ -225,6 +235,7 @@ class MemoryConsolidator(BaseStage):
         # the run-local reset in assemble_payload / _format_assembled_payload, leaking
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
+        self._undatable_freshness_records: int = 0
 
     async def run(
         self,
@@ -258,6 +269,12 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+
+        # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
+        # the remediation early-return so the key is unconditionally present, including
+        # on remediation passes (which never call assemble_payload's freshness filters
+        # and so leave the per-instance counter at its __init__/reset value of 0).
+        report.stats['stage1_undatable_freshness_records'] = self._undatable_freshness_records
 
         # Always present (task-2312): set BEFORE the remediation early-return below
         # so downstream consumers see this key on every run, including remediation
@@ -1111,6 +1128,66 @@ class MemoryConsolidator(BaseStage):
     def get_disallowed_tools(self) -> list[str]:
         return STAGE1_DISALLOWED
 
+    def _filter_records_newer_than_watermark(
+        self,
+        records: list[dict],
+        watermark: datetime,
+        *,
+        source: str,
+        id_key: str,
+        get_raw_ts: Callable[[dict], str | None],
+    ) -> list[dict]:
+        """Return the subset of *records* strictly newer than *watermark*.
+
+        Parses each record's raw timestamp exactly once via ``_parse_instant``
+        and compares it against *watermark* normalized to UTC exactly once per
+        call (hoisted out of the loop as ``wm_utc``) — the same two steps
+        ``_is_newer_than_watermark`` (task 4574) performs per call, inlined
+        here so a record's timestamp is never parsed twice and the watermark
+        is never re-normalized per record. ``_is_newer_than_watermark`` stays
+        the public, independently unit-tested predicate for external callers;
+        this method does not call it.
+
+        ALSO classifies and counts the "undatable" case here at the call
+        site: a record whose timestamp is missing, empty, or unparseable. An
+        undatable record is excluded from the result — same as a genuinely
+        older record — but is counted in ``self._undatable_freshness_records``
+        and logged with its id and raw value via a single structured
+        ``logger.warning``, rather than silently dropped, per design
+        invariant INV-2 ``structured-facts-at-failure``. Exclusion (not
+        fail-open inclusion) matters specifically here because a record
+        whose timestamp can never be parsed would otherwise re-surface as
+        "new" on every single cycle forever — the 894fbe90 incident's
+        symptom, reached by a different cause (a string-typed comparison
+        degenerating to date-granularity, vs. an outright unparseable value
+        here).
+
+        *source* and *id_key* are caller-supplied purely to shape the log
+        record (``'episodes'``/``'uuid'`` or ``'mem0'``/``'id'``); *get_raw_ts*
+        lets the caller apply the mem0-only ``created_at`` -> ``updated_at``
+        fallback without duplicating this method per record shape.
+        """
+        wm_utc = _to_utc(watermark)
+        new_records = []
+        for record in records:
+            raw_ts = get_raw_ts(record)
+            ts = _parse_instant(raw_ts)
+            if ts is None:
+                self._undatable_freshness_records += 1
+                logger.warning(
+                    'reconciliation.stage1_undatable_freshness_record',
+                    extra={
+                        'project_id': self.project_id,
+                        'source': source,
+                        'record_id': record.get(id_key),
+                        'raw_timestamp': raw_ts,
+                    },
+                )
+                continue
+            if ts > wm_utc:
+                new_records.append(record)
+        return new_records
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -1131,6 +1208,10 @@ class MemoryConsolidator(BaseStage):
         # Reset run-local degraded list before fetches (must precede every early-return so
         # reused instances never leak a stale list into a subsequent remediation run's stats)
         self._fetch_degraded_sources = []
+        # Reset run-local undatable-record counter (task 4574) — same reused-instance
+        # leak hazard as _fetch_degraded_sources above, so it gets the identical
+        # precede-every-early-return placement.
+        self._undatable_freshness_records = 0
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
@@ -1150,11 +1231,25 @@ class MemoryConsolidator(BaseStage):
             self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
-            wm_str = str(watermark.last_episode_timestamp)
-            new_episodes = [
-                e for e in episodes
-                if (e.get('created_at') or '') > wm_str
-            ]
+            # WHY _is_newer_than_watermark and not `str(watermark...) > str(...)`:
+            # str(datetime) renders with a space separator
+            # ('2026-08-20 12:00:00+00:00'), while e['created_at'] here comes
+            # from services/memory_service.py::_created_at_to_utc_iso as
+            # ISO-8601 with a 'T' separator ('2026-08-20T01:52:27+00:00'). A
+            # lexical `>` between the two short-circuits at index 10 ('T'
+            # 0x54 > ' ' 0x20) and degenerates to date-granularity, so any
+            # episode from the watermark's own calendar day compares as
+            # "newer" regardless of its actual time (task 4574). Task 2055
+            # fixed retrieve_episodes' ordering and its follow-up 2079 added
+            # _created_at_to_utc_iso to normalize the producer side, but left
+            # this consumer comparing strings — do not reintroduce that.
+            new_episodes = self._filter_records_newer_than_watermark(
+                episodes,
+                watermark.last_episode_timestamp,
+                source='episodes',
+                id_key='uuid',
+                get_raw_ts=lambda e: e.get('created_at'),
+            )
 
         # 2. Mem0 memories (recent)
         from fused_memory.models.scope import Scope
@@ -1180,11 +1275,19 @@ class MemoryConsolidator(BaseStage):
 
         new_memories = mem0_memories
         if watermark.last_memory_timestamp:
-            wm_str = str(watermark.last_memory_timestamp)
-            new_memories = [
-                m for m in mem0_memories
-                if (m.get('created_at') or m.get('updated_at') or '') > wm_str
-            ]
+            # Same str(watermark) lexical-compare defect as the episode filter
+            # above (task 4574) — Mem0 created_at/updated_at values are also
+            # ISO-with-'T' and, unlike episodes, are not normalized by
+            # _created_at_to_utc_iso, so they can carry non-UTC offsets too.
+            # Keep the `or` (not `if/else`) so an empty-string created_at
+            # still falls through to updated_at, matching prior behavior.
+            new_memories = self._filter_records_newer_than_watermark(
+                mem0_memories,
+                watermark.last_memory_timestamp,
+                source='mem0',
+                id_key='id',
+                get_raw_ts=lambda m: m.get('created_at') or m.get('updated_at'),
+            )
 
         # 3. Store stats
         status = await self._fetch_status()
@@ -1240,7 +1343,7 @@ class MemoryConsolidator(BaseStage):
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark)}
+{_format_watermark(watermark, include_freshness_cutoffs=True)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1278,6 +1381,12 @@ Review the above data and perform memory consolidation:
         # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
         # Reset here so each assembled-path call starts clean (no leak from a prior run).
         self._fetch_degraded_sources = []
+        # This path does no freshness filtering (it formats ContextAssembler output
+        # directly, not the episodes/mem0-memories filters below), so the count stays
+        # 0 here — but reset it anyway so a reused instance never inherits a stale
+        # value from a prior time-windowed assemble_payload call (task 4574, same
+        # leak hazard as _fetch_degraded_sources above).
+        self._undatable_freshness_records = 0
 
         event_summary = _format_events(ap.events)
 
@@ -1462,6 +1571,69 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 """
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Coerce *dt* to a tz-aware UTC datetime, assuming UTC when naive.
+
+    Shared normalization step for both sides of ``_is_newer_than_watermark``'s
+    comparison, mirroring ``backends/graphiti_client.py::_as_sortable_utc``'s
+    "naive means UTC" convention for its sort key.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _parse_instant(raw_ts: str | None) -> datetime | None:
+    """Parse *raw_ts* into a tz-aware UTC datetime, or None if it is
+    missing, empty, or unparseable ("undatable" — see
+    ``_is_newer_than_watermark`` and ``MemoryConsolidator._filter_records_newer_than_watermark``,
+    which count and log this case rather than silently dropping it).
+
+    Catches both ``ValueError`` (malformed ISO-8601 text) and ``TypeError``
+    (a non-str, non-None value such as a ``datetime``, an int epoch, or a
+    dict — ``datetime.fromisoformat`` raises ``TypeError`` rather than
+    ``ValueError`` for these) so one malformed record is classified as
+    undatable rather than raising out of the caller's filter loop.
+    """
+    if not raw_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw_ts)
+    except (TypeError, ValueError):
+        return None
+    return _to_utc(ts)
+
+
+def _is_newer_than_watermark(raw_ts: str | None, watermark: datetime) -> bool:
+    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*.
+
+    Both sides are compared as instants, never as strings: *raw_ts* is
+    parsed with ``datetime.fromisoformat`` and *watermark* is taken as
+    given, then each is coerced to a tz-aware UTC datetime — naive
+    (tzinfo-less) values on EITHER side are assumed to already be UTC
+    rather than raising on naive-vs-aware comparison, mirroring
+    ``backends/graphiti_client.py::_as_sortable_utc`` — before comparing
+    with ``>`` (strictly after, not ``>=``, so an instant exactly equal to
+    *watermark* is not re-surfaced). A non-UTC offset is therefore compared
+    correctly by its true instant, not by its printed digits.
+
+    Comparing these values as STRINGS is wrong: ``str(datetime)`` renders
+    with a space separator (``'2026-08-20 12:00:00+00:00'``) while
+    ``created_at`` values produced by
+    ``services/memory_service.py::_created_at_to_utc_iso`` use ``T``
+    (``'2026-08-20T01:52:27+00:00'``) — a lexical ``>`` then short-circuits
+    at the separator and degenerates to date-granularity (task 4574).
+
+    *raw_ts* that is missing, empty, or unparseable returns False — an
+    undatable record cannot be shown to be newer than the watermark, so it
+    is treated as not-newer rather than raising.
+    """
+    ts = _parse_instant(raw_ts)
+    if ts is None:
+        return False
+    return ts > _to_utc(watermark)
+
+
 def _format_events(events: list[ReconciliationEvent]) -> str:
     if not events:
         return 'No events.'
@@ -1620,10 +1792,43 @@ def _format_findings(findings: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _format_watermark(watermark: Watermark) -> str:
+def _format_watermark(watermark: Watermark, *, include_freshness_cutoffs: bool = False) -> str:
+    """Render the "Previous Reconciliation" section.
+
+    *include_freshness_cutoffs* must be True ONLY from the caller that
+    actually ran the episode/mem0 "new since last reconciliation" filters
+    against these cutoffs — today that is exclusively the time-windowed
+    ``assemble_payload`` path. ``_format_assembled_payload`` (the
+    ContextAssembler/token-budget path) does no freshness filtering at all
+    and formats ``### Related Context`` instead of a filtered episode/mem0
+    count, so it leaves this False (the default): showing the cutoffs there
+    would claim a relationship to the displayed items that does not exist
+    (task 4574 review amendment).
+    """
     if watermark.last_full_run_completed is None:
         return 'First run — no previous reconciliation.'
-    return (
+    lines = [
         f'Last full run: {watermark.last_full_run_id} '
         f'at {watermark.last_full_run_completed.isoformat()}'
-    )
+    ]
+    if include_freshness_cutoffs:
+        # Disclose the freshness cutoffs the episode/mem0 "new since last
+        # reconciliation" filters above actually compared against (task 4574).
+        # Previously invisible here — the payload showed a filtered COUNT
+        # ("New Episodes Since Last Reconciliation (N)") with no way to see
+        # what cursor N was computed against, which is why the 894fbe90
+        # incident survived three full cycles of re-investigation undiagnosed.
+        # Rendered via .isoformat() (never str(datetime), which uses a space
+        # separator — see _is_newer_than_watermark) and omitted entirely
+        # (rather than printed as the literal 'None') when unset, e.g. on a
+        # watermark that has a completed full run but has not yet recorded an
+        # episode or memory cutoff.
+        if watermark.last_episode_timestamp is not None:
+            lines.append(
+                f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}'
+            )
+        if watermark.last_memory_timestamp is not None:
+            lines.append(
+                f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}'
+            )
+    return '\n'.join(lines)

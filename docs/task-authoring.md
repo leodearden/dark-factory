@@ -66,6 +66,28 @@ target project's checkout (e.g. `/home/leo/src/dark-factory`). It's how
 fused-memory locates the right per-project task backend and write lock;
 pass the same value consistently for a given project across a session.
 
+### `test_strategy` is closed — use `details`
+
+Decided, not deferred. The `tasks.test_strategy` column is Taskmaster
+inheritance and there is **no write path**: neither `submit_task` nor
+`update_task` declares the field, `SqliteTaskBackend.add_task`'s INSERT binds
+the literal `''` in that column's position rather than a parameter
+(`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.add_task`),
+and `SqliteTaskBackend.update_task` never adds it to its updatable columns. It
+also reaches no orchestrator role — and, being unwritable, never will. Measured
+2026-09-11 (task 5359): 24 tasks carry content, out of ~5,365; all 24 are
+terminal, with ids in 24–1143, i.e. the pre-fused-memory Taskmaster-JSON era.
+
+Put per-task test direction in **`details`** instead. That field IS writable by
+both tools and IS rendered to the architect by
+`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._format_task`.
+
+The column is not dropped, and that is deliberate: a migration on a live store
+would destroy those 24 rows of real historical content and shrink the
+four-column hygiene scan at
+`scripts/scan_task_toolcall_leaks.py::SCANNED_COLUMNS` — its one actual reader —
+for no benefit, since an unwritable field is already inert.
+
 ---
 
 ## 2. Task statuses & transitions
@@ -516,6 +538,33 @@ script's existence and executability with a test.
 
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
+
+**What the dispatched agent sees**
+
+As of task 5359 a task's own `metadata.delivered_checks` is rendered into every
+briefing built through
+`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._format_task`
+— architect, simple_task, revalidation, plan-completion, plan-tightening and
+steward-initial. Before that it reached no role at all, so an agent was measured
+against a contract it could not see: the gate
+`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`
+blocks the mark-done of the task CARRYING the checks, not only the dispatch of
+its dependents.
+
+For an author, the consequence is that the agent now reads your `pattern`. The
+warning above — that a symbol-name grep is satisfiable by prose — is therefore
+no longer only a hazard YOU can trip when authoring; it is one the agent can
+trip while implementing. That is why the rendered section states plainly that
+satisfying a pattern without delivering the behaviour is a defect rather than a
+pass, and that a descriptor the task's work cannot satisfy should be escalated
+(`escalate_blocker(category='design_concern')`) rather than written into the
+tree to make the grep match. It does not restate the descriptor shape; it points
+back here.
+
+The implementer, amender, debugger, completion judge, reviewer and merger do
+NOT see the field directly — they hold a plan plus a task id, or a diff, not the
+task record. They inherit the constraint through the plan the architect authors
+from it.
 
 **Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable):
 

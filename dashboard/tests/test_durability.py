@@ -340,7 +340,14 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
             patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
             patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
-            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_app.state.http_client,
+                )
+            )
             try:
                 # Wait until store.checkpoint() is actually called — this is racefree
                 # because the event is set inside the checkpoint mock itself.
@@ -406,7 +413,14 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
             patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
             patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 3600),
         ):
-            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_app.state.http_client,
+                )
+            )
             try:
                 await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
             finally:

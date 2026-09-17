@@ -1827,7 +1827,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1856,7 +1856,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1887,7 +1887,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1912,7 +1912,7 @@ class TestFireWatchdogKill:
         """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
         import signal
 
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         # ppid_map: P(100) -> A(200) -> B(300); unrelated 999 (ppid 1, not a descendant of P)
         ppid_map = {200: 100, 300: 200, 999: 1}
@@ -1941,6 +1941,7 @@ class TestFireWatchdogKill:
 
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=5.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -1973,7 +1974,7 @@ class TestFireWatchdogKill:
 
     def test_dead_descendant_process_lookup_error_tolerated(self):
         """(e): a descendant already dead (ProcessLookupError) is tolerated; exit_fn still fires."""
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         ppid_map = {200: 100}  # single descendant, already gone
         exit_calls = []
@@ -1993,6 +1994,7 @@ class TestFireWatchdogKill:
         # Must not raise despite kill() always raising ProcessLookupError.
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=0.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -2002,6 +2004,243 @@ class TestFireWatchdogKill:
         )
 
         assert exit_calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-3: fire_watchdog_kill reports WHICH branch fired, on stderr
+#
+# The ssh stderr channel is the ONLY path from a self-killing remote back to
+# the dispatcher: stdout is deliberately suppressed on a fire (cli.py's
+# watchdog_fired gate never echoes a VerifyResult for a build it just killed),
+# and exit_fn is os._exit, which skips every structured return path AND skips
+# stdio flushing -- so the line must be written AND flushed before the exit or
+# it is silently lost.  It is written last, after the SIGKILL pass, so the
+# token survives a reader that keeps only a bounded tail.  And it is
+# best-effort: a diagnostic that could raise past exit_fn would strand the
+# abandoned verify-merge leader as exactly the setsid orphan the watchdog
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStderr:
+    """stderr double appending ('write', text) / ('flush',) to a shared ordered log."""
+
+    def __init__(self, events, *, raise_on_write=None, raise_on_flush=None):
+        self._events = events
+        self._raise_on_write = raise_on_write
+        self._raise_on_flush = raise_on_flush
+
+    def write(self, text):
+        self._events.append(('write', text))
+        if self._raise_on_write is not None:
+            raise self._raise_on_write
+        return len(text)
+
+    def flush(self):
+        self._events.append(('flush',))
+        if self._raise_on_flush is not None:
+            raise self._raise_on_flush
+
+
+def _fire_with_recording_stderr(trigger, events, *, stderr=None):
+    """Drive fire_watchdog_kill over a fixed 100 -> 200 -> 300 tree, recording onto *events*."""
+    import signal
+
+    from orchestrator.verify_cancel import fire_watchdog_kill
+
+    def fake_kill(pid, sig):
+        events.append(('term' if sig == signal.SIGTERM else 'kill', pid))
+
+    fire_watchdog_kill(
+        100,
+        trigger=trigger,
+        grace_secs=5.0,
+        ppid_map_provider=lambda: {200: 100, 300: 200, 999: 1},  # 999 is unrelated
+        kill=fake_kill,
+        killpg=lambda pgid, sig: events.append(('killpg', pgid)),
+        sleep=lambda secs: events.append(('sleep', secs)),
+        exit_fn=lambda code: events.append(('exit', code)),
+        stderr=stderr if stderr is not None else _RecordingStderr(events),
+    )
+    return events
+
+
+def _written(events):
+    """Everything the double was asked to write, in order."""
+    return ''.join(e[1] for e in events if e[0] == 'write')
+
+
+class TestFireWatchdogKillTriggerLine:
+    """fire_watchdog_kill writes one flushed, attributable trigger line before exiting."""
+
+    def test_writes_one_flushed_trigger_line_before_exit(self):
+        """One newline-terminated line naming the trigger, flushed, with exit_fn still last."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        written = _written(events)
+        assert written.endswith('\n')
+        assert written.count('\n') == 1, f'expected exactly one line; got {written!r}'
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=heartbeat_starvation' in written
+
+        kinds = [e[0] for e in events]
+        assert kinds.index('write') < kinds.index('flush') < kinds.index('exit')
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1), 'exit_fn must stay the final action'
+
+    def test_eof_trigger_is_reported_verbatim(self):
+        """The EOF branch is distinguishable from starvation by the line alone."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        written = _written(_fire_with_recording_stderr(WatchdogTrigger.EOF, []))
+
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof' in written
+        assert 'heartbeat_starvation' not in written
+
+    def test_trigger_line_is_emitted_after_the_kill_sequence(self):
+        """The line is written after the SIGKILL pass, so the token is last on the channel."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.EOF, [])
+
+        write_idx = [i for i, e in enumerate(events) if e[0] == 'write']
+        kill_idx = [i for i, e in enumerate(events) if e[0] == 'kill']
+        assert kill_idx, 'expected a SIGKILL pass'
+        assert min(write_idx) > max(kill_idx)
+
+    def test_kill_sequence_is_unchanged(self):
+        """NON-GOAL guard: reporting changed, fire behaviour did not."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        assert {e[1] for e in events if e[0] == 'term'} == {200, 300}  # descendants only
+        assert {e[1] for e in events if e[0] == 'kill'} == {200, 300}
+
+        sleep_idx = events.index(('sleep', 5.0))
+        assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
+        assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
+
+        assert [e for e in events if e[0] == 'killpg'] == []
+        assert len([e for e in events if e[0] == 'exit']) == 1
+
+    @pytest.mark.parametrize(
+        'raise_on_write,raise_on_flush',
+        [
+            (OSError('Broken pipe'), None),
+            (None, ValueError('I/O operation on closed file')),
+        ],
+        ids=['write-raises', 'flush-raises'],
+    )
+    def test_stderr_failure_never_prevents_exit(self, raise_on_write, raise_on_flush):
+        """A dead channel loses the diagnostic, never the self-exit that frees the flock."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = []
+        stderr = _RecordingStderr(
+            events, raise_on_write=raise_on_write, raise_on_flush=raise_on_flush
+        )
+
+        # Must not raise: the abandoned leader has to die even with no channel left.
+        _fire_with_recording_stderr(WatchdogTrigger.EOF, events, stderr=stderr)
+
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1)
+
+    def test_default_stream_is_sys_stderr_resolved_at_call_time(self, monkeypatch):
+        """With no stderr= override the token lands on stderr — never on stdout.
+
+        The channel is load-bearing, not cosmetic: on a remote verify stdout is
+        the VerifyResult JSON transport ``verify_runner.result_from_json`` parses,
+        so a default that resolved to stdout would turn every self-kill into an
+        unparseable-result RunnerUnavailable.  Every other test here injects
+        ``stderr=``, which would leave that resolution unexecuted.  Patching
+        ``sys.stderr`` after import also pins the resolution to CALL time.
+        """
+        import sys
+
+        from orchestrator.verify_cancel import (
+            WATCHDOG_FIRE_TRIGGER_TOKEN,
+            WatchdogTrigger,
+            fire_watchdog_kill,
+        )
+
+        err_events, out_events = [], []
+        monkeypatch.setattr(sys, 'stderr', _RecordingStderr(err_events))
+        monkeypatch.setattr(sys, 'stdout', _RecordingStderr(out_events))
+
+        fire_watchdog_kill(
+            100,
+            trigger=WatchdogTrigger.EOF,
+            grace_secs=0.0,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+            sleep=lambda secs: None,
+            exit_fn=lambda code: None,
+        )
+
+        assert _written(err_events) == f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof\n'
+        assert out_events == [], f'the trigger line must never reach stdout; got {out_events!r}'
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 amend: elide_middle keeps exactly the two ends it is asked for
+#
+# ``text[-tail:]`` is ``text[0:]`` when tail is 0, so the "keep nothing from
+# this end" cell returned the WHOLE string behind a marker claiming characters
+# had been dropped — loud-over-silent inverted inside the helper that exists to
+# uphold it.  The sole call site takes the defaults, but the helper is public,
+# imported across modules, and its docstring invites tuning either end.  The
+# merge_queue tests reach it only through a formatted log record, so these are
+# the only assertions that touch the ends and the boundary directly.
+# ---------------------------------------------------------------------------
+
+
+class TestElideMiddle:
+    """elide_middle keeps the ends it is asked for and counts exactly what it dropped."""
+
+    def test_tail_zero_keeps_nothing_from_the_end(self):
+        """tail=0 is a count, not an offset: text[-0:] would keep everything."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=10, tail=0)
+
+        assert elided == 'A' * 10 + '…<90 chars elided>…'
+        assert len(elided) < 100
+
+    def test_head_zero_keeps_nothing_from_the_start(self):
+        """The other end has always been a plain forward slice; pin it so both stay honest."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=0, tail=10)
+
+        assert elided == '…<90 chars elided>…' + 'A' * 10
+
+    def test_marker_counts_exactly_the_dropped_characters(self):
+        """Everything is either kept at one end or accounted for by the marker."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('HH' + 'M' * 47 + 'TTT', head=2, tail=3)
+
+        assert elided == 'HH…<47 chars elided>…TTT'
+
+    def test_text_of_exactly_head_plus_tail_is_verbatim(self):
+        """The bound is inclusive: nothing is dropped, so no marker is added."""
+        from orchestrator.verify_cancel import elide_middle
+
+        text = 'A' * 30
+
+        assert elide_middle(text, head=10, tail=20) == text
+
+    def test_one_character_over_the_bound_elides_that_character(self):
+        """The first cell past the bound drops exactly one character and says so."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 31, head=10, tail=20)
+
+        assert elided == 'A' * 10 + '…<1 chars elided>…' + 'A' * 20
 
 
 # ---------------------------------------------------------------------------
@@ -2034,7 +2273,7 @@ class TestStartStdinWatchdog:
             read_fd=0,
             select_fn=fake_select,
             read_fn=fake_read,
-            fire=lambda: fire_calls.append(True),
+            fire=lambda trigger: fire_calls.append(True),
         )
 
         # (a) return value is a Thread with .daemon True; join() only succeeds if started
@@ -2045,3 +2284,143 @@ class TestStartStdinWatchdog:
 
         # (b) the injected fire was invoked exactly once (loop wired to on_fire)
         assert fire_calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-1: WatchdogTrigger — which branch judged the channel dead
+#
+# run_stdin_watchdog has two fire branches whose causes and remedies have
+# nothing in common: EOF (the writing end closed the dispatch channel — the
+# orchestrator died, or ssh dropped) and heartbeat starvation (no beat
+# arrived inside the window — a hard partition, or a timeout tuned too tight
+# for the host).  Both call on_fire() with zero arguments today, so once the
+# process has self-exited nothing downstream can say WHICH one fired.  These
+# tests pin the branch identity through every hop of the callback chain
+# (run_stdin_watchdog -> start_stdin_watchdog's default fire -> cli's
+# _on_watchdog_fire -> fire_watchdog_kill); the stderr line that carries it
+# off the host is step-3.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogTriggerThreading:
+    """The WatchdogTrigger naming the fired branch reaches every callback hop."""
+
+    def test_eof_branch_reports_eof_trigger(self):
+        """A b'' read (writing end closed) fires once with WatchdogTrigger.EOF."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return (rlist, [], [])  # fd ready
+
+        def fake_read(fd, size):
+            return b''  # EOF
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.EOF
+
+    def test_timeout_branch_reports_heartbeat_starvation_trigger(self):
+        """An empty ready set fires once with HEARTBEAT_STARVATION, without ever reading."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+        read_calls = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return ([], [], [])  # timeout -- nothing ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b'\n'  # must never be reached
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.HEARTBEAT_STARVATION
+        assert read_calls == []  # starvation fires without ever reading
+
+    def test_trigger_values_are_the_wire_tokens(self):
+        """The enum is the single definition of both spellings that cross the ssh channel."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        assert {t.value for t in WatchdogTrigger} == {'eof', 'heartbeat_starvation'}
+        assert WATCHDOG_FIRE_TRIGGER_TOKEN == 'watchdog_fire_trigger'
+
+    def test_default_fire_forwards_the_trigger(self, monkeypatch):
+        """With no fire= override the default callback forwards the EOF trigger."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: (rlist, [], []),
+            read_fn=lambda fd, size: b'',  # EOF
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.EOF
+
+    def test_default_fire_forwards_starvation_trigger(self, monkeypatch):
+        """The same default callback forwards HEARTBEAT_STARVATION on the timeout branch."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: ([], [], []),  # starvation
+            read_fn=lambda fd, size: b'\n',  # must never be reached
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION

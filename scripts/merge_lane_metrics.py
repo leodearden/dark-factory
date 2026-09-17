@@ -38,9 +38,18 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
   ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
-complete one in the RESULT, not only in a log line" true rather than aspirational:
-``{requested, resolved, unreadable, complete}`` travels in the report AND in the
-committed baseline, and ``--report`` prints it as a row.
+complete one in the RESULT, not only in a log line" true rather than aspirational.
+The block carrying it is split by KIND, and the two halves are stored
+differently. ``unreadable`` (both halves, by name) and ``complete`` travel in
+the report AND in the committed baseline, as do the cluster's ``requested`` and
+``resolved`` paths -- that is the named manifest where a path the instrument
+cannot read IS the finding. The test tree's breadth travels as ``test_tree``'s
+two counts in the report ONLY: both reach ``--json`` verbatim and both are
+legible under ``--report`` -- the numerator under its own ``test suite --``
+label, since it is ``len(tests)`` and one number gets one place -- but neither
+is ever ratcheted, because ``check_against_baseline`` reads completeness from
+the CURRENT report and freezing a number nothing enforces would only churn the
+file on every unrelated test file the repo gains (esc-5021-7).
 
 Exit codes
 ----------
@@ -167,6 +176,25 @@ class Enumeration:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class TestTreeCoverage:
+    """How many .py files the test-tree sweep asked for, and how many it measured.
+
+    The test tree's counterpart to ``Enumeration``, and deliberately NOT more
+    fields on it: the cluster is a named manifest where an unresolved path IS
+    the finding and must be shown by name, while this is an open sweep of other
+    people's files where only the coverage ratio carries information. The
+    ``unreadable`` paths of BOTH halves still travel by name -- that is INV-11's
+    payload and it is never reduced to a count.
+    """
+
+    requested: int
+    resolved: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {'requested': self.requested, 'resolved': self.resolved}
+
+
 def resolve_cluster_paths(root: Path) -> Enumeration:
     """Resolve ``CLUSTER_PATHS`` against *root* into a complete Enumeration.
 
@@ -216,7 +244,7 @@ def _parse(source: str, *, path: str) -> ast.Module:
     """Parse *source*, translating a SyntaxError into a named MetricsError.
 
     INV-11: an unparseable CLUSTER file is the finding, never a skipped measure.
-    Callers sweeping files OUTSIDE the cluster (the 559-file test tree) catch
+    Callers sweeping files OUTSIDE the cluster (the whole test tree) catch
     this and record the path in ``Enumeration.unreadable`` instead.
     """
     try:
@@ -539,24 +567,40 @@ def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
         ) from exc
 
 
-def cognitive_complexity(path: Path) -> dict[str, int]:
-    """Per-function cognitive complexity of *path*, keyed by complexipy qualname.
+@dataclasses.dataclass(frozen=True)
+class FileCognitive:
+    """Both cognitive projections of ONE complexipy measurement of one file."""
 
-    complexipy already emits ``Class::method`` for methods, so the key needs no
-    post-processing. A module with no functions yields an empty map -- that is a
+    total: int
+    per_function: dict[str, int]
+
+
+def file_cognitive_measures(path: Path) -> FileCognitive:
+    """Measure *path* with complexipy ONCE and derive both projections from it.
+
+    The file total and the per-function map are two VIEWS of a single
+    ``FileComplexity``, so one call answers both and ``build_report`` -- the
+    only caller -- asks once per file. There are deliberately no separate
+    ``cognitive_complexity`` / ``file_cognitive_total`` accessors: with one
+    call site, a named half per projection would be surface kept alive by its
+    own tests. Deliberately NOT a cache either: a memo keyed on a path would
+    return the file as it WAS, would retain every result for the life of a
+    process the merge lane runs on every verify leg, and would need a carve-out
+    to keep ``_file_complexity``'s MetricsError from being swallowed.
+
+    ``total`` is reported and ratcheted alongside ``per_function`` because it
+    also counts module-level control flow belonging to no function. complexipy
+    already emits ``Class::method`` for methods, so the keys need no
+    post-processing, and a module with no functions yields an empty map -- a
     real measurement, not a skipped one.
     """
     result = _file_complexity(path)
-    return {function.name: function.complexity for function in result.functions}
-
-
-def file_cognitive_total(path: Path) -> int:
-    """complexipy's whole-file cognitive total for *path*.
-
-    Reported and ratcheted alongside the per-function map, because the file
-    total also counts module-level control flow that belongs to no function.
-    """
-    return int(_file_complexity(path).complexity)
+    return FileCognitive(
+        total=int(result.complexity),
+        per_function={
+            function.name: function.complexity for function in result.functions
+        },
+    )
 
 
 def maintainability_index(source: str, *, path: str) -> float:
@@ -836,6 +880,12 @@ def build_report(root: Path) -> dict[str, object]:
     shared totals line would conflict on every one of ten rebases -- while
     deriving preserves the anti-rename-gaming property in full (see
     ``derive_totals``) and keeps one number in one place.
+
+    The ``enumeration`` block obeys that same constraint, which it did not when
+    the argument above was first written: the cluster half is a fixed manifest
+    that moves only when ``CLUSTER_PATHS`` does, and the test tree's size is
+    reported rather than stored, so nothing here is a shared line ten branches
+    would each rewrite (see ``_stored_enumeration``).
     """
     # Up front, before any measurement: a wrong-version engine must fail
     # immediately with a named cause rather than after a 250-second run whose
@@ -849,17 +899,18 @@ def build_report(root: Path) -> dict[str, object]:
         source = _read_source(root, relpath)
         size = file_size_measures(source, path=relpath)
         target = root / relpath
+        cognitive = file_cognitive_measures(target)
         files[relpath] = {
             'lines': size.lines,
             'prose_lines': size.prose_lines,
-            'cognitive': file_cognitive_total(target),
+            'cognitive': cognitive.total,
             'function_local_imports': function_local_imports(source, path=relpath),
             'reexport_names': len(reexport_names(source, path=relpath)),
         }
-        for qualname, score in cognitive_complexity(target).items():
+        for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
 
-    tests, test_enumeration = _sweep_test_tree(root)
+    tests, test_unreadable, coverage = _sweep_test_tree(root)
 
     return {
         'schema_version': SCHEMA_VERSION,
@@ -869,15 +920,23 @@ def build_report(root: Path) -> dict[str, object]:
             'file_line_ceiling': FILE_LINE_CEILING,
             'new_function_cognitive_ceiling': NEW_FUNCTION_COGNITIVE_CEILING,
         },
-        'enumeration': _merge_enumerations(enumeration, test_enumeration).to_dict(),
+        'enumeration': _report_enumeration(enumeration, test_unreadable, coverage),
         'files': dict(sorted(files.items())),
         'functions': dict(sorted(functions.items())),
         'tests': dict(sorted(tests.items())),
     }
 
 
-def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
+def _sweep_test_tree(
+    root: Path,
+) -> tuple[dict[str, object], tuple[str, ...], TestTreeCoverage]:
     """Measure every lane-importing file under ``orchestrator/tests``.
+
+    Returns the measures, the paths SKIPPED (by name, verbatim), and how broad
+    the sweep was as counts. The swept paths themselves are deliberately not
+    accumulated: the caller has no use for a 568-entry manifest of other
+    people's test files, and building one is how it ended up frozen in the
+    committed baseline (esc-5021-7).
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
     unrelated mid-edit test file must not redden the ratchet, which is the
@@ -889,11 +948,11 @@ def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
     mid-edit".
     """
     tests: dict[str, object] = {}
-    requested: list[str] = []
+    requested = 0
     unreadable: list[str] = []
     for path in sorted((root / TESTS_ROOT).rglob('*.py')):
         relpath = path.relative_to(root).as_posix()
-        requested.append(relpath)
+        requested += 1
         try:
             source = path.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError):
@@ -906,21 +965,39 @@ def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
             continue
         if measures is not None:
             tests[relpath] = measures
-    return tests, Enumeration(
-        requested=tuple(requested),
-        resolved=tuple(sorted(tests)),
-        unreadable=tuple(unreadable),
-        complete=not unreadable,
+    return (
+        tests,
+        tuple(unreadable),
+        TestTreeCoverage(requested=requested, resolved=len(tests)),
     )
 
 
-def _merge_enumerations(cluster: Enumeration, tests: Enumeration) -> Enumeration:
-    return Enumeration(
-        requested=cluster.requested + tests.requested,
-        resolved=cluster.resolved + tests.resolved,
-        unreadable=cluster.unreadable + tests.unreadable,
-        complete=cluster.complete and tests.complete,
-    )
+def _report_enumeration(
+    cluster: Enumeration,
+    test_unreadable: tuple[str, ...],
+    coverage: TestTreeCoverage,
+) -> dict[str, object]:
+    """The report's enumeration block: cluster paths, test-tree counts, INV-11.
+
+    The two halves stay APART rather than being flattened into one pair of
+    lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
+    literals that live under ``orchestrator/tests`` appeared in both halves, so
+    the merged lists carried three duplicate entries each, and any later attempt
+    to separate them again by set membership against CLUSTER_PATHS would drop a
+    ``merge_lane/**`` file once PRD task zeta1 makes that glob expand -- a
+    silent completeness hole in the instrument whose whole job is completeness.
+
+    Key order is fixed here, not incidental: ``render_baseline`` emits this block
+    with ``json.dumps(..., indent=2)``, so insertion order IS the committed
+    bytes.
+    """
+    return {
+        'requested': list(cluster.requested),
+        'resolved': list(cluster.resolved),
+        'test_tree': coverage.to_dict(),
+        'unreadable': list(cluster.unreadable) + list(test_unreadable),
+        'complete': cluster.complete and not test_unreadable,
+    }
 
 
 #: Per-file measures summed into a cluster total by ``derive_totals``.
@@ -985,7 +1062,11 @@ BASELINE_README = (
     'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
     'RISES above these numbers. Equality is fine, lowering is the point. NEVER '
     'regenerate this file merely to make a test pass -- that silently widens '
-    'the ratchet for every downstream task. A task that legitimately LOWERS a '
+    'the ratchet for every downstream task. The enumeration block below is the '
+    'CLUSTER half only: the instrument also sweeps every .py under '
+    'orchestrator/tests for the measures in the tests section, and that sweep '
+    'is sized by --report rather than ratcheted here, so an unrelated test file '
+    'arriving never touches these bytes. A task that legitimately LOWERS a '
     'measure regenerates the baseline in the SAME commit: '
     'python scripts/merge_lane_metrics.py --write-baseline '
     'orchestrator/tests/merge_lane_ratchet_baseline.json'
@@ -995,58 +1076,51 @@ BASELINE_README = (
 _PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
 
 
-def _lane_scoped_enumeration(enumeration: dict) -> dict:
-    """Narrow ``enumeration.requested`` to the lane-relevant paths, for STORAGE.
+def _stored_enumeration(enumeration: dict) -> dict:
+    """Strip the live-only test-tree counts; the baseline stores the cluster half.
 
-    WHY THIS EXISTS (esc-5021-7). ``_sweep_test_tree`` appends EVERY ``*.py``
-    under ``orchestrator/tests`` to ``requested`` -- 583 paths, of which only
-    the lane-importing ones are ever measured. Freezing that full manifest in
-    the committed baseline made this gate a hair trigger: any task ANYWHERE in
-    the repo that adds, removes or renames a single test file reddened
-    ``test_baseline_matches_a_fresh_measurement`` even though no lane measure
-    moved, and the failure it printed ("Regenerate it in this commit if you
-    lowered a measure") invited a blind regeneration of a baseline that task had
-    never inspected -- exactly the silent widening ``BASELINE_README`` and that
-    test exist to prevent. Observed live: an unrelated file arriving via rebase
-    (test_roles_error_remedy_hint.py, task 4964) produced a ONE-LINE baseline
-    diff and a red gate.
+    WHY THE TEST TREE IS NOT STORED AT ALL, in paths OR in counts (esc-5021-7).
+    ``_sweep_test_tree`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
+    paths, of which only the lane-importing ones are ever measured. Freezing that
+    manifest in the committed baseline made this gate a hair trigger: any task
+    ANYWHERE in the repo that added, removed or renamed a single test file
+    reddened ``test_baseline_matches_a_fresh_measurement`` even though no lane
+    measure moved, and the failure it printed ("Regenerate it in this commit if
+    you lowered a measure") invited a blind regeneration of a baseline that task
+    had never inspected -- exactly the silent widening ``BASELINE_README`` and
+    that test exist to prevent. Observed live: an unrelated file arriving via
+    rebase (``test_roles_error_remedy_hint.py``, task 4964) produced a ONE-LINE
+    baseline diff and a red gate.
 
     It also cut against this task's decompose-time baseline-format constraint,
     which rejected even a single shared ``totals`` line because ten parallel
-    gamma branches "would conflict on every rebase". A frozen 583-entry list is
-    strictly MORE rebase-sensitive than the line that constraint rejected, and
-    it is sensitive to churn outside the lane entirely.
+    gamma branches "would conflict on every rebase". A frozen 568-entry list is
+    strictly MORE rebase-sensitive than the line that constraint rejected, and it
+    is sensitive to churn outside the lane entirely.
 
-    WHAT IS KEPT: every ``CLUSTER_PATHS`` entry (including the glob LITERALS,
-    which are the SPOT record of PRD Appendix A and do not churn), plus anything
-    that actually resolved or was skipped. So the stored list still moves on
-    REAL lane churn -- a new test that imports a lane module lands in
-    ``resolved`` and is kept, and it was already going to move the ``tests``
-    section anyway -- while a non-lane test file is invisible here.
+    STORING THE COUNTS INSTEAD WOULD BE WORSE, NOT BETTER, which is why this
+    function drops them rather than reducing them. The denominator moves on any
+    ``.py`` arriving anywhere under ``orchestrator/tests``, so it is the same
+    hair trigger with a shorter diff. The numerator is exactly
+    ``len(report['tests'])``, already in the file line-locally, so storing it is
+    a second copy of one number (SPOT) -- and it is a single SHARED line that
+    every gamma branch deleting a lane-importing test would rewrite, which is the
+    guaranteed one-line conflict the ``totals`` constraint rejected. Neither is
+    ratcheted by anything: ``check_against_baseline`` reads completeness from the
+    CURRENT report, never from the stored block.
 
-    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` entries are
-    retained rather than filtered, ``complete`` is untouched, and
-    ``check_against_baseline`` reads completeness from the CURRENT report, never
-    from the stored list. The full 583-path denominator remains in ``--report``
-    and ``--json`` output, which is where the sweep's coverage is legible; the
-    live sweep's breadth is floored by
-    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` so a
-    COLLAPSED sweep still fails loudly rather than quietly shrinking this list.
+    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` keeps every skipped
+    path from BOTH halves verbatim and ``complete`` is untouched, so a skipped
+    test-tree file is still named in the committed file and still makes
+    ``check_against_baseline`` refuse to compare. The sweep's breadth is reported
+    by ``--report`` and ``--json``, and a COLLAPSED sweep still fails loudly via
+    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` rather than
+    quietly shrinking anything.
 
     Idempotent, which ``render_baseline``'s round-trip contract requires:
-    the kept set is a function of ``resolved``/``unreadable``/``CLUSTER_PATHS``,
-    all of which survive filtering, so re-filtering a filtered block is a no-op.
+    dropping an absent key is a no-op.
     """
-    requested = enumeration.get('requested')
-    if not isinstance(requested, list):
-        return enumeration
-    keep = set(CLUSTER_PATHS)
-    keep.update(enumeration.get('resolved', ()) or ())
-    keep.update(enumeration.get('unreadable', ()) or ())
-    return {
-        **enumeration,
-        'requested': [entry for entry in requested if entry in keep],
-    }
+    return {key: value for key, value in enumeration.items() if key != 'test_tree'}
 
 
 def _render_section(name: str, mapping: dict) -> str:
@@ -1077,12 +1151,12 @@ def render_baseline(report: dict) -> str:
             entries.append(_render_section(key, value))
         else:
             # Top-level scalars and the small params/enumeration blocks are
-            # ordinary pretty-printed JSON, shifted one level in. `enumeration`
-            # is narrowed to the lane-relevant paths first -- see
-            # _lane_scoped_enumeration for why storing the full 583-path sweep
-            # made this a hair trigger on unrelated test files (esc-5021-7).
+            # ordinary pretty-printed JSON, shifted one level in. The
+            # `enumeration` block sheds its live-only test-tree counts first --
+            # see _stored_enumeration for why neither the test tree's paths nor
+            # its numbers belong in a committed baseline (esc-5021-7).
             if key == 'enumeration' and isinstance(value, dict):
-                value = _lane_scoped_enumeration(value)
+                value = _stored_enumeration(value)
             block = json.dumps(value, indent=2).replace('\n', '\n  ')
             entries.append(f'  {json.dumps(key)}: {block}')
     return '{\n' + ',\n'.join(entries) + '\n}\n'
@@ -1447,12 +1521,24 @@ def _render_table(report: dict, root: Path) -> str:
     # INV-11's user-observable signal: completeness is legible in the RESULT,
     # not only in a log line. A partial sweep measures LOW, so a reader who
     # cannot see this row cannot tell an improvement from a skipped file.
+    #
+    # THE TEST-TREE DENOMINATOR IS ONLY HERE. It is reported, never ratcheted --
+    # the same call this function already makes for `mi` -- so the committed
+    # baseline carries no test-tree number at all and this row is the one place
+    # the sweep's breadth is visible. Its NUMERATOR is deliberately absent: that
+    # is ``len(report['tests'])``, already rendered under a better label by the
+    # "test suite --" line above, and two copies of one number in one table only
+    # invite a reader to wonder whether they can disagree (SPOT). `.get` is
+    # tolerant on purpose: a stored baseline block has no `test_tree` key, and
+    # rendering one must not raise.
     enumeration = report.get('enumeration', {})
     unreadable = list(enumeration.get('unreadable', ()))
+    test_tree = enumeration.get('test_tree', {})
     lines.append(
         f'enumeration: complete={enumeration.get("complete")}  '
-        f'requested={len(enumeration.get("requested", ()))}  '
+        f'cluster requested={len(enumeration.get("requested", ()))} '
         f'resolved={len(enumeration.get("resolved", ()))}  '
+        f'test tree requested={test_tree.get("requested")}  '
         f'unreadable={len(unreadable)}'
     )
     if unreadable:

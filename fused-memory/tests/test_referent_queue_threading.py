@@ -475,6 +475,232 @@ class TestAddMemoryStampsReferents:
         assert '_write_op_id' in payload
 
 
+class TestAddMemoryStampsDeclaredReferents:
+    """The tier ABOVE the metadata bridge, reachable for the first time.
+
+    Leaf delta's `entities` parameter fills the `declared=None` seam epsilon
+    left annotated at this producer. What lands on the wire is
+    `{'source': 'declared', ...}` — the bucket leaf iota counts and leaf zeta
+    verifies edges against.
+
+    The service is MECHANISM, not policy, exactly as gamma split reporting from
+    rejecting: a declaration that contradicts the prose is LEGAL here and
+    stamps normally. The tool-boundary `entities_gate` is what refuses it, and
+    tests/server/test_entities_gate_ingestion.py is where that is pinned.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declared_outranks_the_derived_scan(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_declared_outranks_the_metadata_bridge(self, service):
+        """The precedence tier that could not be tested before this leaf, and
+        the one that proves declared > metadata > derived > none is live end to
+        end: prose says 3127, ambient metadata says 3129, the declaration says
+        3127 and wins."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            metadata={'task_id': 3129},
+            declared_referents=[{'kind': 'task', 'id': 3127}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_empty_declaration_is_distinct_from_none(self, service):
+        """`{'source': 'declared', 'refs': []}` vs `{'source': 'none', ...}` IS
+        the "considered referents and none applied" vs "never looked" signal
+        leaf iota counts. Collapsing [] onto None anywhere on this path would
+        erase it silently."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'declared', 'refs': []}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
+    async def test_epsilons_behaviour_is_byte_identical_without_a_declaration(
+        self, service, omit,
+    ):
+        """The regression guard for epsilon: adding a tier must not disturb the
+        three below it."""
+        kwargs = {} if omit else {'declared_referents': None}
+        cases = [
+            ({'metadata': {'task_id': 3129}}, 'metadata', ['3129']),
+            ({}, 'derived', ['3127']),
+        ]
+        for extra, source, numbers in cases:
+            service.durable_queue.enqueue.reset_mock()
+            await service.add_memory(
+                content='the fix for Task 3127 landed',
+                category='decisions_and_rationale',
+                project_id='dark_factory',
+                **extra,
+                **kwargs,
+            )
+            payload = service.durable_queue.enqueue.call_args[1]['payload']
+            assert payload['referents'] == {
+                'source': source,
+                'refs': [
+                    {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
+                ],
+            }, f'{extra!r}: {payload["referents"]!r}'
+
+        service.durable_queue.enqueue.reset_mock()
+        await service.add_memory(
+            content='the merge-lane hardening task',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            **kwargs,
+        )
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'none', 'refs': []}
+
+    @pytest.mark.asyncio
+    async def test_declared_digits_are_verbatim(self, service):
+        """'0132' is a DIFFERENT referent from '132'; int-normalizing would
+        silently repoint the caller's own assertion."""
+        await service.add_memory(
+            content='the merge-lane hardening task',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'id': '0132'}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents']['refs'][0]['number'] == '0132'
+
+    @pytest.mark.asyncio
+    async def test_the_declared_blob_is_json_safe(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+
+
+class TestADeclarationIsScopedToTheGraphitiLeg:
+    """A declaration is RECORDED only on a write that reaches Graphiti.
+
+    `resolve_referents` is called inside `if write_graphiti:`, so on a
+    MEM0_PRIMARY category without `dual_write` the caller's declaration is
+    accepted and then discarded: no resolution, no encoded set, no counter
+    increment.  That is deliberate — the referent set is a field on the
+    Graphiti queue payload, and a Mem0-primary write produces no queue row to
+    carry it and no edges for leaf zeta to verify it against — but it was
+    stated nowhere and pinned by nothing, and every other test in this file
+    uses a GRAPHITI_PRIMARY category, so the hole was invisible.  These rows
+    make the scope a decision on the record.
+
+    The consequence leaf IOTA must price in: its declaration-rate denominator
+    is "every Graphiti write", NOT "every add_memory call".  Mem0-primary
+    traffic is outside the counter entirely rather than counted as undeclared.
+
+    The tool-boundary `entities_gate` is category-INDEPENDENT and still rejects
+    a CONFLICTING declaration on this path — pinned separately in
+    tests/server/test_entities_gate_ingestion.py.  Absence is never rejected,
+    so an agent that omits `entities` cannot lose a write here either way.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'category',
+        ['procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries'],
+    )
+    async def test_a_declaration_on_a_mem0_primary_write_is_discarded(
+        self, service, category
+    ):
+        before = service.referent_source_counts()
+
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category=category,
+            project_id='dark_factory',
+            dual_write=False,
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        # No queue row, so nothing carries the declaration...
+        service.durable_queue.enqueue.assert_not_called()
+        # ...and the 'declared' bucket leaf iota reads never moves.
+        assert service.referent_source_counts() == before
+
+    @pytest.mark.asyncio
+    async def test_the_declaration_is_indistinguishable_from_its_absence_there(
+        self, service
+    ):
+        """The precise shape of the loss: on a Mem0-primary write, declaring
+        and not declaring leave IDENTICAL observable state.  Nothing
+        downstream can tell the two apart — which is why the docstrings must
+        not promise that a declaration is honoured here."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+        declared_calls = service.durable_queue.enqueue.call_args_list[:]
+        declared_counts = service.referent_source_counts()
+
+        service.durable_queue.enqueue.reset_mock()
+
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+
+        assert service.durable_queue.enqueue.call_args_list == declared_calls == []
+        assert service.referent_source_counts() == declared_counts
+
+    @pytest.mark.asyncio
+    async def test_dual_write_is_the_documented_way_to_get_it_recorded(self, service):
+        """`dual_write=True` puts a Mem0-primary category back on the Graphiti
+        leg, and the declaration is stamped exactly as it is for a
+        GRAPHITI_PRIMARY one.  This is the escape hatch the corrected
+        docstrings name, so it is pinned rather than left as folklore."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            dual_write=True,
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+
 class TestAddEpisodeStampsReferents:
     """The second producer. `add_episode` deliberately never persists a
     metadata argument — the same fact that forced task 3142's
@@ -566,6 +792,153 @@ class TestAddEpisodeStampsReferents:
     async def test_the_stamped_blob_is_json_safe(self, service):
         await service.add_episode(
             content='Task 3127 was merged', project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+
+
+class TestAddEpisodeStampsDeclaredReferents:
+    """Leaf delta's `entities` fills the second producer's `declared=None` seam.
+
+    Same tier-1 declaration as `add_memory`'s, and it must behave identically —
+    the gate stack does not diverge between the two write tools, so neither may
+    the stamping. What DOES stay asymmetric is a tier below: this producer has
+    no metadata to bridge from, so `declared > derived > none` is the whole
+    ladder here and the metadata rung stays structurally unreachable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declared_outranks_the_derived_scan(self, service):
+        await service.add_episode(
+            content='the fix for Task 3127 landed',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_empty_declaration_is_distinct_from_none(self, service):
+        """"considered referents and none applied" vs "never looked" — the
+        distinction leaf iota counts, and the one a `not entities` shortcut
+        anywhere on this path would erase in silence."""
+        await service.add_episode(
+            content='the fix for Task 3127 landed',
+            project_id='dark_factory',
+            declared_referents=[],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'declared', 'refs': []}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
+    async def test_epsilons_behaviour_is_byte_identical_without_a_declaration(
+        self, service, omit,
+    ):
+        """The regression guard for epsilon at THIS producer."""
+        kwargs = {} if omit else {'declared_referents': None}
+        cases = [
+            ('the fix for Task 3127 landed', 'derived', ['3127']),
+            ('the merge-lane hardening work', 'none', []),
+        ]
+        for content, source, numbers in cases:
+            service.durable_queue.enqueue.reset_mock()
+            await service.add_episode(
+                content=content, project_id='dark_factory', **kwargs,
+            )
+            payload = service.durable_queue.enqueue.call_args[1]['payload']
+            assert payload['referents'] == {
+                'source': source,
+                'refs': [
+                    {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
+                ],
+            }, f'{content!r}: {payload["referents"]!r}'
+
+    @pytest.mark.asyncio
+    async def test_the_metadata_rung_stays_structurally_unreachable(self, service):
+        """Adding the declared tier must not quietly wake the dead metadata rung.
+
+        `MemoryService.add_episode` has no `metadata` parameter at all — the
+        tool reads metadata for _causation_id/source routing and never forwards
+        it — which is what makes epsilon's hardcoded `metadata=None` true by
+        CONSTRUCTION rather than by convention. So the pin is the raise itself:
+        there is no metadata rung to consult here because the call carrying one
+        cannot be made.
+
+        Asserted behaviourally (the TypeError) rather than by
+        `inspect.signature`, per the house norm against parameter-name
+        introspection meta-tests. Here the two are not equivalent anyway — the
+        raise is the actual consequence a caller meets, and the signature is
+        merely its cause.
+
+        The regression this guards: `declared_referents` is the first new
+        resolve-input to cross into this producer, and the plausible next
+        change is adding `metadata` alongside it "for symmetry with
+        add_memory". That would hand this producer a metadata rung whose value
+        nothing persists, silently re-opening the asymmetry epsilon documented
+        — and it would turn this test green-to-red at exactly the right moment.
+        """
+        with pytest.raises(TypeError, match='metadata'):
+            await service.add_episode(
+                content='the fix for Task 3127 landed',
+                project_id='dark_factory',
+                metadata={'task_id': 9999},
+            )
+
+        service.durable_queue.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_declaration_is_additive_to_every_preexisting_key(self, service):
+        """A declaration adds a tier; it must not displace the payload."""
+        await service.add_episode(
+            content='the fix for Task 3127 landed',
+            project_id='dark_factory',
+            agent_id='a1',
+            session_id='s1',
+            source_description='notes',
+            causation_id='c1',
+            temporal_context='planning',
+            unverified_claim=True,
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        # 'uuid' is deliberately absent: task 3561 removed it from the enqueue
+        # payload (a fresh uuid means "load this node" to graphiti_core).
+        for key in (
+            'name', 'content', 'source', 'group_id', 'source_description',
+            'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
+            'temporal_context', 'unverified_claim', 'reference_time',
+        ):
+            assert key in payload, f'{key} was dropped from the payload'
+        assert payload['temporal_context'] == 'planning'
+        assert payload['unverified_claim'] is True
+        assert payload['reference_time'] is None
+        assert payload['referents']['source'] == 'declared'
+
+    @pytest.mark.asyncio
+    async def test_declared_digits_are_verbatim(self, service):
+        await service.add_episode(
+            content='the merge-lane hardening work',
+            project_id='dark_factory',
+            declared_referents=[{'id': '0132'}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents']['refs'][0]['number'] == '0132'
+
+    @pytest.mark.asyncio
+    async def test_the_declared_blob_is_json_safe(self, service):
+        await service.add_episode(
+            content='the fix for Task 3127 landed',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
@@ -1152,3 +1525,189 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         assert observed['content'] == 'test content'
         assert observed['referent_source'] == 'derived'
         assert lock.locked() is False, 'the lock must be released on return'
+
+
+class TestDeclaredReferentsEndToEnd:
+    """The whole of leaf delta in ONE path, not only at each seam.
+
+    Everything above pins a single hop: the tool boundary (in
+    tests/server/test_entities_gate_ingestion.py, against an AsyncMock
+    service), or the producer (above, called directly). Neither can catch a
+    wiring defect that lives BETWEEN them — a parameter renamed on one side, a
+    gate that returns the right block while the tool forwards the write anyway.
+    So this class drives the REAL `MemoryService` behind `create_mcp_server`
+    and reads the durable-queue payload the executor will actually receive.
+
+    Each case is one row of the PRD's own table, in the order that table
+    states them, so a reader can check the implementation against the spec by
+    reading the ids.
+
+    `add_memory` carries the full table because it is the tool with all three
+    rungs live (declared > metadata > derived). `add_episode` gets the two rows
+    that are not merely a repeat of a seam test: the accepted declaration and
+    the rejected one. Those two are what the between-the-seams gap can actually
+    hide — a `declared_referents` kwarg the tool forwards under a name the
+    producer no longer reads would leave BOTH seam suites green (each asserts
+    its own side of the name) and land the write stamped `derived` in silence,
+    and a gate whose block the tool returns while still enqueueing is invisible
+    to a return-value assertion. The rungs BELOW tier 1 are deliberately not
+    repeated here: `add_episode` persists no metadata, so its metadata rung is
+    structurally dead and is pinned as such at the producer.
+    """
+
+    @pytest.fixture
+    def server(self, service):
+        from fused_memory.server.tools import create_mcp_server
+
+        return create_mcp_server(service)
+
+    @staticmethod
+    def _referents(service) -> dict:
+        return service.durable_queue.enqueue.call_args[1]['payload']['referents']
+
+    @pytest.mark.asyncio
+    async def test_declared_and_corroborated_lands_as_declared(self, server, service):
+        """The PRD's transition out of the transitional auto-derive phase: a
+        real declaration, observable at the wire."""
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'category': 'decisions_and_rationale',
+                'entities': [{'kind': 'task', 'id': 3127}],
+            },
+        )
+
+        assert 'error' not in result, f'the write was blocked: {result!r}'
+        assert service.durable_queue.enqueue.call_count == 1, (
+            f'{service.durable_queue.enqueue.call_args_list!r}'
+        )
+        assert self._referents(service) == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_headline_conflict_enqueues_nothing_at_all(
+        self, server, service,
+    ):
+        """The rejection's real payoff, and the assertion the return value
+        cannot make: NOTHING is enqueued. No episode, so no edges, so nothing
+        for leaf zeta to verify and nothing for leaf eta to repair. A gate that
+        returned this error while still enqueueing would look identical to the
+        caller and would be the exact misattribution this PRD exists to stop.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'category': 'decisions_and_rationale',
+                'entities': [{'kind': 'task', 'id': 3129}],
+            },
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        assert result.get('conflicts') == ['Task 3129'], f'{result!r}'
+        assert result.get('content_referents') == ['Task 3127'], f'{result!r}'
+        service.durable_queue.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_undeclared_but_derivable_lands_as_derived(self, server, service):
+        """The PRD's "Undeclared, derivable" row — today's majority, which must
+        keep working untouched through the same path."""
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'category': 'decisions_and_rationale',
+            },
+        )
+
+        assert 'error' not in result, f'{result!r}'
+        assert self._referents(service) == {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_metadata_bridge_is_live_at_the_tool_boundary(
+        self, server, service,
+    ):
+        """Delta's piece 2, delivered by epsilon and pinned here at the seam it
+        was never pinned at: `metadata['task_id']` outranks the prose scan
+        through the TOOL, not merely through a direct service call. The Graphiti
+        enqueue used to discard this metadata entirely, so "it works at the
+        service" was never sufficient evidence that an agent's task_id survives.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'category': 'decisions_and_rationale',
+                'metadata': {'task_id': 3129},
+            },
+        )
+
+        assert 'error' not in result, f'{result!r}'
+        assert self._referents(service) == {
+            'source': 'metadata',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_add_episode_declared_and_corroborated_lands_as_declared(
+        self, server, service,
+    ):
+        """The same accepted-declaration row, through the OTHER write tool.
+
+        PRD Open Question 3 was resolved by giving both tools `entities` in one
+        leaf on the grounds that their gate stacks do not diverge. That claim
+        is only checkable end to end: the seam tests assert the tool forwards
+        `declared_referents` and (separately) that the producer stamps what it
+        is handed, and neither can see the hop between them.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'entities': [{'kind': 'task', 'id': 3127}],
+            },
+        )
+
+        assert 'error' not in result, f'the episode was blocked: {result!r}'
+        assert service.durable_queue.enqueue.call_count == 1, (
+            f'{service.durable_queue.enqueue.call_args_list!r}'
+        )
+        assert self._referents(service) == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_add_episode_headline_conflict_enqueues_nothing_at_all(
+        self, server, service,
+    ):
+        """The rejection's payoff at `add_episode`, where it is worth strictly
+        more than at `add_memory`: an ingested episode runs Graphiti's full
+        extraction, so a misattributed one deposits edges nobody declared. The
+        block alone does not prove that did not happen — only the absence of an
+        enqueue does.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'entities': [{'kind': 'task', 'id': 3129}],
+            },
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        assert result.get('conflicts') == ['Task 3129'], f'{result!r}'
+        assert result.get('content_referents') == ['Task 3127'], f'{result!r}'
+        service.durable_queue.enqueue.assert_not_called()

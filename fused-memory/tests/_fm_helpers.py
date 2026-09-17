@@ -1717,9 +1717,11 @@ def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None
 
 
 # ---------------------------------------------------------------------------
-# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
-# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
-# independent copies of the same loader).
+# Non-package script loading — the single loader for every test module that
+# imports a script by file path. Task 3738 hoisted it here out of two
+# independent copies; task 3895 migrated the 42 further copies that had
+# accumulated since, and tests/test_script_loader_routing_guard.py holds that
+# population at zero.
 # ---------------------------------------------------------------------------
 
 # sys.modules keys this helper itself installed. Only these may be REPLACED by
