@@ -779,10 +779,12 @@ lifecycle.
    `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
    cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
    "## Source-Completion" section is the authority for that canonical key and its \
-   read-side aliases). AMEND HAZARD: `update_task`'s `append=True` governs only \
-   `details` / `prompt` and does NOT append `description`, which always overwrites — \
-   so to extend a description, READ the current text first, write the full merged \
-   text, and verify the echoed `updated_task` reflects it. Re-filing is not an escape \
+   read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
+   amending one is a read-modify-write — READ the current text first, then write the \
+   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
+   reflects it. Pairing `description` with `append=True` is REJECTED; the \
+   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
+   and is the authority for it. Re-filing is not an escape \
    from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
    whose carrier is still non-terminal.
 
