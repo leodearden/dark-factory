@@ -7,6 +7,7 @@ const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -108,7 +109,13 @@ function App() {
   const railCounts = {
     orch: summary.orchRunning,
     tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
-    recon: DD.RECON_STATE.runs.filter(r => r.status === 'failed' || r.status === 'partial').length,
+    // Runs an operator should go and look at: failures, plus any row whose
+    // status recon_status.js does not recognise, so vocabulary drift is
+    // visible from the rail and not only from the tab. 'interrupted' is
+    // excluded — this fleet is restarted routinely, so those rows would sit
+    // the badge permanently nonzero on a healthy system. In-flight runs get
+    // their own tile on the tab rather than inflating this number.
+    recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
     merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
