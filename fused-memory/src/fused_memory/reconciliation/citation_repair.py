@@ -547,20 +547,15 @@ async def repair_memory_citation(
     caller's own ``run_id``, which the ``ReconReportState`` wrapper keeps for
     its unchanged ``_resolve_entry`` contract and for stamping ``repaired_by``.
 
-    ``reason`` names the citation's DEFECT CLASS and is the only thing that
-    changes between the two: ``memory_not_found`` requires the victim to be
-    confirmed ABSENT, ``wrong_memory`` requires it to be confirmed PRESENT (it
-    resolves, it just does not back the finding). It is written verbatim into
-    the durable provenance record, so each class's assertion is CHECKED rather
-    than trusted, and getting it wrong is a refusal naming the other class, not
-    a silent reclassification. Orthogonally, ``replacement_memory_id`` chooses
-    drop (``None``) or swap — the two axes never interact.
-
-    ``justification`` is the prose account recorded alongside it. REQUIRED
-    (non-blank after strip) for ``wrong_memory``, which removes a citation that
-    still resolves and would otherwise leave nothing in the blob saying why;
-    optional for ``memory_not_found``, whose confirmed absence is its own
-    account, but recorded when supplied.
+    ``reason`` names the citation's DEFECT CLASS — ``memory_not_found``
+    requires the victim to be confirmed ABSENT, ``wrong_memory`` to be confirmed
+    PRESENT — and this function CHECKS the assertion rather than trusting it,
+    refusing with a pointer at the other class. Orthogonally,
+    ``replacement_memory_id`` chooses drop (``None``) or swap; the two axes
+    never interact. ``justification`` is the prose account recorded with it:
+    REQUIRED non-blank for ``wrong_memory``, optional for ``memory_not_found``
+    but recorded when supplied. The module docstring says why each of those
+    holds; it is not repeated here.
 
     Returns a structured dict: ``{'status': 'repaired'|'dry_run', ...}`` on
     success, or one of the ``_ERR_*`` branches — every one of which is keyed by

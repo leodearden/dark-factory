@@ -2988,9 +2988,10 @@ class ReconReportState:
         ``target_run_id`` is the run that OWNS the finding. The two are
         deliberately separate rather than one overloaded parameter.
 
-        ``reason`` and ``justification`` pass straight through to
-        ``citation_repair`` (task 5552), which owns every gate they select:
-        this wrapper adds no branching and duplicates no validation.
+        ``reason`` and ``justification`` pass straight through (task 5552) to
+        ``citation_repair.py::repair_memory_citation``, which owns every gate
+        they select and states the contract: this wrapper adds no branching,
+        duplicates no validation and restates no rule.
 
         This is the ONLY recon-report tool that writes to the reconciliation
         journal. It never touches in-process state — no ``_persist_run``, no
@@ -3413,17 +3414,12 @@ Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
                   OWNS the finding — these are two different things, and
                   passing the target's id as run_id will just fail with
                   run_id_unknown.
-                  reason names the DEFECT CLASS and is CHECKED, not trusted, so
-                  naming the wrong one is a refusal pointing at the other:
+                  reason names the DEFECT CLASS and is CHECKED, not trusted:
                   'memory_not_found' (the default) requires the cited memory to
-                  be CONFIRMED ABSENT; 'wrong_memory' requires it to RESOLVE
-                  but not back the finding, and then a non-blank justification
-                  is REQUIRED — it is the only surviving account of removing a
-                  citation that was still live. Drop vs re-point is a separate
-                  axis, chosen by replacement_memory_id.
-                  The replacement must resolve and must not be the cited memory
-                  itself, so this can never install a second unresolvable id
-                  and never report a repair that changed nothing.
+                  be CONFIRMED ABSENT, 'wrong_memory' requires it to RESOLVE
+                  and then REQUIRES a justification. Read the tool's own
+                  description for the rest — every gate and every structured
+                  error is listed there, once.
 """
 
 
@@ -3672,12 +3668,6 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         non-blank justification saying why it does not back the finding — that
         record is the only surviving account of removing a citation that was
         still live. Picking the wrong class is a refusal naming the other one.
-
-        Three invariants to understand before calling: the cited memory's state
-        must match the reason you gave; the replacement must resolve, and must
-        not be the cited memory itself. So this can never install a second
-        unresolvable id, never report a repair that changed nothing, and never
-        remove a live citation without a recorded reason.
 
         The repair is confined to YOUR OWN project: the reconciliation journal
         is shared across every project this process reconciles, so a
