@@ -1313,8 +1313,35 @@ class TestRepairLiveRunRefusalAndDryRun:
             await journal.close()
 
     @pytest.mark.asyncio
-    async def test_dry_run_matches_applied_outcome_without_writing(self, tmp_path):
-        """``apply=False`` answers exactly what ``apply=True`` would, and writes nothing."""
+    @pytest.mark.parametrize(
+        ('reason', 'justification', 'recorded', 'victim_record'),
+        [
+            ('memory_not_found', None, None, None),
+            (
+                'wrong_memory',
+                f'  {WHY_WRONG}  ',
+                WHY_WRONG,
+                LIVE_VICTIM_RECORD,
+            ),
+        ],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    async def test_dry_run_matches_applied_outcome_without_writing(
+        self, tmp_path, reason, justification, recorded, victim_record
+    ):
+        """``apply=False`` answers exactly what ``apply=True`` would, and writes nothing.
+
+        Parametrized over BOTH classes because the dry run is what an operator
+        runs first, and ``wrong_memory`` is the class whose corroboration is
+        the inverse of the default — a dry run that only ever exercised
+        ``memory_not_found`` would leave the flag combination the operator
+        script's own worked example instructs them to run entirely unpinned.
+
+        The justification is passed PADDED and asserted stripped: the outcome
+        echoes the normalised value, so ``apply=False`` shows the exact prose
+        the durable record would carry. There is no record to read yet, which
+        is why the echo is the only place a dry run can show it.
+        """
         journal = await build_journal_with_closed_run(
             tmp_path,
             run_id=RUN_ID,
@@ -1322,7 +1349,9 @@ class TestRepairLiveRunRefusalAndDryRun:
         )
         try:
             before = _dump(await journal.get_run(RUN_ID))
-            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            memory = FakeMemoryLookup(
+                {DANGLING: victim_record, SUCCESSOR: SUCCESSOR_RECORD}
+            )
             spy = AsyncMock(wraps=journal.update_run_stage_reports)
             journal.update_run_stage_reports = spy
 
@@ -1333,6 +1362,8 @@ class TestRepairLiveRunRefusalAndDryRun:
                 store='mem0',
                 replacement_memory_id=SUCCESSOR,
                 repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
             )
             dry = await citation_repair.repair_memory_citation(
                 journal, memory, apply=False, **call
@@ -1341,6 +1372,8 @@ class TestRepairLiveRunRefusalAndDryRun:
             assert dry['status'] == 'dry_run'
             assert spy.await_count == 0
             assert _dump(await journal.get_run(RUN_ID)) == before
+            assert dry['reason'] == reason
+            assert dry['justification'] == recorded
             # Both corroboration reads still happened — a dry-run that skipped
             # them would tell the operator nothing about whether the gates hold.
             assert [mid for _project, mid in memory.calls] == [DANGLING, SUCCESSOR]
@@ -1355,6 +1388,12 @@ class TestRepairLiveRunRefusalAndDryRun:
             assert {k: v for k, v in dry.items() if k != 'status'} == {
                 k: v for k, v in applied.items() if k != 'status'
             }
+            # What the dry run PROMISED is what the write actually stored.
+            record = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0][CITATION_REPAIRS_KEY][0]
+            assert record['reason'] == dry['reason']
+            assert record['justification'] == dry['justification']
         finally:
             await journal.close()
 

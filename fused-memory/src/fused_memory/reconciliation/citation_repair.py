@@ -256,6 +256,7 @@ def build_citation_repair_record(
     replacement_memory_id: str | None,
     store: str,
     repaired_by: str,
+    *,
     reason: str = REASON_MEMORY_NOT_FOUND,
     justification: str | None = None,
 ) -> dict[str, Any]:
@@ -270,7 +271,11 @@ def build_citation_repair_record(
     ``reason`` is the CHECKED defect class; ``justification`` is its
     human-readable companion, stored verbatim and never parsed. The two split
     the labour heuristic 12 asks for: the enum is the control value, the prose
-    is payload. ``justification`` is None for a ``memory_not_found`` repair
+    is payload. They are KEYWORD-ONLY because they are adjacent, both
+    string-typed and both copied verbatim into the durable record: a
+    transposition would type-check, pass ruff and pyright, and persist
+    ``reason: '<prose>'`` into the only surviving account of the change —
+    and nothing here re-checks the enum, which the caller validated. ``justification`` is None for a ``memory_not_found`` repair
     whose caller supplied none — the confirmed absence is its own account —
     and is always present for ``wrong_memory``, where the removed citation
     resolved perfectly well and nothing else in the blob would say why it went.
@@ -810,9 +815,14 @@ async def repair_memory_citation(
         'replacement_memory_id': replacement_memory_id,
         'deduped': deduped,
         'store': store,
-        # Echoed so a caller that reads only the outcome knows which
-        # corroboration was asserted, without re-reading the durable record.
+        # Both echoed so a caller that reads only the outcome knows which
+        # corroboration was asserted and what prose would be recorded, without
+        # re-reading the durable record — which an ``apply=False`` run cannot
+        # do, there being no record yet. ``justification`` is the NORMALISED
+        # value, so a dry run shows the exact text the write would store rather
+        # than the padding the caller happened to pass.
         'reason': reason,
+        'justification': justification,
         'cited_memories': kept,
     }
     if not apply:
@@ -824,7 +834,12 @@ async def repair_memory_citation(
         return outcome
 
     repair_record = build_citation_repair_record(
-        memory_id, replacement_memory_id, store, repaired_by, reason, justification
+        memory_id,
+        replacement_memory_id,
+        store,
+        repaired_by,
+        reason=reason,
+        justification=justification,
     )
     finding['cited_memories'] = kept
     finding.setdefault(CITATION_REPAIRS_KEY, []).append(repair_record)
