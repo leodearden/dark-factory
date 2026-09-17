@@ -2222,6 +2222,20 @@ def _candidate_pool(
         source: The ``ReferentSource`` :func:`_decode_referents` read off the
             queue payload — one of :data:`REFERENT_SOURCES`. Read ONLY to decide
             whether the whole-declared-set fallback is licensed (veto 2 above).
+
+    THE WHOLE-SET FALLBACK IS NO LONGER THE LAST WORD. Licensing the fallback
+    says the declared set may SUPPLY a target; it never said the target it
+    supplies is plausible. The repair pass now tests the nominated target before
+    acting on it — :func:`_implausible_target_reason`, applied by
+    :meth:`MemoryService._repair_edge_findings` on the fallback arm only — and
+    records a refusal instead of repairing when it fails.
+
+    That guard lives THERE, not here, and this function is unchanged by it: no
+    veto is added and none is reordered. This pass still detects and records
+    (a finding drawn from the fallback is still ``resolvable``, which is what
+    leaf iota's rate counts); the refusal belongs at the one site where a write
+    can actually happen. Its rule is deliberately not restated here — read it at
+    that function (SPOT).
     """
     if endpoint in ambiguous:
         # VETO 1. The episode content itself could not say which project's task
@@ -4844,6 +4858,35 @@ class MemoryService:
           corroborated at WRITE time rather than taken from a lookup made a few
           statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
           its own docstring already calls it: an audit convenience.
+
+        THE THREE PRE-WRITE GUARDS, in the order they are evaluated. Each
+        RECORDS the finding and moves on; none of them drops it, and none is
+        reachable after a write has begun:
+
+        1. ZETA-UNRESOLVABLE — zeta determined no single target. Recorded with
+           zeta's own reason, verbatim: NEVER GUESS.
+        2. IMPLAUSIBLE TARGET — zeta determined one, from the whole-set
+           fallback, and it is not plausible
+           (:func:`_implausible_target_reason`). Refused BEFORE
+           ``ensure_entity_node``, so the phantom node is never minted.
+        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
+           nodes, and the backend raises rather than collapsing them.
+
+        Guards 1 and 2 are evaluated in :meth:`_repair_edge_findings` before the
+        write block; guard 3 is the backend's, surfaced as
+        ``AmbiguousEntityError`` and caught there. All three book
+        ``outcome='unrepairable'`` — the edge was left alone — which is what
+        keeps a refusal out of ``failed``, where a FalkorDB outage belongs.
+
+        WHY GUARD 3 IS A REFUSAL HERE AND A COLLAPSE ELSEWHERE. The >=2-match
+        ``merge_entities`` collapse remains licensed on exactly one path, the
+        episode-write dedup of the PRD's seam S1 (see
+        ``plans/fm-memory-identity-prd.md``, whose S1 scope amendment names this
+        task) — and that path reaches ``_resolve_or_create_entity`` DIRECTLY,
+        never ``ensure_entity_node``. A repair is not that path: collapsing two
+        same-named nodes is irreversible, and doing it as a SIDE EFFECT of
+        moving an edge is precisely what Ratified Decision 1 forbids. Hence
+        ``merge_duplicates=False`` at this call site.
 
         INV-3 CORROBORATE-BEFORE-ACTING is preserved by DELEGATION, not by a
         second check here. ``reassign_edge`` re-reads BOTH endpoints from
