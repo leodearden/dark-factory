@@ -53,7 +53,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import AmendmentOutcome, EscalationQueue
+from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
@@ -1853,6 +1853,27 @@ def create_server(
         otherwise. Not forwarded to the ``park`` action (the record stays
         open at L2, unclassified until eventually resolved).
 
+        **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
+        (task 4495).  ``queue.resolve``'s status check is an atomic
+        check-and-set, so if an automated sweep (the W9-δ steward auto-dismiss,
+        the orphan reaper, the revalidation sweep) closed the record microseconds
+        before this call arrived, that close WINS: ``status`` / ``resolution`` /
+        ``resolved_at`` / ``resolved_by`` are left exactly as the sweep left them,
+        because downstream waiters have already consumed them.  Your text is not
+        discarded, though — it is appended to the record's ``late_resolutions``,
+        and a ``'benign'`` stamp the sweep DERIVED is corrected (see
+        ``escalation.classify.default_resolution_class_for_resolver``).
+
+        Read ``late_resolution_captured`` in the returned dict rather than
+        assuming a non-error return means the resolution took effect: the
+        returned record looks identically healthy on both paths.  The key is
+        always present (``False`` on the ordinary applied path); a
+        ``late_resolution_reason`` string naming the sweep that won is added only
+        when it is ``True``.  Note the compact projection
+        ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
+        NOT widened by any of this — ``late_resolutions`` is forensic detail for
+        a full-record read, not triage-facing.
+
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
         resolver best-effort pre-increments the task's
@@ -2200,11 +2221,16 @@ def create_server(
             rec.resolution_action = action
             queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
+        resolve_outcome: ResolveOutcome = {
+            'applied': False, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
             granted_files=granted_files,
+            outcome=resolve_outcome,
         )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -2230,7 +2256,27 @@ def create_server(
                         '(non-fatal): %s',
                         rec.task_id, _e,
                     )
-        return esc.to_dict()
+        # Tell the caller whether its text APPLIED or was merely CAPTURED — the
+        # returned record looks identically healthy either way (task 4495).  The
+        # flag is always present so a caller can index it rather than `.get()` a
+        # default that would read a typo'd key as "fine"; the human-readable
+        # reason is added only when there is something to explain.
+        payload = esc.to_dict()
+        payload['late_resolution_captured'] = resolve_outcome['late_resolution_captured']
+        if resolve_outcome['late_resolution_captured']:
+            corrected = resolve_outcome['resolution_class_corrected']
+            payload['late_resolution_reason'] = (
+                f'Escalation {escalation_id} was ALREADY {resolve_outcome["prior_status"]} '
+                f'by {resolve_outcome["prior_resolved_by"]!r} when this call arrived, so '
+                'its terminal state (status/resolution/resolved_at/resolved_by) was NOT '
+                'changed. Your resolution text was preserved on the record in '
+                '`late_resolutions` rather than discarded'
+                + (
+                    f', and resolution_class was corrected to {corrected!r}.'
+                    if corrected else '.'
+                )
+            )
+        return payload
 
     @mcp.tool()
     async def get_pending_escalations(

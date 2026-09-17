@@ -26,9 +26,12 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    _MAX_LATE_RESOLUTION_CHARS,
+    _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
+    ResolveOutcome,
     iter_all_escalation_paths,
 )
 
@@ -7820,4 +7823,1042 @@ class TestNoteSuppressedRefile:
         )
         assert record.status == 'resolved', (
             f'the concurrent bumps disturbed the adjudication: {record.status!r}'
+        )
+
+
+class TestResolveOutcomeOutParam:
+    """`resolve(..., outcome=...)` reports what the call DID, on every return path.
+
+    An OUT-PARAM for the same reason `AmendmentOutcome` is one (see its
+    docstring): the `Escalation` is `resolve()`'s primary return value and every
+    existing call site reads it directly, and the facts a caller wants —
+    "did my text actually apply?" — are only exact when computed INSIDE
+    `escalation_id_lock`.  Re-deriving them in `server.resolve_issue` from a
+    pre-call `queue.get` would be a real TOCTOU: this queue is built for
+    cross-process mutators, so a concurrent auto-dismiss landing between the
+    pre-read and the call makes the reported flag wrong.
+    """
+
+    @staticmethod
+    def _poisoned() -> ResolveOutcome:
+        """A pre-seeded outcome whose every key is WRONG.
+
+        Seeding the opposite of the expected value is what makes "the key was
+        left stale on this return path" distinguishable from "the key happens
+        to already hold the right value".
+        """
+        return {
+            'applied': True,
+            'prior_status': 'poison',
+            'prior_resolved_by': 'poison',
+            'late_resolution_captured': True,
+            'resolution_class_corrected': 'poison',
+        }
+
+    def test_unknown_id_reports_not_applied_with_no_prior_state(self, tmp_path: Path):
+        """(a) The not-found early return still resets every key."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        out = self._poisoned()
+
+        assert queue.resolve('esc-nope-1', 'never lands', outcome=out) is None
+
+        assert out['applied'] is False, f'nothing was applied: {out}'
+        assert out['prior_status'] is None, f'there was no prior record: {out}'
+        assert out['prior_resolved_by'] is None, f'there was no prior record: {out}'
+        assert out['late_resolution_captured'] is False, f'nothing was captured: {out}'
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_pending_record_reports_applied(self, tmp_path: Path):
+        """(b) The ordinary path: the resolution took effect."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        out = self._poisoned()
+
+        result = queue.resolve('esc-1-1', 'Fixed', resolved_by='interactive', outcome=out)
+
+        assert result is not None and result.status == 'resolved'
+        assert out['applied'] is True, f'a pending record accepts the resolve: {out}'
+        assert out['prior_status'] == 'pending', f'prior status must be exact: {out}'
+        assert out['prior_resolved_by'] is None, (
+            f'an unresolved record has no prior resolver: {out}'
+        )
+        assert out['late_resolution_captured'] is False, (
+            f'nothing was captured — the text APPLIED: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_already_terminal_record_reports_not_applied_and_echoes_prior_state(
+        self, tmp_path: Path,
+    ):
+        """(c) The already-terminal branch reports the state that WON the race."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'Fixed once', resolved_by='interactive')
+
+        out = self._poisoned()
+        result = queue.resolve('esc-1-1', 'Fixed again', resolved_by='interactive', outcome=out)
+
+        # The stored record is still what comes back — the contract
+        # `TestResolveIdempotent` pins is unchanged.
+        assert result is not None
+        assert result.resolution == 'Fixed once'
+        assert out['applied'] is False, (
+            f'the second resolve is a no-op and must say so: {out}'
+        )
+        assert out['prior_status'] == 'resolved', (
+            f'prior_status names the state that won: {out}'
+        )
+        assert out['prior_resolved_by'] == 'interactive', (
+            f'prior_resolved_by names WHO won: {out}'
+        )
+
+    def test_existing_call_sites_stay_byte_compatible(self, tmp_path: Path):
+        """(d) The out-param changed nothing for the callers that ignore it.
+
+        `resolve()` has callers that pass positionally (`resolve(id, text,
+        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
+        of which want the out-param.  Keyword-only with a None default is what
+        keeps them untouched, asserted the way those callers experience it: a
+        third POSITIONAL argument still means `dismiss` (it would have meant
+        `outcome` had the new parameter been added positionally), and a call
+        that passes no out-param at all still resolves exactly as before.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.submit(_make_escalation('esc-1-2'))
+
+        positional = queue.resolve('esc-1-1', 'Fixed', True)
+        assert positional is not None and positional.status == 'dismissed', (
+            'the third positional argument must still bind to dismiss: '
+            f'{positional and positional.status!r}'
+        )
+
+        omitted = queue.resolve('esc-1-2', 'Fixed')
+        assert omitted is not None and omitted.status == 'resolved', (
+            'a call with no out-param must behave exactly as before: '
+            f'{omitted and omitted.status!r}'
+        )
+
+
+class TestResolveCapturesLateResolution:
+    """The esc-3902-1 shape at the queue level: a late resolve is CAPTURED, not dropped.
+
+    THE RACE.  The W9-δ steward auto-dismiss closes a capped L0 with
+    `resolved_by='auto-dismissed'`.  A `resolve_issue` already in flight from
+    the killed agent session lands microseconds later.  `resolve()` correctly
+    refuses to re-close the record — its status check is an atomic check-and-set
+    inside `escalation_id_lock` — but it also used to DISCARD the incoming text,
+    so the steward's actual finding was destroyed and the record kept the
+    `resolution_class='benign'` the automated dismissal derived.
+    """
+
+    LATE_TEXT = "the steward's real finding: the verify command was never run"
+    LATE_RESOLVER = 'claude-task-3902-steward'
+
+    def _auto_dismissed(self, tmp_path: Path) -> EscalationQueue:
+        """A queue holding one L0 an automated sweep has already dismissed."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1',
+            'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_late_substantive_resolve_is_captured(self, tmp_path: Path, caplog):
+        """(a)(b)(c)(e) The text survives, the terminal state does not move, and it is loud."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1',
+            'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+        dismissed = queue.get('esc-3902-1')
+        assert dismissed is not None
+        stored_resolved_at = dismissed.resolved_at
+        assert stored_resolved_at is not None, 'setup: the dismissal must be stamped'
+
+        out: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            returned = queue.resolve(
+                'esc-3902-1', self.LATE_TEXT,
+                resolved_by=self.LATE_RESOLVER, outcome=out,
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+
+        # --- (a) exactly ONE entry, carrying the incoming facts.
+        assert len(record.late_resolutions) == 1, (
+            f'expected exactly one captured late resolution: {record.late_resolutions!r}'
+        )
+        entry = record.late_resolutions[0]
+        assert entry['resolution'] == self.LATE_TEXT, (
+            f"the steward's finding was lost or mangled: {entry!r}"
+        )
+        assert entry['resolved_by'] == self.LATE_RESOLVER, f'wrong attribution: {entry!r}'
+        assert entry['dismiss'] is False, f'the late call did not ask to dismiss: {entry!r}'
+        # The timestamp is stamped by the QUEUE at write time — a caller cannot
+        # backdate a capture, the same contract Amendment/stamp_triage carry.
+        stamped = datetime.fromisoformat(entry['timestamp'])
+        assert stamped.tzinfo is not None, f'timestamp must be tz-aware: {entry!r}'
+        assert stamped >= datetime.fromisoformat(stored_resolved_at), (
+            f'the capture cannot predate the dismissal it followed: {entry!r}'
+        )
+
+        # --- (b) the record's OWN terminal state is untouched.  Downstream
+        # waiters (_resolve_callback -> harness -> the workflow resume) already
+        # consumed it; flipping it now would rewrite history already acted on.
+        assert record.status == 'dismissed', f'status must not move: {record.status!r}'
+        assert record.resolution == 'Auto-dismissed: steward interrupted (attempt cap)', (
+            f'the stored resolution must not be overwritten: {record.resolution!r}'
+        )
+        assert record.resolved_at == stored_resolved_at, (
+            f'resolved_at must not move: {record.resolved_at!r}'
+        )
+        assert record.resolved_by == 'auto-dismissed', (
+            f'resolved_by must not move: {record.resolved_by!r}'
+        )
+
+        # --- (c) the return value is still the stored record; the outcome tells
+        # the caller its text did NOT apply but WAS preserved.
+        assert returned is not None
+        assert returned.status == 'dismissed'
+        assert out['applied'] is False, f'the late text did not apply: {out}'
+        assert out['late_resolution_captured'] is True, (
+            f'the caller must learn its text was captured late: {out}'
+        )
+        assert out['prior_resolved_by'] == 'auto-dismissed', (
+            f'the outcome names the automated dismisser that won: {out}'
+        )
+
+        # --- (e) the capture is LOUD as well as durable.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'esc-3902-1' in m and 'auto-dismissed' in m and self.LATE_RESOLVER in m
+            for m in warnings
+        ), (
+            'expected a WARNING naming the escalation id, the stored '
+            f'auto-dismisser and the late resolver; got: {warnings}'
+        )
+
+    def test_capture_writes_in_place_with_no_resurrected_root_copy(self, tmp_path: Path):
+        """(d) The write lands at the ARCHIVE path, never back in the queue root.
+
+        `_atomic_write` is hard-wired to `queue_dir/{id}.json`, so using it here
+        would write a SECOND copy beside the archived one — resurrecting a
+        closed record into the pending-scan surface and creating exactly the
+        orphan state `TestResolveIdempotent` exists to prevent.
+        """
+        queue = self._auto_dismissed(tmp_path)
+
+        archived_before = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived_before) == 1, f'setup: {archived_before}'
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER)
+
+        archived_after = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived_after) == 1, (
+            f'expected exactly one archive copy after the capture (no orphan), '
+            f'got {[str(p) for p in archived_after]}'
+        )
+        assert archived_after[0] == archived_before[0], (
+            f'archive path moved: {archived_before[0]} -> {archived_after[0]}'
+        )
+        assert not (queue.queue_dir / 'esc-3902-1.json').exists(), (
+            'the capture resurrected a root copy of an archived record — it '
+            'would reappear on the pending scan surface'
+        )
+
+        # And the capture is genuinely ON DISK, not merely on the in-memory
+        # object the call returned.
+        on_disk = Escalation.from_json(archived_after[0].read_text())
+        assert len(on_disk.late_resolutions) == 1, (
+            f'the capture did not reach disk: {on_disk.late_resolutions!r}'
+        )
+        assert on_disk.late_resolutions[0]['resolution'] == self.LATE_TEXT
+
+
+class TestLateResolutionCaptureFailsClosed:
+    """The capture WRITE did not land — so nothing may be reported as captured.
+
+    `_write_late_resolution` is fail-closed by contract: a missing
+    `_locate_path` or a raising write returns False, and the capture then rolls
+    back FOUR pieces of in-memory state (the entry list, the truncation
+    counter, the elision counter and the corrected stamp) so the record the
+    caller gets back is what is actually on disk.  Nothing else pins that, and
+    every way it can break is silent: a reported capture that never reached
+    disk, a returned record disagreeing with disk on one un-rolled-back field,
+    or the exception escaping and killing the `resolve()` it rode in on — the
+    call whose real business (reporting the record's terminal state) is already
+    done.
+    """
+
+    #: Long enough to be ELIDED, so the elision counter's rollback is
+    #: observable, and prefixed so the fail-closed WARNING can be identified.
+    LATE_TEXT = 'UNPERSISTABLE FINDING: ' + 'detail. ' * 300
+
+    def _break_the_write(self, monkeypatch, mode: str) -> None:
+        """Install one of the two ways `_write_late_resolution` returns False.
+
+        `missing_path` lets the FIRST `_locate_path` call through — the one
+        `resolve()`'s in-lock `get()` makes to read the record — and loses the
+        file for every call after it, which is exactly the window the
+        fail-closed branch defends: another process moved or removed the
+        archived file between that read and the capture's write.  A blanket
+        None would instead make `get()` itself miss, and `resolve()` would
+        return None long before reaching the code under test.
+        """
+        if mode == 'write_raises':
+            def _boom(self, path: Path, content: str) -> None:
+                raise OSError(28, 'No space left on device')
+            monkeypatch.setattr(EscalationQueue, '_atomic_write_path', _boom)
+            return
+
+        real_locate = EscalationQueue._locate_path
+        seen: list[str] = []
+
+        def _vanishing(self, escalation_id: str) -> Path | None:
+            seen.append(escalation_id)
+            return real_locate(self, escalation_id) if len(seen) == 1 else None
+
+        monkeypatch.setattr(EscalationQueue, '_locate_path', _vanishing)
+
+    def _at_the_cap(self, tmp_path: Path) -> EscalationQueue:
+        """A dismissed record already holding a FULL `late_resolutions` list.
+
+        At the cap the next capture would BOTH trim (moving
+        `late_resolutions_truncated`) and correct the stamp, so a rollback that
+        forgot either is observable rather than merely theoretical.  The
+        fillers pass `resolution_class='benign'` explicitly — a candidate equal
+        to the stored stamp is not a correction, so the record keeps the
+        DERIVED 'benign' the sweep left and the failing capture below is still
+        one the correction would fire on.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        for i in range(_MAX_LATE_RESOLUTIONS):
+            queue.resolve(
+                'esc-3902-1', f'earlier finding {i}',
+                resolved_by='claude-task-3902-steward', resolution_class='benign',
+            )
+        return queue
+
+    @pytest.mark.parametrize('mode', ['write_raises', 'missing_path'])
+    def test_a_capture_that_never_reached_disk_is_not_reported_as_one(
+        self, tmp_path: Path, caplog, monkeypatch, mode: str,
+    ):
+        queue = self._at_the_cap(tmp_path)
+        before = queue.get('esc-3902-1')
+        assert before is not None
+        assert len(before.late_resolutions) == _MAX_LATE_RESOLUTIONS, 'setup: at the cap'
+        assert before.resolution_class == 'benign', f'setup: {before.resolution_class!r}'
+        self._break_the_write(monkeypatch, mode)
+
+        out: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': True, 'resolution_class_corrected': 'poison',
+        }
+        # The eight setup captures each logged a (correct) capture WARNING; this
+        # test asserts on what the FAILING one logs, so they are dropped first.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            returned = queue.resolve(
+                'esc-3902-1', self.LATE_TEXT,
+                resolved_by='claude-task-3902-steward', outcome=out,
+            )
+        # The failure is armed for the capture ONLY — every assertion below
+        # reads the record back through the real code.
+        monkeypatch.undo()
+
+        # --- the resolve itself survives: a capture failure must not crash the
+        # call it rode in on, whose real business is already done.
+        assert returned is not None, 'the capture failure killed the resolve'
+        assert returned.status == 'dismissed'
+        assert returned.resolution == 'Auto-dismissed: steward interrupted (attempt cap)'
+
+        # --- nothing is reported as captured or corrected.
+        assert out['late_resolution_captured'] is False, (
+            f'the write did not land, so nothing was captured: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'a rolled-back stamp was never corrected: {out}'
+        )
+        assert out['applied'] is False, f'the text still did not apply: {out}'
+        assert out['prior_resolved_by'] == 'auto-dismissed', (
+            f'the prior state is still reported exactly: {out}'
+        )
+
+        # --- all FOUR rolled-back fields, on the returned object AND on disk:
+        # a record that disagrees with disk is the silent half of this defect.
+        on_disk = queue.get('esc-3902-1')
+        assert on_disk is not None
+        for label, record in (('returned', returned), ('on-disk', on_disk)):
+            assert record.late_resolutions == before.late_resolutions, (
+                f'{label}: the unpersisted entry survived in memory: '
+                f'{record.late_resolutions!r}'
+            )
+            assert record.late_resolutions_truncated == 0, (
+                f'{label}: a trim that never reached disk was counted: '
+                f'{record.late_resolutions_truncated!r}'
+            )
+            assert record.late_resolutions_chars_elided == (
+                before.late_resolutions_chars_elided
+            ), (
+                f'{label}: an elision that never reached disk was counted: '
+                f'{record.late_resolutions_chars_elided!r}'
+            )
+            assert record.resolution_class == 'benign', (
+                f'{label}: the stamp was corrected for a capture that never '
+                f'landed: {record.resolution_class!r}'
+            )
+
+        # --- degraded to log-only, never silently lost.
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'esc-3902-1' in m and 'UNPERSISTABLE FINDING' in m for m in warnings
+        ), (
+            'the text that could not be persisted must survive in the log line '
+            f'that reports the failure; got: {warnings}'
+        )
+        assert not any('CAPTURED in late_resolutions' in m for m in warnings), (
+            f'nothing was captured, so no capture may be announced: {warnings}'
+        )
+
+
+class TestLateResolutionCapturePredicate:
+    """The NEGATIVES: the capture stays narrow, so it cannot become noise.
+
+    A high-signal forensic field is only high-signal while it stays rare.  Each
+    case below is a shape that ALREADY happens routinely in this system; if any
+    of them captured, `late_resolutions` would fill with entries nobody filed a
+    race about, and the one entry that matters would be indistinguishable.
+
+    Every case also re-asserts `TestResolveIdempotent`'s no-orphan-archive
+    guarantee: a suppressed capture must write NOTHING, not write a no-change
+    record to a fresh path.
+    """
+
+    LATE_TEXT = "the steward's real finding"
+
+    def _archive_state(self, queue: EscalationQueue, esc_id: str) -> tuple[list[Path], list[str]]:
+        """(archive paths, their bytes) — the on-disk footprint of *esc_id*."""
+        paths = sorted((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        return paths, [p.read_text() for p in paths]
+
+    def _assert_nothing_written(
+        self, queue: EscalationQueue, esc_id: str,
+        before: tuple[list[Path], list[str]],
+    ) -> None:
+        """No entry appended, no orphan copy, and the on-disk BYTES unchanged."""
+        record = queue.get(esc_id)
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'capture must be suppressed for this shape: {record.late_resolutions!r}'
+        )
+        after = self._archive_state(queue, esc_id)
+        assert after[0] == before[0], (
+            f'archive layout changed: {before[0]} -> {after[0]}'
+        )
+        assert after[1] == before[1], 'on-disk bytes changed despite a suppressed capture'
+        assert not (queue.queue_dir / f'{esc_id}.json').exists(), (
+            'a suppressed capture resurrected a queue-root copy of an archived record'
+        )
+
+    def _seeded(
+        self, tmp_path: Path, *, dismiss: bool, resolved_by: str, resolution: str,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve('esc-3902-1', resolution, dismiss=dismiss, resolved_by=resolved_by)
+        return queue
+
+    def test_stored_human_resolver_does_not_capture(self, tmp_path: Path):
+        """(a) A HUMAN closed it, so a second resolve is an ordinary double-close.
+
+        `resolved_by='interactive'` classifies as tier 'human', not
+        'reaper-sweep'.  Without this conjunct every idempotent re-resolve of a
+        human-closed record would append an entry.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='interactive', resolution='closed by hand',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_stored_resolved_status_does_not_capture(self, tmp_path: Path):
+        """(b) Only a DISMISSAL loses information — a resolve already carries a finding."""
+        queue = self._seeded(
+            tmp_path, dismiss=False, resolved_by='auto-dismissed', resolution='closed',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_incoming_automated_dismissal_does_not_capture(self, tmp_path: Path):
+        """(c) An auto-dismisser re-closing an auto-dismissed record is routine.
+
+        THIS is the conjunct that keeps workflow.py's five idempotent
+        auto-dismiss backstops and test_workflow_escalated_steward_stall.py's
+        deliberate re-dismissals silent.  Without it they would each append an
+        entry every time they re-closed an already-closed record.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: workflow backstop',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_other_reaper_sweep_resolvers_are_also_excluded_incoming(self, tmp_path: Path):
+        """(c cont.) The exclusion is the TIER, not the literal 'auto-dismissed'.
+
+        Both sides derive from `classify.classify_resolver_tier`, so a future
+        member added to `_REAPER_SWEEP_RESOLVERS` is covered automatically
+        rather than silently starting to generate noise (INV-5).
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='harness-orphan-reaper',
+            resolution='swept: orphaned',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'swept again: orphaned',
+            dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_empty_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d) There is nothing to preserve."""
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', '', resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_identical_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d cont.) A byte-identical retry preserves nothing the record lacks."""
+        stored = 'Auto-dismissed: steward interrupted (attempt cap)'
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed', resolution=stored,
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', stored, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+
+class TestCascadeForwardIsCapturedButNotReportedAsARace:
+    """An L2 member cascade is an ORDINARY close path — capture it, don't cry race.
+
+    `resolve()`'s cascade re-resolves every member of an L2 under
+    `l2-cascade:<id>`, so a member an automated sweep had already dismissed
+    passes the capture predicate.  That is deliberate: the text being forwarded
+    is the L2's own resolution, which can be a human's substantive finding about
+    the whole cluster — the same loss the capture exists to prevent, arriving
+    through a different door.  What must NOT happen is describing it as a late
+    arrival that beat a dismissal, at the WARNING level the genuine race owns:
+    the field's signal is defended in the LOG, not by dropping the finding.
+    """
+
+    MEMBER = 'esc-3902-member'
+    L2 = 'esc-3902-l2'
+
+    def _capture_lines(self, caplog) -> list[tuple[int, str]]:
+        """(level, message) for every queue log line reporting a capture."""
+        return [
+            (r.levelno, r.getMessage()) for r in caplog.records
+            if r.name == 'escalation.queue' and 'CAPTURED in late_resolutions' in r.getMessage()
+        ]
+
+    def _l2_over_an_auto_dismissed_member(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation(self.MEMBER, task_id='3902', level=1))
+        l2 = _make_escalation(self.L2, task_id='3902', level=2)
+        l2.members = [self.MEMBER]
+        queue.submit(l2)
+        queue.resolve(
+            self.MEMBER, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_cascade_forward_is_captured_and_logged_at_info(self, tmp_path: Path, caplog):
+        """(a) The human's cluster finding reaches the member — at INFO, as a forward."""
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.L2, 'root cause was a stale lockfile across the whole cluster',
+                resolved_by='interactive',
+            )
+
+        record = queue.get(self.MEMBER)
+        assert record is not None
+        # The finding is NOT dropped — that is what the cascade is carrying.
+        assert len(record.late_resolutions) == 1, (
+            f"the L2's resolution must reach the already-closed member: "
+            f'{record.late_resolutions!r}'
+        )
+        entry = record.late_resolutions[0]
+        assert entry['resolution'] == 'root cause was a stale lockfile across the whole cluster'
+        assert entry['resolved_by'] == f'l2-cascade:{self.L2}'
+        assert entry['prior_resolution_class'] == 'benign'
+        assert record.resolution_class == 'actionable', (
+            f'a human resolve cascading onto a swept member corrects the derived '
+            f'stamp like any other capture: {record.resolution_class!r}'
+        )
+
+        # …but it is reported as the routine forward it is.
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.INFO, (
+            f'a cascade forward is not a race and must not claim the WARNING the '
+            f'genuine race owns: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'CASCADE forward' in message, (
+            f'the line must name what actually happened: {message}'
+        )
+        assert 'arriving after that automated dismissal' not in message, (
+            f'no dismissal was beaten here — nothing raced: {message}'
+        )
+        assert self.MEMBER in message and f'l2-cascade:{self.L2}' in message, (
+            f'the line must name the member and the cascade it came from: {message}'
+        )
+
+    def test_a_genuine_late_arrival_still_warns(self, tmp_path: Path, caplog):
+        """(b) The race the field exists for keeps its WARNING, unchanged.
+
+        The INFO demotion is scoped to the cascade tier by
+        `classify_resolver_tier`; a direct resolve from an agent session is the
+        esc-3902-1 shape and must stay loud.
+        """
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.MEMBER, "the steward's real finding",
+                resolved_by='claude-task-3902-steward',
+            )
+
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.WARNING, (
+            f'a late arrival that beat nothing but the sweep is the reported harm '
+            f'and stays loud: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'arriving after that automated dismissal' in message, (
+            f'the line must name the race it is reporting: {message}'
+        )
+        assert 'CASCADE' not in message, f'nothing cascaded here: {message}'
+
+
+class TestLateResolutionCorrectsResolutionClass:
+    """The reported harm: "recorded as resolution_class=benign instead of carrying
+    the steward's actual finding".
+
+    `resolved_by='auto-dismissed'` classifies as tier 'reaper-sweep', which
+    `default_resolution_class_for_resolver` maps to 'benign' — so the sweep's
+    own stamp says "nothing actionable happened here" about a record whose
+    actual resolution was a real finding.  Capturing the text without correcting
+    the stamp would leave the dashboard aggregation still reading the lie.
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+    LATE_RESOLVER = 'claude-task-3902-steward'
+
+    def _auto_dismissed(
+        self, tmp_path: Path, *, stored_class: str | None = None,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed', resolution_class=stored_class,
+        )
+        return queue
+
+    @staticmethod
+    def _outcome() -> ResolveOutcome:
+        return {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': 'poison',
+        }
+
+    def test_derived_benign_is_corrected_to_actionable(self, tmp_path: Path):
+        """(a)(d)(e) The derived stamp is re-stamped, the prior one preserved."""
+        queue = self._auto_dismissed(tmp_path)
+        seeded = queue.get('esc-3902-1')
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', (
+            f'setup: the auto-dismiss must derive benign, got {seeded.resolution_class!r}'
+        )
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'actionable', (
+            f'the derived benign stamp must be corrected: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'actionable', (
+            f'the caller must learn the stamp was re-derived: {out}'
+        )
+        # (d) the correction DESTROYS nothing — the superseded stamp is on the entry.
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign', (
+            f'the superseded stamp must be preserved: {record.late_resolutions[0]!r}'
+        )
+        # (e) the dashboard aggregation now reads the truth rather than the lie.
+        assert effective_benign(record) == ('actionable', 'stamped'), (
+            f'effective_benign must report the corrected stamp: {effective_benign(record)}'
+        )
+
+    def test_explicit_incoming_class_wins_over_the_actionable_default(self, tmp_path: Path):
+        """(b) 'actionable' is the DEFAULT, not an override of the caller."""
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+            resolution_class='stale-strand', outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'stale-strand', (
+            f'an explicit incoming class must win: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'stale-strand', f'{out}'
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign'
+
+    @pytest.mark.parametrize('stored_class', ['actionable', 'moot-terminal-subject'])
+    def test_a_non_benign_stamp_is_never_overwritten(self, tmp_path: Path, stored_class: str):
+        """(c) Only the DERIVED benign is corrected.
+
+        'moot-terminal-subject' is task 2724's deliberately-distinct sweep stamp:
+        it says something specific about WHY the record was closed, and silently
+        flattening it to 'actionable' would destroy that distinction.  An
+        'actionable' stamp is already the truth this correction aims at.
+        """
+        queue = self._auto_dismissed(tmp_path, stored_class=stored_class)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == stored_class, (
+            f'a non-benign stamp must survive: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'nothing was corrected, so nothing must be reported: {out}'
+        )
+        # The TEXT is still captured — the capture and the correction are
+        # independent; only the correction is conditional on the stamp.
+        assert len(record.late_resolutions) == 1, (
+            f'the text must still be preserved: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+
+    def test_a_candidate_equal_to_the_stored_stamp_is_not_a_correction(
+        self, tmp_path: Path, caplog,
+    ):
+        """(a)(b)(c) Re-deriving the SAME stamp is not a correction, and is not reported as one.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' passes the capture predicate — the TEXT is a genuine late
+        finding — but nothing about the stamp changed.  Reporting a correction
+        here would contradict both documented contracts: `ResolveOutcome`'s
+        'the stamp this call re-derived, or None' (queue.py:301) and the
+        entry's `prior_resolution_class`, which names the stamp this capture
+        SUPERSEDED.  Nothing was superseded.
+        """
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+                resolution_class='benign', outcome=out,
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        # (a) nothing was re-derived, so nothing is reported as re-derived.
+        assert out['resolution_class_corrected'] is None, (
+            f'a candidate equal to the stored stamp is not a correction: {out}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+        # (b) capture and correction stay independent — the TEXT still lands.
+        assert out['late_resolution_captured'] is True, (
+            f'the text is still a genuine late finding: {out}'
+        )
+        assert len(record.late_resolutions) == 1, (
+            f'exactly one entry must be captured: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged, not re-written: {record.resolution_class!r}'
+        )
+        # (c) a log reader is not told about a change that did not happen.
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any('CAPTURED in late_resolutions' in m for m in messages), (
+            f'setup: the capture WARNING must have fired: {messages}'
+        )
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened, so none may be logged: {messages}'
+        )
+
+    def test_the_l2_member_cascade_reaches_the_no_op_correction_for_real(
+        self, tmp_path: Path, caplog,
+    ):
+        """(d) The same shape, driven end-to-end rather than via an explicit kwarg.
+
+        Resolving a reaper-sweep L2 forwards its OWN derived 'benign' stamp to
+        each member (queue.py:1476) under `resolved_by='l2-cascade:<id>'`, whose
+        tier is 'cascade' — so the incoming side of the capture predicate passes
+        and a member already auto-dismissed 'benign' gets a candidate identical
+        to its stored stamp.  This is how the no-op arises in production, with
+        no caller ever typing `resolution_class='benign'`.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        member = _make_escalation('esc-3902-member', task_id='3902', level=1)
+        queue.submit(member)
+        l2 = _make_escalation('esc-3902-l2', task_id='3902', level=2)
+        l2.members = ['esc-3902-member']
+        queue.submit(l2)
+        queue.resolve(
+            'esc-3902-member', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        seeded = queue.get('esc-3902-member')
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', f'setup: {seeded.resolution_class!r}'
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-l2', 'aged out', dismiss=True, resolved_by='auto-dismissed',
+            )
+
+        parent = queue.get('esc-3902-l2')
+        assert parent is not None
+        assert parent.resolution_class == 'benign', f'setup: {parent.resolution_class!r}'
+        record = queue.get('esc-3902-member')
+        assert record is not None
+        assert len(record.late_resolutions) == 1, (
+            f'the cascade text is still captured: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'the member stamp must be untouched: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened on the cascade path either: {messages}'
+        )
+
+    def test_patch_resolution_metadata_preserves_the_capture_and_correction(
+        self, tmp_path: Path,
+    ):
+        """(f) The new field rides along through that method's full-record RMW.
+
+        `patch_resolution_metadata` is a `from_json` -> mutate -> `to_json`
+        rewrite of the WHOLE record (serialised under the same per-id lock since
+        commit 226c1ad696), and the steward calls it on records in exactly this
+        family.  A field it did not know about must survive it.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER)
+
+        patched = queue.patch_resolution_metadata(
+            'esc-3902-1', resolved_by='claude-task-3902-steward-repatched',
+        )
+
+        assert patched is not None
+        assert patched.resolved_by == 'claude-task-3902-steward-repatched', 'setup: patch applied'
+        assert len(patched.late_resolutions) == 1, (
+            f'the RMW clobbered the capture: {patched.late_resolutions!r}'
+        )
+        assert patched.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert patched.resolution_class == 'actionable', (
+            f'the RMW clobbered the correction: {patched.resolution_class!r}'
+        )
+
+        # And on disk, not merely on the returned object.
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == 1
+        assert record.resolution_class == 'actionable'
+
+
+class TestLateResolutionBounds:
+    """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
+
+    The same no-silent-cap policy `_MAX_AMENDMENTS` already models: the oldest
+    entries are shed, each drop is counted ON THE RECORD (not merely logged), an
+    over-long entry is elided with an in-band marker naming what was dropped, and
+    the dropped character total is likewise durable — so `len(list) + truncated`
+    never plateaus and INV-8 (loss is assertable from the record) holds.
+    """
+
+    def _auto_dismissed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_oldest_entries_are_shed_at_the_cap_and_counted(self, tmp_path: Path, caplog):
+        """(a)(c) Past the cap the OLDEST go, each drop counted, and it is loud.
+
+        The list is read from DISK after every single call, so an
+        over-cap list that existed durably even momentarily — a trim in a
+        second write rather than the same one as the append — would be caught.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 3
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_LATE_RESOLUTIONS + overshoot):
+                queue.resolve(
+                    'esc-3902-1', f'finding number {i}',
+                    resolved_by='claude-task-3902-steward',
+                )
+                on_disk = queue.get('esc-3902-1')
+                assert on_disk is not None
+                assert len(on_disk.late_resolutions) <= _MAX_LATE_RESOLUTIONS, (
+                    f'an over-cap list existed on disk after call {i}: '
+                    f'{len(on_disk.late_resolutions)} > {_MAX_LATE_RESOLUTIONS} — '
+                    'the trim must share the append\'s single write'
+                )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == _MAX_LATE_RESOLUTIONS
+        assert record.late_resolutions_truncated == overshoot, (
+            f'every drop must be counted on the record: '
+            f'{record.late_resolutions_truncated!r} != {overshoot}'
+        )
+        # OLDEST-shed: the survivors are the most recent window, and the true
+        # total (kept + truncated) never plateaus.
+        kept = [e['resolution'] for e in record.late_resolutions]
+        assert kept == [
+            f'finding number {i}'
+            for i in range(overshoot, _MAX_LATE_RESOLUTIONS + overshoot)
+        ], f'expected the most-recent window, got {kept}'
+        assert len(record.late_resolutions) + record.late_resolutions_truncated == (
+            _MAX_LATE_RESOLUTIONS + overshoot
+        ), 'the TRUE total must keep climbing past the cap'
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('shed' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the shed must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_over_long_resolution_is_elided_in_band_and_the_loss_is_durable(
+        self, tmp_path: Path, caplog,
+    ):
+        """(b)(c) Elision is MARKED, and the dropped characters land on the record.
+
+        A silently truncated finding is worse than a dropped one: a reader
+        cannot tell "this is all of it" from "this is the head of it".
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 250
+        long_text = 'x' * (_MAX_LATE_RESOLUTION_CHARS + overshoot)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', long_text, resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        stored = record.late_resolutions[0]['resolution']
+        assert stored != long_text, 'an over-long resolution must be elided'
+        assert stored.startswith('x' * _MAX_LATE_RESOLUTION_CHARS), (
+            'the HEAD of the finding must be what is kept'
+        )
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+        # INV-8: the loss is assertable FROM THE RECORD, never log-only.
+        assert record.late_resolutions_chars_elided == overshoot, (
+            f'dropped characters must be counted on the record: '
+            f'{record.late_resolutions_chars_elided!r} != {overshoot}'
+        )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('elid' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the elision must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_chars_elided_accumulates_across_captures(self, tmp_path: Path):
+        """(b cont.) The counter is a RUNNING total, not the last call's loss."""
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 100
+
+        for i in range(3):
+            queue.resolve(
+                'esc-3902-1', f'{i}' + 'y' * (_MAX_LATE_RESOLUTION_CHARS + overshoot - 1),
+                resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions_chars_elided == 3 * overshoot, (
+            f'expected a running total: {record.late_resolutions_chars_elided!r}'
         )
