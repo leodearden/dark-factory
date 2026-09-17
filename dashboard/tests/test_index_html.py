@@ -813,7 +813,7 @@ def test_recon_status_js_loads_before_tabs(index_html_body: str) -> None:
     throws while tabs.jsx is evaluating, so every tab that file defines goes
     with it.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RECON_STATUS_PREFIX,
         _TABS_PREFIX,
@@ -835,7 +835,7 @@ def test_recon_status_js_loads_before_app(index_html_body: str) -> None:
     the rail count is a single digit an operator has no independent way to
     check, which is how the vocabulary mismatch this task fixes survived.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RECON_STATUS_PREFIX,
         _APP_JSX_PREFIX,
