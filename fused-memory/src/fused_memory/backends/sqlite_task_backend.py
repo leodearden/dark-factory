@@ -3432,8 +3432,20 @@ def _reject_append_on_replace_only_fields(
 
     Args:
         append: The call's ``append`` flag. Checked with ``is True`` (not
-            truthiness), matching ``_resolve_metadata_mode``'s merge+append
-            carve-out, so only the sanctioned flag value trips the guard.
+            truthiness), matching ``_resolve_metadata_mode``, whose
+            merge+append carve-out and legacy shim both key on identity.
+            One cell is KNOWINGLY left uncovered by that choice: a truthy
+            NON-bool, which the details/prompt concatenation below does
+            treat as an append (``if (append and existing_details)``) while
+            a co-passed ``description`` would still be overwritten. It is
+            left to the details path deliberately, not overlooked — the wire
+            caller ``server/tools.py::update_task`` declares
+            ``append: bool | None`` and pydantic coerces there (measured:
+            ``1`` and ``'yes'`` arrive as ``True`` and DO trip this guard,
+            ``2`` is rejected outright), so the cell is reachable only from
+            an in-process caller that bypasses the annotation, and keeping
+            the two sibling guards on this method agreeing about what counts
+            as ``append=True`` was preferred to covering it.
         title / description / priority: The call's replace-only field values;
             non-``None`` means the write would touch that column.
         task_id: Recorded on the raised error for structural branching.
@@ -3443,15 +3455,17 @@ def _reject_append_on_replace_only_fields(
             replace-only field is non-``None``. ``.fields`` lists the
             offenders in ``_REPLACE_ONLY_FIELDS`` order (deterministic, not
             set-iteration order) and the message names them.
+        KeyError: If ``_REPLACE_ONLY_FIELDS`` ever names a field with no
+            matching keyword parameter. The ``candidates`` lookup below is
+            the single place the constant and the signature must agree, so
+            a half-done widening fails loudly at that one site instead of
+            silently skipping the new field.
     """
     if append is not True:
         return
+    candidates = {'title': title, 'description': description, 'priority': priority}
     offending = tuple(
-        name
-        for name, value in zip(
-            _REPLACE_ONLY_FIELDS, (title, description, priority), strict=True,
-        )
-        if value is not None
+        name for name in _REPLACE_ONLY_FIELDS if candidates[name] is not None
     )
     if offending:
         raise AppendUnsupportedFieldError(offending, task_id)

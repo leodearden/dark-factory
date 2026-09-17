@@ -6035,7 +6035,13 @@ def test_reject_append_on_replace_only_fields_keys_on_identity_not_truthiness():
     identity check _resolve_metadata_mode's merge+append carve-out uses. A
     truthy non-bool (e.g. ``1``) is not the sanctioned flag value and does not
     trip the guard, keeping the two sibling guards on this method consistent
-    about what counts as append=True."""
+    about what counts as append=True.
+
+    This pins a cell that is KNOWINGLY left to the details/prompt path (which
+    does key on truthiness), not an oversight, and it is only reachable from
+    an in-process caller that bypasses the wire annotation — the reasoning and
+    the coercion measurement live with the guard itself,
+    sqlite_task_backend.py::_reject_append_on_replace_only_fields."""
     assert _reject_append_on_replace_only_fields(
         1,  # pyright: ignore[reportArgumentType] - off-type BY DESIGN, see docstring
         description='x',
