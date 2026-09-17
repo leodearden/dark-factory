@@ -1247,6 +1247,49 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # unrepairable until task 3777 lifts the presence-only write-authority
         # floor.
         'execution_class',
+        # Merge-queue priority-lane selector (task 4888). The sole input to
+        # lane selection anywhere in the system, and the only way a task can
+        # ask to be merged ahead of the normal queue. Writers and reader are
+        # named because that is what a future reader greps when deciding
+        # whether the key is still load-bearing (all re-verified 2026-09-17):
+        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
+        # main-health fix task, 'high'), `orchestrator/src/orchestrator/
+        # workflow.py::build_offline_lane_fix_task_arguments` (offline-lane fix
+        # task, 'normal') and `orchestrator/src/orchestrator/workflow.py::
+        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
+        # reader `orchestrator/src/orchestrator/merge_queue.py::
+        # lane_for_task_metadata` -> `_normalize_lane`, consumed at
+        # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
+        # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
+        # task -- by `escalation/src/escalation/merge_lane_resolution.py::
+        # resolve_merge_lane` on the MCP submit path.
+        #
+        # THE BLESSING GROUND IS NOT CORPUS VOLUME, unlike the
+        # finding-provenance and `related_tasks` entries above. Census
+        # (2026-08-20): FOUR carriers -- tasks 3875, 4221, 4289, 4471, values
+        # {normal: 3, high: 1} -- which on volume alone would decide nothing.
+        # It rests on the other two criteria in docs/task-authoring.md
+        # "Promoting a convention": LOAD-BEARING (above) and STABLE (a closed
+        # two-value vocabulary, `MERGE_LANES = ('high', 'normal')`). As with
+        # the entries above, this comment is deliberately the SINGLE in-repo
+        # copy of those figures -- the doc cites this entry rather than
+        # restating them, so a re-census updates one place.
+        #
+        # BLESSED RATHER THAN PROMOTED TO A TYPED `Literal['normal', 'high']`,
+        # which is tempting here precisely because the vocabulary IS closed.
+        # Declined on the `execution_class` precedent below: a Literal raises
+        # on every metadata write to an out-of-vocabulary carrier under
+        # direction='write', enforce=True, permanently, because terminal tasks
+        # are unrepairable under the `done_provenance` write-authority floor --
+        # and task 4888 deliberately GROWS this population via the new
+        # `merge_request(lane=...)` parameter. The typo the stronger form would
+        # catch is caller intent, and that path is now guarded where it
+        # actually lives: `merge_request` rejects an unknown CALLER-supplied
+        # lane loudly with `code='invalid_lane'`, while an inherited metadata
+        # value still normalises silently so a lane resolution can never fail
+        # a merge submission.
+        'merge_lane',
     }
 )
 

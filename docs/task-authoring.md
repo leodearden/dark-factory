@@ -1077,7 +1077,7 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class
+execution_class, merge_lane
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
