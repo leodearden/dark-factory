@@ -1221,7 +1221,11 @@ class UnauthorizedRaise(Exception):
 
 
 def write_baseline(
-    path: Path, report: dict, *, authorization: object | None = None
+    path: Path,
+    report: dict,
+    *,
+    authorization: RaiseAuthorization | None = None,
+    ledger: Path | None = None,
 ) -> Path:
     """Render *report* and write it to *path* atomically, refusing silent raises.
 
@@ -1247,6 +1251,19 @@ def write_baseline(
     the cluster still raises the derived totals, so it still needs an
     authorization -- which is honest, the totals really did rise.
 
+    With an *authorization*, the raises are recorded in the append-only ledger
+    at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
+    ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
+    a crash between the two writes leaves a recorded authorization over an
+    unchanged baseline -- the gate stays red, nothing was widened, and the
+    orphaned record is visible -- rather than an unrecorded raise sitting in the
+    committed baseline, which is the exact silent widening this prevents. Both
+    texts are rendered before either file is touched, extending the
+    render-before-write property above across the pair.
+
+    An authorization over a report that raises NOTHING is ignored and appends no
+    record: the ledger holds raises, not intentions.
+
     A MISSING destination is a first write with nothing to compare against. A
     MALFORMED one propagates ``load_baseline``'s ``MetricsError`` rather than
     being overwritten: a previous baseline you cannot read is one whose raises
@@ -1254,10 +1271,16 @@ def write_baseline(
     """
     text = render_baseline(report)
     target = Path(path)
-    if target.exists():
-        raises = _measure_raises(report, load_baseline(target))
-        if raises and authorization is None:
+    raises = (
+        _measure_raises(report, load_baseline(target)) if target.exists() else []
+    )
+    if raises:
+        if authorization is None:
             raise UnauthorizedRaise(raises)
+        append_authorization(
+            Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
+            authorization_record(authorization, raises),
+        )
     safe_io.atomic_write_text(target, text, mkdir=True)
     return target
 
@@ -1296,6 +1319,182 @@ def load_baseline(path: Path) -> dict:
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# Authorized raises -- the ratchet's reviewed escape hatch.
+#
+# Placed here, immediately after the baseline's own rule, because a reader who
+# opens this file to find out why a regeneration was refused must meet the rule
+# and its escape hatch together. Splitting the enforcement away from the thing
+# it enforces to keep a line count down is precisely the move this mechanism
+# exists to stop rewarding.
+
+
+@dataclasses.dataclass(frozen=True)
+class RaiseAuthorization:
+    """Permission to record ONE set of raises, granted by one invocation.
+
+    An ACT, not a standing permission. It authorizes exactly the raises present
+    in the report it accompanies and nothing else; the ledger entry it produces
+    is provenance a reviewer reads, never an ACL this instrument consults. If a
+    landed record could license a later raise, the natural next move -- pre-write
+    a record, then regenerate -- would be indistinguishable from the silent
+    widening the ratchet exists to prevent. Per-invocation means the default is
+    always refusal, a stale record licenses nothing, and each raise costs one
+    deliberate, attributed command.
+    """
+
+    task_id: str
+    reason: str
+
+
+#: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
+LEDGER_SCHEMA_VERSION = 1
+
+#: Emitted as the ledger's leading key, for the same reason BASELINE_README is:
+#: the rule belongs in the file a reader has open.
+LEDGER_README = (
+    'This is the APPEND-ONLY provenance of every raise ever authorized against '
+    'the merge-lane ratchet baseline '
+    '(orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a '
+    'permission list: nothing in this file grants a future raise, and no entry '
+    'here will ever let --write-baseline absorb one. Authorization is an act, '
+    'not a standing entry -- rerun --authorize-raise for each raise, and it '
+    'appends one more record. Each entry\'s "measures" block is DERIVED from the '
+    'measured raises the write gate computed, never hand-written, so it is '
+    'mechanically incapable of disagreeing with the baseline diff it '
+    'accompanies. There is no timestamp: git already carries the date, and a '
+    'clock would churn this file on every rewrite. Written by '
+    'scripts/merge_lane_metrics.py --write-baseline '
+    'orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise '
+    '<task-id> --reason "<why>".'
+)
+
+
+def _non_blank(authorization: RaiseAuthorization, field: str) -> str:
+    value = getattr(authorization, field)
+    if not isinstance(value, str) or not value.strip():
+        raise MetricsError(
+            f'authorized raise is missing {field}: {value!r}. An authorization '
+            f'with no {field} is not an authorization -- the ledger entry exists '
+            'to tell a reviewer WHO raised a measure and WHY, and an entry that '
+            'answers neither is worse than no entry at all.'
+        )
+    return value
+
+
+def authorization_record(
+    authorization: RaiseAuthorization, raises: Sequence[Violation]
+) -> dict:
+    """One ledger entry: who authorized it, why, and exactly what rose.
+
+    ``measures`` is PROJECTED off the Violations the write gate measured, in
+    their already-sorted order, reusing ``Violation``'s field names so the audit
+    record and the failure message describe a raise in one vocabulary. Nothing
+    here is typed by the agent, so the record cannot drift from the diff.
+    """
+    return {
+        'task_id': _non_blank(authorization, 'task_id'),
+        'reason': _non_blank(authorization, 'reason'),
+        'measures': [
+            {
+                'measure': violation.measure,
+                'key': violation.key,
+                'baseline': violation.baseline,
+                'current': violation.current,
+            }
+            for violation in raises
+        ],
+    }
+
+
+def empty_ledger() -> dict:
+    """A ledger that has authorized nothing -- the day-one and fail-closed state."""
+    return {
+        '_README': LEDGER_README,
+        'schema_version': LEDGER_SCHEMA_VERSION,
+        'raises': [],
+    }
+
+
+def render_ledger(ledger: dict) -> str:
+    """Serialize *ledger* as the committed file's exact bytes.
+
+    Idempotent, like ``render_baseline``: the ``_README`` is re-emitted from
+    ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
+    rather than a churned file.
+
+    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
+    one-line-per-entry writer. That writer exists for one stated reason -- ten
+    parallel PRD gamma branches each editing different per-path measures would
+    conflict inside indent=2's six-line-per-path hunks. An append-only file
+    gaining one entry per authorizing task has no such shape, so inheriting the
+    custom writer would cargo-cult a constraint that does not apply and cost
+    legibility for it.
+    """
+    body = {key: value for key, value in ledger.items() if key != '_README'}
+    return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
+
+
+def load_ledger(path: Path) -> dict:
+    """Load the authorized-raise ledger. ABSENT is empty; MALFORMED is fatal.
+
+    THE POLARITY IS THE OPPOSITE OF ``load_baseline``'s on absence, deliberately,
+    because absence means opposite things. An absent BASELINE would compare clean
+    against every measure -- a silent disarming, so it must fail hard (INV-11).
+    An absent LEDGER means no raise was ever authorized, which is the fail-CLOSED
+    state: nothing is permitted by it, and hard-failing would only break the
+    day-one and fresh-tmp-path cases for no safety gain.
+
+    Corruption is different in kind. A ledger that cannot be parsed is one whose
+    entries cannot be audited, and reading it as empty would hide history, so
+    every malformed shape fails hard and names the file. Do not "fix" the split
+    by copying the neighbour -- this module already carries one deliberate
+    fail-soft/fail-hard seam that neighbours were tempted to flatten.
+    """
+    target = Path(path)
+    try:
+        text = target.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return empty_ledger()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} could not be read: '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise MetricsError(
+            f'authorized-raise ledger {target} holds a '
+            f'{type(loaded).__name__} at top level, expected a JSON object'
+        )
+    if not isinstance(loaded.get('raises'), list):
+        raise MetricsError(
+            f'authorized-raise ledger {target} has no "raises" list -- a ledger '
+            'whose entries cannot be read is one whose history cannot be '
+            'audited, which must never read as "nothing was authorized"'
+        )
+    return loaded
+
+
+def append_authorization(path: Path, record: dict) -> Path:
+    """Append one record to the ledger at *path*, preserving every prior entry.
+
+    Append-only: history is never rewritten, so a reviewer reading the file
+    reads every raise this baseline has ever absorbed.
+    """
+    target = Path(path)
+    ledger = load_ledger(target)
+    ledger['schema_version'] = LEDGER_SCHEMA_VERSION
+    ledger['raises'] = [*ledger['raises'], record]
+    safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
+    return target
 
 
 # ---------------------------------------------------------------------------
