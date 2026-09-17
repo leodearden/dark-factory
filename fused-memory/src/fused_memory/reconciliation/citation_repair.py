@@ -171,6 +171,19 @@ _ERR_REPLACEMENT_NOT_FOUND: dict[str, str] = {
     'error_type': 'ReconCitationReplacementNotFound',
 }
 
+# Swapping a citation for ITSELF: ``kept`` strips the victim and the dedupe
+# below puts it straight back, so nothing changes. Newly reachable with
+# ``wrong_memory`` — under ``memory_not_found`` an absent victim is an absent
+# replacement, so ``replacement_not_found`` fires first. Without this gate the
+# no-op is caught only by the read-after-write check, which answers
+# ``repair_clobbered``: it blames a concurrent writer that never existed, and it
+# fires AFTER the write, so the blob keeps an append-only citation_repairs
+# record asserting a repair that did not happen.
+_ERR_REPLACEMENT_IS_VICTIM: dict[str, str] = {
+    'error': 'replacement_is_victim',
+    'error_type': 'ReconCitationReplacementIsVictim',
+}
+
 _ERR_VERIFICATION_ERROR: dict[str, str] = {
     'error': 'verification_error',
     'error_type': 'ReconCitationVerificationError',
@@ -545,6 +558,29 @@ async def repair_memory_citation(
                     'read as a confirmed-absent citation.'
                 ),
             }
+
+    # Compared case-insensitively for ``_is_citation_of``'s documented reason:
+    # neither backend normalises UUID case on read-back, so a case-differing
+    # spelling is the SAME citation, and a gate using a stricter comparison than
+    # the matcher would have a hole exactly where the matcher does not.
+    if (
+        replacement_memory_id is not None
+        and replacement_memory_id.lower() == memory_id.lower()
+    ):
+        return _ERR_REPLACEMENT_IS_VICTIM | {
+            'memory_id': memory_id,
+            'replacement_memory_id': replacement_memory_id,
+            'hint': (
+                'the replacement is the victim, so this repair would strip the '
+                'citation and immediately re-append it — cited_memories '
+                'unchanged, nothing repaired. Caught late it surfaces as '
+                'repair_clobbered, which names a concurrent writer that does '
+                'not exist and only after a citation_repairs record claiming a '
+                'repair has already been written. To DROP the citation pass '
+                'replacement_memory_id=None; to RE-POINT it, pass a different '
+                'id.'
+            ),
+        }
 
     if reason not in REPAIRABLE_REASONS:
         return _ERR_INVALID_REASON | {
