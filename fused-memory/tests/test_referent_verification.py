@@ -3241,14 +3241,15 @@ class TestResolvableFindingsAreJournalledDurably:
         cap = _warn_cap()
         journal = await _wired_journal(service, tmp_path)
         commits = 0
-        real_commit = journal._db.commit
+        db = journal._require_db()
+        real_commit = db.commit
 
         async def _counting_commit():
             nonlocal commits
             commits += 1
             await real_commit()
 
-        monkeypatch.setattr(journal._db, 'commit', _counting_commit)
+        monkeypatch.setattr(db, 'commit', _counting_commit)
         stats = await service._verify_episode_referents(
             _episode_with_identity(_finding_storm_episode(cap + 5)),
             group_id='dark_factory', referents=(Referent(number='3127'),),

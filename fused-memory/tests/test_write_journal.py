@@ -1756,14 +1756,15 @@ async def test_one_episode_is_one_commit_however_many_findings_it_carries(
     public surface distinguishes one transaction from N.
     """
     commits = 0
-    real_commit = journal._db.commit
+    db = journal._require_db()
+    real_commit = db.commit
 
     async def _counting_commit():
         nonlocal commits
         commits += 1
         await real_commit()
 
-    monkeypatch.setattr(journal._db, 'commit', _counting_commit)
+    monkeypatch.setattr(db, 'commit', _counting_commit)
     payloads = [_finding_payload(edge_uuid=f'e{n}') for n in range(10)]
 
     await journal.log_referent_findings(
