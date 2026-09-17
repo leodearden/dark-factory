@@ -11,7 +11,6 @@ review rejected a source-lint living inside the pytest suite.
 from __future__ import annotations
 
 import ast
-import importlib.util
 import re
 import shutil
 import subprocess
@@ -21,23 +20,14 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _fm_helpers import load_script_module
 
-# Load the checker script via importlib to avoid sys.path pollution.
+# Load the checker script by path to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_module_local_testclient.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    spec = importlib.util.spec_from_file_location('check_module_local_testclient', SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_module_local_testclient')
 find_violations = _checker.find_violations
 main = _checker.main
 
@@ -612,18 +602,17 @@ def _load_verify_cmd() -> types.ModuleType:
     collections.abc, dataclasses, enum), so it loads standalone.  The module
     must be registered in ``sys.modules`` BEFORE exec_module: its ``@dataclass``
     decorators resolve ``cls.__module__`` through that table and raise
-    AttributeError otherwise.
+    AttributeError otherwise.  ``load_script_module`` installs the key before
+    executing, so that constraint is satisfied by using it.
+
+    The explicit *mod_name* keeps the key off the file stem: ``verify_cmd`` is
+    the name the real ``orchestrator.verify_cmd`` would occupy if anything else
+    in the process imported the package.
 
     Loading the REAL module (rather than skipping, or reimplementing the split)
     is what keeps this assertion non-vacuous.
     """
-    spec = importlib.util.spec_from_file_location('_vc_for_4485', _VERIFY_CMD_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_VERIFY_CMD_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules['_vc_for_4485'] = module
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
+    return load_script_module(_VERIFY_CMD_PATH, mod_name='_vc_for_4485')
 
 
 class TestWiring:
