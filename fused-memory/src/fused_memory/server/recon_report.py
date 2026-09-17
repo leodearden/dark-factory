@@ -2970,8 +2970,10 @@ class ReconReportState:
         memory_id: str,
         store: str,
         replacement_memory_id: str | None = None,
+        reason: str = 'memory_not_found',
+        justification: str | None = None,
     ) -> dict[str, Any]:
-        """Repair a dangling citation on a finding owned by a COMPLETED run (task 3065).
+        """Repair a defective citation on a finding owned by a COMPLETED run (task 3065).
 
         This tool exists because the ``cite_*`` tools structurally cannot reach
         such a finding: they all resolve through ``_resolve_entry(run_id)``,
@@ -2985,6 +2987,10 @@ class ReconReportState:
         resolved unchanged, which also supplies the ``repaired_by`` attribution;
         ``target_run_id`` is the run that OWNS the finding. The two are
         deliberately separate rather than one overloaded parameter.
+
+        ``reason`` and ``justification`` pass straight through to
+        ``citation_repair`` (task 5552), which owns every gate they select:
+        this wrapper adds no branching and duplicates no validation.
 
         This is the ONLY recon-report tool that writes to the reconciliation
         journal. It never touches in-process state — no ``_persist_run``, no
@@ -3019,6 +3025,8 @@ class ReconReportState:
             memory_id=memory_id,
             store=store,
             replacement_memory_id=replacement_memory_id,
+            reason=reason,
+            justification=justification,
             repaired_by=f'run:{run_id}',
             caller_project_id=entry.project_id,
             # A run is live iff it holds at least one IN-PROGRESS stage entry —
@@ -3626,25 +3634,36 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         memory_id: str,
         store: Literal['graphiti', 'mem0'],
         replacement_memory_id: str | None = None,
+        reason: Literal['memory_not_found', 'wrong_memory'] = 'memory_not_found',
+        justification: str | None = None,
     ) -> dict:
-        """Repair a dangling citation on a PRIOR, already-completed run's finding (task 3065).
+        """Repair a defective citation on a PRIOR, already-completed run's finding (task 3065).
 
-        Use when a memory cited by an older run's finding no longer resolves —
-        typically because a Stage-1 consolidation superseded it. The cite_*
-        tools cannot reach such a finding: they require the owning run to have a
-        live active stage, and a closed run's report state is TTL-evicted within
-        minutes. This writes the reconciliation journal's durable
+        Use when a memory cited by an older run's finding does not back the
+        claim — because it no longer resolves (a Stage-1 consolidation
+        superseded it), or because it resolves but is the wrong memory. The
+        cite_* tools cannot reach such a finding: they require the owning run to
+        have a live active stage, and a closed run's report state is TTL-evicted
+        within minutes. This writes the reconciliation journal's durable
         stage_reports blob instead.
 
         run_id is YOUR current run (unchanged from every other tool here);
         target_run_id is the run that OWNS the finding. Omit
-        replacement_memory_id to DROP the dangling citation instead of
-        re-pointing it.
+        replacement_memory_id to DROP the citation instead of re-pointing it.
 
-        Two invariants to understand before calling: the cited memory must be
-        CONFIRMED dangling, and the replacement must resolve. So this can only
-        ever repair provenance — it can never rewrite a live claim, and it can
-        never install a second unresolvable id.
+        reason names the defect CLASS, and is checked rather than trusted
+        because it is written verbatim into the durable provenance record:
+        'memory_not_found' (the default) requires the cited memory to be
+        CONFIRMED ABSENT; 'wrong_memory' requires it to RESOLVE, and requires a
+        non-blank justification saying why it does not back the finding — that
+        record is the only surviving account of removing a citation that was
+        still live. Picking the wrong class is a refusal naming the other one.
+
+        Three invariants to understand before calling: the cited memory's state
+        must match the reason you gave; the replacement must resolve, and must
+        not be the cited memory itself. So this can never install a second
+        unresolvable id, never report a repair that changed nothing, and never
+        remove a live citation without a recorded reason.
 
         The repair is confined to YOUR OWN project: the reconciliation journal
         is shared across every project this process reconciles, so a
@@ -3653,12 +3672,18 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         through the out-of-band repair_recon_citation operator script.
 
         Structured errors: invalid_uuid_shape (either id is not a canonical
-        36-char UUID); unsupported_store (only 'mem0' can be corroborated —
+        36-char UUID); replacement_is_victim (the replacement IS the cited
+        memory — that swap changes nothing; pass None to drop it);
+        invalid_reason (reason is outside the enum, which is listed under
+        'accepted'); justification_required (reason='wrong_memory' with a blank
+        justification); unsupported_store (only 'mem0' can be corroborated —
         get_memory_by_id is a Mem0/Qdrant point read and would false-flag every
         graphiti citation as dangling); target_run_not_found; project_mismatch
         (the target run belongs to another project); finding_unknown;
         citation_not_present (also the idempotent no-op on a re-run);
-        citation_not_dangling (the cited memory still resolves);
+        citation_not_dangling (reason='memory_not_found' but the cited memory
+        still resolves); citation_not_resolving (reason='wrong_memory' but it
+        does not resolve — the other class applies);
         replacement_not_found; verification_error (a lookup RAISED — unknown is
         not absent, so nothing is written); run_still_live (the target run is
         not finished — use cite_memory/delete_finding within a live run; it
@@ -3679,6 +3704,8 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
             memory_id=memory_id,
             store=store,
             replacement_memory_id=replacement_memory_id,
+            reason=reason,
+            justification=justification,
         )
 
     @mcp.tool()
