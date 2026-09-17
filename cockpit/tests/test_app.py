@@ -535,7 +535,7 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
         `records` -- so a visible parent's non-terminal child is never
         undercounted just because the child itself is hidden from view."""
         from cockpit.app import CockpitApp
-        from cockpit.panes.session_table import SessionTable
+        from cockpit.panes.session_table import LiveSessions, SessionTable
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
         running_child = _make_record(
@@ -550,14 +550,14 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
             table = app.query_one(SessionTable)
 
             table.replace_rows(
-                [parent],
+                LiveSessions(visible=[parent], total=1),
                 datetime.fromisoformat('2026-07-07T00:00:00+00:00'),
                 all_records=[parent, running_child],
             )
             await pilot.pause()
 
             assert table.row_count == 1
-            assert table.get_row('parent-1')[4] == '1'
+            assert table.get_row('parent-1')[5] == '1'
 
 
 class TestWriteDiscipline:
@@ -5001,3 +5001,206 @@ class TestDecisionQueueDetail:
             await pilot.pause()
 
             assert 'PPP parked question, REVISED?' in detail.rendered_text
+
+
+class TestSessionTableFocusCue:
+    """Signal (a): a row says whether Enter can raise anything for it.
+
+    Rendered end-to-end rather than only at the helper level, because the
+    defect being fixed is that replace_rows never consulted record.display
+    at all -- a passing focus_marker unit test would say nothing about what
+    an operator actually sees in the table.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_focusable_and_headless_rows_are_distinguishable(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable, focus_marker, state_glyph
+
+        focusable = _make_record(
+            session_slug='focusable-1',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='focusable title'),
+        )
+        headless = _make_record(
+            session_slug='headless-1', status=sr.Status.RUNNING, display=None
+        )
+        for r in (focusable, headless):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            focusable_row = table.get_row('focusable-1')
+            headless_row = table.get_row('headless-1')
+
+            assert focus_marker(focusable) in focusable_row
+            assert focus_marker(focusable) not in headless_row
+            assert focus_marker(headless) in headless_row
+            assert focus_marker(headless) not in focusable_row
+
+            # The status vocabulary is untouched: both sessions are RUNNING,
+            # and the focusability cue is a second, orthogonal column -- not
+            # a re-spelling of the state glyph.
+            assert state_glyph(sr.Status.RUNNING) in focusable_row
+            assert state_glyph(sr.Status.RUNNING) in headless_row
+
+
+class _FixedScanner:
+    """Fake SessionScanner returning a prebuilt in-memory record list.
+
+    Satisfies SessionScannerProtocol structurally (see _BlockingScanner):
+    a cap test needs a few hundred records to EXIST, not to be on disk, so
+    this skips writing that many record.json files.
+    """
+
+    def __init__(self, records: list) -> None:
+        self._records = records
+
+    def scan(self) -> list:
+        return list(self._records)
+
+
+class TestSessionTableCapNotice:
+    """Signal (b): a capped table says so, instead of looking complete.
+
+    Driven through the widget rather than only the formatter because the
+    notice's failure mode is silent: border labels are painted as part of
+    the border edge (measured, textual 8.2.8), so a subtitle set on a
+    border-less widget reads back correctly and renders NOTHING.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_replace_rows_reports_and_clears_the_cap_notice(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import LiveSessions, SessionTable
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(3)
+        ]
+        now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            # The notice has somewhere to paint. Without a border this
+            # whole class would keep passing while the operator saw
+            # nothing -- which is the exact defect the task exists to fix.
+            assert table.styles.border_bottom[0] != ''
+
+            table.replace_rows(LiveSessions(visible=records, total=12), now)
+            await pilot.pause()
+            assert table.border_subtitle == 'showing 3 of 12'
+
+            # Unconditional assignment: a rebuild that is no longer
+            # truncated must CLEAR the notice, not leave a stale one up.
+            table.replace_rows(LiveSessions(visible=records, total=3), now)
+            await pilot.pause()
+            assert table.border_subtitle == ''
+
+            table.replace_rows(LiveSessions(visible=records, total=12), now)
+            await pilot.pause()
+            assert table.border_subtitle == 'showing 3 of 12'
+
+    @pytest.mark.timeout(10)
+    async def test_app_hands_the_table_the_true_live_total(self, tmp_path):
+        """The end-to-end half: _rebuild_session_table must report what
+        filter_live_sessions hid, or the whole mechanism is inert.
+
+        Uses a fake scanner rather than writing _DEFAULT_VISIBLE_CAP+5
+        record.json files -- the records only need to exist in memory for
+        the cap to bite, and this keeps the test in the same sub-second
+        band as its neighbours.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
+
+        over_cap = [
+            _make_record(session_slug=f'over-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 5)
+        ]
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(over_cap), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == (
+                f'showing {_DEFAULT_VISIBLE_CAP} of {_DEFAULT_VISIBLE_CAP + 5}'
+            )
+
+    @pytest.mark.timeout(10)
+    async def test_small_fleet_claims_no_truncation(self, tmp_path):
+        """A fleet that fits stays quiet -- a complete table must not
+        announce itself as capped."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        records = [
+            _make_record(session_slug='small-0', status=sr.Status.RUNNING),
+            _make_record(session_slug='small-1', status=sr.Status.IDLE),
+        ]
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(records), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == 2
+            assert table.border_subtitle == ''
+
+    @pytest.mark.timeout(15)
+    async def test_history_toggle_clears_and_restores_the_notice(self, tmp_path):
+        """The transition that matters: an actually-capped view toggled to
+        history and back.
+
+        History renders self._records UNFILTERED, so it hides nothing by
+        construction and must clear the notice it inherits -- and toggling
+        back must bring the notice returned. Driven from a genuinely
+        over-cap fleet (plus terminal records, which history shows and the
+        live band does not) because with a small fleet an empty subtitle
+        after 'h' is true no matter what the history branch reports.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
+
+        live = [
+            _make_record(session_slug=f'live-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 5)
+        ]
+        exited = [
+            _make_record(session_slug=f'exited-{i}', status=sr.Status.EXITED)
+            for i in range(3)
+        ]
+        notice = f'showing {_DEFAULT_VISIBLE_CAP} of {_DEFAULT_VISIBLE_CAP + 5}'
+
+        app = CockpitApp(
+            fleet_root=tmp_path, scanner=_FixedScanner(live + exited), poll_interval=60
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == notice
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.row_count == len(live) + len(exited)
+            assert table.border_subtitle == ''
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.row_count == _DEFAULT_VISIBLE_CAP
+            assert table.border_subtitle == notice

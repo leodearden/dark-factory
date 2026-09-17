@@ -76,7 +76,12 @@ from cockpit.panes.decision_queue import (
     resolve_target,
 )
 from cockpit.panes.detail_pane import DetailPane
-from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
+from cockpit.panes.session_table import (
+    LiveSessions,
+    SessionTable,
+    filter_live_sessions,
+    order_sessions,
+)
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.panes.weight_editor import WeightEditorScreen, known_projects
@@ -466,7 +471,7 @@ class CockpitApp(App):
         self._snapshot = new_snapshot
         self._decisions_snapshot = new_decisions_snapshot
         self._decisions = decisions
-        self._records = order_sessions(records)
+        self._records = order_sessions(records, focus_first=True)
         try:
             self._rebuild_session_table()
             self._rebuild_queue()
@@ -486,6 +491,10 @@ class CockpitApp(App):
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
 
+        Either way the table is handed a LiveSessions view, so what the cap
+        hid travels with the rows it kept and the table can say so: history
+        mode builds its own view over the full set, hiding nothing.
+
         The rebuild owns the detail pane only while the pane still belongs
         to the session table: a rebuild refreshes whichever kind currently
         owns the detail, and only an operator cursor move transfers that
@@ -498,10 +507,13 @@ class CockpitApp(App):
         INDEX changes; suppressing them costs nothing and stops a
         same-content rebuild from stealing a decision an operator is reading.
         """
-        visible = self._records if self._show_history else filter_live_sessions(self._records)
+        if self._show_history:
+            view = LiveSessions(visible=self._records, total=len(self._records))
+        else:
+            view = filter_live_sessions(self._records)
         table = self.query_one('#session-table', SessionTable)
         with self.prevent(DataTable.RowHighlighted):
-            table.replace_rows(visible, self._now_fn(), all_records=self._records)
+            table.replace_rows(view, self._now_fn(), all_records=self._records)
         self._resync_session_detail(table.highlighted_slug())
 
     def _resync_session_detail(self, slug: str | None) -> None:
