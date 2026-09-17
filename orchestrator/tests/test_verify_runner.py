@@ -6763,6 +6763,53 @@ class TestRemoteRunnerPassSummaryArchival:
 # ---------------------------------------------------------------------------
 
 
+# Task 4195 step-7: sizing for test_beats_survive_a_blocked_event_loop, which
+# blocks the dispatching event loop for longer than the child's own heartbeat
+# deadline and lets the CHILD return the verdict.
+#
+# The bound needs a basis, because the flake class it must avoid is measured:
+# test_laptop_warm_verify_boundary.py's HeartbeatWriter comment records an
+# Event.wait-driven writer showing inter-write gaps of p999 0.386s / MAX 0.845s
+# at loadavg 113-178, with the overshoot largely ADDITIVE scheduling delay
+# rather than multiplicative.  Five beats at 0.05s is 0.25s nominal; even a
+# pathological run costing one full 0.845s gap plus four 0.386s gaps totals
+# ~2.4s, inside the 2.5s deadline.  That is why BEATS_REQUIRED is 5 rather than
+# 10 and the deadline is 10x nominal rather than 2x.
+#
+# If this ever measures tight under an xdist storm, raise CHILD_DEADLINE_SECS
+# and LOOP_HOG_SECS together (keeping the hog longer than the deadline); do NOT
+# lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
+# The discriminator survives any such widening, because the pre-4195 producer
+# delivers exactly ZERO beats for the whole hog.
+BEATS_REQUIRED = 5
+BEAT_INTERVAL_SECS = 0.05
+CHILD_DEADLINE_SECS = 2.5
+LOOP_HOG_SECS = 4.0
+
+#: Child program for that test: counts beats off fd 0 under its own deadline and
+#: exits with a verdict — 0 with BEATS_OK on stdout, 3 if it starved, 4 on EOF.
+#: Computing the verdict in the child keeps the measurement off the very thread
+#: the test deliberately blocks, and off any inter-beat gap measured in the
+#: parent (the shape the 0.845s figure above makes flaky).
+_BEAT_COUNTING_CHILD = f'''
+import os, select, sys, time
+deadline = time.monotonic() + {CHILD_DEADLINE_SECS}
+beats = 0
+while beats < {BEATS_REQUIRED}:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(3)
+    ready, _, _ = select.select([0], [], [], remaining)
+    if not ready:
+        sys.exit(3)
+    data = os.read(0, 4096)
+    if data == b'':
+        sys.exit(4)
+    beats += data.count(b'\\n')
+print('BEATS_OK')
+'''
+
+
 @pytest.mark.asyncio
 class TestDefaultSshHeartbeatRun:
     """_default_ssh_heartbeat_run opens the child with stdin=PIPE and writes a
@@ -6816,6 +6863,43 @@ class TestDefaultSshHeartbeatRun:
         assert rc == 0
         assert stdout == ''
         assert stderr == ''
+
+    async def test_beats_survive_a_blocked_event_loop(self):
+        """The beat keeps its cadence while the dispatching event loop is blocked.
+
+        THE HEADLINE PROPERTY of task 4195.  The orchestrator's single shared
+        loop carries the scheduler, agent dispatch, the merge worker and the
+        uvicorn escalation server; a producer scheduled on it stops beating for
+        exactly as long as any of them stalls it, and the remote correctly reads
+        a silent channel as a dead one.
+
+        The loop is blocked here by a SYNCHRONOUS ``time.sleep`` for longer than
+        the child's own heartbeat deadline.  That is an optimistic model of a
+        real stall (it releases the GIL, where ``shutil.rmtree`` and sqlite
+        commits hold it between syscalls), but modelling GIL contention is not
+        this test's job: it discriminates the asyncio-scheduled producer from
+        the OS-thread producer, which is the change under test.
+
+        The PARENT asserts no timing at all — only the child's exit code.
+        """
+        import sys
+        import time
+
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        argv = [sys.executable, '-c', _BEAT_COUNTING_CHILD]
+
+        async def hog():
+            await asyncio.sleep(0)  # let the dispatch coroutine reach its spawn
+            time.sleep(LOOP_HOG_SECS)  # synchronous: blocks the whole loop
+
+        (rc, stdout, stderr), _ = await asyncio.gather(
+            _default_ssh_heartbeat_run(argv, heartbeat_interval=BEAT_INTERVAL_SECS),
+            hog(),
+        )
+
+        assert rc == 0, f'child exited {rc} (3=heartbeat starved, 4=EOF): {stderr!r}'
+        assert 'BEATS_OK' in stdout
 
 
 # ---------------------------------------------------------------------------
