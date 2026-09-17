@@ -224,10 +224,14 @@ class TestReferentFindingCarriesItsProjectScope:
             ReferentFinding(**self._BASE, project_id='dark_factory')
 
     def test_to_dict_emits_both_keys_with_the_constructed_values(self):
-        """DISTINCT values, even though `Scope.graphiti_group_id` returns
-        `self.project_id` today: the GRAPH written to and the SCOPE written
-        under are two dimensions that merely coincide, and a payload echoing
-        one into both would satisfy an equal-value assertion while losing that.
+        """DISTINCT values — as a DISCRIMINATOR, not as a claim about what the
+        system emits. The production path aliases the pair (the sole
+        construction site passes `project_id=group_id`, having no Scope to read
+        a separate one from), so equal values here would pass just as well
+        against a `to_dict` that echoed one field into both keys, or derived
+        one from the other. What is pinned is the RECORD's ability to carry a
+        pair that disagrees, which is what task 3335's cross-project split and
+        the durable journal rows written before it will need.
         """
         payload = self._scoped(
             group_id='graph_scope', project_id='write_scope',
@@ -253,7 +257,12 @@ class TestReferentFindingCarriesItsProjectScope:
     def test_replace_carries_the_scope_pair_through_the_second_pass(self):
         """`_verify_episode_referents`' second pass rebuilds every resolvable
         finding with `dataclasses.replace` to stamp `new_endpoint_uuid`; a
-        field that did not survive that would be stamped and then dropped."""
+        field that did not survive that would be stamped and then dropped.
+
+        Distinct values again as the discriminator (see above): with the pair
+        aliased, a `replace` that rebuilt one field from the other would carry
+        both through unnoticed.
+        """
         finding = self._scoped(
             group_id='graph_scope',
             project_id='write_scope',

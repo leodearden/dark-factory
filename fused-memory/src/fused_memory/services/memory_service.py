@@ -1799,14 +1799,28 @@ class ReferentFinding:
     group_id: str
     #: The project SCOPE the write ran under.
     #:
-    #: Equal to :attr:`group_id` today, because
+    #: A KNOWN-ALIASED PAIR TODAY — said plainly here so nobody reads a
+    #: guarantee into it. ``_verify_episode_referents`` is handed a ``group_id``
+    #: and no :class:`~fused_memory.models.scope.Scope`, so the ONE production
+    #: construction site fills this field from that same value, and no live
+    #: payload has ever carried a pair that disagrees. There is nothing for it
+    #: to disagree with yet:
     #: :attr:`~fused_memory.models.scope.Scope.graphiti_group_id` returns
-    #: ``self.project_id``. Recorded SEPARATELY anyway, because they are two
-    #: orthogonal dimensions that merely coincide — the graph written TO and the
-    #: scope written UNDER — and :meth:`MemoryService._reconcile_episode_identity`'s
-    #: own docstring already anticipates task 3335's cross-project split, after
-    #: which they need not agree. A record that collapsed them would have to be
-    #: re-audited then; one that carries both does not.
+    #: ``self.project_id``.
+    #:
+    #: Kept as its own field anyway, for a reason that is about the DURABLE row
+    #: rather than the in-memory record: this payload is written verbatim to
+    #: ``write_journal``'s ``referent_findings`` table and read back by a later
+    #: process. :meth:`MemoryService._reconcile_episode_identity`'s own
+    #: docstring already anticipates task 3335's cross-project split, after
+    #: which the two need not agree — and a row that had carried only
+    #: ``group_id`` would by then be permanently ambiguous about which of the
+    #: two it meant, with no back-fill possible for rows already on disk. The
+    #: cost is one string per finding on the ~0.2%-of-edges path.
+    #:
+    #: What the tests pin is accordingly that the RECORD can carry a distinct
+    #: pair — that neither field is derived from or collapsed into the other —
+    #: never that the system today produces one.
     project_id: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
@@ -4297,10 +4311,12 @@ class MemoryService:
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
-                    # ONE value fills both: `Scope.graphiti_group_id` returns
-                    # `self.project_id`, so the graph written to and the scope
-                    # written under coincide today — see the field docs for why
-                    # the record keeps them apart anyway.
+                    # ONE value fills both, and this is the ONLY site that
+                    # constructs a finding: this pass is handed a group_id and
+                    # no Scope, so the pair is ALIASED here by construction.
+                    # See the `project_id` field docs for why the record keeps
+                    # them apart anyway — the argument is about the durable row,
+                    # not about this call.
                     group_id=group_id,
                     project_id=group_id,
                     check=check,
