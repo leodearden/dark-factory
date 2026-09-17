@@ -52,6 +52,10 @@ _MAX_KEEPALIVE_CONNECTIONS = 20
 _KEEPALIVE_EXPIRY = 4.0
 
 _LOGGER_NAME = 'dashboard.http_pool'
+
+# Captured before any test patches asyncio.sleep, so the fake cadence below can
+# still yield control without recursing into itself.
+_REAL_SLEEP = asyncio.sleep
 _URL = 'http://svc.local/mcp'
 _CANNED_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}'
 
@@ -390,16 +394,25 @@ _UNRESOLVABLE = [
 ]
 
 
-def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
-    """Messages this module logged at exactly *level*.
+def _records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    """Records this module logged at exactly *level*.
 
     Filtering on ``r.name`` is also the "names the module" half of the
     assertion: a record from anywhere else does not count.
     """
+    return [r for r in caplog.records if r.levelno == level and r.name == _LOGGER_NAME]
+
+
+def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [r.getMessage() for r in _records(caplog, level)]
+
+
+def _above_debug(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Everything this module said loudly enough to reach an operator."""
     return [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == level and r.name == _LOGGER_NAME
+        if r.name == _LOGGER_NAME and r.levelno > logging.DEBUG
     ]
 
 
@@ -486,3 +499,160 @@ class TestShapeGuardDegradesLoudly:
         finally:
             with contextlib.suppress(Exception):
                 await client.aclose()
+
+
+class FakeSleep:
+    """A cadence driver: records each requested interval, waits for nothing.
+
+    Ends the loop after *stop_after* ticks by raising ``CancelledError`` from
+    the sleep — the same way the lifespan's ``task.cancel()`` does — so a test
+    drives the loop through its real termination path rather than a special
+    one built for testing.
+    """
+
+    def __init__(self, stop_after: int) -> None:
+        self.intervals: list[float] = []
+        self._stop_after = stop_after
+
+    async def __call__(self, interval: float) -> None:
+        if len(self.intervals) >= self._stop_after:
+            raise asyncio.CancelledError
+        self.intervals.append(interval)
+        await _REAL_SLEEP(0)
+
+
+class TestReaperLoop:
+    """The background sweep, driven by a fake cadence rather than real time.
+
+    Every test here patches ``asyncio.sleep``, so the loop's schedule is
+    exercised in microseconds and asserted exactly, instead of being slept
+    through and asserted approximately.
+    """
+
+    async def test_each_sweep_targets_the_client_it_was_handed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleep = FakeSleep(stop_after=3)
+        monkeypatch.setattr(asyncio, 'sleep', sleep)
+        swept: list[httpx.AsyncClient] = []
+
+        async def _record(client: httpx.AsyncClient) -> int:
+            swept.append(client)
+            return 0
+
+        monkeypatch.setattr(http_pool, 'reap_orphaned_connections', _record)
+        harness = _build_harness()
+
+        with pytest.raises(asyncio.CancelledError):
+            await http_pool.reaper_loop(harness.client)
+
+        # The CLIENT, not merely a client: a correct reaper pointed at the
+        # wrong pool fixes nothing (see TestLifespanWiresTheReaper).
+        assert swept == [harness.client] * 3
+        assert sleep.intervals == [http_pool.REAP_INTERVAL_SECONDS] * 3
+
+    async def test_a_sweep_that_reaps_warns_with_the_count_and_the_census(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One line per reap is diagnostic, not a flood: reaps run ~2/hour."""
+        monkeypatch.setattr(asyncio, 'sleep', FakeSleep(stop_after=1))
+
+        async def _reaped_two(client: httpx.AsyncClient) -> int:
+            return 2
+
+        monkeypatch.setattr(http_pool, 'reap_orphaned_connections', _reaped_two)
+        harness = _build_harness()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await http_pool.reaper_loop(harness.client)
+
+        warnings = _messages(caplog, logging.WARNING)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        assert '2' in warnings[0], f'the WARNING must name the count, got {warnings[0]}'
+        assert all(field in warnings[0] for field in ('total=', 'orphaned=', 'max_connections=')), (
+            'the WARNING must name the resulting census, so one line answers both '
+            f'"did it work" and "is the pool still healthy"; got {warnings[0]}'
+        )
+
+    async def test_a_sweep_that_reaps_nothing_says_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The overwhelmingly common case. A line per quiet sweep is 1440/day."""
+        monkeypatch.setattr(asyncio, 'sleep', FakeSleep(stop_after=3))
+
+        async def _reaped_none(client: httpx.AsyncClient) -> int:
+            return 0
+
+        monkeypatch.setattr(http_pool, 'reap_orphaned_connections', _reaped_none)
+        harness = _build_harness()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await http_pool.reaper_loop(harness.client)
+
+        assert _above_debug(caplog) == []
+
+    async def test_a_failing_sweep_does_not_end_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The house pattern for a background task that must outlive its errors.
+
+        ``_burndown_loop`` and ``_metrics_loop`` both wrap each cycle in
+        ``try/except Exception: logger.warning(..., exc_info=True)`` for the
+        same reason: a loop that dies on its first bad cycle is a loop that
+        silently stopped doing its job.
+        """
+        monkeypatch.setattr(asyncio, 'sleep', FakeSleep(stop_after=3))
+        sweeps: list[httpx.AsyncClient] = []
+
+        async def _fail_the_first_sweep(client: httpx.AsyncClient) -> int:
+            sweeps.append(client)
+            if len(sweeps) == 1:
+                raise RuntimeError('pool went sideways')
+            return 0
+
+        monkeypatch.setattr(http_pool, 'reap_orphaned_connections', _fail_the_first_sweep)
+        harness = _build_harness()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await http_pool.reaper_loop(harness.client)
+
+        assert len(sweeps) == 3, 'a failed sweep must not stop the ticks after it'
+        failures = _records(caplog, logging.WARNING)
+        assert len(failures) == 1, f'expected one WARNING for the failed sweep, got {failures}'
+        assert failures[0].exc_info is not None, (
+            'the traceback is the whole diagnostic value of this line; log it with '
+            'exc_info=True as _burndown_loop and _metrics_loop do'
+        )
+
+    async def test_cancellation_propagates_so_shutdown_terminates(self) -> None:
+        """No patched sleep — this is the real lifespan shutdown path.
+
+        ``lifespan`` cancels the task and awaits it under
+        ``contextlib.suppress(asyncio.CancelledError)``. A loop that caught
+        ``CancelledError`` itself would return normally instead, and the
+        shutdown would move on believing it had stopped something it had not.
+        """
+        harness = _build_harness()
+        # An interval long enough that the loop is certainly parked in its
+        # sleep when the cancel lands, which is where shutdown finds it.
+        task = asyncio.create_task(http_pool.reaper_loop(harness.client, interval=3600.0))
+        await _step_until(lambda: not task.done(), what='the reaper loop starting')
+        await asyncio.sleep(0)
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled(), (
+            'the loop swallowed CancelledError; lifespan shutdown would hang waiting '
+            'for a task that had already decided to keep running'
+        )
