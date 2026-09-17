@@ -2697,36 +2697,38 @@ class TestWatchdogTimeoutDerivedFromTransport:
 
         assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS >= 2 * HEARTBEAT_INTERVAL_SECS
 
-    def test_the_ssh_argv_and_the_watchdog_deadline_read_the_same_pair(self):
-        """The flags the dispatcher SENDS and the deadline the remote ENFORCES agree.
+    def test_the_two_modules_agree_on_the_keepalive_pair(self):
+        """The dispatcher's keepalive values and the watchdog's deadline agree.
 
-        This is the honest form of the SPOT property, and the honesty matters.
-        Identity (``is``) does NOT enforce single-sourcing here: 15 and 4 both
-        sit inside CPython's small-int cache, so two independently written
-        literals compare identical and a re-introduced ``SSH_SERVER_ALIVE_
-        INTERVAL = 15`` in verify_runner would leave such a test green — it
-        would regain its strength only if some future retune happened to push a
-        value past 256.
+        Stated as the property this can actually enforce, which is NOT what a
+        predecessor of this test claimed. That version asserted identity
+        (``is``) and said it proved verify_runner "does not keep a second
+        copy": 15 and 4 both sit inside CPython's small-int cache, so two
+        independently written literals ARE identical and a re-introduced
+        ``SSH_SERVER_ALIVE_INTERVAL = 15`` in verify_runner would have left it
+        green — it would have regained its advertised strength only if a future
+        retune happened to push a value past 256.
 
-        What is enforced instead is the consequence a second copy actually has:
-        the moment it DRIFTS, the argv rendered into every ssh site and the
-        deadline derived for the watchdog stop following from the same two
-        numbers, and that is caught here rather than in production.
+        What IS enforceable is the consequence a second copy has the moment it
+        matters: it DRIFTS, and then the values the dispatcher sends stop
+        agreeing with the deadline the remote waits out. Equality catches that
+        at the drift.
+
+        An argv-level check — that verify_runner's private ``_SSH_BASE_OPTS``
+        interpolates verify_cancel's pair — was considered and deliberately not
+        made. It would be exactly as blind to a same-valued second copy (such a
+        copy renders identical flags), so it detects nothing this does not,
+        while reaching into a module internal from a test: the interface smell
+        docs/code-quality.md names, and one the merge-lane ratchet's
+        ``private_reads`` measure counts and forbids raising. The argv surface
+        is covered on its own side of the boundary by
+        ``test_verify_runner.py::test_all_four_sites_carry_identical_keepalive_flags``.
         """
         from orchestrator import verify_cancel, verify_runner
 
         assert verify_runner.SSH_SERVER_ALIVE_INTERVAL == verify_cancel.SSH_SERVER_ALIVE_INTERVAL
         assert verify_runner.SSH_SERVER_ALIVE_COUNT_MAX == verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
 
-        # What every ssh site sends on the wire...
-        assert (
-            f'ServerAliveInterval={verify_cancel.SSH_SERVER_ALIVE_INTERVAL}'
-            in verify_runner._SSH_BASE_OPTS
-        )
-        assert (
-            f'ServerAliveCountMax={verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX}'
-            in verify_runner._SSH_BASE_OPTS
-        )
         # ...and the deadline the remote waits out, from those same two names.
         assert verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS == (
             verify_cancel.WATCHDOG_TRANSPORT_HEADROOM
