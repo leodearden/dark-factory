@@ -101,13 +101,19 @@ def _make_harness(
     return harness
 
 
-def _make_server(tmp_path: Path, harness, mq: asyncio.Queue):
+def _make_server(tmp_path: Path, harness, mq: asyncio.Queue, registry=None):
+    """``registry`` is only passed when a test needs it PRE-SEEDED.
+
+    A pre-seeded entry is what makes a submission coalesce instead of
+    dispatching, which is the only way to reach the ``'attached'`` response
+    shape.
+    """
     return create_server(
         EscalationQueue(tmp_path / 'esc'),
         merge_queue=mq,
         orch_config=OrchestratorConfig(project_root=tmp_path / 'repo'),
         harness=harness,
-        merge_inflight_registry=InFlightMergeRegistry(),
+        merge_inflight_registry=registry if registry is not None else InFlightMergeRegistry(),
     )
 
 
@@ -146,6 +152,30 @@ async def _submit(tmp_path: Path, harness, **kwargs) -> tuple[dict[str, Any], li
     if captured_req:
         await worker_task
     return result, captured_req
+
+
+async def _submit_nonblocking(
+    tmp_path: Path, harness, *, registry=None, **kwargs
+) -> dict[str, Any]:
+    """Submit with ``wait_secs=0`` and return the immediate non-blocking shape.
+
+    Deliberately runs with NO worker.  The non-blocking path answers before
+    anything dequeues, so this response is the whole of what the submitter
+    learns at submit time — which is what makes it the audit surface.
+    """
+    mq: asyncio.Queue = asyncio.Queue()
+    server = _make_server(tmp_path, harness, mq, registry=registry)
+    return await asyncio.wait_for(
+        call_merge_request(
+            server,
+            task_id='4888',
+            branch='4888',
+            worktree=str(tmp_path / 'wt'),
+            wait_secs=0,
+            **kwargs,
+        ),
+        timeout=5.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,3 +386,74 @@ class TestMetadataReadIsPaidAtMostOnce:
 
         assert captured and captured[0].lane == 'high'
         harness.scheduler.get_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The audit echo — the submitter can see which lane it got
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitResponseEchoesTheResolvedLane:
+    """The submit response reports the resolved lane AND which source won.
+
+    Design decision 4 puts the audit trail here rather than on the
+    ``merge_queued`` event.  ``get_merge_queue`` already carries ``lane`` per
+    queue item; what no existing surface can show is which SOURCE won, or
+    anything at all about a submission that coalesced and so never became a
+    queue item of its own.  Without this echo a caller that passed no ``lane``
+    has no way to learn whether its task's ``metadata.merge_lane`` was
+    honoured — the very blindness that let the key sit inert.
+    """
+
+    async def test_metadata_lane_is_echoed_with_its_source(self, tmp_path: Path):
+        result = await _submit_nonblocking(
+            tmp_path, _make_harness(metadata={'merge_lane': 'high'})
+        )
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'high', result
+        assert result.get('lane_source') == 'task_metadata', result
+
+    async def test_explicit_argument_is_named_as_the_source(self, tmp_path: Path):
+        """The metadata says ``'normal'`` and loses, so ``source`` is the tell.
+
+        Both sources would otherwise be indistinguishable from the lane alone
+        on a submission whose argument and metadata agree.
+        """
+        result = await _submit_nonblocking(
+            tmp_path, _make_harness(metadata={'merge_lane': 'normal'}), lane='high'
+        )
+        assert result.get('lane') == 'high', result
+        assert result.get('lane_source') == 'argument', result
+
+    async def test_neither_source_reports_the_default(self, tmp_path: Path):
+        """``'normal'`` alone cannot say whether anything asked for it."""
+        result = await _submit_nonblocking(tmp_path, _make_harness(metadata={}))
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'default', result
+
+    async def test_attached_response_carries_the_same_two_keys(self, tmp_path: Path):
+        """A coalesced submission never becomes its own queue item.
+
+        So this response is the only place its lane resolution is ever
+        observable: ``get_merge_queue`` lists the in-flight entry, not the
+        submission that attached to it.  The two keys report what THIS
+        submission resolved to; attaching does not move the in-flight entry
+        between lanes.
+        """
+        registry = InFlightMergeRegistry()
+        never: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '4888', 'other-task', never, request_id='mr-existing'
+        ), 'prerequisite: the registry must accept the first acquire'
+        try:
+            result = await _submit_nonblocking(
+                tmp_path,
+                _make_harness(metadata={'merge_lane': 'high'}),
+                registry=registry,
+            )
+        finally:
+            never.cancel()
+
+        assert result.get('status') == 'attached', result
+        assert result.get('lane') == 'high', result
+        assert result.get('lane_source') == 'task_metadata', result
