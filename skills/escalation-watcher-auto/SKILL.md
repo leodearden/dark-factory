@@ -813,15 +813,15 @@ Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>"`.
 mcp__escalation__promote_to_l2(
   task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
   agent_role="escalation-watcher-auto",
-  member_ids=[<esc_id>, ...],
-  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<esc-id>[+<esc-id>...]",
+  member_ids=[<the sentinel veto-streak L1 esc ids being clustered — NOT the pinning ids>, ...],
+  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>[+<pinning_esc_id>...]",
   evidence=(
     "Task <real_task_id> held by the same veto at <site> for <n> consecutive "
-    "sweeps over <span> (reason <reason>); pinned by <esc-ids with their ages>."
+    "sweeps over <span> (reason <reason>); pinned by <pinning_esc_ids with their ages>."
   ),
   options=[
-    "A: resolve or dismiss <esc-id> if it is stale — that releases task <real_task_id>",
-    "B: drive <esc-id> to completion; it is a live hold, not noise",
+    "A: resolve or dismiss <pinning_esc_id> if it is stale — that releases task <real_task_id>",
+    "B: drive <pinning_esc_id> to completion; it is a live hold, not noise",
     "C: retune or silence the detector via the green-tier recovery_emission knobs",
     "D: something else",
   ],
@@ -830,6 +830,8 @@ mcp__escalation__promote_to_l2(
   # severity omitted — inherited from the members, as in `infra_issue` above.
 )
 ```
+
+**The pinning escalations must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
 
 The options must name the **pinning escalation**, because resolving it is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did.
 
