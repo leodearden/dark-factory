@@ -88,6 +88,12 @@ enumerates ``_ARMS`` itself rather than a copy, asserts BOTH directions so
 the mapping can neither miss an arm nor keep a dead key, and asserts each
 stem is actually emitted.
 
+NO PRODUCTION CODE READS THIS TABLE, and that is its point rather than an
+oversight: it is a DECLARATION, and its readers are the reconcilers — the
+parity test above, and the calibration script's own copy which that test
+checks against this one. Stated here so a later agent weighing its deletion
+does not have to infer the purpose from an empty grep.
+
 The stems are NOT mechanically derivable from the arm names, which is exactly
 why this is an explicit table and not a rule: the four host arms gain a
 ``psi_`` prefix, ``own_cpu_some_avg10`` records as ``own_cpu_some10``
@@ -279,7 +285,18 @@ def collect_load_metrics(
         own_cgroup_path=own_cgroup_path, cgroup_root=cgroup_root
     )
     if not leaves:
-        logger.warning(
+        # Severity by CAUSE, because this fires on a 5 s oneshot: an
+        # unconditional warning here is 17,280 journal lines a day for a steady
+        # condition, which buries the per-tick logger.exception lines the three
+        # degrade handlers exist to surface. No anchor at all is STRUCTURAL and
+        # expected (a dev box, a container, any sampler outside a systemd user
+        # manager) -> debug. An anchor that resolved but enumerated nothing is a
+        # surprise worth a warning: we are in a user manager and it holds
+        # neither a df-*.slice nor an orchestrator-*.service. Either way the
+        # corpus stays the channel that matters -- absent own_read_ok:<leaf>
+        # rows make the condition countable without reading the journal.
+        say = logger.debug if _anchor_segments(own_cgroup_path) is None else logger.warning
+        say(
             'no pressure cgroups discovered under the anchor derived from %r; '
             'emitting no own_* rows rather than inventing a leaf name',
             own_cgroup_path,

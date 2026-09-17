@@ -20,7 +20,8 @@ The unit of writing is the TICK, not the row: write_tick(ts, unwindowed=,
 windowed=) reads every trailing window and inserts every row on one connection
 inside one transaction, so a tick's cost is flat in its metric count and a
 tick reaches the corpus whole or not at all (see its docstring for both
-measurements). insert_sample remains the single-row primitive.
+measurements). insert_sample remains the single-row primitive, with no
+production caller of its own -- see its docstring.
 
 Retention policy
 ----------------
@@ -148,9 +149,15 @@ class LoadSampleStore:
     ) -> None:
         """Insert a single sample row and commit.
 
-        The single-row primitive. ``write_tick`` is what the sampler uses; this
-        stays as the store's one-row write and the seam its own tests seed
-        through.
+        NO PRODUCTION CALLER, deliberately, and said here so nobody has to grep
+        to find out: every tick goes through ``write_tick``, and the ~30
+        remaining call sites are all in this store's own tests, seeding rows.
+
+        Kept rather than deleted because it is the store's one-row primitive —
+        the smallest honest unit of this interface — and because deleting it
+        would rewrite those call sites into ``write_tick(ts, unwindowed=...,
+        windowed={})``, which is a wordier way to say the same thing and drags
+        the windowing machinery into tests that are not about windows.
         """
         conn = self._connect()
         try:
@@ -196,9 +203,24 @@ class LoadSampleStore:
             batched ....  13.2 ms median (mean  15.1, max  34.6)
 
         23x, or 6.2% of the paired timer's 5 s cadence down to 0.26%, on a host
-        that also runs seven orchestrators. The cost is now flat in the metric
-        count, which is what actually matters: the cgroup leaf count is
-        DISCOVERED per tick and nothing here bounds it.
+        that also runs seven orchestrators.
+
+        What is FLAT in the metric count is the CONNECTION and fsync cost — one
+        of each per tick, whatever the vocabulary. The tick as a whole is not:
+        the trailing-window loop below still issues one indexed
+        ``ORDER BY ts DESC LIMIT`` per WINDOWED metric, and the load group is
+        routed there whole (``sampler.py::run_tick``), so even a 0/1
+        ``*_read_ok`` flag buys a window read. That is worth stating because the
+        cgroup leaf count is DISCOVERED per tick and nothing here bounds it — so
+        it was measured, same host and method, 40 timed ticks after 80 warm-up:
+
+            1 leaf ......   9 windowed metrics ....  4.5 ms median
+            100 leaves .. 207 windowed metrics .... 23.4 ms median
+
+        23x the metrics for 5.2x the time — the per-metric SELECT is real but
+        each one is an index seek, so 100 leaves is 0.47% of the cadence. Leaf
+        growth is affordable, not free; collapsing the N window reads into one
+        grouped query is the move if a host ever carries leaves in the thousands.
 
         ATOMICITY comes with it and is not incidental. Every read happens
         before any insert, and the single commit lands the whole tick or none

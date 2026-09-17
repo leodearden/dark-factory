@@ -906,7 +906,9 @@ class TestCollectLoadMetricsOwnPressure:
         tree.proc_cgroup_path.write_text('0::/system.slice/not-a-user-manager.service\n')
         resolve_own_cgroup.cache_clear()
 
-        with caplog.at_level(logging.WARNING, logger='sampler.metrics'):
+        # DEBUG, not WARNING: an unanchorable 0:: line is the structural case
+        # and is logged below warning level so a 5 s oneshot stays quiet.
+        with caplog.at_level(logging.DEBUG, logger='sampler.metrics'):
             result = collect_load_metrics(
                 read_runqueue=lambda **_kwargs: RunqueueReading(1.0, True),
                 proc_cgroup_path=tree.proc_cgroup_path,
@@ -965,6 +967,35 @@ class TestCollectLoadMetricsOwnPressure:
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any('user@1000.service' in msg for msg in warnings), (
             f'Expected a WARNING naming the attempted anchor; got: {warnings}'
+        )
+
+    def test_an_unanchorable_path_says_so_below_warning_level(self, tmp_path, caplog):
+        """The same "no leaves" outcome, at two severities, chosen by CAUSE.
+
+        Its sibling above resolves an anchor and finds it empty — a surprise,
+        so WARNING. Here there is no ``user@<uid>.service`` segment to anchor
+        at, which is the ordinary state of a dev box, a container, or any
+        sampler outside a systemd user manager. At the unit's 5 s cadence
+        warning on that would be 17,280 journal lines a day carrying no
+        information after the first, burying the per-tick ``logger.exception``
+        lines the three degrade handlers exist to surface.
+
+        Asserted as "no WARNING, and the DEBUG record still names the path",
+        not as "logger.debug was called": the operator-visible property is the
+        severity the journal filters on, and the diagnosis must survive the
+        downgrade rather than be silenced by it.
+        """
+        tree = build_cgroup_tree(tmp_path, groups={})
+
+        with caplog.at_level(logging.DEBUG, logger='sampler.metrics'):
+            result = _collect(tree, own_cgroup_path='/system.slice/nowhere.service')
+
+        assert [k for k in result if k.startswith('own_')] == []
+        assert result['runqueue_read_ok'] == 1.0
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('nowhere.service' in msg for msg in debug), (
+            f'the diagnosis was silenced rather than downgraded; got: {debug}'
         )
 
     def test_some_only_pressure_file_still_reads_ok(self, tmp_path):

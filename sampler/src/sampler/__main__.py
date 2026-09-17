@@ -68,7 +68,7 @@ def main() -> None:
     try:
         psi = collect_psi()
     except Exception:
-        logger.exception('Failed to collect PSI metrics; writing process metrics only')
+        logger.exception('Failed to collect PSI metrics; writing the other groups only')
         psi = {}
 
     try:
@@ -80,7 +80,7 @@ def main() -> None:
         # run_tick writes ZERO process rows — distinguishable from a fabricated
         # healthy 0.0.  Per-process NoSuchProcess/AccessDenied are still
         # silently skipped inside the counters (benign mid-scan deaths).
-        logger.exception('Failed to collect process metrics; writing PSI metrics only')
+        logger.exception('Failed to collect process metrics; writing the other groups only')
         process_metrics = {}
 
     try:

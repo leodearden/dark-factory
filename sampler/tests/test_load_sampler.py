@@ -574,6 +574,11 @@ class TestTickCostIsFlatInTheMetricCount:
         self._tick(store, 1_000_005, leaves=100)
         many = len(opened)
 
+        # A FLOOR before the equality, because both sides are spy counts: if the
+        # monkeypatched seam ever stops being the one write_tick uses — a
+        # connection helper, a pool, a module-level alias — both stay 0 and
+        # `0 == many` holds while measuring nothing.
+        assert few >= 1, 'the connect spy never fired — the seam has detached'
         assert few == many, (
             f'a 4-metric tick opened {few} connections and a 103-metric tick '
             f'opened {many}'
