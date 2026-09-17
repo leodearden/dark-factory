@@ -1839,8 +1839,11 @@ class Harness:
         # (which flows into build_workflow) to keep the resume payload clean.
         self._recovered_session_config_dirs: dict[str, str] = {}
         # session_resume_fallback streak (task γ storm escape, INV-4).
-        # Incremented in _run_slot on each UNEXPLAINED fallback ('stale' /
-        # 'no_transcript'); reset to 0 on any eligible resume. When it reaches
+        # Incremented on each GENUINE eligible-but-FAILED resume reported to
+        # note_resume_failed; reset to 0 by one that ADOPTED AND SURVIVED
+        # (note_resume_succeeded, task ε/3733) — never by a resume merely
+        # judged ELIGIBLE, which is a pre-dispatch predicate evaluated before
+        # the restore and so not a verdict on any outcome. When it reaches
         # session_resume.fallback_storm_threshold, one deduped L1 is filed.
         # By-design degradations do NOT feed it: disabled, capped, and (task
         # 3256) reseeded.
@@ -1852,7 +1855,8 @@ class Harness:
         # storm). The stamp below is the chain's comparison point, on the
         # MONOTONIC clock — 'stale' is itself produced by clock skew, so a
         # wall-clock decay would be corrupted by the very failure it detects.
-        # None means "no run in progress" (boot, or after an eligible resume).
+        # None means "no run in progress" (boot, or after a surviving resume
+        # retired one).
         self._session_resume_fallback_streak: int = 0
         self._last_session_resume_fallback_at: float | None = None
         # The EVIDENCE behind that streak (task ε/3733): the genuine
@@ -9565,12 +9569,24 @@ class Harness:
                     'role': recovered_session.get('role'),
                 }
                 if not reasons:
-                    # Break any storm run: the streak, the chain's comparison
-                    # point and the recorded failures go together, so the next
-                    # fallback starts a fresh run rather than chaining off a
-                    # pre-reset stamp (task 3256) and no retired run's evidence
-                    # can surface on a later L1 (task 3733).
-                    self._retire_session_resume_run()
+                    # ELIGIBILITY IS NOT SURVIVAL (task ε/3733), so the storm
+                    # run is not touched here. This predicate runs one whole
+                    # process-phase BEFORE the restore it was being read as a
+                    # verdict on — build_workflow is a few lines below, and
+                    # _invoke's restore later still — so retiring the run here
+                    # treated a not-yet-succeeded resume as a success, the exact
+                    # anti-masking rule note_resume_failed's own docstring
+                    # quotes. For ε's headline feeder (an archive-backed session
+                    # judged eligible BECAUSE δ's hoisted lookup found an
+                    # archive, whose restore then faults) every failure was
+                    # preceded by its own reset — eligible → 0 → fault → 1 —
+                    # so the streak could never exceed 1 and INV-4's escape was
+                    # unfireable.
+                    #
+                    # note_resume_succeeded, reported from the arm seam only
+                    # when a resume was adopted AND survived, is now the correct
+                    # and SOLE success reset; the rolling-window decay above
+                    # remains the only other way a run ends.
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,

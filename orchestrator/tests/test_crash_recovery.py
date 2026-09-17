@@ -2907,8 +2907,11 @@ class TestSessionResumeGuard:
         2026-09-04) had exactly this recoverable archive the predicate never
         consulted.
 
-        Also pins that adoption RESETS the storm streak: an archive-mediated
-        resume is a resume, so it breaks a fallback run like any other.
+        Also pins what adoption does NOT do: a storm run in progress survives
+        it untouched (task ε/3733). Adoption is an ELIGIBILITY verdict reached
+        before the restore, so on this very path — archive-mediated, the one δ
+        opened — the resume it adopts may still fault a phase later. Only a
+        resume that survived retires the run.
         """
         cfg = SessionResumeConfig()
         harness.config.session_resume = cfg
@@ -2933,7 +2936,7 @@ class TestSessionResumeGuard:
         assert resume_id is session
         emits = _session_resume_emits(harness)
         assert [et for et, _ in emits] == [EventType.session_resume]
-        assert _streak(harness) == 0
+        assert _streak(harness) == 2
 
     async def test_aged_out_archive_backed_session_still_falls_back(
         self, harness: Harness
@@ -3041,8 +3044,10 @@ class TestSessionResumeStorm:
 
     The streak is a rolling CHAIN, not a per-boot running total: consecutive
     means chained within storm_window_secs, so a gap at least that long decays
-    it to 0 (an eligible resume also resets it outright, and clears the chain's
-    comparison stamp).
+    it to 0 (a resume that ADOPTED AND SURVIVED also retires the run outright,
+    clearing the chain's comparison stamp and the recorded failures with it —
+    a resume merely judged ELIGIBLE does not, since that predicate runs before
+    the restore and settles nothing about its outcome).
 
     WHAT FEEDS IT is the part task 3728 changed. EVERY by-design outcome is now
     excluded by construction — 'disabled' (silent kill switch), 'capped'
@@ -3785,29 +3790,15 @@ class TestSessionResumeStorm:
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
 
-    async def test_eligible_resume_clears_fallback_timestamp(
-        self, harness: Harness, tmp_path: Path
-    ):
-        """An eligible resume clears the chain's comparison point as well as
-        the streak, so the next fallback starts a fresh run rather than
-        chaining off a pre-reset stamp (task 3256).
-        """
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        self._arm_synthetic_feeder(harness)
-        await _drive_session_slot(harness, 'ts0', self._fresh_session('uuid-ts0'))
-        assert _streak(harness) == 1
-        assert _chain_stamp(harness) is not None
-
-        del harness._session_resume_reasons  # a resume must be genuinely eligible
-        cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
-        await _drive_session_slot(
-            harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
-        )
-
-        assert _streak(harness) == 0
-        assert _chain_stamp(harness) is None
+    # β's `test_eligible_resume_clears_fallback_timestamp` stood here. Its
+    # whole subject was the retirement task ε/3733 deleted, and its real
+    # contract — that a reset clears the chain's comparison point and not only
+    # the streak (task 3256) — moved with the reset to the arm seam, where
+    # `test_success_report_retires_the_run` asserts it verbatim. Re-pointing it
+    # would have produced a duplicate of that row, or of
+    # `test_an_eligible_dispatch_never_retires_a_run_in_progress`, which
+    # asserts the stamp's survival along with the other two pieces of run
+    # state; neither is a second kind of coverage (SPOT).
 
     async def test_no_escalation_queue_never_raises(self, harness: Harness):
         """A bare harness (no escalation queue) must never raise on a fallback
