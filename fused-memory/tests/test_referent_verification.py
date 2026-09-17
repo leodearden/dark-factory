@@ -474,7 +474,19 @@ class TestSetMembershipCheck:
     async def test_a_cross_project_endpoint_is_a_different_referent(self, service):
         """The qualifier is a DIFFERENT-project signal and is never normalized
         away — flattening 'reify:132' onto 'Task 132' is precisely the
-        cross-project collapse utils/cross_project_refs.py exists to detect."""
+        cross-project collapse utils/cross_project_refs.py exists to detect.
+
+        REGISTERING 'reify' IS NOW LOAD-BEARING (task 4985), not scene-setting.
+        The set-membership arm skips a foreign-qualified endpoint whose
+        qualifier names no project the registry knows, so against the empty
+        registry this test's subject — the PARSE — would never be reached and
+        the assertion would pass for the wrong reason. Registering it keeps the
+        parse under test AND pins the guard's in-registry boundary from the
+        other side.
+        """
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
         result = _episode(
             edges=[_edge('e1', source='n-r132', target='n-x')],
             nodes=[MockNode(name='reify:132', uuid='n-r132'),
@@ -3453,3 +3465,176 @@ class TestResolvableFindingsAreJournalledDurably:
         assert [r['payload'] for r in rows] == [
             f.to_dict() for f in stats.findings
         ]
+
+
+class TestTheUnregisteredQualifierGuard:
+    """Guard (a) — the set-membership arm SKIPS a foreign-qualified endpoint
+    whose qualifier names no project this instance knows (task 4985).
+
+    Restores cancelled task 3335's guard-3 protection class in zeta's own
+    idiom; guard 3 died silently in the 3666 cherry-pick and is not portable
+    (it asked whether the episode touched a node named 'Task N', while zeta
+    inverts the direction and starts from an ENDPOINT).
+
+    The permissive scan is currently the ONLY thing protecting the live reify
+    node 'localhost:3939', and narrowing the producer (task 3881) would convert
+    it from protected to repairable — which is why this guard is prerequisite
+    to that narrowing.
+
+    Confined to the MEMBERSHIP arm: the pairing arm fires only when the
+    endpoint IS declared, where the qualifier carries no such signal.
+    """
+
+    @staticmethod
+    def _qualified_episode(name='redis:6379', uuid='n-redis', fact=''):
+        return _episode(
+            edges=[_edge('e1', fact=fact, source=uuid, target='n-x')],
+            nodes=[MockNode(name=name, uuid=uuid),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_qualifier_is_skipped_but_counted(self, service):
+        """(1) No finding — and the skip is LEGIBLE as a skip, never as an
+        agreement. `endpoints_checked` counts both, so a skipped endpoint
+        recorded nowhere would be indistinguishable from one that AGREED."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(), group_id='dark_factory',
+            referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+        assert stats.endpoints_unregistered_qualifier == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_a_registered_qualifier_is_checked_exactly_as_today(self, service):
+        """(2) The guard's boundary is the REGISTRY, not the qualifier's mere
+        presence."""
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='reify:132', uuid='n-r132'),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].check == 'set-membership'
+        assert stats.findings[0].endpoint_referent == Referent(
+            number='132', project_id='reify',
+        )
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_it_is_fail_closed_on_an_empty_registry(self, service):
+        """(3) NOT relaxed to "permissive until the registry is populated".
+
+        MemoryService is constructed BEFORE build_known_projects_map runs, so
+        `{}` is a real window; a permissive relaxation would leave exactly the
+        pre-registry window unprotected, which is the opposite of what a safety
+        guard is for. Skipping costs a detection, never a wrong repair.
+        """
+        assert service._known_projects == {}
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(), group_id='dark_factory',
+            referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bare_own_project_endpoint_is_untouched(self, service):
+        """(4a) project_id is empty, so the guard cannot fire. The dominant
+        live shape."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='Task 1251', uuid='n-1251'),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(number='1251')
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_a_self_qualified_endpoint_is_untouched(self, service):
+        """(4b) `local_referent` reclassifies a SELF-qualified spelling to the
+        bare local referent, so project_id is '' by the time the guard reads it
+        — own-project endpoints can never be skipped even if the registry
+        somehow lacks their own key."""
+        service.set_known_projects({})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='dark_factory:3127', uuid='n-df3127'),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(number='3127')
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_pairing_arm_is_untouched(self, service):
+        """(5) A foreign-qualified endpoint that IS in the declared referent
+        set, on an edge whose fact cites a DIFFERENT declared referent, still
+        yields a pairing finding even though its qualifier is unregistered."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        declared = (Referent(number='6379', project_id='redis'),
+                    Referent(number='3127'))
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(fact='This is really about Task 3127.'),
+            group_id='dark_factory', referents=declared,
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].check == 'per-edge-pairing'
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_counter_stays_zero_on_a_clean_episode(self, service):
+        """(6) And it is a plain ReferentStats field defaulting to 0."""
+        assert ReferentStats().endpoints_unregistered_qualifier == 0
+
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='Task 3127', uuid='n-3127'),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_live_regression_shape(self, service):
+        """(7) NAMED FOR A FUTURE READER. The reify node 'localhost:3939' is the
+        only non-project qualified-shape node in the fleet, and its two edges
+        differ only in whether the paraphrase happens to cite the endpoint.
+        Pre-fix it is repairable; post-fix it is skipped.
+
+        This is the protection class task 3335's guard 3 lost in the 3666
+        cherry-pick, and the one task 3881's registry narrowing depends on:
+        without it, narrowing the producer converts protected endpoints into
+        repairable ones.
+        """
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(
+                name='localhost:3939', uuid='n-localhost',
+                fact='The dashboard was served without incident.',
+            ),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 1
+        assert_never_repaired(service)
