@@ -29,6 +29,7 @@ from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
 
 from fused_memory.models.reconciliation import RunStatus
 from fused_memory.reconciliation import citation_repair
+from fused_memory.reconciliation.citation_repair import CITATION_REPAIRS_KEY
 
 RUN_ID = '06a4466d-cdc0-49ac-8e99-e6723be39392'
 DANGLING = 'beacf7fc-b76a-4c0b-876d-f4cf6d906d42'
@@ -819,6 +820,92 @@ class TestRepairJustificationGate:
             ]['items_flagged'][0]['citation_repairs'][0]
             assert record['reason'] == 'memory_not_found'
             assert record['justification'] == recorded
+        finally:
+            await journal.close()
+
+
+class TestRepairSelfSwapGate:
+    """Swapping a citation for ITSELF is a no-op, and must not report a repair.
+
+    A hazard the dangling-only design made unreachable: ``kept`` strips every
+    citation of ``memory_id`` and then appends the replacement only if it is not
+    already in ``kept``, so a self-swap removes the victim and puts it straight
+    back, leaving ``cited_memories`` unchanged.
+
+    What that produced BEFORE this gate, measured rather than assumed: the
+    read-after-write check notices the victim is still cited and answers
+    ``repair_clobbered`` — so the no-op is caught, but MISDIAGNOSED. Its hint
+    names a concurrent writer that never existed, sending an operator to look
+    for a race instead of at their own arguments; and the write has already
+    landed, so the durable blob keeps a ``citation_repairs`` record asserting a
+    repair that did not happen. Those records are append-only and nothing ever
+    removes one. A no-I/O refusal naming the real cause writes nothing at all.
+
+    Under ``memory_not_found`` it could not happen (an absent victim is an
+    absent replacement, so ``replacement_not_found`` fires first — also
+    measured), but the gate applies to BOTH classes: a self-swap is meaningless
+    under either, and a gate that fires for only one is a gate a reader has to
+    look up.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('reason', 'justification'),
+        [('memory_not_found', None), ('wrong_memory', WHY_WRONG)],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    @pytest.mark.parametrize(
+        'spelling',
+        [DANGLING, DANGLING.upper()],
+        ids=['same_case', 'differing_case'],
+    )
+    async def test_replacement_equal_to_victim_is_refused_before_any_io(
+        self, tmp_path, spelling, reason, justification
+    ):
+        """Case-insensitively equal, because that is what ``_is_citation_of`` matches.
+
+        Neither backend normalises UUID case on read-back, so an
+        upper-cased replacement is the SAME citation and would be re-appended
+        by the same dedupe path — the refusal has to use the same comparison the
+        matcher does, or the gate has a hole exactly where the matcher does not.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=spelling,
+                repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'replacement_is_victim'
+            assert outcome['error_type'] == 'ReconCitationReplacementIsVictim'
+            assert 'status' not in outcome
+
+            # What the refusal bought: the blob is in exactly the state the
+            # no-op would have left it — victim still cited once — but WITHOUT
+            # the provenance record the pre-gate path had already written.
+            finding = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            assert [c['memory_id'] for c in finding['cited_memories']] == [DANGLING]
+            assert CITATION_REPAIRS_KEY not in finding
         finally:
             await journal.close()
 
