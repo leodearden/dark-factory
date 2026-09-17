@@ -4506,6 +4506,32 @@ class MemoryService:
                         # never reach here at all: `local_referent` reclassifies
                         # a SELF-qualified spelling to the bare local referent,
                         # so its project_id is '' by the time this reads it.
+                        #
+                        # WHY A COUNT IS THE WHOLE STATS RECORD HERE, where the
+                        # sibling plausibility guard refuses to be folded into
+                        # `_candidate_pool` precisely to avoid "erasing the
+                        # evidence that a junk referent was declared at all".
+                        # The discriminator is WHERE THE EVIDENCE LIVES. There
+                        # it is the DECLARED referent set: in-episode, and gone
+                        # the moment this pass returns, so a record is the only
+                        # copy. Here it is the ENDPOINT'S OWN NAME, already
+                        # durable in the graph and re-read by every later scan
+                        # — skipping it erases nothing and defers nothing.
+                        #
+                        # A `ReferentFinding` is also not a neutral note: it is
+                        # eta's work queue, and its refusals land in
+                        # `flagged_unrepairable` on the operator surface. Filing
+                        # one would ASSERT the conflation this guard exists
+                        # because we do not believe, so a fleet of host:port
+                        # endpoints would read there as a scanner regression.
+                        # The count carries the one thing a caller cannot
+                        # re-derive — whether this guard fired at all, which is
+                        # the question whose answer is actionable (an
+                        # under-populated registry; remedy `set_known_projects`).
+                        # The per-endpoint identity rides the INFO line below.
+                        # If an operator ever needs to act per ENDPOINT rather
+                        # than per registry, widen this stats record; do not
+                        # fabricate a finding to carry it.
                         stats.endpoints_unregistered_qualifier += 1
                         logger.info(
                             'Referent verification skipped an endpoint whose '
