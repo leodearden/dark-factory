@@ -66,6 +66,11 @@ DEFAULT_STALL_THRESHOLD_SECONDS = 90.0
 SIGTERM_UNSERVICED = "sigterm-unserviced"
 STOPPED_ON_SIGNAL = "stopped-on-signal"
 SELF_RECOVERED = "self-recovered"
+# The fourth answer is that the question does not apply: the three above all
+# describe how a BLOCKED LOOP answered a stop signal, and a silence that begins
+# with the unit already stopped had no loop to block. Named rather than folded
+# into 'self-recovered', which would tell a reader the loop resumed on its own.
+UNIT_DOWN = "unit-down"
 
 # scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict's own words,
 # reused verbatim so this output collates with its journal lines instead of
@@ -269,8 +274,19 @@ class StallEpisode:
         return (self.stall_ended_at - self.stall_started_at).total_seconds()
 
     @property
+    def began_with_unit_down(self) -> bool:
+        """Was the unit already stopped when this silence began?
+
+        The single fact both :attr:`outcome` and :attr:`watchdog_verdict` turn
+        on, asked once so the two can never disagree about it.
+        """
+        return any(marker in self.last_line_before_stall for marker in _UNIT_DOWN_MARKERS)
+
+    @property
     def outcome(self) -> str:
         """Whether the loop was still blocked when systemd tried to stop it."""
+        if self.began_with_unit_down:
+            return UNIT_DOWN
         if any(marker in line for line in self.aftermath for marker in _SIGKILL_MARKERS):
             return SIGTERM_UNSERVICED
         if any(marker in line for line in self.aftermath for marker in _STOP_MARKERS):
@@ -287,9 +303,7 @@ class StallEpisode:
         served by the same blocked loop — fails: that is 'wedged'. A gap that
         begins after the unit is already down is 'port-down' instead.
         """
-        if any(marker in self.last_line_before_stall for marker in _UNIT_DOWN_MARKERS):
-            return PORT_DOWN
-        return WEDGED
+        return PORT_DOWN if self.began_with_unit_down else WEDGED
 
     @property
     def aftermath(self) -> tuple[str, ...]:

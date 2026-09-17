@@ -330,10 +330,11 @@ def test_every_stall_reports_the_watchdog_verdict_its_probe_would_have_returned(
 def test_a_silence_that_begins_with_the_unit_already_down_reports_port_down():
     """The other half of the verdict, and the half the diagnosis leans on: a
     silence whose last preceding line is the unit's own stop accounting is a
-    DOWN window, so the probe never reached a bound socket at all. The outcome
-    vocabulary describes how a blocked loop answered a signal and says nothing
-    useful here; this verdict is what tells a reader the silence was never a
-    stall.
+    DOWN window, so the probe never reached a bound socket at all.
+
+    The outcome says so too rather than reporting `self-recovered`, which would
+    tell a reader the loop resumed on its own when in fact there was no blocked
+    loop here at all.
 
     Unpinned, both this reading and _UNIT_DOWN_MARKERS are free: returning
     'wedged' unconditionally leaves the rest of the suite green.
@@ -343,6 +344,7 @@ def test_a_silence_that_begins_with_the_unit_already_down_reports_port_down():
     assert len(episodes) == 1
     assert episodes[0].stall_seconds == 240.0
     assert episodes[0].watchdog_verdict == "port-down"
+    assert episodes[0].outcome == "unit-down"
 
 
 # ---------------------------------------------------------------------------
