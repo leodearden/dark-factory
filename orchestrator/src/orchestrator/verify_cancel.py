@@ -46,6 +46,18 @@ Cross-host rollout
 Both the server and the laptop host run the ``df`` checkout, so landing this
 module on ``main`` ships the cancellation contract to the laptop via its
 normal checkout sync — no separate deploy step required.
+
+Self-kill report
+----------------
+The stdin watchdog (:func:`start_stdin_watchdog`) cancels the same subtree
+when the *dispatch channel itself* dies, and — having no structured return
+path left after ``os._exit`` — reports why in one
+``WATCHDOG_FIRE_TRIGGER_TOKEN=<WatchdogTrigger>`` line on stderr.  That line
+is a wire format, so this module owns both ends of it: the tokens, and the
+:func:`elide_middle` / :data:`JOURNALD_LINE_MAX_BYTES` pair that keeps the
+token alive when the dispatcher relays a huge remote stderr into journald.
+``merge_queue.py``'s ``except RunnerUnavailable`` handler imports that pair
+from here rather than respelling the protocol at the receiving end.
 """
 
 from __future__ import annotations
@@ -56,9 +68,12 @@ import os
 import re
 import select
 import signal
+import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -852,9 +867,63 @@ WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
 WATCHDOG_KILL_GRACE_SECS: float = 5.0
 
 
+class WatchdogTrigger(StrEnum):
+    """Which :func:`run_stdin_watchdog` branch judged the dispatch channel dead.
+
+    The two branches have nothing in common but the kill they cause: ``EOF``
+    means the writing end closed the channel (the orchestrator died, or ssh
+    dropped), ``HEARTBEAT_STARVATION`` means no beat arrived inside the
+    window (a hard partition, or a timeout tuned too tight for this host).
+
+    The member *values* are the tokens that cross the ssh stderr channel back
+    to the dispatcher (see :func:`fire_watchdog_kill`), so this enum is their
+    single definition — emitter and operator grep cannot drift apart.
+    """
+
+    EOF = 'eof'
+    HEARTBEAT_STARVATION = 'heartbeat_starvation'
+
+
+#: Key of the ``<key>=<trigger>`` pair :func:`fire_watchdog_kill` writes to
+#: stderr just before self-terminating.  Named rather than inlined so the
+#: emitter and the tests that pin the operator's ``journalctl | grep`` cannot
+#: drift apart.
+WATCHDOG_FIRE_TRIGGER_TOKEN: str = 'watchdog_fire_trigger'
+
+
+JOURNALD_LINE_MAX_BYTES: int = 48 * 1024
+"""journald's default ``LineMax``. Every orchestrator unit sets
+``StandardError=journal``, so a longer line is truncated by the journal itself
+— silently, and from the tail, which is exactly where
+:data:`WATCHDOG_FIRE_TRIGGER_TOKEN` lands in a relayed remote stderr."""
+
+
+def elide_middle(text: str, *, head: int = 200, tail: int = 800) -> str:
+    """Keep the first *head* and last *tail* characters, naming how many were dropped.
+
+    For strings whose two informative ends sit either side of an arbitrarily
+    large middle, where a plain head or tail slice would discard one of them.
+    A dead remote's relayed stderr is logged this way: the ssh rc is at its
+    head and :data:`WATCHDOG_FIRE_TRIGGER_TOKEN` at its tail, with a whole
+    verify's INFO logging in between.
+
+    *head* and *tail* are counts of characters to KEEP, so zero keeps nothing
+    from that end and a *text* no longer than their sum comes back verbatim.
+
+    The defaults sum to 1000 characters — at most 4 KiB of UTF-8, far below
+    :data:`JOURNALD_LINE_MAX_BYTES`, which is the number to check against
+    before widening either end.
+    """
+    if len(text) <= head + tail:
+        return text
+    # Not ``text[-tail:]``: at tail=0 that is ``text[0:]``, the whole string.
+    kept_tail = text[-tail:] if tail else ''
+    return f'{text[:head]}…<{len(text) - head - tail} chars elided>…{kept_tail}'
+
+
 def run_stdin_watchdog(
     read_fd: int,
-    on_fire,
+    on_fire: Callable[[WatchdogTrigger], None],
     *,
     heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     select_fn=select.select,
@@ -879,18 +948,20 @@ def run_stdin_watchdog(
       resets and the loop continues watching.
 
     *on_fire* is called at most once — the function returns immediately
-    afterward.  *select_fn* / *read_fn* are injectable (default
+    afterward — with the :class:`WatchdogTrigger` naming the branch taken, so
+    a self-kill stays attributable to one of those two very different causes
+    everywhere downstream.  *select_fn* / *read_fn* are injectable (default
     ``select.select`` / ``os.read``) so tests can script deterministic fd-0
     behavior without a real pipe or wall-clock waits.
     """
     while True:
         ready, _, _ = select_fn([read_fd], [], [], heartbeat_timeout)
         if not ready:
-            on_fire()
+            on_fire(WatchdogTrigger.HEARTBEAT_STARVATION)
             return
         data = read_fn(read_fd, read_size)
         if data == b'':
-            on_fire()
+            on_fire(WatchdogTrigger.EOF)
             return
         # Non-empty data: a heartbeat arrived -- window resets, keep watching.
 
@@ -898,6 +969,7 @@ def run_stdin_watchdog(
 def fire_watchdog_kill(
     pgid: int,
     *,
+    trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
     ppid_map_provider=read_ppid_map,
     kill=os.kill,
@@ -905,6 +977,7 @@ def fire_watchdog_kill(
     sleep=time.sleep,
     exit_fn=os._exit,
     exit_code: int = 1,
+    stderr=None,
 ) -> None:
     """Kill the build subtree rooted at *pgid* and unconditionally self-terminate.
 
@@ -930,11 +1003,21 @@ def fire_watchdog_kill(
       abandoned verify-merge leader always terminates (freeing its flock and
       letting sshd reap it) even if some descendant could not be killed.
 
+    *trigger* names the :func:`run_stdin_watchdog` branch that judged the
+    channel dead.  It is REPORTED, never acted on -- the kill sequence is
+    identical for both branches -- and it is required and keyword-only so no
+    call site can omit the branch identity and make a self-kill
+    unattributable again.  *stderr* (default ``sys.stderr``, resolved at call
+    time) is the channel it is reported on: once ``exit_fn`` has run there is
+    no structured return path left, and on a remote verify this stderr is the
+    only thing the dispatcher still sees.
+
     Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
     (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
     a permission race is fine, this is a best-effort escalation), sleep
     *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), then ``exit_fn(exit_code)`` as the final action.
+    (same suppression), report the trigger on stderr, then
+    ``exit_fn(exit_code)`` as the final action.
     """
     ppid_map = ppid_map_provider()
     descendants = collect_descendants(pgid, ppid_map)
@@ -950,6 +1033,15 @@ def fire_watchdog_kill(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             kill(pid, signal.SIGKILL)
 
+    # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
+    # buffered line would be dropped.  Suppress everything: a failed
+    # diagnostic (broken pipe on a dead ssh channel) must never prevent the
+    # self-exit that frees the flock and lets sshd reap the leader.
+    stream = stderr if stderr is not None else sys.stderr
+    with contextlib.suppress(Exception):
+        stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
+        stream.flush()
+
     exit_fn(exit_code)
 
 
@@ -961,7 +1053,7 @@ def start_stdin_watchdog(
     read_fd: int = 0,
     select_fn=select.select,
     read_fn=os.read,
-    fire=None,
+    fire: Callable[[WatchdogTrigger], None] | None = None,
 ) -> threading.Thread:
     """Spawn a started daemon thread running :func:`run_stdin_watchdog` against *read_fd*.
 
@@ -973,12 +1065,13 @@ def start_stdin_watchdog(
     thread never blocks interpreter shutdown on its own.
 
     *fire* is injectable for tests (default: a closure over
-    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).
-    *select_fn* / *read_fn* / *read_fd* pass through to
-    :func:`run_stdin_watchdog`.
+    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).  It is
+    called with the :class:`WatchdogTrigger` naming the branch that fired,
+    which the default callback forwards on.  *select_fn* / *read_fn* /
+    *read_fd* pass through to :func:`run_stdin_watchdog`.
     """
     on_fire = fire if fire is not None else (
-        lambda: fire_watchdog_kill(pgid, grace_secs=grace_secs)
+        lambda trigger: fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
     )
     thread = threading.Thread(
         target=run_stdin_watchdog,
