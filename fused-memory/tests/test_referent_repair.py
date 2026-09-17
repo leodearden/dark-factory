@@ -1798,17 +1798,46 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
         # line that read scope off the record would be visible here.
         assert payload['group_id'] == 'dark_factory'
         assert _finding().group_id == 'reify'
-        # The payload IS the audit record plus exactly the two facts that
-        # record does not hold. Pinned as a key set rather than by value,
-        # because `deleted_emptied_node` is stamped onto the record AFTER
-        # this line is emitted.
-        assert set(payload) == set(stats.repairs[0].to_dict()) | {
-            'group_id', 'old_endpoint_name',
-        }
+        # The payload IS the audit record, MINUS the one field that is not yet
+        # determined when the line is emitted, PLUS exactly the two facts the
+        # record does not hold.
+        assert set(payload) == (
+            set(stats.repairs[0].to_dict()) - {'deleted_emptied_node'}
+        ) | {'group_id', 'old_endpoint_name'}
         # `intended_referent` already IS the new endpoint's canonical
         # `node_name`, so a `new_endpoint_name` key would be the same value
         # twice in one payload under two names.
         assert 'new_endpoint_name' not in payload
+
+    @pytest.mark.asyncio
+    async def test_the_line_omits_the_field_that_is_not_settled_yet(
+        self, service, caplog,
+    ):
+        """`deleted_emptied_node` is stamped onto the record by
+        `_cleanup_emptied_nodes` STRICTLY AFTER this line is emitted, so on the
+        line it would read `''` for every repair ever logged — including this
+        one, whose old endpoint IS then deleted. A key that is constant by
+        construction is worse than a missing one: it invites a consumer to
+        aggregate over it and it contradicts the delete's own INFO line.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        # The cleanup really did fire for this repair — otherwise the omission
+        # below would be pinning the uninteresting half of the case.
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert 'deleted_emptied_node' in stats.repairs[0].to_dict()
+        payload = self._payload(self._success_lines(caplog)[0])
+        assert 'deleted_emptied_node' not in payload
+        # And the deletion still announces itself on its own line.
+        assert any(
+            isinstance(r.msg, str) and 'emptied' in r.msg
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_the_old_endpoint_uuid_is_the_reread_not_the_findings_copy(

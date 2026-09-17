@@ -5365,10 +5365,26 @@ class MemoryService:
                 # no `isEnabledFor` guard, unlike the verify pass's finding log,
                 # because that one runs per finding on the DOMINANT shape and
                 # this one at most once per executed repair.
+                #
+                # SETTLED FACTS ONLY, which is why `deleted_emptied_node` is
+                # dropped rather than carried. `_cleanup_emptied_nodes` stamps
+                # it onto the record by `dataclasses.replace` strictly AFTER
+                # this loop, so here it is `''` for EVERY repair — including
+                # the ones whose old endpoint is about to be deleted. Reporting
+                # it would hand an aggregating consumer a value that is
+                # constant by construction and that contradicts the `deleted
+                # emptied node` INFO line the cleanup emits moments later. The
+                # deletion has its own line; this one says only what is true
+                # when it is emitted.
+                settled = {
+                    key: value
+                    for key, value in record.to_dict().items()
+                    if key != 'deleted_emptied_node'
+                }
                 logger.info(
                     'Referent repair executed: %s',
                     {
-                        **record.to_dict(),
+                        **settled,
                         'group_id': group_id,
                         'old_endpoint_name': finding.old_endpoint_name,
                     },
