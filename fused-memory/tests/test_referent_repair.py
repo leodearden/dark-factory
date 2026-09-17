@@ -40,6 +40,7 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
+    _implausible_target_reason,
     MemoryService,
     ReconcileStats,
     ReferentFinding,
@@ -2831,3 +2832,93 @@ class TestTheDuplicateNameRefusal:
         assert 'falkor down' in stats.repairs[0].reason
         assert stats.failed == 1
         assert stats.flagged_unrepairable == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-7/8: _implausible_target_reason — the pure plausibility rule
+# ---------------------------------------------------------------------------
+
+_LIVE_REGISTRY = {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'}
+
+
+class TestImplausibleTargetReason:
+    """The pure rule deciding whether a nominated repair target is plausible.
+
+    `_candidate_pool`'s whole-set fallback nominates a target from the DECLARED
+    set with no test of its plausibility, so a junk derived referent surviving
+    the pool's three vetoes becomes a phantom node with a real edge repointed
+    onto it.  Executed live: referents={redis:6379}, cited={}, endpoint=Task
+    1251 yields candidates=('redis:6379',) and resolvable=True.
+
+    Unit-tested in isolation from the walk that drives it, the same discipline
+    `_candidate_pool` / `_candidate_targets` / `_unresolvable_reason` follow and
+    the stated reason those three are module-level.
+
+    '' means PLAUSIBLE, so the fail-closed direction is the non-empty string.
+    """
+
+    def test_a_registered_qualifier_is_plausible(self):
+        """(i) The qualifier names a project the registry knows, so the node
+        belongs to a real cross-project reference."""
+        assert _implausible_target_reason(
+            Referent(number='132', project_id='reify'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        ) == ''
+
+    def test_a_bare_own_project_task_is_plausible_whatever_the_registry_says(self):
+        """(ii) The dominant live shape. A bare `Task N` referent names this
+        project's own task, and no registry lookup can say otherwise."""
+        for registry in (_LIVE_REGISTRY, {}):
+            assert _implausible_target_reason(
+                Referent(number='3127'),
+                known_projects=registry,
+                target_node_exists=False,
+            ) == ''
+
+    def test_an_existing_node_is_its_own_evidence(self):
+        """(iii) A node with that exact name already exists in the group, so
+        repointing onto it MINTS NOTHING — which is what the guard exists to
+        prevent. The qualifier being unregistered does not outrank that."""
+        assert _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=True,
+        ) == ''
+
+    def test_an_unregistered_qualifier_with_no_node_is_refused(self):
+        """THE LIVE DEFECT. 'redis:6379' names no project the registry knows and
+        no node that exists, so a repair would MINT one."""
+        reason = _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        )
+        assert reason
+        assert 'redis:6379' in reason
+
+    def test_the_reason_says_both_things_that_make_it_implausible(self):
+        """(6) A whole sentence an operator can act on: the qualifier names no
+        known project AND no such node exists, so the repair would mint one."""
+        reason = _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        )
+        assert 'redis' in reason
+        assert 'mint' in reason.lower()
+        # Carried VERBATIM onto the record, like _unresolvable_reason's output:
+        # no leading/trailing formatting of its own beyond the target name.
+        assert reason == reason.strip()
+        assert not reason.startswith(('-', '*', '['))
+
+    def test_it_is_fail_closed_on_an_unpopulated_registry(self):
+        """(5) A qualified referent is refused even when it names a project that
+        WOULD be in a fully-populated registry. MemoryService is constructed
+        before build_known_projects_map runs, so `{}` is a real window, and
+        "permissive until populated" would leave exactly that window open."""
+        assert _implausible_target_reason(
+            Referent(number='132', project_id='reify'),
+            known_projects={},
+            target_node_exists=False,
+        ) != ''
