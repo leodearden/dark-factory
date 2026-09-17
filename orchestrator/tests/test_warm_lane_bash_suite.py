@@ -322,12 +322,19 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     removes one whose test is still listed.  PRD leaf κ needs that condition to
     be false before it deletes reify's originals.
 
-    ``lib_live_refs.sh`` and ``lib_portable.sh`` are excluded from the key set by
-    decision, not oversight: both are ``source``-only, neither has a ``--help``
-    or any invocable entry point, and both are covered *transitively* — the
-    gc/gc-sweep ``exit 2``-on-missing-sibling assertions (``test_warm_lane_gc.sh``
-    A9) exercise ``lib_live_refs.sh``, and ``test_warm_lane_audit.sh`` exercises
-    ``lib_portable.sh`` on every audit invocation.
+    The ``lib_`` prefix is excluded from the key set by decision, not oversight:
+    every one of those files is ``source``-only, none has a ``--help`` or any
+    invocable entry point, and each is covered *transitively* by the script that
+    sources it —
+
+    * ``lib_live_refs.sh`` by the gc/gc-sweep ``exit 2``-on-missing-sibling
+      assertions (``test_warm_lane_gc.sh`` A9);
+    * ``lib_portable.sh`` by ``test_warm_lane_audit.sh``, on every audit
+      invocation;
+    * ``lib_lane_state.sh`` by the same audit suite's Block L and by
+      ``test_lane_state_lib.py``, which pins it directly;
+    * ``lib_task_citation.sh`` by ``test_warm_lane_degenerate_ref.sh``, whose
+      every classification runs through it (task 5566).
     """
     invocable = {
         p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')
