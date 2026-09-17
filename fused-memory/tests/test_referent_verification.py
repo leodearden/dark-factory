@@ -2561,6 +2561,139 @@ def _records_for(caplog, edge_uuid: str) -> list[logging.LogRecord]:
             if f"'edge_uuid': '{edge_uuid}'" in r.getMessage()]
 
 
+class TestTargetCitedTellsTheTwoEvidenceArmsApart:
+    """`ReferentFinding.target_cited` — WHICH EVIDENCE ARM nominated this target.
+
+    `_candidate_pool` returns `cited & referents` whenever that intersection is
+    non-empty and the whole declared set otherwise, so a target drawn from the
+    whole-set FALLBACK can never be in `cited` (if it were, the intersection
+    would have been non-empty) and a target drawn from the INTERSECTION always
+    is.  The arm is therefore readable off the record with no stored flag.
+
+    The structural twin of `corroborated` one property up: same class, same
+    rendered-`node_name` comparison, same "a stored boolean is a second site
+    that must agree with `_candidate_pool` byte-for-byte" rationale (the INV-5
+    lockstep duplication that produced esc-3671-3's blocking bug), and the same
+    injectivity precondition, already pinned by
+    `test_node_name_is_injective_over_the_registered_kinds`.
+
+    Its consumer is the repair pass's target-plausibility guard, which applies
+    ONLY on the fallback arm.
+    """
+
+    def test_true_when_the_fact_cites_the_target(self):
+        """(1) The INTERSECTION arm."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=('Task 3127',),
+            resolvable=True,
+        ).target_cited is True
+
+    def test_false_when_the_fact_cites_nothing(self):
+        """(2) The whole-set fallback on a paraphrased fact naming no task
+        number — `_candidate_pool`'s own docstring calls this "the routine
+        extraction outcome"."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=(),
+            resolvable=True,
+        ).target_cited is False
+
+    def test_false_when_the_citations_name_only_other_referents(self):
+        """(3) The fallback reached because `cited & referents` was empty."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=('Task 9999',),
+            resolvable=True,
+        ).target_cited is False
+
+    def test_false_when_no_target_was_nominated(self):
+        """(4) An unresolvable finding nominates no target, and the fail-closed
+        answer is "not cited" — the direction that REFUSES."""
+        assert _finding(
+            intended_referent=None, cited=('Task 3127',),
+        ).target_cited is False
+
+    def test_it_compares_canonical_node_names_not_spellings(self):
+        """(5) The same discrimination the `corroborated` sibling pins: a
+        foreign-qualified citation does not match a bare local target of the
+        same number, and vice versa."""
+        assert _finding(
+            intended_referent=Referent(number='132'),
+            cited=('reify:132',),
+            resolvable=True,
+        ).target_cited is False
+
+        assert _finding(
+            intended_referent=Referent(number='132', project_id='reify'),
+            cited=('Task 132',),
+            resolvable=True,
+        ).target_cited is False
+
+        assert _finding(
+            intended_referent=Referent(number='132', project_id='reify'),
+            cited=('reify:132',),
+            resolvable=True,
+        ).target_cited is True
+
+    @pytest.mark.parametrize(('referents', 'cited', 'endpoint', 'ambiguous', 'source'), [
+        # INTERSECTION arm: the fact cites a declared referent.
+        (('3127', '3129'), ('3127',), '3200', (), 'derived'),
+        (('3127',), ('3127', '9999'), '3200', (), 'metadata'),
+        # FALLBACK arm: the fact cites nothing, or nothing declared.
+        (('3127',), (), '3200', (), 'derived'),
+        (('3127',), ('9999',), '3200', (), 'declared'),
+        # VETO 1 — an ambiguous endpoint empties the pool.
+        (('3127',), ('3127',), '3200', ('3200',), 'derived'),
+        # VETO — the fact cites the endpoint itself (corroboration).
+        (('3127',), ('3127', '3200'), '3200', (), 'derived'),
+        # VETO 2 — a source='metadata' fallback.
+        (('3127',), (), '3200', (), 'metadata'),
+    ])
+    def test_it_is_equivalent_to_the_pool_having_taken_the_intersection_arm(
+        self, referents, cited, endpoint, ambiguous, source,
+    ):
+        """(6) DERIVED FROM `_candidate_pool`, not restated from it.
+
+        This is what makes "target in cited <=> intersection arm" a CHECKED
+        property of the pool rather than a claim in a comment: a future change
+        to the pool reds here instead of silently re-licensing the repair
+        pass's plausibility guard.
+        """
+        referent_set = frozenset(Referent(number=n) for n in referents)
+        cited_set = frozenset(Referent(number=n) for n in cited)
+        endpoint_ref = Referent(number=endpoint)
+        ambiguous_set = frozenset(Referent(number=n) for n in ambiguous)
+
+        pool = memory_service_module._candidate_pool(
+            referents=referent_set, cited=cited_set, endpoint=endpoint_ref,
+            ambiguous=ambiguous_set, source=source,
+        )
+        candidates = memory_service_module._candidate_targets(
+            referents=referent_set, cited=cited_set, endpoint=endpoint_ref,
+            other_endpoint=None, ambiguous=ambiguous_set, source=source,
+        )
+        if len(candidates) != 1:
+            # A VETO ROW. It nominates no target at all, so the guard this
+            # property feeds is never reached — which is the assertion, not a
+            # reason to skip: a veto that stopped emptying the pool would show
+            # up here as a survivor appearing where none may.
+            assert not pool
+            return
+
+        finding = _finding(
+            endpoint_referent=endpoint_ref,
+            referent_set=tuple(sorted(r.node_name for r in referent_set)),
+            cited=tuple(sorted(r.node_name for r in cited_set)),
+            intended_referent=candidates[0],
+            resolvable=True,
+        )
+        took_the_intersection_arm = bool(cited_set & referent_set) and (
+            pool == (cited_set & referent_set)
+        )
+        assert finding.target_cited is took_the_intersection_arm
+
+
 class TestCorroboratedFindingsAreNotOperatorWarnings:
     """S1 (esc-3671-3): the membership arm's counterpart of the discipline the
     pairing arm already keeps.
