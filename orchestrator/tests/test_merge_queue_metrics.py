@@ -6,6 +6,9 @@ Covers:
     zero-valued before any work, and additive beside the pre-existing keys.
   * The call-site wiring, driven end-to-end: a real merge that lands moves
     ``landings_total``, and a real merge conflict records a drift sample.
+  * Per-request drift-base isolation, driven end-to-end: a conflict counts
+    only the landings since ITS OWN merge-start, so a landing that consumed
+    another in-flight request's drift base is caught.
 
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's former drive mechanism. The wiring used to be exercised by calling the
@@ -32,6 +35,7 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.ports import VerifyPort
 from orchestrator.merge_queue import MergeMetrics, MergeRequest
 from orchestrator.merge_types import QueuedBranch
 
@@ -127,20 +131,68 @@ async def _prepare(
     return request
 
 
-@contextlib.asynccontextmanager
-async def _running_lane(git_ops: GitOps):
-    """A running single-host lane whose scoped verify always passes.
+class _MergeGatedGitOps(GitOps):
+    """A ``GitOps`` whose ``merge_to_main`` parks on an event for ONE branch.
 
-    Teardown goes through ``stop()`` -- the lane's own shutdown protocol, which
+    A SUBCLASS rather than a ``patch``/``setattr``: ``git_ops`` is a
+    constructor parameter of ``MergeLane``, so scripting a PUBLIC method of an
+    injected collaborator is the same category of seam as the injected
+    ``FakeVerifier`` -- it needs no patching and no private access, and keeps
+    this file at its ratchet baseline of 0 patch targets and 0 private reads.
+
+    Parking inside ``merge_to_main`` is what makes a drift drive
+    deterministic: the lane stashes a request's drift base immediately before
+    merging it, and that window is otherwise only a handful of awaits wide.
+    ``at_gate`` being set is proof the base has already been stashed, so a
+    test can hold the gated request there for as long as it needs while it
+    drives another request all the way to a landing.
+    """
+
+    def __init__(self, config: GitConfig, root: Path, *, branch: str) -> None:
+        super().__init__(config, root)
+        self._gated_branch = branch
+        self.at_gate = asyncio.Event()
+        self.release_merge = asyncio.Event()
+
+    async def merge_to_main(self, worktree: Path, branch: str, **kwargs: Any) -> Any:
+        if branch == self._gated_branch:
+            self.at_gate.set()
+            await self.release_merge.wait()
+        return await super().merge_to_main(worktree, branch, **kwargs)
+
+
+@contextlib.asynccontextmanager
+async def _running_lane(
+    git_ops: GitOps,
+    *,
+    verifier: VerifyPort | None = None,
+    speculation_depth: int = 1,
+    gates: tuple[asyncio.Event, ...] = (),
+):
+    """A running single-host lane; its scoped verify passes unless scripted.
+
+    Every keyword defaults to today's behaviour, so the plain
+    ``_running_lane(git_ops)`` call sites are unchanged: an always-passing
+    ``FakeVerifier``, one merge ahead, and no gates.
+
+    Teardown releases every gate in *gates* BEFORE stopping, so a failing
+    assertion can never leave a verify or a merge parked and hang the stop.
+    It then goes through ``stop()`` -- the lane's own shutdown protocol, which
     resolves in-flight request futures, drains its queues, cleans merge
     worktrees and releases leases, and is internally bounded so it cannot hang.
     """
     queue: asyncio.Queue = asyncio.Queue()
-    lane = MergeLane(git_ops, queue, verifier=FakeVerifier())
+    lane = MergeLane(
+        git_ops, queue,
+        speculation_depth=speculation_depth,
+        verifier=FakeVerifier() if verifier is None else verifier,
+    )
     lane_task = asyncio.ensure_future(lane.run())
     try:
         yield lane, queue
     finally:
+        for gate in gates:
+            gate.set()
         # Exception, not BaseException: this must not swallow a CancelledError
         # aimed at the enclosing test task (or a KeyboardInterrupt).
         with contextlib.suppress(Exception):
