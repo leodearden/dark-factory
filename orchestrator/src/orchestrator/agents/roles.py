@@ -834,6 +834,179 @@ that replacing all of them is what you wanted.
 """
 
 
+# Census finding, task 5331 (`metadata.source: legibility_census`),
+# reproduced first-hand in the founding session and again on revalidation
+# 2026-09-17:
+#
+#     Grep(pattern='config\.(?!git|project_root|verify_env)[a-z_]+', ...)
+#     -> error: look-around, including look-ahead and look-behind, is not
+#        supported
+#        Consider enabling PCRE2 with the --pcre2 flag
+#
+# The search never runs. Two facts make that a legibility defect rather than
+# a plain capability limit. The `Grep` tool's own description advertises
+# "Full regex syntax" and warns only about literal braces, so the agent
+# learns the limit by failure. And the printed remedy is UNREACHABLE through
+# the tool that printed it: `Grep`'s schema exposes pattern/path/glob/type/
+# output_mode/-i/-n/-A/-B/-C/-o/multiline/head_limit/offset and nothing that
+# can carry `--pcre2`.
+#
+# WHAT IS AND IS NOT ADDRESSED. `Grep` is a Claude Code builtin: no in-repo
+# code path produces, wraps or can intercept its pattern rejection, so
+# nothing here can add a `--pcre2` option or change that message. Only the
+# told-upfront/recovery facet is in scope -- an agent told the limit BEFORE
+# it writes the pattern does not spend a turn discovering it, and one that
+# reads the remedy correctly does not spend a second turn trying to pass
+# `--pcre2` to a tool with no such parameter. Same carve-out tasks 4273,
+# 4578 and 4964 documented for the three findings above, and the reason a
+# harness-rooted census finding still lands in this file.
+#
+# DISCRIMINATION, NOT DUPLICATION -- a FOURTH shape, against three
+# neighbours. `TOOL_CALL_REJECTION_GUIDANCE` covers `InputValidationError`:
+# a defect in the CALL you just made, in three shapes (unparseable JSON /
+# invented parameter name / missing required sibling), every one of them
+# fixed by re-emitting the call correctly. `ERROR_REMEDY_HINT_GUIDANCE`
+# covers a well-formed call that failed on CONTENT and printed a remedy
+# naming a real PARAMETER of the erroring tool -- fixed by re-issuing with
+# it set. This is neither: the call was well-formed, it failed on content,
+# and the remedy names a flag of the WRAPPED BINARY that the tool exposes no
+# parameter for, so NO re-issue can ever succeed and the correct response is
+# to restructure the pattern or switch tools. Folding this into either
+# neighbour would collapse the discrimination it exists to draw; neither
+# block may be deleted as redundant with the other.
+#
+# TWO VARIANTS, because two orthogonal capability dimensions decide who
+# needs what. All 9 roles hold `Grep`, so every role can hit the rejection
+# and needs the LIMITATION; but the `grep -P` escape hatch is gated on the
+# `Bash` grant, and `judge` holds only `Bash(git:*)`, so prescribing it
+# there would walk that role into a permission denial -- the same "agent
+# follows its own instructions into a denial" defect that
+# orchestrator/tests/test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# guards against for MCP tools, and which does NOT cover builtins. Composed
+# the way _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE compose
+# SCOPE_BOUNDARY_GUIDANCE below: the shared facts stated once so the two
+# variants cannot drift, each half self-contained with its own
+# leading/trailing blank line, plain `+` concatenation, and only the
+# composed units ever spliced into a prompt.
+#
+# THE SHELL MEASUREMENTS BEHIND THE ESCAPE HATCH, with the commands that
+# produced them, taken in a dispatched agent session in a task worktree
+# (2026-09-17):
+#     type -a rg               -> "rg is a function": a shell function the
+#                                 harness snapshot installs, re-execing the
+#                                 Claude Code bundle via CLAUDE_CODE_EXECPATH
+#     which rg                 -> empty
+#     bash -c 'command -v rg'  -> not found
+#     type -a grep             -> /usr/bin/grep, /bin/grep; no function shadow
+#     grep --version           -> GNU grep 3.11; no ugrep installed here
+#     command grep -rPoh --include='*.py' <the look-ahead pattern above> \
+#         orchestrator/src/orchestrator/verify.py
+#                              -> exit 0, the intended matches returned
+# Those are the claims that were measured; nothing broader is asserted about
+# the environment. In particular the shadowed SET is NOT stable across time
+# or host: a 2026-08-11 project memory records `grep` ITSELF shadowed by a
+# ugrep-wrapping shell function that honoured .gitignore and silently
+# skipped a whole ignored tree, returning a fast, confident, wrong zero --
+# which does not hold here. That instability is precisely why the guidance
+# prescribes the `command` prefix (it resolves the real /usr/bin/grep
+# whichever way a given snapshot falls) rather than depending on which
+# commands happen to be shadowed, and why `rg --pcre2` is mentioned only
+# with its caveat instead of being led with despite the error message
+# suggesting it. Leading with `rg` would repeat the defect census
+# 2026-09-10 sec 1.1 caught: role wait-guidance naming `BashOutput`, a tool
+# absent from every CLI build in the corpus, sending the agent after
+# something that is not there.
+#
+# HARD CONSTRAINTS, four, every one machine-checked:
+#   - No literal `{`/`}` in the constants. Role prompts reach them by plain
+#     `+` concatenation, but they are held brace-free defensively so a
+#     future interpolating splice site stays safe -- CODE_QUALITY_GUIDANCE
+#     below is the live example, brace-free BY CONTRACT because it reaches
+#     _REVIEWER_HEURISTICS_TEMPLATE's str.format().
+#   - No `mcp__<family>__<name>` name in the prompt text: the ancestry check
+#     cited above is parametrized over every role, and these constants land
+#     in 8 roles with differing allowlists. `Grep`, `Bash` and `Read` are
+#     builtins and do not match its regex.
+#   - No `Test` + CamelCase class citation that does not resolve to a real
+#     class. orchestrator/tests/test_cited_test_class_drift.py statically
+#     requires every such identifier in a comment or string token of any
+#     member's src tree to resolve to a real test class, so every test cited
+#     from here is named `path/to/test_module.py::lowercase_function`, which
+#     is out of scope by shape.
+#   - No sighting COUNT and no byte-size figure in the prose. The codebook
+#     accrues a sighting every census cycle, and the BACKGROUND_WAIT_GUIDANCE
+#     comment above records what byte-size figures cost: an earlier revision
+#     hand-copied one to 8 sites and every one was wrong, one by 7x, because
+#     a prose copy does not move when the string it describes does.
+_GREP_ENGINE_LIMITS = """
+## The `Grep` tool's regex engine rejects look-around outright
+
+`Grep` runs ripgrep's default engine: no look-ahead, no look-behind, no
+backreferences. A pattern using any of them is REJECTED before the search
+runs — `error: look-around, including look-ahead and look-behind, is not
+supported`, and you get no results at all rather than a partial or degraded
+match. Know this before you write the pattern. `multiline: true` does not
+change it: same engine either way.
+
+The rejection prints "Consider enabling PCRE2 with the --pcre2 flag". That
+remedy is addressed to ripgrep's command line, NOT to the `Grep` tool, which
+exposes no such parameter under any spelling — not `--pcre2`, not `pcre2`,
+and not a flag smuggled into `pattern`. Do not retry the call. This is the
+discriminator against the section just above: THERE the remedy named a real
+parameter of the erroring tool and re-issuing with it set is the fix; HERE it
+names a flag of the WRAPPED BINARY that the tool does not expose, so no
+re-issue of `Grep` can ever succeed and you must change approach instead.
+
+FIRST-LINE RECOVERY, needing no other tool: express the intent without
+look-around — match broadly, then exclude from the results. The rejected
+pattern above meant "every `config.<key>` except git, project_root and
+verify_env"; the working form is `Grep` for `config\\.[a-z_]+` with `-o`,
+then drop those three names from what comes back. "Not followed by", "not
+preceded by" and "the same capture twice" are all this one shape: the engine
+cannot express them, and a second pass over the matches can.
+"""
+
+
+# Recourse for the roles holding unqualified `Bash`. Concatenated onto
+# _GREP_ENGINE_LIMITS below -- never used alone.
+_GREP_PCRE_BASH_RECOURSE = """
+When look-around or a backreference is genuinely required, the escape hatch
+is `Bash`: `command grep -rP '<pattern>' <path>`, adding `--include='*.py'`
+for the glob filter `Grep` would have applied. `-P` is real PCRE, so the
+rejected pattern runs unchanged.
+
+The `command` prefix is load-bearing, not decoration. The harness shell
+snapshot shadows some search commands with shell functions, and WHICH ones is
+not stable across sessions or hosts: one measured shadow wrapped `grep` in a
+.gitignore-respecting tool that silently skipped an ignored tree and returned
+a fast, confident, empty result. `command` reaches the real `/usr/bin/grep`
+either way.
+
+`rg --pcre2` also works, but only at the TOP LEVEL of a `Bash` call. `rg`
+here is currently a shell FUNCTION that re-execs the Claude Code bundle, not
+a binary on `PATH` — `which rg` finds nothing, and a nested `bash -c` cannot
+see it. Never put `rg` in a script, a subshell or any nested shell; use
+`command grep -rP` there.
+"""
+
+
+# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch
+# above would land it a permission denial rather than a result -- naming a
+# command the role cannot run is the failure this variant exists to avoid.
+# Concatenated onto _GREP_ENGINE_LIMITS below -- never used alone.
+_GREP_PCRE_READ_ONLY_RECOURSE = """
+Shelling out is NOT available to you here: your `Bash` grant is restricted to
+git commands, so a `grep -P` call would land a permission denial rather than
+a result. The restructure above IS your recovery — match broadly with `Grep`
+and exclude afterwards. Where the candidate region is small enough, `Read` it
+and judge the text directly instead of searching it.
+"""
+
+
+GREP_LOOKAROUND_GUIDANCE = _GREP_ENGINE_LIMITS + _GREP_PCRE_BASH_RECOURSE
+GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_RECOURSE
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
