@@ -4420,24 +4420,38 @@ class TestMergeRequestDegenerateBranchFastPath:
     async def test_guard_probes_at_most_once_across_both_arms(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The probe is memoized, and is not paid when no arm hits.
+        """The task-metadata read is paid at most once, and the arms share it.
 
-        The guard's only power is to SUPPRESS an already_merged return, so it
-        runs after an arm tests positive — never on the common
-        not-yet-merged submission, where it would add a scheduler round-trip
-        (a Taskmaster MCP dispatch with an internal timeout=15) to the submit
-        path for no possible effect.  When an arm does hit, the two arms share
-        one lookup.
+        Task 4888 superseded the zero-read half of this contract, deliberately
+        and by its design decision 5: honouring ``metadata.merge_lane``
+        requires reading the metadata, so a submission that supplies no
+        explicit ``lane`` now pays exactly one memoized
+        ``scheduler.get_task``.  The superseded assertion rested on the
+        premise that the read could have no possible effect on a plain
+        not-yet-merged submission — true while the PROBE was its only
+        consumer, false now that the same read also resolves the lane.
+
+        The two consumers stay individually attributable.  With neither arm
+        hitting, the guard's ``_declined()`` is never awaited, so the single
+        recorded lookup can only be the lane fallback's.  With an arm hitting,
+        both consumers want the metadata and the memo is the whole reason the
+        count is one rather than two.  The remaining cell — an explicit
+        ``lane=`` skipping the fallback, so nothing reads at all — is pinned
+        in scope by ``escalation/tests/test_merge_request_lane.py``
+        ``::TestMetadataReadIsPaidAtMostOnce``
+        ``::test_explicit_lane_pays_no_metadata_read_at_all``.
         """
-        # Neither arm hits → the probe must not run at all.
-        quiet: list[str] = []
+        # Neither arm hits → the probe stays off, and the lane fallback pays
+        # the one read on its own.
+        lane_only: list[str] = []
         await _run_fast_path_probe(
             tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=False,
-            metadata={'branch_base_sha': 'b' * 40}, requested_ids=quiet,
+            metadata={'branch_base_sha': 'b' * 40}, requested_ids=lane_only,
         )
-        assert quiet == [], (
-            f'A plain not-yet-merged submission must not consult the task '
-            f'store at all, got: {quiet}'
+        assert lane_only == ['591'], (
+            f'A plain not-yet-merged submission must consult the task store '
+            f'exactly once — the lane fallback, not the suppressed probe — '
+            f'got: {lane_only}'
         )
 
         # The patch-id arm hits (is_ancestor misses first) → exactly one lookup.
