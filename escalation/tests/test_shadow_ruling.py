@@ -24,13 +24,18 @@ import json
 
 import pytest
 
+from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
 from escalation.models import Escalation
 from escalation.shadow_ruling import (
+    DETECTABLE_GATES,
     FIRST_TRANCHE_CLASSES,
+    GATED_CATEGORIES,
+    GATED_ROLES,
     HUMAN_FOREVER_GATES,
     REVERSIBLE_ACTIONS,
     SHADOW_RULING_MARKER,
     ShadowRuling,
+    mechanically_gated,
     parse_shadow_ruling,
 )
 
@@ -260,3 +265,99 @@ def test_escalation_carries_the_triage_fields_the_codec_rides_in():
     assert record.triage_note == ''
     assert record.triaged_by is None
     assert record.triaged_at is None
+
+
+# ---------------------------------------------------------------------------
+# Mechanical gate detection (step-3)
+# ---------------------------------------------------------------------------
+
+
+def _record(**overrides: object) -> Escalation:
+    """A real ``Escalation`` — never a dict. The detector reads dataclass
+    attributes, so a dict stand-in would pass while the production call site
+    raised."""
+    fields: dict[str, object] = {
+        'id': 'esc-5374-1',
+        'task_id': '5374',
+        'agent_role': 'claude-task-5374-implementer',
+        'severity': 'info',
+        'category': 'risk_identified',
+        'summary': 'an ordinary L2',
+        'level': 2,
+    }
+    fields.update(overrides)
+    return Escalation(**fields)  # type: ignore[arg-type]
+
+
+class TestMechanicallyGated:
+    """The detectable subset of the human-forever gate list, read off
+    ``escalation.authority`` rather than restated here."""
+
+    def test_flags_the_milestone_gate_category(self):
+        assert mechanically_gated(_record(category='milestone_gate')) == 'milestone_gate'
+
+    @pytest.mark.parametrize('category', sorted(L2_AUTO_CLOSE_DENY_CATEGORIES))
+    def test_flags_every_denied_category(self, category: str):
+        """authority.py's own docstring calls all of these the born-at-L2 human
+        gates, so every member flags — not only the one named `milestone_gate`."""
+        assert mechanically_gated(_record(category=category)) == 'milestone_gate'
+
+    @pytest.mark.parametrize('role', sorted(L2_AUTO_CLOSE_DENY_ROLES))
+    def test_flags_every_denied_role(self, role: str):
+        assert mechanically_gated(_record(agent_role=role)) == 'deterministic_runner_filing'
+
+    def test_returns_none_for_an_ordinary_risk_identified_l2(self):
+        assert mechanically_gated(_record()) is None
+
+    def test_role_is_checked_even_when_the_category_is_benign(self):
+        """Defence in depth, the property authority.py already relies on: the
+        two checks are independent, so neither benign half can mask the other."""
+        record = _record(category='risk_identified', agent_role='orchestrator-deterministic')
+        assert record.category not in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert mechanically_gated(record) == 'deterministic_runner_filing'
+
+    def test_category_is_checked_even_when_the_role_is_benign(self):
+        record = _record(category='milestone_gate', agent_role='claude-task-1-implementer')
+        assert record.agent_role not in L2_AUTO_CLOSE_DENY_ROLES
+        assert mechanically_gated(record) == 'milestone_gate'
+
+
+class TestMechanicalGateSpot:
+    """The detector must not hold a SECOND copy of the denylists."""
+
+    def test_the_detector_reads_the_imported_category_denylist(self):
+        assert GATED_CATEGORIES is L2_AUTO_CLOSE_DENY_CATEGORIES, (
+            'the detector must consult the imported frozenset itself, so a member '
+            'added in escalation/src/escalation/authority.py propagates here '
+            'instead of drifting'
+        )
+
+    def test_the_detector_reads_the_imported_role_denylist(self):
+        assert GATED_ROLES is L2_AUTO_CLOSE_DENY_ROLES, (
+            'the detector must consult the imported frozenset itself, so a member '
+            'added in escalation/src/escalation/authority.py propagates here '
+            'instead of drifting'
+        )
+
+    def test_every_slug_the_detector_can_return_is_a_human_forever_gate(self):
+        assert DETECTABLE_GATES <= HUMAN_FOREVER_GATES
+
+    def test_the_detectable_gates_are_a_proper_subset(self):
+        """Five of the seven gates are semantic and have NO record-level signal.
+        A detector that ever covered all seven would be claiming a completeness
+        it cannot have — so the properness is the guard, not a coincidence."""
+        assert DETECTABLE_GATES < HUMAN_FOREVER_GATES
+        assert len(HUMAN_FOREVER_GATES - DETECTABLE_GATES) == 5
+
+    def test_the_observable_slugs_match_the_declared_detectable_set(self):
+        """Non-vacuity: DETECTABLE_GATES is not a hand-written label — every
+        slug in it is really reachable, and nothing reachable is missing."""
+        observed = {
+            slug
+            for slug in (
+                [mechanically_gated(_record(category=c)) for c in L2_AUTO_CLOSE_DENY_CATEGORIES]
+                + [mechanically_gated(_record(agent_role=r)) for r in L2_AUTO_CLOSE_DENY_ROLES]
+            )
+            if slug is not None
+        }
+        assert observed == DETECTABLE_GATES
