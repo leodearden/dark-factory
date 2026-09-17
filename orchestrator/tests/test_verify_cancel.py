@@ -2598,3 +2598,84 @@ class TestWatchdogTriggerThreading:
         assert pgid == 12345
         assert kwargs['grace_secs'] == 1.0
         assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION
+
+
+# ---------------------------------------------------------------------------
+# Task 4195 step-11: the watchdog deadline is DERIVED from the ssh transport's
+# own dead-peer verdict, not pinned independently of it.
+#
+# ssh declares a peer dead at ServerAliveInterval * ServerAliveCountMax and
+# exits non-zero, which the dispatcher already handles.  A watchdog deadline
+# below that opens a band in which the remote self-kills a healthy build on a
+# link ssh would have ridden through — the watchdog out-voting the transport on
+# a question the transport is the authority for.  These tests pin the
+# derivation and its invariant against the constants, never against the number.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogTimeoutDerivedFromTransport:
+    """WATCHDOG_HEARTBEAT_TIMEOUT_SECS follows from the ssh keepalive constants."""
+
+    def test_timeout_is_the_transport_deadline_times_the_headroom(self):
+        """Every input is auditable: the value is a named multiple of a product."""
+        from orchestrator.verify_cancel import (
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+            SSH_TRANSPORT_DEAD_PEER_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+            WATCHDOG_TRANSPORT_HEADROOM,
+        )
+
+        assert SSH_TRANSPORT_DEAD_PEER_SECS == (
+            SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX
+        )
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS == (
+            WATCHDOG_TRANSPORT_HEADROOM * SSH_TRANSPORT_DEAD_PEER_SECS
+        )
+
+    def test_the_watchdog_never_out_votes_the_transport(self):
+        """THE INVARIANT this task exists to establish."""
+        from orchestrator.verify_cancel import (
+            SSH_TRANSPORT_DEAD_PEER_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        )
+
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS > SSH_TRANSPORT_DEAD_PEER_SECS, (
+            f'The watchdog would fire at {WATCHDOG_HEARTBEAT_TIMEOUT_SECS}s, inside ssh\'s own '
+            f'{SSH_TRANSPORT_DEAD_PEER_SECS}s dead-peer verdict. That opens a band in which the '
+            f'remote self-kills a healthy build on a link ssh would have ridden through — the '
+            f'watchdog out-voting the transport on a question the transport is the authority '
+            f'for. Lowering WATCHDOG_TRANSPORT_HEADROOM to <= 1.0 re-opens that band; the old '
+            f'independently-pinned 10.0s sat 6x inside it.'
+        )
+
+    def test_timeout_still_tolerates_many_missed_beats(self):
+        """The superseded ``2 * HEARTBEAT_INTERVAL_SECS`` definition's property, kept as a floor.
+
+        That definition existed to tolerate a single missed or delayed beat.
+        The derived value clears it by a wide margin (18 beats), but stating it
+        as an explicit floor means a future retune of either input cannot
+        silently drop back below it.
+        """
+        from orchestrator.verify_cancel import (
+            HEARTBEAT_INTERVAL_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        )
+
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS >= 2 * HEARTBEAT_INTERVAL_SECS
+
+    def test_ssh_keepalive_constants_are_single_sourced(self):
+        """verify_runner re-exports these; it does not keep a second copy (SPOT).
+
+        A second copy is precisely the silent drift the derivation exists to
+        close: the dispatcher's ssh argv and the remote's deadline would stop
+        following from the same two numbers.
+        """
+        from orchestrator import verify_cancel, verify_runner
+
+        assert (
+            verify_runner.SSH_SERVER_ALIVE_INTERVAL is verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+        )
+        assert (
+            verify_runner.SSH_SERVER_ALIVE_COUNT_MAX is verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
+        )
