@@ -3060,6 +3060,78 @@ class TestCliContract:
         assert Path(args.baseline).name == 'merge_lane_ratchet_baseline.json'
 
 
+class TestTheBlockMessageNamesTheAuthorizedPath:
+    """The task's also-fix, asserted as runtime behaviour, not as a prose pin.
+
+    Every site that tells an agent a measure may not rise composes the ONE
+    RAISE_REMEDY constant, so the mechanism can never be documented in two
+    places out of three. The site that actually mattered was the committed
+    baseline's own _README -- that is what a blocked agent opens -- and it said
+    only that raising was forbidden, which is what sent task 5342's implementer
+    to escalation instead of to a sanctioned path.
+    """
+
+    def test_the_remedy_names_the_flags_and_both_artifacts(self) -> None:
+        for fragment in (
+            '--authorize-raise',
+            '--reason',
+            metrics.LEDGER_RELPATH,
+            metrics.BASELINE_RELPATH,
+        ):
+            assert fragment in metrics.RAISE_REMEDY, fragment
+
+    def test_the_committed_baseline_bytes_state_the_mechanism(self) -> None:
+        # THE SITE THAT MATTERED. Not the docstring, not the CLI -- the file a
+        # reader has open when the gate goes red.
+        #
+        # Read off the COMMITTED bytes, so this goes red until the baseline is
+        # regenerated with the new README rather than passing on the constant
+        # alone. The remedy carries newlines (the sanctioned commands belong on
+        # their own lines at a terminal) and JSON escapes those, so the verbatim
+        # match is against the decoded _README while the flag and the ledger
+        # path -- which a reader greps for -- are matched in the raw text.
+        committed = (_REPO_ROOT / metrics.BASELINE_RELPATH).read_text(
+            encoding='utf-8'
+        )
+        assert '--authorize-raise' in committed
+        assert metrics.LEDGER_RELPATH in committed
+        assert json.loads(committed)['_README'].endswith(metrics.RAISE_REMEDY)
+
+    def test_the_readme_composes_the_remedy_rather_than_paraphrasing_it(
+        self,
+    ) -> None:
+        assert metrics.BASELINE_README.endswith(metrics.RAISE_REMEDY)
+
+    def test_the_check_trailer_is_the_same_constant(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
+        assert metrics.RAISE_REMEDY in capsys.readouterr().err
+
+    def test_the_old_flat_prohibition_survives_nowhere(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # ANTI-REGRESSION on the exact wording the task names as having sent an
+        # agent to escalation. A paraphrase left behind at either site would
+        # undo the fix while every assertion above stayed green.
+        stale = 'A task may never raise one.'
+        assert stale not in metrics.BASELINE_README
+
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+        metrics.main(['--check', '--baseline', str(baseline)])
+        assert stale not in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # THE RATCHET ITSELF.
 #
