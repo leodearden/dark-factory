@@ -26,8 +26,8 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
-from _orch_helpers import wait_responsive
+from _merge_lane_fakes import FakeVerifier, hangs_until, passes
+from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -370,3 +370,105 @@ class TestMetricsFromRealMerges:
                 f'no drift sample ({drift!r})'
             )
             assert drift['last'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-request drift-base isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftBaseIsolation:
+    """A landing must not consume another in-flight request's drift base."""
+
+    async def test_drift_counts_only_the_landings_since_its_own_merge_start(
+        self, git_config: GitConfig, git_repo: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A conflict after ONE intervening landing records a drift of 1.
+
+        The sibling ``test_conflicting_merge_records_a_drift_sample`` records a
+        drift of 0 by construction -- it lands A before B is dequeued, so no
+        landing falls between B's merge-start and its conflict. At 0, "pop MY
+        entry" and "clear EVERY entry" are indistinguishable. Only an
+        intervening landing separates them: here B's base is stashed while
+        main_position is still 0, A lands (main_position -> 1), and only then
+        does B conflict. A landing that consumed B's base instead of its own
+        would drop the sample back to 0.
+
+        The window between B's ``_note_merge_started`` and its merge is a
+        handful of awaits wide, so it is not stably observable on the public
+        snapshot. Parking B INSIDE ``merge_to_main`` holds it open for as long
+        as the test needs: ``at_gate`` being set is proof the base was already
+        stashed, and A's landing is then driven to completion and confirmed on
+        the public counter before B's merge is released.
+        """
+        verify_gate = asyncio.Event()
+        git_ops = _MergeGatedGitOps(git_config, git_repo, branch='task/drift-blocked')
+        verifier = FakeVerifier(
+            default=passes(), scripts={'drift-lander': hangs_until(verify_gate)},
+        )
+
+        async with _running_lane(
+            git_ops,
+            verifier=verifier,
+            speculation_depth=2,
+            gates=(verify_gate, git_ops.release_merge),
+        ) as (lane, queue):
+            # Both branches are cut from the same base, before either lands, so
+            # they each ADD clash.py -- an add/add conflict.
+            lander = await _prepare(
+                git_ops, config, 'drift-lander', 'clash.py', 'x = 1\n',
+            )
+            blocked = await _prepare(
+                git_ops, config, 'drift-blocked', 'clash.py', 'x = 2\n',
+            )
+
+            await queue.put(lander)
+            await asyncio.wait_for(
+                verifier.await_entry(1), timeout=MERGE_RESULT_TIMEOUT,
+            )
+
+            await queue.put(blocked)
+            await asyncio.wait_for(
+                git_ops.at_gate.wait(), timeout=MERGE_RESULT_TIMEOUT,
+            )
+            # Load-bearing precondition: the blocked request is parked INSIDE
+            # merge_to_main, so its drift base was stashed while main_position
+            # was still 0. Without this, the whole drive proves nothing.
+            assert lane.snapshot()['metrics']['landings_total'] == 0, (
+                'the lander landed before the blocked request reached its '
+                'merge -- the blocked base was stashed too late to be at 0'
+            )
+
+            verify_gate.set()
+            outcome_lander = await wait_responsive(lander.result, label='lander lands')
+            assert outcome_lander.status == 'done', (
+                f'expected the lander to land, got {outcome_lander!r}'
+            )
+            async def _lander_counted() -> None:
+                while lane.snapshot()['metrics']['landings_total'] < 1:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(
+                _lander_counted(), timeout=MERGE_RESULT_TIMEOUT,
+            )
+
+            git_ops.release_merge.set()
+            outcome_blocked = await wait_responsive(
+                blocked.result, label='blocked request conflicts',
+            )
+            assert outcome_blocked.status == 'conflict', (
+                f'expected the blocked request to conflict, got {outcome_blocked!r}'
+            )
+
+            metrics = lane.snapshot()['metrics']
+            assert metrics['landings_total'] == 1
+            drift = metrics['drift_at_detection']
+            assert drift['count'] == 1, (
+                f'the conflict recorded no drift sample ({drift!r})'
+            )
+            assert drift['last'] == 1, (
+                'a landing consumed another request\'s drift base: the blocked '
+                'request started merging at main_position 0 and conflicted at 1, '
+                f'so its drift is 1, not {drift["last"]!r}'
+            )
