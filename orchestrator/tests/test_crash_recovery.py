@@ -236,7 +236,7 @@ async def _drive_session_slot(
     session: dict,
     *,
     config_dir: Path | str | None = None,
-    workflow_reports: Callable[[object], None] | None = None,
+    workflow_reports: Callable[[Harness], None] | None = None,
 ):
     """Populate recovered-session state and run ``_run_slot`` with
     ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
