@@ -3112,6 +3112,14 @@ def create_server(
         ``lane='normal'`` deliberately holds a ``metadata.merge_lane='high'``
         task back to the normal lane.
 
+        Omitting it is not free: honouring ``metadata.merge_lane`` means
+        reading the task, which costs one Taskmaster ``get_task`` with an
+        internal ``timeout=15``, so a wedged task store delays every
+        no-explicit-lane submission by up to that much before degrading the
+        lane to ``'normal'``.  Passing *lane* explicitly skips the read
+        entirely — reach for it if submissions are slow, or on a hotfix whose
+        lane you are not willing to have degrade.
+
         Named ``lane``, not ``merge_lane``, because that is the word the whole
         merge-queue boundary already uses: ``MergeRequest.lane``,
         ``orchestrator/src/orchestrator/merge_queue.py::MERGE_LANES``, and the
@@ -3400,6 +3408,29 @@ def create_server(
             # order as work already here.  (A previous version of this comment
             # claimed the read was paid "only when an arm is about to return";
             # that stopped being true when the lane fallback landed.)
+            #
+            # THE TAIL, stated because the mean is not the whole cost.  That
+            # timeout=15 is the read's WORST case, not its typical one: a
+            # wedged or merely slow task store makes every no-explicit-lane
+            # submission block up to ~15s before `task_metadata` fails open to
+            # {} and the lane degrades to 'normal' — including the high-lane
+            # hotfix submissions this parameter exists for, on a path that paid
+            # zero task-store reads before task 4888.  The escape hatch is the
+            # precedence rule itself and needs no new machinery: an explicit
+            # `lane=` skips the read entirely, which the parameter's own
+            # docstring now says so a caller who cannot afford the tail can act
+            # on it.  A SHORTER timeout for this arm alone (`asyncio.wait_for`,
+            # ~2s) was considered and declined — it would turn a store that is
+            # merely slow into a silent lane downgrade at a threshold no
+            # measurement here justifies, and report it as
+            # `lane_source='default'`, i.e. "nothing asked at all" when the
+            # truth is "we could not find out".  That conflation is present
+            # today on the 15s failure too and is recorded as a known gap
+            # (esc-4888 amendment pass): `task_metadata` returns
+            # `TaskMetadataResult.unavailable`, so the honest source is
+            # available to a later change that widens the `lane_source`
+            # vocabulary; this pass does not, because that vocabulary is
+            # pinned as closed across four surfaces.
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
