@@ -1723,7 +1723,16 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
 
 
 def _measure_raises(current: dict, previous: dict) -> list[Violation]:
-    """Every measure *current* raises above *previous*, sorted by (measure, key).
+    """Every RAISE *current* introduces over *previous*, sorted by (measure, key).
+
+    A "raise" is any state the baseline may not silently acquire. That is the
+    four rise arms, and it is also a CEILING BREACH -- a new path over
+    ``FILE_LINE_CEILING`` or a new function over
+    ``NEW_FUNCTION_COGNITIVE_CEILING``. The two belong together because
+    regeneration is *how* a ceiling breach would be acquired: ceilings apply
+    only to keys ABSENT from the baseline, so writing an oversized new file into
+    the baseline exempts it from that moment on. Absorbed by a blind
+    regeneration, the two are indistinguishable.
 
     The comparison arms only -- no preconditions, no policy. TWO callers run
     this one implementation (SPOT): ``check_against_baseline``, which is what
@@ -1737,6 +1746,7 @@ def _measure_raises(current: dict, previous: dict) -> list[Violation]:
         *_check_functions(current, previous),
         *_check_tests(current, previous),
         *_check_totals(current, previous),
+        *_check_ceilings(current, previous),
     ]
     return sorted(violations, key=lambda v: (v.measure, v.key))
 
@@ -1754,12 +1764,7 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """
     _require_complete_enumeration(current)
     _require_matching_params(current, baseline)
-
-    violations = [
-        *_measure_raises(current, baseline),
-        *_check_ceilings(current, baseline),
-    ]
-    return sorted(violations, key=lambda v: (v.measure, v.key))
+    return _measure_raises(current, baseline)
 
 
 # ---------------------------------------------------------------------------
