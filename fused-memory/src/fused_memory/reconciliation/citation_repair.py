@@ -475,10 +475,11 @@ def _run_still_live_hint(
             )
     if in_process:
         parts.append(
-            f'run {target_run_id} is still held by the in-process recon-report '
-            'state, so the harness may yet rewrite its stage_reports. Within a '
-            'live run the ordinary cite_memory / delete_finding path already '
-            'reaches the finding (_resolve_finding is cross-stage).'
+            f'run {target_run_id} holds at least one IN-PROGRESS stage entry in '
+            'the in-process recon-report state, so that stage may yet rewrite '
+            'its stage_reports. Within a live run the ordinary cite_memory / '
+            'delete_finding path already reaches the finding (_resolve_finding '
+            'is cross-stage).'
         )
     return ' '.join(parts)
 

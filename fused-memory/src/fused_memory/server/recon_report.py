@@ -3021,9 +3021,25 @@ class ReconReportState:
             replacement_memory_id=replacement_memory_id,
             repaired_by=f'run:{run_id}',
             caller_project_id=entry.project_id,
-            # Every run this process still holds report state for is "live" for
-            # repair purposes, whatever its journal row says.
-            live_run_ids=frozenset(rid for (rid, _stage) in self._state),
+            # A run is live iff it holds at least one IN-PROGRESS stage entry —
+            # i.e. a stage that can still rewrite the whole stage_reports blob.
+            # Resident state alone is not enough: a COMPLETED entry lingers for
+            # recon_report_state_ttl_seconds (300s by default) before tick()
+            # sweeps it, so counting it would keep a genuinely finished run
+            # "live" for minutes after its journal row already reads completed.
+            # ``completed_at is None`` is tick()'s own eviction discriminator,
+            # so what may still be written has ONE definition in this class.
+            #
+            # The window this narrowing gives up — the harness calling
+            # complete() BEFORE its trailing update_run_stage_reports() — is
+            # already covered in depth by citation_repair's read-after-write
+            # check, which turns a clobbered repair into a loud repair_clobbered
+            # rather than a false 'repaired'.
+            live_run_ids=frozenset(
+                rid
+                for (rid, _stage), entry in self._state.items()
+                if entry.completed_at is None
+            ),
         )
 
     async def write_entity_standing_decision(
