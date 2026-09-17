@@ -1096,16 +1096,16 @@ BASELINE_README = (
     '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
     'frozen at its value on the commit that recorded it: the gate '
     'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
-    'RISES above these numbers. Equality is fine, lowering is the point. NEVER '
-    'regenerate this file merely to make a test pass -- that silently widens '
-    'the ratchet for every downstream task. The enumeration block below is the '
-    'CLUSTER half only: the instrument also sweeps every .py under '
+    'RISES above these numbers. Equality is fine, lowering is the point. The '
+    'enumeration block below is the CLUSTER half only: the instrument also '
+    'sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
-    'arriving never touches these bytes. A task that legitimately LOWERS a '
-    'measure regenerates the baseline in the SAME commit: '
-    'python scripts/merge_lane_metrics.py --write-baseline '
-    'orchestrator/tests/merge_lane_ratchet_baseline.json'
+    'arriving never touches these bytes.\n'
+    # Composed, never paraphrased: this is the one string in the instrument that
+    # changes what a blocked agent does next, and the copy that mattered was
+    # always the one in THIS file.
+    + RAISE_REMEDY
 )
 
 #: The three per-path maps whose entries get one line each.

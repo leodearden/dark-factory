@@ -3154,13 +3154,7 @@ def test_merge_lane_ratchet_holds(
         'The merge-lane quality ratchet has been breached by '
         f'{len(violations)} measure(s):\n'
         + '\n'.join(f'  - {v.message}' for v in violations)
-        + '\n\nRemedy: LOWER the measure. A task that legitimately lowers one '
-        'regenerates the baseline in the SAME commit:\n'
-        '  python scripts/merge_lane_metrics.py --write-baseline '
-        f'{metrics.BASELINE_RELPATH}\n'
-        'A task may never RAISE a measure, and regenerating the baseline to '
-        'make this test go green silently widens the ratchet for every task '
-        'that follows.'
+        + f'\n\n{metrics.RAISE_REMEDY}'
     )
 
 
@@ -3259,7 +3253,7 @@ def test_baseline_matches_a_fresh_measurement(live_report: dict) -> None:
         live_report
     ), (
         'The committed baseline is not what measuring this tree produces. '
-        'Regenerate it in this commit if you lowered a measure:\n'
-        '  python scripts/merge_lane_metrics.py --write-baseline '
-        f'{metrics.BASELINE_RELPATH}'
+        'Regenerate it in this commit -- which the instrument itself will '
+        'refuse to do if that would absorb a raise you have not authorized:\n'
+        f'\n{metrics.RAISE_REMEDY}'
     )
