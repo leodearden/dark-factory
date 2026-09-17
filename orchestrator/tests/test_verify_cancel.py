@@ -13,6 +13,7 @@ Steps covered:
 """
 
 import errno
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -1789,6 +1790,65 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
         f'window rather than being a genuine escapee, cross-check it '
         f'against read_ppid_map() output captured around this time.)'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 4195 step-1: run_stdin_heartbeat — the PRODUCER half of the same
+# connection-death wire protocol whose CONSUMER (run_stdin_watchdog) is tested
+# in the block immediately below.
+#
+# The dispatcher writes one HEARTBEAT_TOKEN per interval down the ssh child's
+# stdin for the full verify span; the remote's watchdog fires when no beat (or
+# EOF) arrives in time.  Both halves now live in verify_cancel.py and are
+# tested side by side in the same idiom: injected syscall seams (write_fn /
+# close_fn mirroring the watchdog's select_fn / read_fn), fake callables, and
+# ZERO wall-clock — interval=0.0 makes threading.Event.wait return at once.
+# ---------------------------------------------------------------------------
+
+
+class TestRunStdinHeartbeat:
+    """run_stdin_heartbeat(write_fd, stop_event, *, interval, write_fn, close_fn)."""
+
+    def test_writes_one_token_per_tick_and_closes_the_fd_once(self):
+        """One HEARTBEAT_TOKEN per tick until stopped; the loop owns and closes write_fd once."""
+        from orchestrator.verify_cancel import HEARTBEAT_TOKEN, run_stdin_heartbeat
+
+        stop = threading.Event()
+        writes: list[tuple[int, bytes]] = []
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            writes.append((fd, data))
+            if len(writes) == 3:
+                stop.set()
+            return len(data)
+
+        run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert writes == [(7, HEARTBEAT_TOKEN)] * 3
+        assert closed == [7]  # the loop owns the fd and closes it exactly once
+
+    def test_returns_without_writing_when_already_stopped(self):
+        """A pre-set stop Event writes nothing at all and still closes the fd.
+
+        Pins two properties at once: the loop waits BEFORE each write (so the
+        first beat lands at t=interval, preserving today's cadence), and the
+        close lives in a ``finally`` rather than on the happy path only.
+        """
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        stop.set()
+        writes: list[tuple[int, bytes]] = []
+        closed: list[int] = []
+
+        run_stdin_heartbeat(
+            7, stop, interval=0.0, write_fn=lambda fd, data: writes.append((fd, data)),
+            close_fn=closed.append,
+        )
+
+        assert writes == []
+        assert closed == [7]
 
 
 # ---------------------------------------------------------------------------
