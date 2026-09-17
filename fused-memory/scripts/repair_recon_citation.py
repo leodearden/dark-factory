@@ -139,13 +139,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--memory-id', dest='memory_id', required=True,
-        help='The dangling cited memory id to remove (must be confirmed absent)',
+        help='The defective cited memory id to remove. Its required state is '
+             'whichever --reason names: absent, or resolving-but-wrong.',
     )
     parser.add_argument(
         '--replacement-memory-id', dest='replacement_memory_id', default=None,
         help='Live successor to cite instead (must resolve). Omit for a '
              'drop-only repair, which removes the dangling citation and cites '
              'nothing in its place.',
+    )
+    parser.add_argument(
+        '--reason', default='memory_not_found',
+        choices=['memory_not_found', 'wrong_memory'],
+        help="The citation's DEFECT CLASS, which selects the corroboration the "
+             "repair demands (default: memory_not_found). 'memory_not_found' "
+             'asserts the cited id is CONFIRMED ABSENT from Mem0; '
+             "'wrong_memory' asserts it RESOLVES but does not back the "
+             'finding. Naming the wrong one is a refusal pointing at the '
+             'other, never a silent reclassification. Orthogonal to drop vs '
+             'swap, which is --replacement-memory-id.',
+    )
+    parser.add_argument(
+        '--justification', default=None,
+        help='Why the cited memory does not back the finding. REQUIRED with '
+             '--reason wrong_memory, which removes a citation that still '
+             'resolves: the citation_repairs record is then the only surviving '
+             'account of the change, so state what the citation should have '
+             'backed and how the claim was independently confirmed. Optional '
+             'for --reason memory_not_found, whose confirmed absence is its '
+             'own account, but recorded when given.',
     )
     parser.add_argument(
         '--store', default='mem0', choices=['mem0', 'graphiti'],
@@ -180,6 +202,8 @@ async def run(args: argparse.Namespace, *, journal: Any, memory: Any) -> dict[st
         memory_id=args.memory_id,
         store=args.store,
         replacement_memory_id=args.replacement_memory_id,
+        reason=args.reason,
+        justification=args.justification,
         repaired_by=REPAIRED_BY,
         apply=args.apply,
     )
