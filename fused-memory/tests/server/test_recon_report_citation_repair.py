@@ -44,6 +44,17 @@ SUCCESSOR_RECORD: dict[str, Any] = {
 }
 
 
+# A victim that RESOLVES — the wrong-but-resolving class's fixture, and the
+# prose account that class requires.
+LIVE_VICTIM_RECORD: dict[str, Any] = {
+    'id': DANGLING,
+    'content': 'a live entry that does not back this finding',
+    'metadata': {'category': 'observations_and_summaries'},
+}
+
+WHY_WRONG = 'mis-cites the task 168 rolling summary; confirmed via get_task(182)'
+
+
 def _finding(finding_id: str, memory_id: str) -> dict[str, Any]:
     return {
         'finding_id': finding_id,
@@ -288,6 +299,80 @@ class TestStateRepairMemoryCitation:
             await journal.close()
 
 
+class TestStateForwardsTheDefectClass:
+    """``reason``/``justification`` reach the repair through the state wrapper.
+
+    The wrapper adds no branching of its own — the gates live in
+    ``citation_repair`` and are tested there. What has to hold HERE is that
+    both parameters arrive, and that omitting them preserves today's behaviour
+    exactly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrong_memory_repairs_a_victim_that_resolves(self, tmp_path):
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['reason'] == 'wrong_memory'
+            run = await journal.get_run(TARGET_RUN)
+            assert run is not None
+            report = run.stage_reports['memory_consolidator']
+            assert isinstance(report, StageReport)
+            record = report.items_flagged[0]['citation_repairs'][0]
+            # The caller's own run still supplies the attribution, unchanged.
+            assert record['repaired_by'] == f'run:{CALLER_RUN}'
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_omitting_both_is_exactly_todays_behaviour(self, tmp_path):
+        """The defaults keep every existing caller on the dangling-only path."""
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            # A live victim under the default class is still refused.
+            assert outcome['error'] == 'citation_not_dangling'
+        finally:
+            await journal.close()
+
+
 class TestRepairLivenessIsPerEntry:
     """A run is live iff it holds an IN-PROGRESS entry — not merely a resident one.
 
@@ -512,6 +597,93 @@ class TestRepairToolViaFastMCP:
 
             assert result['status'] == 'repaired'
             assert result['replacement_memory_id'] == SUCCESSOR
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_defect_class_is_exposed_and_optional_in_the_schema(self):
+        """Both new parameters are optional over the wire, ``reason`` defaulted.
+
+        Read off the generated schema rather than the annotation source, for the
+        same reason the bad-store test calls the tool: under ``from __future__
+        import annotations`` the annotation is only a string.
+        """
+        mcp = create_recon_report_server(_state())
+        tool = next(
+            t for t in await mcp.list_tools() if t.name == 'repair_memory_citation'
+        )
+        schema = tool.inputSchema
+
+        assert 'reason' not in schema['required']
+        assert 'justification' not in schema['required']
+        assert schema['properties']['reason']['default'] == 'memory_not_found'
+
+    @pytest.mark.asyncio
+    async def test_bad_reason_rejected_at_the_schema_boundary(self, tmp_path):
+        """An out-of-enum ``reason`` never reaches the helper's own gate.
+
+        Same boundary the ``store`` Literal already provides: rejected before
+        the body runs, so no backend read is attempted. The helper still
+        re-checks the enum for the operator script and in-process callers, which
+        have no such boundary.
+        """
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            with pytest.raises(ToolError):
+                await mcp._tool_manager.call_tool(
+                    'repair_memory_citation',
+                    {
+                        'run_id': CALLER_RUN,
+                        'target_run_id': TARGET_RUN,
+                        'finding_id': 'f-1',
+                        'memory_id': DANGLING,
+                        'store': 'mem0',
+                        'replacement_memory_id': SUCCESSOR,
+                        'reason': 'detach',
+                    },
+                )
+
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_wrong_memory_tool_call(self, tmp_path):
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            result = await mcp._tool_manager.call_tool(
+                'repair_memory_citation',
+                {
+                    'run_id': CALLER_RUN,
+                    'target_run_id': TARGET_RUN,
+                    'finding_id': 'f-1',
+                    'memory_id': DANGLING,
+                    'store': 'mem0',
+                    'replacement_memory_id': None,
+                    'reason': 'wrong_memory',
+                    'justification': WHY_WRONG,
+                },
+            )
+
+            assert result['status'] == 'repaired'
+            assert result['reason'] == 'wrong_memory'
+            assert result['cited_memories'] == []
         finally:
             await journal.close()
 
