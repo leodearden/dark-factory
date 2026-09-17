@@ -40,13 +40,13 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
-    _implausible_target_reason,
     MemoryService,
     ReconcileStats,
     ReferentFinding,
     ReferentRepair,
     ReferentRepairStats,
     ReferentStats,
+    _implausible_target_reason,
 )
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent

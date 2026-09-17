@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid as uuid_mod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Container, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
@@ -2449,6 +2449,82 @@ def _unresolvable_reason(
     # that reads as "resolvable".
     return 'no candidate target could be determined from the declared referents'
 
+
+def _implausible_target_reason(
+    target: Referent,
+    *,
+    known_projects: Container[str],
+    target_node_exists: bool,
+) -> str:
+    """Why a nominated repair target must NOT be acted on. ``''`` if it may be.
+
+    WHY THIS RULE EXISTS. :func:`_candidate_pool`'s whole-set fallback nominates
+    a target from the DECLARED set with no test of that target's plausibility:
+    whatever survives the pool's three vetoes becomes ``resolvable=True``, and
+    the repair pass then resolves-or-MINTS a node of that name and repoints a
+    real edge onto it. A junk derived referent therefore becomes a PHANTOM NODE
+    carrying a real edge. Executed live: ``referents={redis:6379}``, ``cited={}``
+    (a paraphrased fact naming no task number — the pool's own docstring calls
+    this "the routine extraction outcome"), endpoint ``Task 1251`` yields
+    ``candidates=('redis:6379',)`` and a mint. Nothing tested the TARGET; the
+    corroboration veto tests the ENDPOINT, and every spurious referent observed
+    live was blocked only because the paraphrase happened to cite the endpoint.
+
+    APPLIED ONLY ON THE FALLBACK ARM (``not finding.target_cited``). A fact that
+    NAMES the target is materially stronger evidence than the whole declared
+    set, and the intersection arm is out of scope by ratified decision — its
+    executed repairs were all correct and all fired through fact-cited evidence.
+
+    ``''`` MEANS PLAUSIBLE, so the fail-closed direction is the non-empty
+    string: anything this rule cannot positively vouch for is refused.
+
+    DELIBERATELY NOT A FOURTH VETO IN :func:`_candidate_pool`. zeta detects and
+    records; eta refuses. Folding it into the pool would EMPTY the pool, turning
+    a recorded resolvable finding into an unresolvable one and erasing the
+    evidence that a junk referent was declared at all — and it would reorder
+    vetoes that must not be reordered. Keeping the refusal at the write point
+    also keeps it at the one place a mint can actually happen, so no future
+    caller of :func:`_candidate_targets` can route around it.
+
+    Args:
+        target: The referent :func:`_candidate_targets` nominated.
+        known_projects: The registry of real project keys —
+            ``MemoryService._known_projects``, fed by ``build_known_projects_map``
+            via ``set_known_projects``. Membership is the ONLY thing that makes a
+            foreign qualifier real.
+        target_node_exists: Whether a node of this exact name already exists in
+            the group. An existing node is its own evidence: repointing onto it
+            mints nothing, so there is no phantom to prevent.
+
+    Returns:
+        ``''`` when the target may be repaired towards, else the operator-
+        readable REASON it was refused, carried verbatim onto the record the
+        way :func:`_unresolvable_reason`'s output is.
+    """
+    if target.project_id and target.project_id in known_projects:
+        # (i) A real cross-project reference. The qualifier names a project the
+        # registry knows, so the node is a legitimate one to mint or resolve.
+        return ''
+    if target.kind == 'task' and not target.project_id:
+        # (ii) A bare own-project `Task N` referent — the dominant live shape.
+        # The `kind` test is redundant TODAY, since `_KIND_LABELS` holds exactly
+        # one kind, and is written anyway so that registering a second kind
+        # fails CLOSED here rather than silently widening what counts as "a bare
+        # own-project Task-N referent".
+        return ''
+    if target_node_exists:
+        # (iii) A node of this exact name is already in the group, so repointing
+        # onto it mints nothing — and a phantom node is the whole thing this
+        # rule exists to prevent. Its own existence outranks an unrecognized
+        # qualifier: something already put it there.
+        return ''
+    return (
+        f'the nominated repair target {target.node_name!r} is not plausible: '
+        f'its qualifier {target.project_id!r} names no project this instance '
+        'knows, and no node of that name exists in this group, so repairing '
+        'towards it would MINT one out of a referent nothing corroborates; '
+        'recorded, not repaired'
+    )
 
 
 @dataclass
