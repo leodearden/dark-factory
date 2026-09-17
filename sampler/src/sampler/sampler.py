@@ -147,6 +147,24 @@ def run_tick(
     #    sampler-windowed path, because their write MODE is the same and they
     #    differ along exactly one axis — the stem set their names are validated
     #    against, above.
+    #
+    #    The load group's window columns are RECORDED AHEAD OF A CONSUMER, and
+    #    that is stated here so a reader does not have to grep for one: the
+    #    dashboard reads window_mean/window_max only for the 9 names in
+    #    dashboard/src/dashboard/data/load.py::KNOWN_METRICS, and
+    #    scripts/load-threshold-calibration.py::_fetch selects (metric, ts,
+    #    value) and computes its own windows. So the ~2 + 2-per-cgroup-leaf
+    #    window reads this buys per tick (16 on this host) are write-only
+    #    today, and NO consumer is scheduled — say so rather than implying one.
+    #    Kept windowed regardless, for two reasons that survive having no
+    #    reader. Each read is the indexed `SEARCH samples USING INDEX
+    #    idx_samples_metric_ts (metric=?)` that LoadSampleStore.cleanup_old's
+    #    docstring measured at ~0 ms, so the saving on offer is ~nothing; and
+    #    routing one GROUP to the unwindowed path would give the store a
+    #    second axis of variability (window mode AND provenance) where it
+    #    deliberately has one. Nothing is lost either way if that is revisited:
+    #    both columns are recomputable from the raw values, which are the
+    #    thing this corpus exists to keep.
     store.write_tick(
         now,
         unwindowed=psi,

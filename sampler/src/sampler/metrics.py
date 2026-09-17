@@ -295,6 +295,21 @@ def collect_load_metrics(
         # neither a df-*.slice nor an orchestrator-*.service. Either way the
         # corpus stays the channel that matters -- absent own_read_ok:<leaf>
         # rows make the condition countable without reading the journal.
+        #
+        # The surviving warning branch is per-tick too, and that was weighed
+        # rather than overlooked. It is a SEVERITY signal, not new volume:
+        # __main__ already writes one INFO `tick ...` line per tick, so the
+        # journal carries 17,280 sampler lines a day on every host regardless,
+        # and what this branch adds is a line an operator's `-p warning` filter
+        # can see. De-duplicating it across ticks is what would cost: the unit
+        # is Type=oneshot, so each tick is a FRESH PROCESS and a module-level
+        # "already warned" memo would reset every 5 s. The only cross-tick
+        # state on this host is the store's meta table, and reaching it from
+        # here would hand a pure collector a store handle and invert the
+        # module dependency (heuristic 7) to quieten a log line. On a host
+        # where this branch is steady it is steady BECAUSE the sampler is
+        # collecting nothing useful there, which is worth saying loudly once
+        # per tick rather than never.
         say = logger.debug if _anchor_segments(own_cgroup_path) is None else logger.warning
         say(
             'no pressure cgroups discovered under the anchor derived from %r; '

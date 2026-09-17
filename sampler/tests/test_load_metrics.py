@@ -596,6 +596,49 @@ class TestDiscoverPressureCgroups:
         assert [name for name, _ in found] == sorted(LIVE_ORCHESTRATOR_LEAVES)
         assert len(found) == 7
 
+    def test_a_near_miss_sibling_is_not_swept_in(self, tmp_path):
+        """The SUFFIX half of both globs, which nothing else here exercises.
+
+        Every other fixture plants only leaves that match, so relaxing the two
+        globs to ``*/df-*`` and ``*/orchestrator-*`` left the suite green — and
+        a cgroup manager plants more than services beside a service:
+        ``orchestrator-*.socket`` and ``.scope`` units live in the same
+        directory. Sweeping one in would emit ``own_cpu_some10:<name>`` rows
+        named after a cgroup that is not the unit the arm is about, and ε2
+        would average them in without a way to tell.
+
+        Both branches get a decoy, because the two globs are separate spellings
+        and only the branch that RUNS is under test in any one call.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        orchestrator_tree = build_cgroup_tree(
+            tmp_path / 'else-branch',
+            groups={APP_PARENT: {
+                'orchestrator-1.service': pressure_text(some=1.0),
+                'orchestrator-1.socket': pressure_text(some=2.0),
+                'orchestrator-1.scope': pressure_text(some=3.0),
+            }},
+        )
+        found = discover_pressure_cgroups(
+            own_cgroup_path=orchestrator_tree.own_cgroup_path,
+            cgroup_root=orchestrator_tree.cgroup_root,
+        )
+        assert [name for name, _ in found] == ['orchestrator-1.service']
+
+        df_tree = build_cgroup_tree(
+            tmp_path / 'df-branch',
+            groups={DF_PARENT: {
+                'df-dark_factory.slice': pressure_text(some=1.5),
+                'df-dark_factory': pressure_text(some=2.5),
+            }},
+        )
+        found = discover_pressure_cgroups(
+            own_cgroup_path=df_tree.own_cgroup_path,
+            cgroup_root=df_tree.cgroup_root,
+        )
+        assert [name for name, _ in found] == ['df-dark_factory.slice']
+
     def test_df_wins_outright_when_both_topologies_exist(self, tmp_path):
         """df-*.slice is preferred, not unioned — the PRD says ELSE, not AND."""
         from sampler.metrics import discover_pressure_cgroups

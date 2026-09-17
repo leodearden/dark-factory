@@ -271,6 +271,16 @@ class LoadSampleStore:
         One home for it (heuristic 11): ``write_tick`` needs it on the
         connection it already holds, ``trailing_window`` needs it on one of its
         own, and a second copy would be free to drift.
+
+        The span is bounded by ROW COUNT and not by time, so a "60-sample
+        window" spans whatever wall-clock those 60 rows cover: 300 s at the
+        5 s cadence, and the outage plus 300 s for a metric whose unit was
+        stopped for hours. No ``ts >=`` floor is imposed, because these
+        columns are a convenience over rows that are all kept anyway — a floor
+        would silently narrow the window instead, and a consumer that needs
+        wall-clock windows can compute them from the raw ``ts``/``value``
+        rows, which is what ``scripts/load-threshold-calibration.py`` already
+        does.
         """
         rows = conn.execute(
             'SELECT value FROM samples'
