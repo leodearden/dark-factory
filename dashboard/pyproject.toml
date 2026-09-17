@@ -24,6 +24,14 @@ dependencies = [
     # typing_extensions spelling is accepted at that pin and applies the default,
     # so every single-argument `TTLCache[V]` keeps checking unedited.
     "typing-extensions>=4.12",
+    # Direct import (src/dashboard/http_pool.py, tests/test_http_pool.py), NOT
+    # just an httpx transitive: http_pool.py's shape guard is written against
+    # httpcore's own pool contract, and the test's fake AsyncNetworkBackend
+    # subclasses httpcore base classes by name. pyright's `include` covers
+    # `tests`, so an undeclared transitive would resolve today and vanish the
+    # moment httpx swapped its backend — the same drift the typing-extensions
+    # entry above exists to prevent.
+    "httpcore>=1.0",
     "escalation>=0.1",
     "dark-factory-shared",
 ]
