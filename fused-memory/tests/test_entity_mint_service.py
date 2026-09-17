@@ -176,7 +176,7 @@ class TestIdentityLock:
         lock = service.graphiti._identity_lock_for(_PROJECT)
         observed = {}
 
-        async def _probe(name, *, group_id, summary=''):
+        async def _probe(name, *, group_id, summary='', merge_duplicates=True):
             observed['locked'] = lock.locked()
             return 'uuid-new'
 

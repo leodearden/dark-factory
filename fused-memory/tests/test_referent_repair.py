@@ -388,7 +388,7 @@ class TestTheEpisodeIdentityParameter:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -414,7 +414,7 @@ class TestTheRepairSequence:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -798,7 +798,7 @@ class TestNeverGuess:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -2632,7 +2632,7 @@ class TestEndToEndThroughTheWritePath:
         await service._execute_graphiti_write('add_episode', self._payload())
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',

@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 
-from fused_memory.backends.graphiti_client import ActiveEdgesError, GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    ActiveEdgesError,
+    AmbiguousEntityError,
+    GraphitiBackend,
+)
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -4624,9 +4628,14 @@ class MemoryService:
         calling it from anywhere that does not already hold the lock, would
         reintroduce the race alpha's contract forbids.
 
-        ``ensure_entity_node`` IS CALLED UNCONDITIONALLY, for every resolvable
-        finding, and ITS RETURN — never ``finding.new_endpoint_uuid`` — is the
-        uuid handed to ``reassign_edge``. Three reasons:
+        ``ensure_entity_node`` IS CALLED for every resolvable finding THAT
+        SURVIVES THE REPAIR PATH'S PRE-WRITE GUARDS (see
+        :meth:`_repair_edge_findings`), and its >=2-match arm REFUSES rather
+        than collapses — it is called with ``merge_duplicates=False``. Within
+        that, the call is unconditional: no branch of this pass skips it for a
+        finding it is willing to repair, and ITS RETURN — never
+        ``finding.new_endpoint_uuid`` — is the uuid handed to ``reassign_edge``.
+        Three reasons, all of which still hold:
 
         * It is IDEMPOTENT: once the node exists, every later call takes the
           resolve path and mints nothing. A branch on ``new_endpoint_uuid is
@@ -4634,11 +4643,10 @@ class MemoryService:
           SECOND site that can disagree about what the edge should point at.
         * zeta returns ``None`` for BOTH "absent" and "duplicate-name group"
           (``_intended_endpoint_uuid``: ``len(rows) != 1`` yields ``None``, so
-          zeta never pre-empts the identity-lock-held collapse), and
-          ``ensure_entity_node`` handles the two identically — it
-          resolves-or-collapses-or-mints through ``_resolve_or_create_entity``.
-          Branching would have to re-derive the distinction zeta explicitly
-          declined to make.
+          zeta never pre-empts the identity decision), and this pass does not
+          re-derive the distinction zeta explicitly declined to make: it hands
+          the name to ``ensure_entity_node`` and lets the backend, reading under
+          the lock, mint the absent one and REFUSE the duplicate-name group.
         * It re-reads from the graph under the lock, so the target is
           corroborated at WRITE time rather than taken from a lookup made a few
           statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
@@ -5200,8 +5208,10 @@ class MemoryService:
 
         TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
         wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
-        fail with NOTHING written — and its ``except`` records ``'failed'``.
-        The second wraps only the post-write summary backstop, whose failures
+        fail with NOTHING written — and its generic ``except`` records
+        ``'failed'``; an ``AmbiguousEntityError`` is peeled off AHEAD of that
+        one, because a refusal is not a fault (see the arm's own comment). The
+        second guard wraps only the post-write summary backstop, whose failures
         cannot un-write the move that already landed and therefore must not be
         able to book it as ``'failed'``. Sharing one ``except`` across the
         commit point is what would let a cosmetic post-write problem report an
@@ -5263,6 +5273,16 @@ class MemoryService:
             try:
                 target_uuid = await self.graphiti.ensure_entity_node(
                     intended.node_name, group_id=group_id,
+                    # NO MERGE ON REPAIR. `merge_duplicates=True` is the
+                    # backend default and is licensed for exactly one path —
+                    # the episode-write dedup of the PRD's seam S1, which
+                    # reaches `_resolve_or_create_entity` directly and never
+                    # this method. A repair is not that path: folding two
+                    # same-named nodes together is irreversible, and it would
+                    # be a SIDE EFFECT of moving an edge rather than a
+                    # deliberate act (Ratified Decision 1). The >=2 arm now
+                    # raises instead, and is caught immediately below.
+                    merge_duplicates=False,
                 )
                 result = await self.graphiti.reassign_edge(
                     finding.edge_uuid, target_uuid,
@@ -5271,6 +5291,52 @@ class MemoryService:
                 moved = bool(result.get('moved'))
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except AmbiguousEntityError as exc:
+                # A THIRD POSITION, and it must sit AHEAD of the generic
+                # `except Exception` below or it never fires. Neither existing
+                # disposition describes it:
+                #
+                # * not `'unrepairable'`-by-NEVER-GUESS — we did not refuse to
+                #   guess; zeta determined a target and this pass agreed with
+                #   it. What stopped us is a property of the GRAPH, not of the
+                #   evidence.
+                # * not `'failed'` — the backend did not fail. It did exactly
+                #   what it was asked: it REFUSED an irreversible collapse the
+                #   repair path is not licensed to trigger. Booking a refusal
+                #   as a fault would put it in the same bucket as a FalkorDB
+                #   outage, inflate leaf iota's failure rate with an event that
+                #   is working as designed, and feed a repair-storm streak
+                #   whose whole claim is that something REGRESSED.
+                #
+                # It lands on `'unrepairable'` because that is what actually
+                # happened — the edge is left alone and a human must adjudicate
+                # the duplicates — and the `reason` is the field that exists to
+                # say WHY. It names the duplicate-name group from the
+                # exception's STRUCTURED fields rather than from its message,
+                # so nothing here parses a string.
+                logger.warning(
+                    'Referent repair REFUSED for one edge end: the target name '
+                    '%r resolves to %d nodes in %s, and collapsing them is not '
+                    'this path to make. The edge is left unrepaired and '
+                    'recorded as such: %s',
+                    exc.name, len(exc.uuids), group_id, finding.to_dict(),
+                )
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='unrepairable',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    intended_referent=intended.node_name,
+                    reason=(
+                        f'Repair target {exc.name!r} names a duplicate-name '
+                        f'group in {exc.group_id!r}: {list(exc.uuids)!r}. '
+                        'Collapsing them is irreversible and is deliberately '
+                        'NOT done by the repair path — adjudicate the '
+                        'duplicates by hand.'
+                    ),
+                ))
+                continue
             except Exception as exc:
                 logger.warning(
                     'Referent repair FAILED for one edge end; it is left '
@@ -9845,6 +9911,18 @@ class MemoryService:
             else:
                 uuid = await self.graphiti.ensure_entity_node(
                     name, group_id=project_id, summary=summary,
+                    # Redundant BY CONSTRUCTION with the pre-read above — this
+                    # branch is reached only when `existing` was empty, so the
+                    # backend's >=2 arm cannot fire — and that is precisely why
+                    # it is spelled out. Today the collapse is unreachable here
+                    # through an ORDERING property of this method's body, which
+                    # a later refactor dropping the redundant pre-read would
+                    # silently undo. The keyword makes it structurally
+                    # unreachable instead of contingently unreachable, so
+                    # Ratified Decision 1 holds at BOTH non-S1 call sites (the
+                    # other is `_repair_edge_findings`) as an invariant rather
+                    # than as a coincidence of one caller's ordering.
+                    merge_duplicates=False,
                 )
                 result = {
                     'status': 'minted',
