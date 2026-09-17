@@ -70,6 +70,7 @@ import dataclasses
 import json
 import sys
 import tokenize
+from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
 
@@ -1061,6 +1062,29 @@ def derive_totals(report: dict) -> dict[str, int]:
 BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
 LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
 
+#: THE ONE COPY of what to do when a measure rose. Composed into every site
+#: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
+#: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
+#: and the pytest gate's assertion message. Three near-copies used to say only
+#: that raising was forbidden, and the copy that mattered sent an implementer to
+#: escalation rather than to a sanctioned path (task 5342, esc-5342-1).
+RAISE_REMEDY = (
+    'Remedy: LOWER the measure. A task that legitimately lowers one regenerates '
+    'the baseline in the SAME commit:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH}\n'
+    'RAISING a measure is not forbidden -- it is never SILENT. Net-additive '
+    'work (a bug fix that adds a guard, a widened CLUSTER_PATHS) records the '
+    'raise as a reviewed diff:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH} '
+    '--authorize-raise <task-id> '
+    '--reason "<why this is net-additive work, not a refactor that failed>"\n'
+    f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
+    'task and the reason, so the raise lands as a diff a reviewer reads rather '
+    'than as a number nobody saw move. Without those flags --write-baseline '
+    'REFUSES to absorb a raise at all, so the ratchet stays fail-closed: a '
+    'blind regeneration cannot widen it.'
+)
+
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
@@ -1170,16 +1194,70 @@ def render_baseline(report: dict) -> str:
     return '{\n' + ',\n'.join(entries) + '\n}\n'
 
 
-def write_baseline(path: Path, report: dict) -> Path:
-    """Render *report* and write it to *path* atomically.
+class UnauthorizedRaise(Exception):
+    """``write_baseline`` refused to absorb a raise nobody authorized.
+
+    NOT a ``MetricsError``, deliberately. ``main()`` maps every MetricsError to
+    exit 2 ("the instrument is broken"), and a refused regeneration is not a
+    broken instrument -- it is a measure that rose, discovered at write time
+    instead of at check time, which is squarely exit 1. Subclassing would
+    silently reclassify a real regression as a broken tool, collapsing the one
+    distinction the exit ladder exists to keep.
+
+    Carries the measured ``violations`` so ``main()`` can print the same
+    per-violation lines ``--check`` prints, and so the ledger record for an
+    AUTHORIZED raise is derived from the same comparison that would have
+    refused it.
+    """
+
+    def __init__(self, violations: Sequence[Violation]) -> None:
+        self.violations: tuple[Violation, ...] = tuple(violations)
+        super().__init__(
+            f'refusing to write a baseline that RAISES {len(self.violations)} '
+            'measure(s):\n'
+            + '\n'.join(f'  {v.message}' for v in self.violations)
+            + f'\n{RAISE_REMEDY}'
+        )
+
+
+def write_baseline(
+    path: Path, report: dict, *, authorization: object | None = None
+) -> Path:
+    """Render *report* and write it to *path* atomically, refusing silent raises.
 
     THE TEXT IS RENDERED BEFORE THE DESTINATION IS TOUCHED, so a rendering
     failure leaves the committed baseline byte-for-byte intact instead of
     truncated -- a truncated baseline would be a *widened* ratchet, the one
     failure mode this instrument must never produce silently.
+
+    THE WRITE GATE, and why it lives here rather than in the comparator. The
+    pytest gate pins the committed baseline to equal a fresh measurement of the
+    tree, so in every COMMITTED state the comparator is trivially clean; a raise
+    is red only between editing the code and regenerating, and regeneration used
+    to absorb it silently because this function read nothing before overwriting.
+    Regeneration is therefore the ratchet's real enforcement point. If the
+    destination already holds a baseline, the raises this report would introduce
+    are measured against it, and without an *authorization* the write is REFUSED
+    with ``UnauthorizedRaise`` -- the destination untouched, exit 1 at the CLI.
+
+    DELIBERATELY NOT APPLIED here: ``_require_matching_params``. Both it and
+    ``resolve_cluster_paths`` instruct the reader to edit ``CLUSTER_PATHS`` and
+    regenerate the baseline in one commit, so routing regeneration through that
+    precondition would break the one workflow those messages prescribe. Widening
+    the cluster still raises the derived totals, so it still needs an
+    authorization -- which is honest, the totals really did rise.
+
+    A MISSING destination is a first write with nothing to compare against. A
+    MALFORMED one propagates ``load_baseline``'s ``MetricsError`` rather than
+    being overwritten: a previous baseline you cannot read is one whose raises
+    you cannot see.
     """
     text = render_baseline(report)
     target = Path(path)
+    if target.exists():
+        raises = _measure_raises(report, load_baseline(target))
+        if raises and authorization is None:
+            raise UnauthorizedRaise(raises)
     safe_io.atomic_write_text(target, text, mkdir=True)
     return target
 
@@ -1445,6 +1523,25 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
     return violations
 
 
+def _measure_raises(current: dict, previous: dict) -> list[Violation]:
+    """Every measure *current* raises above *previous*, sorted by (measure, key).
+
+    The comparison arms only -- no preconditions, no policy. TWO callers run
+    this one implementation (SPOT): ``check_against_baseline``, which is what
+    ``--check`` and the pytest gate compare with, and ``write_baseline``'s gate,
+    which is what stops a regeneration absorbing a raise nobody reviewed. Two
+    implementations of "did a measure rise" would eventually disagree, and the
+    one that disagreed quietly would be the write path.
+    """
+    violations = [
+        *_check_files(current, previous),
+        *_check_functions(current, previous),
+        *_check_tests(current, previous),
+        *_check_totals(current, previous),
+    ]
+    return sorted(violations, key=lambda v: (v.measure, v.key))
+
+
 def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """Compare a fresh report against the committed baseline. Pure.
 
@@ -1460,10 +1557,7 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     _require_matching_params(current, baseline)
 
     violations = [
-        *_check_files(current, baseline),
-        *_check_functions(current, baseline),
-        *_check_tests(current, baseline),
-        *_check_totals(current, baseline),
+        *_measure_raises(current, baseline),
         *_check_ceilings(current, baseline),
     ]
     return sorted(violations, key=lambda v: (v.measure, v.key))
