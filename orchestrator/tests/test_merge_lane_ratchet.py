@@ -1801,6 +1801,143 @@ class TestBaselineIO:
         assert 'baseline.json' in str(excinfo.value)
 
 
+class TestWriteBaselineRefusesAnUnauthorizedRaise:
+    """The write path is where the ratchet is actually enforceable.
+
+    ``test_baseline_matches_a_fresh_measurement`` forces the committed baseline
+    to equal the tree in every committed state, so the COMPARATOR is trivially
+    clean on every commit: a raise is red only in the window between editing the
+    code and regenerating. Regeneration then absorbs it, because
+    ``--write-baseline`` reads nothing before it overwrites. So the only place a
+    gate can bite is the write itself, and that is what these pin.
+
+    Synthetic dicts throughout, driven through the public ``write_baseline``:
+    microseconds, and every branch reached directly rather than only through a
+    71-second measurement.
+    """
+
+    @staticmethod
+    def _seeded(tmp_path: Path) -> Path:
+        """A destination already holding the seed baseline, byte-for-byte."""
+        target = tmp_path / 'b.json'
+        metrics.write_baseline(target, _ratchet_baseline())
+        return target
+
+    def test_a_per_file_rise_is_refused_naming_the_measure_and_both_numbers(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][_MQ]['lines'] += 103  # the real task-5342 shape
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        message = str(excinfo.value)
+        assert 'lines' in message
+        assert _MQ in message
+        assert '21550' in message and '21653' in message
+        # The refusal must name the sanctioned path, not merely forbid the move.
+        assert '--authorize-raise' in message
+
+    def test_the_refusal_carries_the_measured_violations(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][_MQ]['lines'] += 103
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        violations = excinfo.value.violations
+        assert isinstance(violations, tuple)
+        assert violations
+        assert all(isinstance(v, metrics.Violation) for v in violations)
+        # Every one is a genuine rise: the refusal reports what it measured, so
+        # the ledger record derived from it cannot disagree with what landed.
+        assert all(v.current > v.baseline for v in violations)
+
+    def test_a_refused_write_leaves_the_destination_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        before = target.read_text(encoding='utf-8')
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][_MQ]['lines'] += 103
+
+        with pytest.raises(metrics.UnauthorizedRaise):
+            metrics.write_baseline(target, current)
+
+        # A truncated or half-written baseline would be a WIDENED ratchet, the
+        # one failure mode this instrument must never produce.
+        assert target.read_text(encoding='utf-8') == before
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['b.json']
+
+    @pytest.mark.parametrize(
+        ('mutate', 'measure'),
+        [
+            pytest.param(
+                lambda cur: cur['files'][_MQ].__setitem__(
+                    'cognitive', cur['files'][_MQ]['cognitive'] + 1
+                ),
+                'cognitive',
+                id='files',
+            ),
+            pytest.param(
+                lambda cur: cur['functions'].__setitem__(
+                    _VERIFIER_LOOP, cur['functions'][_VERIFIER_LOOP] + 1
+                ),
+                'cognitive',
+                id='functions',
+            ),
+            pytest.param(
+                lambda cur: cur['tests'][_TEST_FILE].__setitem__(
+                    'private_reads', cur['tests'][_TEST_FILE]['private_reads'] + 1
+                ),
+                'private_reads',
+                id='tests',
+            ),
+        ],
+    )
+    def test_every_comparison_arm_reaches_the_write_gate(
+        self, tmp_path: Path, mutate, measure: str
+    ) -> None:
+        # One arm left out of the write gate is one section a task could widen
+        # by regenerating -- the same hole, one measure narrower.
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        mutate(current)
+
+        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
+            metrics.write_baseline(target, current)
+
+        assert measure in {v.measure for v in excinfo.value.violations}
+
+    def test_rewriting_an_identical_report_is_not_a_raise(
+        self, tmp_path: Path
+    ) -> None:
+        # ANTI-VACUITY: a gate that refused everything would pass every test
+        # above while making the sanctioned workflow impossible.
+        target = self._seeded(tmp_path)
+        assert metrics.write_baseline(target, _ratchet_baseline()) == target
+
+    def test_lowering_a_measure_stays_frictionless(self, tmp_path: Path) -> None:
+        # Lowering is the POINT. It must cost nothing extra.
+        target = self._seeded(tmp_path)
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][_MQ]['lines'] -= 4000
+
+        assert metrics.write_baseline(target, current) == target
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+
+    def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
+        # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
+        # main() maps every MetricsError to 2, so a refusal that subclassed it
+        # would report a real regression as a broken tool.
+        assert not issubclass(metrics.UnauthorizedRaise, metrics.MetricsError)
+
+
 # ---------------------------------------------------------------------------
 # The ratchet comparator, and INV-10 tier 1.
 #
