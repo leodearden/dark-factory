@@ -62,6 +62,8 @@ from fused_memory.server.write_triage import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from fused_memory.models.memory import MemoryResult
 
 logger = logging.getLogger(__name__)
@@ -265,6 +267,29 @@ _FIELD_CHARS = 1_200
 #: record, and "this text continues" is information the verdict depends on.
 _ELIDED_MARKER = '…[elided]'
 
+#: C1's ~2.5k-token call budget, expressed in the units this module can
+#: actually count: 2_500 tokens at the conventional 4 chars/token.
+#:
+#: WHAT IT BOUNDS is the WHOLE call — :data:`JUDGE_SYSTEM_PROMPT` plus a
+#: worst-case :func:`build_judge_prompt` render, meaning
+#: :data:`_DEFAULT_JUDGE_CANDIDATE_COUNT` candidates and a new entry with
+#: every field at :data:`_FIELD_CHARS`. Not the system prompt alone: the two
+#: halves are summed on every request, so budgeting either in isolation
+#: budgets nothing.
+#:
+#: WHY IT IS A CONSTANT rather than a literal in the test that checks it. The
+#: system prompt is the half that grows — a vocabulary word, a worked example,
+#: a decision rule all land there — so the ceiling needs a home next to the
+#: rationale for its value. Raising it is then an edit to the thing being
+#: budgeted, made where C1 is cited, rather than a number quietly relaxed in a
+#: test until it stops failing.
+#:
+#: The char/token ratio is a convention, not a measurement, and it is
+#: CONSERVATIVE for the case that matters: the worst case is built from
+#: repeated filler, which BPE packs far denser than 4 chars/token, so a
+#: rendering at this ceiling costs fewer real tokens than the figure implies.
+_PROMPT_CHAR_BUDGET = 2_500 * 4
+
 
 def _elide(text: object) -> str:
     """*text* as a string, bounded by :data:`_FIELD_CHARS` and marked if cut."""
@@ -352,6 +377,28 @@ def select_judge_candidates(
 
 # --- prompt -----------------------------------------------------------------
 
+def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
+    """The EXAMPLES section of the system prompt: one block per exemplar.
+
+    A FUNCTION OF THE TUPLE ALONE — pure, total, and walking the sequence in
+    the order given. That is what makes the system prompt byte-identical on
+    every import, which is in turn the precondition for an eval run being
+    reproducible: this file has been bitten once by an iteration order moving
+    between two processes.
+
+    The formatting lives here rather than in :data:`JUDGE_EXEMPLARS` so the
+    data stays checkable — vocabulary closure and verdict coverage are
+    assertions about fields, not greps over a rendered blob — and so two
+    exemplars cannot disagree about their own layout.
+    """
+    return '\n\n'.join(
+        f'new entry: {exemplar.entry}\n'
+        f'candidate: {exemplar.candidate}\n'
+        f'answer: {exemplar.verdict}'
+        for exemplar in exemplars
+    )
+
+
 #: The judge's standing instructions. D3 lives HERE, in the model's own
 #: prompt, not only in a docstring: a model told merely to "classify" will
 #: happily decide which of two contradictory memories is true, and reify
@@ -385,6 +432,10 @@ and nothing you say here deletes or edits anything.
 When more than one word fits, prefer the earlier one in that list: \
 "distinct" over "restates", "restates" over "amends", "amends" over \
 "contests".
+
+Worked examples:
+
+{_render_exemplars(JUDGE_EXEMPLARS)}
 
 Reply with a bare JSON object and nothing else:
 
