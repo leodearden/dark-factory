@@ -75,6 +75,7 @@ from collections import deque
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -989,6 +990,59 @@ def run_stdin_heartbeat(
     finally:
         with contextlib.suppress(OSError):
             close_fn(write_fd)
+
+
+#: Thread name for the writer spawned by :func:`start_stdin_heartbeat`.  Named
+#: rather than anonymous so it is identifiable in a thread dump (``cli.py``'s
+#: shutdown watchdog enumerates live threads by name) and so a test can assert
+#: none survives a dispatch.
+HEARTBEAT_THREAD_NAME: str = 'ssh-stdin-heartbeat'
+
+
+class HeartbeatHandle(NamedTuple):
+    """Return value of :func:`start_stdin_heartbeat`."""
+
+    stop: Callable[[], None]
+    thread: threading.Thread
+
+
+def start_stdin_heartbeat(
+    write_fd: int,
+    *,
+    interval: float = HEARTBEAT_INTERVAL_SECS,
+    write_fn=os.write,
+    close_fn=os.close,
+) -> HeartbeatHandle:
+    """Spawn a started daemon thread running :func:`run_stdin_heartbeat` against *write_fd*.
+
+    The PRODUCER counterpart of :func:`start_stdin_watchdog`, and the reason
+    the symmetry matters: the consumer was given a dedicated OS thread so it
+    fires even when the *build's* event loop is wedged, and this gives the
+    dispatcher's beat the same immunity to the *orchestrator's* loop — which
+    carries the scheduler, agent dispatch, the merge worker and the uvicorn
+    escalation server, and was measured stalling for 16.1s against what was
+    then a 10.0s starvation budget on 2026-08-12.  A beat scheduled behind
+    that stall is a beat the remote correctly reads as a dead channel.
+
+    ``daemon=True`` so the writer can never block interpreter shutdown.
+
+    Returns a :class:`HeartbeatHandle`; ``handle.stop()`` sets the loop's
+    Event and is idempotent — safe to call twice, or after the thread has
+    already exited — matching ``cli.py::_force_exit_after_delay``'s ``disarm``.
+    ``handle.thread`` is exposed so callers and tests can ``join()`` it.
+    *write_fd* belongs to the thread, which closes it on every exit path (see
+    :func:`run_stdin_heartbeat`); no caller may close it too.
+    """
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=run_stdin_heartbeat,
+        args=(write_fd, stop_event),
+        kwargs={'interval': interval, 'write_fn': write_fn, 'close_fn': close_fn},
+        name=HEARTBEAT_THREAD_NAME,
+        daemon=True,
+    )
+    thread.start()
+    return HeartbeatHandle(stop=stop_event.set, thread=thread)
 
 
 def run_stdin_watchdog(
