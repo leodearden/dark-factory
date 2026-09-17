@@ -1960,6 +1960,55 @@ class ReferentFinding:
         """
         return self.endpoint_referent.node_name in self.cited
 
+    @property
+    def target_cited(self) -> bool:
+        """Does this edge's OWN FACT name the target this finding nominates?
+
+        Read it as WHICH EVIDENCE ARM produced that target — exactly, and
+        without a stored flag. :func:`_candidate_pool` returns
+        ``cited & referents`` whenever that intersection is non-empty and the
+        whole declared set otherwise, so a target drawn from the whole-set
+        FALLBACK can never be in :attr:`cited` (if it were, the intersection
+        would have been non-empty), and a target drawn from the INTERSECTION
+        always is. True therefore means "the fact itself names this target";
+        False means "this target came from the declared set, on a fact that
+        says nothing about it".
+
+        A ``@property`` OVER THE RECORDED EVIDENCE, for the reason its sibling
+        :attr:`corroborated` states at length: a stored boolean set where the
+        finding is built would be a second site that must agree with
+        :func:`_candidate_pool` byte-for-byte, which is the INV-5 lockstep
+        duplication that produced esc-3671-3's blocking bug. Derived, the two
+        cannot disagree.
+
+        ITS CONSUMER is the repair pass's TARGET-PLAUSIBILITY guard
+        (:func:`_implausible_target_reason`, applied in
+        :meth:`MemoryService._repair_edge_findings`), which acts ONLY on the
+        fallback arm: a fact that NAMES the target is materially stronger
+        evidence than the whole declared set, so the intersection arm is out of
+        scope by ratified decision.
+
+        Compares rendered ``node_name``s because that is what :attr:`cited`
+        carries, under the same injectivity precondition :attr:`corroborated`
+        rests on and which ``tests/test_referent_verification.py::
+        TestCorroboratedIsDerivedFromTheRecordedEvidence::
+        test_node_name_is_injective_over_the_registered_kinds`` already pins —
+        that one test reds for BOTH properties, so no second precondition test
+        exists.
+
+        ``intended_referent is None`` (an unresolvable finding, which nominates
+        no target at all) answers False: the fail-closed direction, since False
+        is what makes the guard REFUSE.
+
+        Deliberately NOT a :meth:`to_dict` key, like :attr:`corroborated`: that
+        payload's key set is contractually the dataclass FIELD names, and both
+        inputs are already on the record.
+        """
+        return (
+            self.intended_referent is not None
+            and self.intended_referent.node_name in self.cited
+        )
+
     def __post_init__(self) -> None:
         if self.check not in REFERENT_CHECKS:
             raise ValueError(
