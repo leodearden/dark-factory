@@ -157,6 +157,15 @@ _ERR_INVALID_REASON: dict[str, str] = {
     'error_type': 'ReconCitationInvalidReason',
 }
 
+# The compensating control for the structural safety property ``wrong_memory``
+# removes — "the worst this path can do is re-point a claim that already had no
+# backing" is no longer true of it. A live, correct-looking citation must not be
+# strippable from a historical audit record with nothing in the blob saying why.
+_ERR_JUSTIFICATION_REQUIRED: dict[str, str] = {
+    'error': 'justification_required',
+    'error_type': 'ReconCitationJustificationRequired',
+}
+
 _ERR_REPLACEMENT_NOT_FOUND: dict[str, str] = {
     'error': 'replacement_not_found',
     'error_type': 'ReconCitationReplacementNotFound',
@@ -492,6 +501,12 @@ async def repair_memory_citation(
     a silent reclassification. Orthogonally, ``replacement_memory_id`` chooses
     drop (``None``) or swap — the two axes never interact.
 
+    ``justification`` is the prose account recorded alongside it. REQUIRED
+    (non-blank after strip) for ``wrong_memory``, which removes a citation that
+    still resolves and would otherwise leave nothing in the blob saying why;
+    optional for ``memory_not_found``, whose confirmed absence is its own
+    account, but recorded when supplied.
+
     Returns a structured dict: ``{'status': 'repaired'|'dry_run', ...}`` on
     success, or one of the ``_ERR_*`` branches — every one of which is keyed by
     ``error`` and carries NO ``status`` key, so ``status`` is unambiguously the
@@ -541,6 +556,25 @@ async def repair_memory_citation(
                 f'ABSENT; {REASON_WRONG_MEMORY!r} asserts it RESOLVES but does '
                 'not back the finding. Both spellings of the repair — drop and '
                 'swap — are selected by replacement_memory_id, not by this.'
+            ),
+        }
+
+    # Normalised once, here, so the value the gate judges and the value the
+    # durable record stores cannot differ. Emptiness-after-strip is the ONLY
+    # thing checked: the enum above is the control value, this is human-readable
+    # payload and is never parsed, so no length floor and no keyword matching.
+    justification = (justification or '').strip() or None
+    if reason == REASON_WRONG_MEMORY and justification is None:
+        return _ERR_JUSTIFICATION_REQUIRED | {
+            'reason': reason,
+            'hint': (
+                f'reason={REASON_WRONG_MEMORY!r} removes a citation that still '
+                'RESOLVES, so nothing else in the blob will say why it went. '
+                'The citation_repairs record is the only surviving account of '
+                'the change: state what the citation should have backed and how '
+                'the claim was independently confirmed. Not required for '
+                f'reason={REASON_MEMORY_NOT_FOUND!r}, where the confirmed '
+                'absence is its own account.'
             ),
         }
 
