@@ -161,11 +161,18 @@ class _Harness:
     pool: httpcore.AsyncConnectionPool
 
 
-def _build_harness(read_gate: asyncio.Event | None = None) -> _Harness:
-    """An ``httpx.AsyncClient`` over a pool with no sockets behind it."""
+def _build_harness(
+    read_gate: asyncio.Event | None = None,
+    max_connections: int = _MAX_CONNECTIONS,
+) -> _Harness:
+    """An ``httpx.AsyncClient`` over a pool with no sockets behind it.
+
+    *max_connections* is overridable only so the saturation tests can reach a
+    high-water mark in four requests instead of eighty.
+    """
     backend = FakeBackend(read_gate)
     pool = httpcore.AsyncConnectionPool(
-        max_connections=_MAX_CONNECTIONS,
+        max_connections=max_connections,
         max_keepalive_connections=_MAX_KEEPALIVE_CONNECTIONS,
         keepalive_expiry=_KEEPALIVE_EXPIRY,
         network_backend=backend,
@@ -655,4 +662,147 @@ class TestReaperLoop:
         assert task.cancelled(), (
             'the loop swallowed CancelledError; lifespan shutdown would hang waiting '
             'for a task that had already decided to keep running'
+        )
+
+
+# A pool small enough that the high-water mark is four requests away rather
+# than eighty. 4/5 is EXACTLY the 0.8 fraction, so the "at" case pins the
+# inclusive boundary itself rather than a comfortable overshoot.
+_SMALL_MAX_CONNECTIONS = 5
+_AT_HIGH_WATER = 4
+_BELOW_HIGH_WATER = 3
+
+
+async def _fill_pool(client: httpx.AsyncClient, connections: int) -> None:
+    """Leave *connections* idle connections pooled, one per distinct origin.
+
+    Distinct origins are the point: httpcore reuses a pooled connection for
+    the same one, so N requests to a single host would occupy a single slot.
+    """
+    for port in range(9000, 9000 + connections):
+        response = await client.post(f'http://svc.local:{port}/mcp', content=b'{}')
+        assert response.status_code == 200
+
+
+@contextlib.asynccontextmanager
+async def _pool_holding(occupancy: int) -> AsyncIterator[httpx.AsyncClient]:
+    """A small pool left holding exactly *occupancy* idle connections."""
+    harness = _build_harness(max_connections=_SMALL_MAX_CONNECTIONS)
+    try:
+        await _fill_pool(harness.client, occupancy)
+        reading = http_pool.census(harness.client)
+        assert reading is not None and reading.total == occupancy, (
+            f'wanted a pool holding {occupancy} connections, got {reading}'
+        )
+        yield harness.client
+    finally:
+        with contextlib.suppress(Exception):
+            await harness.client.aclose()
+
+
+async def _sweep_once(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run exactly one reaper sweep, through the real loop."""
+    monkeypatch.setattr(asyncio, 'sleep', FakeSleep(stop_after=1))
+    with contextlib.suppress(asyncio.CancelledError):
+        await http_pool.reaper_loop(client)
+
+
+class TestPoolSaturationAlarm:
+    """The guard against this fix silently ceasing to work.
+
+    The original incident was invisible for 32 hours precisely because nothing
+    in the dashboard reported pool occupancy: ``httpx.PoolTimeout`` surfaced
+    only as an "offline" pill on a perfectly healthy orchestrator. If orphans
+    are ever minted faster than the sweep reclaims them — or by a mechanism
+    this module's predicate does not cover — this line is the signal.
+
+    It is an OCCUPANCY reading, taken from the pool's own bookkeeping, so it
+    does not reintroduce the socket census task 3857 correctly rejected.
+
+    XDIST: as with the shape guard, every test here re-arms the latch in its
+    own body and asserts any first/second-sweep pair within itself.
+    """
+
+    def test_the_fixture_occupancies_straddle_the_threshold(self) -> None:
+        """Keeps the tests below honest if POOL_HIGH_WATER_FRACTION ever moves.
+
+        Without this, retuning the fraction would quietly turn the "at" case
+        into a second "below" case, and both tests would still pass while
+        asserting nothing about the boundary.
+        """
+        assert _AT_HIGH_WATER / _SMALL_MAX_CONNECTIONS >= http_pool.POOL_HIGH_WATER_FRACTION
+        assert _BELOW_HIGH_WATER / _SMALL_MAX_CONNECTIONS < http_pool.POOL_HIGH_WATER_FRACTION
+
+    async def test_a_sweep_at_the_high_water_mark_warns_with_the_census(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        http_pool.reset_saturation_guard()
+        async with _pool_holding(_AT_HIGH_WATER) as client:
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await _sweep_once(client, monkeypatch)
+
+        warnings = _messages(caplog, logging.WARNING)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        assert all(
+            field in warnings[0]
+            for field in ('total=', 'idle=', 'orphaned=', 'max_connections=')
+        ), (
+            'the WARNING must carry the whole census: "4 of 5" alone does not say '
+            f'whether the pool is busy or wedged; got {warnings[0]}'
+        )
+
+    async def test_a_sweep_below_the_high_water_mark_says_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        http_pool.reset_saturation_guard()
+        async with _pool_holding(_BELOW_HIGH_WATER) as client:
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await _sweep_once(client, monkeypatch)
+
+        assert _above_debug(caplog) == [], (
+            'an ordinarily busy pool must be silent, or the alarm becomes noise and '
+            'stops being read'
+        )
+
+    async def test_sustained_saturation_warns_once_then_drops_to_debug(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A wedged pool stays wedged; one line per minute forever is not a signal."""
+        http_pool.reset_saturation_guard()
+        async with _pool_holding(_AT_HIGH_WATER) as client:
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await _sweep_once(client, monkeypatch)
+                assert len(_messages(caplog, logging.WARNING)) == 1
+
+                caplog.clear()
+                await _sweep_once(client, monkeypatch)
+
+        assert _messages(caplog, logging.WARNING) == []
+        assert _messages(caplog, logging.DEBUG), 'demoted, not discarded'
+
+    async def test_falling_below_the_mark_re_arms_the_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Otherwise the alarm fires once per process and never again.
+
+        A pool that saturates, recovers, and saturates again has had two
+        incidents, and the second one matters at least as much as the first.
+        """
+        http_pool.reset_saturation_guard()
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            async with _pool_holding(_AT_HIGH_WATER) as client:
+                await _sweep_once(client, monkeypatch)
+            assert len(_messages(caplog, logging.WARNING)) == 1
+
+            caplog.clear()
+            async with _pool_holding(_BELOW_HIGH_WATER) as client:
+                await _sweep_once(client, monkeypatch)
+            assert _above_debug(caplog) == [], 'recovery itself must be silent'
+
+            async with _pool_holding(_AT_HIGH_WATER) as client:
+                await _sweep_once(client, monkeypatch)
+
+        assert len(_messages(caplog, logging.WARNING)) == 1, (
+            'saturating again after a recovery must warn again; a latch that never '
+            're-arms reports only the first incident a process ever sees'
         )
