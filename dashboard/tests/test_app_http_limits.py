@@ -26,8 +26,12 @@ reasons:
    differently, but to keep the shipped number visible and reviewable at
    the call site.
 
-This is a GUARD on worst-case pool growth, not a leak fix. It does NOT fix
-CLOSE-WAIT accumulation (owned by the task-3857 re-spec).
+This is a GUARD on worst-case pool growth, not a leak fix. The CLOSE-WAIT
+accumulation is fixed elsewhere, in ``dashboard/src/dashboard/http_pool.py``,
+which reclaims connections a cancelled request leaves in a state httpcore's
+own sweep cannot reach. That extends task 3857's refutation rather than
+reopening it — 3857 measured IDLE connections — and the mechanism is written
+down once, there.
 
 ``_build_http_limits`` is a PURE helper so the sizing is directly testable:
 ``httpx.AsyncClient`` exposes no public accessor for its limits, so the only

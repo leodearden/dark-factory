@@ -3,8 +3,9 @@
 ``TTLCache._start_bypass`` fires a bare ``asyncio.create_task`` that the
 cache's abandon-don't-cancel policy deliberately never cancels — correct while
 the process runs, since a late store still heals the key for the next caller.
-``lifespan``'s shutdown, though, cancels exactly ``collector_task`` and
-``metrics_task``, so a bypass started under one app outlives it: the caches are
+``lifespan``'s shutdown, though, cancels exactly the tasks it started itself —
+``collector_task``, ``metrics_task`` and the ``http_pool`` orphan reaper — so a
+bypass started under one app outlives it: the caches are
 module-level and so process-global, and it keeps pinning a connection on an
 ``httpx.AsyncClient`` that is about to be closed.
 

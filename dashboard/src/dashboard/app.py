@@ -128,6 +128,7 @@ from dashboard.data.write_journal import (
     get_memory_timeseries,
     get_operations_breakdown,
 )
+from dashboard.http_pool import reaper_loop
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
@@ -463,9 +464,12 @@ async def _metrics_loop(
 #
 # THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention, while
 # letting the concurrency ceiling track the fleet (see the two-dimensions
-# note below). It does NOT fix the CLOSE-WAIT accumulation — that diagnosis
-# is owned by the task-3857 re-spec, and nothing here should be read as
-# addressing it.
+# note below). It does NOT fix the CLOSE-WAIT accumulation — that is fixed in
+# dashboard/src/dashboard/http_pool.py, which reclaims connections a cancelled
+# request leaves in a state httpcore's own sweep cannot reach. Task 3857's
+# refutation stands and is not reopened by it: 3857 measured IDLE connections,
+# and the NEW/ACTIVE case http_pool.py handles is invisible to that
+# measurement by construction. The mechanism is written down once, there.
 #
 # For reference, the two server-side keepalive settings the dashboard talks
 # to:
@@ -548,8 +552,8 @@ _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 #     would hand a 40-project install 84 idle keepalive slots against httpx's
 #     stock 20 — i.e. this "guard" would LOOSEN retention for exactly the
 #     large fleets it is meant to bound, and retention is the dimension the
-#     deferred CLOSE-WAIT investigation (task 3857) cares about. The `// 2`
-#     term stays only as a sanity clamp for tiny pools.
+#     CLOSE-WAIT investigation (task 3857) cared about. The `// 2` term stays
+#     only as a sanity clamp for tiny pools.
 _HTTP_MIN_CONNECTIONS = 100
 _HTTP_CONNS_PER_ENDPOINT = 4
 _HTTP_ASSUMED_CONCURRENT_VIEWERS = 3
@@ -709,17 +713,31 @@ async def lifespan(app: FastAPI):
         _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
     )
 
+    # Reclaims pool connections a cancelled request orphaned, which httpcore
+    # itself cannot: dashboard/src/dashboard/http_pool.py states the mechanism.
+    # Takes the LOCAL http_client as an argument — never app.state.http_client —
+    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    #
+    # LAST, with nothing awaited between here and the yield, though it needs
+    # only http_client and could be started as soon as that exists. Startup has
+    # no try/except, so a task created above `await burndown_store.open()` is
+    # stranded — still ticking against a client nobody will close — if that open
+    # raises. Creating all three background tasks at one site also makes them
+    # read as the set the teardown below cancels as a set.
+    reaper_task = asyncio.create_task(reaper_loop(http_client))
+
     yield
 
     try:
-        for task in (collector_task, metrics_task):
+        for task in (collector_task, metrics_task, reaper_task):
             task.cancel()
-        for task in (collector_task, metrics_task):
+        for task in (collector_task, metrics_task, reaper_task):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        # After the loops above, so THIS app's two pollers cannot enqueue a
-        # fresh refresh behind the reaper; before http_client.aclose() below,
-        # so a cancelled refresh unwinds into a pool that still exists. One
+        # After the loops above, so THIS app's three background tasks cannot
+        # enqueue a fresh refresh behind this reap; before http_client.aclose()
+        # below, so a cancelled refresh unwinds into a pool that still
+        # exists. One
         # pass over a snapshot, not a barrier: any other caller still in
         # flight can start a bypass behind it, which is the ordinary
         # abandon-don't-cancel leak this reap narrows rather than abolishes.
