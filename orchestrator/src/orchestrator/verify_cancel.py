@@ -837,14 +837,17 @@ def remove_lock_holder_pgid(worktree_base: Path) -> None:
 # above cleans up *after the fact*; this watchdog prevents it from ever being
 # needed on the connection-death path).
 #
-# Protocol: the dispatcher (``verify_runner.RemoteRunner.run_merge_verify``)
-# opens the ssh child with ``stdin=PIPE`` and writes a heartbeat newline down
-# the channel every ``HEARTBEAT_INTERVAL_SECS`` for the full verify span. The
-# remote (``orchestrator verify-merge --request-id``) spawns a watchdog
-# thread owning fd 0 *before* the build starts (see :func:`start_stdin_watchdog`).
-# It fires on stdin EOF (the channel was cleanly closed) or when no heartbeat
-# arrives within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no
-# clean close).  ``setsid`` + the pgid file are unchanged by this protocol —
+# Protocol: the dispatcher (``verify_runner._default_ssh_heartbeat_run``)
+# opens the ssh child on the read end of a pipe it owns and beats one
+# ``HEARTBEAT_TOKEN`` down the write end every ``HEARTBEAT_INTERVAL_SECS`` for
+# the full verify span (see :func:`start_stdin_heartbeat`). The remote
+# (``orchestrator verify-merge --request-id``) spawns a watchdog thread owning
+# fd 0 *before* the build starts (see :func:`start_stdin_watchdog`). It fires
+# on stdin EOF (the channel was cleanly closed) or when no heartbeat arrives
+# within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no clean
+# close). Both halves are dedicated OS threads for one shared reason: neither
+# end's verdict about the channel may depend on how busy the other end's event
+# loop is.  ``setsid`` + the pgid file are unchanged by this protocol —
 # ``setsid`` does not close fd 0, so the watchdog reads stdin regardless of
 # session, and ``cancel_request`` keeps tree-killing by pgid with zero
 # contract churn.

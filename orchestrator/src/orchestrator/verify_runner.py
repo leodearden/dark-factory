@@ -37,6 +37,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import os
 import shlex
 import time
 import uuid
@@ -50,7 +51,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
-from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
+from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS, start_stdin_heartbeat
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 if TYPE_CHECKING:
@@ -1080,58 +1081,76 @@ async def _default_ssh_heartbeat_run(
     """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
     plus a stdin heartbeat (connection-death protocol, PRD §8.1).
 
-    Opens *argv* with ``stdin=PIPE`` (unlike :func:`_default_subprocess_run`,
-    whose stdin is unset/inherited) and runs a concurrent writer task that
-    sends a heartbeat newline down the child's stdin every
+    Opens *argv* on the read end of a pipe this coroutine owns (unlike
+    :func:`_default_subprocess_run`, whose stdin is unset/inherited) and beats
+    one ``verify_cancel.HEARTBEAT_TOKEN`` down the write end every
     *heartbeat_interval* seconds for the full duration of the call.  This is
     the dispatcher half of the connection-death protocol: the remote
-    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if
-    heartbeats stop arriving, tying the remote build's lifetime to this ssh
-    child's lifetime.
+    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if beats
+    stop arriving, tying the remote build's lifetime to this ssh child's
+    lifetime.
 
-    A heartbeat write failing with ``BrokenPipeError``/``ConnectionResetError``
-    means the child is already gone (EPIPE) — benign, since the existing
-    transport-failure handling (non-zero rc / unparseable stdout ->
-    RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
-    it never raises out of the writer nor alters the returned
-    ``(rc, stdout, stderr)``.  The writer task is cancelled once stdout/stderr
-    have been fully read and the child has exited.
+    The beat is written from a dedicated OS thread
+    (``verify_cancel.start_stdin_heartbeat``), NOT an asyncio task on this
+    coroutine's loop.  That loop is the orchestrator's single shared one —
+    scheduler, agent dispatch, merge worker, uvicorn escalation server — and a
+    producer scheduled behind its stalls stops beating for exactly as long as
+    the stall lasts, which the remote correctly reads as a dead channel.
+    Owning a raw pipe is what makes the thread possible: ``proc.stdin`` would
+    be a loop-bound ``StreamWriter`` whose ``write``/``drain`` must not be
+    called from another thread, and routing through ``call_soon_threadsafe``
+    would put the write back on the very loop whose stalls are the defect.
+
+    A failed beat never raises out of the writer nor alters the returned
+    ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
+    suppressed error and why it is benign.
 
     Deliberately does NOT use ``proc.communicate()`` (task 2309 boundary gate,
     SS9 Row 6): ``communicate()`` unconditionally calls its internal
     ``_feed_stdin(input)`` helper whenever ``self.stdin is not None`` — true
-    here since this coroutine opens with ``stdin=PIPE`` — and ``_feed_stdin``
-    closes ``proc.stdin`` right after (a no-op) write/drain, even when
-    ``input`` is ``None``.  That closes the connection-death channel within
-    milliseconds of spawn, racing the heartbeat writer above so real
+    whenever this coroutine opens with ``stdin=PIPE``, as it once did — and
+    ``_feed_stdin`` closes ``proc.stdin`` right after (a no-op) write/drain,
+    even when ``input`` is ``None``.  That closes the connection-death channel
+    within milliseconds of spawn, racing the heartbeat writer so real
     heartbeats never reach the child — confirmed via a real child that reports
     back exactly what it read from stdin (a plain ``readline()``-based check
     is fooled: EOF unblocks a blocking read the same as a real newline would,
     so it can't tell "closed" from "heartbeat delivered").  Reading the
     streams directly (mirroring ``communicate()``'s own
-    ``gather(...); await self.wait()`` shape, minus the stdin feed/close)
-    keeps ``proc.stdin`` open for the full duration instead.
+    ``gather(...); await self.wait()`` shape, minus the stdin feed/close) kept
+    the channel open for the full duration instead.
+
+    Task 4195 changed that paragraph's premise without changing its
+    conclusion: with ``stdin=<raw fd>`` ``proc.stdin`` is ``None``, so
+    ``_feed_stdin`` never fires and ``communicate()`` is technically safe here
+    again.  The direct read is retained anyway, and the record above kept,
+    because reverting to ``stdin=PIPE`` is the single edit that would silently
+    re-arm the defect — this paragraph is the only thing standing in its way.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-    )
-
-    async def _heartbeat() -> None:
-        assert proc.stdin is not None  # stdin=PIPE above guarantees this
-        while True:
-            await asyncio.sleep(heartbeat_interval)
-            try:
-                proc.stdin.write(b'\n')
-                await proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # child already gone -- benign, transport-failure path handles it
-
-    heartbeat_task = asyncio.ensure_future(_heartbeat())
+    # Ordering is load-bearing.  The writer is started BEFORE the spawn so that
+    # exactly ONE owner exists for write_fd on every path: if
+    # create_subprocess_exec raises, the outer finally stops the thread, which
+    # closes the fd in its own finally, and nothing leaks.  The write end is
+    # non-blocking so a full pipe raises BlockingIOError in the writer (skipping
+    # one beat) instead of parking that thread forever and wedging the teardown
+    # join below.
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    heartbeat = start_stdin_heartbeat(write_fd, interval=heartbeat_interval)
     try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=read_fd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+        finally:
+            # The child holds its own dup.  A reader left open in the parent
+            # would stop a dead child's pipe from ever raising BrokenPipeError
+            # — the signal the writer's suppression is built around.
+            os.close(read_fd)
         # stdout=PIPE/stderr=PIPE above guarantees these are populated; an
         # explicit check (rather than a bare assert) keeps the guard live
         # under `python -O`, which strips asserts.
@@ -1144,11 +1163,10 @@ async def _default_ssh_heartbeat_run(
         stdout_b, stderr_b = await asyncio.gather(stdout_r.read(), stderr_r.read())
         await proc.wait()
     finally:
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            proc.stdin.close()
+        # The writer owns write_fd and closes it as it exits; that close is what
+        # delivers EOF to the remote's watchdog.
+        heartbeat.stop()
+        heartbeat.thread.join()
 
     return (
         proc.returncode or 0,
