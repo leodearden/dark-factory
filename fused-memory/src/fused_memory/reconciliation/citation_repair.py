@@ -133,9 +133,28 @@ _ERR_CITATION_NOT_PRESENT: dict[str, str] = {
     'error_type': 'ReconCitationNotPresent',
 }
 
+# The ``memory_not_found`` class's corroboration failing: the victim resolves,
+# so it is not the defect this caller claimed.
 _ERR_CITATION_NOT_DANGLING: dict[str, str] = {
     'error': 'citation_not_dangling',
     'error_type': 'ReconCitationNotDangling',
+}
+
+# Its exact inverse, protecting the ``wrong_memory`` class: the victim does NOT
+# resolve, so calling it the wrong memory would stamp a false claim onto the one
+# durable record of the repair. Each refusal's hint names the other reason.
+_ERR_CITATION_NOT_RESOLVING: dict[str, str] = {
+    'error': 'citation_not_resolving',
+    'error_type': 'ReconCitationNotResolving',
+}
+
+# A ``reason`` outside the enum. Re-checked here, not only at the FastMCP
+# ``Literal`` boundary, because the operator script and every in-process caller
+# have no schema boundary: a typo that fell through to whichever branch the
+# ``if`` happened to default to would silently perform the WRONG corroboration.
+_ERR_INVALID_REASON: dict[str, str] = {
+    'error': 'invalid_reason',
+    'error_type': 'ReconCitationInvalidReason',
 }
 
 _ERR_REPLACEMENT_NOT_FOUND: dict[str, str] = {
@@ -458,11 +477,20 @@ async def repair_memory_citation(
     live_run_ids: frozenset[str] = frozenset(),
     apply: bool = True,
 ) -> dict[str, Any]:
-    """Re-point (or drop) a dangling citation on a completed run's finding.
+    """Re-point (or drop) a defective citation on a completed run's finding.
 
     ``target_run_id`` is the run that OWNS the finding — deliberately NOT the
     caller's own ``run_id``, which the ``ReconReportState`` wrapper keeps for
     its unchanged ``_resolve_entry`` contract and for stamping ``repaired_by``.
+
+    ``reason`` names the citation's DEFECT CLASS and is the only thing that
+    changes between the two: ``memory_not_found`` requires the victim to be
+    confirmed ABSENT, ``wrong_memory`` requires it to be confirmed PRESENT (it
+    resolves, it just does not back the finding). It is written verbatim into
+    the durable provenance record, so each class's assertion is CHECKED rather
+    than trusted, and getting it wrong is a refusal naming the other class, not
+    a silent reclassification. Orthogonally, ``replacement_memory_id`` chooses
+    drop (``None``) or swap — the two axes never interact.
 
     Returns a structured dict: ``{'status': 'repaired'|'dry_run', ...}`` on
     success, or one of the ``_ERR_*`` branches — every one of which is keyed by
@@ -502,6 +530,19 @@ async def repair_memory_citation(
                     'read as a confirmed-absent citation.'
                 ),
             }
+
+    if reason not in REPAIRABLE_REASONS:
+        return _ERR_INVALID_REASON | {
+            'reason': reason,
+            'accepted': sorted(REPAIRABLE_REASONS),
+            'hint': (
+                f'{reason!r} is not a defect class this repair can corroborate. '
+                f'{REASON_MEMORY_NOT_FOUND!r} asserts the cited id is CONFIRMED '
+                f'ABSENT; {REASON_WRONG_MEMORY!r} asserts it RESOLVES but does '
+                'not back the finding. Both spellings of the repair — drop and '
+                'swap — are selected by replacement_memory_id, not by this.'
+            ),
+        }
 
     if store != SUPPORTED_STORE:
         return _ERR_UNSUPPORTED_STORE | {
@@ -589,15 +630,16 @@ async def repair_memory_citation(
     # Ordered so NO journal write can happen unless every gate passes. Both
     # reads run even for apply=False, so a dry-run tells the operator whether
     # the gates hold before anything is written.
+    #
+    # ``reason`` decides WHICH fact this one read has to establish, and the two
+    # are exact inverses — each class is checked, neither is a bypass. The
+    # raised branch wins over both: unknown is never 'absent' AND never
+    # 'present', so a flapping backend licenses no class at all.
     try:
         victim_record = await memory_service.get_memory_by_id(run.project_id, memory_id)
     except Exception as exc:
         return _verification_error(memory_id, 'victim', exc)
     if reason == REASON_MEMORY_NOT_FOUND and victim_record:
-        # Still alive — so this is not the defect class the caller asserted.
-        # ``memory_not_found`` claims the id has no backing at all; stamping it
-        # on a live id would put a false statement into the one durable record
-        # of the repair.
         return _ERR_CITATION_NOT_DANGLING | {
             'target_run_id': target_run_id,
             'finding_id': finding_id,
@@ -605,7 +647,21 @@ async def repair_memory_citation(
             'hint': (
                 f'{memory_id} still resolves in mem0 for project '
                 f'{run.project_id!r}; only a CONFIRMED-absent citation may be '
-                'repaired.'
+                f'repaired as {REASON_MEMORY_NOT_FOUND!r}. A citation that '
+                'resolves but does not back the finding is the other class: '
+                f'pass reason={REASON_WRONG_MEMORY!r} with a justification.'
+            ),
+        }
+    if reason == REASON_WRONG_MEMORY and not victim_record:
+        return _ERR_CITATION_NOT_RESOLVING | {
+            'target_run_id': target_run_id,
+            'finding_id': finding_id,
+            'memory_id': memory_id,
+            'hint': (
+                f'{memory_id} does not resolve in mem0 for project '
+                f'{run.project_id!r}, so it cannot be the WRONG memory — there '
+                'is no memory there to be wrong. A confirmed-absent citation is '
+                f'repaired as reason={REASON_MEMORY_NOT_FOUND!r} instead.'
             ),
         }
 
