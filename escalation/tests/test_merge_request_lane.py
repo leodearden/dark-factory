@@ -228,3 +228,131 @@ class TestInvalidLaneIsRejectedLoudly:
 
         harness.scheduler.get_task.assert_not_awaited()
         git_ops.resolve_branch_sha.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The metadata fallback — the headline regression
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataMergeLaneIsHonoured:
+    """``metadata.merge_lane`` was INERT for every MCP-submitted merge."""
+
+    async def test_metadata_lane_reaches_the_enqueued_request(self, tmp_path: Path):
+        """THE SIGNAL. No ``lane`` argument, so the task's own lane is inherited.
+
+        RED before task 4888: ``MergeRequest(...)`` omitted ``lane=`` and took
+        the dataclass default, so a main-health fix task carrying
+        ``metadata.merge_lane='high'`` was silently enqueued behind every
+        routine merge.
+        """
+        harness = _make_harness(metadata={'merge_lane': 'high'})
+        _, captured = await _submit(tmp_path, harness)
+        assert captured, 'nothing was enqueued'
+        assert captured[0].lane == 'high'
+
+    async def test_explicit_normal_argument_beats_high_metadata(self, tmp_path: Path):
+        """PRECEDENCE. The argument wins even when it equals the default.
+
+        A truthiness-based implementation passes the test above and fails this
+        one — and holding a ``'high'`` task back to the normal lane is a thing
+        an operator legitimately wants to do.
+        """
+        harness = _make_harness(metadata={'merge_lane': 'high'})
+        _, captured = await _submit(tmp_path, harness, lane='normal')
+        assert captured and captured[0].lane == 'normal'
+
+    async def test_no_metadata_lane_is_normal(self, tmp_path: Path):
+        _, captured = await _submit(tmp_path, _make_harness(metadata={}))
+        assert captured and captured[0].lane == 'normal'
+
+    async def test_inherited_typo_normalises_silently_and_still_submits(
+        self, tmp_path: Path
+    ):
+        """The deliberate asymmetry against an invalid ``lane`` ARGUMENT.
+
+        An inherited value was written by another actor at another time, so it
+        fails OPEN to ``'normal'`` and the submission succeeds — where the same
+        spelling passed as ``lane=`` is rejected outright.
+        """
+        harness = _make_harness(metadata={'merge_lane': 'higgh'})
+        result, captured = await _submit(tmp_path, harness)
+        assert 'code' not in result, f'an inherited typo must not reject: {result}'
+        assert captured and captured[0].lane == 'normal'
+
+
+class TestLaneResolutionFailsOpen:
+    """A lane resolution must never be able to FAIL a merge submission."""
+
+    async def test_raising_scheduler_still_submits_at_the_normal_lane(
+        self, tmp_path: Path
+    ):
+        harness = _make_harness(scheduler_raises=True)
+        result, captured = await _submit(tmp_path, harness)
+        assert result.get('status') == 'done', result
+        assert captured and captured[0].lane == 'normal'
+
+    async def test_harness_without_a_scheduler_still_submits(self, tmp_path: Path):
+        harness = _make_harness(no_scheduler=True)
+        result, captured = await _submit(tmp_path, harness)
+        assert result.get('status') == 'done', result
+        assert captured and captured[0].lane == 'normal'
+
+
+class TestMetadataReadIsPaidAtMostOnce:
+    """The COST contract, made executable (design decision 5).
+
+    ``git_authority.task_metadata`` is uncached: every call is a fresh
+    ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+    ``timeout=15``.  Without these two tests the memoization is unpinned and a
+    later edit can silently reintroduce a second round-trip on the submit path.
+    """
+
+    @staticmethod
+    def _degenerate_branch_git_ops(tmp_path: Path, tip: str) -> types.SimpleNamespace:
+        """git_ops for a branch that reaches the degeneracy probe AND enqueues.
+
+        ``is_ancestor`` is True so the ancestor arm runs ``_declined()``; the
+        task metadata records ``branch_base_sha == tip`` so the probe answers
+        DEGENERATE, which declines both fast-path arms and lets the request
+        fall through to the queue.  Both metadata consumers are therefore live
+        in one call — which is the only configuration in which a second
+        round-trip could hide.
+        """
+        repo = tmp_path / 'repo'
+        # `git cherry` runs with cwd=git_ops.project_root, and git_ops raises
+        # WorktreeMissing on a cwd that does not exist.  The directory need only
+        # EXIST: it is not a git repo, so `git cherry` exits non-zero and
+        # patch_content_contained fails open to False — which is what lets the
+        # request fall through to the queue.
+        repo.mkdir(parents=True, exist_ok=True)
+        return _stub_git_ops(
+            resolve_branch_sha=AsyncMock(return_value=tip),
+            is_ancestor=AsyncMock(return_value=True),
+            project_root=repo,
+        )
+
+    async def test_at_most_one_get_task_when_both_consumers_are_live(
+        self, tmp_path: Path
+    ):
+        tip = 'b' * 40
+        harness = _make_harness(
+            metadata={'branch_base_sha': tip, 'merge_lane': 'high'},
+            git_ops=self._degenerate_branch_git_ops(tmp_path, tip),
+        )
+        _, captured = await _submit(tmp_path, harness)
+
+        assert captured, 'the degenerate branch should fall through to the queue'
+        assert captured[0].lane == 'high'
+        assert harness.scheduler.get_task.await_count <= 1, (
+            'the degeneracy probe and the lane fallback must share ONE metadata '
+            f'read; got {harness.scheduler.get_task.await_count} awaits'
+        )
+
+    async def test_explicit_lane_pays_no_metadata_read_at_all(self, tmp_path: Path):
+        """An explicit argument makes the metadata irrelevant by precedence."""
+        harness = _make_harness(metadata={'merge_lane': 'normal'})
+        _, captured = await _submit(tmp_path, harness, lane='high')
+
+        assert captured and captured[0].lane == 'high'
+        harness.scheduler.get_task.assert_not_awaited()
