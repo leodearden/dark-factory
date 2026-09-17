@@ -2,21 +2,30 @@
 that turns a `journalctl --user -u fused-memory.service` capture into measured
 stall episodes (task 5544).
 
-Every input here is an EXCERPT of the real user journal for the two episodes
-the task was filed for, embedded as a module-level string constant. Deliberately
-NOT read from the live journal: the user journal rotates (it currently reaches
-back only to 2026-08-24), so both episodes age out and a journal-driven test
-would then fail for a reason having nothing to do with this code. It would also
-be unrunnable in CI or on any host that never had these incidents. Same
-stdin-driven pure-function shape as scripts/tests/test_recon_busy_check.py,
-for the same stated reason: the pure analyze() gets pytest coverage and the CLI
-gets subprocess coverage, with no live service involved.
+Every input here is built from REAL lines of the user journal for the episodes
+the task was filed for, embedded as a module-level string constant.
+Deliberately NOT read from the live journal: the user journal rotates (it
+currently reaches back only to 2026-08-24), so both episodes age out and a
+journal-driven test would then fail for a reason having nothing to do with this
+code. It would also be unrunnable in CI or on any host that never had these
+incidents. Same stdin-driven pure-function shape as
+scripts/tests/test_recon_busy_check.py, for the same stated reason: the pure
+analyze() gets pytest coverage and the CLI gets subprocess coverage, with no
+live service involved.
 
 The excerpts are REDUCED (tens of lines, not the ~6700/~8900 the two windows
 actually hold), keeping the pre-stall content lines, the silence boundary and
 every systemd[...] line. The reduction preserves the real gap structure: every
 inter-line gap above 20s in each full window is still present here at its real
 magnitude, so the excerpts cannot manufacture — or hide — an episode.
+
+Two inputs go further than reduction and are ASSEMBLED, each saying so at its
+own definition and naming what the retained journal does not contain:
+UNIT_LEFT_DOWN_JOURNAL (a down-window long enough to register) and
+LOGGING_CHILD_JOURNAL (a spawned child that wrote a line of its own). Both
+cover branches that a real capture in this retention window cannot reach, and
+both use real line texts with only the separation or the pid attribution
+changed.
 """
 from __future__ import annotations
 
@@ -24,6 +33,12 @@ import json
 import os
 import subprocess
 from pathlib import Path
+
+from fm_wedge_forensics import (
+    DEFAULT_STALL_THRESHOLD_SECONDS,
+    analyze,
+    parse_consumed,
+)
 
 # ---------------------------------------------------------------------------
 # Episode 2 — 2026-09-16 12:04. The decisive one: fm did not service SIGTERM
@@ -128,13 +143,17 @@ WATCHDOG_CAUGHT_STALL_JOURNAL = """\
 2026-09-16T16:18:44+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
-# The same 160s self-recovered stall, then an UNRELATED restart. Assembled
-# from two real, non-adjacent stretches of one capture: the ~2h49m of dense
-# logging between them is omitted, which is why this input shows two silences
-# where the capture shows one. That omission is also why this fixture can only
-# DOCUMENT correct attribution and cannot guard it — a faithful reduction of a
-# 2h51m separation is not expressible in a few lines. The guard for the defect
-# it describes is the real-capture verification recorded in the commit.
+# The same 160s self-recovered stall, then an UNRELATED restart. Two real,
+# non-adjacent stretches of one capture: the ~2h49m of dense logging between
+# them is elided, which is why this input shows two silences where the capture
+# shows one.
+#
+# That elision does NOT cost the fixture its teeth — it IS the executable guard
+# on restart_sequence_after's `_TEARDOWN_START` bound. Measured by deleting
+# that bound and re-running analyze() on this exact input: stall 1 flips to
+# `stopped-on-signal` with teardown_seconds == 3.0 and total_seconds ==
+# 10300.0, the three wrong numbers the test below names. Do not treat this
+# fixture as decorative.
 SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL = """\
 2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
 2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
@@ -143,6 +162,48 @@ SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL = """\
 2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 29min 6.600s CPU time, 2.7G memory peak, 628.5M memory swap peak.
 2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T15:07:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: the real 15:07 stop sequence above with the restart
+# pushed out, so the silence begins with the unit already DOWN rather than
+# wedged. Only the separation is synthetic; every line text is real.
+#
+# Why no capture can supply this. fused-memory is restarted rather than left
+# down, and measured across 2026-09-14 → 2026-09-17 every `Stopped
+# fused-memory.service` in the retained journal is followed by `Starting`
+# within 0–3s — far below any workable stall threshold — so the whole
+# down-window branch is unreachable from this host's real captures. The branch
+# is still load-bearing: the orchestrator-watchdog's own journal recorded
+# `port-down` for episode 1's third probe at 23:58:03, taken while fm sat
+# between `Stopped` (23:58:00) and `Started` (23:58:42).
+UNIT_LEFT_DOWN_JOURNAL = """\
+2026-09-16T15:07:03+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 29min 6.600s CPU time, 2.7G memory peak, 628.5M memory swap peak.
+2026-09-16T15:11:06+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T15:11:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: episode 2 reduced to its teardown, plus ONE added
+# line — a git error attributed to the pid systemd later SIGKILLs as `git`.
+# A spawned child inherits the unit's stderr, so its output is journaled under
+# this same unit; that is the shape any pid- or name-based exclusion silently
+# drops, taking the single most decisive signal in this diagnosis with it.
+#
+# The added line is the only synthetic element, and it is synthetic because the
+# hazard is LATENT here rather than realized: measured over the real 12:03–12:10
+# capture (6686 lines), pid 1289425 appears exactly once, in the `Killing
+# process 1289425 (git)` line itself — the child wrote nothing. Covering a
+# branch a capture cannot reach is the whole reason this constant exists.
+LOGGING_CHILD_JOURNAL = """\
+2026-09-16T12:04:01+01:00 leo-MS-7C35 uv[3655756]: 2026-09-16 12:04:01 - mcp.server.streamable_http - INFO - Terminating session: None
+2026-09-16T12:06:52+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T12:06:57+01:00 leo-MS-7C35 uv[1289425]: error: cannot lock ref 'refs/heads/main': Unable to create '/home/leo/src/dark-factory/.git/refs/heads/main.lock': File exists.
+2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: State 'stop-sigterm' timed out. Killing.
+2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Killing process 3655756 (python3) with signal SIGKILL.
+2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Killing process 1289425 (git) with signal SIGKILL.
+2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-16T12:09:03+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
@@ -159,8 +220,6 @@ DENSE_HEALTHY_JOURNAL = """\
 def test_analyze_finds_the_episode_2_stall_between_its_bounding_log_lines():
     """The stall is the gap between the LAST line before the silence and the
     FIRST line after it — both measured off the journal, not assumed."""
-    from fm_wedge_forensics import analyze
-
     episodes = analyze(EPISODE_2_JOURNAL)
 
     assert len(episodes) == 1
@@ -171,8 +230,6 @@ def test_analyze_finds_the_episode_2_stall_between_its_bounding_log_lines():
 
 
 def test_analyze_reports_no_episode_for_a_dense_healthy_window():
-    from fm_wedge_forensics import analyze
-
     assert analyze(DENSE_HEALTHY_JOURNAL) == []
 
 
@@ -187,14 +244,10 @@ def test_analyze_reports_no_episode_for_a_dense_healthy_window():
 
 def test_default_threshold_clears_the_normal_61s_harness_cadence():
     """An idle-but-healthy fm must not read as a stall."""
-    from fm_wedge_forensics import analyze
-
     assert analyze(NORMAL_HARNESS_CADENCE_JOURNAL) == []
 
 
 def test_default_threshold_catches_the_shorter_episode_1_stall():
-    from fm_wedge_forensics import analyze
-
     episodes = analyze(EPISODE_1_JOURNAL)
 
     assert len(episodes) == 1
@@ -202,8 +255,6 @@ def test_default_threshold_catches_the_shorter_episode_1_stall():
 
 
 def test_default_threshold_catches_the_longer_episode_2_stall():
-    from fm_wedge_forensics import analyze
-
     episodes = analyze(EPISODE_2_JOURNAL)
 
     assert len(episodes) == 1
@@ -214,8 +265,6 @@ def test_threshold_is_a_parameter_not_baked_into_the_detection():
     """Lowering the threshold below the harness cadence makes the same healthy
     window register — proving the default is a tunable bound and the detection
     logic carries no hidden magnitude of its own."""
-    from fm_wedge_forensics import analyze
-
     episodes = analyze(NORMAL_HARNESS_CADENCE_JOURNAL, 30.0)
 
     assert len(episodes) == 5
@@ -233,8 +282,6 @@ def test_default_threshold_sits_between_the_cadence_and_the_shorter_stall():
     both endpoints here means moving the constant toward either one fails
     loudly at the boundary rather than silently eroding the margin.
     """
-    from fm_wedge_forensics import DEFAULT_STALL_THRESHOLD_SECONDS
-
     assert 61.0 < DEFAULT_STALL_THRESHOLD_SECONDS < 120.0
 
 
@@ -250,8 +297,6 @@ def test_default_threshold_sits_between_the_cadence_and_the_shorter_stall():
 # ---------------------------------------------------------------------------
 
 def test_episode_2_never_serviced_sigterm_so_the_loop_was_still_blocked():
-    from fm_wedge_forensics import analyze
-
     episode = analyze(EPISODE_2_JOURNAL)[0]
 
     assert episode.outcome == "sigterm-unserviced"
@@ -260,16 +305,12 @@ def test_episode_2_never_serviced_sigterm_so_the_loop_was_still_blocked():
 def test_episode_1_stopped_cleanly_so_the_loop_ran_its_signal_handler():
     """Same stall signature, milder outcome: `Stopping` -> `Stopped` with no
     stop-sigterm timeout, so the loop recovered enough to service the signal."""
-    from fm_wedge_forensics import analyze
-
     episode = analyze(EPISODE_1_JOURNAL)[0]
 
     assert episode.outcome == "stopped-on-signal"
 
 
 def test_a_stall_with_no_systemd_stop_at_all_is_self_recovered():
-    from fm_wedge_forensics import analyze
-
     episode = analyze(SELF_RECOVERED_STALL_JOURNAL)[0]
 
     assert episode.stall_seconds == 160.0
@@ -282,10 +323,26 @@ def test_every_stall_reports_the_watchdog_verdict_its_probe_would_have_returned(
     served by the same blocked loop does not — which is its 'wedged' verdict.
     Reported in the watchdog's own word so the output collates with its
     journal lines instead of needing a translation step."""
-    from fm_wedge_forensics import analyze
-
     for journal in (EPISODE_1_JOURNAL, EPISODE_2_JOURNAL, SELF_RECOVERED_STALL_JOURNAL):
         assert analyze(journal)[0].watchdog_verdict == "wedged"
+
+
+def test_a_silence_that_begins_with_the_unit_already_down_reports_port_down():
+    """The other half of the verdict, and the half the diagnosis leans on: a
+    silence whose last preceding line is the unit's own stop accounting is a
+    DOWN window, so the probe never reached a bound socket at all. The outcome
+    vocabulary describes how a blocked loop answered a signal and says nothing
+    useful here; this verdict is what tells a reader the silence was never a
+    stall.
+
+    Unpinned, both this reading and _UNIT_DOWN_MARKERS are free: returning
+    'wedged' unconditionally leaves the rest of the suite green.
+    """
+    episodes = analyze(UNIT_LEFT_DOWN_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].watchdog_verdict == "port-down"
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +354,6 @@ def test_every_stall_reports_the_watchdog_verdict_its_probe_would_have_returned(
 # ---------------------------------------------------------------------------
 
 def test_pre_stall_context_shows_what_the_loop_was_doing_when_it_went_quiet():
-    from fm_wedge_forensics import analyze
-
     context = analyze(EPISODE_2_JOURNAL)[0].pre_stall_context
 
     assert any("reconciliation.run_started" in line for line in context)
@@ -306,11 +361,19 @@ def test_pre_stall_context_shows_what_the_loop_was_doing_when_it_went_quiet():
     assert not any("Stopping fused-memory" in line for line in context)
 
 
+def test_context_depth_is_a_parameter_not_baked_into_the_extraction():
+    """A full window buries the application's own loggers under hundreds of
+    access lines per second, so the depth has to be dialable. Same shape as the
+    threshold test: pass a non-default and the output follows it."""
+    context = analyze(EPISODE_2_JOURNAL, context_lines=2)[0].pre_stall_context
+
+    assert len(context) == 2
+    assert context[-1].endswith("Terminating session: None")
+
+
 def test_consumed_line_is_parsed_into_separate_resource_fields():
     """`Xh Ymin Z.Zs` CPU time plus G/M sizes, as structured numbers rather
     than a string the reader has to re-parse."""
-    from fm_wedge_forensics import analyze
-
     resources = analyze(EPISODE_2_JOURNAL)[0].resources
 
     assert resources is not None
@@ -322,8 +385,6 @@ def test_consumed_line_is_parsed_into_separate_resource_fields():
 def test_consumed_line_parses_both_systemd_cpu_time_spellings():
     """Episode 1 carries `1h 22min 57.690s`; the 16:15 stall carries systemd's
     hourless `20min 30.697s`. Both are real lines, not constructed variants."""
-    from fm_wedge_forensics import analyze
-
     with_hours = analyze(EPISODE_1_JOURNAL)[0].resources
     without_hours = analyze(WATCHDOG_CAUGHT_STALL_JOURNAL)[0].resources
 
@@ -334,29 +395,74 @@ def test_consumed_line_parses_both_systemd_cpu_time_spellings():
     assert without_hours.memory_peak_bytes == 2.3 * 1024**3
 
 
+def test_a_consumed_line_without_memory_accounting_keeps_its_cpu_time():
+    """systemd prints CPU time alone for a unit with memory accounting off —
+    real on this host, e.g. `df-verify-reify-4ae45bbd-6a64e60bb1f4.scope:
+    Consumed 8min 25.125s CPU time.` at 2026-09-16 12:11:40. Requiring the
+    memory clause would throw away a measurement systemd took and report the
+    whole line as unmeasured."""
+    totals = parse_consumed(
+        "2026-09-16T12:11:40+01:00 leo-MS-7C35 systemd[2626]: "
+        "df-verify-reify-4ae45bbd-6a64e60bb1f4.scope: Consumed 8min 25.125s CPU time."
+    )
+
+    assert totals is not None
+    assert totals.cpu_seconds == 8 * 60 + 25.125
+    assert totals.memory_peak_bytes is None
+    assert totals.swap_peak_bytes is None
+
+
+def test_a_measured_zero_is_not_reported_as_unmeasured():
+    """systemd renders a zero with a bare `B` suffix (`0B memory swap peak`,
+    real at 2026-09-16 10:13:35). Dropping `B` from the size units would turn
+    "measured, and it was zero" into "not measured" — the same absence-of-
+    evidence confusion this module refuses everywhere else."""
+    totals = parse_consumed(
+        "2026-09-16T10:13:35+01:00 leo-MS-7C35 systemd[2626]: reify-warm-lane-gc.service: "
+        "Consumed 16min 24.123s CPU time, 1.1G memory peak, 0B memory swap peak."
+    )
+
+    assert totals is not None
+    assert totals.memory_peak_bytes == 1.1 * 1024**3
+    assert totals.swap_peak_bytes == 0.0
+
+
 def test_a_stall_with_no_consumed_line_reports_absent_not_zero():
     """A self-recovered stall never produced a `Consumed` line, and reporting
     it as 0 would read as "consumed nothing" — the opposite of the truth."""
-    from fm_wedge_forensics import analyze
-
     assert analyze(SELF_RECOVERED_STALL_JOURNAL)[0].resources is None
 
 
-def test_a_foreign_process_sigkilled_from_the_cgroup_is_reported_by_name():
+def test_every_sigkilled_process_is_reported_with_the_unit_s_own_annotated():
     """The `git` child still alive at teardown is the evidence that a
-    synchronous git subprocess was in flight on the blocked loop. It must not
-    be diluted by the unit's own `uv`/`python3` entries, which are expected."""
-    from fm_wedge_forensics import analyze
+    synchronous git subprocess was in flight on the blocked loop. Every kill is
+    listed, with the unit's own `uv`/`python3` entries annotated rather than
+    removed, so the child stands out without any of them being hidden."""
+    killed = analyze(EPISODE_2_JOURNAL)[0].killed_processes
 
-    foreign = analyze(EPISODE_2_JOURNAL)[0].foreign_killed_processes
+    assert [(process.pid, process.name) for process in killed] == [
+        (3655692, "uv"),
+        (3655756, "python3"),
+        (1289425, "git"),
+    ]
+    assert [process.name for process in killed if not process.wrote_journal_lines] == ["git"]
 
-    assert [(process.pid, process.name) for process in foreign] == [(1289425, "git")]
+
+def test_a_child_that_wrote_a_journal_line_is_still_reported():
+    """The suppression this guards against. A child inherits the unit's stderr,
+    so writing even one line credits it with journal output — and a filter keyed
+    on that would drop the `git` entry entirely, leaving an empty list that
+    reads as "nothing outlived the stop". The annotation records the credit; it
+    must not gate the report."""
+    killed = analyze(LOGGING_CHILD_JOURNAL)[0].killed_processes
+    child = [process for process in killed if process.name == "git"]
+
+    assert [(process.pid, process.name) for process in child] == [(1289425, "git")]
+    assert child[0].wrote_journal_lines is True
 
 
-def test_an_episode_that_killed_nothing_reports_no_foreign_processes():
-    from fm_wedge_forensics import analyze
-
-    assert analyze(EPISODE_1_JOURNAL)[0].foreign_killed_processes == ()
+def test_an_episode_that_killed_nothing_reports_no_processes():
+    assert analyze(EPISODE_1_JOURNAL)[0].killed_processes == ()
 
 
 # ---------------------------------------------------------------------------
@@ -370,8 +476,6 @@ def test_an_episode_that_killed_nothing_reports_no_foreign_processes():
 # ---------------------------------------------------------------------------
 
 def test_episode_2_cost_decomposes_into_teardown_startup_and_total():
-    from fm_wedge_forensics import analyze
-
     costs = analyze(EPISODE_2_JOURNAL)[0].costs
 
     assert costs.teardown_seconds == 90.0
@@ -380,16 +484,18 @@ def test_episode_2_cost_decomposes_into_teardown_startup_and_total():
 
 
 def test_episode_2_teardown_dominates_startup():
-    """The answerable form of "should the port-down streak be shortened?" —
-    with numbers rather than intuition."""
-    from fm_wedge_forensics import analyze
+    """Of the two recovery terms this capture can witness, teardown is the
+    larger — 90s of ignored SIGTERM against a 41s start.
 
+    Deliberately NOT an answer to "should the port-down streak be shortened?".
+    The streak is logged in the watchdog's journal, so detection_seconds is
+    structurally unavailable here and dominant_recovery_term cannot see it; the
+    measured streak (121s) in fact exceeds this term. That comparison belongs
+    to plans/fused-memory-wedge-diagnosis.md, which has both journals."""
     assert analyze(EPISODE_2_JOURNAL)[0].costs.dominant_recovery_term == "teardown"
 
 
 def test_episode_1_cost_decomposes_from_its_own_clean_stop():
-    from fm_wedge_forensics import analyze
-
     costs = analyze(EPISODE_1_JOURNAL)[0].costs
 
     assert costs.teardown_seconds == 50.0
@@ -400,8 +506,6 @@ def test_detection_interval_is_reported_unavailable_not_fabricated():
     """The watchdog's consecutive-failure streak is logged in the WATCHDOG's
     journal, not fused-memory's, so no fm-only capture can witness it. Absent
     rather than guessed."""
-    from fm_wedge_forensics import analyze
-
     for journal in (EPISODE_1_JOURNAL, EPISODE_2_JOURNAL):
         assert analyze(journal)[0].costs.detection_seconds is None
 
@@ -409,8 +513,6 @@ def test_detection_interval_is_reported_unavailable_not_fabricated():
 def test_a_self_recovered_stall_has_no_teardown_or_startup_cost():
     """Nothing was torn down or started, so those terms are absent — not zero,
     which would read as an instantaneous restart that never happened."""
-    from fm_wedge_forensics import analyze
-
     costs = analyze(SELF_RECOVERED_STALL_JOURNAL)[0].costs
 
     assert costs.teardown_seconds is None
@@ -424,8 +526,6 @@ def test_a_later_unrelated_restart_is_not_attributed_to_a_self_recovered_stall()
     restart was 2h51m later and unconnected. Attributing it produced a
     'stopped-on-signal' verdict, a 3s teardown and a 10300s total — three
     wrong numbers a reader would have had no way to doubt."""
-    from fm_wedge_forensics import analyze
-
     episodes = analyze(SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL)
 
     self_recovered, ended_by_restart = episodes
@@ -483,7 +583,11 @@ def test_cli_json_carries_the_same_episode_records():
     assert episodes[0]["stall_seconds"] == 171.0
     assert episodes[0]["outcome"] == "sigterm-unserviced"
     assert episodes[0]["costs"]["teardown_seconds"] == 90.0
-    assert episodes[0]["foreign_killed_processes"] == [{"pid": 1289425, "name": "git"}]
+    assert episodes[0]["killed_processes"][-1] == {
+        "pid": 1289425,
+        "name": "git",
+        "wrote_journal_lines": False,
+    }
 
 
 def test_cli_threshold_flag_overrides_the_default():
@@ -493,12 +597,41 @@ def test_cli_threshold_flag_overrides_the_default():
     assert len(json.loads(result.stdout)["episodes"]) == 5
 
 
+def test_cli_context_flag_overrides_the_default():
+    result = _run_cli(EPISODE_2_JOURNAL, "--json", "--context", "2")
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert len(json.loads(result.stdout)["episodes"][0]["pre_stall_context"]) == 2
+
+
 def test_cli_reports_an_uneventful_window_as_zero_episodes_and_exits_0():
     """A window with nothing in it is a legitimate answer, not an error."""
     result = _run_cli(DENSE_HEALTHY_JOURNAL, "--json")
 
     assert result.returncode == 0, f"stderr={result.stderr!r}"
     assert json.loads(result.stdout)["episodes"] == []
+
+
+def test_cli_says_so_in_words_when_a_window_holds_no_stall():
+    """The --json shape above is for a pipeline; this is what an operator
+    mid-incident actually reads, and "nothing here" has to be legible as an
+    answer rather than as empty output."""
+    result = _run_cli(DENSE_HEALTHY_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "no stalls above the threshold" in result.stdout
+
+
+def test_cli_human_report_marks_absent_terms_as_not_measured():
+    """A self-recovered stall has no teardown and no startup, and the report
+    has to say NOT MEASURED rather than print a zero an operator would read as
+    an instantaneous restart."""
+    result = _run_cli(SELF_RECOVERED_STALL_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "teardown         not measured" in result.stdout
+    assert "startup          not measured" in result.stdout
+    assert "self-recovered" in result.stdout
 
 
 def test_cli_fails_loudly_when_nothing_in_the_input_parses():

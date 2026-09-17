@@ -82,14 +82,21 @@ DEFAULT_CONTEXT_LINES = 10
 
 # systemd's stop-time accounting, e.g.
 #   Consumed 2h 29min 21.259s CPU time, 3.2G memory peak, 934.4M memory swap peak.
-# The hours group is optional: a shorter-lived invocation prints `20min 30.697s`.
+# CPU time is the only mandatory clause, and every optional one is really seen
+# on this host: the hours drop out of a shorter-lived invocation (`20min
+# 30.697s`), and a unit without memory accounting prints CPU time alone
+# (`df-verify-reify-…scope: Consumed 8min 25.125s CPU time.`). Requiring the
+# memory clause would discard the CPU time systemd DID measure and report the
+# whole line as unmeasured.
 _CONSUMED_PATTERN = re.compile(
     r"Consumed (?:(?P<hours>\d+)h )?(?:(?P<minutes>\d+)min )?(?P<seconds>[\d.]+)s CPU time"
-    r", (?P<memory>[\d.]+)(?P<memory_unit>[KMGT]) memory peak"
-    r"(?:, (?P<swap>[\d.]+)(?P<swap_unit>[KMGT]) memory swap peak)?"
+    r"(?:, (?P<memory>[\d.]+)(?P<memory_unit>[BKMGT]) memory peak)?"
+    r"(?:, (?P<swap>[\d.]+)(?P<swap_unit>[BKMGT]) memory swap peak)?"
 )
-# systemd prints these with 1024-based units.
-_SIZE_MULTIPLIER = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+# systemd prints these with 1024-based units, down to a bare `B` for a size
+# below one kibibyte — which is how it renders a measured zero (`0B memory swap
+# peak`, real). Without `B` here that zero would read as "not measured".
+_SIZE_MULTIPLIER = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 
 _KILLED_PATTERN = re.compile(r"Killing process (?P<pid>\d+) \((?P<name>[^)]+)\) with signal SIGKILL")
 # `<identifier>[<pid>]:` — the journal's own attribution of each line.
@@ -99,7 +106,15 @@ _SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
 _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
 # A stall that BEGINS here began with the unit already down, so its socket was
 # unbound and a watchdog probe would have seen 'port-down' rather than 'wedged'.
-_UNIT_DOWN_MARKERS = ("Stopped fused-memory", "Main process exited", "with signal SIGKILL")
+# `Consumed ` earns its place: systemd emits its stop-time accounting as the
+# unit deactivates, which makes that the LAST line of a real stop sequence, so
+# without it a gap opening after a stop would still read 'wedged'.
+_UNIT_DOWN_MARKERS = (
+    "Stopped fused-memory",
+    "Main process exited",
+    "with signal SIGKILL",
+    "Consumed ",
+)
 
 # The observed boundaries of the two recovery terms. Teardown ends at
 # whichever came first of a clean stop and a SIGKILL, so an ignored SIGTERM
@@ -123,10 +138,15 @@ class ResourceTotals:
     Byte counts are converted from systemd's own 1024-based G/M rendering,
     which is already rounded to two significant figures; they carry that
     precision and no more.
+
+    Each byte count is None when systemd printed no clause for it — a unit
+    with memory accounting off prints CPU time alone — and that is NOT MEASURED,
+    distinct from the measured zero systemd spells `0B`. CPU time is never
+    None: a line that does not carry it is not a `Consumed` line at all.
     """
 
     cpu_seconds: float
-    memory_peak_bytes: float
+    memory_peak_bytes: float | None
     swap_peak_bytes: float | None
 
 
@@ -181,8 +201,22 @@ class CostBreakdown:
 
 @dataclasses.dataclass(frozen=True)
 class KilledProcess:
+    """One process SIGKILLed out of the unit's cgroup when systemd gave up on it.
+
+    *wrote_journal_lines* says only what it says: this capture credits output
+    to this process, by pid or by journal identifier. It is an ANNOTATION and
+    never a filter, because it is NOT the same question as "is this the unit's
+    own runtime". A child the unit spawned inherits the unit's stderr, so
+    anything it writes is journaled under this same unit — a writer set can
+    therefore contain the very child we are looking for. Filtering on it would
+    drop that child QUIETLY, as an empty list indistinguishable from "nothing
+    outlived the stop", and that absence-of-evidence reading is the one this
+    module exists to refuse.
+    """
+
     pid: int
     name: str
+    wrote_journal_lines: bool
 
 
 def parse_consumed(line: str) -> ResourceTotals | None:
@@ -195,12 +229,18 @@ def parse_consumed(line: str) -> ResourceTotals | None:
         + int(match["minutes"] or 0) * 60
         + float(match["seconds"])
     )
-    swap = match["swap"]
     return ResourceTotals(
         cpu_seconds=cpu_seconds,
-        memory_peak_bytes=float(match["memory"]) * _SIZE_MULTIPLIER[match["memory_unit"]],
-        swap_peak_bytes=float(swap) * _SIZE_MULTIPLIER[match["swap_unit"]] if swap else None,
+        memory_peak_bytes=_size_bytes(match["memory"], match["memory_unit"]),
+        swap_peak_bytes=_size_bytes(match["swap"], match["swap_unit"]),
     )
+
+
+def _size_bytes(size: str | None, unit: str | None) -> float | None:
+    """One of systemd's `<number><unit>` sizes in bytes, or None if unprinted."""
+    if size is None or unit is None:
+        return None
+    return float(size) * _SIZE_MULTIPLIER[unit]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -290,16 +330,16 @@ class StallEpisode:
         return None
 
     @property
-    def foreign_killed_processes(self) -> tuple[KilledProcess, ...]:
-        """Processes SIGKILLed out of the cgroup that are NOT the unit's own.
+    def killed_processes(self) -> tuple[KilledProcess, ...]:
+        """Every process SIGKILLed out of the cgroup, in the order systemd killed them.
 
-        The unit's own runtime is identified from the capture itself rather
-        than from a hardcoded name list: a process belongs to it if its pid
-        wrote journal lines under this unit, or if its name is one of the
-        journal identifiers those lines carry. For episode 2 that excludes
-        `python3` (pid 3655756 wrote the unit's log) and `uv` (the identifier
-        every one of those lines is tagged with), leaving the `git` child —
-        which is the whole signal, and would be diluted by the other two.
+        Reported in full, annotated rather than filtered (see
+        :class:`KilledProcess`). The annotation is read off the capture itself
+        rather than a hardcoded name list: for episode 2 it marks `python3`
+        (pid 3655756 wrote the unit's log) and `uv` (the identifier every one
+        of those lines carries), leaving the `git` child as the one entry with
+        no journal output of its own — which is the evidence that a
+        synchronous subprocess was still in flight on the blocked loop.
         """
         killed = []
         for line in self.aftermath:
@@ -307,9 +347,15 @@ class StallEpisode:
             if match is None:
                 continue
             pid, name = int(match["pid"]), match["name"]
-            if pid in self.unit_process_pids or name in self.unit_process_names:
-                continue
-            killed.append(KilledProcess(pid=pid, name=name))
+            killed.append(
+                KilledProcess(
+                    pid=pid,
+                    name=name,
+                    wrote_journal_lines=(
+                        pid in self.unit_process_pids or name in self.unit_process_names
+                    ),
+                )
+            )
         return tuple(killed)
 
 
@@ -431,8 +477,8 @@ def as_dict(episode: StallEpisode) -> dict:
         "watchdog_verdict": episode.watchdog_verdict,
         "pre_stall_context": list(episode.pre_stall_context),
         "resources": dataclasses.asdict(resources) if resources else None,
-        "foreign_killed_processes": [
-            dataclasses.asdict(process) for process in episode.foreign_killed_processes
+        "killed_processes": [
+            dataclasses.asdict(process) for process in episode.killed_processes
         ],
         "costs": {
             **dataclasses.asdict(costs),
@@ -464,12 +510,16 @@ def format_report(episodes: list[StallEpisode]) -> str:
         if episode.resources:
             lines.append(
                 f"  consumed         {episode.resources.cpu_seconds:.0f}s CPU, "
-                f"{episode.resources.memory_peak_bytes / 1024**3:.1f}G peak "
+                f"{_show_gigabytes(episode.resources.memory_peak_bytes)} peak "
                 "(cumulative for the whole invocation, not this stall)"
             )
-        for process in episode.foreign_killed_processes:
+        for process in episode.killed_processes:
+            attribution = (
+                "logged under this unit" if process.wrote_journal_lines
+                else "NO journal output of its own in this capture"
+            )
             lines.append(
-                f"  still in cgroup  {process.name} (pid {process.pid}) SIGKILLed at teardown"
+                f"  sigkilled        {process.name} (pid {process.pid}) — {attribution}"
             )
         lines.append("  last lines before the silence:")
         lines.extend(f"    {line}" for line in episode.pre_stall_context)
@@ -479,6 +529,10 @@ def format_report(episodes: list[StallEpisode]) -> str:
 
 def _show_seconds(seconds: float | None) -> str:
     return "not measured" if seconds is None else f"{seconds:.0f}s"
+
+
+def _show_gigabytes(byte_count: float | None) -> str:
+    return "not measured" if byte_count is None else f"{byte_count / 1024**3:.1f}G"
 
 
 def main(argv: list[str] | None = None) -> int:
