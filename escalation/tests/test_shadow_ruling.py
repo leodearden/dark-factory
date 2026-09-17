@@ -41,6 +41,7 @@ from escalation.shadow_ruling import (
     SHADOW_RULING_MARKER,
     ShadowRuling,
     agreement_report,
+    main,
     mechanically_gated,
     parse_shadow_ruling,
 )
@@ -818,3 +819,203 @@ def test_comparable_actions_stay_in_lockstep_with_the_c1_vocabulary():
     from escalation.server import RESOLVE_ACTIONS
 
     assert REVERSIBLE_ACTIONS & frozenset(RESOLVE_ACTIONS) == COMPARABLE_ACTIONS
+
+
+# ---------------------------------------------------------------------------
+# The CLI arm the skill quotes (step-7)
+# ---------------------------------------------------------------------------
+
+
+def _row_for(out: str, ruling_class: str) -> str:
+    rows = [line for line in out.splitlines() if ruling_class in line]
+    assert len(rows) == 1, f'expected exactly one row for {ruling_class!r}, got {rows}'
+    return rows[0]
+
+
+class TestCliTable:
+    def test_prints_a_row_per_class_with_counts_and_rate(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        for _ in range(3):
+            fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        fixture.stamped_and_resolved(_ruling(action='resume'), observed_action='close_only')
+        fixture.stamped_and_resolved(_ruling(action='file_task'), observed_action=None)
+
+        code = main([
+            '--queue-dir', str(fixture.queue.queue_dir),
+            '--since', '2000-01-01T00:00:00+00:00',
+            '--until', '2100-01-01T00:00:00+00:00',
+        ])
+
+        assert code == 0
+        row = _row_for(capsys.readouterr().out, _BRANCH_BEHIND)
+        for field in ('3', '1', '4', '75'):
+            assert field in row, f'expected {field!r} in the class row: {row!r}'
+
+    def test_prints_the_three_excluded_buckets(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+        )
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+        pending = fixture.submit()
+        fixture.stamp(pending, _ruling(), by='watcher-a')
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        out = capsys.readouterr().out
+        assert 'gated_stamps=1' in out
+        assert 'self_resolved=1' in out
+        assert 'unresolved=1' in out
+
+    def test_self_resolved_is_printed_even_when_zero(self, tmp_path: Path, capsys):
+        """A reader deciding whether a class cleared "95% over at least 10
+        items" must see, from the pasted output alone, how many of its records
+        were thrown out for self-agreement. A class whose stamps are mostly
+        self_resolved is NOT MEASURABLE YET and must not read like a class with
+        a small sample."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        assert 'self_resolved=0' in capsys.readouterr().out
+
+    def test_self_resolved_is_not_folded_into_unresolved_or_the_class_row(
+        self, tmp_path: Path, capsys,
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        for _ in range(2):
+            fixture.stamped_and_resolved(
+                _ruling(), observed_action='close_only',
+                stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+            )
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        out = capsys.readouterr().out
+        assert 'self_resolved=2' in out
+        assert 'unresolved=0' in out
+        row = _row_for(out, _BRANCH_BEHIND)
+        assert '2' not in row.replace(_BRANCH_BEHIND, ''), (
+            f'the two self-resolved records leaked into the class row: {row!r}'
+        )
+
+    def test_an_unmeasurable_rate_is_not_printed_as_a_number(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='file_task'), observed_action=None)
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        assert 'n/a' in _row_for(capsys.readouterr().out, _BRANCH_BEHIND)
+
+
+class TestCliWindow:
+    def test_defaults_to_the_trailing_seven_days(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        out = capsys.readouterr().out
+        assert _BRANCH_BEHIND in out, 'a record resolved just now falls in the trailing week'
+
+    def test_echoes_the_resolved_window_so_a_pasted_report_is_self_describing(
+        self, tmp_path: Path, capsys,
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+
+        before = datetime.now(UTC)
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        after = datetime.now(UTC)
+
+        out = capsys.readouterr().out
+        windows = [
+            datetime.fromisoformat(token)
+            for token in out.replace(',', ' ').split()
+            if token.count('-') >= 2 and 'T' in token
+        ]
+        assert len(windows) == 2, f'expected the window echoed as two timestamps: {out!r}'
+        since, until = windows
+        assert before - timedelta(days=7, seconds=5) <= since <= after - timedelta(days=7)
+        assert before <= until <= after
+
+    def test_an_explicit_window_is_honoured(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        assert main([
+            '--queue-dir', str(fixture.queue.queue_dir),
+            '--since', (at - timedelta(days=1)).isoformat(),
+            '--until', (at - _MICROSECOND).isoformat(),
+        ]) == 0
+        assert _BRANCH_BEHIND not in capsys.readouterr().out
+
+
+class TestCliDegradesLoudly:
+    def test_a_missing_queue_dir_is_a_nonzero_exit_on_stderr(self, tmp_path: Path, capsys):
+        """An empty report and a misconfigured path must not look identical: an
+        all-zero table reads like a real measurement."""
+        code = main(['--queue-dir', str(tmp_path / 'nope')])
+
+        assert code != 0
+        captured = capsys.readouterr()
+        assert 'nope' in captured.err
+        assert 'gated_stamps' not in captured.out, (
+            'a misconfigured path must not print a table at all'
+        )
+
+    def test_an_empty_window_says_so_rather_than_printing_nothing(
+        self, tmp_path: Path, capsys,
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        assert 'no shadow rulings in window' in capsys.readouterr().out
+
+
+class TestCliJson:
+    def test_json_parses_back_to_the_same_counts_as_the_table(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        fixture.stamped_and_resolved(_ruling(action='resume'), observed_action='close_only')
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+        )
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir), '--json']) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload['gated_stamps'] == 1
+        assert payload['self_resolved'] == 1
+        assert payload['unresolved'] == 0
+        row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
+        assert (row['agreed'], row['diverged'], row['not_comparable']) == (1, 1, 0)
+        assert row['comparable'] == 2
+        assert row['agreement_rate'] == 0.5
+        assert payload['since'] and payload['until']
+
+    def test_json_reports_an_unmeasurable_rate_as_null(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='file_task'), observed_action=None)
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir), '--json']) == 0
+        payload = json.loads(capsys.readouterr().out)
+        row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
+        assert row['agreement_rate'] is None
+
+    def test_json_is_emitted_for_an_empty_window_too(self, tmp_path: Path, capsys):
+        fixture = _Fixture(tmp_path)
+        fixture.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir), '--json']) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload['classes'] == []
+        assert payload['self_resolved'] == 0
