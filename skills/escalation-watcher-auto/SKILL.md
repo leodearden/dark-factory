@@ -777,6 +777,58 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): infra_issue — <task_id or N/A> — <summary>`
 
+#### Recovery veto-streak sentinel L1s (`__recovery_veto_streak__*`)
+
+The orchestrator files ONE blocking L1 when the same recovery veto has held a task for `threshold` consecutive sweeps over a minimum elapsed span (`orchestrator/src/orchestrator/recovery_emission.py::emit_recovery_veto_streak_escalation`). These are **monitor signals**, not work: the record's `task_id` is a SYNTHETIC sentinel (`__recovery_veto_streak__<real_task_id>`) precisely so that observing a hold cannot itself deepen it.
+
+Every record in this class looks alike at the mechanism level, so the generic `"risk:<module-or-area-slug>"` key below folds **unrelated** streaks into one perpetually-growing L2 that eventually self-truncates. Key the promote on the ORIGINATING PIN instead — the escalation actually holding the task — so streaks held by different incidents land in different L2s.
+
+**Class discriminator.** Match a pending L1 where **both** hold:
+- `task_id` starts with `__recovery_veto_streak__` (`RECOVERY_VETO_STREAK_SENTINEL_PREFIX`)
+- `category == "risk_identified"` (`_STREAK_CATEGORY`)
+
+Both come from the emitter. The category half is what keeps an **unrelated** record filed on the same sentinel id out of this class — the sentinel prefix alone does not discriminate it.
+
+**Extraction.** From `esc["detail"]`, take the single line beginning `Pinning escalations: `. Each comma-separated entry reads `<esc_id> (<age> old)` or `<esc_id> (age unknown)`; take the id and discard the parenthetical. So
+
+```
+Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)
+```
+
+yields `esc-1000-2`, `esc-5000-3`, `esc-9999-1`. The emitter already renders these **sorted and deduplicated** across its buckets (`_flatten_ids` returns `sorted(set(...))`), so read them in the order given — do not re-sort, re-order, or drop any. That format is pinned by `orchestrator/tests/test_recovery_emission.py::TestEmitRecoveryVetoStreakEscalation::test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated`, so you may rely on it rather than re-deriving the order.
+
+The same `detail` names the REAL task id (`Task: <id>`), plus `Veto site:`, `Consecutive IDENTICAL vetoes:` and `Elapsed since the streak began:` — quote those as evidence rather than re-deriving them.
+
+Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>"`. When multiply pinned, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different pin-sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<esc-id>[+<esc-id>...]",
+  evidence=(
+    "Task <real_task_id> held by the same veto at <site> for <n> consecutive "
+    "sweeps over <span> (reason <reason>); pinned by <esc-ids with their ages>."
+  ),
+  options=[
+    "A: resolve or dismiss <esc-id> if it is stale — that releases task <real_task_id>",
+    "B: drive <esc-id> to completion; it is a live hold, not noise",
+    "C: retune or silence the detector via the green-tier recovery_emission knobs",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="risk_identified",
+  # severity omitted — inherited from the members, as in `infra_issue` above.
+)
+```
+
+The options must name the **pinning escalation**, because resolving it is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did.
+
+**Why key on the pin.** Streaks genuinely held by the SAME incident still fold together (same pin id → same key), which is the clustering you want; only truly unrelated pins separate. The accepted cost is more, smaller L2s — that is triage volume, not blocked work, because the sentinel `task_id` is synthetic and pins nothing real, so an open L2 in this class never holds a task.
+
+Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <summary>`
+
 #### `design_concern` / `risk_identified` / `missing_premise`
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
