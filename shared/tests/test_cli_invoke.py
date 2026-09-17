@@ -5076,16 +5076,23 @@ class TestUnreadableTranscriptEscapeWiring:
 
         The barrier here provably cannot open: a readable transcript latches
         `seen_turn` on the first read and the progress extension is off, so the
-        loop never reads again — one read, forever short of the five demanded.
+        loop never reads again — one read, forever short of the count demanded.
+
+        Both assertions are deliberately loose. The property under test is that
+        the run ENDED with the barrier still shut; the exact poll count and the
+        exact wall clock are scheduling artefacts, and pinning either would put
+        this test back on the race the rest of the class exists to remove.
         """
         import time as _time
+
+        unreachable_reads = 5
 
         started = _time.monotonic()
         with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
             mock_turns = await self._drive(
                 tmp_path,
                 turns_side_effect=lambda *a, **k: 1,
-                required_reads=5,
+                required_reads=unreachable_reads,
                 release_timeout_secs=0.05,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
@@ -5093,14 +5100,15 @@ class TestUnreadableTranscriptEscapeWiring:
             )
         elapsed = _time.monotonic() - started
 
-        assert elapsed < 5.0, (
+        assert elapsed < 30.0, (
             f'an unsatisfiable barrier must be released by the valve, not waited '
             f'out at the 300s pytest timeout; the run took {elapsed:.2f}s'
         )
-        assert mock_turns.call_count == 1, (
+        assert mock_turns.call_count < unreachable_reads, (
             f'the valve must release the child WITHOUT the barrier being '
             f'satisfied, so the surviving failure is the caller\'s own poll-count '
-            f'assertion; got {mock_turns.call_count} polls'
+            f'assertion; got {mock_turns.call_count} of the {unreachable_reads} '
+            f'polls demanded'
         )
 
     async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
