@@ -15386,8 +15386,18 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
             tks_module, 'detect_live_workflow', self._recording_detector(probed)
         )
         # Neutralise the (already-tested) per-render hoists so this class
-        # measures only the fan-out, with no real subprocess.
-        monkeypatch.setattr(tks_module, 'worktree_index_for', lambda _pr: {})
+        # measures only the fan-out, with no real subprocess. The fake must be
+        # a COROUTINE function: production awaits `worktree_index_for`, and
+        # `monkeypatch.setattr` performs no async auto-detection — unlike
+        # `patch.object`, which returns an AsyncMock when the target is a
+        # coroutine function. A sync `lambda _pr: {}` here is not neutral: it
+        # makes the await raise TypeError, which the renderer's fail-safe
+        # swallows into the degraded per-task-probe branch, so the cap would be
+        # measured with the hoist broken rather than engaged.
+        async def _worktree_index(_pr):
+            return {}
+
+        monkeypatch.setattr(tks_module, 'worktree_index_for', _worktree_index)
         result = await _render_live_workflow_section(
             tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
         )
@@ -15449,6 +15459,22 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         )
         capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
         assert not capped, f'false overflow alarm at n={n_tasks}: {capped}'
+
+        # ...and quiet means quiet. Filtering caplog on _CAP_EVENT alone once
+        # hid a real WARNING firing on every run of this class: the hoist fake
+        # was sync, so the renderer's fail-safe caught the TypeError and
+        # degraded to a per-task probe. Any swallowed degradation in the
+        # renderer now fails here instead of hiding behind an event-name filter.
+        noisy = [
+            r for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno >= logging.WARNING
+            and self._CAP_EVENT not in r.getMessage()
+        ]
+        assert not noisy, (
+            f'the steady state at n={n_tasks} must be silent at WARNING+; got '
+            f'{[r.getMessage() for r in noisy]}'
+        )
 
     @pytest.mark.asyncio
     async def test_cap_follows_the_constant_not_a_second_literal(self, monkeypatch, caplog):
