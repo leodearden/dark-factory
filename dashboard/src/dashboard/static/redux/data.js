@@ -195,10 +195,37 @@ window.DF_DATA = {
   // holding `const DF = window.DF_DATA` reads it with no new capture.  It is
   // not an endpoint key, so applyKey never overwrites it.
   __loaded: {},
+  // Per-endpoint staleness, keyed by endpoint PATH (pollKey): each entry is
+  // `{failures, lastSuccessAt}`, republished by refreshOne on BOTH the
+  // success and the failure path. endpoint_staleness.js turns it into the
+  // notices app.jsx renders above every tab body.
+  //
+  // Nested under DF_DATA for the same reason __loaded is — see that block
+  // above: a consumer holding `const DF = window.DF_DATA` reads it with no
+  // new capture, and it is not an endpoint key, so applyKey never overwrites
+  // it.
+  //
+  // Staleness is derived from RECORDED TIMESTAMPS, never from an identity
+  // comparison against a captured seed. The __loaded block documents why
+  // that pattern is unsafe here (a text/babel module is evaluated after
+  // DOMContentLoaded, while the immediate first fetch can resolve BEFORE
+  // that, freezing a REAL payload as the "seed"), and the same race would
+  // make an identity-derived staleness verdict wrong in the same direction:
+  // it would report "current" for a payload that has not moved in hours.
+  // Do not reintroduce it.
+  __stale: {},
 };
 
 function applyKey(key, value) {
   if (value === undefined || value === null) return;
+  // `__`-prefixed names are DF_DATA's internal namespace (__loaded, __stale)
+  // — never endpoint keys, and never anything a server payload may write.
+  // The invariant was previously structural only (no endpointsFor() key list
+  // names one), which left both maps one server-side key rename away from
+  // being silently overwritten: a payload key literally named `__loaded`
+  // would flip every marker, and one named `__stale` would erase the very
+  // record that reports the server is failing. Enforce it here instead.
+  if (typeof key === 'string' && key.startsWith('__')) return;
   if (STABLE_ARRAY_KEYS.has(key) && Array.isArray(window.DF_DATA[key]) && Array.isArray(value)) {
     window.DF_DATA[key].length = 0;
     window.DF_DATA[key].push(...value);
@@ -224,7 +251,7 @@ function stateFor(state, url) {
   const key = pollKey(url);
   let st = state.get(key);
   if (!st) {
-    st = { inFlight: false, failures: 0, nextAllowedAt: 0 };
+    st = { inFlight: false, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
     state.set(key, st);
   }
   return st;
@@ -264,7 +291,56 @@ const JITTER_MAX_MS = 1500;
 // the page, with no console warning and no UI signal. Bound each attempt
 // with an abort deadline; timing out is treated exactly like a thrown
 // fetch error (counts toward backoff, clears in-flight in `finally`).
+//
+// LEAVE THIS EXACTLY AS IT IS — same name, same literal, same assignment
+// shape. Two Python structural tests parse it straight out of this shipped
+// source with /DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/ — test_tasks_budget.py and
+// test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
+// on the server-side budgets. Renaming it, or tidying it into a computed
+// expression, fails both loudly.
 const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
+
+// A shorter deadline for an endpoint that has already demonstrated it is
+// failing. Deliberately a SECOND, separately named constant rather than a
+// redefinition of the one above.
+//
+// THE CONNECTION-BUDGET ARITHMETIC. Browsers allow ~6 concurrent HTTP/1.1
+// connections per origin. Three wedged endpoints each holding a socket for
+// the full 30s deadline is about half that budget held continuously, which
+// is why the HEALTHY tabs also felt sluggish and slow to answer chip changes
+// during the 2026-08-27 incident. Once an endpoint has failed
+// STALE_FAILURE_THRESHOLD times in a row there is nothing left to wait 30s
+// for: it is already reported stale in the UI, and a shorter deadline gets
+// the socket back for the tabs that are still working.
+const STALE_TIMEOUT_MS = 5000;
+
+// Fallback for endpoint_staleness.js's threshold. data.js is the FIRST
+// classic script in index.html, so reading window.DF_ENDPOINT_STALENESS at
+// module scope would be a hard load-order dependency on a script that has
+// not run yet. Read it lazily instead, and fall back to this literal when
+// absent (the node --test harness, where no classic scripts load at all).
+// endpoint_staleness.test.mjs asserts the two values agree.
+const STALE_FAILURE_THRESHOLD_FALLBACK = 3;
+
+function staleFailureThreshold() {
+  if (typeof window !== 'undefined' && window.DF_ENDPOINT_STALENESS) {
+    const n = Number(window.DF_ENDPOINT_STALENESS.STALE_FAILURE_THRESHOLD);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return STALE_FAILURE_THRESHOLD_FALLBACK;
+}
+
+// Republish this endpoint's staleness record onto DF_DATA. Called from
+// refreshOne's `finally`, so it covers the success path, the thrown-error
+// path AND the `!resp.ok` early return alike — an endpoint that 503s for an
+// hour is exactly as stale as one that times out for an hour.
+function publishStaleness(url, st) {
+  if (typeof window === 'undefined' || !window.DF_DATA) return;
+  window.DF_DATA.__stale[pollKey(url)] = {
+    failures: st.failures,
+    lastSuccessAt: st.lastSuccessAt,
+  };
+}
 
 async function refreshOne(url, keys, state, deps) {
   const st = stateFor(state, url);
@@ -285,7 +361,10 @@ async function refreshOne(url, keys, state, deps) {
     if (deps.jitterMaxMs > 0) {
       await deps.sleep(Math.floor(deps.random() * deps.jitterMaxMs));
     }
-    const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // An explicitly injected deps.timeoutMs still wins over both defaults;
+    // the reduced deadline is a DEFAULT selection, not an override.
+    const timeoutMs = deps.timeoutMs
+      ?? (st.failures >= staleFailureThreshold() ? STALE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     // Races the fetch against a deadline instead of relying on the fetch
     // implementation to honour AbortSignal itself (test stubs generally
@@ -310,6 +389,7 @@ async function refreshOne(url, keys, state, deps) {
     keys.forEach(k => applyKey(k, body[k]));
     st.failures = 0;
     st.nextAllowedAt = 0;
+    st.lastSuccessAt = deps.now();
   } catch (err) {
     recordFailure(st, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
@@ -318,6 +398,9 @@ async function refreshOne(url, keys, state, deps) {
   } finally {
     clearTimeoutFn(timeoutId);
     st.inFlight = false;
+    // In `finally` so the `!resp.ok` early return is covered too, not just
+    // the success and thrown-error paths.
+    publishStaleness(url, st);
   }
 }
 
@@ -327,6 +410,22 @@ let currentWin = '24h';
 
 // Real (browser) deps; opts.deps overrides individual entries (tests inject
 // a controllable clock/RNG/fetch instead of these).
+//
+// EVERY ENTRY HERE IS AN ENVIRONMENT CAPABILITY — a clock, an RNG, fetch, the
+// timer pair. Do NOT add a policy value, and `timeoutMs` in particular. It was
+// pinned here once and that silently disabled the reduced deadline entirely:
+// refreshDFData merges these FIRST, so `deps.timeoutMs` was never undefined,
+// so refreshOne's `deps.timeoutMs ?? (failures >= threshold ? STALE_TIMEOUT_MS
+// : DEFAULT_TIMEOUT_MS)` could not fall through and STALE_TIMEOUT_MS was dead
+// code in every browser. The node suite stayed green throughout, because its
+// tests hand refreshOne a partial deps object with no timeoutMs and so take a
+// path production never takes. Chrome 151 is what caught it (task 4884 step-19,
+// #4791 acceptance 3): four consecutive ~30000ms aborts on a wedged endpoint
+// whose banner already read "4 consecutive attempts failed".
+//
+// Now pinned from both ends by data_poll.test.mjs's "PRODUCTION deps merge"
+// test — behaviourally through refreshDFData, and structurally against this
+// literal.
 const DEFAULT_POLL_DEPS = {
   now: () => Date.now(),
   random: () => Math.random(),
@@ -334,7 +433,6 @@ const DEFAULT_POLL_DEPS = {
   fetchImpl: (u, i) => fetch(u, i),
   setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
   clearTimeoutImpl: id => clearTimeout(id),
-  timeoutMs: DEFAULT_TIMEOUT_MS,
 };
 
 // `opts.state`/`opts.deps` let callers supply isolated flow-control state

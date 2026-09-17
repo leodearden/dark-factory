@@ -13,7 +13,18 @@
 test_command: "uv run --directory sampler pytest tests/ --tb=short -q --timeout=300"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --directory sampler ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py sampler/tests"
-type_check_command: "uv run --directory sampler pyright src/ tests/"
+# --threads 8 (task 5408). pyright is this module's LONG POLE — ~11s pyright
+# against ~4s pytest — so the type leg is where its merge-gate wall-clock is.
+# THE FULL RATIONALE lives in shared/orchestrator.yaml above its own
+# type_check_command and is deliberately not restated here: the measurement
+# behind the flag, the `--stats` mutual exclusion that means nothing may add
+# that flag to this command, why this edit is what reaches the merge gate's
+# leg-2 unscoped type check, and why dark-factory-orchestrator.yaml's fleet
+# fallback chain must NOT be given the same flag.
+# This exact spelling is the one that was validated: `uv run --directory sampler
+# pyright --threads 8 src/ tests/` -> rc=0, "0 errors, 0 warnings, 0
+# informations" on the pinned pyright 1.1.408.
+type_check_command: "uv run --directory sampler pyright --threads 8 src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, sampler declared nothing
 # here and fell HARD through to the repo-root whole-fleet ceiling.

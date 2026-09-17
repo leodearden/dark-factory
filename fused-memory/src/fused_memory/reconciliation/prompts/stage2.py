@@ -658,7 +658,9 @@ window (even if `run_id` was omitted by the Stage 1 producer), appear in the \
 "Stage 1 Flagged Items" section above. Any markers from prior cycles that \
 failed FIX C deletion are excluded from the section above and garbage-collected \
 deterministically by the reconciliation ledger (TTL expiry or terminal-task match, \
-not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept`. \
+not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept` — \
+a count of reconciliation-ledger rows, NOT of Mem0 records, so do not read it as a \
+signal about the Mem0 marker pool. \
 You do NOT need to search for, re-process, or \
 count prior-cycle markers — every flag in this section is current-cycle and is your \
 responsibility to process and delete.
@@ -752,6 +754,22 @@ lifecycle.
    the build succeeds, the orchestrator will merge automatically. A manual merge \
    instruction competes with the live pipeline and can produce a race condition or a \
    double-merge.
+
+4. **Never CANCEL an existing human-gate carrier because its subject showed a live \
+   signal.** A liveness flicker is transient; cancelling the carrier and re-minting one \
+   next cycle is what orphaned esc-5881-1 / esc-5902-1 / esc-5916-1 as \
+   permanently-pending L2 escalations, and what produced three carriers \
+   (5902 -> 5916 -> 5929) for the single subject 5879. Instead, AMEND the carrier in \
+   place with `update_task` — refresh its evidence and bump \
+   `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
+   cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
+   "## Source-Completion" section is the authority for that canonical key and its \
+   read-side aliases). AMEND HAZARD: `update_task`'s `append=True` governs only \
+   `details` / `prompt` and does NOT append `description`, which always overwrites — \
+   so to extend a description, READ the current text first, write the full merged \
+   text, and verify the echoed `updated_task` reflects it. Re-filing is not an escape \
+   from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
+   whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
 — i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
-from shared.verify_admission import acquire_task_slot, nice_prefix
+from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
@@ -5245,62 +5245,65 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
 async def _admission_slot(role: str, config: OrchestratorConfig):
     """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
 
-    Gates only the test leg of a verify (callers decide that; this CM itself
-    is role-agnostic and always attempts acquisition uniformly — T1's
-    ``acquire_task_slot`` internally no-ops for ``role`` values other than
-    ``'task'``/``'background'`` and always yields ``held=False`` immediately
-    for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
-    is owned entirely by T1, not re-implemented here).
+    Callers gate only a verify's test leg; WHICH roles that gate actually
+    acquires for is T1's ``is_gated_role`` to decide, never re-derived here.
 
-    T1 never creates ``slots_dir`` itself (fails open when absent) and never
-    even inspects it for roles it can't acquire for (its own role check
-    short-circuits first), so this CM only mkdirs it for roles that actually
-    attempt acquisition (``task``/``background``) — leaving ``merge`` (and any
-    other role) with no filesystem side effect. The mkdir and the blocking,
-    potentially-unbounded ``acquire_task_slot(...).__enter__`` (a synchronous
-    flock poll-loop) both run on the dedicated ``_admission_executor`` so the
-    wait never blocks the event loop nor contends with unrelated
-    ``asyncio.to_thread`` work — a loop-blocking acquire would otherwise stall
-    the holder's own subprocess-exit callback from ever firing on this same
-    loop, deadlocking cross-verify contention.
+    Gated role — the mkdir (T1 never creates ``slots_dir`` itself, and fails
+    open when it is absent) and the blocking, potentially-unbounded
+    ``__enter__`` (a synchronous flock poll-loop) both run on the dedicated
+    ``_admission_executor``, so the wait neither blocks the event loop nor
+    contends with unrelated ``asyncio.to_thread`` work: a loop-blocking
+    acquire would stall the current holder's own subprocess-exit callback
+    from ever firing on this same loop, deadlocking cross-verify contention.
+    The await is shielded because cancellation (shutdown, or a sibling
+    verify's failure cancelling this one via ``asyncio.gather``) cannot
+    interrupt that worker thread mid-``time.sleep`` — a bare cancel would
+    leave the slot acquired-but-never-released if the thread goes on to
+    succeed, so a done-callback releases it instead. That release race, and
+    its adjacent never-entered-CM guard, are pinned by
+    ``test_verify_admission_cancel_release.py``.
 
-    The acquire await is shielded from cancellation (``asyncio.shield``): if
-    the awaiting coroutine is cancelled mid-wait (e.g. orchestrator shutdown,
-    or a sibling verify's failure cancelling this one via ``asyncio.gather``),
-    the worker thread's poll loop keeps running in the background regardless
-    — it cannot be interrupted mid-``time.sleep`` — so a bare cancellation
-    would otherwise leave a slot acquired-but-never-released if the thread
-    goes on to succeed after we stopped waiting. A done-callback releases it
-    in that case instead. Release on the normal path (``os.close`` under the
-    hood) is synchronous and instant, so it runs directly in ``finally``
-    without needing an executor thread.
+    Ungated role — ``__enter__`` is a synchronous no-op (T1's own role check
+    short-circuits before any I/O), so it runs inline on the event loop
+    thread and ``slots_dir`` is never even created. Routing it through the
+    executor instead would subject a role T1 guarantees is instant to that
+    shared pool's queueing delay, reintroducing inside this CM the very
+    head-of-line ``merge`` starvation T1's no-op exists to prevent
+    (C-merge-priority; task 5424).
 
+    Release (``os.close`` under the hood) is synchronous and instant on both
+    paths, so it runs directly in ``finally`` without an executor thread.
     Fails open (runs ungated) on any ``OSError`` — most commonly a
     ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
     fail-open contract for acquisition itself).
     """
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
-    loop = asyncio.get_running_loop()
-    executor = _admission_executor()
     cm = None
     try:
-        if role in {'task', 'background'}:
+        # Constructing the CM runs none of acquire_task_slot's body (it is a
+        # @contextlib.contextmanager generator function); only __enter__ does,
+        # and the branch below differs solely in HOW that __enter__ is invoked.
+        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+        if is_gated_role(role):
+            loop = asyncio.get_running_loop()
+            executor = _admission_executor()
             await loop.run_in_executor(
                 executor, lambda: slots_dir.mkdir(parents=True, exist_ok=True),
             )
-        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
-        enter_future = loop.run_in_executor(executor, cm.__enter__)
-        try:
-            await asyncio.shield(enter_future)
-        except asyncio.CancelledError:
-            def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
-                if cm is None or fut.cancelled() or fut.exception() is not None:
-                    return
-                with contextlib.suppress(OSError):
-                    cm.__exit__(None, None, None)
-            enter_future.add_done_callback(_release_if_acquired)
-            raise
+            enter_future = loop.run_in_executor(executor, cm.__enter__)
+            try:
+                await asyncio.shield(enter_future)
+            except asyncio.CancelledError:
+                def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
+                    if cm is None or fut.cancelled() or fut.exception() is not None:
+                        return
+                    with contextlib.suppress(OSError):
+                        cm.__exit__(None, None, None)
+                enter_future.add_done_callback(_release_if_acquired)
+                raise
+        else:
+            cm.__enter__()
     except OSError:
         cm = None
     try:
@@ -5663,13 +5666,14 @@ async def run_verification(
         # the `-n` gate reads it and must itself precede that wrap; it
         # depends on nothing but config/label, so the move is inert.
         admission = _verify_admission_active(config) and label == 'test'
-        # -n cap (task 2394 T6): applies only to roles {task, background} —
-        # 'merge' is never -n-capped (bypasses admission slot-counting,
-        # latency-critical). No-op when the knob is '' or 'auto' (the
-        # apply_pytest_numprocesses no-op guard) — byte-identical to today.
-        # config_cmd above intentionally stays un-rewritten (same treatment
-        # as the nice prefix: an execution detail layered onto cmd, not the
-        # persisted config command).
+        # -n cap (task 2394 T6): capping is a property of the SAME role set
+        # the slot semaphore gates, so it asks T1's is_gated_role rather than
+        # re-deriving that set (task 5424) — 'merge' bypasses slot-counting
+        # and, being latency-critical, is never -n-capped either. No-op when
+        # the knob is '' or 'auto' (the apply_pytest_numprocesses no-op
+        # guard) — byte-identical to today. config_cmd above intentionally
+        # stays un-rewritten (same treatment as the nice prefix: an execution
+        # detail layered onto cmd, not the persisted config command).
         #
         # Hoisted into ONE local (task 3478) because the segmented branch
         # below applies the same cap per segment: a second copy of this
@@ -5677,7 +5681,7 @@ async def run_verification(
         # disagree between the segmented and unsegmented paths.
         pytest_n_capped = (
             admission
-            and role in {'task', 'background'}
+            and is_gated_role(role)
             and config.verify_admission_pytest_n not in {'', 'auto'}
         )
         # _with_pytest_numprocesses_str identity-checks the mutation before
@@ -5691,7 +5695,7 @@ async def run_verification(
         # /bin/bash -c '...'` string that parse_config_command can no longer
         # see as pytest, so the cap would silently vanish. Both gates are
         # disjoint today (governance resolves only for role=='merge', the cap
-        # only for role in {'task','background'}), so this is defence in
+        # only for the admission-gated roles), so this is defence in
         # depth; ordering it identically to _run_one_segment below is what
         # keeps the two paths from disagreeing if either gate ever widens.
         if pytest_n_capped:
@@ -5934,8 +5938,8 @@ async def run_verification(
             #   The guard above warns if either gate ever relaxes.
             #
             # - apply_pytest_numprocesses IS now applied per segment, inside
-            #   _run_one_segment. Its gate's roles ({'task','background'}) are
-            #   exactly the segmented-path roles, so it was never exempt —
+            #   _run_one_segment. Its gate's roles (the admission-gated ones)
+            #   are exactly the segmented-path roles, so it was never exempt —
             #   just silently dropped, the rewrite landing on `cmd` while
             #   segments are built from `config_cmd`. Segments run
             #   sequentially, so a per-segment `-n N` keeps its single-command

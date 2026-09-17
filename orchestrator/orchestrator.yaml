@@ -6,3 +6,78 @@ test_command: "uv run --directory orchestrator pytest tests/ --tb=short -q --tim
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --directory orchestrator ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py orchestrator/tests"
 type_check_command: "uv run --directory orchestrator pyright src/ tests/"
+
+# Per-module verify budget — RULED BY LEO, esc-4211-6 (2026-09-07 option B,
+# unstuck 2026-09-11 option C), recorded on task 3353 and split out as task
+# 5422 because 3353 could not dispatch.
+#
+# INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08). 7200 is an
+# operator estimate, not a measured distribution — task 3353's own scope D (a
+# distribution measured under load: p50/p90/max, with PSI and runqueue
+# recorded alongside) is what refines it later. No later reader should
+# mistake this for a measured budget.
+#
+# DELIBERATELY NOT NARROWER than the repo-root whole-fleet ceiling — the
+# opposite of every other module's per-module budget, which narrows below
+# it. Green orchestrator runs have reached ~5288s, past the 3600s fleet
+# ceiling in force when this was ruled, so a budget below that ceiling would
+# make the false-timeout failure MORE common, not less.
+#
+# EQUAL TO THAT CEILING TODAY RATHER THAN ABOVE IT, and that is the
+# OPERATOR's doing, not this module's: commit 36c4c71eb4 (Leo, 2026-09-12)
+# raised the fleet ceiling 3600 -> 7200 as a stopgap, recording in
+# dark-factory-orchestrator.yaml that "7200 is the figure already ruled as
+# task 3353 scope B" — this figure. That same note states the revert
+# condition, "when ... the module declares its own budget, put these back to
+# 3600/5400" — i.e. this declaration — so the two are expected to separate
+# again. THE DECLARATION IS NOT REDUNDANT WHILE THEY COINCIDE: the fleet
+# ceiling is operator-tunable and this figure is RULED, so the module keeps
+# 7200 through that revert instead of falling back to 3600 with it. The
+# guard below therefore asserts at-or-above rather than strictly-above.
+#
+# The documented, single-entry exception this overrides — for both the
+# "at least ~2x worst measured" and the "strictly below the fleet ceiling"
+# checks — lives in tests/scripts/test_module_verify_budgets.py::
+# RULED_INTERIM_BUDGET_EXCEPTIONS.
+#
+# BASIS FOR 7200: ~1.6x headroom over the ~4400s loaded extrapolation from
+# task 4176's contended run.
+#
+# WARM-ONLY REMEDY, DELIBERATELY — do not read the value below as covering a
+# cold verify. Per verify._resolve_verify_timeout's cascade an unset module
+# cold knob does NOT inherit the warm budget: a COLD verify of this module
+# falls through to the repo-root verify_cold_command_timeout_secs, and pays
+# verify_cold_preprovision_command (`uv sync --all-packages && npm ci ...`)
+# and unwarmed caches on top of the warm cost this number sizes.
+#
+# WHETHER THAT FALL-THROUGH IS ADEQUATE IS AN OPERATOR-TUNABLE QUESTION, and
+# the answer has already changed once. At the 5400s cold ceiling it was NOT:
+# 5400 is BELOW the 7200 declared here and only ~2% above the 5288s worst
+# observed green WARM run, on a path that is strictly costlier — so the
+# false-infra_timeout mode esc-4211-6 documents was LIVE ON THE COLD LANE.
+# Commit 36c4c71eb4 raised cold 5400 -> 10800, which clears both; under that
+# commit's own revert condition ("put these back to 3600/5400") the hazard
+# returns. NOT CLOSED HERE BY CHOICE, IN EITHER STATE — a cold budget is a
+# second number needing its own basis, and task 3353's scope D (the measured
+# distribution that refines this whole block) is where the cold lane belongs.
+# Assertion (f) of the guard named below pins the fall-through RELATION —
+# cold resolves to the repo-root cold ceiling, whatever the operator has set
+# it to, and never to this warm value — rather than either literal. It is
+# also the assertion to update if a cold budget is ever declared here.
+#
+# COUNT THE RETRIES — the wall clock a genuine hang costs is a MULTIPLE of
+# 7200, not 7200. config.verify_timeout_retries defaults to 2
+# (orchestrator/src/orchestrator/defaults.yaml; dark-factory-orchestrator.yaml
+# does not override it) and verify.py's attempt loop re-runs a PURE TIMEOUT
+# failure — it breaks only on `attempt.passed or not
+# attempt.pure_timeout_failure or retries >= max_retries`. So on the TASK path
+# a real hang here now burns up to 3 x 7200s = ~6 hours before it surfaces,
+# against ~3 hours at the old 3600s ceiling. That is the price of removing the
+# false timeouts, written down because an operator would act on it; the
+# MERGE-verify and background-sweep paths pass max_retries=0, so on those the
+# bound is a single 7200s. Full statement of this mechanism lives ONCE, in
+# shared/orchestrator.yaml paragraph (4a).
+#
+# GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[orchestrator].
+verify_command_timeout_secs: 7200

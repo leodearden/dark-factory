@@ -1165,6 +1165,19 @@ class _MultiTenantFalkorDriver(FalkorDriver):
         return cloned
 
 
+# The one copy of the ``uuid=`` contract that ``GraphitiBackend.add_episode``
+# carries to its caller — interpolated into BOTH failure messages that seam
+# emits (the content-discard warning and the translated not-found), and pointed
+# at, not restated, by that method's docstring. Verified against graphiti_core
+# 0.28.2, ``graphiti_core/graphiti.py::Graphiti.add_episode``.
+_UUID_MEANS_LOAD = (
+    "A non-None uuid= selects graphiti_core's LOAD branch "
+    '(EpisodicNode.get_by_uuid), so it can only name an episode that ALREADY '
+    'exists, never one to create under that id. To create a NEW episode pass '
+    'uuid=None and read the minted uuid off result.episode.uuid.'
+)
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -1480,26 +1493,70 @@ class GraphitiBackend:
         compose rather than overwrite. This is the only channel that reaches
         the persisted episode: the harm being labelled is the EDGES extracted
         from it, not the tool response.
+
+        ``uuid`` means LOAD, never create-with-this-id — the contract stated
+        once at ``graphiti_client.py::_UUID_MEANS_LOAD``, which is what both
+        failure messages below carry. See
+        ``services/memory_service.py::MemoryService._execute_graphiti_write``,
+        the only production caller, for why the minted identity is load-bearing.
+        A legitimate load-an-existing-episode call passes ``content=''``: any
+        non-empty ``content`` alongside a resolving ``uuid`` is discarded
+        upstream in favour of the stored episode body, and warns here.
+
+        Raises:
+            NodeNotFoundError: the module-local one, when a non-None ``uuid``
+                does not resolve. Chained from graphiti_core's own, whose
+                message names only the caller's own input.
         """
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
+        if uuid is not None and content:
+            logger.warning(
+                f'add_episode called with both uuid={uuid} and content in group '
+                f'{group_id}: the content will NOT be stored — the '
+                f'already-stored episode body wins. {_UUID_MEANS_LOAD}'
+            )
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
-        return await asyncio.wait_for(
-            client.add_episode(
-                name=name,
-                episode_body=content,
-                source=source,
-                group_id=group_id,
-                source_description=source_description,
-                reference_time=ref_time,
-                entity_types=entity_types,
-                uuid=uuid,
-            ),
-            timeout=self._write_timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                client.add_episode(
+                    name=name,
+                    episode_body=content,
+                    source=source,
+                    group_id=group_id,
+                    source_description=source_description,
+                    reference_time=ref_time,
+                    entity_types=entity_types,
+                    uuid=uuid,
+                ),
+                timeout=self._write_timeout,
+            )
+        except GraphitiCoreNodeNotFoundError as exc:
+            # Translate only a not-found provably about the caller's own uuid —
+            # graphiti_core raises the same class from entity/edge resolution
+            # after the episode loaded fine. The proof CONSTRUCTS the genuine
+            # upstream exception instead of parsing its text (the regex in
+            # durable_queue.py::_parse_not_found_uuid exists only because that
+            # module refuses to import graphiti_core; this one already does), so
+            # an upstream reword fails open rather than mislabelling.
+            #
+            # The replacement message deliberately does not match
+            # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
+            # it would fall open to ordinary retry rather than task 3586's
+            # ('permanent', 1) rule — moot today, since post-3561 an add_episode
+            # payload cannot carry a uuid at all. Enforced, not merely claimed:
+            # tests/test_graphiti_add_episode_uuid_param.py::
+            # test_the_translated_message_stays_retryable_for_the_durable_queue
+            # feeds this message through durable_queue's real parser.
+            if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
+                raise
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {uuid} — '
+                f'{_UUID_MEANS_LOAD}'
+            ) from exc
 
     @_canonicalize_group_args
     async def search(

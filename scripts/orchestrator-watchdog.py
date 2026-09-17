@@ -187,6 +187,17 @@ try:
 except (KeyError, ValueError):
     ORCH_RESTART_MIN_INTERVAL_SECS = 28800
 
+# Provenance recorded in every clock this script stamps (task 4823). These
+# MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
+# ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
+# df_pytest_isolation.py::deploy_clock_change_report reads and is the one place
+# that explains what they are for. They cannot be imported: this script is
+# stdlib-only and imports no first-party package (the same constraint that
+# forced the four-way FLEET_DEPLOY_CLOCK_RELPATH mirror below). Both mirrors are
+# pinned together by tests/scripts/test_orchestrator_watchdog.py.
+CLOCK_SOURCE = "orchestrator-watchdog.py"
+PYTEST_SESSION_TOKEN_ENV = "DF_PYTEST_SESSION_TOKEN"
+
 # Path to the shared fleet-deploy clock file: the SAME file
 # restart-all-orchestrators.sh stamps (atomically, only on its verified-fresh
 # exit-0 path) and the orchestrator's own StaleServiceRestartCoordinator
@@ -1052,10 +1063,12 @@ def _read_clock_epoch(path: str, label: str) -> float | None:
     The shared CLOCK-layer read primitive, one level above _read_json_state
     (which owns the missing/corrupt/non-object branches) — extracted so the
     three watchdog clocks cannot drift apart in their fail-open contracts.
-    All three write and read the same ``{ts, iso}`` schema that
-    restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
+    All three write and read the same ``{ts, iso, source, pytest_session}``
+    schema that restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
     ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
-    single ``float(ts)`` extraction serves every tier.
+    single ``float(ts)`` extraction serves every tier. The two provenance keys
+    (task 4823) are read ONLY by the pytest-side deploy-clock guard; nothing
+    here extracts them, and a reader added later should not start.
 
     *label* names the clock in the log line only ("fleet-deploy clock",
     "fm-deploy clock", ...) so a journal reader can tell WHICH clock
@@ -1079,19 +1092,42 @@ def _read_clock_epoch(path: str, label: str) -> float | None:
 
 
 def _stamp_clock(path: str) -> bool:
-    """Atomically stamp *path* with the current ``{ts, iso}`` time; True iff it landed.
+    """Atomically stamp *path* with the current time and provenance; True iff it landed.
 
     The shared CLOCK-layer write primitive paired with _read_clock_epoch.
     Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock,
     emitting the identical schema: an integer epoch plus a human-readable UTC
     rendering that exists purely so an operator reading the file by hand does
-    not have to decode a bare number.
+    not have to decode a bare number, plus the two provenance keys below.
+
+    SCHEMA {ts, iso, source, pytest_session} (task 4823; ts/iso predate it).
+    The two provenance keys are ADDITIVE and inert to every reader — all three
+    extract `ts` and nothing else — and what they are FOR is stated once, in
+    df_pytest_isolation.py::deploy_clock_change_report. The one contract this
+    writer must hold on its own: `pytest_session` is ALWAYS present, empty
+    included, because empty is the positive statement "no pytest session was an
+    ancestor of this write" whereas an omitted key is indistinguishable from a
+    pre-4823 writer and fails the run.
+
+    NO SANITISER HERE, unlike the bash sibling, and the asymmetry is deliberate
+    rather than an oversight: _atomic_write_json serialises through json.dumps,
+    which escapes any value correctly. stamp_fleet_deploy_clock builds its body
+    with printf, which cannot escape JSON at all, so it must strip the token
+    first (falling back to a non-empty sentinel, since stripping to "" would
+    forge the one value that forgives a change) or risk emitting a corrupt clock
+    — and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
+    very cap the stamp arms.
 
     Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
     error is logged and swallowed rather than raised, and reported back as
     False. Callers whose SAFETY depends on the stamp landing (rather than
     merely their convenience) must inspect that value and say so at their own
     call site — see _stamp_fm_liveness_restart_clock.
+
+    All three clocks this serves (fleet-adjacent, fm deploy, fm liveness
+    restart) get the fields uniformly. The liveness clock is not one of the
+    guarded paths, but a schema that diverged between siblings is exactly the
+    drift these mirrors exist to prevent.
     """
     now = time.time()
     return _atomic_write_json(
@@ -1099,6 +1135,8 @@ def _stamp_clock(path: str) -> bool:
         {
             "ts": int(now),
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+            "source": CLOCK_SOURCE,
+            "pytest_session": os.environ.get(PYTEST_SESSION_TOKEN_ENV, ""),
         },
     )
 
@@ -1209,10 +1247,11 @@ def _within_fleet_staleness_head_start() -> bool:
 def _read_last_fm_deploy_epoch() -> float | None:
     """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
 
-    fm sibling of _read_last_fleet_deploy_epoch: reads the same ``{ts, iso}``
-    JSON schema _stamp_fm_deploy_clock writes (which itself mirrors
-    restart-all-orchestrators.sh's stamp_fleet_deploy_clock), so ``float(ts)``
-    reads it identically.
+    fm sibling of _read_last_fleet_deploy_epoch: reads the same
+    ``{ts, iso, source, pytest_session}`` JSON schema _stamp_fm_deploy_clock
+    writes (which itself mirrors restart-all-orchestrators.sh's
+    stamp_fleet_deploy_clock), so ``float(ts)`` reads it identically — the
+    provenance keys are inert here.
 
     Fail-open via _read_clock_epoch: returns None (never raises) when the file
     is missing (no fm deploy has ever verified fresh, or a fresh checkout with
@@ -1290,7 +1329,7 @@ def _within_fm_staleness_head_start() -> bool:
 
 
 def _stamp_fm_deploy_clock() -> None:
-    """Atomically stamp FM_DEPLOY_CLOCK_PATH with the current ``{ts, iso}`` time.
+    """Atomically stamp FM_DEPLOY_CLOCK_PATH with the current ``{ts, iso, ...}`` stamp.
 
     Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock
     (mkdir -p, mktemp a sibling, write, atomic rename). Needed because
@@ -1308,9 +1347,9 @@ def _stamp_fm_deploy_clock() -> None:
     secondary flap-guard.
 
     Thin wrapper over the shared _stamp_clock helper (task 3764), which owns
-    the ``{ts, iso}`` payload schema and the atomic-write dance. Reads
-    FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
-    monkeypatch the module global still work.
+    the ``{ts, iso, source, pytest_session}`` payload schema and the
+    atomic-write dance. Reads FM_DEPLOY_CLOCK_PATH at CALL time, not at def
+    time, so tests that monkeypatch the module global still work.
     """
     _stamp_clock(FM_DEPLOY_CLOCK_PATH)
 

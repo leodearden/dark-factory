@@ -5578,6 +5578,19 @@ async def run_bake_off(
     # because `resolve_guard_threshold` navigates the SERVICE to find the
     # threshold production would really run at, and hard-coding or defaulting
     # that number is what its docstring exists to forbid.
+
+    # Resolved HERE, before the first acquisition below — never in the `with`
+    # header further down.  `load_cleanup_script()` can raise
+    # (`_load_sibling_script` raises `FixtureError` when the spec cannot be
+    # built), and evaluated there it would sit after `mkdtemp` and after
+    # `MemoryService(...)` but before the `try` — the one window in which a
+    # raise leaks the queue directory and skips `close()` on a half-built
+    # service.  That it is unreachable today (the `ephemeral_collection_prefix`
+    # call above has already cached the module) is an accident of ordering
+    # rather than a property, and reordering those two lines would restore the
+    # leak silently.
+    reaper = load_cleanup_script()
+
     queue_dir = tempfile.mkdtemp(prefix='e2-bakeoff-queue-')
     config.queue.data_dir = queue_dir
 
@@ -5599,98 +5612,116 @@ async def run_bake_off(
     records_by_shape: dict[str, list[ArmRecord]] = {}
     baseline: dict[str, dict[str, Any]] = {}
     after_by_mode: dict[str, dict[str, dict[str, Any]]] = {}
-    try:
-        drop_collections(collections.values(), qdrant_url=qdrant_url)
-        await memory.initialize()
-        guard_threshold = resolve_guard_threshold(memory)
-        base_records: list[ArmRecord] = []
-        for shape in ARM_SHAPES:
-            records = materialize_arm(shape, clusters, claims, topics, distractors)
-            seeded = _index_arm(
-                shape,
-                arm_project_id(shape, suffix=project_suffix),
-                collections[shape],
-                records,
-                claims,
-            )
-            await seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
-            # Fetched HERE rather than inside `run_arm` only when the cache is
-            # being written, so the unflagged path is byte-for-byte the run it
-            # always was.  The rankings handed to `run_arm` are the same
-            # objects that get dumped, so the cache cannot describe a fetch
-            # that differs from the one measured.
-            #
-            # The probe additionally captures the RATIFIED arm's fetches,
-            # because they ARE its baseline: `measure_arm` is pure over
-            # `(SeededArm, fetched)`, so the un-injected side is scored from
-            # the very rankings the decision table above is built from — and
-            # the three read arms over it are scored from one seeding, which
-            # is what makes an arm-vs-arm comparison seeding-free.  The
-            # `after` side below is a separate collection, so a
-            # baseline-vs-after delta is not; the `flat` stamping row is the
-            # noise floor that bounds it (see `_reseeding_control_phrase`).
-            capture = dump_fetches_to is not None or (
-                probe_regrowth and shape == REGROWTH_SHAPE
-            )
-            fetched: dict[str, dict[str, list[ScoredHit]]] | None = None
-            if capture:
-                fetched = await fetch_arm(
-                    memory.mem0, seeded, queries, probes, limit=limit,
+    # The lease that stops `scripts/cleanup_test_collections.py` — a 6-hourly
+    # cron job — deleting this run's collections between its seed and measure
+    # phases.  Every name below starts with `E2_BAKEOFF_PREFIX`, which that
+    # sweep reaps unconditionally.
+    #
+    # OUTSIDE the try, deliberately: the lease has to be live before the
+    # pre-run `drop_collections` creates anything, and stay live until the
+    # teardown in the `finally` has finished dropping.
+    #
+    # Reached through `load_cleanup_script()` (resolved above), never by
+    # re-deriving a path, for the reason `ephemeral_collection_prefix` (:3747)
+    # already gives: the guard and the sweep it guards must move together
+    # under a rename.
+    #
+    # This also covers the `__main__` CLI path, where no pytest conftest
+    # exists to take a lease on the run's behalf — and that is how a bake-off
+    # is usually driven.
+    with reaper.hold_lease(owner=f'bake_off_storage_shape {worker_suffix()}'):
+        try:
+            drop_collections(collections.values(), qdrant_url=qdrant_url)
+            await memory.initialize()
+            guard_threshold = resolve_guard_threshold(memory)
+            base_records: list[ArmRecord] = []
+            for shape in ARM_SHAPES:
+                records = materialize_arm(shape, clusters, claims, topics, distractors)
+                seeded = _index_arm(
+                    shape,
+                    arm_project_id(shape, suffix=project_suffix),
+                    collections[shape],
+                    records,
+                    claims,
                 )
-                fetched_by_shape[shape] = fetched
-                records_by_shape[shape] = records
-            arms.update(await run_arm(
-                memory.mem0, seeded, queries=queries, probes=probes,
-                limit=limit, estimator=estimator,
-                guard_threshold=guard_threshold, fetched=fetched,
-            ))
-            if probe_regrowth and shape == REGROWTH_SHAPE:
-                base_records = records
-                # Read back through `fetched_by_shape` rather than the local
-                # `fetched`: `capture` is true whenever this branch is, so the
-                # two name the SAME object, but the dict's value type is
-                # non-optional.  A broken invariant then surfaces as a
-                # KeyError here instead of measuring against a silent `None`.
-                baseline = _plucked_regrowth_arms(measure_regrowth_arms(
-                    seeded, fetched_by_shape[shape], queries=queries, probes=probes,
+                await seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+                # Fetched HERE rather than inside `run_arm` only when the cache is
+                # being written, so the unflagged path is byte-for-byte the run it
+                # always was.  The rankings handed to `run_arm` are the same
+                # objects that get dumped, so the cache cannot describe a fetch
+                # that differs from the one measured.
+                #
+                # The probe additionally captures the RATIFIED arm's fetches,
+                # because they ARE its baseline: `measure_arm` is pure over
+                # `(SeededArm, fetched)`, so the un-injected side is scored from
+                # the very rankings the decision table above is built from — and
+                # the three read arms over it are scored from one seeding, which
+                # is what makes an arm-vs-arm comparison seeding-free.  The
+                # `after` side below is a separate collection, so a
+                # baseline-vs-after delta is not; the `flat` stamping row is the
+                # noise floor that bounds it (see `_reseeding_control_phrase`).
+                capture = dump_fetches_to is not None or (
+                    probe_regrowth and shape == REGROWTH_SHAPE
+                )
+                fetched: dict[str, dict[str, list[ScoredHit]]] | None = None
+                if capture:
+                    fetched = await fetch_arm(
+                        memory.mem0, seeded, queries, probes, limit=limit,
+                    )
+                    fetched_by_shape[shape] = fetched
+                    records_by_shape[shape] = records
+                arms.update(await run_arm(
+                    memory.mem0, seeded, queries=queries, probes=probes,
+                    limit=limit, estimator=estimator,
+                    guard_threshold=guard_threshold, fetched=fetched,
+                ))
+                if probe_regrowth and shape == REGROWTH_SHAPE:
+                    base_records = records
+                    # Read back through `fetched_by_shape` rather than the local
+                    # `fetched`: `capture` is true whenever this branch is, so the
+                    # two name the SAME object, but the dict's value type is
+                    # non-optional.  A broken invariant then surfaces as a
+                    # KeyError here instead of measuring against a silent `None`.
+                    baseline = _plucked_regrowth_arms(measure_regrowth_arms(
+                        seeded, fetched_by_shape[shape], queries=queries, probes=probes,
+                        estimator=estimator, guard_threshold=guard_threshold,
+                        limit=limit,
+                    ))
+
+            # The two injected passes, INSIDE the try so the `finally` below
+            # still reaps their collections when one of them raises mid-seed.
+            for mode in REGROWTH_MODES if probe_regrowth else ():
+                key = regrowth_pass_key(mode)
+                injected = regrowth_corpus(
+                    base_records, injections, claims, clusters, mode=mode,
+                )
+                # `shape` stays REGROWTH_SHAPE, never the pass key: the pass key
+                # names the collection and the cache slot, and `read_path`
+                # branches on `seeded.shape`.  Passing the key here would silently
+                # take the grouped-read branch out of play for a corpus that is
+                # still the ratified flat one.
+                seeded_pass = _index_arm(
+                    REGROWTH_SHAPE,
+                    arm_project_id(key, suffix=project_suffix),
+                    collections[key],
+                    injected,
+                    claims,
+                )
+                await seed_arm(memory.mem0, seeded_pass, concurrency=seed_concurrency)
+                injected_fetched = await fetch_arm(
+                    memory.mem0, seeded_pass, queries, probes, limit=limit,
+                )
+                fetched_by_shape[key] = injected_fetched
+                records_by_shape[key] = injected
+                after_by_mode[mode] = _plucked_regrowth_arms(measure_regrowth_arms(
+                    seeded_pass, injected_fetched, queries=queries, probes=probes,
                     estimator=estimator, guard_threshold=guard_threshold,
                     limit=limit,
                 ))
-
-        # The two injected passes, INSIDE the try so the `finally` below
-        # still reaps their collections when one of them raises mid-seed.
-        for mode in REGROWTH_MODES if probe_regrowth else ():
-            key = regrowth_pass_key(mode)
-            injected = regrowth_corpus(
-                base_records, injections, claims, clusters, mode=mode,
-            )
-            # `shape` stays REGROWTH_SHAPE, never the pass key: the pass key
-            # names the collection and the cache slot, and `read_path`
-            # branches on `seeded.shape`.  Passing the key here would silently
-            # take the grouped-read branch out of play for a corpus that is
-            # still the ratified flat one.
-            seeded_pass = _index_arm(
-                REGROWTH_SHAPE,
-                arm_project_id(key, suffix=project_suffix),
-                collections[key],
-                injected,
-                claims,
-            )
-            await seed_arm(memory.mem0, seeded_pass, concurrency=seed_concurrency)
-            injected_fetched = await fetch_arm(
-                memory.mem0, seeded_pass, queries, probes, limit=limit,
-            )
-            fetched_by_shape[key] = injected_fetched
-            records_by_shape[key] = injected
-            after_by_mode[mode] = _plucked_regrowth_arms(measure_regrowth_arms(
-                seeded_pass, injected_fetched, queries=queries, probes=probes,
-                estimator=estimator, guard_threshold=guard_threshold,
-                limit=limit,
-            ))
-    finally:
-        await memory.close()
-        drop_collections(collections.values(), qdrant_url=qdrant_url)
-        shutil.rmtree(queue_dir, ignore_errors=True)
+        finally:
+            await memory.close()
+            drop_collections(collections.values(), qdrant_url=qdrant_url)
+            shutil.rmtree(queue_dir, ignore_errors=True)
 
     # Pure, and computed before the dump so the cache's fixture list and the
     # protocol block's are decided by the same value.

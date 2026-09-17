@@ -479,8 +479,8 @@ _RESET_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
 # convention so the sentinel is self-documenting in logs, and is chosen
 # distinct from every other rc _seed_warm_lane's docstring documents (0
-# success, 75 disk-pressure, 127 absent-script/exception sentinel; any other
-# value is a generic script fault). A genuine seed-warm-lane.sh exit code of
+# success, 75 disk-pressure, 77 lane-lock refusal, 127 absent-script/exception
+# sentinel; any other value is a generic script fault). A genuine seed-warm-lane.sh exit code of
 # 124 would be misattributed to a lock-wait timeout, but no script
 # convention in this codebase uses 124 for anything else.
 _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
@@ -490,6 +490,13 @@ _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 # against that lock (flock is not re-entrant across a process tree).  See
 # :meth:`GitOps._seed_warm_lane` for why this is load-bearing (reify 5556).
 _SEED_ASSUME_LANE_LOCK_HELD_FLAG = '--assume-lane-lock-held'
+
+# The seed-warm-lane.sh opt-in flag under which BOTH of the script's lane-lock
+# refusal arms — the ``flock -n`` immediate refusal and the ``flock -w`` queue
+# timeout — exit 77 with a ``LANE_LOCK_CONTENDED:`` stderr marker instead of the
+# shared 75.  Passed UNGATED by ``take_lane_lock``; see
+# :meth:`GitOps._seed_warm_lane` for why.
+_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG = '--distinct-lock-refusal-rc'
 
 
 # ── warm-lane script resolution (task 3072, PRD leaf α) ───────────────────────
@@ -539,34 +546,81 @@ def _df_warm_lane_script_dir() -> Path:
     return _DF_WARM_LANE_SCRIPT_DIR
 
 
+# ── seed-script capability probing ───────────────────────────────────────────
+#
+# Both optional flags below are read from the LANE's OWN checked-out copy of
+# seed-warm-lane.sh, so availability varies per lane: a lane on an older base
+# predates the flag and would reject it as a usage error (exit 2), converting a
+# working seed into a hard fault.  A text probe is the cheapest reliable
+# capability check — a supported flag's string appears in that version's arg
+# parser, an unsupported one's nowhere.
+
+
 @functools.lru_cache(maxsize=256)
-def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
-    """Does this lane's ``seed-warm-lane.sh`` accept ``--assume-lane-lock-held``?
+def _seed_script_text(script: Path, mtime_ns: int, size: int) -> str:
+    """Cached read of a lane seed script, keyed on its on-disk IDENTITY.
 
-    The seed script is read from the LANE's own checkout, so its vintage varies
-    per lane: a lane sitting on a pre-reify-5354 base predates the flag and
-    would reject it as a usage error (exit 2), converting a working seed into a
-    hard fault.  Probing the script text is the cheapest reliable capability
-    check — the flag string appears in the arg parser of every version that
-    supports it, and in none that don't.
+    ``mtime_ns`` / ``size`` are unused in the body — they are cache-key
+    components supplied by :func:`_seed_script_supports` so a script REPLACED
+    at the same path invalidates the entry instead of serving the previous
+    vintage's answer.  ``acquire_warm_lane``'s create-once route re-adds
+    ``_lane-N`` at a fixed path and a reseed rewrites the checkout in place, so
+    one path can hold scripts of different vintages.
 
-    Fails CLOSED (``False``) on any read error: omitting the flag restores the
-    pre-5354 behaviour, in which the script never takes the lane lock itself,
-    so a false negative is never worse than not having this fix at all.
+    Keying on the path alone would allow a stale TRUE, which is NOT
+    safe-by-degradation: the flag would reach a parser that rejects it, the
+    script would exit 2, and :func:`_seed_rc_to_unavailable` maps that to
+    ``FAULT`` — blocked + L1, strictly WORSE than the rc-75 fallback a stale
+    FALSE gives.
 
-    Cached per resolved path — lane scripts change only on reseed, and a wrong
-    cached answer degrades to the same safe fallback.
+    Returns ``''`` — "advertises no optional flag" — on any read error, the
+    fail-CLOSED answer for every caller.
     """
+    del mtime_ns, size  # cache-key components only; see docstring
     try:
-        return _SEED_ASSUME_LANE_LOCK_HELD_FLAG in script.read_text(
-            encoding='utf-8', errors='replace',
-        )
+        return script.read_text(encoding='utf-8', errors='replace')
     except OSError:
         logger.debug(
-            '_seed_script_supports_assume_lane_lock_held: unreadable %s — '
-            'assuming unsupported', script, exc_info=True,
+            '_seed_script_text: unreadable %s — treating it as advertising '
+            'no optional flags', script, exc_info=True,
+        )
+        return ''
+
+
+def _seed_script_supports(script: Path, flag: str) -> bool:
+    """Does this lane's ``seed-warm-lane.sh`` accept ``flag``?
+
+    Fails CLOSED (``False``) on any stat/read error, and omitting either flag
+    is a safe degradation:
+
+    * ``--assume-lane-lock-held`` omitted means the script never takes the lane
+      lock itself.
+    * ``--distinct-lock-refusal-rc`` omitted means a lane-lock refusal exits 75
+      and surfaces as :attr:`WarmLaneUnavailable.DISK_PRESSURE`.
+
+    The ``stat`` is what makes the shared :func:`_seed_script_text` cache
+    self-invalidating on a same-path script swap — see there for why a stale
+    TRUE would not be a safe degradation.
+    """
+    try:
+        st = script.stat()
+    except OSError:
+        logger.debug(
+            '_seed_script_supports(%s): cannot stat %s — assuming unsupported',
+            flag, script, exc_info=True,
         )
         return False
+    return flag in _seed_script_text(script, st.st_mtime_ns, st.st_size)
+
+
+def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
+    """Named probe for ``--assume-lane-lock-held`` (see :func:`_seed_script_supports`)."""
+    return _seed_script_supports(script, _SEED_ASSUME_LANE_LOCK_HELD_FLAG)
+
+
+def _seed_script_supports_distinct_lock_refusal_rc(script: Path) -> bool:
+    """Named probe for ``--distinct-lock-refusal-rc`` (see :func:`_seed_script_supports`)."""
+    return _seed_script_supports(script, _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
 
 
 # Short window (seconds) over which the θ soft-floor defer path memoizes the
@@ -927,6 +981,9 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+      Caveat: on a lane whose seed script lacks
+      ``--distinct-lock-refusal-rc`` this ALSO covers a lane-lock refusal,
+      which exits 75 there too; see :func:`_seed_rc_to_unavailable`.
     * ``SOFT_PRESSURE`` — θ proactive soft-floor throttle (task 2443, §9.5):
       the reify ε script's ``check --soft`` reported soft pressure (rc=3,
       above the hard floor but below the soft one) for a FRESH allocation
@@ -951,6 +1008,12 @@ class WarmLaneUnavailable(Enum):
       reseed-consistency defect — :meth:`create_worktree` maps it to
       :class:`WarmLaneReseedContaminated` so the task requeues to re-acquire a
       DIFFERENT lane rather than dispatch onto the stale tree (task 2854).
+    * ``LANE_LOCK_CONTENDED`` — seed exited 77: another live consumer holds
+      ``<lane_dir>.lock``, so seed refused rather than seeding.  Explicitly NOT
+      disk pressure — seed has no disk-pressure exit-75 path at all.  Transient
+      shared-resource contention — requeue
+      (:class:`WarmLaneLockContention`), never a per-task fault.  Contract:
+      :func:`_seed_rc_to_unavailable`.
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -969,6 +1032,7 @@ class WarmLaneUnavailable(Enum):
     SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
     RESEED_CONTAMINATED = 'reseed_contaminated'
+    LANE_LOCK_CONTENDED = 'lane_lock_contended'
     DISABLED = 'disabled'
 
 
@@ -976,20 +1040,38 @@ def _seed_rc_to_unavailable(rc: int) -> WarmLaneUnavailable:
     """Discriminate a seed-warm-lane.sh exit code into a WarmLaneUnavailable.
 
     Shared by every seed-rc call site in :meth:`GitOps.acquire_warm_lane` so
-    the 75/76/other mapping lives in exactly one place.
+    the 75/76/77/other mapping lives in exactly one place.
 
     * ``75`` (EX_TEMPFAIL) → ``DISK_PRESSURE`` — transient disk pressure.
     * ``76`` → ``BASE_ABSENT`` — reify contract for "CoW base missing".
       **DORMANT**: no shipped seed-warm-lane.sh emits 76 today: this branch
       is inert until a future reify version adopts the exit-76 convention. It
       is harmless meanwhile (no script exits 76, so it is simply never hit).
+    * ``77`` → ``LANE_LOCK_CONTENDED`` — a lane-lock REFUSAL: another live
+      consumer holds ``<lane_dir>.lock``.  Emitted by both of
+      ``reify/scripts/seed-warm-lane.sh``'s refusal arms (``flock -n``
+      immediate refusal, ``flock -w`` queue timeout), each carrying a
+      ``LANE_LOCK_CONTENDED:`` stderr marker, but ONLY when DF passes the
+      opt-in ``--distinct-lock-refusal-rc`` flag; the per-lane capability probe
+      :func:`_seed_script_supports_distinct_lock_refusal_rc` decides whether to
+      pass it, and fails CLOSED.
     * anything else (including ``127``, the absent-script / unexpected-
       exception sentinel) → ``FAULT`` — generic infra fault.
+
+    75 deliberately KEEPS its DISK_PRESSURE meaning for two independent
+    reasons.  (1) A lane whose script lacks the flag still exits 75 for a lock
+    refusal, so narrowing 75 would change behaviour for exactly the lanes that
+    cannot signal 77.  (2) DF has a genuine exit-75 producer that is not seed at
+    all — the ε pre-acquire disk-guard path in
+    :meth:`GitOps.acquire_warm_lane`.  Disambiguation is therefore purely
+    additive: only the opt-in 77, never a re-reading of 75.
     """
     if rc == 75:
         return WarmLaneUnavailable.DISK_PRESSURE
     if rc == 76:
         return WarmLaneUnavailable.BASE_ABSENT
+    if rc == 77:
+        return WarmLaneUnavailable.LANE_LOCK_CONTENDED
     return WarmLaneUnavailable.FAULT
 
 
@@ -1476,6 +1558,10 @@ class WarmLaneRequeue(Exception):
         WarmLaneReseedContaminated — fresh reseed failed verification: the
             lane still carries a prior occupant's commits (task 2854,
             data-integrity); requeue to re-acquire a DIFFERENT lane.
+        WarmLaneLockContention — seed refused because another live consumer
+            holds <lane_dir>.lock (seed exit 77); transient
+            shared-resource contention, deliberately distinct from
+            WarmLaneDiskPressure.
     """
 
 
@@ -1566,6 +1652,28 @@ class WarmLaneReseedContaminated(WarmLaneRequeue):
     ``counts_against_requeue_cap=True`` so a persistent/pathological
     contamination eventually trips the requeue-cap escalation — a loud human
     signal — instead of requeuing forever silently.
+    """
+
+
+class WarmLaneLockContention(WarmLaneRequeue):
+    """Seed exited 77 — it REFUSED because another live consumer holds
+    ``<lane_dir>.lock``.
+
+    See :func:`_seed_rc_to_unavailable` for the rc-77 contract and
+    :data:`_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG` for the opt-in flag that makes
+    it reachable; on a lane whose script lacks that flag the refusal still
+    exits 75 and still surfaces as :class:`WarmLaneDiskPressure`.  Distinct
+    from that class deliberately: the requeue routing matches, the
+    operator-facing signal must not.
+
+    Transient SHARED-RESOURCE contention and never a fault of this task, so it
+    requeues via the :class:`WarmLaneRequeue` base handler and its
+    disposition-table row sets ``counts_against_requeue_cap=False`` — the
+    :class:`WarmLaneDiskPressure` / :class:`WarmLanePoolHardDown` /
+    :class:`WarmLaneSoftPressure` shape, deliberately NOT
+    :class:`WarmLaneReseedContaminated`'s ``True`` (that is a per-task
+    data-integrity fault; burning this task's requeue cap for someone else's
+    lock hold would punish the wrong party).
     """
 
 
@@ -2999,7 +3107,28 @@ class GitOps:
                         seed_rc = await self._seed_warm_lane(
                             tmp_path, '--fresh-checkout', take_lane_lock=False,
                         )
-                        if seed_rc != 0:
+                        _seed_self_refused = seed_rc != 0 and (
+                            _seed_rc_to_unavailable(seed_rc)
+                            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                        )
+                        if _seed_self_refused:
+                            # --assume-lane-lock-held is gated on
+                            # take_lane_lock, so this take_lane_lock=False
+                            # caller never sends it and a self-locking seed
+                            # script refuses against OUR OWN lock every time
+                            # (flock is not re-entrant across a process tree,
+                            # so the "other live consumer" is this process).
+                            # rc 77 makes that legible; it does not prevent it.
+                            logger.info(
+                                'ephemeral_worktree(%s): warm seed SELF-refused '
+                                'on %s.lock (rc=%d, lane-lock contention) — this '
+                                'CM holds that lock itself and cannot assert it '
+                                'to seed, so the seed is a no-op against a '
+                                'self-locking script; proceeding COLD '
+                                '(fail-soft)',
+                                kind.name, tmp_path, seed_rc,
+                            )
+                        elif seed_rc != 0:
                             logger.info(
                                 'ephemeral_worktree(%s): warm seed failed (rc=%d) '
                                 'for %s — proceeding COLD (fail-soft)',
@@ -4216,6 +4345,16 @@ class GitOps:
                     f"(lane retained a prior occupant's commits beyond base); "
                     f'requeue to re-acquire a different lane (task 2854)'
                 )
+            if pool_info is WarmLaneUnavailable.LANE_LOCK_CONTENDED:
+                # Seed exited 77 — another live consumer holds <lane_dir>.lock.
+                # Transient shared-resource contention: requeue
+                # (WarmLaneRequeue), and say so.  The message deliberately
+                # never mentions disk pressure; see WarmLaneLockContention.
+                raise WarmLaneLockContention(
+                    f'warm-lane seed refused: lane lock contention for branch '
+                    f'{branch_name!r} (another consumer holds the lane lock); '
+                    f'requeue (task 4211)'
+                )
             # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
             # DISABLED is a programming error (caller bypassed the pool-enabled
             # guard); it is treated as a fault here so blocked+L1 surfaces the
@@ -4972,6 +5111,12 @@ class GitOps:
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
             75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
+                  On a lane script that lacks the flag below this ALSO covers a
+                  lane-lock refusal — see 77.
+            77  — script exited 77: a lane-lock REFUSAL, i.e. another live
+                  consumer holds <lane_dir>.lock.  Reached only when
+                  _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG was passed (decided per
+                  lane, fails CLOSED).
             124 — outer <lane_dir>.lock wait timed out after
                   _SEED_WARM_LANE_LOCK_WAIT_SECS — a live-but-wedged lock
                   holder; the script itself never ran (task 2599 amendment).
@@ -4980,9 +5125,12 @@ class GitOps:
             127 — any unexpected exception (non-zero sentinel, never raises).
 
         Callers must use ``rc == 0`` for success and may inspect the exact
-        code to discriminate disk-pressure (75) or a lock-wait timeout (124,
-        see ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) from a generic fault (any
-        other non-zero).
+        code to discriminate disk-pressure (75), a lane-lock refusal by the
+        script (77), or a lock-wait timeout on OUR outer lock (124, see
+        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) from a generic fault (any other
+        non-zero).  77 and 124 are both contention on ``<lane_dir>.lock`` but
+        from opposite sides: 77 is the SCRIPT refusing, 124 is THIS method
+        timing out waiting.
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
@@ -5014,13 +5162,15 @@ class GitOps:
             # 7b20d010c6 (task 5354) — previously opt-in via --lane-lock — and
             # flock is not re-entrant across a process tree, so the script's
             # own flock -n self-refuses against this method's lock and exits
-            # 75. That 75 is indistinguishable from genuine disk pressure at
-            # _classify_seed_rc, so every dispatch requeued as
+            # 75. That 75 WAS indistinguishable from genuine disk pressure at
+            # _seed_rc_to_unavailable, so every dispatch requeued as
             # WarmLaneDiskPressure with agent_invocations=0, released the lane,
             # and re-picked the same lowest-index free lane: a fleet-wide
             # dispatch livelock (349 requeues / 4 completions per day).
-            # --assume-lane-lock-held (reify db9ea9387b, same task) is the
-            # sanctioned opt-out for exactly this caller shape.
+            # (A lane whose script supports the flag appended just below
+            # reports that refusal as 77 instead — legible, but still a
+            # refusal.)  --assume-lane-lock-held is the sanctioned opt-out for
+            # exactly this caller shape.
             #
             # Capability-probed rather than passed blind: `script` is the LANE's
             # own checked-out copy, so a lane sitting on a pre-5354 base would
@@ -5030,6 +5180,21 @@ class GitOps:
             seed_flags: list[str] = []
             if take_lane_lock and _seed_script_supports_assume_lane_lock_held(script):
                 seed_flags.append(_SEED_ASSUME_LANE_LOCK_HELD_FLAG)
+            # Opt in to the distinct lane-lock refusal code so a refusal
+            # arrives as 77 instead of 75 (see
+            # _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG).  Capability-probed for the
+            # same per-lane-vintage reason as the flag above, failing CLOSED to
+            # today's rc-75 behaviour.
+            #
+            # Deliberately NOT gated on take_lane_lock, unlike the flag above:
+            # that one matters only when WE hold the outer lock, whereas the
+            # refusal arms this one names are reachable precisely in the
+            # take_lane_lock=False shape (the ephemeral_worktree CM, which locks
+            # for itself).  Gating it would make it inert in the cases it exists
+            # for; passing it always is safe because the script accepts it as
+            # inert wherever no refusal is reachable, never as a usage error.
+            if _seed_script_supports_distinct_lock_refusal_rc(script):
+                seed_flags.append(_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
@@ -5072,6 +5237,19 @@ class GitOps:
                     'another seed) is still live; failing closed rather '
                     'than risk a torn target/ (rc=%d)',
                     _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock, rc,
+                )
+            elif rc == 77:
+                # Its own branch, beside the 124 outer-lock-timeout branch
+                # above, so the journal names the condition and the contended
+                # path.  CONSTRAINT: this line must never carry the words "disk
+                # pressure", not even to negate them — operators triage the
+                # conflated signal by grepping that phrase, and a line carrying
+                # it would come back as a hit despite being the NOT-disk case.
+                logger.warning(
+                    '_seed_warm_lane: seed refused for %s — lane lock %s is '
+                    'held by another live consumer (rc=77, lane-lock '
+                    'contention); requeue (stderr=%r)',
+                    lane_dir, lane_lock_path(lane_dir), err,
                 )
             elif rc != 0:
                 logger.warning(
@@ -7061,10 +7239,22 @@ class GitOps:
                     # NOT the shared create tail at the bottom of this method.
                     _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                     if _co_seed_rc != 0:
+                        _co_unavail = _seed_rc_to_unavailable(_co_seed_rc)
+                        _co_contended = (
+                            _co_unavail is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                        )
                         if _co_seed_rc == 127:
                             logger.warning(
                                 'acquire_warm_lane: create-once reattach seed script '
                                 'absent for lane %s (rc=127)', lane,
+                            )
+                        elif _co_contended:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed refused '
+                                'for lane %s (rc=%d, lane-lock contention) — '
+                                'RETAINING the worktree; removing it would race the '
+                                'live lock holder',
+                                lane, _co_seed_rc,
                             )
                         else:
                             logger.warning(
@@ -7073,9 +7263,9 @@ class GitOps:
                                 _co_seed_rc, lane,
                             )
                         await self._abort_lane_acquisition(
-                            lane, branch_name, remove_worktree=True,
+                            lane, branch_name, remove_worktree=not _co_contended,
                         )
-                        return _seed_rc_to_unavailable(_co_seed_rc)
+                        return _co_unavail
                     info = await self._reuse_warm_lane(lane, full_branch)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
@@ -7104,6 +7294,19 @@ class GitOps:
                     # producing one BLOCKED+L1 escalation per dispatched task.
                     # Operators should check that seed-warm-lane.sh is present
                     # and executable in the lane's checked-out scripts/ directory.
+                    #
+                    # ONE exception to "remove the worktree": on a lane-lock
+                    # refusal (rc 77) the removal would race the live lock
+                    # holder, and is unnecessary anyway because seed refused
+                    # BEFORE touching the lane.  Retaining it leaves the lane in
+                    # EXACTLY the state the recycle and reset-in-place abort
+                    # routes already leave (both pass remove_worktree=False), so
+                    # the next acquire takes the reset-in-place path.  Every
+                    # other rc keeps today's teardown unchanged.
+                    _seed_unavail = _seed_rc_to_unavailable(seed_rc)
+                    _seed_contended = (
+                        _seed_unavail is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                    )
                     if seed_rc == 127:
                         logger.warning(
                             'acquire_warm_lane: seed script absent for lane %s '
@@ -7111,6 +7314,14 @@ class GitOps:
                             'EVERY task on this host will fault while pool is '
                             'enabled and the script is missing',
                             lane,
+                        )
+                    elif _seed_contended:
+                        logger.warning(
+                            'acquire_warm_lane: seed refused for lane %s '
+                            '(rc=%d, lane-lock contention) — RETAINING the '
+                            'worktree and releasing the lane; removing it '
+                            'would race the live holder of the lane lock',
+                            lane, seed_rc,
                         )
                     else:
                         logger.warning(
@@ -7132,9 +7343,9 @@ class GitOps:
                     # _delete_branch_if_on_main, so a commit-bearing branch
                     # is never destroyed.
                     await self._abort_lane_acquisition(
-                        lane, branch_name, remove_worktree=True,
+                        lane, branch_name, remove_worktree=not _seed_contended,
                     )
-                    return _seed_rc_to_unavailable(seed_rc)
+                    return _seed_unavail
                 route = AcquireRoute.CREATE_ONCE_FRESH
             else:
                 # ── Already-registered lane — check on-disk backstop first ─

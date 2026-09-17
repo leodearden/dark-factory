@@ -71,6 +71,44 @@ class TestVocabularyConstants:
                 f'MCP_CALL_SIGNATURES[{key!r}] must be a non-empty str, got {sig!r}'
             )
 
+    def test_add_finding_contract_names_every_parameter(self):
+        """task-4653: the hand-transcribed add_finding contract must name every
+        parameter the real tool takes — supersedes above all.
+
+        An agent reading only this self-model would otherwise never learn that
+        a claim can be explicitly retired by a later finding — and the
+        (task_id, flag_type) dedup key it DOES describe cannot relate a claim
+        to its resolution, so it would have no reason to look for one.
+
+        Derived from the live symbol rather than asserting a hand-written
+        substring, so the check is referential integrity in both directions: a
+        renamed or removed kwarg fails here instead of leaving a stale
+        transcription green, and a typo in the transcription is no longer
+        indistinguishable from a correct mention.  This is the one entry of
+        MCP_CALL_SIGNATURES held to that standard — the module docstring's
+        transcription-fidelity caveat still stands for the rest, and closing it
+        wholesale is task ξ's prompt-cutover job.
+        """
+        import inspect
+
+        from fused_memory.server.recon_report import ReconReportState
+
+        sig = m.MCP_CALL_SIGNATURES['add_finding']
+        params = inspect.signature(ReconReportState.add_finding).parameters
+        # supersedes must be a REAL parameter, not merely a mentioned word: the
+        # loop below only requires the transcription to cover whatever the code
+        # happens to take, so on its own it would go quiet if the kwarg were
+        # dropped from both sides at once.
+        assert 'supersedes' in params
+        # run_id is exempt: it is the per-call plumbing every recon_report tool
+        # carries, and the transcription describes the call shape as the stage
+        # prompts present it (cite_task's entry omits it for the same reason).
+        transcribed = {n for n in params if n not in ('self', 'run_id')}
+        missing = sorted(n for n in transcribed if n not in sig)
+        assert not missing, (
+            f'MCP_CALL_SIGNATURES[add_finding] does not name: {missing}'
+        )
+
 
 # --------------------------------------------------------------------------- #
 # MARKER_LIFECYCLE + consistency with recon_ledger.MARKER_KINDS (step-3/4)

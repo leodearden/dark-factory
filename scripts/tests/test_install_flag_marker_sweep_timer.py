@@ -285,3 +285,54 @@ def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
         f"from the fake systemctl's generic 'Job for ... failed' message; "
         f"stderr={result.stderr!r}"
     )
+
+
+def test_installed_service_unit_carries_explicit_path_for_boot_catchup(tmp_path):
+    """Task 2917 EDIT 3, unit half.
+
+    The .timer unit sets `Persistent=true`, so a nightly firing missed while
+    the machine was asleep/offline is caught up at BOOT -- and a boot-time
+    systemd user service gets a minimal PATH,
+    because the login session has not yet pushed the user PATH into the
+    systemd user manager. OBSERVED consequence (journalctl --user -u
+    fused-memory-flag-marker-sweep.service):
+
+        Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.sh[65377]:
+            .../fused-memory-flag-marker-sweep.sh: line 46: exec: uv: not found
+        Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.service:
+            Main process exited, code=exited, status=127/n/a
+
+    Asserted on the unit the installer actually COPIED into place rather
+    than on the in-repo template, so this is genuinely "the installer sets
+    it up correctly at install time" coverage. /home/leo/.local/bin is where
+    `uv` measurably lives; /usr/bin is needed so `systemctl`, `grep` and
+    `cut` -- which the wrapper also shells out to -- resolve under the same
+    minimal boot env."""
+    xdg_config = tmp_path / "xdg-config"
+
+    result = _run_script(tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    service_path = xdg_config / "systemd" / "user" / SERVICE_NAME
+    installed = service_path.read_text()
+
+    path_lines = [
+        ln for ln in installed.splitlines() if ln.startswith("Environment=PATH=")
+    ]
+    assert path_lines, (
+        f"Expected the INSTALLED unit to pin an explicit Environment=PATH= so "
+        f"the Persistent=true boot catch-up run can find uv (OBSERVED "
+        f"status=127 without it); installed unit=\n{installed}"
+    )
+    path_value = path_lines[0].split("=", 2)[2]
+    assert "/home/leo/.local/bin" in path_value, (
+        f"Expected the pinned PATH to include /home/leo/.local/bin, where uv "
+        f"actually lives; path_value={path_value!r}"
+    )
+    assert "/usr/bin" in path_value, (
+        f"Expected the pinned PATH to include /usr/bin so systemctl/grep/cut "
+        f"resolve under the boot catch-up's minimal env; "
+        f"path_value={path_value!r}"
+    )

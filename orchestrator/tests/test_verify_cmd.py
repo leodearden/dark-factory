@@ -18,17 +18,21 @@ import shutil
 import subprocess
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _verify_config_corpus import (
     DF_CONFIG_PATH,
     FM_LINT_COMMAND,
+    REPO_ROOT,
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
     ROOT_TYPE_CHECK_COMMAND,
+    SCRIPTS_CONFIG_PATH,
     SCRIPTS_LINT_COMMAND,
     load_config_scalar,
 )
 
 from orchestrator import verify
+from orchestrator.config import _discover_module_configs
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
     ChainSegment,
@@ -791,6 +795,151 @@ class TestSerialPytest:
         cmd = parse_config_command('mypy src/')
         assert serial_pytest(cmd) == cmd
 
+    # ── the xdist worker-flag family `-o addopts=` cannot reach (task 5408) ──
+    #
+    # `serial_pytest` recovers by appending `-p no:xdist -o addopts=`. The
+    # `-o addopts=` clears an ADDOPTS-sourced `-n auto` — which is why the
+    # five modules that carry the flags in pyproject.toml are unaffected —
+    # but it cannot clear a flag already on ARGV, and `-p no:xdist` then
+    # UNREGISTERS the option that flag names. MEASURED on this tree against
+    # the live scripts leg, with `--dist` correctly bound:
+    #
+    #   uv run --project shared pytest ... -n auto --dist loadgroup \
+    #       -p no:xdist -o addopts= <probe>
+    #   pytest: error: unrecognized arguments: -n --dist          (rc=4)
+    #
+    # So every serial recovery of that leg — verify.py's env-transient
+    # re-run, and each flake-confirm re-run — hard-fails on a usage error
+    # instead of recovering. Independent of the `--dist` binding defect: this
+    # reproduces with the flag bound.
+    _XDIST_WORKER_FLAGS = ('-n', '--numprocesses', '--dist', '--maxprocesses')
+    _XDIST_ATTACHED_PREFIXES = ('--dist=', '--numprocesses=', '--maxprocesses=')
+
+    @staticmethod
+    def _live_scripts_test_command() -> str:
+        """The LIVE scripts leg, read from its yaml rather than copied here.
+
+        Same rationale as ``TestSplitAndChainSegmentsLiveConfigDrift``: the
+        recovery path runs whatever that config says today, so a copy would
+        let the config drift out from under this guard silently.
+        """
+        return load_config_scalar(SCRIPTS_CONFIG_PATH, 'test_command')
+
+    def _assert_no_xdist_worker_flags(self, rendered: str, *, what: str) -> None:
+        tokens = shlex.split(rendered)
+        offenders = [
+            token
+            for token in tokens
+            if token in self._XDIST_WORKER_FLAGS
+            or token.startswith(self._XDIST_ATTACHED_PREFIXES)
+        ]
+        assert not offenders, (
+            f'{what}: serial recovery left {offenders} on argv. With '
+            f'`-p no:xdist` also appended, pytest has unregistered those '
+            f'options and exits rc=4 with `unrecognized arguments`. '
+            f'`-o addopts=` clears only the ADDOPTS-sourced copy.\n'
+            f'rendered: {rendered!r}'
+        )
+
+    def test_live_scripts_leg_sheds_its_xdist_flags_on_serial_recovery(self):
+        command = self._live_scripts_test_command()
+        rendered = render(serial_pytest(parse_config_command(command)))
+        self._assert_no_xdist_worker_flags(rendered, what='live scripts leg')
+        assert '-p no:xdist' in rendered, rendered
+        assert '-o addopts=' in rendered, rendered
+        for target in ('tests/scripts/', 'scripts/tests/'):
+            assert target in shlex.split(rendered), (
+                f'the strip dropped the real target {target!r} — recovery must '
+                f'shed the worker flags, not the tests: {rendered!r}'
+            )
+
+    def test_a_doubled_worker_flag_is_stripped_in_full(self):
+        """verify.py can cap the workers BEFORE forcing serial, giving two `-n`.
+
+        Measured: ``apply_pytest_numprocesses(parsed, '8')`` appends `-n 8`
+        to a command whose argv already carries `-n auto`. A strip that
+        removes only the first occurrence leaves the identical usage error,
+        so this pins that ALL occurrences go.
+        """
+        parsed = parse_config_command(self._live_scripts_test_command())
+        capped = apply_pytest_numprocesses(parsed, '8')
+        assert capped.base_flags.count('-n') == 2, (
+            f'precondition lost: the ordering this guards against no longer '
+            f'produces a doubled -n ({capped.base_flags})'
+        )
+        self._assert_no_xdist_worker_flags(
+            render(serial_pytest(capped)), what='worker cap applied before serial',
+        )
+
+    def test_the_strip_preserves_the_already_serial_invariant(self):
+        """Shedding `-n` must not re-open the door `_is_serial_forced` closes.
+
+        ``apply_pytest_numprocesses`` consults ``_is_serial_forced`` to stay a
+        no-op on an already-serial command, precisely so a recovery re-run
+        cannot re-inject the `-n` that `-p no:xdist` has unregistered. That
+        keys on `no:xdist`, which the strip leaves alone — asserted here so
+        the strip cannot regress it, and true before the strip exists too.
+        """
+        stripped = serial_pytest(parse_config_command(self._live_scripts_test_command()))
+        assert _is_serial_forced(stripped)
+        assert apply_pytest_numprocesses(stripped, '8') is stripped, (
+            're-injection guard lost: -n came back after the command was '
+            'forced serial, which is the rc=4 this whole class is about'
+        )
+
+    # Grouped so that this file's real-subprocess probes land on ONE xdist
+    # worker rather than competing across workers; it is the only member
+    # today, and a future exec probe here joins it rather than adding a
+    # second uncoordinated heavyweight. No `uv`-on-PATH skipif: `uv` is a hard
+    # dependency of the command under test, so — exactly as `_BASH` above
+    # argues for bash — a missing toolchain must fail loudly rather than
+    # silently drop the coverage that closes this defect.
+    #
+    # The mark is the VERIFY CLI BUDGET itself, and NOT a number picked to sit
+    # just above the `timeout=` below: a marker is a two-way override, so any
+    # value under that budget TIGHTENS the run that gates the merge instead of
+    # loosening this slow probe — the inversion the VERIFY_CLI_PER_TEST_TIMEOUT
+    # comment block in _orch_helpers.py derives and
+    # test_timeout_marker_inversion_guard.py ratchets. The subprocess timeout
+    # stays the operative bound, so a hung probe surfaces as a `TimeoutExpired`
+    # carrying both streams rather than as an `os._exit()`d xdist worker.
+    @pytest.mark.xdist_group('verify_cmd_real_pytest')
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    def test_recovered_live_scripts_leg_is_accepted_by_a_real_pytest(self, tmp_path):
+        """The proof the structural arms are not just string-shuffling.
+
+        Renders the recovered command and re-targets it at a one-test probe
+        file, so what is under test is pytest's ARGUMENT GRAMMAR rather than
+        the 5333-test collection the real leg would run. Both streams are
+        captured into the failure message: a usage error is written to
+        STDERR, and omitting it is how this test would fail misleadingly.
+
+        Measured on this tree: rc=4 before the strip, rc=0 (1 passed) after.
+        """
+        probe = tmp_path / 'test_probe.py'
+        probe.write_text('def test_probe():\n    assert True\n', encoding='utf-8')
+
+        parsed = parse_config_command(self._live_scripts_test_command())
+        recovered = dataclasses.replace(serial_pytest(parsed), targets=(str(probe),))
+        rendered = render(recovered)
+
+        result = subprocess.run(
+            [_BASH, '-c', rendered],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=100,
+        )
+        assert result.returncode == 0, (
+            f'the serial-recovered scripts leg was rejected by pytest '
+            f'(rc={result.returncode}), so every env-transient and '
+            f'flake-confirm re-run of that leg fails on a usage error '
+            f'instead of recovering.\n'
+            f'rendered: {rendered!r}\n'
+            f'stdout: {result.stdout}\n'
+            f'stderr: {result.stderr}'
+        )
+
 
 class TestRawRewriteDoesNotSwallowSubshellTerminator:
     """The raw-retained rewrite must append INSIDE a subshell, not after its `)`.
@@ -1422,6 +1571,16 @@ class TestSeparateTokenValueFlagBinding:
             ('-p', 'no:cacheprovider'),
             ('-o', 'addopts='),
             ('-n', '4'),
+            # The xdist worker-flag family (task 5408). `--dist` is confirmed
+            # value-taking by pytest's own diagnostic, measured on this tree:
+            # `pytest: error: argument --dist: expected one argument`.
+            # `--numprocesses`/`--maxprocesses` are xdist's long spellings for
+            # the worker count and its cap, listed with `--dist` because a set
+            # that binds `-n` but not `-n`'s own long spelling is the same
+            # latent defect one config rename away.
+            ('--dist', 'loadgroup'),
+            ('--numprocesses', '4'),
+            ('--maxprocesses', '4'),
         ],
     )
     def test_value_flag_binds_to_following_token_at_parse_time(self, flag, value):
@@ -1449,6 +1608,47 @@ class TestSeparateTokenValueFlagBinding:
         assert tokens[tokens.index(flag) + 1] == 'VAL'
         assert tokens[tokens.index('-n') + 1] == '16'
         assert f'{flag} -n' not in rendered, f'flag/value split corruption in {rendered!r}'
+
+    @pytest.mark.parametrize(
+        ('flag', 'value'),
+        [
+            ('-n', 'auto'),
+            ('--dist', 'loadgroup'),
+            ('--numprocesses', '4'),
+            ('--maxprocesses', '4'),
+        ],
+    )
+    def test_xdist_worker_flag_pair_survives_a_later_base_flags_append(self, flag, value):
+        """The contiguity pinned above must still hold AFTER a base_flags append.
+
+        Parse-time binding is only worth having because every mutator appends
+        to the END of ``base_flags``. An UNLISTED value flag is not bound, so
+        its value is stranded in ``targets`` and the append lands where the
+        value should be. Measured on this tree for the live ``scripts``
+        test_command before task 5408 listed the family::
+
+            render(with_junitxml(parsed, '/tmp/j.xml'))
+            # ... -n auto --dist --junitxml /tmp/j.xml ... loadgroup
+            # pytest: error: argument --dist: expected one argument   (rc=4)
+
+        That is the MERGE GATE's own path, not a hypothetical one:
+        ``verify.py`` injects ``--junitxml`` whenever a junit path is computed
+        (role ``merge`` with ``merge_verify_breadth`` ``full``). ``-n auto``
+        is carried as the control — it was already bound, and its staying
+        green is what localises a failure here to the newly listed spellings.
+        """
+        cmd = parse_config_command(f'pytest {flag} {value} tests/x.py')
+        rendered = render(with_junitxml(cmd, '/tmp/j.xml'))
+        tokens = shlex.split(rendered)
+        assert tokens[tokens.index(flag) + 1] == value, (
+            f'{flag} lost its value to the --junitxml append in {rendered!r}; '
+            f'{flag} is not bound by _PYTEST_VALUE_FLAGS, so {value!r} was '
+            f'classified as a test target instead of as the flag value.'
+        )
+        assert value not in cmd.targets, (
+            f'{value!r} is {flag}\'s value, not a test target, but it was '
+            f'admitted as one: targets={cmd.targets}'
+        )
 
     def test_serial_pytest_does_not_split_bound_value_flag(self):
         """Acceptance regression: serial_pytest's appended `-p no:xdist -o
@@ -2984,6 +3184,104 @@ class TestSplitAndChainSegmentsLiveConfigDrift:
         assert any('tests/scripts/' in s.command for s in segments), (
             "the live chain no longer carries a 'tests/scripts/' clause the "
             'segmenter can run independently (esc-3062-2)'
+        )
+
+
+class TestLiveModuleTestCommandTargetsExistOnDisk:
+    """Every target a LIVE module ``test_command`` parses to must be a real path.
+
+    Task 5408. Sibling in kind to
+    ``TestSplitAndChainSegmentsLiveConfigDrift`` above — a property of the
+    live config STRINGS rather than of the corpus copies — but swept across
+    every module config rather than pinned on the root one, because a module
+    config is where a new pytest flag actually gets written.
+
+    WHAT IT CATCHES. ``_split_pytest_args`` binds a value flag to its value
+    only when the flag is listed in ``_PYTEST_VALUE_FLAGS``. An unlisted
+    value-taking flag therefore donates its VALUE to ``targets`` as a
+    "phantom target", and leaves the flag itself value-less as soon as a
+    later ``base_flags`` append renders between them. Measured on this tree
+    on the live ``scripts`` command before the fix::
+
+        parse_config_command(tc).targets
+        # ('tests/scripts/', 'scripts/tests/', 'loadgroup')
+
+    WHY NOT THE ROUND-TRIP CHECK. The obvious guard — "the rendered argv is
+    unchanged modulo ordering" — was measured VACUOUS. Stranding a value does
+    not change the token MULTISET; ``loadgroup`` is merely reclassified from
+    flag-value to target. So
+    ``sorted(shlex.split(render(parse(cmd)))) == sorted(shlex.split(cmd))``
+    evaluates TRUE on the broken tree, with and without the ``--junitxml``
+    injection, and would pin nothing. On-disk existence is decisive instead,
+    and it generalises to the whole unlisted-value-flag class rather than to
+    ``--dist`` alone. The shape is already established in-repo:
+    ``tests/scripts/test_skills_module_config_decision.py::_pytest_targets``.
+    """
+
+    @staticmethod
+    def _swept() -> list[tuple[str, str, VerifyCmd]]:
+        """``[(prefix, test_command, parsed)]`` for every module config with one."""
+        swept = []
+        for prefix, module_config in _discover_module_configs(REPO_ROOT).items():
+            command = module_config.test_command
+            if not command:
+                continue
+            swept.append((prefix, command, parse_config_command(command)))
+        return swept
+
+    def test_every_parsed_target_exists_on_disk(self):
+        """A parsed target names a path pytest will open, so it must be one."""
+        swept = self._swept()
+        for prefix, command, parsed in swept:
+            # Resolve against the command's OWN cwd, not bare REPO_ROOT: a
+            # `uv run --directory <module>` command names targets relative to
+            # that module. `parse_config_command` has already extracted it as
+            # `cwd_rel` (None for a root-bound command, e.g. `scripts`), which
+            # is the structured equivalent of the --directory scan the
+            # test_skills_module_config_decision.py precedent does by hand.
+            base = REPO_ROOT / (parsed.cwd_rel or '')
+            for target in parsed.targets:
+                path = base / target.split('::', 1)[0]
+                assert path.exists(), (
+                    f"the {prefix!r} module's test_command names target "
+                    f'{target!r}, which does not exist under {base} '
+                    f'(task 5408). Either that config carries a stale target '
+                    f'— which makes pytest exit non-zero on every verify leg '
+                    f'that runs it — or a value-taking flag is missing from '
+                    f'verify_cmd._PYTEST_VALUE_FLAGS and this is its VALUE '
+                    f'admitted as a target, in which case the flag is also '
+                    f'rendering value-less. Add the flag to that set; do not '
+                    f'filter the phantom out here.\n'
+                    f'  command: {command!r}\n'
+                    f'  targets: {parsed.targets}'
+                )
+
+    def test_the_sweep_reaches_every_module_test_command(self):
+        """No module's command may escape the check by parsing to nothing.
+
+        The sweep asserts a property of ``targets``, so a command that comes
+        back raw-retained (unstructurable ``&&`` chain) or classified as some
+        other tool would pass it VACUOUSLY — zero targets, zero assertions.
+        Measured today: all nine discovered module configs parse structured
+        and PYTEST. Pinning that here means such a change reds loudly instead
+        of silently dropping a module out of the guard above.
+        """
+        swept = self._swept()
+        assert swept, (
+            f'no module config under {REPO_ROOT} declares a test_command, so '
+            f'the target-existence sweep above is vacuous (task 5408).'
+        )
+        unstructured = [
+            (prefix, command)
+            for prefix, command, parsed in swept
+            if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None
+        ]
+        assert not unstructured, (
+            f'these module test_commands no longer parse to a structured '
+            f'pytest command, so their targets are unchecked by '
+            f'test_every_parsed_target_exists_on_disk: {unstructured}. '
+            f'Either restore a structurable single-tool command, or extend '
+            f'that test to state what its targets mean for the new shape.'
         )
 
 

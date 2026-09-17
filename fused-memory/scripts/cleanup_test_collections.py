@@ -21,6 +21,29 @@ script that seeds under one imports its constant from HERE.  A name coined
 in one file and reaped by a constant in another is one rename away from
 orphaning collections forever.
 
+WHY THIS SWEEP CAN HOLD OFF (task 4775)
+---------------------------------------
+A live ``-m integration`` run, or the E2 storage-shape bake-off, seeds its
+corpus under :data:`E2_BAKEOFF_PREFIX` — a prefix listed right below as
+reapable.  Unguarded, a sweep landing between that run's seed and measure
+phases deletes the corpus out from under it, and leaves nothing behind
+pointing back here: the run simply measures a world that quietly emptied.
+
+So a holder publishes a lease (:func:`hold_lease`) for as long as it has
+collections in flight, and this sweep skips ENTIRELY while any lease is live
+(:func:`live_leases`).  Blanket rather than per-name, because a run grows its
+own collection set mid-setup and a future driver would add names no lease
+format here knows about — an incomplete list would let this delete exactly
+the collection the guard exists to protect, while reading as if it were
+guarded.  A deferred sweep costs nothing: it runs again in six hours, over
+debris nothing depends on.
+
+The task-4293 premises below are untouched by that guard.  It constructs no
+``MemoryService``, takes no input that can widen :data:`PREFIXES`, and only
+NARROWS the circumstances under which the existing deletes may run.  Its one
+new mutation, :func:`reap_dead_leases`, unlinks files inside the lease
+directory and can never reach a Qdrant collection.
+
 WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
 ------------------------------------------------------------------------
 ``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``
@@ -54,7 +77,16 @@ die and the guard becomes required.
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
+import json
+import os
 import sys
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path
 
 PREFIX = '_test_mem0_qdrant_integration_'
 
@@ -74,7 +106,458 @@ PREFIXES: tuple[str, ...] = (PREFIX, E2_BAKEOFF_PREFIX)
 QDRANT_URL = 'http://localhost:6333'
 
 
+#: Environment override for :func:`lease_dir`.  It exists so tests never
+#: write into the real directory the live cron reads — a test that left a
+#: lease there would hold a real sweep off this host, and one that reaped
+#: there would unlink a live run's lease.  An OPERATOR who sets it has to
+#: set it for BOTH sides: a holder and a reaper that disagree about the
+#: directory are exactly the silent-no-guard failure described below.
+LEASE_DIR_ENV = 'DF_EPHEMERAL_COLLECTION_LEASE_DIR'
+
+#: How many times :func:`hold_lease` re-attempts an acquisition a concurrent
+#: sweep reclaimed under it.  Bounded, and small: each retry is answering a
+#: race that only a sweep running in the same microsecond can cause, and a
+#: holder that loses three in a row is better off failing OPEN and saying so
+#: than spinning inside a context manager a test is waiting on.
+_ACQUIRE_ATTEMPTS = 3
+
+#: ``flock`` refusals that mean "someone else holds this right now" rather
+#: than "this cannot be locked at all".  BSD flock reports contention as
+#: ``EWOULDBLOCK``; the aliases are listed because they are not distinct
+#: values on every platform and ``errno.EACCES`` is what some libcs return.
+_CONTENDED_ERRNOS = (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK)
+
+#: Where in-use leases live.  Hardcoded and absolute on purpose; see
+#: :func:`lease_dir` for why every "portable" alternative is wrong here.
+DEFAULT_LEASE_DIR = Path('/tmp/dark-factory-ephemeral-collection-leases')
+
+
+def lease_dir() -> Path:
+    """Return the directory in-use leases live in, resolved at CALL time.
+
+    A hardcoded absolute ``/tmp`` path looks like a smell and is the one
+    property that makes the guard correct.  The guard fires only if the
+    HOLDER and the REAPER resolve the SAME directory, and they never share
+    an environment: the reaper is this file, run by cron under a bare
+    ``python3`` with a near-empty env; a holder is a pytest process (usually
+    inside a ``.worktrees/<id>`` checkout, under an xdist worker) or a
+    hand-run script in a login shell.
+
+      * ``tempfile.gettempdir()`` honours ``TMPDIR``/``TEMP``/``TMP``, and
+        pytest and cron set those differently;
+      * ``XDG_RUNTIME_DIR`` is ``/run/user/<uid>`` in a login session and
+        unset under cron;
+      * a repo-relative path gives every worktree its own private lease
+        directory even though ONE Qdrant at ``localhost:6333`` is shared by
+        all of them — and it would leave the machine-operated
+        ``project_root`` checkout dirty besides.
+
+    Under any of those the reaper would read an empty directory, find no
+    lease and delete: a guard that silently never fires, which is strictly
+    worse than no guard because it also stops the next person looking.
+
+    Resolved on every call, never memoised, so :data:`LEASE_DIR_ENV` can be
+    redirected after this module is imported — which is what lets the test
+    suite keep its hands off the real directory.  An empty value counts as
+    unset: ``Path('')`` is the current working directory, i.e. precisely the
+    repo-relative failure above.
+    """
+    override = os.environ.get(LEASE_DIR_ENV)
+    return Path(override) if override else DEFAULT_LEASE_DIR
+
+
+def _lease_filename(owner: str) -> str:
+    """A filename no other holder can collide with, readable in a listing.
+
+    Uniqueness is what lets the acquisition use ``O_CREAT | O_EXCL``: holders
+    never contend for a path, so an ``EEXIST`` would be a real defect rather
+    than ordinary contention.  (:func:`hold_lease` does retry, but never for
+    ``EEXIST`` — only when a concurrent sweep reclaimed the file mid-
+    acquisition, and each retry coins a name from scratch.)  It also means no
+    new holder can ever reuse a DEAD holder's path, which is what makes
+    reaping dead lease files safe (see :func:`reap_dead_leases`).
+
+    The owner is slugified rather than dropped because these names are read
+    by a human in cron mail; the pid and a uuid4 carry the uniqueness.
+    """
+    slug = ''.join(c if (c.isalnum() or c in '._-') else '-' for c in owner)
+    slug = slug.strip('-')[:60] or 'holder'
+    return f'{slug}.{os.getpid()}.{uuid.uuid4().hex}.lease'
+
+
+def _lease_body(owner: str) -> bytes:
+    """The diagnostics a prober reads out of a held lease file.
+
+    Nothing branches on this — liveness is the flock, never the body — so a
+    corrupt or empty body may degrade the diagnostic and must never degrade
+    the guard.  Deliberately no expiry or TTL field: the kernel releases the
+    flock when the holder dies, SIGKILL included, so there is no stale-lease
+    case for a timeout to bound.
+    """
+    record = {
+        'owner': owner,
+        'pid': os.getpid(),
+        'started_at': datetime.now(UTC).isoformat(),
+    }
+    return json.dumps(record).encode()
+
+
+#: How many times :func:`hold_lease` re-attempts an acquisition a concurrent
+#: sweep unlinked out from under it.  Bounded rather than unbounded because
+#: this runs inside live experiments: a pathological loop must degrade to the
+#: documented fail-open (one stderr line, no guard) instead of hanging a
+#: bake-off.  Three is already far past the plausible worst case — the sweep
+#: fires every six hours and would have to lose the same microsecond race
+#: three times in a row, against a fresh filename each time.
+_ACQUIRE_ATTEMPTS = 3
+
+
+def _still_linked(fd: int) -> bool:
+    """Is the flocked file still IN the directory, or was it unlinked?
+
+    ``st_nlink == 0`` means some other process unlinked this path while the
+    acquisition was in flight — a lock on an inode nothing can name, which
+    :func:`live_leases` will never see again.  Asked AFTER the flock, of the
+    open file description rather than the path, so the answer cannot be
+    stale: once the flock is held, the file can no longer be reaped.
+    """
+    return os.fstat(fd).st_nlink != 0
+
+
+@contextlib.contextmanager
+def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
+    """Publish a lease that holds :func:`main`'s sweep off while it is open.
+
+    Yields whether the lease is HELD.  Take one around anything that seeds
+    collections under :data:`PREFIXES` — the 6-hourly cron is otherwise free
+    to delete a live run's corpus between its seed and measure phases.
+
+    The exclusion is an ``fcntl.flock``, not the file's existence.  That is
+    the whole reason there is no TTL, no expiry field and no pid-liveness
+    probe: the kernel frees a flock when the holder dies, SIGKILL included,
+    with no daemon, canary or ``atexit`` involved.  A TTL would force a trade
+    with no good value — long enough for the longest live run, short enough
+    that a crashed run does not wedge the cron — and a pid probe re-opens the
+    PID-reuse hazard that makes a dead owner look alive.
+
+    The flock is taken BEFORE the body is written, so a prober can never read
+    a half-written record out of an unlocked file.  Each holder gets its own
+    uniquely-named file, so concurrent holders (xdist workers, a bake-off
+    beside an integration test) never contend and one release never
+    un-guards another.
+
+    Acquisition is create, lock, then CONFIRM-THE-ENTRY, and is retried up to
+    :data:`_ACQUIRE_ATTEMPTS` times under a fresh name if the confirmation
+    fails or the new file is already locked.  Both outcomes mean the same
+    thing — a sweep reclaimed the file in the window where it existed
+    unlocked — and both would otherwise leave this yielding ``True`` over a
+    lease :func:`live_leases` cannot see.
+
+    FAILS OPEN — do not "tighten" this into a raise.  An unusable lease
+    directory (unwritable, full, a regular file in the way) yields ``False``
+    and reports one line on stderr instead of raising.  The callers are
+    integration tests and two seeding scripts: raising would abort a live
+    bake-off for a reason with nothing to do with what it measures, and fail
+    an integration test on infrastructure noise.  What this guard improves
+    on is "no guard at all", so degrading back to it is not a regression —
+    degrading back to it SILENTLY would be, which is what the stderr line is
+    for.  Same yielded-``held`` contract as
+    ``shared/verify_admission.py::acquire_task_slot`` (clause C-fail-open).
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    path = None
+    fd = None
+    # The path this holder created, or None when it created nothing: what the
+    # `finally` has to take away again, tracked separately from `fd` because a
+    # re-attempt closes one file and creates another.
+    path: Path | None = None
+    # `held` is set only after the WHOLE acquisition succeeds, and is never
+    # inferred from `fd`: a file opened but not flocked is not a lease, and
+    # reporting one as held would be the silent no-guard this fails open to
+    # avoid — the caller would believe it was covered while `live_leases`
+    # correctly saw nothing.
+    #
+    # "The whole acquisition" includes confirming the directory entry still
+    # names the inode we locked.  Between the O_EXCL create and the flock the
+    # file exists and is UNLOCKED, so a sweep landing in that window unlinks
+    # it as litter; we would then hold a real lock on an inode with no
+    # directory entry, yield True, and `live_leases` — which can only see
+    # entries — would correctly report nothing, for the entire rest of the
+    # run.  That is the run-long silent no-guard, so the entry is re-checked
+    # and the acquisition restarted under a fresh name instead.
+    held = False
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for _attempt in range(_ACQUIRE_ATTEMPTS):
+            path = target / _lease_filename(owner)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.set_inheritable(fd, False)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as lock_exc:
+                if lock_exc.errno not in _CONTENDED_ERRNOS:
+                    raise
+                # Filenames are unique per holder, so the only thing that can
+                # already hold OUR brand-new file's lock is a reaper's
+                # LOCK_SH probe — which holds it across its unlink.  Stand
+                # aside rather than fail open: the file is the reaper's to
+                # remove, and a fresh name is not in the listing it is
+                # working through.
+            else:
+                if _entry_still_names(path, fd):
+                    os.write(fd, _lease_body(owner))
+                    held = True
+                    break
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+            path = None
+        else:
+            # Loud, for the same reason the OSError path below is: degrading
+            # back to "no guard at all" is tolerable, degrading back to it
+            # SILENTLY is not.
+            print(
+                f'Could not take an ephemeral-collection lease in {target} '
+                f'(a concurrent sweep reclaimed it {_ACQUIRE_ATTEMPTS} '
+                f'times); the cleanup sweep is NOT held off for {owner}',
+                file=sys.stderr,
+            )
+    except OSError as exc:
+        # Both facts on one line: the directory says WHERE to look, the
+        # error says what to fix.
+        print(
+            f'Could not take an ephemeral-collection lease in {target} '
+            f'({exc}); the cleanup sweep is NOT held off for {owner}',
+            file=sys.stderr,
+        )
+
+    try:
+        yield held
+    finally:
+        # Closing the fd is what releases the flock; the unlink is only
+        # tidiness, and a holder that dies before reaching it leaves a file
+        # that `reap_dead_leases` collects rather than a lease that holds
+        # anything off.  Both run even for a PARTIAL acquisition — a file
+        # created but not flocked is still this holder's litter.
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+
+
+def _entry_still_names(path: Path, fd: int) -> bool:
+    """Does *path* still name the inode behind *fd*?
+
+    Asked immediately after :func:`hold_lease`'s flock, and only ever about a
+    file this process created microseconds earlier.  ``False`` means a
+    concurrent :func:`reap_dead_leases` unlinked the entry while the file was
+    still unlocked: the lock is real, but it guards an inode no listing can
+    reach, so it holds nothing off.  A missing entry raises out of
+    ``os.stat`` and is the same answer as a mismatched one.
+    """
+    try:
+        return os.stat(path).st_ino == os.fstat(fd).st_ino
+    except OSError:
+        return False
+
+
+def _is_held(path: Path) -> bool | None:
+    """Is some living process holding *path*'s flock?
+
+    ``True`` a holder is live, ``False`` the holder is gone (or there never
+    was one), ``None`` the question could not be asked at all — the file
+    vanished under us, or is unreadable.
+
+    The probe is ``LOCK_SH``, not ``LOCK_EX``: two sweepers running at once
+    must not exclude each other and mistake a peer's probe for a live run.
+    Shape copied from
+    ``fused_memory/middleware/ticket_janitor.py::_orchestrator_running``;
+    copied rather than imported because cron runs this file under the system
+    ``python3``, where ``fused_memory`` is not importable.
+    """
+    try:
+        handle = path.open('rb')
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return True
+            return None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def _unlink_if_dead(path: Path) -> bool:
+    """Unlink *path* iff no living process holds its flock; did we?
+
+    The probe lock is taken and HELD ACROSS the unlink rather than released
+    first, and that is the whole point of this existing separately from
+    :func:`_is_held`.  Probing, releasing, then unlinking leaves a window in
+    which an acquiring holder takes ``LOCK_EX`` on a file this is about to
+    remove — so the unlink lands on a live holder's entry, and the guard is
+    gone for the rest of that run with nothing reported anywhere.  While the
+    shared lock is held, no ``LOCK_EX`` can have been granted, so the entry
+    removed here is provably one nobody holds.
+
+    ``False`` covers every reason not to remove it, deliberately without
+    distinguishing them: held by a live run, unreadable, unprobeable, or
+    already unlinked by a peer sweeper.  None of those is this sweep's
+    litter, and none of them is an error — two sweeps overlap whenever an
+    operator runs this by hand while cron fires.
+    """
+    try:
+        handle = path.open('rb')
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        try:
+            # No `missing_ok`: a peer sweeper that got there first collected
+            # that litter, and counting it here too would report more files
+            # reaped than existed.
+            path.unlink()
+        except OSError:
+            return False
+        return True
+    finally:
+        handle.close()
+
+
+def _describe(path: Path) -> dict:
+    """Read a held lease's diagnostics, falling back to its filename.
+
+    Nothing branches on the result: the guard has already decided the lease
+    is live before this is called.  A holder killed between creating its
+    file and writing its record therefore degrades what an operator reads in
+    cron mail, and never whether the sweep holds off.
+    """
+    record = {'owner': path.name, 'pid': None, 'path': str(path)}
+    try:
+        body = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return record
+    if isinstance(body, dict):
+        record['owner'] = body.get('owner') or path.name
+        record['pid'] = body.get('pid')
+    return record
+
+
+def live_leases(*, directory: Path | None = None) -> list[dict]:
+    """Return one record per lease a LIVING process is holding.
+
+    Liveness is the flock and nothing else — not the file's existence, not
+    an age, not a pid.  A lease file left behind by a SIGKILLed holder is
+    unlocked the moment that process dies, so it is reported here as absent
+    and collected later by :func:`reap_dead_leases`.
+
+    Never raises.  A missing directory, a file that vanishes mid-scan, an
+    unreadable file and an unparseable body are each ordinary rather than
+    exceptional: this is called from an unattended cron job whose contract
+    is "Always exits 0 (idempotent)".
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    try:
+        entries = sorted(target.iterdir())
+    except OSError:
+        return []
+
+    held = []
+    for path in entries:
+        if _is_held(path) is True:
+            held.append(_describe(path))
+    return held
+
+
+def reap_dead_leases(*, directory: Path | None = None) -> int:
+    """Unlink lease files no living process holds; return how many.
+
+    Litter collection, not a guard.  These files hold nothing off —
+    :func:`live_leases` already ignores an unlocked file — so this exists
+    only to stop the lease directory growing without bound after every run
+    that is SIGKILLed, OOM-killed or otherwise denied its ``finally``.
+
+    Unlinking a LIVE holder's file is impossible rather than merely avoided:
+    the shared probe lock is HELD ACROSS the unlink (see
+    :func:`_unlink_if_dead`), so no ``LOCK_EX`` can have been granted between
+    deciding and removing, and unique filenames (see :func:`_lease_filename`)
+    mean no new holder can ever be handed a dead holder's path.  The
+    remaining window — a holder that has CREATED its file but not yet locked
+    it — is closed from the other side, by :func:`hold_lease` re-checking its
+    directory entry after the flock and starting over if this reclaimed it.
+    A file that cannot be probed at all is skipped rather than removed —
+    unprobeable is not the same as dead.
+
+    The one file this CAN take from a living process is one still being
+    ACQUIRED: created, not yet flocked, and from here identical to litter —
+    same bytes, same absent lock.  That is unresolvable from this side, so it
+    is resolved on the holder's instead: :func:`hold_lease` re-checks after
+    locking and starts over when its file has been taken.  Named rather than
+    implied, because this is the only case in which the paragraph above is
+    not the whole truth.
+
+    Never raises, for the same reason as :func:`live_leases`: two sweeps can
+    overlap (an operator running this by hand while cron fires), and the
+    loser of that race must return a count rather than a traceback.
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    try:
+        entries = sorted(target.iterdir())
+    except OSError:
+        return 0
+
+    reaped = 0
+    for path in entries:
+        if _unlink_if_dead(path):
+            reaped += 1
+    return reaped
+
+
+def _report_hold_off(holders: list[dict]) -> None:
+    """Name every live holder on stderr, then say why nothing was swept."""
+    for holder in holders:
+        print(
+            f'In-use lease held by {holder["owner"]} '
+            f'(pid {holder["pid"]}, {holder["path"]})',
+            file=sys.stderr,
+        )
+    print(
+        f'{len(holders)} ephemeral-collection lease(s) live; skipping the '
+        f'sweep so a running experiment keeps its collections',
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
+    # FIRST of two lease checks.  This one sits before the client is
+    # constructed, so a held-off sweep costs zero network — and, because no
+    # client exists yet on this path, returning from here cannot leak a
+    # connection past the `finally` further down.
+    holders = live_leases()
+    if holders:
+        _report_hold_off(holders)
+        return
+
+    # Only on a sweep that will actually proceed: there is nothing to
+    # reclaim while a run is live, and the held-off path above must stay
+    # zero-cost.  Reported on stderr and never stdout — stdout is reserved
+    # for the deletion report below, because a cron job that prints on every
+    # no-op trains its reader to ignore it.
+    dead = reap_dead_leases()
+    if dead:
+        print(f'Removed {dead} lease file(s) left by dead holders', file=sys.stderr)
+
     try:
         from qdrant_client import QdrantClient
     except ImportError:
@@ -100,6 +583,26 @@ def main() -> None:
             collections = client.get_collections().collections
         except Exception as exc:
             print(f'Qdrant unreachable ({exc}), skipping', file=sys.stderr)
+            return
+
+        # SECOND lease check.  Two rather than one, and they buy different
+        # things: the first bought a zero-network exit, this one covers the
+        # listing round-trip above — the part of the sweep where the wall
+        # clock actually goes, so a lease taken during it would be invisible
+        # to a check placed only before it.  This return is INSIDE the `try`,
+        # so it leaves through the `finally` that closes the client.
+        #
+        # Re-checking before each individual delete was rejected: the deletes
+        # are the fast part, so it would add N directory scans to close a
+        # window this already collapsed.  What survives is a holder that
+        # writes its lease AND creates its collections entirely inside the
+        # delete loop — sub-second, against a job that runs every six hours.
+        # Named rather than implied: a guard described as airtight when it is
+        # not is how the next reader mis-diagnoses the failure it finally
+        # causes.
+        holders = live_leases()
+        if holders:
+            _report_hold_off(holders)
             return
 
         for col in collections:

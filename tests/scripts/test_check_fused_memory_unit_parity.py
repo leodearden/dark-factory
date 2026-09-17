@@ -9,6 +9,7 @@ check_fused_memory_unit_parity.py via importlib.util.spec_from_file_location,
 mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watchdog.
 """
 
+import ast
 import importlib.util
 import pathlib
 import subprocess
@@ -28,6 +29,11 @@ from setup_host_sections import (
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
 TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
+
+# The checker's own log tag, duplicated here only as a literal to strip from
+# captured output (see _untagged). That the CHECKER still spells it this way is
+# asserted against the module in test_main_every_emitted_line_carries_the_log_tag.
+LOG_TAG = "fused_memory_unit_parity"
 
 
 def _load_checker() -> types.ModuleType:
@@ -497,6 +503,323 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
+# The DROP-IN layer  (step-1 / step-2)
+# ---------------------------------------------------------------------------
+#
+# `systemctl --user edit` never modifies the unit file; it writes
+# `<unit>.d/override.conf` beside it, and systemd merges that OVER the unit at
+# load time. So this checker's whole-line membership test can find every
+# required directive present while the EFFECTIVE configuration is not the one
+# it just certified.
+#
+# This is the LAST drop-in-blind member of the check_*_unit_parity.py family:
+# the dashboard, orchestrator and lms checkers all consult
+# systemd_unit_parity.find_dropins already. Structural difference handled here:
+# this checker takes `--installed <FILE>`, not `--installed-dir`, so the
+# drop-in directory is derived from the file path as
+# `installed.parent / f"{installed.name}.d"`.
+#
+# Nothing below touches ~/.config/systemd/user: every unit is written into a
+# bare tmp_path and the drop-ins are planted beside it.
+
+# A drop-in redeclaring ONE directive. Deliberately a directive the checker
+# also requires (WatchdogSec), at a DIFFERENT value: that is the shape in
+# which the unit file passes every check while the running service does not
+# have the value the check certified.
+_FM_DROPIN = "[Service]\nWatchdogSec=600\n"
+
+
+def _plant_fm_dropin(
+    installed: pathlib.Path, name: str, text: str
+) -> pathlib.Path:
+    """Write a drop-in under ``<installed>.d/``, beside the installed unit.
+
+    Modelled on tests/scripts/test_check_lms_unit_parity.py::_plant_dropin, but
+    keyed off the ``--installed`` FILE path rather than an installed-DIR,
+    because that is this checker's CLI shape. The directory name systemd looks
+    for is the unit's FILE NAME plus ``.d``, so it is built from
+    ``installed.name`` and not from a hardcoded unit name — which keeps the
+    helper usable with the suite's ``_write_unit(..., name=...)`` variants.
+    """
+    dropin_dir = installed.parent / f"{installed.name}.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / name
+    dropin.write_text(text, encoding="utf-8")
+    return dropin
+
+
+def _untagged(out: str) -> str:
+    """Strip the ``[fused_memory_unit_parity] `` prefix from every line.
+
+    Needed because LOG_TAG contains the word "parity". Asserting that the
+    checker did NOT claim parity has to look at what it SAID, not at how it
+    labelled itself — a bare ``"parity" not in out`` is unsatisfiable on any
+    line this checker emits, so it would assert nothing about the verdict.
+    """
+    return "\n".join(
+        line.removeprefix(f"[{LOG_TAG}] ") for line in out.splitlines()
+    )
+
+
+def test_a_dropin_over_a_clean_unit_is_not_parity(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A unit at full directive parity plus a drop-in must NOT report parity.
+
+    This is the behavioural claim the workstream rests on. The unit FILE is at
+    parity — find_drift has genuinely nothing to say — while the EFFECTIVE
+    configuration is not, because systemd merges the drop-in over it at load
+    time. Reporting `[ok] ... parity` here would be a green claim covering
+    exactly the configuration that is not running.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    dropin = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    # Precondition: the file layer genuinely has nothing to report, so the
+    # exit 1 below can only be coming from the drop-in.
+    assert mod.find_drift(_CLEAN_UNIT) == []
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+    assert str(dropin) in out
+    # Checked against the UNTAGGED text: LOG_TAG is literally
+    # "fused_memory_unit_parity", so a bare `"parity" not in out` can never
+    # pass and would be testing the tag rather than the verdict.
+    assert "[ok]" not in _untagged(out)
+    assert "parity" not in _untagged(out)
+
+
+def test_every_applying_fm_dropin_is_named_by_path(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """EVERY applying drop-in is named by path — not a count, not just the first.
+
+    systemd merges all of them, so a report naming one leaves the operator
+    fixing half the problem and re-running into the same red.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    first = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    second = _plant_fm_dropin(
+        installed, "20-limits.conf", "[Service]\nTimeoutStartSec=60\n"
+    )
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert str(first) in out
+    assert str(second) in out
+
+
+def test_fm_dropin_report_is_worded_apart_from_drift(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """The [override] block is not phrased as a directive diff.
+
+    Mirrors tests/scripts/test_check_lms_unit_parity.py::
+    test_dropin_report_is_worded_apart_from_drift, for the same reason: the
+    required directives all MATCHED, so an operator sent hunting for a
+    directive diff that does not exist wastes the trip. The block must say what
+    was actually not established — the EFFECTIVE configuration — and must name
+    how to inspect the merged result.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    override_lines = [line for line in out.splitlines() if "[override]" in line]
+    assert override_lines, out
+
+    override_text = "\n".join(override_lines)
+    assert "EFFECTIVE" in override_text
+    assert "systemctl --user cat" in override_text
+    # The required directives DID all match, so nothing may be reported as a
+    # missing-directive difference.
+    assert "[drift]" not in out
+
+
+def test_fm_override_report_carries_the_log_tag_on_every_physical_line(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """The multi-line [override] block leaves no untagged physical line.
+
+    The LOG_TAG contract below is load-bearing for setup-host.sh's gate, which
+    reads tag ABSENCE as "the checker did not run". A multi-line override block
+    naming one path per line is exactly the shape that breaks a logger which
+    prefixes once per call, so the contract is re-asserted on THIS path rather
+    than assumed to carry over from the drift path.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    _plant_fm_dropin(installed, "20-limits.conf", "[Service]\nTimeoutStartSec=60\n")
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    assert rc == 1, f"{captured.out}\n{captured.err}"
+    assert captured.out.strip(), "The checker must report something."
+    for line in (captured.out + captured.err).splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
+
+
+def test_fm_checker_reuses_the_shared_find_dropins():
+    """The checker uses the SHARED find_dropins, not a fourth pasted copy.
+
+    Structural anti-fork guard, in the style the three existing lifts are
+    already pinned by (see tests/scripts/test_check_orchestrator_unit_parity.py,
+    which asserts the same identity for the checker and the dashboard). An
+    identity assertion, not an equality one: a pasted copy would satisfy every
+    behavioural test above while reproducing — inside the tooling built to
+    report silent duplication — exactly the duplication it exists to report.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.find_dropins is systemd_unit_parity.find_dropins
+
+
+def test_a_non_conf_file_in_the_dropin_dir_is_not_an_override(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A stray non-``.conf`` file in the ``.d/`` dir is not an override.
+
+    systemd only merges ``*.conf`` there, so counting an ``override.conf.bak``
+    would report an override that has no effect at all — and an operator sent
+    to remove a file systemd never read learns to distrust the report. Pins
+    that the shared find_dropins' ``.conf``-only rule is what is in force here,
+    rather than a bare "the directory exists" test.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "override.conf.bak", _FM_DROPIN)
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 0, out
+    assert "[ok]" in out
+    assert "parity" in out
+    assert "[override]" not in out
+
+
+# ---------------------------------------------------------------------------
+# --fix must not launder an override into a green verdict  (step-3 / step-4)
+# ---------------------------------------------------------------------------
+#
+# The sharper half of the drop-in workstream. --fix APPENDS missing directives
+# and then reports; if it reported 0 while a drop-in silently overrode the
+# values it had just written, the checker would have MANUFACTURED the
+# reassurance — an operator watching it "repair" a unit whose effective
+# configuration is still not the committed one.
+#
+# The three tests below also fix the shape of the remedy: repair what can be
+# repaired, refuse to call the result parity, and never touch the drop-in.
+
+
+def test_fix_does_not_report_success_while_an_override_applies(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """--fix repairs the unit, reports the override, and still returns 1.
+
+    Both halves are the point. --fix legitimately appends the directives it
+    can synthesize — refusing to repair because an override exists would make
+    the drop-in block a repair, which it is not. And it must still decline to
+    report success, because what it wrote is not what would run.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    # Precondition: WITHOUT the drop-in this exact input returns 0 — pinned by
+    # ::test_main_fix_rewrites_file. So a 1 below is the drop-in's doing.
+    assert "Environment=MEM0_TELEMETRY=false" in mod.find_drift(
+        _DRIFTED_WITH_HOST_SPECIFIC
+    )
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+
+    # The fix still did its job: the missing directive is now in [Service].
+    sections = mod.parse_unit_sections(installed.read_text(encoding="utf-8"))
+    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+
+
+def test_fix_on_a_clean_unit_with_an_override_still_returns_1(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """No directive drift + a drop-in + --fix => 1, and the unit file is untouched.
+
+    There was nothing for --fix to append, and a drop-in is not something it
+    may resolve: it lives in a DIFFERENT FILE, and this checker is read-only
+    about those by design. So the unit file must come back byte-identical —
+    "--fix ran" is not licence to rewrite a file that had nothing wrong with
+    it — while the verdict is still not parity.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    before = installed.read_bytes()
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+    assert installed.read_bytes() == before
+
+
+def test_fix_never_removes_a_dropin(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """Reporting an override never deletes it, even on the --fix path.
+
+    Mirrors tests/scripts/test_check_lms_unit_parity.py::
+    test_a_dropin_is_never_removed_by_the_checker and its recorded reason: the
+    real observed drop-in was LOAD-BEARING (task 3750), so removing it would
+    have broken exactly the thing the check exists to protect. Removal has a
+    correct owner with preconditions
+    (scripts/remove-lms-arm-worktree-dropin.sh); a general-purpose parity
+    checker has no business re-implementing them. Fail loud, do not "fix".
+
+    A regression guard that passes on arrival, kept because it is what forbids
+    the tempting wrong way to green the two tests above.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+    dropin = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    before = dropin.read_bytes()
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+    capsys.readouterr()
+
+    assert rc == 1
+    assert dropin.is_file()
+    assert dropin.read_bytes() == before
+    assert dropin.parent.is_dir()
+
+
+# ---------------------------------------------------------------------------
 # LOG_TAG contract  (task 3909)
 # ---------------------------------------------------------------------------
 #
@@ -709,8 +1032,13 @@ def _gate_repo(
     """A tmp repo root holding the template and (optionally) the checker.
 
     The checker is copied from the real repo so the gate drives the real one;
-    only the TREE is fake. It imports nothing from scripts/, so one file is the
-    whole dependency.
+    only the TREE is fake. ``systemd_unit_parity.py`` is copied BESIDE it: the
+    checker imports ``find_dropins`` from that sibling by bare module name,
+    which resolves off ``sys.path[0]`` — the executed script's own directory —
+    so the sibling must be in the SAME fake ``scripts/`` dir or every gate test
+    dies at import with a ModuleNotFoundError that looks nothing like the
+    wiring under test. Same reason, same spelling, as
+    tests/scripts/test_check_orchestrator_unit_parity.py's installer harness.
     """
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
@@ -718,7 +1046,12 @@ def _gate_repo(
         TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
     )
     if with_checker:
-        write_checker(repo, CHECKER_PATH.name, body=checker_body)
+        write_checker(
+            repo,
+            CHECKER_PATH.name,
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
     return repo
 
 
@@ -962,6 +1295,92 @@ def test_gate_reports_skip_when_the_unit_is_genuinely_not_installed(
     )
 
 
+def test_gate_reports_an_override_as_needing_manual_removal(
+    tmp_path: pathlib.Path,
+):
+    """A drop-in override reaches the operator as needing MANUAL removal.
+
+    The checker reports an override on exit 1, which the shared
+    `_parity_verdict` classifier maps to the same `finding` token as drift. The
+    gate's arm therefore has to cover both, and the two remedies are different:
+    --fix appends directives to the unit FILE and can neither synthesize nor
+    resolve an override living in a different one. An arm that names only
+    `--fix` sends the operator to a command that cannot help, and — worse —
+    implies the state is repairable when it is not.
+
+    The false green this closes is the fourth assertion: before the checker
+    consulted drop-ins at all, this exact host state produced
+    `OK ... parity with template`.
+    """
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+    dropin_dir = unit_dir / "fused-memory.service.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    (dropin_dir / "10-override.conf").write_text(_FM_DROPIN, encoding="utf-8")
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    # (i) A post-install health check with nothing installing after it must
+    # never `fail` — see the gate's own comment.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "FAIL " not in result.stdout, (
+        f"An override is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+
+    # (ii) The checker's own report is printed before classification, so the
+    # operator can see WHICH file overrides the unit.
+    assert "[fused_memory_unit_parity]" in result.stdout, result.stdout
+    assert "[override]" in result.stdout, result.stdout
+    assert str(dropin_dir / "10-override.conf") in result.stdout, result.stdout
+
+    # (iii) The `finding` arm ran, and it says manual removal — not that --fix
+    # resolves this.
+    assert "WARN " in result.stdout, result.stdout
+    warn_text = "\n".join(
+        line for line in result.stdout.splitlines() if line.startswith("WARN ")
+    )
+    assert "manual removal" in warn_text, warn_text
+
+    # (iv) The false green.
+    assert "OK " not in result.stdout, result.stdout
+    assert "parity with template" not in result.stdout, result.stdout
+
+
+def test_gate_still_names_fix_for_plain_directive_drift(tmp_path: pathlib.Path):
+    """Rewording the arm for overrides must stay ADDITIVE for plain drift.
+
+    Not redundant with ::test_gate_reports_drift_when_a_required_directive_is_
+    missing above. That test predates the override arm and asserts the tokens
+    incidentally; this one states explicitly that they are a CONSTRAINT on the
+    rewording, so an edit that drops `DRIFT detected` or `--fix` while widening
+    the arm fails here with a reason attached rather than in a neighbouring
+    test with none.
+
+    The unit is drop-in free on purpose: this is the arm's OTHER input, and
+    --fix genuinely is the remedy for it.
+
+    What the pin does NOT say: that `DRIFT detected` must be the arm's whole
+    headline. It is now a disjunction — "DRIFT detected or unverifiable state"
+    — because the same arm also fires for a drop-in override, where nothing
+    drifted and --fix cannot help; the two remedies are named UNDER their own
+    conditions on the lines below it. The assertions here are TOKEN presence,
+    which is the part that must survive any such rewording: an operator whose
+    unit is genuinely missing a directive must still be told the word for what
+    happened and the command that repairs it.
+    """
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path, content=_MISSING_MEM0_UNIT)
+    assert not (unit_dir / "fused-memory.service.d").exists()
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "DRIFT detected" in result.stdout, result.stdout
+    assert "--fix" in result.stdout, result.stdout
+
+
 # ---------------------------------------------------------------------------
 # ACCEPTANCE 3 — the checker, INCLUDING --fix, cannot undo the preservation
 # (step-7)
@@ -1161,6 +1580,149 @@ def test_a_required_known_project_roots_line_would_reclobber():
     # And the checker would then report the clobbered unit as being at parity,
     # which is what makes the loss invisible rather than merely bad.
     assert mod.find_drift(fixed, (*mod.REQUIRED_SERVICE_DIRECTIVES, single_root_line)) == []
+
+
+# The SECOND anchor for the invariant above, and the reason it exists.
+#
+# (ii) derives `preserved` solely from render_dashboard_unit.UNITS[*].
+# host_local_environment. That is one END of the coupling. The other end —
+# the one that makes a clobber DAMAGING rather than merely untidy — is that
+# fused_memory/models/scope.py reads the variable as reconciliation's
+# project-root scope, and reconciliation/harness.py raises UnknownProjectError
+# for anything outside it.
+#
+# Drop the name from a UnitSpec while scope.py still reads it and (ii) goes
+# VACUOUSLY GREEN: `preserved` shrinks, the intersection is empty for the wrong
+# reason, and the hazard is wide open again with a passing test over it. So the
+# invariant is pinned from BOTH ends.
+#
+# READ BY `ast`, NOT BY IMPORT, and that is measured rather than stylistic:
+# `uv run --project shared python -c 'import fused_memory'` raises
+# ModuleNotFoundError. tests/scripts/ runs under `--project shared`
+# (scripts/orchestrator.yaml's test_command, whose own comment records that
+# neither target directory is a workspace member), and that environment
+# installs no fused_memory. An import-based guard would fail at COLLECTION with
+# an error bearing no resemblance to the invariant under test.
+
+_SCOPE_PATH = (
+    REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "models" / "scope.py"
+)
+
+
+def _scope_known_project_roots_env() -> str | None:
+    """Return the literal of scope.py's ``KNOWN_PROJECT_ROOTS_ENV: str = ...``.
+
+    A SOURCE read, never an import — see the section comment above for the
+    measurement that forces it. Returns None if the annotated assignment is not
+    found or is not a plain string literal, which callers must treat as a
+    FAILURE rather than as "nothing to check": a rename or a refactor into a
+    computed value has to fail loudly here, not yield None and pass vacuously.
+    That vacuity is the exact failure mode this guard exists to close.
+    """
+    tree = ast.parse(_SCOPE_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.AnnAssign):
+            continue
+        target = node.target
+        if not isinstance(target, ast.Name) or target.id != "KNOWN_PROJECT_ROOTS_ENV":
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return node.value.value
+        return None
+    return None
+
+
+def test_scope_known_project_roots_env_is_readable_from_source():
+    """The ast read finds a non-empty str, so the two guards below cannot go vacuous.
+
+    Asserted separately from the invariants it feeds because the failure modes
+    are different and want different messages: this one says "the helper can no
+    longer see the constant", the two below say "the constant is now in a place
+    it must not be".
+    """
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name, (
+        f"Could not read KNOWN_PROJECT_ROOTS_ENV as a string literal from "
+        f"{_SCOPE_PATH}. It was renamed, moved, or made computed. Without it "
+        "the two guards below silently stop checking anything — repair the "
+        "read rather than deleting them, and do NOT switch to importing "
+        "fused_memory: it is not installed in the `uv run --project shared` "
+        "environment this suite runs under."
+    )
+
+
+def test_scope_known_project_roots_env_is_disjoint_from_required_service_directives():
+    """The CONSUMER's variable name is not on this checker's required list.
+
+    Anchors the (ii) invariant on the module that actually reads the variable,
+    so it keeps meaning something even if the renderer's spec changes. Same
+    hazard, stated from the other end: put this name on the required list and
+
+      1. find_drift tests EXACT WHOLE-LINE membership, so on a host whose value
+         differs from the committed one the required line reads as MISSING;
+      2. --fix appends it after the LAST [Service] line;
+      3. systemd applies Environment= in file order with LAST-WINS, so the
+         appended line BEATS the host's;
+      4. the checker reports parity and exits 0.
+
+    The projects dropped from the set stop being known to reconciliation, and
+    nothing reports it.
+    """
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name
+
+    mod = _load_checker()
+    required_env_vars = {
+        directive[len("Environment=") :].split("=", 1)[0]
+        for directive in mod.REQUIRED_SERVICE_DIRECTIVES
+        if directive.startswith("Environment=")
+        and "=" in directive[len("Environment=") :]
+    }
+
+    assert name not in required_env_vars, (
+        f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV as "
+        "reconciliation's project-root scope AND exact-matched by "
+        "REQUIRED_SERVICE_DIRECTIVES. On a host whose value differs from the "
+        "committed one, find_drift reports the required line as missing, --fix "
+        "APPENDS it after the last [Service] line, systemd's last-wins "
+        "silently beats the host's value, and the checker then exits 0 — so "
+        "projects silently stop being known to reconciliation "
+        "(reconciliation/harness.py raises UnknownProjectError for a project "
+        "outside the set). See "
+        "test_a_required_known_project_roots_line_would_reclobber for the "
+        "demonstration. The remedy for a host-local value is the renderer's "
+        "preserve set, not this list."
+    )
+
+
+def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
+    """The JOIN between the two anchors: the renderer still preserves what scope.py reads.
+
+    This is what makes the disjointness invariant non-vacuous. If the renderer
+    ever stopped preserving this name while scope.py went on reading it, the
+    (ii) guard's `preserved` set would no longer contain it, the intersection
+    would be empty for the wrong reason, and the hazard would be reopened under
+    a passing test. That state is precisely what goes red here.
+    """
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name
+
+    preserved = {
+        preserved_name
+        for spec in render_dashboard_unit.UNITS.values()
+        for preserved_name in spec.host_local_environment
+    }
+
+    assert name in preserved, (
+        f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV but no "
+        f"render_dashboard_unit.UNITS spec preserves it (preserved: "
+        f"{sorted(preserved)}). Either a re-render now silently drops this "
+        "host's reconciliation scope, or the variable moved and this guard "
+        "plus ::test_preserved_names_are_disjoint_from_required_service_"
+        "directives are both now checking nothing."
+    )
 
 
 # ---------------------------------------------------------------------------

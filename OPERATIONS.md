@@ -227,8 +227,32 @@ duration by runner, host occupancy, heartbeat queue depth, and the
 `merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
 `--speculation` (depth distributions, the chain-dead void rate, and a
 cross-project void-rate block) and `--chains` (deep merge-ahead chain
-landings and observed chain lengths). `--json` emits the same numbers
+landings and observed chain lengths — see
+[§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap)
+for the mechanism those numbers measure). `--json` emits the same numbers
 keyed by project root and nothing else on stdout.
+
+`--chains` reads three event fields, and naming them is how you get from
+the report back to the raw `runs.db` rows: `merge_finalized.state`, which
+defines a landing (`state == 'done'` — every other row is skipped outright)
+and so supplies the denominator in both the chain-landed share and the "of
+N" on the same report line; `merge_finalized.landed_via_chain` (an int **per
+landed item**, summed to give items-landed-via-chain — it is neither a
+boolean flag nor the chain size); and `merge_verify.chain_items` (the
+1-indexed count of items in the verified tree, so a two-link chain reads
+`chain_items == 3`, and a non-chained verify is a chain of *one* rather than
+a missing measurement). Two readings
+`scripts/merge_lane_throughput.py::compute_chains` already encodes will
+otherwise catch you out: the mean chain length averages only the **deep**
+verifies (`chain_items > 1`), because including the chains of one would drag
+it toward 1 and hide how long real chains get; and a non-numeric
+`landed_via_chain` — a bool included, deliberately, since a payload written
+as a flag would sum to a wrong number — is counted in
+`n_unusable_landed_via_chain` rather than coerced. A float *is* numeric and
+*is* coerced (truncated), so a non-zero unusable count means a bool or a
+non-number, never a fraction. `chain_items` supersedes the probe-era `depth`
+label (PRD decision 8) — historical `depth >= 2` events stay excluded from
+calibration.
 
 It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
 writes nothing, files nothing, escalates nothing and emits no events, so
@@ -528,6 +552,59 @@ worker for the same ref. Always go through `/merge-queue`:
    genuinely unreachable (orchestrator not running) — never as a shortcut
    when the queue is merely slow.
 
+### Deep merge-ahead chains (`merge_deep.chain_cap`)
+
+Ordinarily one merge verify covers one item. When the queue holds **two or
+more** mergeable items and `merge_deep.chain_cap > 0`, the second verify
+slot instead builds a **chain**: it claims one pooled `_spec-N` lane, merges
+the queued items onto the head in submission order inside that single lane
+(truncating at the first textual conflict), verifies only the resulting
+**tip**, and on a pass CAS-lands the whole verified prefix in submission
+order. One passing verify can therefore land k items — and it is not a
+statistical bet, because the suite that passed ran on the exact cumulative
+tree being landed.
+
+**The knob.** `merge_deep.chain_cap` bounds how many queued items one chain
+may contain. The shipped default is **`0`**, which is the **kill switch**:
+the gate can never open, so no chain code executes on any dispatch path and
+merging is byte-identical to pre-feature behaviour. Every `merge_deep` leaf
+is green-tier hot-reloadable (see [§6](#6-config-reload-vs-restart)), so
+enabling, retuning and killing the feature are each one `reload_config`
+away — no restart, no drained queue.
+
+**Cap staging is a plan, not a live value.** `plans/deep-merge-ahead-prd.md`
+decision 6 stages the cap `6` → `32` (the study-validated depth, then
+"uncapped in practice"), but that rollout is owned by tasks ζ (reify canary
+at 6), η1 (the 7-day predicate) and η2 (promote to 32), and the cap is
+per-project config. The stock default is still `0` everywhere. To learn
+whether chains are live on a unit, read that project's
+`dark-factory-orchestrator.yaml` — do not infer `6` from the PRD.
+
+**Failure policy: halve on fail, reset on pass.** A tip failure says nothing
+about *which* item broke, so the next round targets `max(1, ⌊d/2⌋)` against
+the depth actually built, and consecutive failures log-bisect (6 → 3 → 1)
+toward the bad item. **Any** pass resets the state. Each round recomputes
+`target_depth = min(queue_len, chain_cap, halving_state)` afresh, so a reset
+re-derives the target from the queue as it is *now* rather than replaying a
+stale length. At the `d=1` floor no chain is built at all and the round
+takes today's adjacent verify — the floor is byte-identical **by
+construction**, not by careful mimicry. A failed tip lands nothing *via the
+chain* and mutates the queue not at all: its items stay queued and take
+their normal sequential path. The round is not therefore a zero-landing
+round — the head is never chained, so its own verify proceeds untouched and
+can still land in that same round; the head's verdict is discarded only on a
+tip **pass**, where the tip's tree strictly contains it.
+
+**What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
+and `reload_config`; that is the whole intervention, and it takes effect on
+the next dispatch round. To judge whether to raise it, read the `--chains`
+report (see
+[§"Reading the merge-lane throughput baseline"](#reading-the-merge-lane-throughput-baseline)).
+The authoritative contract — the dispatch and landing invariants,
+truncate-at-conflict semantics, and the stale-CAS abort — is
+`plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
+it, not a second copy.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
@@ -699,6 +776,13 @@ takes no arguments: it always re-reads that process's own
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
   false-positive L2 can be cleared on a live unit)
+- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+  [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
+  `0` is the shipped default and the feature's kill switch). Green-tier on
+  purpose, for the reason the `config_key_census.*` bullet above and the
+  `mem0_update.enabled` bullet below both give: a kill switch you can only
+  pull by restarting the unit is not a kill switch. Enable, retune and
+  kill all land on the next dispatch round.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -1158,6 +1242,27 @@ Both staleness and the coordinator invoke the same
 once: the script is the sole on-disk writer of the shared clock, and only on
 its all-units-verified-fresh exit-0 path.
 
+**What a clock file contains.** The stamp is
+`{ts, iso, source, pytest_session}`. `ts` (integer epoch) is the only field
+any reader extracts; `iso` is the same instant rendered for a human. The two
+provenance fields are for triage:
+
+- `source` — which writer stamped it, `restart-all-orchestrators.sh` or
+  `orchestrator-watchdog.py`.
+- `pytest_session` — empty for every genuine deploy. It is non-empty ONLY
+  when a pytest session was an ancestor of the write, i.e. a test suite
+  falsified a real clock. A non-empty value in a clock file on this machine
+  means the 8h staleness backstop was disarmed by a test, not by a deploy.
+
+**Triage: a deploy-clock message in a verify or merge-lane run.** A
+`DeployClockRedeployWarning` means a real redeploy stamped a protected clock
+while that run was in flight — the branch is not at fault and no action is
+needed. A run that still ERRORs at teardown with `falsified a REAL deploy
+clock` is either a genuine test-side falsification or an unattributable
+(provenance-free) write; the message's `Attribution:` line names which.
+`df_pytest_isolation.py::deploy_clock_change_report` is the authority on both
+verdicts and on why the two are told apart the way they are.
+
 **Drain behavior is NOT defined once, and the two tiers CAN both redeploy
 inside one 8-hour window.** Two corrections measured 2026-08-24/25:
 
@@ -1294,6 +1399,7 @@ directly, not just interactive sessions. Treat it accordingly:
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
 | MCP tools stop responding mid-session for every open Claude session | fused-memory was restarted while sessions were live — it's a single shared process, so every session's MCP connection is severed at once | Never restart fused-memory without explicit operator sign-off (it affects the whole fleet, not one project); expect to reconnect/restart affected sessions after a planned restart |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
+| A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_written` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 
 ---
 
@@ -1358,7 +1464,6 @@ cases, the same backing stores. **Check this table before adding a job** —
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
-| 04:30 | reify closure-staleness sweep + drain | `reify-closure-staleness-sweep.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
@@ -1366,149 +1471,25 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the two sections below for the 04:30 and 05:00 ones.
+for the 03:30 job; the section below for the 05:00 one.
 
-### Nightly reify closure-staleness sweep (04:30)
-
-**What it does.** Runs reify's deterministic-gate closure-staleness sweep,
-then drains the re-dispatch requests that sweep emitted — one job, in
-sequence, so the consumer always reads a directory the sweep has just
-refreshed.
-
-This is a **cross-repo seam**: reify ships the primitive, dark-factory wires
-the invocation. reify's
-`scripts/deterministic-gate-closure-staleness-sweep.sh` is read-only on all
-task state by design (its invariant L6); it adjudicates stranded rows and
-writes one request file per confirmed hit into
-`/home/leo/src/reify/data/redispatch-requests/`. dark-factory's
-`scripts/consume_redispatch_requests.py` performs the actual writes through
-the fused-memory MCP server, so every transition goes through the
-reconciliation-triggering path.
-
-**The normative contract is the reify script itself** — its
-`--emit-requests consumer contract` header block and `_write_request`. Not
-this section, and not reify's
-`docs/notes/deterministic-gate-closure-staleness-sweep.md` digest. Read the
-script before changing either half.
-
-| File | Role |
-|---|---|
-| `scripts/reify-closure-staleness-sweep.sh` | Wrapper: sweep, then consume |
-| `scripts/reify-closure-staleness-sweep.service` | `Type=oneshot` around the wrapper |
-| `scripts/reify-closure-staleness-sweep.timer` | `OnCalendar=*-*-* 04:30:00` |
-| `scripts/install-reify-closure-staleness-sweep-timer.sh` | Installer |
-| `scripts/consume_redispatch_requests.py` | The consumer |
-
-**The three actions**, fixed by the sweep's class of finding:
-
-| Class | Action | Write | Legal row status |
-|---|---|---|---|
-| `gate_closure` | `close` | `set_task_status('cancelled')` | `blocked` only |
-| `merge_verify_red` | `reverify` | clear claimant, then `set_task_status('pending')` | `blocked`, `in-progress` |
-| `unmet_dependency` | `redispatch` | clear claimant, then `set_task_status('pending')` | `blocked` only |
-
-The claimant clear goes **first**: once the row reads `pending` a competing
-dispatcher may stamp a fresh claimant that a late-landing clear would
-clobber (same ordering, and same reason, as the orchestrator's own
-stranded-blocked re-dispatch path in `scheduler.py`).
-
-**The guards.** Before each write the consumer re-reads the row and skips
-when it is already at the target status (an already-applied request is a
-no-op, not a second transition), when its status is outside the class's
-legal scope above, or when its `updatedAt`/`heartbeat_at` post-dates the
-request file's mtime — the row moved after the sweep observed it, so the
-next sweep re-adjudicates. The request body deliberately carries no
-wall-clock field (re-emission is byte-idempotent), which is why mtime is the
-recency signal. Every uncertainty skips: the fail-safe direction is always
-do-nothing.
-
-`--max-writes` (default 5) caps the blast radius. It counts write-bearing
-**attempts** — applied *plus* failed — not successes: the re-dispatch path
-clears the claimant before it flips the status, so a run whose flips are all
-being rejected still mutates every row it touches, and a cap keyed on
-successes alone would never engage on exactly that run. The remainder is
-reported as deferred and picked up next run.
-
-Applied requests are archived into a `consumed/` subdirectory —
-retraction-safe, since the sweep's retraction globs `redispatch-*.json` at
-the top level only. A failed apply leaves its file in place so the retry is
-immediate rather than waiting on re-emission. If the archive move itself
-fails the write still counts as applied and says so loudly; the next run's
-guard then skips the file as already-applied rather than re-transitioning
-the row.
-
-**Two things the consumer deliberately will not do.**
-
-1. **Re-derive the sweep's predicates.** None of the L1 heartbeat/claimant
-   liveness guard, the escalation terminal-allowlist oracle, merge-verify
-   ancestry, the dependency roll-up, or the corruption signatures is
-   reproduced on this side. There is one implementation of the
-   adjudication, in reify, where the evidence lives.
-2. **Act on a `CORRUPT-HOLD` row.** The sweep emits only on
-   `verdict=STALE` (its invariant L5), so a corrupt-hold row produces no
-   file at all — declining to read the sweep's stdout report is sufficient
-   to honour it. Those rows need the human git-history adjudication in
-   reify's `docs/notes/offline-lane-red-corruption-remediation.md` §4.
-
-**First run: dry-run before arming.** The installer deliberately does *not*
-kick an immediate run — unlike its two siblings, this job mutates the live
-reify task store. Read the planned writes first:
-
-```bash
-python3 scripts/consume_redispatch_requests.py --dry-run \
-    --requests-dir /home/leo/src/reify/data/redispatch-requests
-```
-
-Then arm the timer:
-
-```bash
-scripts/install-reify-closure-staleness-sweep-timer.sh
-```
-
-No `dark-factory-orchestrator.yaml` change and no orchestrator redeploy is
-involved in either step.
-
-**Reading the output.** Every line is prefixed
-`consume_redispatch_requests:` and the run ends with exactly one summary
-line — on **every** exit path, including a night that could not reach the
-server at all:
-
-```
-consume_redispatch_requests: task 5321 (gate_closure): close applied -> cancelled [escalation esc-5321-1 resolved 2026-07-29T04:11Z]
-consume_redispatch_requests: SUMMARY applied=2 skipped=7 failed=0 deferred=0 planned=0
-```
-
-The bracketed tail on an applied (or `--dry-run` `WOULD`) line is the
-sweep's own `evidence` string — the only statement of *why* that travels
-with a request, and worth reading before undoing anything, since the file
-itself is archived out of the way the moment the write lands.
-
-- `applied` — writes that landed (checked against the tool response, not
-  assumed from the absence of an exception: a JSON-RPC `error` envelope, a
-  FastMCP `isError` result, and an embedded `success: False` all count as
-  failures)
-- `skipped` — a guard declined, or the file failed validation; the reason is
-  on its own line above
-- `failed` — a write was attempted and did not land; the file stays put
-- `deferred` — `--max-writes` was reached
-- `planned` — `--dry-run` only: writes that *would* have been made
-
-```bash
-journalctl --user -u reify-closure-staleness-sweep.service -n 100
-systemctl --user list-timers reify-closure-staleness-sweep.timer
-```
-
-The service always exits 0 on a valid invocation: a recurring `oneshot` that
-can fail enters systemd `failed` state and stays there, silently stopping
-the whole nightly job. Per-request failures are reported and counted
-instead, so a red run is found by reading the summary line, not the unit
-state.
-
-A night that could not run at all logs a `RUN FAILED` line ahead of its
-(zeroed) summary, and distinguishes the two cases it could be — `could not
-reach the MCP server` (a transport problem: check the fused-memory unit) vs
-`aborted on an unexpected error` (a bug in the consumer: read the exception
-type on that line). Requests are left in place either way.
+**04:30 is free.** The nightly reify closure-staleness sweep and its
+`consume_redispatch_requests` drain that used to hold that slot were retired by
+task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
+second, opposite-policy owner of the stranded-blocked population, and over the
+15 retained journal runs it cancelled 7 reify tasks as collateral. Its tracked
+units, wrapper, consumer and installer are deleted; the timer is **disabled**
+on this machine, but its unit files are **still installed** at
+`~/.config/systemd/user/reify-closure-staleness-sweep.{service,timer}` — the
+retirement ran sandboxed and could not remove them (esc-5247-1 carries the
+`rm` + `systemctl --user daemon-reload` an operator should run to finish the
+job). Until that runs, `systemctl --user enable --now
+reify-closure-staleness-sweep.timer` still re-arms the unit; its `ExecStart`
+names the deleted wrapper, so once this retirement is on main it fails
+`203/EXEC` nightly rather than sweeping anything. That population is now owned
+by the orchestrator scheduler's `_phase_redispatch_stranded_blocked`, the
+harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
+reconciliation.
 
 ### Nightly canonical/topic coverage census (05:00)
 
@@ -1964,7 +1945,14 @@ whole `session_resume` submodel hot-reloads via `reload_config` ([§6](#6-config
 Distinct from `session_resume.enabled`, which kills the whole feature at the
 harness guard: turning restoration off alone keeps the veto, its WARNING and
 the events below, so you do not go blind on the population while you have it
-disabled. It deliberately does **not** consult `transcript_archive.enabled` —
+disabled. Since task 3730 it also withholds the archive from the *eligibility*
+predicate ([below](#reachability-outranks-freshness-and-the-age-bound-that-outranks-reachability)),
+so pulling it reverts that change in full — an archive-only-reachable session
+goes back to falling back rather than being armed for a resume this same switch
+has just told the arm site not to rehydrate. The `archive_available` field on
+the fallback event is deliberately **not** withheld with it: that field is the
+population you would otherwise go blind on, and it is the only thing in
+`runs.db` that tells "no archive at all" from "restoration switched off". It deliberately does **not** consult `transcript_archive.enabled` —
 with archival off there is simply nothing on disk to find, and gating on the
 flag would add a second source of truth that can disagree with the filesystem
 (archival on last week still leaves restorable archives today).
@@ -2033,6 +2021,118 @@ returning the same empty-handed `None` an absent archive does.
 coverage is a red herring. Note `restore='published'` should never appear at
 all: a published restore satisfies the corroboration, so no veto — and no
 event — follows it. Its absence is not evidence about archive coverage.
+
+### Reachability outranks freshness, and the age bound that outranks reachability
+
+Task 3730 changed *what makes a recovered session eligible to resume*. Before
+it, the harness guard asked "is this sidecar fresh, and is its transcript still
+in the live config dir?" — and the live config dir is deleted on every
+crash-recovery path: `TaskWorkflow.run` registers the `cleanup_config_dir`
+teardown entry from
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._on_terminal_cleanups`,
+which runs on every terminal exit, while `session_preserved` keeps the sidecar.
+So the guard was asking a question that the crash it exists to recover from had
+already answered "no".
+
+**What it asks now.** A durable archive entry counts as *reachability*: if the
+transcript is in the archive, the session is neither `stale` on age nor
+uncorroborated, because an archived transcript does not decay with wall-clock.
+`session_resume.freshness_window_secs` (24h) therefore applies **only when no
+archive exists**. The lookup is done once per dispatch by the guard
+(`orchestrator/src/orchestrator/harness.py::Harness._archive_available`) and
+feeds both the eligibility decision and the `archive_available` field on the
+fallback event, so the two can never disagree about what is on disk. They are
+not the same reading: eligibility additionally requires
+`session_resume.restore_from_archive` (the knob described in the previous
+subsection), because an archive nothing will rehydrate does not make a session
+reachable — while the event reports the on-disk answer either way.
+
+**The backstop.** `session_resume.absolute_resume_age_secs` (default
+`432000` = 5 days) rejects a sidecar past that age **regardless** of
+reachability, reporting the reason `aged_out`. Without it "an archive outranks
+freshness" would slide into "an archive means no age limit", and a sidecar that
+survived an arbitrarily long outage would resume into a world that had moved
+on. The two knobs are not redundant and neither is dead config: freshness is
+the tighter, archive-suppressible one; the backstop is looser and
+unconditional.
+
+**It is DERIVED, not chosen.** The number answers "past what sidecar age can no
+legitimate in-flight task still be running?", and a sidecar's `started_at` is
+stamped per *invocation*, so its age at re-dispatch is two terms, both measured
+from `runs.db` by
+`orchestrator/src/orchestrator/resume_age_bound.py::observed_resume_age_inputs`:
+
+Both terms are sampled over the same trailing 90 days, so neither can ratchet
+the bound up off history the fleet has already left behind:
+
+| term | what it is | measured 2026-09-07 |
+|---|---|---|
+| T1 in-flight | max `task_completed.duration_ms`, legitimate outcomes only (cancellations excluded — their durations reflect operator action) | 8.90 h over n=4,730 |
+| T2 downtime | max gap between consecutive `events` rows: the sidecar ages while nothing runs | 56.99 h over n=303,040 gaps |
+
+(The `n` for T1 is the pre-windowing population; scoping it to the same 90 days
+narrows the count — 2,993 rows on 2026-09-10 — without moving the maximum, so
+the derivation below is unchanged.)
+
+`required = ceil((T1 + T2) × 1.5)` = 355,803 s = 4.12 days; the shipped default
+is that rounded up to the next whole day. **T2 is why the bound must exceed the
+freshness window** — a physical reason, not a multiplier tuned until it cleared
+the constraint: T1 alone (8.90 h) cannot reach 24 h at any honest factor.
+
+`orchestrator/tests/test_resume_age_bound.py` re-derives this against the live
+`runs.db` on **every verify run** and goes red if the fleet outgrows the shipped
+default (trip point: T1 + T2 above 80 h, roughly a 3.3-day outage). When it
+fires it is telling the truth — re-derive the bound, do not raise the constant
+to silence it; an anti-inflation clamp in the same file fails a default raised
+high enough that no realistic fleet could trip the guard. **Green tier**: the
+knob hot-reloads with the rest of the `session_resume` submodel via
+`reload_config` ([§6](#6-config-reload-vs-restart)), with no `RELOADABLE_FIELDS`
+edit.
+
+**The reason vocabulary** on `session_resume_fallback`. `data.reasons` is a
+**sorted list of every** reason the session was rejected, not a first match — so
+a `GROUP BY 1` over it is a co-occurrence census, and a session can report two
+at once:
+
+| reason | means | actionable? |
+|---|---|---|
+| `stale` | Old **with no archive to redeem it** (age ≥ `freshness_window_secs` and nothing in the archive), *or* the sidecar could not be dated at all — a missing/unparseable `started_at` is never redeemed by an archive, because an age that cannot be computed cannot be bounded either. | Yes — ask why the archive is missing (work the archival subsection above). |
+| `aged_out` | Age ≥ `absolute_resume_age_secs`. The backstop, and the one age check an archive does not suppress. | No — this is the backstop working. Expect a batch of them after a long outage. |
+| `no_transcript` | No archive, and the live config dir survives but holds no transcript for this session (or no config dir / session id was ever stashed). | Yes — a genuine corroboration failure. |
+| `reseeded` | No archive, and the stashed config dir is *provably* gone (ENOENT/ENOTDIR): warm-lane acquire always re-seeds from base, wiping `<lane>/.task/`. | No — expected. |
+| `capped` | `resume_count` ≥ `max_resumes_per_task`. Deliberately **mediation-agnostic**: an archive-mediated resume is throttled by the same counter, because the archive is transport, not a fresh start. | No — by-design throttling. |
+
+None of these feeds the fallback-storm escalation; all five are by-design
+(`_BY_DESIGN_SESSION_RESUME_REASONS`), so a week-old batch of sidecars after an
+outage cannot page you.
+
+```sql
+-- How often is the backstop firing, and with what beside it?
+SELECT json_extract(data, '$.reasons') AS reasons,
+       json_extract(data, '$.archive_available') AS archived,
+       COUNT(*)
+  FROM events
+ WHERE event_type = 'session_resume_fallback'
+   AND json_extract(data, '$.reasons') LIKE '%aged_out%'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+**Two baselines that are stale in the older task records, corrected here.** The
+task 3730 record cites "0 successes against 217 fallbacks" and task 3221;
+re-measured against `runs.db` on 2026-09-07 the true lifetime figures are **6**
+`session_resume`, **432** `session_resume_fallback` and **6**
+`session_resume_failed` (3221 is cancelled). And the archive-ignored rate — the
+share of post-3578 fallbacks that carried a recoverable archive the predicate
+never consulted, which is the measurement this change acts on — now stands at
+**159 of 172 (92%)**, measured 2026-09-07. It has been re-measured three times
+at growing sample size and has not moved: 32/34 in the original disposition,
+92/101 (91%) on 2026-09-04, 159/172 (92%) today. A finding that stable is not
+sampling noise. Expect the
+fallback count to fall and `session_resume` to rise as the fleet redeploys onto
+it; a `session_resume` that does **not** rise means the archive-mediated path is
+not firing. Check `session_resume.restore_from_archive` first — with it off the
+path is *meant* not to fire — then the query above (with `archive_available`
+true beside a non-`aged_out` reason).
 
 ---
 

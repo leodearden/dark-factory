@@ -580,6 +580,7 @@ _RECON_REPORT_PLACEHOLDERS = {
     'actionable': '<actionable>',
     'task_id': '<task_id>',
     'flag_type': '<flag_type>',
+    'supersedes': '<finding_id of the earlier finding this one makes historical>',
     'key': '<key>',
     'value': '<value>',
     'delta': '<delta>',
@@ -703,7 +704,11 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' filed, not overriding a verdict a finished stage already closed.'
         ' Structured errors: run_id_unknown / finding_unknown /'
         ' report_already_completed. Retract and re-file rather than filing a'
-        ' correction alongside a finding you know to be wrong.\n'
+        ' correction alongside a finding you know to be wrong — that applies to'
+        ' your OWN stage. To retire an EARLIER stage\'s claim, which this tool'
+        ' refuses, pass `supersedes=<that finding_id>` on `add_finding` instead:'
+        ' it marks the old finding historical and keeps it readable rather than'
+        ' destroying it.\n'
     ),
     'cite_entity': (
         '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
@@ -967,6 +972,7 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
         ('actionable', False),
         ('task_id', False),
         ('flag_type', False),
+        ('supersedes', False),
     ),
     'delete_finding': (('run_id', True), ('finding_id', True)),
     'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),

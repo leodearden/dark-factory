@@ -737,6 +737,21 @@ def _query_recon_report_findings(
     record can never hide a ``systemic_pattern`` finding from Stage 2 through
     this path.
 
+    Findings carrying ``superseded_by`` ARE dropped here (task-4653).  A
+    supersession is not an external suppression but an explicit in-run
+    retirement asserted by a LATER finding of the same run, so re-injecting
+    one would raise a claim the run itself has already refuted as a live
+    instruction.  The filter lives at this poll site, not in
+    ``get_findings_for_run`` — same precedent that method's own docstring
+    records for the task-2453 guard — so the channel stays genuinely raw.
+
+    Dropping rather than merely deprioritising is load-bearing:
+    ``assemble_payload``'s poll loop dedups FIRST-WINS on signature/content
+    fingerprint, so a superseded finding appearing earlier in this run-scoped
+    list would SHADOW its own replacement; and ``_format_flagged`` truncates
+    the TAIL at a fixed char budget, so a retained-but-dead row can also push
+    the live one off the end.
+
     Reached via duck-typed method call (no import of ``ReconReportState`` —
     mirrors ``base.py``'s ``_active_rrs.get_assembled_report`` usage, avoiding
     a server←reconciliation import).
@@ -757,7 +772,11 @@ def _query_recon_report_findings(
             extra={'run_id': run_id},
         )
         return []
-    return [f for f in findings if f.get('category') in categories]
+    return [
+        f
+        for f in findings
+        if f.get('category') in categories and not f.get('superseded_by')
+    ]
 
 
 def _compute_stale_flags(
@@ -3782,6 +3801,18 @@ class TaskKnowledgeSync(BaseStage):
         terminal_task_ids = await _resolve_terminal_task_ids(
             self.taskmaster, self.scope, run_id,
         )
+
+        # WARNING — this stat counts SQLite recon_ledger ROWS ONLY. It never
+        # reaches Mem0, and a healthy value here says NOTHING about whether
+        # the Mem0 stage1_flag_marker pool is draining. The Mem0-pool
+        # counterpart is 'stale_mem0_flag_markers_gc_swept' (emitted ~35
+        # lines below); the two address disjoint populations. Reading a
+        # healthy recon_markers_gc_swept as evidence that the Mem0 markers
+        # are being collected is precisely the inference that produced the
+        # task-2228 W5-κ regression, which deleted the two Mem0 sweeps and
+        # left that pool with no collector at all while this stat kept
+        # reporting green. See RCA §4.3,
+        # plans/reify-flag-marker-backlog-rca-2026-07-22.md.
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
             terminal_task_ids=terminal_task_ids,

@@ -20,43 +20,20 @@ booleans and on flips. ``k`` appears only as a metric parameterisation.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_retrieval_probe.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'memory_eval_retrieval_probe'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 # ---------------------------------------------------------------------------
@@ -3612,7 +3589,7 @@ class TestSeededInducedRegression:
     """Delete the canonical; the tripwire item must flip. That is the signal."""
 
     def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
-        self, monkeypatch, probe_config, probe_project_id,
+        self, probe_config, probe_project_id,
     ):
         """A leaked collection under the default prefix would live forever.
 
@@ -3623,24 +3600,19 @@ class TestSeededInducedRegression:
         this module's docstring and the merge lane's ``-m 'not integration'``
         selection. ``mem0_collection_name`` is pure, so ask it directly.
         """
-        import importlib.util as _ilu  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-
         from fused_memory.models.scope import Scope  # noqa: PLC0415
 
         collection = Scope(project_id=probe_project_id).mem0_collection_name(
             probe_config.mem0.collection_prefix,
         )
 
-        path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
-        spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
-        assert spec is not None and spec.loader is not None
-        cleanup = _ilu.module_from_spec(spec)
-        # setitem, not a bare assignment: exec_module needs the module visible
-        # in sys.modules, but leaving it there leaks into the rest of the
-        # session. monkeypatch undoes it at teardown.
-        monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
-        spec.loader.exec_module(cleanup)
+        # The SAME module object conftest.py's session lease fixture installs
+        # under this key, not a second copy of it: the key is shared, so a
+        # local re-exec is what would have leaked (task 3895).
+        cleanup = load_script_module(
+            SCRIPT_PATH.parent / 'cleanup_test_collections.py',
+            mod_name='cleanup_test_collections',
+        )
 
         assert collection.startswith(cleanup.PREFIX)
 

@@ -271,6 +271,18 @@ and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line
 every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
 parse.
 
+**Second stderr marker — `WATCHER_NTFY_OUTCOME: FAILED esc=<id> url=<url>: <error>`:** the phone
+push for that escalation was dropped. The queue item itself is **unaffected** — it was still
+printed to stdout and is still pending on disk — and the push failure does not change the exit
+code, so the arm still reports `WATCHER_REARM_OUTCOME: FIRED exit=0` beside it. Nothing is lost
+that you need to recover; what is lost is the user's out-of-band ping, so **tell them their phone
+trigger is down** rather than silently relying on it. One line is emitted per dropped push, which
+is how an outage is counted: a single line is a one-off (a flaky POST), the same marker recurring
+across successive arms is an ntfy outage. There is deliberately no success counterpart — a line
+here always means a drop. The line travels the watcher's logging stream, so it carries its
+level as a prefix (`ERROR: WATCHER_NTFY_OUTCOME: FAILED ...`) — match on the marker as a
+substring rather than anchoring at the start of the line.
+
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
 returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
 `timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
@@ -743,7 +755,18 @@ mechanical gate to check whether the at-block-time dry-run investigation found a
 > tag was wrong).
 
 Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remaining`,
-`already_attempted`, `head_sha`, `main_sha`, `age_seconds`.
+`already_attempted`, `head_sha`, `main_sha`, `age_seconds`, `age_state`.
+
+`age_state` (`parsed`|`unparseable`|`absent`) says WHY `age_seconds` is `null` when it is.
+The implication runs ONE way: a non-`parsed` `age_state` can never accompany
+`verdict == "fresh"` — the gate never certifies a proposal fresh without a parsed
+`investigated_at` — but it does NOT imply `abort`. The age check is deliberately last, so an
+earlier, more specific check can return `drift` first: a proposal missing its sha anchor
+returns `drift` with `age_state: "absent"`. Branch on `verdict` alone; read `age_state` as the
+diagnostic explaining a null `age_seconds`, never as evidence of which verdict you got.
+
+> A fourth value, `no_clock`, exists in the gate for in-process callers that pass no clock.
+> `check` always resolves one, so the CLI documented here never emits it.
 
 **Decision table:**
 
@@ -807,7 +830,13 @@ anchor at re-investigation start:
 ```bash
 head_sha=$(git -C <worktree> rev-parse HEAD)
 main_sha=$(git -C <worktree> rev-parse main)
+investigated_at=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
 ```
+
+Take `investigated_at` from that command rather than writing one yourself. It MUST carry a UTC
+offset: the gate subtracts it from an aware clock, so a naive timestamp
+(`2026-09-16T12:00:00`) raises, yields `age_state: "unparseable"`, and hard-ABORTs the re-gate
+— dead-ending the very recovery path this section exists to complete.
 
 When the sub-agent returns `{proposal_text, files_referenced, risk_label}`, build a proposal
 entry mirroring `_build_entry` success-path keys and append it via
@@ -819,7 +848,7 @@ entry mirroring `_build_entry` success-path keys and append it via
   "risk_label":       "<from sub-agent>",
   "files_referenced": ["<from sub-agent>"],
   "block_reason":     "<original block reason>",
-  "investigated_at":  "<ISO now at re-investigation start>",
+  "investigated_at":  "<$investigated_at from above — UTC ISO-8601 WITH offset>",
   "timestamp":        "<ISO now>",
   "head_sha":         "<captured above>",
   "main_sha":         "<captured above>"
@@ -1027,13 +1056,25 @@ own framing.** The two are different things and the distinction is the whole poi
 - Framing byte-identical to what the record already says is **not** re-recorded, so every entry
   present is a genuine reframing rather than a re-promote echo.
 
-Two counters say what was NOT kept — check them before treating the list as complete:
+A set of counters says what was NOT kept — check them before treating any of these lists as
+complete. Each is a durable record field you can read straight off `get_escalation(id)`, so the
+loss is always assertable from the record rather than being log-only:
 
 - `amendments_truncated > 0` — older entries were shed at the cap (oldest-first). The record's own
   original framing is unaffected; only intermediate reframings were lost.
 - `amendments_chars_elided > 0` — individual fields were long enough to be clipped at the per-field
   cap. Elision is marked in-band (`[... N char(s) elided ...]`), so a field ending in that marker is
   the head of what was submitted, not all of it.
+- `root_cause_variants_truncated > 0` — the oldest distinct **pre-canonical** root-cause spellings
+  were shed at the 20-entry cap (oldest-first). The TRUE distinct count is
+  `len(root_cause_variants) + root_cause_variants_truncated`. Weigh this one heavily: over-folding
+  is the exact failure this set exists to catch, so a non-zero value means the over-fold evidence is
+  under-reported **precisely when there is most of it**.
+- `dedupe_children_truncated > 0` — the oldest **non-head** child ids were shed at the 200-entry
+  cap, which is head-preserving (the first 20 are always kept). The TRUE provenance total is
+  `len(dedupe_children) + dedupe_children_truncated`. `dedupe_count` — the load-bearing recurrence
+  signal — is **not** capped and is unaffected, so a truncated `dedupe_children` never understates
+  how often the cluster recurred, only which ids you can name.
 
 A sustained burst of truncation files its own `info` infra escalation (under the synthetic
 `l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
@@ -1075,9 +1116,20 @@ question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be cl
 last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
 close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
 `root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
-question are indistinguishable. Until task 4377 lands `pin_declared_by` as the machine-readable
-opt-out, the only protection is reading the record and its companions before proposing any
-disposition.
+question are indistinguishable. The machine-readable marker now exists (task 4377): a record whose
+**`pin_declared_by`** is non-empty has been declared load-bearing, and `resolve_issue` refuses
+every non-`park` action on it — and on any L2 whose cascade would close it — with
+`{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so read it
+on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
+`get_escalation`. Read what `pin_declared_by` NAMES and consult it — `acknowledge_declared_pins`
+exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
+check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
+it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
+companions before proposing any disposition remains the protection. Note also who can WRITE the
+marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
+(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
+likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
+appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
 permission a second time to do the bookkeeping on a decision he has already made and that has
@@ -1105,10 +1157,11 @@ esc-3105-5 fails at item 5 and keeps working exactly as it does today.
    enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
    work landed hours ago with the record still open is terminated for this purpose. If it may still
    be running, leave the record and note it.
-5. **The record is NOT a pin.** `pins_recovery` is empty, `root_cause` is not a
-   `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same task.
-   **This is the protection that must not be weakened** — if any of the three is unclear, treat the
-   record as a pin and stop.
+5. **The record is NOT a pin.** `pin_declared_by` is empty, `pins_recovery` is empty, `root_cause`
+   is not a `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same
+   task. **This is the protection that must not be weakened** — if any of the four is unclear, treat
+   the record as a pin and stop. (A non-empty `pin_declared_by` is refused by `resolve_issue`
+   regardless; `acknowledge_declared_pins` is never the answer on this path.)
 6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
    task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
    look sideways before moving on" under "Resolving Escalations" below).
@@ -1130,7 +1183,7 @@ exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing 
 now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
 briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
 — but that session ran out of context before closing the record, so the L2 sat pending with its
-question already answered. `pins_recovery` empty, `root_cause` the substantive
+question already answered. `pin_declared_by` empty, `pins_recovery` empty, `root_cause` the substantive
 `design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
 `esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
 
@@ -1264,7 +1317,8 @@ Agent found it depends on work that isn't done yet.
 
 Architectural or design questions. These already failed steward auto-resolution — they're genuinely ambiguous.
 
-**Always escalate to the human:**
+**Always escalate to the human**, except for the narrow self-close case defined in "Standing rule:
+accept verified info-level design deviations" below — check that subsection first:
 1. Present the concern with full context
 2. Leave the escalation pending — the open escalation record IS the durable record that something
    needs doing
@@ -1286,6 +1340,56 @@ triage-ack annotation" and the "Ruled-elsewhere check" above) — never a predic
 record's own pending status. If a probe fires, the ask flips from "human must decide" to "human
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
 the record via amendment. This applies equally to `risk_identified` parks below.
+
+#### Standing rule: accept verified info-level design deviations (Leo, 2026-09-17)
+
+The watcher may close a `design_concern` itself, without parking it, **only when ALL of these
+hold**:
+
+1. **Kind.** Severity `info`, never `blocking`/`critical`/`urgent`, and never a `milestone_gate`.
+2. **After the fact.** It asks the human to ratify a deviation an agent has **already made**. The
+   agent is an architect, planner or amendment pass, and the deviation is from a frozen plan, a
+   reviewer suggestion or a prescribed approach. It is not a choice about what happens next.
+3. **Evidence checked.** The deviation's reason is measured or documented, AND the watcher has
+   checked it itself against the diff, plan, code or test output. Never take it from the record's
+   own text.
+4. **Nothing waits on it.** The subject task is not blocked on this record, and the record is not
+   a pin: `pin_declared_by` is empty and `root_cause` is not `veto-pin-do-not-close:*`.
+5. **Accept is enough.** After checking, the answer is "accept as done" with no follow-up work.
+6. **It overrides nothing of the human's.** Accepting does not:
+   - contradict an existing ruling;
+   - touch a HOLD or a milestone gate;
+   - drop scope a task was meant to deliver;
+   - change a persisted, public or cross-project contract away from what a PRD or ruling
+     specified;
+   - touch security or sandboxing;
+   - cancel or delete work.
+
+**When all hold:**
+- `resolve_issue(action='close_only')`, which leaves the task untouched. The `resolution` names
+  the deviation and the evidence checked, and says "accepted under the standing rule (Leo,
+  2026-09-17)".
+- Append a one-line dated note to the task's `details` (`update_task(..., append=True)`) so the
+  acceptance is visible from the task record. An escalation's resolution is not reachable from the
+  task.
+- Report it to the human in the next message as one line: id, what was accepted, what was
+  checked. A cockpit DecisionRecord already filed for it closes through `reap-decisions`.
+
+**Otherwise**, meaning any condition fails, the evidence cannot be checked, or the recommendation
+is anything but accept, use the normal park procedure above.
+
+**Limits.** A second such escalation on the same task, or more than 3 qualifying in one day, goes
+to the human as a pattern instead: a stream of deviations suggests the planning itself is off. The
+human can revoke this rule at any time.
+
+**Worked examples (2026-09-17).**
+- **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
+  `entity_types` reaches the dedupe decision. The watcher confirmed against the installed
+  `graphiti_core` that `resolve_extracted_nodes` takes no `custom_extraction_instructions` and
+  that `prompts/dedupe_nodes.py` never uses it.
+- **Excluded: esc-4811-3.** "Fixture expansion (plan item 4) is not deliverable" is a *scope item
+  not delivered*, bearing on a reason behind the human's write_triage HOLD. That fails condition 6
+  even though it is info-level and well-evidenced, and its task was blocked on it (condition 4).
 
 ### `risk_identified` (info)
 
@@ -1444,6 +1548,13 @@ mcp__escalation__resolve_issue(
 ```
 
 ### C1 — `action` semantics (single source of truth)
+
+Scope: this is `resolve_issue`'s HANDLER-side `action` parameter (`server.py::RESOLVE_ACTIONS`).
+`escalate_blocker`'s *response* also carries an `action` key, but that is an orthogonal
+filer-facing vocabulary (`terminate_cleanly` / `keep_driving`,
+`escalation.models.FILER_ACTIONS`, described in DESIGN.md) which merely shares the key name —
+you never receive one, since this skill resolves escalations and never files them, and none of
+its values may be passed to `resolve_issue`.
 
 | `action` | Record disposition | Live workflow | Task status effect | Intent |
 |---|---|---|---|---|

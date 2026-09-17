@@ -1,7 +1,12 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
-max_concurrent_tasks: 48
+# 48 -> 24 (Leo, 2026-09-11, note on esc-codex-mcp-config-3). With
+# verify_admission_task_slots: 1, most of the 48 slots were held by tasks that
+# had finished implementing and sat in verify, measured at 44 of 48, several for
+# 8h+. Each held its dispatch slot while contributing ~1.8 test legs to the
+# single-slot admission queue. Red tier: takes effect at restart.
+max_concurrent_tasks: 24
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -67,14 +72,46 @@ lock_depth: 12
 # fan-out for non-prefixed source, this command rarely fires; when it does
 # (root conftest.py changes), the fan-out keeps it safe.
 # task 2361: worker-kill de-flake + coverage. Every segment appends
-# --timeout=300 (CLI overrides each subproject's pyproject.toml timeout=60):
-# orchestrator/fused-memory run pytest-xdist with a 60s per-test timeout, and
+# --timeout=300 (a CLI --timeout overrides each subproject's pyproject.toml
+# `[tool.pytest.ini_options].timeout`, which was 60 when this was written and
+# is now itself 300 — see shared/pyproject.toml, 2026-09-12):
+# some segments run pytest-xdist, and
 # under host CPU oversubscription a starved xdist worker crosses that ceiling,
 # gets os._exit()'d by pytest-timeout's thread method, and
 # --max-worker-restart=0 turns that into a false-failing per-test "node down"
-# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
-# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
-# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# on whatever test happens to be running. A uniform ``-n`` cap on THIS chain was
+# rejected and stays rejected: ``-n`` errors with "unrecognized arguments" on any
+# segment whose member does not declare pytest-xdist, and not every member does.
+# Task 5408 shrank that set without emptying it — dashboard, escalation and
+# cockpit joined orchestrator and fused-memory. WHICH members do is deliberately
+# not restated here, because a list like that drifts silently. What is gated
+# instead, stated at exactly its real width: a pytest leg that DECLARES ``-n``
+# in its own config — the module config's own argv, or the addopts of the member
+# its uv selector names — must declare the plugin. That is derived structurally
+# from the module-config walk by
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_every_pytest_leg_running_workers_declares_the_plugin.
+#
+# READ THAT NARROWLY, because it is NOT the whole population of legs that end up
+# running ``-n``, and the difference is live today. ``verify_admission_pytest_n``
+# below is set to "8", and verify.py's ``_with_pytest_numprocesses_str`` appends
+# ``-n 8`` to EVERY pytest leg at the roles ``shared.verify_admission
+# .is_gated_role`` names (task, background) — a leg that declares the flag
+# nowhere still receives it. MEASURED on the task-5408 tree by running the
+# production parser over the live commands: sampler's
+# ``uv run --directory sampler pytest tests/ ...`` renders as
+# ``cd sampler && uv run pytest ... -n 8 tests/`` while
+# sampler/pyproject.toml's dev group lists no pytest-xdist at all. It survives
+# only by the same ``uv sync --all-packages`` accident recorded for
+# psutil/sampler further down, and the guard above cannot see it. Filed as
+# follow-up ticket tkt_0RTMJWCW8D5E60N72FATP7EC8F (curator-assigned task id
+# pending), which proposes both halves: declare the plugin for sampler, and
+# widen the guard to count the injected ``-n`` when this knob is a literal. When
+# that lands, widen this paragraph back with it. The worker count
+# belongs in each member's own addopts regardless: there it travels with that
+# member's own timeout/dist settings and also governs a bare
+# ``cd <member> && uv run pytest tests/``, which a flag added here would not.
+# A 6th segment now also runs
 # the repo-root tests/scripts/ suite (not a workspace member, so never covered
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
@@ -126,10 +163,16 @@ lock_depth: 12
 # ``pytest tests/scripts/ scripts/tests/`` — the same two-directory form,
 # in the same order, as this segment — so a scripts/** diff is gated on
 # BOTH directories by its owning module config, under FULL_SUITE and under
-# merge-role merge_verify_breadth="full" alike. The two are kept spelled
-# identically deliberately, so this path and that one cannot drift into
+# merge-role merge_verify_breadth="full" alike. The two TARGET LISTS are kept
+# spelled identically deliberately, so this path and that one cannot drift into
 # different notions of "the scripts suites"; if you widen one, widen the
-# other. That coupling is GATED, not merely asserted here —
+# other. Their FLAGS are not coupled and never were — that module config carries
+# --tb=short/-q/--import-mode=importlib this segment does not, and task 5408
+# added `-n auto --dist loadgroup` there without parallelising this fallback
+# chain (doing so would need every member in it to declare pytest-xdist, which
+# is the same reason the uniform `-n` cap above stays rejected).
+# The TARGET-LIST coupling — and only that one; the flags above are explicitly
+# NOT coupled — is GATED, not merely asserted here:
 # tests/scripts/test_scripts_module_config.py::
 # test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
 # this segment through the production config loader and fails if either side
@@ -645,9 +688,21 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #                                                 -------
 #     honest green path (at orchestrator p50)      ~2645
 #
-# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
-# and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s, and the
+# dashboard and cockpit estimates above were derived from it precisely because
+# those two segments also ran serial. TASK 5408 ENDED THAT: dashboard, escalation
+# and cockpit each declare pytest-xdist and carry `-n auto --dist loadgroup` in
+# their own addopts now, joining orchestrator and fused-memory. So three of the
+# figures above are OVER-estimates rather than wrong — measured on the 5408 tree
+# under those addopts: dashboard 2299 passed / 1 xfailed in 95.07s (estimated
+# ~190), escalation 1721 passed / 2 xfailed in 49.63s (estimated from its 123.29s
+# serial run), cockpit 346 passed in 16.78s (estimated ~44).
+# THE SUM IS DELIBERATELY NOT RE-DERIVED from those three. It already mixes
+# measured and estimated segments of two provenances, and 5408 re-measured only
+# the three segments it changed; the honest statement is that the headroom below
+# can only have moved in the SAFE direction. Whether 3600s can now be narrowed is
+# a measurement question for a whole-fleet run, not an arithmetic one.
+# 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
 # the 4902 re-measurement, and the margin has since collapsed.
 #
 # THE LOAD VARIANCE THAT HEADROOM HAS TO COVER is far wider than this comment
@@ -798,8 +853,47 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # the answer is scoping verify to the task's declared modules — which is what
 # tests/scripts/orchestrator.yaml now does for this very fallback path (task
 # 3350) — or sharding the suite (task 3353), not raising this number again.
-verify_command_timeout_secs: 3600
-verify_cold_command_timeout_secs: 5400
+# RAISED 3600 -> 7200 warm / 5400 -> 10800 cold (Leo, 2026-09-12), OVERRIDING the
+# paragraph immediately above, which says "not raising this number again". Recorded
+# as an override rather than by quietly deleting that sentence, because its
+# reasoning is still correct and is the thing that should eventually retire this
+# raise.
+#
+# WHY OVERRIDE IT NOW. That paragraph names the right answers — scope verify to the
+# task's declared modules, or shard the suite (task 3353) — but neither is
+# implemented, and the cost of waiting is being paid daily in FALSE reds, not in
+# slow runs: 5 worktrees lost to false verify timeouts in 6 days (esc-4211-6), each
+# burning ~1h of 8 workers on a task that was fully green, plus task 3202, which is
+# complete and review-clean and cannot pass verify at any priority. A ceiling a
+# green run cannot clear surfaces nothing but false infra_timeouts — this file
+# already says so, twelve lines up, about the 1800s era.
+#
+# WHAT THIS ACTUALLY LOOSENS: only the `orchestrator` module. Every other
+# discovered module config declares its own budget (600-2400s) and is unaffected;
+# `orchestrator` is the single documented exception that hard-falls-through to this
+# value (see MODULE_BUDGET_EXCLUSIONS). Its measured cost is 1765.95s median with an
+# 864.83..3310.50s spread (n=28, task 4902) — at that observed max the honest green
+# path is ~4190s, i.e. OVER the old ceiling, which is the defect in one line.
+# 7200 is the figure already ruled as task 3353 scope B.
+#
+# THE COLD VALUE MOVED BECAUSE IT HAD TO, not from measurement: warm <= cold is
+# asserted twice (test_fallback_verify_config.py, tasks 3350 and 3397) on the
+# ground that a cold run does strictly more work. Both values are scaled x2 so the
+# previously-ruled 1.5x cold/warm relationship is preserved exactly rather than
+# silently re-derived on the way past.
+#
+# THE COST, stated because it is real: a genuinely WEDGED run now holds a verify
+# slot for 2h warm / 3h cold instead of 1h / 1.5h, and verify_admission_task_slots
+# is 1, so that is the whole task-verify lane. Accepted against a false-red rate of
+# ~1 stranded green worktree per day.
+#
+# REVERT CONDITION, and it is the one the paragraph above already wrote: when task
+# 3353 lands (split or shard the orchestrator suite) or the module declares its own
+# budget, put these back to 3600/5400. This raise buys time for that work; it is not
+# a replacement for it. Do NOT read it as licence to raise again — the next raise
+# should be refused and 3353 done instead.
+verify_command_timeout_secs: 7200
+verify_cold_command_timeout_secs: 10800
 
 # Pre-turn-1 startup grace (Leo, 2026-09-07; esc-4444-3 cluster).
 # RAISED 120 -> 450, matching reify's already-ruled value.
@@ -998,8 +1092,76 @@ verify_admission_task_slots: 1
 # PYTEST_XDIST_AUTO_NUM_WORKERS=8 that caps the offline lane and agent shells.
 # Green-tier (verify_env is in RELOADABLE_FIELDS).
 verify_env:
-  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "8" at 2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh
-  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"
+  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "16" at 2026-09-17T11:39:20Z by scripts/merge-pytest-n-ab-switch.sh
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "16"
+
+  # ARM THE REAL-KERNEL SANDBOX ENFORCEMENT SURFACE (task 4635, esc-4559-9).
+  #
+  # THE GAP THIS CLOSES. orchestrator/tests/test_landlock.py and
+  # test_sandbox_enforcement_matrix.py each probe /var/tmp with an actual
+  # ``tempfile.mkdtemp(dir='/var/tmp')`` write before running the real-kernel
+  # Landlock enforcement rows (TestLandlockEnforcement, TestLandlockRefer,
+  # TestLandlockClaudeHomeNarrowing, all 12 matrix rows — 30 tests total).
+  # An AGENT sandbox denies that write via a syscall filter (EACCES) even
+  # though /var/tmp's own mode is 1777, so a run launched from inside an
+  # agent's own sandboxed shell silently SKIPS all ~15 mkdtemp-rooted tests
+  # and still reports green — root-caused as the mechanism behind a reported
+  # skip-count delta (1 -> 16) between two full suite runs. Both files already
+  # contain the correct escape hatch: under DF_REQUIRE_SANDBOX_TESTS=1, a
+  # probe failure is ``pytest.fail``-ed instead of silently skipped. Nothing
+  # in the repo ever SET that variable, so the hatch was dead code and no
+  # configuration guaranteed the surface ever ran.
+  #
+  # PRECONDITION CONFIRMED before arming, per this key's own guard rationale:
+  # /var/tmp measured writable (mode 1777) from an UNSANDBOXED shell on the
+  # verify host, and the 30-test surface passed there in 11.10s. The
+  # orchestrator's own verify subprocess is unsandboxed (verify.py's
+  # _target_subprocess_env only strips venv/PATH activation vars — it never
+  # wraps the verify command itself in landlock), which is exactly why the
+  # gate has kept passing this surface all along (measured: attempt-1 /
+  # attempt-2 verify logs show only 1 skip) even though an AGENT's own shell
+  # sees /var/tmp EACCES. Arming this key only changes behavior on a HOST
+  # where that precondition stops holding — it turns a silent 15-test
+  # disappearance into a loud, named failure there, per the tests' own
+  # docstrings.
+  #
+  # BOTH ARMS OF THE GUARD ARE ARMED, not just /var/tmp. Every real-kernel row
+  # is gated on TWO skips — a writable /var/tmp AND a landlock-capable kernel —
+  # so arming only the first would still let all 30 rows vanish silently the
+  # moment `is_landlock_available()` went False, which on a stable host is the
+  # MORE likely of the two: that probe is first-party code exercised by the very
+  # suite it guards, so a regression IN THE PROBE drops the surface as
+  # effectively as a kernel change would. Both test files therefore route their
+  # availability guard through a `_skip_landlock()` helper that fails loudly
+  # under this variable, mirroring `_skip_var_tmp()`. Measured on this host
+  # before arming that second arm: landlock ABI 8. Deliberately NOT armed:
+  # TestLandlockRefer's `ABI < 2` arm — an ABI-1 kernel HAS landlock and the
+  # wrapper correctly omits REFER there, so that skip is a genuine capability
+  # difference, not a missing enforcement surface.
+  #
+  # PINNED EXECUTABLY by orchestrator/tests/test_verify_env_sandbox_arming.py:
+  # it loads THIS file through the real config model and asserts the resolved
+  # verify_env still carries DF_REQUIRE_SANDBOX_TESTS == "1" for every verify
+  # role, and that no module-level verify_env shadows it away. Deleting or
+  # retyping the key below turns that test red rather than silently returning
+  # the guards to dead code.
+  #
+  # SCOPE DECISION (explicit, not left implicit): fused-memory/tests/
+  # reconciliation/test_recon_sandbox_guard.py carries a verbatim-duplicated
+  # copy of the same _var_tmp_writable/_skip_var_tmp guard and reads this
+  # same DF_REQUIRE_SANDBOX_TESTS variable. verify._resolve_verify_env
+  # ALWAYS starts from THIS file's top-level verify_env unconditionally, then
+  # merges any module_config.verify_env on top (SETUP.md "verify_env behaves
+  # differently…"; verify.py::_resolve_verify_env). Neither
+  # orchestrator/orchestrator.yaml nor fused-memory/orchestrator.yaml declares
+  # its own verify_env, so this single top-level key already reaches BOTH
+  # packages' copies of the guard — no separate fused-memory/orchestrator.yaml
+  # entry is needed, and adding one would only be a second copy to drift.
+  #
+  # Does NOT touch task 3247's skip behaviour for ordinary agent-sandboxed
+  # runs — those still skip quietly, as 3247 deliberately decided. This only
+  # arms the override for the one context (the verify host) already known-good.
+  DF_REQUIRE_SANDBOX_TESTS: "1"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
@@ -1109,6 +1271,69 @@ budgets:
 models:
   implementer: opus
   debugger: opus
+  # merger -> claude-fable-5-1 (Leo ruling D6, 2026-09-10; applied 2026-09-12 after the
+  # D5 evidence package, plans/fable-evidence-package-2026-09-10.md §3/§6): on the 16
+  # in-window conflict fixtures Fable resolved 15/16 vs opus 13/16 at the D4 100-turn cap,
+  # in half the turns (p50 17 vs 24) and half the wall clock (p50 7 min vs 14), with no
+  # drop-guard violation and +23% per run ($1.64 vs $1.33 median) on ~18-79 runs/month.
+  # Cache read is $0.25/Mtok (measured), so the swap premium is output + cache-create only.
+  merger: claude-fable-5-1
+
+# Model routing (Leo ruling D6, 2026-09-10; applied 2026-09-12). Admits claude-fable-5-1
+# for exactly two roles: the merger (via models.merger above) and the steward on its
+# second attempt (the steward rule below). The reviewer stays opus: the D5 campaign's
+# pre-registered paired three-repeat F1 rule FAILED for Fable (Δ +0.028 / -0.062 /
+# -0.052); task 5438 reruns it on the D2 briefing. The architect and implementer are
+# out of scope by ruling.
+#
+# DELIBERATE DEVIATION from P4-06's "ladder top = fable": the ladder is left at
+# [haiku, sonnet, opus] because the shipped `retry-tier-up` rule bumps implementer,
+# debugger and architect retries by "+1" -- a ladder with fable on top would route those
+# excluded roles' retries to fable. Absolute model strings are used instead.
+#
+# A project-level `rules:` list REPLACES the fleet default list (config._deep_merge only
+# recurses into dicts), so the four shipped rules from orchestrator/defaults.yaml are
+# restated verbatim here ahead of the steward rule; keep them in step with that file.
+# `usage_cap.scoped_cap_models` (restart-tier) is set below so Fable's cap hits stay
+# scoped once the daemon restarts. Green-tier fields hot-reload.
+routing:
+  allowed_models: [haiku, sonnet, opus, claude-fable-5-1]
+  ladder: [haiku, sonnet, opus]
+  per_model_daily_ceiling_usd:
+    claude-fable-5-1: 150.0
+  rules:
+    - id: large-plan-steps
+      match:
+        role: [implementer, debugger]
+        plan_min_steps: 12
+      set:
+        model: opus
+        max_turns: 120
+    - id: large-plan-modules
+      match:
+        role: [implementer, debugger]
+        plan_min_modules: 3
+      set:
+        model: opus
+        max_turns: 120
+    - id: simple-saturated-full-path
+      match:
+        role: [architect]
+        simple_saturated: true
+      set:
+        model: opus
+    - id: retry-tier-up
+      match:
+        role: [implementer, debugger, architect]
+        min_routing_tier: 1
+      set:
+        model: "+1"
+    - id: steward-retry-fable
+      match:
+        role: [steward]
+        min_routing_tier: 1
+      set:
+        model: claude-fable-5-1
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
@@ -1126,6 +1351,10 @@ watcher_daily_cost_ceiling_usd: 150.0
 usage_cap:
   enabled: true
   accounts_file: "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"
+  # Restart-tier (not hot-reloadable): keeps claude-fable-5-1 cap hits scoped to that
+  # model per account instead of marking the whole account capped (ruling D6, 2026-09-12).
+  # Until the next restart a Fable cap hit counts against the general scope.
+  scoped_cap_models: [claude-fable-5, claude-fable-5-1]
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
@@ -1211,6 +1440,51 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/pyproject.toml"
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
+
+# Starvation watchdog idle-only backstop, effectively OFF until task 3821 deploys
+# (Leo, 2026-09-11, L2 docket option A). Its eligibility clock is in-memory, so
+# every restart re-anchors the whole pending pool, and idle_only_secs (72h in
+# defaults.yaml) later the entire cohort fires at once: 489 records on 09-07
+# (esc-4851-3) and 368 on 09-10 (esc-4507-5). With deploys paused, processes now
+# routinely outlive 72h. 30 days satisfies the idle_only_secs >= idle_secs
+# validator and leaves the dual gate (skip_threshold AND idle_secs) armed.
+# Green tier: applied by hot reload. REVERT by deleting this block once 3821's
+# restart-safe clock is deployed, or when deploys resume (task 5020).
+starvation_watchdog:
+  idle_only_secs: 2592000.0
+
+# Recovery-veto-streak alarm: silence the ESCALATION arm only (Leo, 2026-09-12,
+# authorizing the standing request in cockpit decision veto-streak-alarm-retune-df,
+# filed 2026-08-22 and unactioned since).
+#
+# WHY THE NARROW SWITCH AND NOT A THRESHOLD BUMP. The alarm fires on hold
+# DURATION, and the holds it reports are CORRECT — mostly milestone_gates and
+# design_concerns parked awaiting a human ruling. Verified noise at 51/51 across
+# four batches (15/15, 17/17, 12/12, 7/7): every pin resolved to a legitimate
+# pending L2, zero orphans. A longer veto_streak_min_span_secs only delays a
+# filing that a correct, human-gated hold guarantees will come — the alarm
+# cannot self-quiet while the hold is the intended state, so raising the
+# thresholds trades noise volume for noise latency and nothing else.
+#
+# COST IT WAS IMPOSING: it drove the L1 auto-watcher into its
+# ROTATION_ESCALATIONS limit, TRUNCATING that rotation's drain and deferring
+# unrelated real findings — i.e. a false alarm was displacing true ones. 38 more
+# records minted since 09-10, and four of the eleven pending L2s on 2026-09-12
+# are veto-streak records or their do-not-close pins.
+#
+# WHAT IS KEPT: `enabled` stays true, so recovery_vetoed / recovery_left events
+# and the streak counter keep flowing. Only the blocking-L1 write is suppressed,
+# which is exactly what this field is documented for
+# (orchestrator/src/orchestrator/config.py::RecoveryEmissionConfig). Already-filed
+# L1s still auto-resolve when their veto stops.
+#
+# Green tier (RELOADABLE_FIELDS) — applied by hot reload, no restart needed.
+# SCOPE: dark_factory only. Each project carries its own config, so reify and the
+# other five still have the alarm armed.
+# REVERT by deleting this block if the streak alarm is ever made hold-aware
+# (i.e. taught not to charge a streak whose veto is a legitimate open L2).
+recovery_emission:
+  streak_escalation_enabled: false
 
 # Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
 # Flips the broad merge-role verify gate on and enables merge-train formation

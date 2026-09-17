@@ -436,17 +436,47 @@ stamp_fleet_deploy_clock() {
     # Atomically stamps CLOCK_FILE with the current epoch/UTC-ISO time:
     # mktemp a sibling file IN the same directory, write it, then `mv -f`
     # onto CLOCK_FILE (same-filesystem rename -- atomic). Schema is {ts,
-    # iso}, matching the coordinator's _persist_last_fire_wall, so
-    # float(raw['ts']) reads it identically from either writer. Called ONLY
-    # from the all-units-verified-fresh exit-0 path below -- never on a
-    # failed/partial verify or the early no-running-units exit -- so a
-    # failed fleet restart can never silence the watchdog backstop (I2).
-    local clock_dir tmp_file
+    # iso, source, pytest_session}; the {ts, iso} half matches the
+    # coordinator's _persist_last_fire_wall, so float(raw['ts']) reads it
+    # identically from either writer. Called ONLY from the
+    # all-units-verified-fresh exit-0 path below -- never on a failed/partial
+    # verify or the early no-running-units exit -- so a failed fleet restart
+    # can never silence the watchdog backstop (I2).
+    #
+    # `source` and `pytest_session` are ADDITIVE (task 4823) and inert to
+    # every reader -- all three extract `ts` and nothing else. They mirror
+    # df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
+    # ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
+    # df_pytest_isolation.py::deploy_clock_change_report reads and is the one
+    # place that explains what they are for. Neither side can import the
+    # other, so both mirrors are pinned together by
+    # tests/scripts/test_restart_all_orchestrators.py.
+    #
+    # The one contract this writer must hold on its own: `pytest_session` is
+    # ALWAYS present, empty included. Empty is the positive statement "no
+    # pytest session was an ancestor of this write"; an OMITTED key is
+    # indistinguishable from a pre-4823 writer and fails the run.
+    local clock_dir tmp_file raw_token session_token
     clock_dir="$(dirname "$CLOCK_FILE")"
     mkdir -p "$clock_dir"
     tmp_file="$(mktemp "$clock_dir/.last_redeploy_orchestrator.XXXXXX")"
-    printf '{"ts": %s, "iso": "%s"}\n' \
-        "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" > "$tmp_file"
+    # printf cannot escape JSON, so an env value carrying a quote, a
+    # backslash or a newline could otherwise emit a syntactically broken
+    # clock file -- and _read_clock_epoch fails OPEN on a corrupt body, which
+    # would disarm the very min-interval cap this stamp exists to arm. A
+    # uuid4().hex passes through untouched.
+    raw_token="${DF_PYTEST_SESSION_TOKEN:-}"
+    session_token="$(printf '%s' "$raw_token" | tr -cd '[:alnum:]_-')"
+    # Sanitising must never MANUFACTURE the empty token. Empty is not a
+    # neutral fallback here: it is the one value that forgives a change, so a
+    # token that stripped down to nothing would forgive precisely the
+    # test-spawned write it proves. Any loss at all becomes a non-empty
+    # sentinel, which keeps the guard on its accusing path -- fail-closed, as
+    # the pytest side is throughout.
+    [[ "$raw_token" == "$session_token" ]] || session_token="unsanitizable"
+    printf '{"ts": %s, "iso": "%s", "source": "%s", "pytest_session": "%s"}\n' \
+        "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+        "restart-all-orchestrators.sh" "$session_token" > "$tmp_file"
     mv -f "$tmp_file" "$CLOCK_FILE"
 }
 

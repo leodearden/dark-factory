@@ -346,6 +346,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
@@ -354,7 +355,40 @@ from shared.task_statuses import TaskStatus
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.standing_decision_constants import (
+    CATEGORY_STANDING_DECISION_STORM,
+    GROUNDS_TOKEN_FAMILIES,
+    STATE_ACTIVE,
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+)
 from fused_memory.utils.async_utils import gather_collect
+
+# Optional escalation dependency (mirrors stage1_stall_detector's pattern): the
+# reconciliation package must import cleanly even where the escalation package
+# is not installed. maybe_escalate_suppression_storm no-ops when Escalation is
+# None.
+#
+# ONE combined block, deliberately (same reasoning as stage1_stall_detector's):
+# all four names bind or fail together, so any ONE identity check suffices at
+# RUNTIME. Every name is still listed in that guard because only an identity
+# check on the name itself narrows an optionally-imported symbol for the type
+# checker.
+try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    _HAS_ESCALATION = True
+except ImportError:
+    Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    content_fingerprint_key = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
+    _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -715,6 +749,500 @@ async def filter_suppressed(
         return canonical_flag_type_family(str(flag_type)) not in allowlist
 
     return [f for f in flags if _keep(f)]
+
+
+# --------------------------------------------------------------------------- #
+# Entity-standing-decision match helpers (Hook A / γ, task 2896)
+#
+# Pure, sync building blocks for filter_entity_standing_decisions' FALLBACK
+# (stamps-omitted) match path: an LLM-emitted recon flag that omits the
+# structured entity_uuid/grounds stamps is matched to an active standing
+# decision by (a) recovering every UUID it cites anywhere in its free text and
+# (b) gating on whether its flag_type belongs to the decision's grounds→token
+# family. See filter_entity_standing_decisions (step-4/6) for the composition.
+# --------------------------------------------------------------------------- #
+
+#: Canonical 8-4-4-4-12 hex UUID, anchored on word boundaries so a UUID is only
+#: extracted when it stands alone (not as a substring of a longer alnum run). A
+#: DEDICATED constant rather than a reused splitter, mirroring the module's
+#: per-feature regex convention (_CONTENT_FP_RE, _FLAG_TYPE_TOKEN_SPLIT_RE, ...).
+_UUID_RE: re.Pattern[str] = re.compile(
+    r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+)
+
+
+def _extract_uuids(text: str) -> set[str]:
+    """Return the set of lowercased canonical UUIDs appearing in *text*.
+
+    Case-insensitive extraction normalized to lowercase, so upper- and
+    lower-case spellings of the same UUID (and repeats) collapse to a single
+    distinct value. Text with no UUID (including empty/``None``-coerced) yields
+    an empty set. Pure, sync, no I/O.
+    """
+    if not text:
+        return set()
+    return {m.lower() for m in _UUID_RE.findall(text)}
+
+
+def _collect_str_values(value: Any, out: list[str]) -> None:
+    """Recursively append every ``str`` VALUE reachable in *value* to *out*.
+
+    Descends dicts (values only, not keys), lists, and tuples; every other
+    scalar type (int, float, bool, None, ...) is ignored rather than
+    stringified. Pure, sync, no I/O.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_str_values(v, out)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _collect_str_values(v, out)
+    # Any other type (int/float/bool/None/...) is intentionally ignored: only
+    # LLM-authored free text can carry a cited UUID, and stringifying a numeric
+    # or structured value could mint spurious tokens.
+
+
+def _flag_text_blob(flag: dict[str, Any]) -> str:
+    """Return every ``str`` value in *flag* (recursively), space-joined.
+
+    FALLBACK match is exactly the stamps-omitted path, so a cited UUID may
+    appear in any free-text field (``description``/``summary``/nested
+    ``evidence``/list items). Collecting all string values finds it wherever
+    the LLM placed it while ignoring structured/numeric noise. Pure, sync, no
+    I/O.
+    """
+    parts: list[str] = []
+    _collect_str_values(flag, parts)
+    return ' '.join(parts)
+
+
+def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
+    """Return True iff *flag_type* belongs to *grounds*' bound token family.
+
+    Guards a non-``str``/empty *flag_type* → ``False``. Looks up the token
+    family bound to *grounds* in
+    :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_TOKEN_FAMILIES`;
+    an unknown/empty grounds (no bound family) → ``False``. Otherwise returns
+    True when any family stem is a casefolded SUBSTRING of the whole
+    *flag_type*.
+
+    Substring, NOT ``_``-split token equality (unlike
+    :func:`canonical_flag_type_family`, whose splitter this deliberately does
+    not reuse): the family is a list of stems precisely so ``'conflat'`` can
+    match ``topic_conflation`` and ``'size'`` can match ``oversized_entity``,
+    neither of which is a whole ``_``-delimited token. Splitting first would
+    silently narrow the gate to the stems that happen to be complete words.
+
+    The safety of a substring test therefore rests entirely on the family
+    holding stems that appear in NO unrelated flag_type — the property
+    ``GROUNDS_TOKEN_FAMILIES``' own comment makes a precondition of adding one.
+    A stem that is a common word (``count``, ``scope``) matches unrelated
+    findings and, for an entity under an active decision, DROPS them. Pure,
+    sync, no I/O.
+    """
+    if not isinstance(flag_type, str) or not flag_type:
+        return False
+    family = GROUNDS_TOKEN_FAMILIES.get(grounds)
+    if not family:
+        return False
+    folded = flag_type.casefold()
+    return any(stem.casefold() in folded for stem in family)
+
+
+@dataclass(frozen=True)
+class EntityStandingSuppressionResult:
+    """Outcome of :func:`filter_entity_standing_decisions` (task 2896 γ).
+
+    - ``kept_flags`` — the flags that survived (input order preserved), to be
+      assigned back to ``report.items_flagged``.
+    - ``suppressed_by_decision`` — ``{entity_uuid(lower): count}`` of flags
+      suppressed, attributed per active standing decision; its ``values()`` sum
+      is the ``entity_standing_decision_suppressed`` per-cycle stat, and it
+      drives the storm escalation (:func:`maybe_escalate_suppression_storm`).
+    - ``grounds_by_decision`` — ``{entity_uuid(lower): grounds}`` for each
+      decision that suppressed at least one flag (observability + escalation
+      detail).
+    """
+
+    kept_flags: list[dict[str, Any]]
+    suppressed_by_decision: dict[str, int]
+    grounds_by_decision: dict[str, str]
+
+
+def _match_entity_standing_decision(
+    flag: dict[str, Any], active_by_uuid: dict[str, ReconLedgerRecord]
+) -> str | None:
+    """Return the ``entity_uuid`` (lowercased) of the active standing decision
+    that suppresses *flag*, or ``None`` if none does.
+
+    Evaluated as independent OR conditions (strong OR fallback); STRONG wins
+    decision-attribution when both would fire.
+
+    STRONG: the flag carries a structured ``entity_uuid`` stamp matching an
+    active row AND its ``grounds`` stamp equals that row's grounds
+    (``row.flag_type`` — the α PK-slot mapping). A deliberate LLM-stamped
+    (entity, grounds) assertion is high-signal, so it is trusted even if the
+    flag text also cites another UUID (the second-UUID escape below is FALLBACK
+    -only).
+
+    FALLBACK (stamps omitted): the flag's free text cites exactly ONE distinct
+    UUID, that UUID names an active row, AND the flag's ``flag_type`` belongs to
+    that row's grounds token family. The exactly-one-UUID gate is the escape
+    hatch protecting this low-signal free-text guess — a second cited UUID
+    (≈ an edge/new-fact citation) means "never suppress via fallback". Together
+    with the active-row requirement and the token-family gate, this preserves
+    the under-suppression bias: a fallback miss costs one cycle of noise, never
+    a hidden finding.
+    """
+    stamped_uuid = flag.get('entity_uuid')
+    if isinstance(stamped_uuid, str) and stamped_uuid:
+        key = stamped_uuid.lower()
+        row = active_by_uuid.get(key)
+        if row is not None and flag.get('grounds') == row.flag_type:
+            return key
+
+    uuids = _extract_uuids(_flag_text_blob(flag))
+    if len(uuids) == 1:
+        sole = next(iter(uuids))
+        row = active_by_uuid.get(sole)
+        if row is not None and _flag_type_in_grounds_family(
+            flag.get('flag_type'), row.flag_type
+        ):
+            return sole
+    return None
+
+
+def _index_active_standing_decisions(
+    rows: list[ReconLedgerRecord], project_id: str, now: str
+) -> dict[str, ReconLedgerRecord]:
+    """Index the ACTIVE standing-decision *rows* by lowercased ``entity_uuid``.
+
+    Two classes of row are dropped rather than indexed, each logged, because
+    suppressing on either would hide a finding on information this function
+    can see is unsound:
+
+    **TTL already lapsed** (``expires_at`` non-None and before *now*) — logged
+    INFO. ``state`` alone is not sufficient evidence that a decision is still
+    in force: the active→expired flip lives ONLY in ``ReconLedgerStore.gc()``,
+    whose sole caller is Stage 2's ``stages.task_knowledge_sync._gc_recon_markers``
+    — a different stage, running AFTER this one, which a deployment may skip
+    and whose gc pass may error. Trusting ``state`` alone would let a decision
+    past its 90-day TTL keep suppressing for at least one more cycle, and
+    indefinitely wherever that pass never runs, turning a deliberately
+    time-bounded hold into an unbounded one. The comparison is a plain string
+    ``<``, matching ``gc()``'s own semantics: both sides are the canonical
+    zero-padded UTC ISO-8601 form ``ReconLedgerRecord`` documents, so
+    lexicographic order is chronological order.
+
+    **Ambiguous entity** (more than one active row for one ``entity_uuid``) —
+    logged WARNING naming both grounds, and that entity suppresses NOTHING this
+    cycle. An entity can carry one row per grounds, so once ``GROUNDS_ENUM``
+    grows past its single seed value several can be ACTIVE at once. The shared
+    by-uuid lookup ``ReconLedgerStore.get_active_entity_standing_decision``
+    raises ``ValueError`` on exactly this state rather than picking one under an
+    unstated ordering; a plain ``{row.entity_uuid: row}`` comprehension here
+    would instead collapse them silently, last-row-wins in SELECT order — the
+    non-determinism that guard exists to prevent. Skipping is the fail-open
+    analogue of its raise: loud, deterministic, and under-suppressing.
+
+    Why γ indexes at all instead of calling that shared lookup per flag: Hook A
+    is a whole-batch filter, and one indexed read per cycle is what gives it the
+    same clean batch fail-open as :func:`filter_suppressed` (N per-flag queries
+    cannot fail as a unit mid-batch). INV-5's single source is α's ledger rows
+    and grounds constants, which both hooks read — not one Python call site.
+    """
+    by_uuid: dict[str, list[ReconLedgerRecord]] = {}
+    for row in rows:
+        if not row.entity_uuid:
+            continue
+        if row.expires_at is not None and row.expires_at < now:
+            logger.info(
+                'filter_entity_standing_decisions: skipping standing decision '
+                'entity_uuid=%s grounds=%s in project %s — still state=active but '
+                'expires_at=%s has lapsed (now=%s); the Stage-2 gc() TTL flip has '
+                'not run. Not suppressing on a lapsed decision.',
+                row.entity_uuid,
+                row.flag_type,
+                project_id,
+                row.expires_at,
+                now,
+            )
+            continue
+        by_uuid.setdefault(row.entity_uuid.lower(), []).append(row)
+
+    indexed: dict[str, ReconLedgerRecord] = {}
+    for entity_uuid, matches in by_uuid.items():
+        if len(matches) > 1:
+            logger.warning(
+                'filter_entity_standing_decisions: found more than one ACTIVE '
+                'entity_standing_decision for entity_uuid=%s in project %s '
+                '(grounds=%s) — suppressing nothing for that entity this cycle. '
+                'This lookup assumes at most one active grounds per entity; add an '
+                'explicit grounds argument before growing GROUNDS_ENUM past one '
+                'value (see ReconLedgerStore.get_active_entity_standing_decision).',
+                entity_uuid,
+                project_id,
+                sorted(match.flag_type for match in matches),
+            )
+            continue
+        indexed[entity_uuid] = matches[0]
+    return indexed
+
+
+async def filter_entity_standing_decisions(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+    *,
+    now: str | None = None,
+) -> EntityStandingSuppressionResult:
+    """Drop recon flags already adjudicated by an ACTIVE ``entity_standing_decision``.
+
+    Hook A of the entity-standing-decision PRD (task 2896 γ). Does ONE indexed
+    ``recon_ledger.list_entity_standing_decisions(project_id, state=active)``
+    read per cycle, builds a ``{entity_uuid(lower): row}`` map, and suppresses
+    each flag matched by :func:`_match_entity_standing_decision`.
+
+    Whole-batch fail-open, mirroring :func:`filter_suppressed` exactly: when
+    *flags* is empty, or ``memory_service.recon_ledger`` is unset/``None``, or
+    the ledger read raises, NO suppression is applied this cycle (all flags
+    kept) — a ledger read failure must never hide a finding. The ledger-None
+    path logs DEBUG; the read-exception path logs WARNING.
+
+    A read row is not automatically a licence to suppress: rows whose TTL has
+    lapsed and entities carrying more than one active row are dropped from the
+    index (see :func:`_index_active_standing_decisions`). *now* — the
+    lapsed-TTL reference, a canonical UTC ISO-8601 string — defaults to
+    ``datetime.now(UTC).isoformat()``, the same spelling the β writer uses for
+    ``expires_at``, so the two are string-comparable; tests inject a fixed
+    value.
+
+    Returns an :class:`EntityStandingSuppressionResult`; the caller assigns
+    ``kept_flags`` back to ``items_flagged`` and reads ``suppressed_by_decision``
+    for the stat / storm escalation. Suppression is NOT resolution — the caller
+    excludes suppressed flags' signatures from marker acknowledgment so
+    recurrence history is preserved (see the consolidator wiring).
+    """
+    if not flags:
+        return EntityStandingSuppressionResult(
+            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        logger.debug(
+            'filter_entity_standing_decisions: no recon_ledger on memory_service '
+            'for project %s; passing %d flag(s) through unfiltered',
+            project_id,
+            len(flags),
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception as e:
+        logger.warning(
+            'filter_entity_standing_decisions: recon_ledger.'
+            'list_entity_standing_decisions failed for project %s: %s (best-effort'
+            ' — treating as no standing decision in effect, passing %d flag(s)'
+            ' through unfiltered)',
+            project_id,
+            e,
+            len(flags),
+            exc_info=True,
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    active_by_uuid = _index_active_standing_decisions(
+        rows, project_id, now if now is not None else datetime.now(UTC).isoformat()
+    )
+    if not active_by_uuid:
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    kept: list[dict[str, Any]] = []
+    suppressed_by_decision: dict[str, int] = {}
+    grounds_by_decision: dict[str, str] = {}
+    for flag in flags:
+        matched_uuid = _match_entity_standing_decision(flag, active_by_uuid)
+        if matched_uuid is None:
+            kept.append(flag)
+            continue
+        row = active_by_uuid[matched_uuid]
+        suppressed_by_decision[matched_uuid] = suppressed_by_decision.get(matched_uuid, 0) + 1
+        grounds_by_decision[matched_uuid] = row.flag_type
+        logger.info(
+            'filter_entity_standing_decisions: suppressed flag_type=%r for project'
+            ' %s by active standing decision entity_uuid=%s grounds=%s',
+            flag.get('flag_type'),
+            project_id,
+            matched_uuid,
+            row.flag_type,
+        )
+
+    return EntityStandingSuppressionResult(
+        kept_flags=kept,
+        suppressed_by_decision=suppressed_by_decision,
+        grounds_by_decision=grounds_by_decision,
+    )
+
+
+#: Finding-category component of the storm escalation's dedupe fingerprint —
+#: the second axis of ``compute_content_fingerprint``, distinguishing this
+#: finding from any other that might one day share the storm category.
+_STORM_FINDING_CATEGORY: str = 'entity_standing_decision_suppression_storm'
+
+
+async def maybe_escalate_suppression_storm(
+    escalation_queue: Any,
+    project_id: str,
+    run_id: str,
+    result: EntityStandingSuppressionResult,
+    *,
+    threshold: int = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+) -> list[str]:
+    """File (or fold) a "storm escape" L1 escalation per over-active standing decision.
+
+    For each ``(entity_uuid, count)`` in ``result.suppressed_by_decision`` whose
+    *count* exceeds *threshold* (strict ``>``), submit one
+    ``Escalation(level=1, severity='blocking',
+    category=CATEGORY_STANDING_DECISION_STORM,
+    agent_role='reconciliation-stage1', ...)`` naming the entity, its grounds,
+    and the per-cycle count. An active decision hiding a flood of flags in one
+    cycle is a signal it may be over-broad or the entity's situation changed —
+    worth a human look.
+
+    **Filed through** :func:`escalation.dedupe.submit_or_dedupe`, NOT gated on
+    ``has_open_l1`` (task 3522). Stage 1 re-evaluates every cycle, so a decision
+    that storms once tends to storm every cycle — exactly the recurring-detector
+    shape for which the sibling gate-backlog path retired the ``has_open_l1``
+    skip: that skip suppressed every cycle after the first, so ``dedupe_count``
+    stayed pinned at 0 and the operator saw no difference between one storm and
+    forty. Folding instead keeps ONE pending record per entity and increments
+    ``dedupe_count`` on it, which is the steward's recurrence / triage-order
+    signal. The fold key is the ``(category, finding_category, project:entity)``
+    content fingerprint stamped below — deliberately NOT the count or run_id,
+    which drift every cycle and would mint a fresh record per breach. The window
+    is UNBOUNDED so a decision storming for days still folds into its original
+    parent. Accepted cost, as on the gate-backlog path: a folded record keeps the
+    PARENT's summary, so the count named there is the FIRST breach's, while
+    ``dedupe_count`` carries how often it has recurred since.
+
+    Best-effort throughout: returns ``[]`` immediately when the ``escalation``
+    package is unavailable; any per-decision fingerprint/id-gen/construction/
+    submit/fold failure logs WARNING and excludes that entity from the returned
+    list. Returns the entity_uuids that received a NEW record this cycle — folds
+    are excluded, so the list means "new filings", with recurrence carried by
+    ``dedupe_count`` and the fold INFO log.
+
+    (The PRD's parenthetical cross-cycle-streak variant needs persistent
+    per-decision state and is deferred; this is the self-contained per-cycle N.)
+    """
+    # Any ONE identity check suffices at runtime (all five names bind or fail
+    # together in the module's single import block); each is named so the type
+    # checker narrows it at the use sites below.
+    if (
+        Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or content_fingerprint_key is None
+        or submit_or_dedupe is None
+    ):
+        return []
+
+    config = DedupeConfig(
+        infra_dedupe_enabled=True,
+        infra_dedupe_window_secs=float('inf'),
+        infra_dedupe_categories=(CATEGORY_STANDING_DECISION_STORM,),
+        key_fn=content_fingerprint_key,
+    )
+
+    escalated: list[str] = []
+    for entity_uuid, count in result.suppressed_by_decision.items():
+        if count <= threshold:
+            continue
+
+        grounds = result.grounds_by_decision.get(entity_uuid, 'unknown')
+        summary = (
+            f'Standing decision for entity {entity_uuid} suppressed {count} recon '
+            f'flag(s) in a single cycle (> {threshold})'
+        )
+        detail = '\n'.join([
+            f'project_id: {project_id}',
+            f'run_id: {run_id}',
+            f'entity_uuid: {entity_uuid}',
+            f'grounds: {grounds}',
+            f'suppressed_this_cycle: {count}',
+            f'threshold: {threshold}',
+        ])
+
+        try:
+            # Everything that can fail is inside the try, so a fingerprint,
+            # id-gen, constructor, submit or fold failure is logged rather than
+            # aborting the remaining decisions.
+            fingerprint = compute_content_fingerprint(
+                CATEGORY_STANDING_DECISION_STORM,
+                _STORM_FINDING_CATEGORY,
+                [f'{project_id}:{entity_uuid}'],
+            )
+            # Fail closed rather than file with a falsy key: find_dedupe_parent
+            # short-circuits on one, so the record would silently become a second
+            # visible pending record for this entity every cycle. Unreachable via
+            # today's sha256 callee — this guards a future change to it.
+            if not fingerprint:
+                raise ValueError(
+                    f'empty dedupe_fingerprint for storm entity_uuid={entity_uuid}'
+                )
+            esc = Escalation(
+                id=escalation_queue.make_id(entity_uuid),
+                # The entity is the subject, so it occupies task_id: that is the
+                # key get_by_task/has_open_l1 read a storm record back by, and it
+                # is what makes the record greppable per entity. It is NOT the
+                # fold key — dedupe_fingerprint below is — so the two cannot
+                # drift apart the way a task_id-keyed guard once did.
+                task_id=entity_uuid,
+                agent_role='reconciliation-stage1',
+                severity='blocking',
+                category=CATEGORY_STANDING_DECISION_STORM,
+                summary=summary,
+                detail=detail,
+                level=1,
+                dedupe_fingerprint=fingerprint,
+            )
+            outcome = submit_or_dedupe(escalation_queue, esc, config)
+            if outcome.get('status') == 'dedup_skipped':
+                # Loud-over-silent: the recurrence is visible in the log stream,
+                # not only as a counter on disk.
+                logger.info(
+                    'maybe_escalate_suppression_storm: entity_uuid=%s folded into '
+                    'parent_id=%s (child_id=%s) — the storm is recurring',
+                    entity_uuid,
+                    outcome.get('parent_id'),
+                    outcome.get('child_id'),
+                    extra={'project_id': project_id},
+                )
+            else:
+                # Tested with != rather than == 'queued' so observed_submit_response's
+                # auto-resolved/dismissed branch (a record WAS minted) still counts.
+                escalated.append(entity_uuid)
+        except Exception as exc:
+            logger.warning(
+                'maybe_escalate_suppression_storm: failed to escalate entity_uuid=%s '
+                '(fingerprint, id-gen, construction, submit, or fold): %s',
+                entity_uuid,
+                exc,
+                extra={'project_id': project_id},
+            )
+
+    return escalated
 
 
 # --------------------------------------------------------------------------- #
