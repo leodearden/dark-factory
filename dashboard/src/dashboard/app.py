@@ -464,9 +464,12 @@ async def _metrics_loop(
 #
 # THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention, while
 # letting the concurrency ceiling track the fleet (see the two-dimensions
-# note below). It does NOT fix the CLOSE-WAIT accumulation — that diagnosis
-# is owned by the task-3857 re-spec, and nothing here should be read as
-# addressing it.
+# note below). It does NOT fix the CLOSE-WAIT accumulation — that is fixed in
+# dashboard/src/dashboard/http_pool.py, which reclaims connections a cancelled
+# request leaves in a state httpcore's own sweep cannot reach. Task 3857's
+# refutation stands and is not reopened by it: 3857 measured IDLE connections,
+# and the NEW/ACTIVE case http_pool.py handles is invisible to that
+# measurement by construction. The mechanism is written down once, there.
 #
 # For reference, the two server-side keepalive settings the dashboard talks
 # to:
@@ -549,8 +552,8 @@ _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 #     would hand a 40-project install 84 idle keepalive slots against httpx's
 #     stock 20 — i.e. this "guard" would LOOSEN retention for exactly the
 #     large fleets it is meant to bound, and retention is the dimension the
-#     deferred CLOSE-WAIT investigation (task 3857) cares about. The `// 2`
-#     term stays only as a sanity clamp for tiny pools.
+#     CLOSE-WAIT investigation (task 3857) cared about. The `// 2` term stays
+#     only as a sanity clamp for tiny pools.
 _HTTP_MIN_CONNECTIONS = 100
 _HTTP_CONNS_PER_ENDPOINT = 4
 _HTTP_ASSUMED_CONCURRENT_VIEWERS = 3
