@@ -99,7 +99,11 @@
 # Exit codes (single-ref mode; audit mode always exits 0 on a completed sweep):
 #   0  — degenerate  (count==0, tip does not cite N — skip-sweep / prune-safe)
 #   1  — live        (count>0 — own commits ahead of main)
-#   2  — usage error
+#   2  — usage/WIRING error: an unknown flag, a missing flag value, OR a
+#        missing sibling library (scripts/lib_task_citation.sh). The library
+#        case is a wiring error, not a runtime one: nothing about the
+#        invocation could have avoided it and no retry will fix it — the
+#        deployment is incomplete. Same class as an unknown flag, hence 2.
 #   3  — structural  (not a git work tree, or --main-ref unresolvable)
 #   4  — landed      (count==0, tip DOES cite N — genuinely merged)
 #   5  — absent      (no such ref)
@@ -124,6 +128,17 @@ unset _src _dir
 # scripts/lib_task_citation.sh is the SINGLE copy of the "cites task N"
 # grammar; see its header for why that matters across the reify/dark-factory
 # seam. Re-inlining either ERE here is what the lib exists to prevent.
+#
+# Fail LOUDLY if the lib is missing: without it EVERY classification is wrong,
+# and an absent sibling is an incomplete DEPLOYMENT, never a data problem --
+# exit 2 (usage/WIRING), not the 1 bash's own bare `source` failure produces
+# under `set -e`. reify's copy does a bare `source`; this guard is the
+# dark-factory divergence recorded in README.md "Delta 11", in the shape task
+# 3370 ("Delta 8") established for lib_portable.sh.
+if [ ! -f "$SCRIPT_DIR/lib_task_citation.sh" ]; then
+    echo "warm-lane-degenerate-ref-check.sh: ERROR — scripts/lib_task_citation.sh not found next to warm-lane-degenerate-ref-check.sh" >&2
+    exit 2
+fi
 # shellcheck source=orchestrator/scripts/warm-lane/lib_task_citation.sh
 source "$SCRIPT_DIR/lib_task_citation.sh"
 
@@ -152,7 +167,9 @@ Usage: $(basename "$0") --task <id> [OPTIONS]
     --status-cmd <cmd>       (--audit only) Advisory status oracle.
     -h, --help               Print this message and exit 0.
 
-  Exit codes: 0=degenerate 1=live 2=usage 3=structural 4=landed 5=absent
+  Exit codes: 0=degenerate 1=live 2=usage/wiring 3=structural 4=landed
+              5=absent
+    2 also covers a missing sibling scripts/lib_task_citation.sh.
 
   See: docs/design/warm-lane-degenerate-ref-seam.md
 EOF
