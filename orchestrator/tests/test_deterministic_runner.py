@@ -22,6 +22,12 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+# The one orchestrator symbol imported at module scope (the rest are imported
+# inside each test, as this file has always done): a `parametrize` decorator is
+# evaluated at collection time, so the disposition matrix below cannot name its
+# enum members any other way.
+from orchestrator.deterministic_runner import ProcessTeardown
+
 # ---------------------------------------------------------------------------
 # Task 3286 — the real task-2902 specimen shape.
 #
@@ -2889,9 +2895,17 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
     ``communicate()`` times out with the script's REAL exit code already in
     hand.  That is the very shape Layer A (task 2087/2090) exists for, and
     reporting "no exit code was produced" there would swap a fabricated rc
-    for an affirmative falsehood (reviewer amendment).
+    for an affirmative falsehood (reviewer amendment).  It is also the shape
+    in which the teardown dispatches NO signal, so it pins the escalation
+    against claiming a kill and against losing the surviving process.
 
-    The fourth is a green-on-arrival companion: only the TIMEOUT wording
+    The matrix test then drives every {exit code} x {teardown disposition}
+    cell through the seam, pinning that the kill claim keys on the MEASURED
+    disposition rather than on the exit code — which is not a sound proxy in
+    either direction, and whose exit-during-teardown cell no end-to-end test
+    can reach.
+
+    A green-on-arrival companion closes the class: only the TIMEOUT wording
     moved, and a genuine non-zero exit code is still reported verbatim.
     """
 
@@ -3102,6 +3116,13 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         "no exit code was produced" — which would replace the fabricated rc
         this task removed with an affirmative falsehood about a script that
         ran to completion.
+
+        And because the script was already reaped when the teardown ran, the
+        pid-recycling guard dispatched NO signal: the child holding the pipe
+        open is STILL RUNNING while this escalation is read.  So this test
+        also pins the escalation against claiming a kill — the most
+        operationally costly direction of the defect, since it tells an
+        operator a surviving process is gone when it is not.
         """
         import asyncio
 
@@ -3109,13 +3130,15 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         from orchestrator.workflow import WorkflowOutcome
 
         script = tmp_path / 'exits-but-child-lives.sh'
-        script.write_text('#!/bin/sh\nsleep 30 &\necho started\nexit 7\n')
+        pidfile = tmp_path / 'survivor.pid'
+        script.write_text(_SURVIVOR_SCRIPT)
         script.chmod(0o755)
 
         task = _deploy_task(
             task_id='4252d',
             target_unit=None,
             script=str(script),
+            args=[str(pidfile)],
             cwd=str(tmp_path),
             timeout_secs=1,
         )
@@ -3131,53 +3154,161 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             script_runner=None,
         )
 
-        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        try:
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+            assert outcome == WorkflowOutcome.BLOCKED
+
+            pending = queue.get_by_task('4252d', status='pending')
+            assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+            esc = pending[0]
+            assert esc.level == 2
+            assert esc.severity == 'critical'
+            assert esc.agent_role == 'orchestrator-deterministic'
+            assert esc.category == 'infra_issue'
+            assert esc.summary == (
+                'Deploy script timed out (script exited rc=7, output pipe held '
+                'open, no target_unit)'
+            ), (
+                f'the HEADLINE must not claim "no exit code" for a script that '
+                f'produced one — and must still be the timeout arm, not the rc\u22600 '
+                f'ladder (the exit code never reached the classifier): {esc.summary!r}'
+            )
+            assert 'per-script timeout (1s' in esc.detail, (
+                f'the detail must still name the guard that fired and the budget '
+                f'it overran: {esc.detail!r}'
+            )
+            assert 'already exited with code 7' in esc.detail, (
+                f'the honest exit code is in hand at the raise site and must be '
+                f'reported, not discarded: {esc.detail!r}'
+            )
+            assert 'No exit code was produced' not in esc.detail, (
+                f'HONESTY PIN: the script DID exit and produced code 7, so this '
+                f'sentence would be an affirmative falsehood — the failure mode '
+                f'that replaces one lie with another: {esc.detail!r}'
+            )
+            assert '<script timed out after 1s>' not in esc.detail, (
+                f'still no stand-in output: the read was in flight when the kill '
+                f'fired, so nothing was captured either way: {esc.detail!r}'
+            )
+
+            survivor_pid = _read_survivor_pid(pidfile)
+            assert _is_alive(survivor_pid), (
+                f'THE MEASUREMENT the assertions below are about: survivor pid '
+                f'{survivor_pid} is still RUNNING, because the teardown dispatched '
+                f'no signal to it at all'
+            )
+            assert 'SIGKILLed' not in esc.detail, (
+                f'HONESTY PIN (task 4252 reviewer finding): in this shape '
+                f"_terminate_process_tree's pid-recycling guard dispatched NO "
+                f'signal, so claiming a kill tells the operator that surviving '
+                f'process (pid {survivor_pid}, alive as this runs) is gone when it '
+                f'is not — the most operationally costly direction of the defect: '
+                f'{esc.detail!r}'
+            )
+            assert 'nothing was signalled at all' in esc.detail, (
+                f'the detail must state that the process group was deliberately NOT '
+                f'signalled: {esc.detail!r}'
+            )
+            assert 'recycled pid' in esc.detail, (
+                f'...and WHY: the script had already been reaped, so signalling its '
+                f'pid could hit an unrelated group (task 845): {esc.detail!r}'
+            )
+            assert 'located and killed out-of-band' in esc.detail, (
+                f'nothing else will clean the survivor up, so the detail must tell '
+                f'the operator to find and kill it before resolving: {esc.detail!r}'
+            )
+            assert str(script) in esc.detail, (
+                f'...and must name the script path as the thing to search BY — the '
+                f'raw pid is deliberately not offered, since the runner refused to '
+                f'signal it precisely because it may now belong to an unrelated '
+                f'group: {esc.detail!r}'
+            )
+
+            done_calls = [
+                c for c in scheduler.set_task_status.call_args_list
+                if c.args[1] == 'done'
+            ]
+            assert done_calls == [], (
+                'a timed-out deploy is never done, even when the script itself '
+                'exited 0 — its result never reached the classifier'
+            )
+            unit_inspector.assert_not_awaited()
+        finally:
+            _kill_survivor(pidfile)
+
+    @pytest.mark.parametrize('exit_code', [None, 7], ids=['no_exit_code', 'exited_rc7'])
+    @pytest.mark.parametrize(
+        'teardown',
+        list(ProcessTeardown),
+        ids=lambda member: member.name,
+    )
+    async def test_deploy_timeout_text_tracks_the_measured_teardown(
+        self, tmp_path: Path, exit_code: int | None, teardown: ProcessTeardown,
+    ):
+        """The kill claim keys on the MEASURED disposition, not on ``exit_code``.
+
+        Two invariants across the whole {exit_code} x {disposition} matrix:
+        the detail claims a whole-group SIGKILL IFF the teardown dispatched
+        one, and it tells the operator a process SURVIVED and must be killed
+        out-of-band IFF it did not.
+
+        ``exit_code`` is not a sound proxy for either, in either direction —
+        the common exited-script shape short-circuits the killpg entirely,
+        while a script that exits in the window between the timeout firing and
+        the killpg gets both a code AND a real group kill.  That second cell is
+        a race no end-to-end test can drive, which is why the matrix is driven
+        through the seam.
+
+        Raising ``ScriptTimeout`` from an INJECTED ``script_runner`` is a
+        deliberate test seam for reaching a specific measured shape.  It is not
+        a contract change: a production custom runner still returns the plain
+        ``(rc, tail)`` pair, and only the default runner raises this (see the
+        ``ScriptTimeout`` docstring).
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4252e', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(),
+            script_runner=AsyncMock(
+                side_effect=ScriptTimeout(1, exit_code=exit_code, teardown=teardown),
+            ),
+        )
+
+        outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
-
-        pending = queue.get_by_task('4252d', status='pending')
+        pending = queue.get_by_task('4252e', status='pending')
         assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
         esc = pending[0]
-        assert esc.level == 2
-        assert esc.severity == 'critical'
-        assert esc.agent_role == 'orchestrator-deterministic'
         assert esc.category == 'infra_issue'
-        assert esc.summary == (
-            'Deploy script timed out (script exited rc=7, output pipe held '
-            'open, no target_unit)'
-        ), (
-            f'the HEADLINE must not claim "no exit code" for a script that '
-            f'produced one — and must still be the timeout arm, not the rc\u22600 '
-            f'ladder (the exit code never reached the classifier): {esc.summary!r}'
-        )
-        assert 'per-script timeout (1s' in esc.detail, (
-            f'the detail must still name the guard that fired and the budget '
-            f'it overran: {esc.detail!r}'
-        )
-        assert 'SIGKILLed' in esc.detail, esc.detail
-        assert 'already exited with code 7' in esc.detail, (
-            f'the honest exit code is in hand at the raise site and must be '
-            f'reported, not discarded: {esc.detail!r}'
-        )
-        assert 'No exit code was produced' not in esc.detail, (
-            f'HONESTY PIN: the script DID exit and produced code 7, so this '
-            f'sentence would be an affirmative falsehood — the failure mode '
-            f'that replaces one lie with another: {esc.detail!r}'
-        )
-        assert '<script timed out after 1s>' not in esc.detail, (
-            f'still no stand-in output: the read was in flight when the kill '
-            f'fired, so nothing was captured either way: {esc.detail!r}'
+        assert esc.summary.startswith('Deploy script timed out'), (
+            f'every cell must reach the dedicated ScriptTimeout arm, not the '
+            f'catch-all: {esc.summary!r}'
         )
 
-        done_calls = [
-            c for c in scheduler.set_task_status.call_args_list
-            if c.args[1] == 'done'
-        ]
-        assert done_calls == [], (
-            'a timed-out deploy is never done, even when the script itself '
-            'exited 0 — its result never reached the classifier'
+        group_killed = teardown is ProcessTeardown.GROUP_KILLED
+        claims_group_kill = 'SIGKILLed' in esc.detail
+        warns_of_survivor = 'located and killed out-of-band' in esc.detail
+
+        assert claims_group_kill == group_killed, (
+            f'the kill claim must track the MEASURED disposition '
+            f'({teardown.name}), never the exit code ({exit_code!r}) and never '
+            f'the mere fact that a timeout fired: {esc.detail!r}'
         )
-        unit_inspector.assert_not_awaited()
+        assert warns_of_survivor == (not group_killed), (
+            f'{teardown.name} left processes the script spawned alive, so the '
+            f'detail must send the operator to find and kill them — and must '
+            f'NOT say so when the group really was killed: {esc.detail!r}'
+        )
 
     async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(
         self, tmp_path: Path,
