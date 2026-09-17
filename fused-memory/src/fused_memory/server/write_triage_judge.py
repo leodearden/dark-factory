@@ -42,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
@@ -101,6 +101,84 @@ JUDGE_VERDICTS: dict[str, str] = {
     'amends': OUTCOME_AMENDED,
     'contests': OUTCOME_CONTESTED,
 }
+
+
+class JudgeExemplar(NamedTuple):
+    """One worked example of the vocabulary: a pair, and the word for it.
+
+    Three fields rather than one pre-formatted line, because the formatting
+    belongs to the renderer: held as data, the set can be checked for
+    vocabulary closure and verdict coverage instead of grepped for.
+    """
+
+    entry: str
+    candidate: str
+    verdict: str
+
+
+#: A worked example per verdict, rendered into :data:`JUDGE_SYSTEM_PROMPT`.
+#:
+#: WHY THESE EXIST. The 2026-08-27 calibration run answered `stored` on 31 of
+#: 75 duplicates with the correct canonical sitting in the slate, while the
+#: distractor control scored 18/18 — so the judge was not attaching
+#: indiscriminately, it was systematically over-answering "distinct". A
+#: vocabulary word the model has never seen USED is the one it under-produces,
+#: which is why coverage of all four is an asserted invariant and not a
+#: stylistic goal.
+#:
+#: WHY THIS PARTICULAR SET. One candidate, four entries. Holding the candidate
+#: fixed isolates the only variable that should decide the answer — the
+#: RELATIONSHIP — and makes the two failure directions visible side by side:
+#:
+#: * `restates` and `amends` share almost no surface vocabulary with the
+#:   candidate and still attach, which is the measured defect stated as an
+#:   example (the judge was demanding lexical overlap before it would attach);
+#: * `distinct` repeats the candidate's own words verbatim and still does NOT
+#:   attach, so the lesson reads as "the claim decides" rather than as the
+#:   cruder "attach more readily" — the latter would cost the distractor
+#:   control, which is exactly what that control is there to report.
+#:
+#: The `restates`/`amends` pair differs only by a trailing novel fragment, so
+#: the discrimination between them is shown on otherwise identical material.
+#:
+#: Declaration order mirrors the decision procedure the prompt states — ask
+#: whether any candidate makes the same core claim first, reach for `distinct`
+#: only when none does — not the vocabulary's alphabet.
+#:
+#: SYNTHETIC AND OFF-CORPUS BY CONSTRUCTION. Nothing here is drawn from
+#: ``tests/fixtures/write_triage_calibration.jsonl``; drawing from it would be
+#: training on the test set, and the judge suite asserts the disjointness
+#: rather than trusting this note. Nothing here interpolates an id, a
+#: category, an agent or any repo context either: PRD C1 keeps all of that out
+#: of the judge, and a prompt that renders no metadata AT ALL is what makes
+#: that structural.
+_EXEMPLAR_CANDIDATE = 'The greenhouse thermostat is calibrated in Fahrenheit.'
+
+JUDGE_EXEMPLARS: tuple[JudgeExemplar, ...] = (
+    JudgeExemplar(
+        entry='Setpoints for the glasshouse heater are entered in degrees F.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='restates',
+    ),
+    JudgeExemplar(
+        entry=(
+            'Glasshouse setpoints are entered in degrees F, and the display '
+            'rounds to the nearest whole degree.'
+        ),
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='amends',
+    ),
+    JudgeExemplar(
+        entry='The greenhouse thermostat was replaced in March after its relay failed.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='distinct',
+    ),
+    JudgeExemplar(
+        entry='The greenhouse thermostat reads only in Celsius; it has no Fahrenheit mode.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='contests',
+    ),
+)
 
 #: How much of a rejected payload is quoted back in the raised message. The
 #: message reaches a log line via ``triage_write``'s ``exc_info``, and a model
