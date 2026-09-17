@@ -105,12 +105,23 @@ class FakeStream(httpcore.AsyncNetworkStream):
     how a request is held GENUINELY in flight — the state a reaper must never
     touch. ``reached_read`` is the observable that lets a test wait for that
     point deterministically instead of guessing a number of loop steps.
+
+    ``close_error`` and ``close_gate`` are the same two controls over the CLOSE
+    side, set on an individual stream after a test has minted its orphan. They
+    exist because ``reap_orphaned_connections``'s two suppressed-failure paths
+    are otherwise unreachable: a close that raises is what separates its
+    "closed" count from the set it unpools, and a close that suspends is the
+    only window in which a concurrent request can unpool a connection the sweep
+    is midway through closing.
     """
 
     def __init__(self, read_gate: asyncio.Event | None = None) -> None:
         self.pending = b''
         self.closed = False
         self.reached_read = False
+        self.reached_close = False
+        self.close_error: Exception | None = None
+        self.close_gate: asyncio.Event | None = None
         self._read_gate = read_gate
 
     async def write(self, buffer: bytes, timeout: float | None = None) -> None:
@@ -124,6 +135,13 @@ class FakeStream(httpcore.AsyncNetworkStream):
         return chunk
 
     async def aclose(self) -> None:
+        self.reached_close = True
+        if self.close_gate is not None:
+            await self.close_gate.wait()
+        # Raised BEFORE the flag, so ``closed`` keeps meaning "this stream was
+        # actually released" — a failed close released nothing.
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
     def get_extra_info(self, info: str) -> Any:
@@ -198,6 +216,16 @@ def _unreclaimable(pool: httpcore.AsyncConnectionPool) -> list[Any]:
     return [c for c in pool._connections if not c.is_idle() and not c.is_closed()]
 
 
+def _queued(pool: httpcore.AsyncConnectionPool) -> list[Any]:
+    """Pool requests still waiting to be handed a connection.
+
+    Stated against httpcore's interface for the same reason as
+    :func:`_unreclaimable`: a test that borrowed the module's own notion of
+    "waiting" could not catch the module getting it wrong.
+    """
+    return [r for r in pool._requests if r.is_queued()]
+
+
 async def _step_until(predicate: Callable[[], bool], *, what: str) -> None:
     """Advance the event loop until *predicate* holds.
 
@@ -213,18 +241,23 @@ async def _step_until(predicate: Callable[[], bool], *, what: str) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _orphan_sweep() -> AsyncIterator[_Harness | None]:
+async def _orphan_sweep(
+    max_connections: int = _MAX_CONNECTIONS,
+) -> AsyncIterator[_Harness | None]:
     """Cancel an in-flight POST at each of :data:`_MAX_CANCEL_STEPS` positions.
 
     Yields the first harness whose pool was left holding an orphan, or ``None``
     if no position produced one. A FRESH client per position, so a connection
     left behind by an earlier position cannot be mistaken for this one's.
+
+    *max_connections* is forwarded to :func:`_build_harness`, so a test can
+    mint its orphan into a pool that the orphan alone fills.
     """
     harnesses: list[_Harness] = []
     try:
         minted: _Harness | None = None
         for steps in range(_MAX_CANCEL_STEPS):
-            harness = _build_harness()
+            harness = _build_harness(max_connections=max_connections)
             harnesses.append(harness)
             task = asyncio.create_task(harness.client.post(_URL, content=b'{}'))
             for _ in range(steps):
@@ -333,6 +366,120 @@ class TestReapingReclaimsTheOrphan:
 
             assert http_pool.census(minted.client) == settled
 
+    async def test_a_close_that_fails_still_unpools_the_connection(self) -> None:
+        """``closed`` counts clean closes; the SET that gets unpooled is larger.
+
+        Both halves are asserted because both are load-bearing and neither is
+        visible elsewhere: a bad close must not be counted as a reclaim (the
+        reap WARNING would overstate what it achieved), and it must not leave
+        the connection pooled either, since httpcore already marked it CLOSED
+        and the slot would be held for nothing. Moving ``closed += 1`` outside
+        phase 2's suppression passes every other test in this module.
+        """
+        async with _orphan_sweep() as minted:
+            assert minted is not None, _NO_ORPHAN_MINTED
+            before = http_pool.census(minted.client)
+            assert before is not None
+            assert before.orphaned == 1
+            [stream] = [s for s in minted.backend.streams if not s.closed]
+            stream.close_error = OSError('close(2) failed on the underlying socket')
+
+            reaped = await http_pool.reap_orphaned_connections(minted.client)
+
+            assert reaped == 0, 'a close that raised is not a clean close and must not count'
+            after = http_pool.census(minted.client)
+            assert after is not None
+            assert after.total == before.total - 1, (
+                'a connection whose close failed is CLOSED as far as httpcore is '
+                'concerned, so leaving it pooled would hold the slot for nothing'
+            )
+            assert after.orphaned == 0
+
+    async def test_a_concurrent_unpooling_mid_sweep_is_not_an_error(self) -> None:
+        """Phase 3's suppressed ``ValueError``, driven by the real race.
+
+        Across phase 2's awaits the connection is already CLOSED, so any other
+        request entering the pool runs ``_assign_requests_to_connections`` and
+        removes it — and phase 3 then finds it gone. Already-removed is the
+        outcome phase 3 wanted, so the sweep must finish normally rather than
+        raise into the loop's error handler.
+        """
+        async with _orphan_sweep() as minted:
+            assert minted is not None, _NO_ORPHAN_MINTED
+            [stream] = [s for s in minted.backend.streams if not s.closed]
+            gate = asyncio.Event()
+            stream.close_gate = gate
+
+            sweep = asyncio.create_task(http_pool.reap_orphaned_connections(minted.client))
+            try:
+                await _step_until(
+                    lambda: stream.reached_close,
+                    what='the sweep suspending inside the orphan\'s close',
+                )
+
+                # A real request, through the real pool: this is what unpools
+                # the connection out from under the sweep.
+                other = await minted.client.post('http://other.local/mcp', content=b'{}')
+                assert other.status_code == 200
+                assert minted.pool._connections and all(
+                    c is not stream for c in minted.pool._connections
+                )
+
+                gate.set()
+                assert await sweep == 1
+            finally:
+                gate.set()
+                sweep.cancel()
+                with contextlib.suppress(BaseException):
+                    await sweep
+
+            settled = http_pool.census(minted.client)
+            assert settled is not None
+            assert settled.orphaned == 0
+
+    async def test_a_request_queued_behind_a_full_pool_is_dispatched_by_the_sweep(
+        self,
+    ) -> None:
+        """Freeing the slot is not enough — httpcore has to be TOLD to use it.
+
+        ``_assign_requests_to_connections`` is the only place a queued
+        ``AsyncPoolRequest`` is handed the connection its ``wait_for_connection``
+        blocks on, and httpcore runs it only as a request enters or leaves the
+        pool. A sweep is neither. So this is the wedge the module exists to end,
+        in its worst form: every slot an orphan, a request already parked. A
+        sweep that only unpools leaves that request to die on its pool timeout
+        seconds after the space it needed appeared.
+        """
+        async with _orphan_sweep(max_connections=1) as minted:
+            assert minted is not None, _NO_ORPHAN_MINTED
+            before = http_pool.census(minted.client)
+            assert before is not None
+            assert before.total == before.max_connections == 1, (
+                f'wanted a pool whose one and only slot is the orphan, got {before}'
+            )
+
+            queued = asyncio.create_task(minted.client.post(_URL, content=b'{}'))
+            try:
+                await _step_until(
+                    lambda: bool(_queued(minted.pool)),
+                    what='the second request queueing for the slot the orphan holds',
+                )
+
+                assert await http_pool.reap_orphaned_connections(minted.client) == 1
+
+                # CLOCK-FREE, deliberately: a sweep that merely unpooled would
+                # exhaust these steps and fail here naming what it was waiting
+                # for, rather than sitting out a real pool timeout.
+                await _step_until(
+                    queued.done,
+                    what='the queued request being dispatched into the freed slot',
+                )
+                assert (await queued).status_code == 200
+            finally:
+                queued.cancel()
+                with contextlib.suppress(BaseException):
+                    await queued
+
 
 class TestReapingSparesLiveTraffic:
     """The one thing standing between this fix and a reaper that kills live traffic.
@@ -400,10 +547,20 @@ def _client_with_malformed_pool() -> httpx.AsyncClient:
 
 # Each case pairs a broken client with the attribute path the WARNING must
 # name, so a message that degraded to a generic "could not resolve pool"
-# fails here rather than passing as if it were still diagnostic.
+# fails here rather than passing as if it were still diagnostic. The two
+# parametrize lists below are derived from it rather than written twice: only
+# one of the two tests has anything to say about the path.
+_UNRESOLVABLE_CASES: dict[str, tuple[Callable[[], httpx.AsyncClient], str]] = {
+    'transport-has-no-pool': (_client_without_pool, '_transport._pool'),
+    'pool-missing-an-attribute': (_client_with_malformed_pool, '_requests'),
+}
+
 _UNRESOLVABLE = [
-    pytest.param(_client_without_pool, '_transport._pool', id='transport-has-no-pool'),
-    pytest.param(_client_with_malformed_pool, '_requests', id='pool-missing-an-attribute'),
+    pytest.param(build, path, id=case)
+    for case, (build, path) in _UNRESOLVABLE_CASES.items()
+]
+_UNRESOLVABLE_CLIENTS = [
+    pytest.param(build, id=case) for case, (build, _) in _UNRESOLVABLE_CASES.items()
 ]
 
 
@@ -444,9 +601,9 @@ class TestShapeGuardDegradesLoudly:
     WITHIN itself — never relying on a sibling having run, or not run.
     """
 
-    @pytest.mark.parametrize(('build_client', 'expected_path'), _UNRESOLVABLE)
+    @pytest.mark.parametrize('build_client', _UNRESOLVABLE_CLIENTS)
     async def test_both_entry_points_return_sentinels_rather_than_raising(
-        self, build_client: Callable[[], httpx.AsyncClient], expected_path: str
+        self, build_client: Callable[[], httpx.AsyncClient]
     ) -> None:
         http_pool.reset_shape_guard()
         client = build_client()
@@ -658,7 +815,13 @@ class TestReaperLoop:
         # An interval long enough that the loop is certainly parked in its
         # sleep when the cancel lands, which is where shutdown finds it.
         task = asyncio.create_task(http_pool.reaper_loop(harness.client, interval=3600.0))
-        await _step_until(lambda: not task.done(), what='the reaper loop starting')
+        # THE ONE STEP THAT PARKS IT. A task just created has not run at all,
+        # and nothing here observes the loop from outside — this test uses the
+        # real asyncio.sleep precisely so it exercises the real shutdown path.
+        # So the wait is this yield and nothing else: it hands control to the
+        # loop, which runs until it suspends in its own sleep. Deleting it
+        # would leave the cancel landing on a task that never started, and the
+        # assertion below would still pass.
         await asyncio.sleep(0)
 
         task.cancel()

@@ -71,13 +71,53 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# The pool attributes this module reads. Named once, here, so the shape guard
-# and the failure message it produces cannot drift apart.
-_REQUIRED_POOL_ATTRIBUTES = ('_connections', '_requests', '_max_connections')
+# The pool attributes and methods this module reads or calls. Named once, here,
+# so the shape guard and the failure message it produces cannot drift apart.
+_REQUIRED_POOL_ATTRIBUTES = (
+    '_connections',
+    '_requests',
+    '_max_connections',
+    '_assign_requests_to_connections',
+    '_close_connections',
+)
 
-# Has the shape guard already announced itself in this process? See
-# :func:`_report_unresolved` for why announcing once is the requirement.
-_shape_guard_warned = False
+
+class _LatchedWarning:
+    """A WARNING that announces itself once, then repeats only at DEBUG.
+
+    LOUD ONCE, THEN QUIET, and both halves matter. Silence is the worst outcome
+    available to this module — a reaper that has quietly become a no-op while
+    still sitting in the tree looking like it handles the problem. But a
+    WARNING on every sweep is its own kind of silence: on a 60s loop that is
+    ~1400 identical lines a day, and the line that opened the diagnosis is
+    buried under its own repeats. Demoted, never discarded: the repeat stays at
+    DEBUG for whoever turns it on.
+
+    ONE TYPE FOR BOTH of this module's throttled reports, because the
+    throttling rule is one rule and stating it twice is how two spellings
+    drift apart. The reports differ only in when they RE-ARM, which is
+    :meth:`clear`'s caller's business rather than this class's: the shape guard
+    never re-arms on its own (a relocated attribute stays relocated), while the
+    saturation alarm re-arms as occupancy falls back under the mark.
+    """
+
+    def __init__(self) -> None:
+        self._fired = False
+
+    def clear(self) -> None:
+        """Re-arm, so the next :meth:`fire` is loud again."""
+        self._fired = False
+
+    def fire(self, message: str, *args: object) -> None:
+        """Log *message* — at WARNING the first time, at DEBUG after that."""
+        if self._fired:
+            logger.debug(message, *args)
+            return
+        self._fired = True
+        logger.warning(message, *args)
+
+
+_shape_guard = _LatchedWarning()
 
 
 def reset_shape_guard() -> None:
@@ -89,33 +129,23 @@ def reset_shape_guard() -> None:
     module's operation to offer, and a test asserting on the WARNING can do so
     without depending on whether some other test ran first.
     """
-    global _shape_guard_warned
-    _shape_guard_warned = False
+    _shape_guard.clear()
 
 
 def _report_unresolved(path: str) -> None:
     """Announce a pool attribute this module can no longer find.
 
-    LOUD ONCE, THEN QUIET, and both halves matter. Silence would be the worst
-    outcome available: the reaper would become a permanent no-op while a
-    module in the tree still looked like it was handling the problem — the
-    original incident again, now harder to find. But a WARNING on every sweep
-    is its own kind of silence: on the reaper's loop that is ~1400 identical
-    lines a day, and the line that opened the diagnosis is buried under its
-    own repeats. Demoted, never discarded: the repeat stays at DEBUG.
+    Latched, for the reason :class:`_LatchedWarning` gives: this is the one
+    line that turns "the reaper stopped working" from a 32-hour mystery into a
+    grep, so it has to survive weeks of journal, which means it has to be rare.
     """
-    global _shape_guard_warned
-    message = (
+    _shape_guard.fire(
         'httpx connection pool is not where this module expects it: cannot resolve '
         'client.%s. The orphan reaper is INERT until this is repaired — see '
         'dashboard/src/dashboard/http_pool.py for the attributes it reads and the '
-        'httpx/httpcore versions they were verified against.'
+        'httpx/httpcore versions they were verified against.',
+        path,
     )
-    if _shape_guard_warned:
-        logger.debug(message, path)
-        return
-    _shape_guard_warned = True
-    logger.warning(message, path)
 
 
 @dataclass(frozen=True)
@@ -144,9 +174,7 @@ class PoolCensus:
 # invisible for 32 hours.
 POOL_HIGH_WATER_FRACTION = 0.8
 
-# Has the saturation alarm already fired for the CURRENT episode? Unlike the
-# shape guard's latch this one re-arms — see :func:`_report_occupancy`.
-_saturation_warned = False
+_saturation_alarm = _LatchedWarning()
 
 
 def reset_saturation_guard() -> None:
@@ -157,41 +185,32 @@ def reset_saturation_guard() -> None:
     pool?" and "is the pool filling up?"), so a test that wants one in a known
     state should not have to disturb the other.
     """
-    global _saturation_warned
-    _saturation_warned = False
+    _saturation_alarm.clear()
 
 
 def _report_occupancy(reading: PoolCensus) -> None:
     """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
 
-    Throttled like the shape guard — loud on the first sweep that crosses the
-    mark, DEBUG on the ones after — because a wedged pool STAYS wedged, and one
-    line a minute forever is not a signal.
-
-    It RE-ARMS on the way back down, which is the difference between the two
-    latches. A pool that saturates, recovers, and saturates again has had two
-    incidents, and the second matters at least as much as the first; a latch
-    that only ever fell one way would report the first episode a process saw
-    and nothing after it.
+    RE-ARMS ON THE WAY BACK DOWN, which is the only thing distinguishing this
+    report from the shape guard's. A pool that saturates, recovers, and
+    saturates again has had two incidents, and the second matters at least as
+    much as the first; a latch that only ever fell one way would report the
+    first episode a process saw and nothing after it.
 
     The whole census goes in the line, not just the ratio: "80 of 100" does not
     say whether those are healthy in-flight requests or orphans this module
     failed to reclaim, and that is the first question an operator asks.
     """
-    global _saturation_warned
     if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
-        _saturation_warned = False
+        _saturation_alarm.clear()
         return
-    message = (
+    _saturation_alarm.fire(
         'httpx connection pool at or above its high-water mark (%.0f%% of capacity): '
         '%s. Sustained saturation ends in httpx.PoolTimeout, which the dashboard '
-        'renders as an "offline" pill on a healthy orchestrator.'
+        'renders as an "offline" pill on a healthy orchestrator.',
+        POOL_HIGH_WATER_FRACTION * 100,
+        reading,
     )
-    if _saturation_warned:
-        logger.debug(message, POOL_HIGH_WATER_FRACTION * 100, reading)
-        return
-    _saturation_warned = True
-    logger.warning(message, POOL_HIGH_WATER_FRACTION * 100, reading)
 
 
 def _resolve_pool(client: httpx.AsyncClient) -> httpcore.AsyncConnectionPool | None:
@@ -265,7 +284,7 @@ def census(client: httpx.AsyncClient) -> PoolCensus | None:
 async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
     """Close and unpool *client*'s orphaned connections. Returns how many closed.
 
-    THREE PHASES, AND THE ORDER IS LOAD-BEARING.
+    FOUR PHASES, AND THE ORDER IS LOAD-BEARING.
 
     1. SYNCHRONOUS — resolve the pool and decide the doomed set. There is no
        ``await`` between reading ``_requests`` and fixing that set, so httpcore
@@ -279,10 +298,28 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
        process is going away and every remaining connection is either already
        closed or still pooled — both safe.
 
-    3. SYNCHRONOUS — drop the now-closed connections from ``_connections``, so
-       the slot is free immediately instead of at the pool's next use. This is
-       the half that actually ends the wedge: a connection marked closed but
-       still listed keeps counting against ``max_connections``.
+    3. SYNCHRONOUS — drop the doomed connections from ``_connections``. Phase 4
+       below would remove most of them anyway, through httpcore's own
+       ``is_closed()`` branch, and that overlap is deliberate rather than
+       missed: this phase states the guarantee DIRECTLY — a sweep unpools what
+       it doomed — instead of inheriting it from a private reclaim branch the
+       shape guard cannot check and a future httpcore is free to narrow. It
+       also covers the one case that branch cannot see, a connection whose
+       ``aclose()`` was a no-op because it had no transport yet.
+
+    4. HAND THE FREED SLOTS TO WHOEVER IS ALREADY WAITING, and nothing else
+       will. ``_assign_requests_to_connections`` is the ONLY place httpcore
+       gives a queued ``AsyncPoolRequest`` the connection its
+       ``wait_for_connection`` is blocked on, and httpcore runs it only as a
+       request enters or leaves the pool. A sweep is neither. So phase 3 alone
+       leaves the wedge this module exists to end fully intact in its worst
+       case — a pool at ``max_connections``, every slot an orphan, N requests
+       parked in ``wait_for_connection``: the slots are freed and the waiters
+       are still never dispatched, dying on their own pool timeouts seconds
+       after the space they needed appeared. MEASURED on a ``max_connections=1``
+       harness: without this phase the queued request burned its entire 2.0s
+       pool budget and raised ``httpx.PoolTimeout``; with it the same request
+       completed in ~1ms with a 200.
 
     CLOSING BEFORE REMOVING is what makes a cancellation mid-sweep harmless.
     An already-closed connection still in ``_connections`` satisfies httpcore's
@@ -300,6 +337,12 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
         return 0
 
     doomed = _orphaned(pool)
+    if not doomed:
+        # The overwhelmingly common sweep. Returning here keeps it a pure read:
+        # phase 4 below is httpcore's own pool-management pass, and running that
+        # every 60s on an untouched pool would make this function's effect
+        # something other than what its name says.
+        return 0
 
     closed = 0
     for connection in doomed:
@@ -315,6 +358,13 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
     for connection in doomed:
         with contextlib.suppress(ValueError):
             pool._connections.remove(connection)
+
+    # Phase 4, in httpcore's own pairing: assign synchronously, then close what
+    # the assignment displaced. ``_close_connections`` shields its awaits from
+    # cancellation, which matters because those connections are already out of
+    # ``_connections`` and nothing else would ever close them.
+    closing = pool._assign_requests_to_connections()
+    await pool._close_connections(closing)
 
     return closed
 
