@@ -1250,6 +1250,12 @@ entries:
     origin_phase: prd
     manifested_phase: architect
     note: Planning-phase dispatch consumed 124 transcript turns and exhausted $15 budget with zero output—characteristic pattern of amnesiac investigation running retry loops until budget exhaustion
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 32572223-a3dd-4e69-b0e6-17e5a17e5c42
+    origin_phase: merge
+    manifested_phase: merge
+    note: 'Task 5185 merge-phase retry (counter=2) launched without prior-attempt context; steward rebase was unknown to retry loop, causing re-diagnosis of stale problems (from memory: ''steward had ALREADY rebased; check branch reflog + merge-base'')'
 - id: recon-prompt-schema-drift
   title: Recon stage prompts show pseudocode diverging from real MCP schemas; fused-memory identifier naming is inconsistent across sibling tools
   severity: medium
@@ -1991,6 +1997,13 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Background tasks killed by memory pressure (turns 415-416); watcher agent in retry loops (40x reap-decisions, 35x heartbeat/lease/drain checks); session score 36.0 with 4 tool_errors and 2 not_found signals
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a163237c-14e1-4b17-a03c-89e9788d3ddb
+    origin_phase: ops
+    manifested_phase: ops
+    invariant_violated: Watcher-spawned background tasks should respect system resource limits
+    note: Four consecutive background commands (bcquuew6m 'recon watcher 1h slice', blt5a7k3d 'spawn gates session', b27rhz48s 'spawn unblock session', bxco24n9b 'spawn gate revive session') all killed due to system low-memory condition in turns 293–296
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -2318,6 +2331,12 @@ entries:
     origin_phase: implement
     manifested_phase: review
     note: 'Turn 24: StructuredOutput double-wrapping — agent provided {decisions: {decisions: [...]}} when schema expects {decisions: array}. This is the exact pattern described: StructuredOutput parameter name collides with schema''s top-level key.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: e42517a5-e857-4a83-9b0d-acfc2b00301e
+    origin_phase: unknown
+    manifested_phase: review
+    note: 'StructuredOutput returned {"decisions": {"decisions": [...]}} violating schema expecting top-level array — double-wrap from parameter/key naming collision at turn 24'
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -3814,6 +3833,12 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: Two separate Bash calls (turn 32 and turn 409) pipe a multi-line python3 -c script through the tool; the JSON payload carries proper \n escapes but the executed script lands on a single space-joined line, producing IndentationError both times — the same newline-flattening failure this entry already tracks, recurring ~370 turns apart in one session without the agent ever diagnosing the root cause (it just rewrote the one-liner differently each time).
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 47d2d52e-54f5-45a2-a8c2-1d276420e9f5
+    origin_phase: verify
+    manifested_phase: verify
+    note: 'Turn 172: multiline heredoc `cat <<''EOF''` in git commit command rejected by Bash pre-check with syntax error; exit 127 indicates shell eval failure on the compound command'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
   severity: medium
@@ -3932,6 +3957,12 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: mcp__fused-memory__resolve_ticket(timeout_seconds=115) returned only 'The operation timed out.' (turn 659) with no partial/outcome signal, and the session's subsequent behavior was exactly the redundant state-polling loop (lease-heartbeat/loop-status/fires/drain-delta checks repeated dozens of times) the candidate describes.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 4b8838b3-e315-4ecf-8c3a-bc8ee8d8ca0f
+    origin_phase: ops
+    manifested_phase: ops
+    note: resolve_ticket MCP calls timed out at turns 494–495 with 'The operation timed out' response; no outcome signal, forcing manual finalization; exact match to timeout-with-no-signal pattern
 - id: entry-cand-20260722-9
   title: Recon action-provenance logger records target='?' for write_journal add/delete ops
   severity: medium
@@ -8097,6 +8128,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Guard-trip signals rendered as bare 'blocked:' templates on turns 4 and 22 with no matched substring or explanation; interactive session with zero user turns
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 126447f8-51a7-45f2-b7d7-0b8a0b428ba1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest renders two ''not_found'' signals as bare templates without context: ''(turn 43) does not exist'' and ''(turn 86) not found in'' — missing matched substring and lookup target/scope information'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 4553decd-e786-4167-b82d-5b70ff3d4525
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Guard signal rendered as bare template 'blocked:' with no matched substring or detail; session digest generator drops guard content
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -9234,6 +9277,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Merger watcher session (opus100 fable-evidence-package worktree, resolving real merge conflicts in session_registry.py/SKILL.md); digest's 'User Corrections' bucket captured turn-3's injected '# Task Intent' + '# Merge Conflicts' diff briefing (an ordinary task assignment, not user feedback) and truncated 9674 of 11673 bytes, discarding the actual conflict content behind a high score (10.0) driven only by 2 tool_errors.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 30b86a6a-da6e-4a10-bb38-86969f8ac1dc
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Supervisor-injected watcher rotation configuration (rotation limits, DARK_FACTORY_ROOT) mislabeled as 'User Corrections' in digest. Existing entry describes task-briefing mislabeling; this is the same root cause (over-aggressive categorization of injected blocks) at the supervisor-injection layer.
 - id: entry-cand-20260731-1
   title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
   severity: medium
@@ -9578,6 +9627,12 @@ entries:
     origin_phase: review
     manifested_phase: unknown
     note: Digest 'User Corrections' bucket captured structured review analyzer output (with wording-meta-test finding, False Failure/False Pass analysis) as if it were user corrective feedback. The digest item is truncated (37720/39718 bytes dropped), obscuring the full scope; structured review output was extracted into the 'User Corrections' section instead of being recognized as tool-generated analysis.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 21398ba1-1f64-49cd-94ad-1f63ed73bec5
+    origin_phase: ops
+    manifested_phase: ops
+    note: Task-notification JSON outputs (spawned L2 brief agents, verdict analysis, decision rows) are placed in 'User Corrections' bucket alongside actual user commands (/escalation-watcher, /team). Turns 236, 248, 282, 388, 409, 527 show <task-notification> blocks with structured JSON payloads (status=completed/killed) miscategorized as corrections.
 - id: entry-cand-20260728-2
   title: Digest score and 'User Corrections' label are decoupled from the session's own signal_counts
   severity: medium
@@ -10478,6 +10533,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Session scored 5.0 with every signal_counts field at 0 (tool_error/self_correct/not_found/df_guard/interrupt/designed_outcome all 0), matching the pattern of severity scores assigned independent of the underlying zero signal counters.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 5b236c5d-f63e-463c-855b-6a035d8e7d25
+    origin_phase: unknown
+    manifested_phase: review
+    note: Digest assigned severity score 5.0 despite all signal_counts reading zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0, designed_outcome=0). Score and signal evidence are decoupled.
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -11154,6 +11215,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest 'User Corrections' bucket captured the injected periodic-census verifier prompt—a task instruction/context block—as if it were user corrective feedback, mislabeling a system/scaffolding artifact as a correction
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 5b236c5d-f63e-463c-855b-6a035d8e7d25
+    origin_phase: unknown
+    manifested_phase: review
+    note: Digest 'User Corrections' bucket captured an injected task briefing/instruction block ('You are adjudicating whether each CURRENT review suggestion...') as if it were user-provided corrective feedback, when it is plainly the orchestrated-task context/system prompt for review-round adjudication.
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -12061,6 +12128,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Watcher session's 'User Corrections' bucket captures an injected task-dispatch briefing ('# Task Intent' + '# Merge Conflicts' sections with raw diff/conflict-marker content) rather than an actual user correction — same digest-mislabeling class as the '# Context' briefing entries, just a different injected-briefing template (merge-conflict-resolution dispatch, not project-context).
+  - date: '2026-09-16'
+    project: dark_factory
+    session: e42517a5-e857-4a83-9b0d-acfc2b00301e
+    origin_phase: ops
+    manifested_phase: review
+    note: Digest mislabeled injected '# Context' briefing block (adjudication workflow instructions) as a 'User Correction'
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -14336,6 +14409,32 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Orchestrated worktree task 4926 failed post-merge verification; Bash exit 1 when attempting to read .task/metadata.json and .task/plan.json during diagnostic attempt
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 47d2d52e-54f5-45a2-a8c2-1d276420e9f5
+    origin_phase: implement
+    manifested_phase: verify
+    note: Orchestrated-task in worktree 4495 fires 4 tool_errors across turns 43/172/220/253 (exit 2, 127, 137, 143) with minimal diagnostic context; session ends without designed_outcome
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 01d6bef0-85e0-4a48-a55b-dc691a63c71a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Three 'does not exist' not_found signals plus one grep tool_error (pattern/file lookup failure) in .worktrees/5544 session with zero user turns and minimal diagnostic context; consistent with incomplete worktree provisioning or path coherence mismatch between main and task checkout
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 63ab57ff-56b7-4e30-90dd-8dce7220f04b
+    origin_phase: implement
+    manifested_phase: implement
+    invariant_violated: worktree git state path construction
+    note: Rebase state check on turn 39 probes `.git/worktrees/5185/` for rebase-merge/rebase-apply, but the worktree is at `.worktrees/5185`, so git state is at `.worktrees/5185/.git/`. Produces ls 'no such file or directory' with no diagnostic context.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: f7292394-f19d-4980-98b3-5298418b9744
+    origin_phase: verify
+    manifested_phase: verify
+    invariant_violated: Task-metadata file provisioning in merge worktrees
+    note: 'Orchestrated task in .worktrees/5440 (merge worktree) repeatedly fails with ''no such file or directory'' when reading .task/metadata.json (turn 26) and .task/iterations.jsonl (turn 69). Pattern matches entry-cand-20260728-3 exactly: orchestrated worktree, repeated file-access failures. Manifested during post-merge verification when agent attempts to gather task state for investigation. Signal_counts: tool_error=3, not_found=2, test_failure also present but appears secondary to the metadata-access pattern.'
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -14693,6 +14792,19 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: 'Digest ''Retry Loops'' section flags the watcher rotation''s designed wait-and-check cycle (get_pending_escalations x3, watcher-rearm.sh Bash x6) as suspicious retries, when these are the normal operational pattern: await next escalation via bounded-wait timeout (exit 124), then re-check queue. Three complete cycles shown in Designed Outcomes.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 4023ad77-81b1-4b8e-af80-c621be746c84
+    origin_phase: merge
+    manifested_phase: merge
+    note: Digest flags agent's polling for merge outcome (5× get_merge_queue, 9× merge_status, 6× carrier-merge-check Bash, 14× train-check Bash) as retry loops. This is designed wait-behavior during /unblock 4762, not a watcher's date-check.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a163237c-14e1-4b17-a03c-89e9788d3ddb
+    origin_phase: ops
+    manifested_phase: ops
+    invariant_violated: Watcher should stop retrying or honor terminal signal; instead compounds attempts across retry cycles
+    note: Bash 'recon drain cycle checks' command retried x4, x6, x34 times in sequence; increasing counts suggest compounding retry behavior without reset
 - id: entry-cand-20260827-23
   title: Edit's multi-match error hint gets invoked as a nonexistent standalone 'replace_all' tool
   severity: medium
@@ -14806,6 +14918,18 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: 'Read tool error in turn 35 shows malformed JSON input with leaked MCP envelope markup: `<parameter name=\"limit\">1}` embedded in the input payload, preventing JSON parse.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: c574c0d1-d50d-4794-ba43-6272236973a8
+    origin_phase: implement
+    manifested_phase: implement
+    note: add_memory call (turn 441) leaked MCP envelope markup (`</content>` closing tag) into content field. Root cause matches entry-cand-20260907-20 (agent serializing MCP XML), but differs in tool (add_memory vs add_design_decision), outcome (rejected by server vs persisting), and error recovery (guard caught it before write).
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 98ef2b53-28d8-404e-9a59-a0fc83e9980c
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'Turn 143: add_design_decision call rejected due to raw MCP envelope markup (''</decision>'') embedded in the decision field string — likely from copying/pasting tool XML during implementation. Known pattern with documented override.'
 - id: entry-cand-20260907-21
   title: Agent busy-polls a long-running background pytest run via repeated foreground Bash ps/pgrep instead of a blocking wait primitive
   severity: medium
@@ -14825,6 +14949,12 @@ entries:
     origin_phase: implement
     manifested_phase: verify
     note: Periodic-census verifier confirms busy-polling with repeated ps/pgrep calls persists as an observable pattern; Monitor tool remains a deferred affordance requiring explicit ToolSearch discovery
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a4e8d360-fbc6-451e-b833-b7200f943ba2
+    origin_phase: unknown
+    manifested_phase: merge
+    note: Agent polls merge-queue status repeatedly (get_merge_queue ×8, merge_status ×4 per request_id) via repeated foreground Bash sleep/poll cycles (×6 `sleep 1200; echo tick`) instead of using a blocking wait primitive or orchestrator queueing. MCP timeouts during polling loop (turns 78, 85) suggest connection instability under repeated polling pressure.
 - id: entry-cand-20260912-25
   title: Implementer guesses an undocumented plan.json per-step 'step_type' field, causing a KeyError
   severity: medium
@@ -27077,3 +27207,211 @@ candidates:
     origin_phase: unknown
     manifested_phase: verify
     evidence_quote: '{\"file_path\": ..., \"offset\": 195, 5}}\n<parameter name=\"limit\">1} — trailing newline and XML parameter markup embedded in what should be valid JSON.'
+- id: cand-20260916-1
+  title: Digest 'User Corrections' bucket captures skill invocations and task notifications
+  cause: Digest extraction treats /unblock skill command and task-completion notifications as user corrections when they are neither corrections nor user-originated feedback.
+  area: digest pipeline / signal extraction
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 4023ad77-81b1-4b8e-af80-c621be746c84
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Section ''## User Corrections'': (turn 7) <command-name>/unblock</command-name> (skill invocation, not a correction); (turn 288, 307, 384, 469) <task-notification> entries (system events, not user corrections)'
+- id: cand-20260916-2
+  title: Task-notification truncation obscures tool_error count
+  cause: 'Digest truncation of task-notification outputs (truncated_items=6; 5 of 6 tasks show ''[item truncated: X of Y bytes dropped]'') means the Error Neighborhoods section documents only ~3 tool errors while signal_counts reports tool_error=7. The 4 missing tool errors are lost to truncation.'
+  area: digest-extraction, signal-accounting
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 21398ba1-1f64-49cd-94ad-1f63ed73bec5
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: Task notifications at turns 236, 248, 282, 388, 409 truncated mid-output; signal_counts.tool_error=7 but Error Neighborhoods documents only Bash exit 1 (turn 99) and blocked (turn 147).
+- id: cand-20260916-3
+  title: Bash tool_error blocks miscategorized as orchestrator 'Guard Trips'
+  cause: Digest 'Guard Trips' section lists turns 147 and 409 as 'blocked:' (Bash tool_error blocks for leading sleep, multi-line heredoc rejection) in the same categorical frame as orchestrator guards, inflating df_guard=2 signal count with tool-level constraints rather than domain/safety guards.
+  area: digest-extraction, signal-classification
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 21398ba1-1f64-49cd-94ad-1f63ed73bec5
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'Guard Trips section: turns 147, 409 show ''blocked:''; Error Neighborhoods detail Bash tool_use_error ''Blocked: sleep 45'' and ''Blocked: multi-line heredoc'', not orchestrator guard denials.'
+- id: cand-20260916-4
+  title: Interactive agent background-task interruption via accidental focus loss
+  cause: Interactive harness allows accidental keyboard events to interrupt background agents mid-run; no confirmation gate or focus-lock for destructive background actions (agent stop)
+  area: harness/background-agent-management
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a4e8d360-fbc6-451e-b833-b7200f943ba2
+    origin_phase: merge
+    manifested_phase: merge
+    evidence_quote: 'Turn 1210: Background agent ''Refresh 4484 loop-blocking allowlist'' was stopped by the user. Turn 1220: I didn''t mean to stop that (focus was in the wrong window)'
+- id: cand-20260916-5
+  title: Bash command construction leaks unrelated tool names into execution string
+  cause: Turn 172's error log shows `skim git status` where only `git status` was intended; either the Bash tool's command assembly corrupts tokens, or the digest transcription is garbled mid-tool-call
+  area: bash-tool-command-execution
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 47d2d52e-54f5-45a2-a8c2-1d276420e9f5
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: '/bin/bash: eval: line 1: `cd /home/leo/src/dark-factory/.worktrees/4495 && skim git status --short && git commit`'
+- id: cand-20260916-6
+  title: Orchestrated task retries long-running pytest without escalating or backoff despite repeated timeouts
+  cause: Turns 220 and 253 show identical pytest commands with only timeout ceiling changes (1800→1500), both hit SIGKILL/SIGTERM; no signal to agent that the gate is broken vs slow
+  area: orchestrator-retry-heuristics
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 47d2d52e-54f5-45a2-a8c2-1d276420e9f5
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: turn 220 exit 137 (SIGKILL); turn 253 exit 143 (SIGTERM) — same pytest command, both >300s runtime
+- id: cand-20260916-7
+  title: Task metadata existence assumption fails silently at session start
+  cause: Turn 43 checks `.task-meta/4495/iterations.jsonl` unconditionally; exit 2 suggests file/directory missing but no compensating fallback or diagnostic forwarded to subsequent steps
+  area: task-state-initialization
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 47d2d52e-54f5-45a2-a8c2-1d276420e9f5
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: 'turn 43: bash exit 2 on `ls .task-meta/4495/ && tail iterations.jsonl` — no-such-file not disambiguated'
+- id: cand-20260916-8
+  title: Watcher digest 'not_found' signal pattern unexplained
+  cause: Six 'not_found' signals at turns 35, 44, 70, 78, 91, 155 in a 155-turn watcher rotation; spacing suggests repeating lookup/poll failure (~10-13 turn intervals except the final one). The digest records only the signal count, not the underlying resource, entity, or query that was not found.
+  area: digest extraction / watcher instrumentation
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 30b86a6a-da6e-4a10-bb38-86969f8ac1dc
+    origin_phase: ops
+    manifested_phase: recon
+    evidence_quote: 'signal_counts: { not_found: 6, ... } with six separate ''## Not Found'' entries (turn 35, 44, 70, 78, 91, 155) — each marked only ''does not exist'''
+- id: cand-20260916-9
+  title: Agent assumes task metadata files exist in worktree
+  cause: Orchestrated-task agent in a task worktree attempts to read `.task-meta/<task_id>/` and `.task/plan.json` as if they are present, but encounters missing-file errors. May reflect misunderstanding of where task metadata lives in a worktree context vs. main checkout.
+  area: worktree-task-metadata
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: c574c0d1-d50d-4794-ba43-6272236973a8
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Turn 35: Bash exit 2 attempting `ls -la /home/leo/src/dark-factory/.task-meta/5112/` and `cat /home/leo/src/dark-factory/.task-meta/5112/iterations.jsonl`; not_found signals at turns 54, 98'
+- id: cand-20260916-10
+  title: Git worktree state path construction error
+  cause: Rebase state checks in unblock flow assume `.git/worktrees/<id>/` location; actual git state for a worktree is `.worktrees/<id>/.git/`
+  area: worktree/git-state/orchestrator
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 63ab57ff-56b7-4e30-90dd-8dce7220f04b
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'ls: cannot access ''.git/worktrees/5185/rebase-merge'': No such file or directory; ls: cannot access ''.git/worktrees/5185/rebase-apply'': No such file or directory (turn 39, exit 2)'
+- id: cand-20260916-11
+  title: Monitor event polling lag in interactive unblock sessions
+  cause: Monitor task with 30m timeout and 30s sleep loop expiration cadence too coarse; merge events only visible after 4 consecutive 30m expirations (turns 298, 320, 349, 376) before first event fires at turn 406
+  area: merge-visibility/interactive-unblock/monitoring
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 63ab57ff-56b7-4e30-90dd-8dce7220f04b
+    origin_phase: implement
+    manifested_phase: review
+    evidence_quote: Monitor expired after 30m with no events delivered (turns 298, 320, 349, 376); merge_verify gate_retry event first appears at turn 406
+- id: cand-20260916-12
+  title: Test assertions become unfalsifiable when mock synchronization barriers open before subject execution
+  cause: 'Mock asyncio.Event released before the tested watchdog loop can iterate (required_reads=0 pre-sets the barrier). Assertion measures zero iterations across both correct and broken implementations. Mutation testing confirms: deleting the production guard leaves test green; prior baseline fails with call_count mismatch.'
+  area: shared/tests/test_cli_invoke.py / test_no_escape_without_config_dir_or_session_id vs shared/src/shared/cli_invoke.py startup-regime guard
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a34425a1-7f1f-4e31-9159-2875d56338cf
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: 'the fake child''s communicate() therefore returns on the very first asyncio.wait() — the watchdog loop breaks at the completion check and NEVER executes a poll body, so the assert mock_turns.call_count == 0 is now unfalsifiable: it holds no matter what the production scope gate does. Mutation-verified: deleting `and config_dir and session_id` from the guard leaves the class GREEN (7 passed), whereas the pre-change version at 08595b81cd FAILS the identical mutation with `33 == 0`'
+- id: cand-20260916-13
+  title: Orchestrated task session kills background shell tasks without completion record or resumption path
+  cause: When an orchestrated task spawns background Bash commands via run_in_background and the session ends (timeout, kill, or normal exit), the harness marks them stopped via task-notification but doesn't record completion, transcript markers, or a recovery path. The calling task has no way to resume or await orphaned background work.
+  area: orchestrator/task-lifecycle
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a4e71f71-0dbf-49eb-9fd1-1c927ff239b6
+    origin_phase: implement
+    manifested_phase: unknown
+    evidence_quote: (turn 397) <task-notification>... 2 background shell command tasks didn't finish before the previous session ended... They may have been stopped (via the UI, Monitor timeout, or agent teardown — these leave no transcript marker), or they may have been running when the previous Claude Code process exited. They have been marked stopped.
+- id: cand-20260916-14
+  title: Agent constructs malformed `python3 -c` one-liners with multiple statements on one line, causing IndentationError instead of using heredoc
+  cause: 'Agent attempted to pack multi-statement Python into a single `-c` command by concatenating statements without newlines or proper syntax (e.g., `import json p=json.load(...) for s in p[''steps'']: ...`), triggering Python''s IndentationError. The agent should have used a heredoc or passed the script as a file.'
+  area: agent/bash-tool-use
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a4e71f71-0dbf-49eb-9fd1-1c927ff239b6
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: '(turn 254) python3 -c "import json p=json.load(open(''.task/plan.json'')) for s in p[''steps'']: print(s[''id''], s[''status''], s[''commit''])" -> [exit 1] IndentationError: unexpected indent'
+- id: cand-20260916-15
+  title: Pytest per-test timeout (--timeout=300) is shadowed by Bash tool wall-clock timeout (2400000ms), exit 137 (SIGKILL) reported as tool_error
+  cause: Pytest received a per-test timeout flag but the Bash tool imposed a 40-minute wall-clock ceiling. When pytest's cumulative runtime exceeded the Bash timeout, the process was killed with SIGKILL (exit 137 = 128+9), recorded as tool_error instead of resource-exhaustion boundary.
+  area: verify/bash-timeout-interaction
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a4e71f71-0dbf-49eb-9fd1-1c927ff239b6
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: '(turn 238) Bash({"command": "cd .../orchestrator && uv run pytest tests/ --timeout=300 -q...", "timeout": 2400000}) -> [exit 137] Exit code 137'
+- id: cand-20260916-16
+  title: Implementation replicates the defect class it was asked to remove, with provably false assertions
+  cause: 'Agent replaced fabricated process-remediation claims with different fabricated assertions in the same code path, without verifying the assertions hold true. The exit_code-non-None branch asserts process group killing via SIGKILLed messages, but _terminate_process_tree provably short-circuits on that exact condition (returncode is not None → no signal dispatched). Root cause: insufficient code-flow verification when addressing a prior ''fabricated remediation'' defect — the fix surface-replaces falsehoods rather than verifying the new claims against the actual execution path.'
+  area: correctness / implementation verification
+  first_seen: '2026-09-16'
+  disposition: pending
+  sightings:
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 98ef2b53-28d8-404e-9a59-a0fc83e9980c
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: '_terminate_process_tree (deterministic_runner.py:1610) short-circuits on `if proc.returncode is not None:` — it logs a debug line, dispatches NO signal at all (the deliberate pid-recycling guard), and only awaits the already-complete reap. But `exit_code is not None` is reachable only when `proc.returncode` was already populated, i.e. almost exactly the case where that short-circuit fires. Measured twice: standalone repro prints `returncode at teardown entry = 7 -> would SKIP killpg` with grandchild still alive; test leaves one live `sleep 30` behind after pytest exits.'
