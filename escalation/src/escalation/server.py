@@ -3076,8 +3076,8 @@ def create_server(
         - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
-          queue_depth, eta_seconds}``, where ``position`` is ``int | None``
-          (see the Queued shape below).
+          queue_depth, eta_seconds, lane, lane_source}``, where ``position``
+          is ``int | None`` (see the Queued shape below).
         - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
           wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
           Resolves within clamp → terminal outcome shape.
@@ -3139,6 +3139,24 @@ def create_server(
         the ``lane``/``lane_source`` audit echo on the response below, rather
         than by a second gate over an already-restricted set.
 
+        That echo exists because the lane a submission GOT is otherwise
+        unobservable to the submitter: omit *lane* and nothing in the response
+        said whether ``metadata.merge_lane`` had been honoured, which is half
+        of why the key could sit inert unnoticed.  ``lane_source`` rides with
+        it because ``'normal'`` alone cannot distinguish "the task asked for
+        normal" from "nothing asked at all".  The rest of the audit trail is
+        elsewhere, and deliberately so: ``get_merge_queue`` already carries
+        ``lane`` per queue item (from the worker snapshot,
+        ``orchestrator/src/orchestrator/merge_queue.py::
+        SpeculativeMergeWorker::snapshot``), while the ``merge_queued`` EVENT
+        does NOT and cannot — ``merge_queue.py`` is frozen by
+        ``orchestrator/tests/test_merge_lane_ratchet.py`` against a
+        line/prose/cognitive baseline that a single added line would break, so
+        extending the event is unavailable at any price this change can pay
+        (task 4888 design decision 4).  The response covers the half
+        ``get_merge_queue`` cannot: which source won, and anything at all
+        about a coalesced submission that never becomes a queue item.
+
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
           push_status}`` (plus optional ``failure_diagnostic`` on failure).
@@ -3150,15 +3168,22 @@ def create_server(
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
         - Queued: ``{status='queued', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
-          (or wait_secs timeout expired).  ``position`` is ``int | None``;
+          position, queue_depth, eta_seconds, lane, lane_source}``.  Branch was
+          freshly dispatched (or wait_secs timeout expired).  ``lane`` is the
+          resolved merge lane and ``lane_source`` names which input won it —
+          ``'argument'``, ``'task_metadata'`` or ``'default'`` (task 4888).
+          ``position`` is ``int | None``;
           ``None`` means the live merge-worker snapshot was unavailable, so
           render it as "unknown" — NEVER as front-of-queue (task 5368).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, inflight_task_id, source,
-          inflight_request_id, poll_by, pollable}``.  Branch is
+          position, queue_depth, eta_seconds, lane, lane_source,
+          inflight_task_id, source, inflight_request_id, poll_by, pollable}``.
+          Branch is
           already in-flight; request_id is the *existing* entry's id (D8), not
-          the submitting call's id.  ``inflight_task_id`` is the authoritative
+          the submitting call's id.  ``lane``/``lane_source`` describe THIS
+          submission's resolution, not the in-flight entry's own lane —
+          attaching does not move that entry between lanes.
+          ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
           ``source`` names which coalesce arm attached (``'registry'`` /
           ``'worktree'``).  ``inflight_request_id`` is the in-flight entry's id
@@ -3621,6 +3646,15 @@ def create_server(
             ``max(0, queue_depth - 1)`` are not fabrications: the request was
             just enqueued, so "last in a queue of this depth" is an honest
             derivation from a real ``queue_depth``.
+
+            ``lane``/``lane_source`` are the audit echo (task 4888).  They are
+            captured from the enclosing call rather than taken as a parameter
+            because one ``merge_request`` call resolves exactly ONE lane —
+            unlike ``status``/``req``, which genuinely differ between the
+            queued and attached call sites.  On an ``'attached'`` response
+            they describe THIS submission's resolution, not the in-flight
+            entry it coalesced onto: attaching does not move that entry
+            between lanes.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
             worker = _get_merge_worker(harness)
@@ -3659,6 +3693,8 @@ def create_server(
                 'position': position,
                 'queue_depth': queue_depth,
                 'eta_seconds': eta,
+                'lane': lane_choice.lane,
+                'lane_source': lane_choice.source,
             }
 
         if dispatch.rejected:
