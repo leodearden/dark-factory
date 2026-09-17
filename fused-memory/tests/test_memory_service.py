@@ -5211,6 +5211,7 @@ class TestReconcileEpisodeIdentity:
             old_endpoint_uuid='n-3129', old_endpoint_name='Task 3129',
             endpoint_referent=Referent(number='3129'),
             referent_set=('Task 3127',),
+            group_id='test', project_id='test',
         ))
         mock_result = MockAddEpisodeResult()
         service._dedup_episode_edges = AsyncMock(return_value=1)

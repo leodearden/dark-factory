@@ -1782,6 +1782,46 @@ class ReferentFinding:
     #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
     #: the identity of the finding — at most one finding per (edge, end).
     which_end: str
+    #: The project GRAPH this episode was written to — Graphiti's ``group_id``,
+    #: and the scope in which every uuid on this record resolves.
+    #:
+    #: REQUIRED, and repeated per-finding rather than deduped onto the enclosing
+    #: :class:`ReferentStats`, for exactly the reason
+    #: :func:`_store_failure_diagnostics`' ``project_id`` Args note gives for the
+    #: identical choice in this same module: an entry must be independently
+    #: self-describing, so a consumer reading ONE finding off a log payload or a
+    #: durable row never has to join back against the enclosing call to learn
+    #: which project it came from. One process serves nine projects, and a
+    #: finding read against the wrong one is not hypothetical — it produced a
+    #: false conclusion in the 2026-08-31 audit. That is why this is required
+    #: rather than defaulted: a finding with no project discriminator is the
+    #: record that failure was made of, and it is now unconstructible.
+    group_id: str
+    #: The project SCOPE the write ran under.
+    #:
+    #: A KNOWN-ALIASED PAIR TODAY — said plainly here so nobody reads a
+    #: guarantee into it. ``_verify_episode_referents`` is handed a ``group_id``
+    #: and no :class:`~fused_memory.models.scope.Scope`, so the ONE production
+    #: construction site fills this field from that same value, and no live
+    #: payload has ever carried a pair that disagrees. There is nothing for it
+    #: to disagree with yet:
+    #: :attr:`~fused_memory.models.scope.Scope.graphiti_group_id` returns
+    #: ``self.project_id``.
+    #:
+    #: Kept as its own field anyway, for a reason that is about the DURABLE row
+    #: rather than the in-memory record: this payload is written verbatim to
+    #: ``write_journal``'s ``referent_findings`` table and read back by a later
+    #: process. :meth:`MemoryService._reconcile_episode_identity`'s own
+    #: docstring already anticipates task 3335's cross-project split, after
+    #: which the two need not agree — and a row that had carried only
+    #: ``group_id`` would by then be permanently ambiguous about which of the
+    #: two it meant, with no back-fill possible for rows already on disk. The
+    #: cost is one string per finding on the ~0.2%-of-edges path.
+    #:
+    #: What the tests pin is accordingly that the RECORD can carry a distinct
+    #: pair — that neither field is derived from or collapsed into the other —
+    #: never that the system today produces one.
+    project_id: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
     #: The node the edge is attached to today — as THIS EPISODE'S in-memory
@@ -1928,14 +1968,22 @@ class ReferentFinding:
     def to_dict(self) -> dict[str, Any]:
         """A plain, JSON-safe dict keyed exactly by this record's field names.
 
-        The payload the operator warning carries. Referents render as their
+        The payload the operator warning carries, and the payload a durable
+        ``referent_findings`` row stores verbatim. Referents render as their
         canonical ``node_name`` rather than as a dataclass repr, so the log
-        line and any future durable row read as graph names — the same thing
-        an operator would type into a query.
+        line and the durable row read as graph names — the same thing an
+        operator would type into a query.
+
+        Because the key set IS the field names, :attr:`group_id` and
+        :attr:`project_id` travel with every payload automatically: no consumer
+        of a rendered finding can be handed one that does not say which project
+        it came from.
         """
         return {
             'edge_uuid': self.edge_uuid,
             'which_end': self.which_end,
+            'group_id': self.group_id,
+            'project_id': self.project_id,
             'check': self.check,
             'old_endpoint_uuid': self.old_endpoint_uuid,
             'old_endpoint_name': self.old_endpoint_name,
@@ -4263,6 +4311,14 @@ class MemoryService:
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
+                    # ONE value fills both, and this is the ONLY site that
+                    # constructs a finding: this pass is handed a group_id and
+                    # no Scope, so the pair is ALIASED here by construction.
+                    # See the `project_id` field docs for why the record keeps
+                    # them apart anyway — the argument is about the durable row,
+                    # not about this call.
+                    group_id=group_id,
+                    project_id=group_id,
                     check=check,
                     old_endpoint_uuid=endpoint_uuid,
                     old_endpoint_name=endpoint_name,
@@ -4313,12 +4369,15 @@ class MemoryService:
                 uuid_lookup_degraded=degraded,
             )
 
-        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
-        # `stats.findings` stay outside it entirely, so suppression costs leaf
-        # iota no rate signal and leaf eta no finding — see
-        # `_REFERENT_FINDING_WARN_CAP`.
+        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below, the
+        # durable row below them and `stats.findings` stay outside it entirely,
+        # so suppression costs leaf iota no rate signal, leaf eta no finding and
+        # the replay pass no diagnosis — see `_REFERENT_FINDING_WARN_CAP`.
         warned = 0
         suppressed = 0
+        # Collected here, written ONCE below the loop — see the journal block
+        # further down for why the batch and not a row per finding.
+        to_journal: list[dict[str, Any]] = []
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -4331,6 +4390,34 @@ class MemoryService:
                 # SUBTRACTS this axis from the membership rate, which needs the
                 # denominator to still be there. See REFERENT_FINDING_AXES.
                 self._referent_finding_counts['corroborated'] += 1
+            # THE THIRD INV-2 SURFACE, and the only one that outlives the
+            # process. The two above are in-memory: a finding fully diagnosed
+            # here and not repairable by eta left NOTHING a later pass could
+            # act on.
+            #
+            # ABOVE THE CAP, alongside the counters, because the cap is a log
+            # VOLUME policy; a suppressed finding is still a diagnosis that has
+            # to survive, and putting the write below it would discard exactly
+            # the rows a storm makes most worth keeping.
+            #
+            # AFTER THE SECOND PASS, because that pass rebuilds each resolvable
+            # finding by `dataclasses.replace` to stamp `new_endpoint_uuid` and
+            # `uuid_lookup_degraded`; a row written earlier would persist a
+            # payload missing the target the replay pass exists to act on.
+            #
+            # RESOLVABLE ONLY. The journal's sole declared consumer is the
+            # phase-5 replay pass, which can act on nothing that names no
+            # intended referent — an unresolvable row would be a permanent
+            # backlog entry nothing could ever drain, and that case is already
+            # served by the returned stats, the 'unresolvable' counter and the
+            # WARNING below. Widening it is a one-predicate change if phase 5
+            # ever wants the operator history.
+            #
+            # COLLECTED HERE, COMMITTED ONCE below the loop. The payload is
+            # built only when there is a journal to take it, so the unwired
+            # path allocates nothing.
+            if finding.resolvable and self._write_journal is not None:
+                to_journal.append(finding.to_dict())
             # WARNING, not DEBUG — but NOT WARNING for every finding.
             #
             # WARNING is right for the shape this pass exists to catch. The task
@@ -4402,6 +4489,32 @@ class MemoryService:
                     level, 'Referent verification finding: %s',
                     finding.to_dict(),
                 )
+
+        if to_journal and self._write_journal is not None:
+            # ONE COMMIT PER EPISODE, not one per finding. Every commit is a
+            # `synchronous=FULL` fsync (~1-5 ms, and up to the journal's 5000 ms
+            # busy_timeout under contention) taken while the per-group identity
+            # lock serializes same-group writes, and the loop above has NO
+            # ceiling on its findings — the warn cap is a log policy. Per
+            # finding, a storm episode of 50-100 misattached ends would hold
+            # that lock for 50-500 ms of fsyncs; batched, the whole episode
+            # costs one. The ~99.8% clean path never reaches this line at all.
+            #
+            # NO GUARD HERE: `log_referent_findings` is fire-and-forget by
+            # contract, so the already-committed episode write cannot be lost to
+            # a journal fault (one guard, at one site). A `None` journal is
+            # skipped silently because the counters remain the unconditional
+            # INV-4 escape — a warning for an unconfigured journal would be a
+            # storm, not a signal.
+            #
+            # `_episode_uuid_of` fails closed to `''` rather than raising on a
+            # malformed or MagicMock result: a row that cannot name its episode
+            # is still a diagnosis worth keeping.
+            await self._write_journal.log_referent_findings(
+                to_journal,
+                group_id=group_id,
+                episode_uuid=_episode_uuid_of(result),
+            )
 
         if suppressed:
             # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply
@@ -5217,7 +5330,7 @@ class MemoryService:
                         tuple(reported)
                         if isinstance(reported, (list, tuple)) else ()
                     )
-            repair_stats.repairs.append(ReferentRepair(
+            record = ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,
                 outcome='repaired',
@@ -5237,7 +5350,61 @@ class MemoryService:
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
                 summaries_refreshed=refreshed,
-            ))
+            )
+            repair_stats.repairs.append(record)
+
+            if moved:
+                # THE CURE, SAID OUT LOUD. Every other disposition on this path
+                # already logs — zeta's finding, eta's refusal, its failure,
+                # the emptied-node delete — and the endpoint move, the one
+                # thing this pass exists to perform, did not. INFO matches that
+                # delete line (a strictly more destructive COMPLETED action,
+                # already at INFO), and `server/main.py` sets INFO as the
+                # deployed root level, so the line genuinely reaches syslog.
+                #
+                # GATED ON `moved` — the same discriminator
+                # `ReferentRepairStats.repaired` counts, because a `moved=False`
+                # result is `reassign_edge`'s corroborate-before-acting no-op:
+                # the edge was already correct and nothing was written, so
+                # there is no executed repair to announce. Sharing the ONE
+                # discriminator makes the line count and that property agree by
+                # construction rather than by two sites staying in lockstep.
+                #
+                # The two added keys are the only facts `record` does not hold:
+                # eta is told its scope by its CALLER (nine projects interleave
+                # in one log), and the old endpoint's NAME lives on the
+                # finding. There is deliberately no `new_endpoint_name` —
+                # `intended_referent` already IS that node's canonical
+                # `node_name`, so a second key would carry one value twice
+                # under two names. The payload is built AT the emission because
+                # `%s` defers the string rendering, never the `to_dict()` call;
+                # no `isEnabledFor` guard, unlike the verify pass's finding log,
+                # because that one runs per finding on the DOMINANT shape and
+                # this one at most once per executed repair.
+                #
+                # SETTLED FACTS ONLY, which is why `deleted_emptied_node` is
+                # dropped rather than carried. `_cleanup_emptied_nodes` stamps
+                # it onto the record by `dataclasses.replace` strictly AFTER
+                # this loop, so here it is `''` for EVERY repair — including
+                # the ones whose old endpoint is about to be deleted. Reporting
+                # it would hand an aggregating consumer a value that is
+                # constant by construction and that contradicts the `deleted
+                # emptied node` INFO line the cleanup emits moments later. The
+                # deletion has its own line; this one says only what is true
+                # when it is emitted.
+                settled = {
+                    key: value
+                    for key, value in record.to_dict().items()
+                    if key != 'deleted_emptied_node'
+                }
+                logger.info(
+                    'Referent repair executed: %s',
+                    {
+                        **settled,
+                        'group_id': group_id,
+                        'old_endpoint_name': finding.old_endpoint_name,
+                    },
+                )
 
     async def _backstop_endpoint_summaries(
         self, result: dict[str, Any], *, group_id: str
