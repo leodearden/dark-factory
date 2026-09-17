@@ -332,3 +332,77 @@ def test_every_pytest_config_declares_a_per_test_timeout() -> None:
         'provenance is plans/pytest-per-test-timeout-measurement-2026-09-17.md; '
         'the rationale for the setting is shared/pyproject.toml.'
     )
+
+
+def _grouped_by_value(timeouts: dict[str, object]) -> str:
+    """Config names grouped under each distinct timeout, for a failure message.
+
+    Grouped rather than listed flat so a reader sees WHICH files disagree and in
+    WHICH direction — which is the whole diagnosis — instead of having to
+    reconstruct it from eight lines of `name: value`.
+    """
+    by_value: dict[object, list[str]] = {}
+    for name, value in sorted(timeouts.items()):
+        by_value.setdefault(value, []).append(f'{name}/pyproject.toml')
+    return '\n'.join(
+        f'  timeout = {value!r}: {", ".join(names)}'
+        for value, names in sorted(by_value.items(), key=lambda item: repr(item[0]))
+    )
+
+
+def test_every_pytest_config_declares_the_same_timeout() -> None:
+    """One value across all eight configs — asserted WITHOUT naming the number.
+
+    A split value means the cap a test runs under depends on which directory
+    pytest happened to resolve its rootdir from: the same test, unchanged, gets
+    one budget from `cd fused-memory && pytest tests` and a different one from
+    `pytest fused-memory/tests` at the repo root. That is the same class of
+    silent asymmetry ``test_pytest_workspace_collection.py::
+    test_root_pyproject_mirrors_member_marker_deselections`` exists to prevent
+    for marker deselection, and it is not hypothetical here: the measurement
+    behind the current value found root-bound runs 1.3x to 1.7x SLOWER than
+    per-member ones, so the two rootdirs are not interchangeable even in
+    principle.
+
+    NO LITERAL NUMBER IS ASSERTED, deliberately. A guard spelling
+    `assert timeout == 540` would be a ninth copy of the configuration, and it
+    would go red the next time the value is honestly re-measured — punishing
+    exactly the behaviour this task exists to establish. The number belongs in
+    the configs; this guard pins the RELATIONSHIP between them, and the only
+    property of the value it is entitled to know is that it is a positive number
+    of seconds.
+    """
+    timeouts = {
+        name: ini_options['timeout']
+        for name, ini_options in discovered_pytest_configs().items()
+        if 'timeout' in ini_options
+    }
+
+    # Presence is test_every_pytest_config_declares_a_per_test_timeout's job, not
+    # this one's — but a sweep that found NO values at all would agree vacuously.
+    assert timeouts, (
+        'no discovered pytest config declares a `timeout` at all (task 5442), so '
+        'this agreement guard would pass by comparing nothing. Fix '
+        'test_every_pytest_config_declares_a_per_test_timeout first.'
+    )
+
+    distinct = set(timeouts.values())
+    assert len(distinct) == 1, (
+        'the pytest configs in this repo disagree about the per-test '
+        f'wall-clock cap (task 5442):\n{_grouped_by_value(timeouts)}\n\n'
+        'A split value means the cap a test runs under depends on which '
+        'directory pytest happened to resolve its rootdir from — the same test, '
+        'unchanged, gets a different budget from `cd <member> && pytest tests` '
+        'than from `pytest <member>/tests` at the repo root. Pick ONE value for '
+        'all of them; its provenance belongs in '
+        'plans/pytest-per-test-timeout-measurement-2026-09-17.md, not in a '
+        'per-config judgement call.'
+    )
+
+    (value,) = distinct
+    assert isinstance(value, int) and value > 0, (
+        f'every pytest config declares timeout = {value!r} (task 5442), which is '
+        'not a positive whole number of seconds. pytest-timeout reads this as a '
+        'wall-clock budget; 0 disables the cap outright and a non-integer is not '
+        'what any of the surrounding comments describe.'
+    )
