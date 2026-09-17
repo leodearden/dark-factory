@@ -826,6 +826,36 @@ class TestEveryToolDeclaresTheOverrideParameter:
             )
 
     @pytest.mark.asyncio
+    async def test_metadata_SAYS_WHAT_IT_IS_FOR(self, harness: Harness):
+        """An undescribed ``metadata`` on sixteen tools INVITES the wrong call.
+
+        A bare ``object|null`` named ``metadata`` on ``create_plan`` or
+        ``mark_step_done`` reads exactly like somewhere to attach metadata to
+        the plan, and a caller who believes that has its payload dropped by
+        ``_consume_override`` with nothing said on a channel it can read.
+        Declaring the parameter is what removed the pydantic bounce that used
+        to be that caller's only diagnostic, so the description is the
+        replacement — the mistake is forestalled in the contract instead of
+        reported after the fact.
+
+        Asserted by MEANING, not by text: the description must name the flag
+        key (so the remediation is actionable from the schema alone) and must
+        say the map is not persisted (so it is not read as payload).
+        """
+        listing = await self._listing(harness)
+
+        for name, schema in listing.items():
+            description = schema['properties']['metadata'].get('description', '')
+            assert MARKUP_OVERRIDE_KEY in description, (
+                f'{name} advertises metadata with no mention of the flag it '
+                f'exists for: {description!r}'
+            )
+            assert 'persists nothing' in description, (
+                f'{name} does not tell a caller its map is discarded: '
+                f'{description!r}'
+            )
+
+    @pytest.mark.asyncio
     async def test_the_schemas_stay_CLOSED(self, harness: Harness):
         """Declaring one parameter must not be done by opening the door.
 

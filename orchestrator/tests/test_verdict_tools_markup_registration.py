@@ -720,6 +720,31 @@ class TestEveryRoleToolDeclaresTheOverrideParameter:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('role', ALL_BRANCHES)
+    async def test_metadata_SAYS_WHAT_IT_IS_FOR(
+        self, artifacts: TaskArtifacts, role: str
+    ):
+        """An undescribed ``metadata`` on a verdict tool invites the wrong call.
+
+        This half of the declaration matters MORE here than on plan-tools: a
+        verdict tool already persists a metadata-shaped envelope, so a bare
+        ``object|null`` named ``metadata`` beside it reads as the place to add
+        to it. It is not — ``_consume_override`` drops the map — and the
+        description is where a caller is told so, on the one channel it reads.
+        """
+        schema = await self._schema(artifacts, role)
+        description = schema['properties']['metadata'].get('description', '')
+
+        assert MARKUP_OVERRIDE_KEY in description, (
+            f'{_ROLE_TOOL[role]} advertises metadata with no mention of the '
+            f'flag it exists for: {description!r}'
+        )
+        assert 'persists nothing' in description, (
+            f'{_ROLE_TOOL[role]} does not tell a caller its map is discarded: '
+            f'{description!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ALL_BRANCHES)
     async def test_the_schema_stays_CLOSED(
         self, artifacts: TaskArtifacts, role: str
     ):

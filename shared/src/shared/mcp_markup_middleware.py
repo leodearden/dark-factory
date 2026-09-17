@@ -107,7 +107,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, NoReturn
+from typing import Annotated, Any, NoReturn
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
@@ -119,6 +119,7 @@ from fastmcp.server.middleware import Middleware
 # submodule instead of the decorator), so it imports fine but type-checks as
 # reportMissingImports. Same class either way — measured identical.
 from fastmcp.tools.base import ToolResult
+from pydantic import Field
 
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
@@ -1623,14 +1624,48 @@ class MarkupGuardMiddleware(Middleware):
 # ---------------------------------------------------------------------------
 
 
+#: What the declared parameter SAYS IT IS FOR, in the schema itself.
+#:
+#: A bare ``metadata: object|null`` on twenty agent-facing tools is an
+#: invitation to the wrong call: ``create_plan`` or ``mark_step_done``
+#: advertising an undescribed ``metadata`` reads exactly like somewhere to
+#: attach metadata to the plan, and a caller that believes it has its payload
+#: dropped by :func:`_consume_override`. Before the declaration existed
+#: pydantic bounced that caller — a bad response, but a response — so the
+#: description is what replaces it: the mistake is forestalled in the contract
+#: rather than reported after the fact. The alternative considered and NOT
+#: taken was handing the leftover key names back to the caller; both channels
+#: that could carry them are closed here. Raising re-creates the bounce D12
+#: deliberately removed (the flag beside another key used to be a hard error),
+#: and widening a tool's RESULT to carry a guard diagnostic would rewrite the
+#: structured-content contract of all twenty.
+#:
+#: Spelled from :data:`~shared.toolcall_markup.MARKUP_OVERRIDE_KEY` rather than
+#: quoting it, so the schema and :data:`_OVERRIDE_SENTENCE` cannot name
+#: different flags (INV-5).
+_OVERRIDE_DESCRIPTION = (
+    "Write-time-only control for this server's tool-call markup guard, and "
+    "NOT payload. Send {'" + MARKUP_OVERRIDE_KEY + "': True} to declare that "
+    'envelope markup in these arguments is quoted DELIBERATELY, so the guard '
+    'lets the call through instead of bouncing it. The tool persists nothing '
+    'from this map — the flag is consumed before dispatch and any other key '
+    'is discarded, so this is not a place to attach metadata to whatever the '
+    'tool writes.'
+)
+
 #: The parameter a decorated tool advertises. Keyword-only and defaulted, so it
 #: lands in ``properties`` and never in ``required``; ``dict | None`` so the
-#: schema accepts the flag map or nothing at all.
+#: schema accepts the flag map or nothing at all; ``Annotated`` with a pydantic
+#: ``Field`` so it also SAYS what it is for. Measured against fastmcp 3.2.2:
+#: the description survives the ``__signature__`` route and lands on the
+#: advertised property beside ``anyOf`` and ``default``.
 _OVERRIDE_PARAMETER = inspect.Parameter(
     'metadata',
     inspect.Parameter.KEYWORD_ONLY,
     default=None,
-    annotation=dict[str, Any] | None,
+    annotation=Annotated[
+        dict[str, Any] | None, Field(description=_OVERRIDE_DESCRIPTION)
+    ],
 )
 
 
@@ -1647,6 +1682,13 @@ def _consume_override(tool: str, metadata: Any) -> None:
     Declaring ``metadata`` removes the bounce, which is the point; silently
     eating the residue with it would not be. So the response goes and the
     REPORT stays.
+
+    The report is a server-side log, which the party holding the bug cannot
+    read. That gap is closed at the DECLARATION rather than here: the schema
+    carries :data:`_OVERRIDE_DESCRIPTION`, so a caller is told what this
+    parameter is and is not for before it sends the wrong thing. The two
+    return channels that could carry the key names back — raising, or widening
+    the tool's own result — are argued and rejected there.
 
     KEYS ONLY, never values — the same names-only convention
     :meth:`MarkupGuardMiddleware._emit_fact` and :meth:`~MarkupGuardMiddleware._forward`
@@ -1737,7 +1779,9 @@ def accepts_markup_override(fn: Callable[..., Any]) -> Callable[..., Any]:
        advertises ``"metadata": {"anyOf": [{"additionalProperties": true,
        "type": "object"}, {"type": "null"}], "default": null}``, with the
        tool's own ``required`` list and its ``additionalProperties: false``
-       both preserved.
+       both preserved. An ``Annotated[..., Field(description=...)]`` annotation
+       survives the same route and lands as that property's ``description``,
+       which is what carries :data:`_OVERRIDE_DESCRIPTION` to the caller.
     2. Calls WITH and WITHOUT the argument both succeed, and the wrapped body
        never sees it.
     3. An ``async def`` tool is supported: FastMCP awaits the coroutine the
