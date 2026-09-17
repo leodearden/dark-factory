@@ -57,6 +57,7 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _FIELD_CHARS,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     JUDGE_SYSTEM_PROMPT,
@@ -241,6 +242,107 @@ class TestJudgeExemplars:
                     f'exemplar {field_name} is drawn from the eval corpus — '
                     f'that is training on the test set: {text!r}'
                 )
+
+    def test_every_exemplar_field_reaches_the_model(self) -> None:
+        """Declared but unrendered exemplars would teach nothing at all.
+
+        All three fields, because a pair rendered without its verdict is a
+        riddle and a verdict rendered without its pair is an assertion.
+        """
+        prompt = JUDGE_SYSTEM_PROMPT
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate', 'verdict'):
+                text = getattr(exemplar, field_name)
+                assert text in prompt, (
+                    f'exemplar {field_name} never reaches the model: {text!r}'
+                )
+
+    def test_the_exemplars_render_once_each_in_declaration_order(self) -> None:
+        """A REPRODUCIBLE measurement needs a prompt that does not move.
+
+        This suite has been bitten once already by an iteration order moving
+        between two processes — the committed `.json`/`.md` confusion-row
+        disagreement that
+        ``test_the_committed_markdown_is_the_render_of_the_committed_json``
+        now pins. A tuple cannot reorder itself, so what is left to check is
+        that the RENDERER walks it in order and does not double-render.
+
+        Asserted on ``entry``, which uniquely identifies an exemplar and
+        occurs nowhere else in the prompt. ``candidate`` and ``verdict``
+        deliberately recur — one candidate is shared by all four exemplars, so
+        the only variable is the relationship, and each verdict word already
+        appears three to five times in the vocabulary section above the
+        examples. Counting occurrences of either would measure the prompt's
+        prose, not the renderer's determinism.
+        """
+        prompt = JUDGE_SYSTEM_PROMPT
+        positions = []
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert prompt.count(exemplar.entry) == 1, (
+                f'exemplar rendered {prompt.count(exemplar.entry)} times, not '
+                f'once: {exemplar.entry!r}'
+            )
+            positions.append(prompt.index(exemplar.entry))
+        assert positions == sorted(positions), (
+            f'the render walks JUDGE_EXEMPLARS out of declaration order: '
+            f'{positions}'
+        )
+
+    def test_the_user_prompt_carries_no_exemplar_text(self) -> None:
+        """Exemplars are constant, so they are paid for ONCE, system-side.
+
+        Two reasons beyond the token bill. ``scripts/check_write_triage_attach_target.py``
+        is the behavioural gate probe for flip-predicate item 1; its
+        ``_echoes_argument`` / ``_swap_verdict`` controls attribute a
+        rendering difference to a SPECIFIC candidate in the user turn, and
+        constant example lines there would be extra material those controls
+        would have to reason around. And the system half is the half a
+        provider can cache — rendered per call, the exemplars would be paid
+        for on all 102 cases of an eval run instead of once.
+
+        Verdict WORDS are excluded: ``build_judge_prompt`` names the closed
+        vocabulary by design, which is a different thing from carrying an
+        example.
+        """
+        candidates = [
+            _result('mem-aaa', 0.9, content='first candidate body'),
+            _result('mem-bbb', 0.8, content='second candidate body'),
+        ]
+        prompt = build_judge_prompt('the new entry text', candidates)
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in prompt, (
+                    f'exemplar {field_name} leaked into the per-call user turn: '
+                    f'{text!r}'
+                )
+
+    def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
+        """PRD C1 bounds the whole call, and the exemplars spend against it.
+
+        The worst case is not hypothetical: ``_FIELD_CHARS`` is exactly how
+        much of a long record survives ``_elide``, so a full slate of maximal
+        candidates plus a maximal entry is what a real call looks like when
+        the corpus is at its largest. Built rather than arithmetic, so the
+        scaffolding between the fields is counted too.
+
+        The ceiling is a module constant, not a literal here, so the budget
+        has one home — raising it is an edit to the thing being budgeted,
+        made next to the C1 rationale, rather than a number quietly relaxed in
+        a test.
+        """
+        maximal = 'x' * _FIELD_CHARS
+        candidates = [
+            _result(f'mem-{i}', 0.9, content=maximal)
+            for i in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+        ]
+        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(
+            build_judge_prompt(maximal, candidates),
+        )
+        assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
+            f'worst-case prompt is {worst_case} chars against a budget of '
+            f'{judge_module._PROMPT_CHAR_BUDGET}'
+        )
 
 
 class TestParseJudgeVerdict:
