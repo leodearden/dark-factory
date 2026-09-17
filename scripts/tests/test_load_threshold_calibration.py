@@ -1451,3 +1451,145 @@ def test_a_failing_commit_does_not_take_the_report_down_with_it(tmp_path: Path):
     assert list(not_a_repo.glob('load-threshold-calibration-*.md')), 'report still written'
     payload = trailing_json(result.stdout)
     assert 'report_commit_failed' in payload['degradations'], payload
+
+
+# ── arm_thresholds: a botched arm leaf is NAMED, never dropped (esc-3592-8) ──
+
+def test_a_non_numeric_arm_leaf_is_named_rather_than_silently_dropped():
+    """The silent-drop this module's own contract forbids.
+
+    The module docstring promises every degradation is a named entry in the
+    report AND a key in the trailing JSON. A `runqueue_ratio: "4.0"` used to
+    vanish from `configured` with nothing said anywhere, so the report printed
+    "no value in force" for a config that visibly sets one.
+    """
+    module = load_script()
+
+    result = module.arm_thresholds(
+        {'enabled': True, 'runqueue_ratio': '4.0', 'cpu_some_avg10': 85.0},
+        'local')
+
+    assert result.in_force == {'cpu_some_avg10': 85.0}
+    assert result.unusable == {'runqueue_ratio': "'4.0' (str)"}
+    assert result.degradations == [
+        "local_threshold_not_numeric: runqueue_ratio = '4.0' (str)"
+    ]
+
+
+def test_the_yaml_1_1_exponent_quirk_is_the_realistic_trigger():
+    """`7.0e1` is a STRING to PyYAML; `7.0e+1` is 70.0. Measured, not supposed.
+
+    This is why the guard is not hypothetical: an operator writes what reads as
+    a number and gets a string. Asserted through yaml itself rather than by
+    hand-writing the string, so the test fails if the quirk ever goes away.
+    """
+    import yaml
+    module = load_script()
+
+    block = yaml.safe_load('runqueue_ratio: 7.0e1\ncpu_some_avg10: 7.0e+1\n')
+    assert block['runqueue_ratio'] == '7.0e1', 'PyYAML quirk gone; revisit'
+
+    result = module.arm_thresholds(block, 'local')
+
+    assert result.in_force == {'cpu_some_avg10': 70.0}
+    assert 'runqueue_ratio' in result.unusable
+    assert result.degradations == [
+        "local_threshold_not_numeric: runqueue_ratio = '7.0e1' (str)"
+    ]
+
+
+def test_a_bool_on_an_arm_leaf_is_unusable_not_the_threshold_one():
+    """bool IS an int in Python, so `runqueue_ratio: true` must not read as 1.0.
+
+    It is also not a silent skip: on an ARM leaf a bool is an authoring
+    mistake, so it lands in `unusable` with a degradation.
+    """
+    module = load_script()
+
+    result = module.arm_thresholds({'runqueue_ratio': True}, 'local')
+
+    assert result.in_force == {}
+    assert result.unusable == {'runqueue_ratio': 'True (bool)'}
+    assert result.degradations == [
+        'local_threshold_not_numeric: runqueue_ratio = True (bool)'
+    ]
+
+
+def test_non_arm_leaves_are_skipped_silently_because_they_are_not_mistakes():
+    """`enabled` and `min_inflight_floor` are not thresholds. No degradation."""
+    module = load_script()
+
+    result = module.arm_thresholds(
+        {'enabled': True, 'min_inflight_floor': 3, 'runqueue_ratio': 4.0},
+        'local')
+
+    assert result.in_force == {'runqueue_ratio': 4.0}
+    assert result.unusable == {}
+    assert result.degradations == []
+
+
+def test_an_absent_block_yields_no_thresholds_and_no_degradation():
+    """`None` in means nothing configured — which is not itself a failure."""
+    module = load_script()
+
+    result = module.arm_thresholds(None, 'local')
+
+    assert (result.in_force, result.unusable, result.degradations) == ({}, {}, [])
+
+
+def test_the_side_prefixes_the_degradation_like_its_sibling_loader():
+    """Same `<side>_<name>` vocabulary as load_psi_admission_block."""
+    module = load_script()
+
+    result = module.arm_thresholds({'runqueue_ratio': '4.0'}, 'peer')
+
+    assert result.degradations == [
+        "peer_threshold_not_numeric: runqueue_ratio = '4.0' (str)"
+    ]
+
+
+def test_an_unconfigured_arm_does_not_misdirect_the_reader_to_degradations():
+    """The other half of the same defect.
+
+    The old single label sent the reader to the Degradations section for an
+    arm that was simply never configured — where there is nothing to read and
+    nothing is wrong. "(see degradations)" is now reserved for the case that
+    actually put something there.
+    """
+    module = load_script()
+
+    assert module._in_force_label('runqueue_ratio', None, {}) == '(not configured)'
+    assert module._in_force_label(None, None, {}) == '(not configured)'
+    assert module._in_force_label('runqueue_ratio', 4.0, {}) == '4.0'
+    assert 'see degradations' in module._in_force_label(
+        'runqueue_ratio', None, {'runqueue_ratio': "'4.0' (str)"})
+
+
+def test_the_botched_leaf_reaches_both_the_report_and_the_json(tmp_path: Path):
+    """End to end, which is where the contract is actually owed.
+
+    Reproduces the reviewer's exact config. Before the fix the JSON reported
+    `configured: {cpu_some_avg10: 85.0}` with no mention of the runqueue leaf
+    in `degradations`, and the report said "(none — see degradations)".
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_ratio': [1.0, 2.0, 3.0]})
+    local = write_yaml(tmp_path / 'local.yaml', """
+psi_admission:
+  enabled: true
+  runqueue_ratio: "4.0"
+  cpu_some_avg10: 85.0
+""")
+
+    result = run_script('--db', str(db), '--config', str(local),
+                        '--peer-config', str(tmp_path / 'absent.yaml'),
+                        '--arm', 'runqueue_ratio', '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert 'local_threshold_not_numeric' in payload['degradations'], payload
+    assert payload['unusable_thresholds'] == {'runqueue_ratio': "'4.0' (str)"}
+    assert 'runqueue_ratio' not in payload['configured']
+    assert any('local_threshold_not_numeric' in d
+               for d in payload['degradation_details']), payload
+    # And the human half of the same promise.
+    assert 'UNUSABLE' in result.stdout

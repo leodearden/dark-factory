@@ -486,22 +486,59 @@ def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[s
     return block, []
 
 
-def arm_thresholds(block: dict | None) -> dict[str, float]:
-    """The arm thresholds a parsed block actually sets.
+class ArmThresholds(NamedTuple):
+    """What a block sets, what it tried and failed to set, and why.
+
+    ``unusable`` is carried as structured data rather than recovered by
+    re-reading ``degradations`` (INV-12, no ad-hoc parsers): the report needs
+    per-arm membership to choose its wording, and the degradation strings exist
+    for humans.
+    """
+    in_force: dict[str, float]
+    unusable: dict[str, str]
+    degradations: list[str]
+
+
+def arm_thresholds(block: dict | None, side: str = 'local') -> ArmThresholds:
+    """The arm thresholds a parsed block actually sets, plus the ones it botched.
 
     Reported beside each ladder so the report always evaluates the value in
     force, not only the hypotheticals. Non-arm leaves (``enabled``,
-    ``min_inflight_floor``) and non-numeric values are skipped; ``bool`` is
-    excluded explicitly because in Python it IS an int, and `enabled: true`
-    would otherwise read as the threshold 1.
+    ``min_inflight_floor``) are skipped silently -- they are not thresholds and
+    their presence is not a mistake.
+
+    A NON-NUMERIC value on an ARM leaf is a different thing and is NAMED, never
+    skipped. The author asked for a threshold and did not get one, so silence
+    here would print "no value in force" for a config that visibly sets one --
+    the silent-fail-soft this module's own contract forbids (see the module
+    docstring: every degradation is a named entry in the report AND a key in the
+    trailing JSON). The trigger is not hypothetical: PyYAML implements YAML 1.1,
+    whose float regex requires a SIGN in the exponent, so `7.0e1` parses as the
+    STRING '7.0e1' while `7.0e+1` parses as 70.0 (pinned by
+    test_a_numeric_looking_string_is_reported_as_drift_not_silently_coerced).
+    A quoted `"4.0"` does the same. An operator can write what reads as a
+    number and have the calibration quietly ignore it.
+
+    ``bool`` is excluded from the numeric case explicitly because in Python it
+    IS an int, and `enabled: true` would otherwise read as the threshold 1. It
+    lands in ``unusable`` rather than being dropped, for the same reason: on an
+    ARM leaf a bool is a mistake worth seeing.
     """
     if block is None:
-        return {}
-    return {
-        arm: float(value) for arm, value in block.items()
-        if arm in ARM_METRIC_SELECTORS and isinstance(value, (int, float))
-        and not isinstance(value, bool)
-    }
+        return ArmThresholds({}, {}, [])
+    in_force: dict[str, float] = {}
+    unusable: dict[str, str] = {}
+    degradations: list[str] = []
+    for arm, value in block.items():
+        if arm not in ARM_METRIC_SELECTORS:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            in_force[arm] = float(value)
+            continue
+        shape = f'{value!r} ({type(value).__name__})'
+        unusable[arm] = shape
+        degradations.append(f'{side}_threshold_not_numeric: {arm} = {shape}')
+    return ArmThresholds(in_force, unusable, degradations)
 
 
 _DEFAULTS_DUMP = (
@@ -606,6 +643,23 @@ def compare_to_code_defaults(block: dict | None, defaults: dict | None) -> dict 
         elif value == defaults[leaf]:
             restates.append(leaf)
     return {'restates_default': sorted(restates), 'unknown_to_schema': sorted(unknown)}
+
+
+def _in_force_label(arm: str | None, in_force: float | None,
+                    unusable: dict[str, str]) -> str:
+    """The three states an arm's configured value can be in, said apart.
+
+    The single "(none -- see degradations)" this replaces was wrong in BOTH
+    directions at once: it pointed at degradations for an unconfigured arm,
+    where there are none to read and nothing is wrong, and it used the same
+    words for a leaf that WAS set and could not be used -- the one case where
+    there is something to go and read.
+    """
+    if in_force is not None:
+        return str(in_force)
+    if arm is not None and arm in unusable:
+        return f'set but UNUSABLE ({unusable[arm]}) — see degradations'
+    return '(not configured)'
 
 
 def compare_blocks(local: dict | None, peer: dict | None) -> dict | None:
@@ -879,7 +933,9 @@ def main(argv: list[str] | None = None) -> int:
     local_block, local_degradations = load_psi_admission_block(args.config, 'local')
     peer_block, peer_degradations = load_psi_admission_block(args.peer_config, 'peer')
     degradations += local_degradations + peer_degradations
-    configured = arm_thresholds(local_block)
+    configured, unusable_thresholds, threshold_degradations = arm_thresholds(
+        local_block, 'local')
+    degradations += threshold_degradations
     drift = compare_blocks(local_block, peer_block)
     code_defaults, defaults_degradations = fetch_code_defaults(
         command=default_defaults_command(args.uv_bin), cwd=args.project_root)
@@ -941,8 +997,7 @@ def main(argv: list[str] | None = None) -> int:
         lines += [
             f'### `{metric}` — {spec.unit if spec else ""}',
             '',
-            f'Configured value in force: '
-            f'{in_force if in_force is not None else "(none — see degradations)"}',
+            f'Configured value in force: {_in_force_label(arm, in_force, unusable_thresholds)}',
             '',
             # A hold fraction's denominator is readable ticks, not ticks, so it
             # is printed beside the coverage it was computed over — never alone.
@@ -1032,6 +1087,11 @@ def main(argv: list[str] | None = None) -> int:
         'holds': holds,
         'coverage': coverage,
         'configured': configured,
+        # The exact counterpart of 'configured', and load-bearing for a machine
+        # consumer: without it the JSON cannot distinguish "this arm was never
+        # set" from "it was set and rejected" -- the confusion this key pair
+        # exists to remove. Naming it here beats re-parsing degradation strings.
+        'unusable_thresholds': unusable_thresholds,
         'drift': drift,
         'restates_code_default': restatements,
         'degradations': [d.split(':', 1)[0] for d in degradations],
