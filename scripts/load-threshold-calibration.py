@@ -34,6 +34,16 @@ infra_issue with no gate: exiting non-zero because reify's yaml was missing
 would page a human about a broken script instead of delivering the
 calibration report that says one side could not be compared.
 
+That contract is scoped by its own first clause, and the scope is the point: a
+DEGRADATION is an unusual INPUT -- an absent config, a non-UTF-8 byte, a yaml
+date scalar -- and belongs in the named vocabulary, which is why each of those
+is caught where it arises. An unanticipated exception is not that. It means no
+analysis was completed, so there is nothing to deliver and an INFRA FAULT page
+is the honest signal; a blanket `except Exception` at __main__ returning 0
+would buy the letter of the contract by reporting a broken script as a
+delivered report with a degradation. Loud beats silent here, so there is no
+top-level guard, deliberately.
+
 Output contract, matching scripts/merge-pytest-n-ab-analysis.py: the human
 report on stdout, the written report's path on STDERR so stdout's last line
 stays the single-line JSON.
@@ -42,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -50,8 +61,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, TypedDict
 
+# The PEER checkout, and so the one path here that must NOT follow
+# $DARK_FACTORY_ROOT: the whole point of the comparison is that it lives in a
+# different project. Every other default is derived from the seam below.
 DEFAULT_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
-DEFAULT_REPORT_DIR = Path('/home/leo/src/dark-factory/plans')
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
 
 # {metric: [(ts, value) in ts order]} — what every reader here hands around.
@@ -115,10 +128,34 @@ ARM_METRIC_SELECTORS = {
 
 
 def pct(xs: list[float], p: float) -> float:
+    """NEAREST-RANK percentile: always a value the corpus actually contains.
+
+    Deliberate, and not the same choice as ``statistics.quantiles`` or
+    ``dashboard/src/dashboard/data/stats_utils.py``, both of which INTERPOLATE.
+    What this feeds is a candidate THRESHOLD ladder, and an interpolated p99 is
+    a number no tick ever produced -- "hold above 4.03" where the corpus only
+    ever holds 4.0 and 4.1. Nearest-rank keeps every reported figure an observed
+    reading, which is what makes the report's numbers checkable against the
+    corpus by hand.
+
+    ``+ 0.5`` and ``math.floor``, not ``round``: round() is banker's, so an
+    exact .5 index alternated between the lower and upper median with n --
+    ``pct([1, 2], .5)`` was 1 while ``pct([1, 2, 3, 4], .5)`` was 3. Same
+    definition either way for every non-tie index (the four ladder rungs on a
+    100-sample series are identical), but a rule that changes with the parity of
+    n is one no reader can state.
+
+    SHARED ORIGIN, and it cannot currently be shared as code: this is a copy of
+    ``scripts/merge-pytest-n-ab-analysis.py::pct``, which has the un-fixed
+    tie-break. Both files must run under the system python3 with stdlib only,
+    and ``scripts/`` is not a package, so there is no module for them to import
+    from and no reconciler test to write against one. Change this and the other
+    one drifts silently -- read them together.
+    """
     if not xs:
         return float('nan')
     ys = sorted(xs)
-    k = max(0, min(len(ys) - 1, int(round(p * (len(ys) - 1)))))
+    k = max(0, min(len(ys) - 1, math.floor(p * (len(ys) - 1) + 0.5)))
     return ys[k]
 
 
@@ -132,6 +169,25 @@ def default_db() -> Path:
     return default_project_root() / 'data/load-samples.db'
 
 
+def default_config() -> Path:
+    """THIS project's orchestrator config, via the same seam as the corpus.
+
+    Honouring the seam here is not symmetry for its own sake. With the path
+    hardcoded, ``DARK_FACTORY_ROOT=/other/checkout`` read the other checkout's
+    corpus and code defaults and then compared them against the ORIGINAL
+    checkout's yaml -- a report that silently mixes two checkouts and says so
+    nowhere. ``--config`` still names a FILE independently of ``--project-root``
+    (which names the checkout whose CODE supplies the shipped defaults); those
+    stay two axes, they just now share one origin when neither is given.
+    """
+    return default_project_root() / 'dark-factory-orchestrator.yaml'
+
+
+def default_report_dir() -> Path:
+    """Where the report lands -- and, with --commit, which repo receives it."""
+    return default_project_root() / 'plans'
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -140,17 +196,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help='load-samples.db (default: $DARK_FACTORY_ROOT/data/load-samples.db)')
     ap.add_argument('--arm', choices=sorted(ARM_METRIC_SELECTORS), default=None,
                     help='restrict the analysis to one arm (default: all)')
-    ap.add_argument('--config', type=Path,
-                    default=Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml'),
-                    help='this project\'s orchestrator config (default: %(default)s)')
+    ap.add_argument('--config', type=Path, default=None,
+                    help='this project\'s orchestrator config '
+                         '(default: $DARK_FACTORY_ROOT/dark-factory-orchestrator.yaml)')
     ap.add_argument('--peer-config', type=Path, default=DEFAULT_PEER_CONFIG,
                     help='the peer project\'s orchestrator config (default: %(default)s)')
     ap.add_argument('--project-root', type=Path, default=None,
                     help='checkout whose orchestrator code supplies the shipped '
                          'defaults (default: $DARK_FACTORY_ROOT). Independent of '
                          '--config, which only says where the yaml lives.')
-    ap.add_argument('--report-dir', type=Path, default=DEFAULT_REPORT_DIR,
-                    help='where the markdown report is written (default: %(default)s)')
+    ap.add_argument('--report-dir', type=Path, default=None,
+                    help='where the markdown report is written '
+                         '(default: $DARK_FACTORY_ROOT/plans)')
     ap.add_argument('--no-report', action='store_true',
                     help='print only; write no report file')
     ap.add_argument('--uv-bin', type=Path, default=DEFAULT_UV_BIN,
@@ -159,12 +216,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument('--commit', action='store_true',
                     help='git commit --only the written report (for the scheduled run)')
     args = ap.parse_args(argv)
-    # Resolved HERE and not as an argparse default, so the env seam is read at
-    # call time rather than frozen at import.
+    # Resolved HERE and not as argparse defaults, so the env seam is read at
+    # call time rather than frozen at import. All four, not just the corpus: a
+    # path that ignores the seam sends the run across two checkouts at once.
     if args.project_root is None:
         args.project_root = default_project_root()
     if args.db is None:
         args.db = default_db()
+    if args.config is None:
+        args.config = default_config()
+    if args.report_dir is None:
+        args.report_dir = default_report_dir()
     return args
 
 
@@ -402,8 +464,15 @@ def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[s
     if not path.is_file():
         return None, [f'{side}_config_missing: {path}']
     try:
-        parsed = yaml.safe_load(path.read_text())
-    except OSError as exc:
+        # encoding= explicitly: read_text() would use the LOCALE codec, so a
+        # config with a non-UTF-8 byte raises UnicodeDecodeError under LANG=C
+        # and not under LANG=*.UTF-8 -- a degradation whose existence depends on
+        # the gate's environment. UnicodeDecodeError is a ValueError, not an
+        # OSError, so it is named in the except too: uncaught it would leave
+        # main() by a path that has no top-level guard, and a non-zero rc here
+        # is an INFRA FAULT page rather than the delivered report.
+        parsed = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError) as exc:
         return None, [f'{side}_config_unreadable: {path} ({exc})']
     except yaml.YAMLError as exc:
         return None, [f'{side}_config_unparseable: {path} ({exc})']
@@ -443,6 +512,14 @@ _DEFAULTS_DUMP = (
 )
 DEFAULT_UV_BIN = Path('/home/leo/.local/bin/uv')
 _DEFAULTS_TIMEOUT_SECONDS = 120
+
+# Every git call is bounded, because an unbounded one defeats the named
+# degradation exactly as thoroughly as a traceback would -- the gate would hang
+# instead of delivering the analysis. Sized by the slowest real case: the commit
+# runs in the machine-operated project_root, where CLAUDE.md budgets pre-commit
+# at up to 300 s. TimeoutExpired is a SubprocessError, so the existing handlers
+# already name it once a timeout exists at all.
+_GIT_TIMEOUT_SECONDS = 360
 
 
 def default_defaults_command(uv_bin: Path) -> list[str]:
@@ -733,6 +810,7 @@ def _discover_repo(directory: Path) -> tuple[str | None, list[str]]:
         proc = subprocess.run(
             ['git', '-C', str(directory), 'rev-parse', '--show-toplevel'],
             capture_output=True, text=True, check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, [f'report_commit_failed: {exc}']
@@ -770,7 +848,10 @@ def commit_report(path: Path, stamp: str) -> list[str]:
             ['git', '-C', repo, 'add', '--', str(path)],
             ['git', '-C', repo, 'commit', '--only', str(path), '-q', '-m', subject],
         ):
-            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, check=False,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
             if proc.returncode != 0:
                 return [
                     f'report_commit_failed: {" ".join(argv[:4])} exited '
@@ -939,6 +1020,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # A degradation raised by the commit above lands in the JSON but not in the
     # already-written report text — the report cannot narrate its own commit.
+    # default=str for the same reason fetch_code_defaults passes it: `drift`
+    # carries RAW parsed yaml values straight through from compare_blocks, and
+    # yaml resolves an unquoted `2026-09-17` to datetime.date, which json cannot
+    # serialise. Without it a TypeError is raised AFTER the whole analysis has
+    # run and printed -- the most expensive possible moment to lose the rc.
     print(json.dumps({
         'generated_at': now.isoformat(timespec='seconds'),
         'db': str(args.db),
@@ -950,7 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
         'restates_code_default': restatements,
         'degradations': [d.split(':', 1)[0] for d in degradations],
         'degradation_details': degradations,
-    }))
+    }, default=str))
     return 0
 
 

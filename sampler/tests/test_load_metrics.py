@@ -1177,6 +1177,43 @@ class TestCalibrationScriptArmTableLockstep:
             'at gate time and cannot import sampler.'
         )
 
+    def test_the_script_reads_a_corpus_THIS_STORE_wrote(self, tmp_path):
+        """The THIRD copy of the samples schema, and until now the unguarded one.
+
+        The schema is spelled in sampler.store (the writer), in
+        dashboard/.../load.py (guarded by its own reconciler) and a third time
+        as a fixture in scripts/tests/test_load_threshold_calibration.py, which
+        cannot import sampler at all. That fixture is what every calibration
+        test reads from, so the whole suite can stay green against a DDL the
+        real store stopped writing years ago, and the first sign would be the
+        gate returning `no_samples_in_window` against the live corpus.
+
+        Guarded from the WRITER's side rather than by comparing two DDL strings.
+        A string comparison would pin the schema's SPELLING -- it would go red
+        on a reformatted CREATE TABLE and stay green if the script selected a
+        column the store never had. This drives the script's own reader over a
+        DB the real store created and wrote, so it fails on exactly the drift
+        that matters and on nothing else.
+        """
+        from sampler.store import LoadSampleStore
+
+        module = self._load_calibration_script()
+        db_path = tmp_path / 'corpus.db'
+        store = LoadSampleStore(db_path)
+        for i in range(3):
+            store.write_tick(
+                1_000_000 + i * 5,
+                unwindowed={'psi_cpu_some_avg10': 10.0 + i},
+                windowed={'runqueue_ratio': 1.0 + i, 'runqueue_read_ok': 1.0},
+            )
+
+        series, readability, degradations = module.read_series(db_path, None)
+
+        assert degradations == [], degradations
+        assert [v for _, v in series['runqueue_ratio']] == [1.0, 2.0, 3.0]
+        assert [v for _, v in series['psi_cpu_some_avg10']] == [10.0, 11.0, 12.0]
+        assert [v for _, v in readability['runqueue_read_ok']] == [1.0, 1.0, 1.0]
+
     def test_every_declared_readability_metric_is_one_the_collectors_emit(
         self, tmp_path
     ):

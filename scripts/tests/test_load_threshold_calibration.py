@@ -24,9 +24,21 @@ REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'load-threshold-calibration.py'
 
 # The real store schema, copied here rather than imported: this suite cannot
-# rely on `sampler` being importable (see the module docstring). The lockstep
-# guard against sampler.store lives in the sampler suite, where both packages
-# do import.
+# rely on `sampler` being importable (see the module docstring).
+#
+# NOTHING IN THIS SUITE RECONCILES THIS COPY, and it cannot: reconciling means
+# importing the writer. Every test below reads a DB built from this fixture, so
+# if sampler.store's schema moved, all of them would stay green against a shape
+# the store no longer writes -- measured, by renaming the `metric` column in
+# sampler.store: 73 green here, and the gate returning no_samples_in_window
+# against the live corpus.
+#
+# The reconciler is therefore in the SAMPLER suite, which can import both sides:
+# sampler/tests/test_load_metrics.py::TestCalibrationScriptArmTableLockstep
+# ::test_the_script_reads_a_corpus_THIS_STORE_wrote drives THIS script's
+# read_series over a DB the real store wrote. It guards from the writer's side
+# rather than comparing two DDL strings, so a reformatted CREATE TABLE does not
+# trip it and a column the store never had does not slip past.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
     ts INTEGER NOT NULL,
@@ -221,6 +233,30 @@ def test_an_unknown_arm_is_rejected_by_argparse():
 
 
 # ── the percentile section ──────────────────────────────────────────────────
+
+
+def test_the_percentile_is_nearest_rank_with_a_tie_break_that_does_not_move():
+    """Two decided properties of `pct`, neither derivable from the ladder tests.
+
+    NEAREST-RANK: every reported figure is a value the corpus contains. The
+    ladder these feed is a threshold ladder, so an interpolated p99 would name a
+    number no tick produced. `[1, 2]` proves it -- an interpolating p50 is 1.5,
+    which is not in the input.
+
+    A TIE-BREAK THAT DOES NOT DEPEND ON n: the index lands on an exact .5 for
+    even-sized inputs, and `round` is banker's, so this alternated between the
+    lower and upper median as n changed -- 1 for `[1, 2]` but 3 for
+    `[1, 2, 3, 4]`. Pinned at both sizes, because one alone cannot see it.
+    """
+    module = load_script()
+
+    assert module.pct([1.0, 2.0], 0.5) == 2.0
+    assert module.pct([1.0, 2.0, 3.0, 4.0], 0.5) == 3.0
+    assert module.pct([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0.5) == 4.0
+    # Non-tie indices are untouched by the tie-break rule, and an empty input
+    # is NaN rather than a crash or a fabricated 0.0.
+    assert module.pct([float(i) for i in range(1, 101)], 0.99) == 99.0
+    assert module.pct([], 0.5) != module.pct([], 0.5)  # NaN
 
 
 def test_percentiles_are_reported_per_metric_including_colon_stems(tmp_path: Path):
@@ -704,6 +740,12 @@ def write_yaml(path: Path, text: str) -> Path:
     return path
 
 
+def _write_bytes(path: Path, raw: bytes) -> Path:
+    """A config that is not decodable text, which write_yaml cannot express."""
+    path.write_bytes(raw)
+    return path
+
+
 def test_formatting_differences_are_not_drift(tmp_path: Path):
     """The comparison is over PARSED MAPPINGS, never text (INV-10)."""
     module = load_script()
@@ -791,6 +833,15 @@ def test_an_absent_block_is_never_treated_as_an_empty_match():
         pytest.param(
             lambda p: write_yaml(p / 'scalar.yaml', 'just-a-string\n'),
             'peer_config_unparseable', id='not-a-mapping'),
+        # A UnicodeDecodeError is a ValueError, not an OSError, so before it was
+        # named here it left main() by a path with no top-level guard -- turning
+        # an odd byte in someone's yaml into an INFRA FAULT page. The read is
+        # pinned to utf-8 for the same reason, so this degrades identically
+        # under LANG=C and LANG=*.UTF-8 rather than only under one of them.
+        pytest.param(
+            lambda p: _write_bytes(p / 'latin1.yaml',
+                                   'psi_admission:\n  note: caf\xe9\n'.encode('latin-1')),
+            'peer_config_unreadable', id='not-utf8'),
     ],
 )
 def test_every_peer_failure_mode_is_its_own_named_degradation(
@@ -815,6 +866,41 @@ def test_the_local_side_gets_the_same_treatment(tmp_path: Path):
 
     assert block is None
     assert [d.split(':', 1)[0] for d in degradations] == ['local_psi_admission_absent']
+
+
+def test_a_yaml_date_scalar_does_not_cost_the_rc_after_the_analysis_ran(
+    tmp_path: Path,
+):
+    """compare_blocks copies RAW parsed yaml values through, and yaml has types.
+
+    An unquoted `2026-09-17` in a psi_admission leaf resolves to datetime.date,
+    which lands in `drift` untouched and reaches the trailing json.dumps. Without
+    `default=`, that raises TypeError AFTER the whole analysis has run and
+    printed the human report -- the single most expensive moment to lose the rc,
+    because eps1/eps2 read a non-zero rc as an INFRA FAULT with no gate and page
+    a human about a broken script that had in fact just delivered its answer.
+
+    Asserted end to end through the real subprocess rather than on json.dumps
+    directly: the property is about the SCRIPT's exit code, and the type only
+    reaches the serialiser by travelling the whole yaml -> compare_blocks ->
+    report path.
+    """
+    db = seed_db(tmp_path / 'load.db', {'runqueue_ratio': [1.0] * 10})
+    local = write_yaml(tmp_path / 'local.yaml',
+                       'psi_admission:\n  review_after: 2026-09-17\n')
+    peer = write_yaml(tmp_path / 'peer.yaml',
+                      'psi_admission:\n  review_after: 2026-10-01\n')
+
+    result = run_script('--db', str(db), '--no-report',
+                        '--config', str(local), '--peer-config', str(peer))
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    payload = trailing_json(result.stdout)
+    drift, = payload['drift']['drift']
+    assert drift['leaf'] == 'review_after'
+    assert (drift['local'], drift['peer']) == ('2026-09-17', '2026-10-01'), (
+        'the date reached the JSON as something other than its str() form'
+    )
 
 
 def test_missing_pyyaml_is_a_named_degradation_not_an_import_crash(
@@ -1133,6 +1219,33 @@ def test_the_project_root_defaults_through_the_same_env_seam_as_the_corpus(
 
     assert module.parse_args([]).project_root == Path('/somewhere/else')
     assert module.default_db() == Path('/somewhere/else/data/load-samples.db')
+
+
+def test_every_this_checkout_default_follows_the_seam_together(monkeypatch):
+    """A path that ignores the seam sends one run across TWO checkouts.
+
+    --db and --project-root honoured $DARK_FACTORY_ROOT while --config and
+    --report-dir were hardcoded, so `DARK_FACTORY_ROOT=/other` read the other
+    checkout's corpus and code defaults, compared them against the ORIGINAL
+    checkout's yaml, and with --commit filed the report into the original repo.
+    Nothing in the report said so. Asserted as a SET so a fifth such default
+    cannot be added while quietly skipping the seam.
+
+    --peer-config is excluded on purpose and pinned by its own test above: it
+    names the OTHER project, which is the entire point of the comparison.
+    """
+    module = load_script()
+    monkeypatch.setenv('DARK_FACTORY_ROOT', '/somewhere/else')
+
+    args = module.parse_args([])
+
+    assert {args.db, args.project_root, args.config, args.report_dir} == {
+        Path('/somewhere/else/data/load-samples.db'),
+        Path('/somewhere/else'),
+        Path('/somewhere/else/dark-factory-orchestrator.yaml'),
+        Path('/somewhere/else/plans'),
+    }
+    assert str(args.peer_config).startswith('/home/leo/src/reify/')
 
 
 # ── the --report-dir / --no-report / --commit trio ──────────────────────────
