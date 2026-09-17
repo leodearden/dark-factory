@@ -709,7 +709,7 @@ class TestEmitRecoveryVetoStreakEscalation:
         )) is True
 
         esc = queue.get_by_task(_streak_sentinel('3535'), status='pending')[0]
-        lines = [l for l in esc.detail.splitlines() if l.startswith('Pinning escalations: ')]
+        lines = [ln for ln in esc.detail.splitlines() if ln.startswith('Pinning escalations: ')]
         assert len(lines) == 1, f'the rule reads ONE whole line, got {lines}'
         assert lines[0] == (
             'Pinning escalations: esc-1000-2 (age unknown), '
@@ -763,7 +763,7 @@ class TestEmitRecoveryVetoStreakEscalation:
             )) is True
 
             esc = queue.get_by_task(_streak_sentinel(task_id), status='pending')[0]
-            lines = [l for l in esc.detail.splitlines() if l.startswith('Pinning escalations: ')]
+            lines = [ln for ln in esc.detail.splitlines() if ln.startswith('Pinning escalations: ')]
             assert lines == ['Pinning escalations: (none recorded)'], (
                 f'{escalation_ids!r} must render the no-pin sentinel, got {lines}'
             )
