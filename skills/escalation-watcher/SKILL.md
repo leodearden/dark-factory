@@ -1300,7 +1300,8 @@ Agent found it depends on work that isn't done yet.
 
 Architectural or design questions. These already failed steward auto-resolution — they're genuinely ambiguous.
 
-**Always escalate to the human:**
+**Always escalate to the human**, except for the narrow self-close case defined in "Standing rule:
+accept verified info-level design deviations" below — check that subsection first:
 1. Present the concern with full context
 2. Leave the escalation pending — the open escalation record IS the durable record that something
    needs doing
@@ -1322,6 +1323,56 @@ triage-ack annotation" and the "Ruled-elsewhere check" above) — never a predic
 record's own pending status. If a probe fires, the ask flips from "human must decide" to "human
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
 the record via amendment. This applies equally to `risk_identified` parks below.
+
+#### Standing rule: accept verified info-level design deviations (Leo, 2026-09-17)
+
+The watcher may close a `design_concern` itself, without parking it, **only when ALL of these
+hold**:
+
+1. **Kind.** Severity `info`, never `blocking`/`critical`/`urgent`, and never a `milestone_gate`.
+2. **After the fact.** It asks the human to ratify a deviation an agent has **already made**. The
+   agent is an architect, planner or amendment pass, and the deviation is from a frozen plan, a
+   reviewer suggestion or a prescribed approach. It is not a choice about what happens next.
+3. **Evidence checked.** The deviation's reason is measured or documented, AND the watcher has
+   checked it itself against the diff, plan, code or test output. Never take it from the record's
+   own text.
+4. **Nothing waits on it.** The subject task is not blocked on this record, and the record is not
+   a pin: `pin_declared_by` is empty and `root_cause` is not `veto-pin-do-not-close:*`.
+5. **Accept is enough.** After checking, the answer is "accept as done" with no follow-up work.
+6. **It overrides nothing of the human's.** Accepting does not:
+   - contradict an existing ruling;
+   - touch a HOLD or a milestone gate;
+   - drop scope a task was meant to deliver;
+   - change a persisted, public or cross-project contract away from what a PRD or ruling
+     specified;
+   - touch security or sandboxing;
+   - cancel or delete work.
+
+**When all hold:**
+- `resolve_issue(action='close_only')`, which leaves the task untouched. The `resolution` names
+  the deviation and the evidence checked, and says "accepted under the standing rule (Leo,
+  2026-09-17)".
+- Append a one-line dated note to the task's `details` (`update_task(..., append=True)`) so the
+  acceptance is visible from the task record. An escalation's resolution is not reachable from the
+  task.
+- Report it to the human in the next message as one line: id, what was accepted, what was
+  checked. A cockpit DecisionRecord already filed for it closes through `reap-decisions`.
+
+**Otherwise**, meaning any condition fails, the evidence cannot be checked, or the recommendation
+is anything but accept, use the normal park procedure above.
+
+**Limits.** A second such escalation on the same task, or more than 3 qualifying in one day, goes
+to the human as a pattern instead: a stream of deviations suggests the planning itself is off. The
+human can revoke this rule at any time.
+
+**Worked examples (2026-09-17).**
+- **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
+  `entity_types` reaches the dedupe decision. The watcher confirmed against the installed
+  `graphiti_core` that `resolve_extracted_nodes` takes no `custom_extraction_instructions` and
+  that `prompts/dedupe_nodes.py` never uses it.
+- **Excluded: esc-4811-3.** "Fixture expansion (plan item 4) is not deliverable" is a *scope item
+  not delivered*, bearing on a reason behind the human's write_triage HOLD. That fails condition 6
+  even though it is info-level and well-evidenced, and its task was blocked on it (condition 4).
 
 ### `risk_identified` (info)
 
