@@ -686,11 +686,6 @@ async def lifespan(app: FastAPI):
         limits=_build_http_limits(config),
     )
     app.state.http_client = http_client
-    # Reclaims pool connections a cancelled request orphaned, which httpcore
-    # itself cannot: dashboard/src/dashboard/http_pool.py states the mechanism.
-    # Takes the LOCAL http_client as an argument — never app.state.http_client —
-    # for the reason _metrics_loop's docstring gives in full (task 3771).
-    reaper_task = asyncio.create_task(reaper_loop(http_client))
     pool = DbPool()
     app.state.db = pool
     app.state.start_time = time.monotonic()
@@ -717,6 +712,19 @@ async def lifespan(app: FastAPI):
     metrics_task = asyncio.create_task(
         _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
     )
+
+    # Reclaims pool connections a cancelled request orphaned, which httpcore
+    # itself cannot: dashboard/src/dashboard/http_pool.py states the mechanism.
+    # Takes the LOCAL http_client as an argument — never app.state.http_client —
+    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    #
+    # LAST, with nothing awaited between here and the yield, though it needs
+    # only http_client and could be started as soon as that exists. Startup has
+    # no try/except, so a task created above `await burndown_store.open()` is
+    # stranded — still ticking against a client nobody will close — if that open
+    # raises. Creating all three background tasks at one site also makes them
+    # read as the set the teardown below cancels as a set.
+    reaper_task = asyncio.create_task(reaper_loop(http_client))
 
     yield
 
