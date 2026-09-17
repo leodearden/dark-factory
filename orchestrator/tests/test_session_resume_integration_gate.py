@@ -2403,9 +2403,18 @@ async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
     files exactly ONE L1 that names the restores that failed.
 
     This is the task's user-observable signal, composed: REAL recovery adopts
-    the sessions, the REAL ``_invoke`` arm site attempts and fails the restore,
-    the REAL Harness classifies and counts, and the REAL filer escalates. No
-    step of that chain is a stand-in except the CLI itself.
+    the sessions, the REAL ``_run_slot`` guard judges them eligible, the REAL
+    ``_invoke`` arm site attempts and fails the restore, the REAL Harness
+    classifies and counts, and the REAL filer escalates. No step of that chain
+    is a stand-in except the CLI itself.
+
+    THE GUARD IS PART OF THE CHAIN, not scenery. Production evaluates
+    eligibility one process-phase BEFORE the restore, in the dispatch that then
+    performs it, so a row that skips it is not the composition it claims to be:
+    while the guard retired the storm run the moment it judged a session
+    eligible, every failure below was preceded by its own reset and this could
+    never reach the threshold — and this row passed anyway, because it dispatched
+    nothing.
 
     The detail must name the failures. The escalation this replaces told the
     operator to run a SQL census and guess which reason drove the run, and
@@ -2420,6 +2429,10 @@ async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
     sessions = await _recover_cold_sessions(harness, specs)
 
     for task_id, _ in specs:
+        # Eligible (a live transcript corroborates it), then the restore that
+        # fails — production's order, in one interleaved run.
+        capture = await _dispatch_capture(harness, task_id)
+        assert capture.resume_session_id is sessions[task_id]
         await _drive_failing_restore(
             harness, tmp_path, caplog, task_id, sessions[task_id],
         )

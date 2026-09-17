@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -235,6 +236,7 @@ async def _drive_session_slot(
     session: dict,
     *,
     config_dir: Path | str | None = None,
+    workflow_reports: Callable[[object], None] | None = None,
 ):
     """Populate recovered-session state and run ``_run_slot`` with
     ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
@@ -244,6 +246,16 @@ async def _drive_session_slot(
     sink wiring). Stashed rather than returned because ~20 existing rows read
     the return value as a session id, and per-harness rather than per-module
     because the fixture is function-scoped, so nothing leaks between rows.
+
+    ``workflow_reports`` COMPOSES the guard with the arm seam (task ε/3733).
+    The stand-in workflow calls it, from inside its ``run()``, with the
+    ``resume_outcome_sink`` kwarg ``_run_slot`` actually handed
+    ``build_workflow`` — the object and the moment production's ``_invoke``
+    reports through. That is what puts the REAL eligibility pass and the REAL
+    sink on ONE streak in a single dispatch, in production's own order; the
+    rows that drive either seam alone cannot observe how they interleave, and
+    the reset-on-eligible defect lived exactly in that gap. Left None, nothing
+    reports and every existing row is byte-identical.
     """
     harness._recovered_sessions[task_id] = session
     if config_dir is not None:
@@ -262,6 +274,14 @@ async def _drive_session_slot(
             total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
         )
         MockWorkflow.return_value = mock_wf
+        if workflow_reports is not None:
+            async def _run(*_args, **_kwargs):
+                workflow_reports(
+                    MockWorkflow.call_args.kwargs['resume_outcome_sink']
+                )
+                return MagicMock(value='done')
+
+            mock_wf.run = _run
         await harness._run_slot(assignment, sem)
         harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs  # type: ignore[attr-defined]
         return MockWorkflow.call_args.kwargs['resume_session_id']
@@ -3536,9 +3556,24 @@ class TestSessionResumeStorm:
         assert esc.level == 1
         assert 'resume' in esc.summary.lower()
 
-    async def test_streak_is_consecutive_reset_by_eligible(
+    async def test_streak_is_consecutive_reset_by_a_surviving_resume(
         self, harness: Harness, tmp_path: Path
     ):
+        """The streak is CONSECUTIVE, not cumulative — and what breaks a run is
+        a resume that SURVIVED, not one merely judged eligible.
+
+        β wrote this row against the guard's eligibility branch, and it was
+        sound while the predicate was the only feeder: "eligible" and "not a
+        failure" were then ONE proposition, on one input, at one instant. ε
+        moves the feeder a whole process-phase downstream — into the restore
+        ``_invoke`` performs after this predicate has already run — so the two
+        are no longer the same claim, and only the arm seam can report that a
+        resume actually worked.
+
+        Both halves of the original contract survive: the run resumes from 0
+        after a genuine reset (the count is consecutive), and an eligible
+        dispatch interleaved mid-run does NOT break the chain.
+        """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
         harness._escalation_queue = self._queue()
         self._arm_synthetic_feeder(harness)
@@ -3546,22 +3581,29 @@ class TestSessionResumeStorm:
         # 2 genuine fallbacks (streak=2)...
         for i in range(2):
             await _drive_session_slot(harness, f'a{i}', self._fresh_session(f'uuid-a{i}'))
-        # ...then an ELIGIBLE resume resets the streak to 0. The real predicate
-        # has to be back in place for a resume to BE eligible.
+        # ...then a resume that ADOPTED AND SURVIVED retires the run.
+        harness.note_resume_succeeded()
+        assert _streak(harness) == 0
+
+        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
+        for i in range(2):
+            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # An ELIGIBLE dispatch interleaved here leaves the run alone — it is a
+        # pre-dispatch predicate, not a verdict on any restore. The real
+        # predicate has to be back in place for a resume to BE eligible.
         del harness._session_resume_reasons
         cfg = _make_transcript(tmp_path, 'uuid-ok')
         await _drive_session_slot(
             harness, 'ok1', self._fresh_session('uuid-ok'), config_dir=cfg,
         )
-        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
-        self._arm_synthetic_feeder(harness)
-        for i in range(2):
-            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
-        assert harness._escalation_queue.submit.call_count == 0
+        assert _streak(harness) == 2
 
         # A 3rd consecutive genuine fallback AFTER the reset reaches threshold →
         # fires once, proving the streak resumed from 0 (consecutive, not
         # cumulative).
+        self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'b2', self._fresh_session('uuid-b2'))
         assert harness._escalation_queue.submit.call_count == 1
 
@@ -3999,6 +4041,102 @@ class TestSessionResumeStorm:
 
         kwargs = harness._last_build_workflow_kwargs  # type: ignore[attr-defined]
         assert kwargs['resume_outcome_sink'] is harness
+
+    async def test_an_eligible_dispatch_never_retires_a_run_in_progress(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """ELIGIBILITY IS NOT SURVIVAL: the guard must leave the run alone.
+
+        Eligibility is a PRE-DISPATCH predicate — evaluated one process-phase
+        BEFORE the restore whose failure is this task's headline feeder, in the
+        SAME dispatch (``build_workflow(..., resume_outcome_sink=self)`` sits a
+        few lines below it, and ``TaskWorkflow._invoke``'s restore later
+        still). While the guard retired the run here, an archive-backed session
+        whose restore then faults ran ``eligible → streak:=0 → fault →
+        streak:=1`` forever: serially the streak could never exceed 1 and
+        INV-4's escape could never fire, which is exactly the "green, and
+        measuring nothing" shape this task exists to end.
+
+        All THREE pieces of run state are asserted, not just the streak: they
+        are retired together, so a partial survival would leave a later L1
+        naming failures from a run it is not about. The ``session_resume`` emit
+        is asserted too — the guard keeps doing its own job; only the
+        retirement goes.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=5, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        for i in range(2):
+            harness.note_resume_failed(self._report(i))
+        run_before = (
+            _streak(harness), _chain_stamp(harness), _recorded_failures(harness),
+        )
+        assert run_before[0] == 2
+        assert run_before[1] is not None
+        assert len(run_before[2]) == 2
+
+        # No synthetic feeder is armed, so the predicate is the REAL one, and a
+        # live transcript makes the session genuinely eligible.
+        cfg = _make_transcript(tmp_path, 'uuid-elig')
+        await _drive_session_slot(
+            harness, 'elig1', self._fresh_session('uuid-elig'), config_dir=cfg,
+        )
+
+        assert [et for et, _ in _session_resume_emits(harness)] == [
+            EventType.session_resume
+        ]
+        assert (
+            _streak(harness), _chain_stamp(harness), _recorded_failures(harness),
+        ) == run_before
+
+    async def test_a_run_of_archive_backed_restore_faults_still_pages(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """THE COMPOSED REGRESSION — the real guard and the real sink, one
+        streak, in production's per-dispatch order.
+
+        Every other row in this class drives ONE of the two seams: the β rows
+        drive the predicate through ``_run_slot``, the ε rows drive
+        ``note_resume_failed`` directly, and the gate's end-to-end rows drive
+        ``_invoke``. None of them can see how the two INTERLEAVE inside a
+        single dispatch, and the reset-on-eligible defect lived precisely in
+        that gap — every one of them stayed green while production measured
+        nothing.
+
+        So this row runs the headline feeder's exact production shape: a
+        session eligible BECAUSE δ/3730's hoisted lookup finds an ARCHIVE (the
+        live config dir survives and simply does not hold the transcript),
+        whose restore then faults and reports back through the very
+        ``resume_outcome_sink`` the guard handed ``build_workflow``. The emits
+        pin that eligibility really was the path taken, so the row cannot pass
+        by quietly falling back instead.
+        """
+        config = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness.config.session_resume = config
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness._escalation_queue = self._queue()
+
+        for i in range(config.fallback_storm_threshold):
+            task_id, session_id = f'af{i}', f'uuid-arch-fault-{i}'
+            _make_archive(harness.config.project_root, task_id, session_id)
+            empty_cfg = tmp_path / f'claude-config-empty-{i}'
+            (empty_cfg / 'projects').mkdir(parents=True)
+            await _drive_session_slot(
+                harness, task_id, self._fresh_session(session_id),
+                config_dir=empty_cfg,
+                workflow_reports=(
+                    lambda sink, n=i: sink.note_resume_failed(self._report(n))
+                ),
+            )
+
+        assert [et for et, _ in _session_resume_emits(harness)] == (
+            [EventType.session_resume] * config.fallback_storm_threshold
+        )
+        assert _streak(harness) == config.fallback_storm_threshold
+        assert harness._escalation_queue.submit.call_count == 1
 
     async def test_the_shipped_window_admits_the_population_that_exists(
         self, harness: Harness,
