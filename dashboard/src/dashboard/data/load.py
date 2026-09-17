@@ -152,6 +152,28 @@ _RECENCY_SLACK_SECONDS = 3600
 #
 # Cost is linear in the SLACK, not in retention, so the slack must stay modest:
 # measured on the same probe, 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms.
+#
+# The anchor is CLAMPED to now() from ABOVE, and that clamp is a bound, not a
+# switch to a wall-clock anchor: when the sampler is behind or down, MAX(ts) is
+# already <= now() and MIN() returns MAX(ts) unchanged, so every property above
+# still holds. It bites only when MAX(ts) is in the FUTURE, which no healthy
+# tick produces -- the sampler stamps `ts = int(time.time())` with no
+# monotonicity guard (sampler/src/sampler/__main__.py), so an NTP step forward,
+# a VM suspend/resume, or a hand-seeded probe row is enough. Unclamped, ONE
+# such row drags the anchor past every real sample and serves placeholders for
+# all nine metrics -- the silent, total blank-dashboard failure this whole
+# bound exists to prevent, and with nothing to recover it: a future-dated row
+# survives every past-only retention sweep. `sampler.store.cleanup_old` now
+# prunes rows beyond +/- retain_seconds, but that sweep runs daily and only
+# catches the egregious ones; this clamp is what makes the endpoint robust on
+# the very next request, at any skew. Pinned by
+# `test_one_future_dated_row_does_not_blank_the_other_eight_metrics`.
+_ANCHOR_SQL = f"""\
+MIN(
+    (SELECT MAX(ts) FROM samples WHERE metric IN ({_PLACEHOLDERS_SQL})),
+    CAST(strftime('%s', 'now') AS INTEGER)
+)"""
+
 _QUERY_SQL = f"""\
 SELECT metric, value, window_mean, window_max, ts
 FROM (
@@ -159,9 +181,7 @@ FROM (
            ROW_NUMBER() OVER (PARTITION BY metric ORDER BY ts DESC) AS rn
     FROM samples
     WHERE metric IN ({_PLACEHOLDERS_SQL})
-      AND ts >= (
-          SELECT MAX(ts) FROM samples WHERE metric IN ({_PLACEHOLDERS_SQL})
-      ) - {_RECENCY_SLACK_SECONDS}
+      AND ts >= ({_ANCHOR_SQL}) - {_RECENCY_SLACK_SECONDS}
 )
 WHERE rn <= 60
 ORDER BY metric, ts ASC

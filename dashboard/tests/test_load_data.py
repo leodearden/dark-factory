@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -380,3 +381,57 @@ async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking
     assert result['psi_cpu_some_avg10'] == {
         'current': None, 'sparkline': [], 'window_mean': None, 'window_max': None,
     }, 'a collector stalled beyond the slack must read as no-data, not as live'
+
+
+@pytest.mark.asyncio
+async def test_one_future_dated_row_does_not_blank_the_other_eight_metrics(
+    tmp_path: Path,
+) -> None:
+    """The clock-skew poison pill the anchor clamp exists to defuse.
+
+    The sampler stamps ``ts = int(time.time())`` with no monotonicity guard, so
+    an NTP step forward, a VM suspend/resume, or a hand-seeded probe row can
+    land ONE sample far beyond every real tick.  Unclamped, that row becomes
+    the global ``MAX(ts)`` anchor and every other metric falls outside the
+    slack — all eight siblings go to the placeholder and the dashboard is
+    blank.  It is also unrecoverable on its own: a past-only retention sweep
+    never reaches a future row, so at the 30-day retention it outlives the
+    corpus it is hiding.
+
+    This is the one case that separates the clamp from the bound.  It is NOT
+    the partial-degrade above: nothing here has stopped writing.
+    """
+    db_path = tmp_path / 'future-row.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    now = int(time.time())
+    rows = [
+        (now - (59 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        for i in range(60)
+    ]
+    rows += [(now - (59 - i) * 5, 'psi_cpu_some_avg10', 5.0 + i, None, None)
+             for i in range(60)]
+    # One row a year ahead of every real tick.
+    rows.append((now + 365 * 86400, 'occt_queue_depth', 7.0, None, None))
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 159.0, (
+        'a single future-dated row dragged the anchor past every real sample'
+    )
+    assert len(result['verify_concurrency']['sparkline']) == 60
+    assert result['psi_cpu_some_avg10']['current'] == 64.0
+    # The clamp bounds the anchor, not the rows: the skewed row is still the
+    # newest sample of its own metric and still serves as that card's current,
+    # exactly as the pre-bound unbounded query did.  Blanking it is not this
+    # change's job — `cleanup_old` prunes it on the next sweep.
+    assert result['occt_queue_depth']['current'] == 7.0

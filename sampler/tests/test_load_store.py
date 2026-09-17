@@ -408,6 +408,77 @@ class TestThirtyDayRetention:
         assert _count_at(db_path, at_cutoff) == 1
         assert _count_at(db_path, one_second_older) == 0
 
+    def test_a_far_future_row_is_pruned_rather_than_outliving_the_corpus(
+        self, tmp_path: Path
+    ):
+        """A past-only cutoff can never reach a clock-skew row.
+
+        `ts` is stamped `int(time.time())` with no monotonicity guard, so an
+        NTP step forward, a VM suspend/resume or a hand-seeded probe row lands
+        a sample beyond every real tick.  Against a past-only cutoff that row
+        is immortal — at 30-day retention it outlives the entire corpus — and
+        it is not inert: every MAX(ts)-anchored consumer is dragged forward
+        with it (the dashboard's recency bound served placeholders for all
+        nine metrics off exactly one such row).
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        healthy = now - 60
+        a_year_ahead = now + 365 * DAY
+        store.insert_sample(healthy, 'runqueue_ratio', 1.0)
+        store.insert_sample(a_year_ahead, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, a_year_ahead) == 0, (
+            'a future-dated row survived the sweep and will outlive the corpus'
+        )
+        assert _count_at(db_path, healthy) == 1
+
+    def test_a_backwards_clock_does_not_delete_a_healthy_corpus(self, tmp_path: Path):
+        """Why the future cutoff is `retain_seconds` and not a tight tolerance.
+
+        The skew cuts both ways: a host whose NTP has not synced at boot reads
+        `now` in the PAST, and every real row then looks future-dated.  A tight
+        future tolerance would delete the whole corpus for a clock that is
+        merely hours out.  At ±30 days only a clock wrong by more than a month
+        loses data, and such a host has no usable corpus either way.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        real_now = 10_000_000
+        clock_reads = real_now - 3 * DAY  # NTP three days behind
+        store.insert_sample(real_now, 'runqueue_ratio', 1.0)
+        store.insert_sample(real_now - 60, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(clock_reads)
+
+        assert _count_at(db_path, real_now) == 1, (
+            'a three-day-behind clock deleted rows a healthy sampler had just written'
+        )
+        assert _count_at(db_path, real_now - 60) == 1
+
+    def test_the_future_cutoff_is_exclusive_too(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        at_cutoff = now + THIRTY_DAYS
+        one_second_further = at_cutoff + 1
+        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
+        store.insert_sample(one_second_further, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, at_cutoff) == 1
+        assert _count_at(db_path, one_second_further) == 0
+
 
 # ---------------------------------------------------------------------------
 # Task 3592 step-15: cleanup_old is interval-gated (decision 4)

@@ -24,7 +24,8 @@ measurements). insert_sample remains the single-row primitive.
 
 Retention policy
 ----------------
-- cleanup_old(now): DELETE rows older than 30 days. Called every tick, but
+- cleanup_old(now): DELETE rows outside ±30 days of now — the future half
+  prunes clock-skew rows a past-only cutoff can never reach. Called every tick, but
   gated by meta.last_cleanup_ts to run at most once per 24h — the DELETE is a
   full table SCAN and cannot be index-backed (see cleanup_old's docstring for
   the measurement and the rejected alternative).
@@ -302,9 +303,29 @@ class LoadSampleStore:
     ) -> None:
         """Delete samples older than ``retain_seconds``, at most once per interval.
 
-        The default window is 30 days (see "Retention policy" above). The
-        cutoff is exclusive — a row at exactly ``now - retain_seconds``
-        survives.
+        The default window is 30 days (see "Retention policy" above), and it
+        is SYMMETRIC about ``now``: rows more than ``retain_seconds`` in the
+        FUTURE are deleted too. Both cutoffs are exclusive — a row at exactly
+        ``now ± retain_seconds`` survives.
+
+        The future half is not symmetry for its own sake. ``ts`` is stamped
+        ``int(time.time())`` with no monotonicity guard
+        (``sampler/__main__.py``), so an NTP step forward, a VM
+        suspend/resume, or a hand-seeded probe row can land a sample beyond
+        any real tick. Such a row is unreachable by the past-only cutoff — it
+        outlives the whole corpus — and it is not inert: every consumer that
+        anchors on ``MAX(ts)`` (``dashboard/src/dashboard/data/load.py``'s
+        recency bound, ``trailing_window``'s ordering) is pulled forward with
+        it. Pruning it is the only path back to a healthy corpus.
+
+        The future cutoff is ``retain_seconds`` and not something tighter
+        BECAUSE THE CLOCK CUTS BOTH WAYS: a host whose clock reads
+        ``now`` too EARLY (unsynced NTP at boot) sees a healthy corpus as
+        future-dated, and a tight tolerance would delete all of it. At 30 days
+        only a clock wrong by more than a month destroys data, and a host that
+        wrong has no usable corpus either way. Consumers that need to be
+        robust to a skewed row WITHIN the window clamp their own anchor rather
+        than rely on this sweep — see load.py's ``_ANCHOR_SQL``.
 
         The interval GATE is what makes a per-tick call affordable.
         ``DELETE FROM samples WHERE ts < ?`` plans as ``SCAN samples``:
@@ -335,10 +356,12 @@ class LoadSampleStore:
         """
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
             return
-        cutoff = now - retain_seconds
         conn = self._connect()
         try:
-            conn.execute('DELETE FROM samples WHERE ts < ?', (cutoff,))
+            conn.execute(
+                'DELETE FROM samples WHERE ts < ? OR ts > ?',
+                (now - retain_seconds, now + retain_seconds),
+            )
             conn.commit()
         finally:
             conn.close()
