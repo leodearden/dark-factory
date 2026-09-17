@@ -187,6 +187,13 @@ WHERE rn <= 60
 ORDER BY metric, ts ASC
 """
 
+# TWO placeholder groups, so the allowlist is bound TWICE -- once for the anchor
+# subquery and once for the outer filter. Named rather than spelled
+# `KNOWN_METRICS + KNOWN_METRICS` at the call site, where the doubling reads as
+# a typo and a "cleanup" back to a single tuple would silently misalign every
+# parameter in the statement.
+_QUERY_PARAMS: tuple[str, ...] = KNOWN_METRICS * 2
+
 
 async def get_load_metrics(
     db: aiosqlite.Connection | None,
@@ -217,7 +224,7 @@ async def get_load_metrics(
     async def _query(conn: aiosqlite.Connection) -> dict[str, dict[str, Any]]:
         result = _default_result()
 
-        rows = await conn.execute_fetchall(_QUERY_SQL, KNOWN_METRICS + KNOWN_METRICS)
+        rows = await conn.execute_fetchall(_QUERY_SQL, _QUERY_PARAMS)
 
         # Group rows by metric (already ordered by metric, ts ASC from SQL).
         # Rows are always aiosqlite.Row objects — DbPool.get sets

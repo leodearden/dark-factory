@@ -384,6 +384,58 @@ async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking
 
 
 @pytest.mark.asyncio
+async def test_the_anchor_is_computed_over_the_allowlist_not_the_whole_table(
+    tmp_path: Path,
+) -> None:
+    """The load group writes metrics this endpoint does not serve, into this table.
+
+    ``samples`` is shared: the sampler writes ``runqueue_ratio``,
+    ``runqueue_read_ok``, ``own_cpu_some10:<leaf>`` and ``own_read_ok:<leaf>``
+    alongside the nine metrics KNOWN_METRICS admits, and none of those four is
+    served here (PRD section 9 dropped the load-view panel).  The anchor
+    subquery therefore carries its own ``WHERE metric IN (...)``, which is the
+    whole reason the statement binds the allowlist TWICE (_QUERY_PARAMS).
+
+    Without that scoping the partial-degrade semantics the module docstring
+    claims invert: a still-ticking load group would advance the anchor past
+    every served metric and blank all nine cards, while the collector it is
+    reporting on is the one still healthy.  The test above pins the degrade
+    when a SERVED group stalls; this one pins that an UNSERVED group cannot
+    cause it.
+    """
+    db_path = tmp_path / 'unserved-anchor.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+            for i in range(10)]
+    # Two hours AHEAD of every served row, and beyond the 1 h slack -- so an
+    # unscoped MAX(ts) would exclude every row above.
+    rows += [(base + 7200, 'runqueue_ratio', 1.5, None, None),
+             (base + 7200, 'own_cpu_some10:orchestrator-reify.service', 4.0, None, None)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 109.0, (
+        'a metric this endpoint does not serve dragged the anchor past one it '
+        'does -- the anchor subquery is not scoped to the allowlist'
+    )
+    assert result['verify_concurrency']['sparkline'] == [100.0 + i for i in range(10)]
+    # And the unserved rows stay unserved: scoping the anchor must not leak them
+    # into the result the way a bare MAX(ts) would have hidden everything else.
+    assert set(result) == set(KNOWN_METRICS)
+
+
+@pytest.mark.asyncio
 async def test_one_future_dated_row_does_not_blank_the_other_eight_metrics(
     tmp_path: Path,
 ) -> None:
