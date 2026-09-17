@@ -908,11 +908,17 @@ HEARTBEAT_INTERVAL_SECS: float = 5.0
 #: builds had been healthy.  The derived 90.0s is 18 heartbeat periods wide
 #: where the old value was 2.
 #:
-#: OPERATOR FOLLOW-UP (task 4195): leo-laptop's /usr/local/bin/orchestrator shim
-#: has exported ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS=90 since 2026-09-14T10:27Z
-#: as the interim mitigation (backup ~/orchestrator-shim.bak-2026-09-14).  This
-#: derivation lands at that same 90.0 in code, so the export is now redundant
-#: and must be removed, or the two halves can drift apart silently.  Acceptance
+#: OPERATOR FOLLOW-UP — TRACKED AS esc-4195-1, not by this comment.  leo-laptop's
+#: /usr/local/bin/orchestrator shim has exported
+#: ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS=90 since 2026-09-14T10:27Z as the interim
+#: mitigation (backup ~/orchestrator-shim.bak-2026-09-14).  This derivation lands
+#: at that same 90.0 in code, so the export is now redundant and must be removed.
+#: Nothing in this repo can detect it if it is not: ``cli.py::_env_float`` gives
+#: the env var precedence over this constant deliberately, so a live override
+#: silently out-ranks whatever the derivation says — the day either input here is
+#: retuned, that host keeps running 90.0 while every test in
+#: TestWatchdogTimeoutDerivedFromTransport reports the new value and passes.  The
+#: escalation is the guard; this note only tells you where to look.  Acceptance
 #: for 4195 must be measured against the 09-05..09-14 window (71 dispatches / 0
 #: verdicts), never against a window in which the override was live.
 WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = (
@@ -1027,7 +1033,10 @@ def run_stdin_heartbeat(
       full.  Skipping the beat is the correct answer: a full pipe proves the
       channel is alive but undrained, which is not the condition the watchdog
       exists to detect, and blocking here instead would park this thread
-      indefinitely and wedge the dispatch's teardown join.
+      indefinitely and wedge the dispatch's teardown join.  That the write end
+      IS non-blocking is established by :func:`start_stdin_heartbeat`, which
+      is what hands this loop its fd; this suppression would be unreachable
+      dead weight without it.
 
     The tuple is deliberately narrow.  Any other ``OSError`` — EBADF, ENOSPC
     — propagates and ends the thread, because none of them has a benign
@@ -1082,6 +1091,17 @@ def start_stdin_heartbeat(
 
     ``daemon=True`` so the writer can never block interpreter shutdown.
 
+    Puts *write_fd* in NON-BLOCKING mode before starting the thread, rather
+    than trusting each call site to have done so.  Two documented guarantees
+    rest on that mode and neither is checkable from where they are stated: the
+    ``BlockingIOError`` arm of :func:`run_stdin_heartbeat`'s suppression (a
+    full pipe skips one beat), and every caller's BOUNDED teardown join (see
+    ``verify_runner.HEARTBEAT_STOP_JOIN_SECS``), whose ceiling is sized on the
+    premise that ``os.write`` can never park.  A blocking fd voids both
+    silently — the writer parks forever on a full pipe and the join simply
+    expires — so the mode is ESTABLISHED here, where the fd is handed to the
+    thread, instead of asserted here or set at one remote call site.
+
     Returns a :class:`HeartbeatHandle`; ``handle.stop()`` sets the loop's
     Event and is idempotent — safe to call twice, or after the thread has
     already exited — matching ``cli.py::_force_exit_after_delay``'s ``disarm``.
@@ -1089,6 +1109,7 @@ def start_stdin_heartbeat(
     *write_fd* belongs to the thread, which closes it on every exit path (see
     :func:`run_stdin_heartbeat`); no caller may close it too.
     """
+    os.set_blocking(write_fd, False)
     stop_event = threading.Event()
     thread = threading.Thread(
         target=run_stdin_heartbeat,

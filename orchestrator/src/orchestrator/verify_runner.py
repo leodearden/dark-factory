@@ -1076,6 +1076,14 @@ async def _default_subprocess_run(
 #: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
 #: never reached in practice.
 #:
+#: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
+#: the coroutine that tears the writer down runs on the orchestrator's single
+#: shared loop — the loop whose 14.8-16.1s stalls are why the beat moved to a
+#: thread in the first place.  Joining inline would hand that loop a fresh
+#: self-inflicted stall of up to this bound, so the join is awaited through
+#: ``asyncio.to_thread``: a wedged writer costs its own dispatch's teardown and
+#: nothing else.
+#:
 #: Bounded at all, rather than a bare ``join()``, because an unbounded one would
 #: let a single pathological writer hold a merge-lane dispatch open forever —
 #: the failure class this protocol exists to remove, re-introduced at the other
@@ -1122,7 +1130,10 @@ async def _default_ssh_heartbeat_run(
 
     The writer is stopped and joined before this returns, so it can never
     outlive its dispatch; the join is bounded by
-    :data:`HEARTBEAT_STOP_JOIN_SECS`.  *start_heartbeat* is injectable
+    :data:`HEARTBEAT_STOP_JOIN_SECS` and is awaited OFF this loop (see that
+    constant: joining inline would re-create, in the teardown, exactly the
+    loop stall the beat was moved to a thread to survive).
+    *start_heartbeat* is injectable
     (default ``verify_cancel.start_stdin_heartbeat``) so tests can observe the
     writer's lifetime, mirroring this module's ``run`` / ``ssh_run`` /
     ``id_factory`` seams.
@@ -1152,12 +1163,11 @@ async def _default_ssh_heartbeat_run(
     # Ordering is load-bearing.  The writer is started BEFORE the spawn so that
     # exactly ONE owner exists for write_fd on every path: if
     # create_subprocess_exec raises, the outer finally stops the thread, which
-    # closes the fd in its own finally, and nothing leaks.  The write end is
-    # non-blocking so a full pipe raises BlockingIOError in the writer (skipping
-    # one beat) instead of parking that thread forever and wedging the teardown
-    # join below.
+    # closes the fd in its own finally, and nothing leaks.  start_stdin_heartbeat
+    # puts the write end in non-blocking mode itself, so a full pipe raises
+    # BlockingIOError in the writer (skipping one beat) instead of parking that
+    # thread forever and wedging the teardown join below.
     read_fd, write_fd = os.pipe()
-    os.set_blocking(write_fd, False)
     heartbeat = start_heartbeat(write_fd, interval=heartbeat_interval)
     try:
         try:
@@ -1186,9 +1196,14 @@ async def _default_ssh_heartbeat_run(
         await proc.wait()
     finally:
         # The writer owns write_fd and closes it as it exits; that close is what
-        # delivers EOF to the remote's watchdog.
+        # delivers EOF to the remote's watchdog.  stop() is synchronous and
+        # instant; the join that follows is not, so it is paid on a worker
+        # thread — this coroutine's loop is the shared one (see
+        # HEARTBEAT_STOP_JOIN_SECS).  A CancelledError raised at that await
+        # during shutdown is harmless: stop() has already been signalled, the
+        # thread is daemon=True, and it closes its own fd in its own finally.
         heartbeat.stop()
-        heartbeat.thread.join(timeout=HEARTBEAT_STOP_JOIN_SECS)
+        await asyncio.to_thread(heartbeat.thread.join, HEARTBEAT_STOP_JOIN_SECS)
 
     return (
         proc.returncode or 0,
