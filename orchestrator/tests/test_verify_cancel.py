@@ -13,6 +13,7 @@ Steps covered:
 """
 
 import errno
+import os
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -1900,6 +1901,68 @@ class TestRunStdinHeartbeat:
 
         assert excinfo.value.errno == errno.EBADF
         assert closed == [7]
+
+
+#: Deliberately longer than the join ceiling below: an implementation whose
+#: timer is ``time.sleep(interval)`` cannot return inside the ceiling, so the
+#: pair is what discriminates it from the ``Event.wait(interval)`` one.
+HEARTBEAT_SLOW_INTERVAL_SECS = 10.0
+
+#: Wedge detector, not a performance budget — paid only when the test is
+#: already failing (same rationale as ROW_TREE_KILL_CEILING_SECS at
+#: test_laptop_warm_verify_boundary.py::ROW_TREE_KILL_CEILING_SECS).  Sized
+#: ~6x above the ~0.85s worst single-gap additive scheduling delay measured at
+#: loadavg 113-178 and recorded in that file's HeartbeatWriter comment, so it
+#: cannot reproduce the flake class described there.
+HEARTBEAT_STOP_JOIN_CEILING_SECS = 5.0
+
+
+class TestStartStdinHeartbeat:
+    """start_stdin_heartbeat spawns a daemon thread running run_stdin_heartbeat."""
+
+    def test_stop_ends_the_thread_well_inside_one_interval(self):
+        """stop() ends the writer at once rather than waiting out the interval."""
+        from orchestrator.verify_cancel import start_stdin_heartbeat
+
+        closed: list[int] = []
+        r_fd, w_fd = os.pipe()
+        try:
+            handle = start_stdin_heartbeat(
+                w_fd, interval=HEARTBEAT_SLOW_INTERVAL_SECS, close_fn=closed.append
+            )
+
+            assert handle.thread.is_alive()
+            assert handle.thread.daemon is True
+
+            handle.stop()
+            handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+
+            assert not handle.thread.is_alive()
+            assert closed == [w_fd]
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_beats_reach_a_real_pipe(self):
+        """Real beats land on a real pipe's read end; the loop closes the write end itself."""
+        from orchestrator.verify_cancel import HEARTBEAT_TOKEN, start_stdin_heartbeat
+
+        r_fd, w_fd = os.pipe()
+        try:
+            handle = start_stdin_heartbeat(w_fd, interval=0.01)
+            # Blocking read: returns as soon as the first beat lands, so there
+            # is no deadline here to be flaky about.  A producer that never
+            # beats hangs and is caught by the file's pytest timeout.
+            data = os.read(r_fd, 64)
+
+            assert data != b''
+            assert data.replace(HEARTBEAT_TOKEN, b'') == b''
+
+            handle.stop()
+            handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            assert not handle.thread.is_alive()
+        finally:
+            os.close(r_fd)
 
 
 # ---------------------------------------------------------------------------
