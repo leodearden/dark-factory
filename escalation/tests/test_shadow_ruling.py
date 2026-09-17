@@ -23,6 +23,7 @@ import dataclasses
 import json
 
 import pytest
+
 from escalation.models import Escalation
 from escalation.shadow_ruling import (
     FIRST_TRANCHE_CLASSES,
