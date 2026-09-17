@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,7 @@ _MAX_CONNECTIONS = 100
 _MAX_KEEPALIVE_CONNECTIONS = 20
 _KEEPALIVE_EXPIRY = 4.0
 
+_LOGGER_NAME = 'dashboard.http_pool'
 _URL = 'http://svc.local/mcp'
 _CANNED_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}'
 
@@ -358,3 +360,129 @@ class TestReapingSparesLiveTraffic:
                 await task
             with contextlib.suppress(Exception):
                 await harness.client.aclose()
+
+
+def _client_without_pool() -> httpx.AsyncClient:
+    """A supported transport that simply is not the pooled one."""
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    )
+
+
+def _client_with_malformed_pool() -> httpx.AsyncClient:
+    """A pool missing one attribute the module reads.
+
+    This is the shape an httpx release that relocated its internals would
+    actually present: the walk still lands on a pool object, and only the
+    attribute check catches it.
+    """
+    harness = _build_harness()
+    delattr(harness.pool, '_requests')
+    return harness.client
+
+
+# Each case pairs a broken client with the attribute path the WARNING must
+# name, so a message that degraded to a generic "could not resolve pool"
+# fails here rather than passing as if it were still diagnostic.
+_UNRESOLVABLE = [
+    pytest.param(_client_without_pool, '_transport._pool', id='transport-has-no-pool'),
+    pytest.param(_client_with_malformed_pool, '_requests', id='pool-missing-an-attribute'),
+]
+
+
+def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    """Messages this module logged at exactly *level*.
+
+    Filtering on ``r.name`` is also the "names the module" half of the
+    assertion: a record from anywhere else does not count.
+    """
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == level and r.name == _LOGGER_NAME
+    ]
+
+
+class TestShapeGuardDegradesLoudly:
+    """The failure mode that would recreate the original incident with a fix in place.
+
+    If a future httpx moves these private attributes, the reaper must not
+    quietly become a permanent no-op — that is the 32-hour-invisible failure
+    all over again, but now with a module in the tree that looks like it is
+    handling the problem.
+
+    XDIST: ``dashboard/pyproject.toml`` runs ``-n auto --dist loadgroup`` and
+    no dashboard test declares an ``xdist_group``, so any two tests here can
+    land on different workers in either order. Every test below therefore
+    resets the latch in its own body and asserts any first/second-call pair
+    WITHIN itself — never relying on a sibling having run, or not run.
+    """
+
+    @pytest.mark.parametrize(('build_client', 'expected_path'), _UNRESOLVABLE)
+    async def test_both_entry_points_return_sentinels_rather_than_raising(
+        self, build_client: Callable[[], httpx.AsyncClient], expected_path: str
+    ) -> None:
+        http_pool.reset_shape_guard()
+        client = build_client()
+        try:
+            assert http_pool.census(client) is None
+            assert await http_pool.reap_orphaned_connections(client) == 0
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    @pytest.mark.parametrize(('build_client', 'expected_path'), _UNRESOLVABLE)
+    async def test_the_first_failure_warns_naming_the_attribute_path(
+        self,
+        build_client: Callable[[], httpx.AsyncClient],
+        expected_path: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        http_pool.reset_shape_guard()
+        client = build_client()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                assert http_pool.census(client) is None
+
+            warnings = _messages(caplog, logging.WARNING)
+            assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+            assert expected_path in warnings[0], (
+                'the WARNING must name the attribute path that could not be resolved, '
+                f'so an upgrade is diagnosable from the journal alone; got {warnings[0]}'
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    async def test_the_warning_fires_once_per_process_not_once_per_sweep(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A repeat at WARNING would bury the opening diagnostic under itself.
+
+        The reaper sweeps every 60s, so a permanently broken guard would emit
+        ~1400 identical lines a day — the flood ``mcp_fanout``'s
+        transition-only WARNING policy exists to prevent. The line has to stay
+        findable weeks later, which means it must be rare.
+        """
+        http_pool.reset_shape_guard()
+        client = _client_without_pool()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                assert http_pool.census(client) is None
+                assert len(_messages(caplog, logging.WARNING)) == 1
+
+                caplog.clear()
+                assert http_pool.census(client) is None
+                assert await http_pool.reap_orphaned_connections(client) == 0
+
+            assert _messages(caplog, logging.WARNING) == [], (
+                'the shape guard warned again on a later sweep; with a 60s loop that '
+                'is ~1400 lines a day burying the one line that mattered'
+            )
+            # Demoted, not discarded: still there for whoever turns DEBUG on.
+            assert _messages(caplog, logging.DEBUG), (
+                'repeat failures must remain visible at DEBUG'
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
