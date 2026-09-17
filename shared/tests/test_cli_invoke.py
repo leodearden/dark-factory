@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -4873,8 +4874,30 @@ class TestUnreadableTranscriptEscapeWiring:
     """
 
     @staticmethod
-    def _proc(run_secs: float = 0.25):
-        """A process whose communicate() stays pending across many watchdog polls."""
+    def _proc(
+        run_secs: float = 0.25,
+        *,
+        polls_observed: list | None = None,
+        min_polls: int = 0,
+        max_extra_wait_secs: float = 10.0,
+    ):
+        """A process whose communicate() stays pending across many watchdog polls.
+
+        "Many" must be CAUSAL, not a wall-clock bet.  *run_secs* alone assumes
+        the loop gets several turns inside it; on an oversubscribed host it does
+        not, and the watchdog's first ``asyncio.wait`` returns with ``comm_task``
+        already done, breaking BEFORE any poll.  The run then ends after one poll
+        (measured: first poll 0.7s after spawn at a patched 5ms cadence, load
+        average 57 on 32 cores) and every ``call_count >= N`` precondition below
+        goes red with the code under test entirely innocent.
+
+        Passing *polls_observed* and *min_polls* keeps the process pending until
+        the polls have actually happened, bounded by *max_extra_wait_secs* so a
+        genuine regression still fails on the caller's assertion instead of
+        hanging.  The bound stays well inside this harness's own
+        ``timeout_seconds=30.0`` and the 30s grace/idle/cap values its callers
+        pass, so the gate can never itself provoke a kill.
+        """
         payload = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -4886,6 +4909,10 @@ class TestUnreadableTranscriptEscapeWiring:
 
         async def _communicate(input=None):  # noqa: A002
             await asyncio.sleep(run_secs)
+            if polls_observed is not None:
+                deadline = time.monotonic() + max_extra_wait_secs
+                while len(polls_observed) < min_polls and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
             return (payload, b'')
 
         proc = MagicMock()
@@ -4907,9 +4934,21 @@ class TestUnreadableTranscriptEscapeWiring:
         startup_grace_secs=0.0,
         working_idle_secs=None,
         absolute_cap_secs=None,
+        min_polls=0,
     ):
-        """Run the watchdog loop at millisecond cadence with a patched transcript read."""
-        proc = self._proc()
+        """Run the watchdog loop at millisecond cadence with a patched transcript read.
+
+        *min_polls* is the poll floor the caller's own assertion needs; the fake
+        process stays pending until it is reached (see ``_proc``).  Callers that
+        expect NO poll at all leave it at 0.
+        """
+        polls: list[None] = []
+
+        def _counting_turns(*args, **kwargs):
+            polls.append(None)
+            return turns_side_effect(*args, **kwargs)
+
+        proc = self._proc(polls_observed=polls, min_polls=min_polls)
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4921,7 +4960,7 @@ class TestUnreadableTranscriptEscapeWiring:
             patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
             patch(
                 'shared.cli_invoke.count_transcript_turns',
-                side_effect=turns_side_effect,
+                side_effect=_counting_turns,
             ) as mock_turns,
         ):
             result = await _run_subprocess(
@@ -4959,6 +4998,7 @@ class TestUnreadableTranscriptEscapeWiring:
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
                 startup_grace_secs=0.0,
+                min_polls=3,
             )
 
         assert mock_turns.call_count >= 3, (
@@ -4986,8 +5026,10 @@ class TestUnreadableTranscriptEscapeWiring:
                 turns_side_effect=lambda *a, **k: None,
                 config_dir=tmp_path / 'cfg',
                 session_id='sid',
-                # The driven run lasts ~0.25s; nothing may fire inside 30s.
+                # The driven run lasts ~0.25s, and at most ~10.25s if the poll
+                # gate has to wait out a starved loop; nothing may fire inside 30s.
                 startup_grace_secs=30.0,
+                min_polls=3,
             )
 
         assert mock_turns.call_count >= 3, (
@@ -5035,6 +5077,7 @@ class TestUnreadableTranscriptEscapeWiring:
                 startup_grace_secs=0.0,
                 working_idle_secs=30.0,
                 absolute_cap_secs=30.0,
+                min_polls=6,
             )
 
         assert mock_turns.call_count >= 6, (
