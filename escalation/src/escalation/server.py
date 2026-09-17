@@ -40,7 +40,11 @@ from escalation.canonical import canonical_root_cause
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
-from escalation.merge_lane_resolution import InvalidMergeLane, validate_requested_lane
+from escalation.merge_lane_resolution import (
+    InvalidMergeLane,
+    resolve_merge_lane,
+    validate_requested_lane,
+)
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -3272,9 +3276,43 @@ def create_server(
         # emits its unknown_branch outcome, preserving existing semantics.
         # git_ops=None (standalone) skips the fast-path entirely.
         # The resolved tip is also stored as merge_req.snapshot_tip (β1 D8).
+        #
+        # full_branch and the metadata memo are hoisted ABOVE the block because
+        # the lane fallback (task 4888) needs both on the standalone path too,
+        # where git_ops is None and the fast path never runs.  Neither hoisted
+        # line does any work: canonical_queued_branch_name is pure, and
+        # _task_metadata_once() is only DEFINED here, never called.
+        full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
+
+        _task_metadata: git_authority.TaskMetadataResult | None = None
+
+        async def _task_metadata_once() -> git_authority.TaskMetadataResult:
+            """The task's metadata, read AT MOST ONCE per merge_request call.
+
+            ``git_authority.task_metadata`` is uncached — every call is a fresh
+            ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+            ``timeout=15`` (``orchestrator/src/orchestrator/scheduler.py::
+            Scheduler::get_task``).  It has two consumers here, the degeneracy
+            probe and the lane fallback, and this memo is what keeps the count
+            per call at 0 or 1 and makes 2 unreachable
+            (test_merge_request_lane.py::TestMetadataReadIsPaidAtMostOnce).
+
+            The tid is derived from the BRANCH, never from the caller-supplied
+            ``task_id`` parameter (review #6) — see ``_declined()`` below for
+            why that distinction is load-bearing.  ``site='merge_request'``
+            (review #3) names this writer in the degradation warning.
+            """
+            nonlocal _task_metadata
+            if _task_metadata is None:
+                _task_metadata = await git_authority.task_metadata(
+                    harness,
+                    full_branch.removeprefix(orch_config.git.branch_prefix),
+                    site='merge_request',
+                )
+            return _task_metadata
+
         resolved_tip: str | None = None
         if git_ops_for_scan is not None:
-            full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
             resolved_tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
             # Shape converged with worker-path already_merged (suggestion 1).
             # request_id is absent: the fast-path short-circuits before any
@@ -3303,14 +3341,29 @@ def create_server(
             #
             # Evaluated LAST in each arm, and memoized across the two (review
             # #1).  The guard's only power is to SUPPRESS an already_merged
-            # return, so it is pure cost on the overwhelmingly common
-            # submission where neither arm hits.  Hoisting it above the block
-            # made every merge_request pay a scheduler.get_task round-trip —
-            # a Taskmaster MCP dispatch with an internal timeout=15
-            # (scheduler.py:2485) — on the submit path.  Ordering it after the
-            # arm test is logically identical (`not degenerate and (A or B)`
-            # ≡ `(A and not degenerate) or (B and not degenerate)`) and pays
-            # that cost only when an arm is about to return.
+            # return, so running it before the arm test would be pure cost on
+            # the overwhelmingly common submission where neither arm hits.
+            # Ordering it after the arm test is logically identical
+            # (`not degenerate and (A or B)` ≡ `(A and not degenerate) or
+            # (B and not degenerate)`) and keeps the PROBE — the git work —
+            # off that common path.
+            #
+            # What the metadata read costs, stated as it now is (task 4888).
+            # At most ONE `scheduler.get_task` per merge_request call — a
+            # Taskmaster MCP dispatch with an internal timeout=15
+            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler::
+            # get_task`) — shared via `_task_metadata_once()` between this
+            # probe and the lane fallback.  It is never paid twice, and never
+            # paid at all when the caller supplies an explicit `lane`; it IS
+            # paid on every no-explicit-lane submission, including the common
+            # one where neither arm hits, because honouring
+            # `metadata.merge_lane` requires reading the metadata.  That is
+            # accepted: the submit path already awaits resolve_branch_sha, an
+            # is_ancestor, a `git cherry` patch-id scan and an on-disk
+            # `_merge-*` worktree scan, so one bounded MCP read is the same
+            # order as work already here.  (A previous version of this comment
+            # claimed the read was paid "only when an arm is about to return";
+            # that stopped being true when the lane fallback landed.)
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
@@ -3391,12 +3444,10 @@ def create_server(
                         # submission).  Task 4651's periodic writer is the
                         # consumer that will read the flag instead, to tell
                         # "no degeneracy observed" from "degeneracy
-                        # unverifiable".
-                        (await git_authority.task_metadata(
-                            harness,
-                            full_branch.removeprefix(orch_config.git.branch_prefix),
-                            site='merge_request',
-                        )).metadata,
+                        # unverifiable".  The lane fallback below reads the
+                        # same memo and makes the same choice, for the same
+                        # reason — neither consumer branches on the flag.
+                        (await _task_metadata_once()).metadata,
                         branch_tip_sha=resolved_tip,
                     )
                 except Exception:
@@ -3425,6 +3476,19 @@ def create_server(
             ) and not await _declined()):
                 return already_merged_response
 
+        # Lane resolution (task 4888): `lane` argument > metadata.merge_lane >
+        # 'normal'.  The metadata arm is read ONLY when the caller supplied no
+        # lane — an explicit argument makes the metadata irrelevant by the
+        # precedence rule, so it never triggers a read.  task_metadata returns
+        # {} on every failure mode and never raises, so this can degrade a lane
+        # to 'normal' but can never fail a submission.
+        lane_choice = resolve_merge_lane(
+            requested=validated_lane,
+            task_metadata=(
+                None if validated_lane is not None else (await _task_metadata_once()).metadata
+            ),
+        )
+
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
         # See OrchestratorConfig.module_configs_or_empty (config.py) for details.
@@ -3441,7 +3505,7 @@ def create_server(
             result=future,
             snapshot_tip=resolved_tip,
             retry_failed_only=retry_failed_only,
-            lane=validated_lane or 'normal',
+            lane=lane_choice.lane,
         )
 
         # Build a live_snapshot provider from the live worker handle so the
