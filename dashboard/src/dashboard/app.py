@@ -128,6 +128,7 @@ from dashboard.data.write_journal import (
     get_memory_timeseries,
     get_operations_breakdown,
 )
+from dashboard.http_pool import reaper_loop
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
@@ -682,6 +683,11 @@ async def lifespan(app: FastAPI):
         limits=_build_http_limits(config),
     )
     app.state.http_client = http_client
+    # Reclaims pool connections a cancelled request orphaned, which httpcore
+    # itself cannot: dashboard/src/dashboard/http_pool.py states the mechanism.
+    # Takes the LOCAL http_client as an argument — never app.state.http_client —
+    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    reaper_task = asyncio.create_task(reaper_loop(http_client))
     pool = DbPool()
     app.state.db = pool
     app.state.start_time = time.monotonic()
@@ -712,9 +718,9 @@ async def lifespan(app: FastAPI):
     yield
 
     try:
-        for task in (collector_task, metrics_task):
+        for task in (collector_task, metrics_task, reaper_task):
             task.cancel()
-        for task in (collector_task, metrics_task):
+        for task in (collector_task, metrics_task, reaper_task):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         # After the loops above, so THIS app's two pollers cannot enqueue a
