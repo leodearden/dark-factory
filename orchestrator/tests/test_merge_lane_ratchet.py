@@ -1938,6 +1938,159 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert not issubclass(metrics.UnauthorizedRaise, metrics.MetricsError)
 
 
+class TestAuthorizedRaise:
+    """The other half of the gate: a raise that WAS authorized lands, recorded.
+
+    The record is what makes the mechanism reviewable rather than an honour
+    system. In commit bbfbf1059e a steward hand-wrote the key-by-key delta and a
+    separate audit confirming no unrelated drift came along; hand-writing is the
+    step that can disagree with what landed, and the audit is the step that gets
+    skipped. Deriving the record from the same comparison that would have
+    refused the write makes both mechanical.
+    """
+
+    @staticmethod
+    def _seeded(tmp_path: Path) -> tuple[Path, Path]:
+        target = tmp_path / 'b.json'
+        metrics.write_baseline(target, _ratchet_baseline())
+        return target, tmp_path / 'ledger.json'
+
+    @staticmethod
+    def _raised() -> dict:
+        """The real task-5342 shape: several measures up across two sections."""
+        current = copy.deepcopy(_ratchet_baseline())
+        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
+        current['functions'][_VERIFIER_LOOP] += 7
+        return current
+
+    @staticmethod
+    def _authorization() -> metrics.RaiseAuthorization:
+        return metrics.RaiseAuthorization(
+            task_id='5342',
+            reason='rename-aware equivalence fix: net-additive bug fix, not a refactor',
+        )
+
+    def test_an_authorized_raise_is_written(self, tmp_path: Path) -> None:
+        target, ledger = self._seeded(tmp_path)
+        current = self._raised()
+
+        assert metrics.write_baseline(
+            target, current, authorization=self._authorization(), ledger=ledger
+        ) == target
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+
+    def test_exactly_one_ledger_entry_is_appended_verbatim(
+        self, tmp_path: Path
+    ) -> None:
+        target, ledger = self._seeded(tmp_path)
+        authorization = self._authorization()
+
+        metrics.write_baseline(
+            target, self._raised(), authorization=authorization, ledger=ledger
+        )
+
+        entries = metrics.load_ledger(ledger)['raises']
+        assert len(entries) == 1
+        assert entries[0]['task_id'] == authorization.task_id
+        assert entries[0]['reason'] == authorization.reason
+
+    def test_the_recorded_measures_are_derived_not_typed(
+        self, tmp_path: Path
+    ) -> None:
+        # THE HEADLINE. An audit record that CAN disagree with the diff it
+        # describes is the failure mode this mechanism replaces, so the record
+        # is projected off the same Violations the refusal would have carried.
+        target, ledger = self._seeded(tmp_path)
+        current = self._raised()
+        expected = [
+            {
+                'measure': v.measure,
+                'key': v.key,
+                'baseline': v.baseline,
+                'current': v.current,
+            }
+            for v in metrics._measure_raises(current, _ratchet_baseline())
+        ]
+
+        metrics.write_baseline(
+            target, current, authorization=self._authorization(), ledger=ledger
+        )
+
+        assert metrics.load_ledger(ledger)['raises'][0]['measures'] == expected
+
+    def test_the_derived_totals_travel_with_the_per_path_rises(
+        self, tmp_path: Path
+    ) -> None:
+        # ANTI-VACUITY for the test above, which an empty list would satisfy:
+        # a real multi-measure raise carries derived total:* rows, and they are
+        # how a reviewer sees that moving mass around did not lower anything.
+        target, ledger = self._seeded(tmp_path)
+        metrics.write_baseline(
+            target, self._raised(), authorization=self._authorization(), ledger=ledger
+        )
+
+        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        totals = [row for row in measures if row['measure'].startswith('total:')]
+        assert {row['measure'] for row in totals} == {
+            'total:lines', 'total:cognitive'
+        }
+        assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
+        assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
+
+    @pytest.mark.parametrize(
+        ('task_id', 'reason', 'field'),
+        [
+            pytest.param('5342', '   ', 'reason', id='blank-reason'),
+            pytest.param('5342', '', 'reason', id='empty-reason'),
+            pytest.param('  ', 'a real reason', 'task_id', id='blank-task-id'),
+            pytest.param('', 'a real reason', 'task_id', id='empty-task-id'),
+        ],
+    )
+    def test_an_authorization_with_no_reason_is_not_an_authorization(
+        self, tmp_path: Path, task_id: str, reason: str, field: str
+    ) -> None:
+        target, ledger = self._seeded(tmp_path)
+        before = target.read_text(encoding='utf-8')
+
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.write_baseline(
+                target,
+                self._raised(),
+                authorization=metrics.RaiseAuthorization(
+                    task_id=task_id, reason=reason
+                ),
+                ledger=ledger,
+            )
+
+        assert field in str(excinfo.value)
+        # Neither file moved: a rejected authorization is not a partial one.
+        assert target.read_text(encoding='utf-8') == before
+        assert not ledger.exists()
+
+    def test_an_authorization_over_a_non_raising_report_records_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        # The ledger records RAISES, not intentions. A routine lowering
+        # regeneration that happens to carry the flag must not manufacture a
+        # record -- a record nobody could point at a diff is noise that makes
+        # the real ones harder to read.
+        target, ledger = self._seeded(tmp_path)
+        lowered = copy.deepcopy(_ratchet_baseline())
+        lowered['files'][_MQ]['lines'] -= 4000
+
+        assert metrics.write_baseline(
+            target, lowered, authorization=self._authorization(), ledger=ledger
+        ) == target
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(lowered)
+        assert not ledger.exists()
+
+    def test_raise_authorization_is_frozen(self) -> None:
+        authorization = self._authorization()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            authorization.task_id = '9999'  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # The ratchet comparator, and INV-10 tier 1.
 #
