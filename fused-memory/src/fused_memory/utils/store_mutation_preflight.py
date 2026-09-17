@@ -35,6 +35,34 @@ which is what :func:`assert_store_mutation_allowed` does.
 
 WHERE THIS IS ENFORCED (a rule, and a dated audit of where it holds)
 --------------------------------------------------------------------
+SCOPE -- what "the shared store" means in the columns below (task 4319)
+------------------------------------------------------------------------
+Those columns enumerate mutators of the mem0 / Qdrant / Graphiti substrate
+ONLY, because this guard exists for the two-substrate tear described above and
+for nothing else.
+
+``tasks.db`` and the durable escalation queue ARE shared production state, and
+they ARE mutated in-process by scripts in ``fused-memory/scripts/`` -- and they
+are DELIBERATELY in neither column. Task 4319 measured both and found no tear
+to prevent: each is a single substrate with no network half, and each is
+already atomic or lock-first
+(``sqlite_task_backend.py::SqliteTaskBackend._txn``'s one BEGIN/COMMIT, which
+every mutating method enters through; the ``os.open(O_CREAT)`` lockfile in
+``escalation/queue.py::escalation_id_lock``, the first write-requiring syscall
+in every mutating queue path, taken outside any handler). A capability probe
+would also be actively misleading for them: their measured failure is
+MIS-TARGETING, where the target directory is writable and a probe passes
+exactly when the danger is present. They get a different guard for that,
+``target_store_preflight.py::assert_target_store_exists`` -- an existence
+assertion rather than a probe.
+
+The consequence, which is the point of writing this down: an audit counting
+"shared production store" mutators will legitimately return a LARGER number
+than one counting :func:`assert_store_mutation_allowed` call sites. Neither is
+wrong, and the two must not be reconciled by widening either column. Different
+failure mode -> different guard -> different population. (No count is quoted
+here on purpose: a number copied into a second home is a number that drifts.)
+
 THE RULE, for authors: if you write a code path in ``fused-memory/scripts/``
 that mutates the shared store in-process -- it constructs its own
 ``MemoryService``, or reaches Qdrant or the graph directly -- call

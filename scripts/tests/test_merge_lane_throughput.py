@@ -1371,6 +1371,374 @@ def test_speculation_void_rate_is_none_when_voids_exist_without_speculation():
 
 
 # ---------------------------------------------------------------------------
+# compute_speculation — the STRICT "adopted" speculative-ahead measure.
+#
+# `speculative_ahead` counts a landing whenever the task had ANY speculation
+# strictly before it, INCLUDING speculations subsequently voided. That
+# over-counts precisely in the project whose voids dominate, which is the
+# artifact task 5058's diagnosis had to name. `speculative_ahead_adopted`
+# additionally requires that no `verdict_voided` row for that task falls
+# strictly between the LAST preceding speculation and the landing — so a
+# speculation that was thrown away before it could help does not count as
+# having run ahead of the landing.
+#
+# Both measures live side by side; the loose one is the landed contract that
+# the downstream before/after reports compare against and is never redefined.
+# ---------------------------------------------------------------------------
+
+
+def _adopted_fixture():
+    """Five landings that separate the LOOSE ahead measure from the STRICT one.
+
+    ``_sm`` stamps 03:MM, ``_vv`` stamps 07:MM, ``_f`` stamps HH:MM — so the
+    orderings below are read straight off the helper arguments.
+
+      A1  spec 03:00, void 07:00, lands 09:00 -> loose YES, adopted NO
+      A2  spec 03:01,             lands 09:01 -> loose YES, adopted YES
+      A3  spec 03:02, lands 05:00, void 07:02 -> loose YES, adopted YES
+                                                 (the void is AFTER the landing)
+      A4  no speculation at all,   lands 09:03 -> loose NO,  adopted NO
+      A5  spec 03:04, void 07:04, RE-spec 08:00, lands 09:04
+                                              -> loose YES, adopted YES
+                                                 (the void precedes the LAST
+                                                  speculation, so it does not
+                                                  disqualify the landing)
+    """
+    speculative = [
+        _sm('A1', 0, '0'), _sm('A2', 1, '0'), _sm('A3', 2, '1'),
+        _sm('A5', 4, '1'),
+        {'timestamp': _ts(11, 8, 0), 'task_id': 'A5',
+         'data': {'base_sha': 'sha-re', 'depth': '1'}},
+    ]
+    voided = [
+        _vv('A1', 0, 'dispatch'), _vv('A3', 2, 'dispatch'),
+        _vv('A5', 4, 'dispatch'),
+    ]
+    finalized = [
+        _f('A1', 9, 0), _f('A2', 9, 1), _f('A3', 5, 0), _f('A4', 9, 3),
+        _f('A5', 9, 4),
+    ]
+    return speculative, voided, [], finalized
+
+
+def _adopted_result():
+    return mlt.compute_speculation(*_adopted_fixture())
+
+
+def test_adopted_ahead_drops_a_landing_whose_speculation_was_voided_first():
+    result = _adopted_result()
+    # A1 speculated at 03:00, was voided at 07:00, and only landed at 09:00.
+    # The loose measure still credits it; the strict one must not.
+    assert result['speculative_ahead']['matched'] == 4
+    assert result['speculative_ahead_adopted']['matched'] == 3
+
+
+def test_adopted_ahead_keeps_a_landing_whose_speculation_was_never_voided():
+    result = _adopted_result()
+    # A2 is the plain case: speculated, never voided, landed. Both measures
+    # must count it, or the strict measure is not a subset but a different one.
+    assert result['speculative_ahead']['total'] == 5
+    assert result['speculative_ahead_adopted']['total'] == 5
+    assert result['speculative_ahead']['share'] == pytest.approx(4 / 5)
+    assert result['speculative_ahead_adopted']['share'] == pytest.approx(3 / 5)
+
+
+def test_adopted_ahead_ignores_a_void_that_lands_after_the_landing():
+    # A3 landed at 05:00 and was voided at 07:02 — a void for a LATER
+    # speculation cannot retroactively disqualify a landing that already
+    # happened. Isolate it so the count is unambiguous.
+    speculative = [_sm('A3', 2, '1')]
+    voided = [_vv('A3', 2, 'dispatch')]
+    result = mlt.compute_speculation(speculative, voided, [], [_f('A3', 5, 0)])
+    assert result['speculative_ahead']['matched'] == 1
+    assert result['speculative_ahead_adopted']['matched'] == 1
+
+
+def test_adopted_ahead_void_must_fall_after_the_LAST_preceding_speculation():
+    # A5 was voided at 07:04 and then re-speculated at 08:00 before landing at
+    # 09:04. The disqualifying window is (last preceding speculation, landing),
+    # so a void that precedes the re-speculation is not disqualifying.
+    speculative = [
+        _sm('A5', 4, '1'),
+        {'timestamp': _ts(11, 8, 0), 'task_id': 'A5',
+         'data': {'base_sha': 'sha-re', 'depth': '1'}},
+    ]
+    result = mlt.compute_speculation(
+        speculative, [_vv('A5', 4, 'dispatch')], [], [_f('A5', 9, 4)]
+    )
+    assert result['speculative_ahead_adopted']['matched'] == 1
+    # Drop the re-speculation and the same void now disqualifies it.
+    result = mlt.compute_speculation(
+        speculative[:1], [_vv('A5', 4, 'dispatch')], [], [_f('A5', 9, 4)]
+    )
+    assert result['speculative_ahead']['matched'] == 1
+    assert result['speculative_ahead_adopted']['matched'] == 0
+
+
+def test_adopted_ahead_is_disqualified_only_by_a_CHAIN_DEAD_void():
+    # Every other number in compute_speculation is computed over the
+    # chain_dead-filtered voids, and the void rate's docstring states that
+    # filter as a deliberate property: a NEW void reason shows up as a
+    # shrinking numerator rather than being silently counted. The strict
+    # measure must not invert that — an unfiltered index would let a new
+    # reason quietly shrink the adopted share, where the drop reads as
+    # "speculation helped less" with nothing on the surface to say otherwise.
+    speculative = [_sm('C1', 0, '0')]
+    landing = [_f('C1', 9, 0)]
+    other = mlt.compute_speculation(
+        speculative, [_vv('C1', 0, 'dispatch', reason='other')], [], landing
+    )
+    assert other['n_voided_chain_dead'] == 0
+    assert other['speculative_ahead']['matched'] == 1
+    assert other['speculative_ahead_adopted']['matched'] == 1
+    # The same void with reason='chain_dead' DOES disqualify it, so the test
+    # pins the filter rather than a landing that could never be disqualified.
+    dead = mlt.compute_speculation(
+        speculative, [_vv('C1', 0, 'dispatch')], [], landing
+    )
+    assert dead['speculative_ahead']['matched'] == 1
+    assert dead['speculative_ahead_adopted']['matched'] == 0
+
+
+def test_adopted_ahead_has_the_same_shape_as_the_loose_measure():
+    result = _adopted_result()
+    assert set(result['speculative_ahead_adopted']) == set(
+        result['speculative_ahead']
+    ) == {'matched', 'total', 'share'}
+
+
+def test_adopted_ahead_share_is_none_not_zero_on_an_empty_denominator():
+    adopted = mlt.compute_speculation([], [], [], [])['speculative_ahead_adopted']
+    # None, not 0.0 — same contract as every other rate in this module: an
+    # empty window is "nobody landed", not "nobody landed with speculation".
+    assert adopted['share'] is None
+    assert adopted == {'matched': 0, 'total': 0, 'share': None}
+
+
+def test_adopted_ahead_leaves_the_existing_loose_measure_untouched():
+    # The landed contract: the loose key's known answers from
+    # test_speculation_ahead_landing_share_is_matched_over_total must be
+    # byte-identical after the strict measure is added beside it.
+    result = _spec_result()
+    assert result['speculative_ahead'] == {
+        'matched': 1, 'total': 3, 'share': pytest.approx(1 / 3),
+    }
+    # No task in that fixture was voided between its speculation and its
+    # landing, so the strict measure agrees there — the two only diverge on
+    # the voided-then-landed population.
+    assert result['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 3, 'share': pytest.approx(1 / 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# compute_speculation — the VOID ANATOMY.
+#
+# The intuitive reading of a 58% void rate is "58% of verify capacity burned".
+# It is not: the dispatch-point void in `merge_queue.py::SpeculativeMergeWorker`
+# fires BEFORE host acquisition, so it discards a merge BUILD and never a
+# verify. These tests pin the split that makes the difference visible — a void
+# is `verify_burned` only when a `merge_verify` for the same task actually ran
+# between the item's last preceding speculation and the void — plus the
+# `dead_link` fan-out that says whether voids are independent stragglers or one
+# dead base cascading into many.
+# ---------------------------------------------------------------------------
+
+
+def _vv_link(task_id, minute, dead_link) -> dict[str, Any]:
+    """A chain_dead void carrying an EXPLICIT dead_link.
+
+    ``_vv`` derives a unique link per minute; the fan-out tests need several
+    voids to share one dead base SHA.
+    """
+    event = _vv(task_id, minute, 'dispatch')
+    event['data']['dead_link'] = dead_link
+    return event
+
+
+def _anatomy_fixture():
+    """Four chain-dead voids covering both arms of the split.
+
+    ``_sm`` stamps 03:MM, ``_v`` stamps HH:MM, ``_vv`` stamps 07:MM.
+
+      V1  spec 03:00, merge_verify 05:00, void 07:00 -> verify_burned
+      V2  spec 03:01,                     void 07:01 -> pre_verify
+      V3  no speculation at all,          void 07:02 -> pre_verify
+      V4  spec 03:03, void 07:03, merge_verify 08:00 -> pre_verify
+                                          (the verify ran AFTER the void)
+    """
+    speculative = [_sm('V1', 0, '0'), _sm('V2', 1, '0'), _sm('V4', 3, '1')]
+    voided = [
+        _vv('V1', 0, 'dispatch'), _vv('V2', 1, 'dispatch'),
+        _vv('V3', 2, 'dispatch'), _vv('V4', 3, 'dispatch'),
+    ]
+    verify = [
+        _v('V1', 5, 0, 600_000, depth=1, speculative=True),
+        _v('V4', 8, 0, 600_000, depth=1, speculative=True),
+    ]
+    return speculative, voided, verify, []
+
+
+def _anatomy_result():
+    return mlt.compute_speculation(*_anatomy_fixture())['void_anatomy']
+
+
+def test_void_anatomy_counts_a_verify_between_speculation_and_void_as_burned():
+    # V1 alone: a merge_verify actually ran on the doomed item before the void
+    # discarded it. That is the expensive arm the measure exists to detect.
+    assert _anatomy_result()['verify_burned'] == 1
+
+
+def test_void_anatomy_counts_a_void_with_no_intervening_verify_as_pre_verify():
+    # V2 (verify never ran) and V4 (the verify ran only AFTER the void) are
+    # both pre-verify: the void cost a merge build and a re-merge, not a verify.
+    assert _anatomy_result()['pre_verify'] == 3
+
+
+def test_void_anatomy_classifies_a_void_whose_task_never_speculated():
+    # V3 has no preceding speculative_merge at all. It must still be
+    # classified — dropping it silently would shrink the denominator and
+    # inflate whichever arm survives.
+    result = mlt.compute_speculation([], [_vv('V3', 2, 'dispatch')], [], [])
+    assert result['void_anatomy']['pre_verify'] == 1
+    assert result['void_anatomy']['verify_burned'] == 0
+
+
+def test_void_anatomy_counts_only_a_SPECULATIVE_verify_as_burned():
+    # The join key is the task COLUMN, not a request id, so a NON-speculative
+    # merge_verify in the interval (a post-merge verify, or a rebased-gate
+    # verify for an earlier attempt on the same task) is not evidence that a
+    # speculative verify was discarded. Booking it as verify_burned would be
+    # an INFLATIONARY error in the one arm whose non-zero-ness is the trigger
+    # to revisit the diagnosis's headline.
+    speculative = [_sm('B1', 0, '0')]
+    voided = [_vv('B1', 0, 'dispatch')]
+    non_spec = [_v('B1', 5, 0, 600_000, depth=1, speculative=False)]
+    anatomy = mlt.compute_speculation(
+        speculative, voided, non_spec, []
+    )['void_anatomy']
+    assert anatomy['verify_burned'] == 0
+    assert anatomy['pre_verify'] == 1
+    # Flip that same row to speculative and it IS the expensive arm — so the
+    # test pins the filter, not merely a quiet zero.
+    spec_verify = [_v('B1', 5, 0, 600_000, depth=1, speculative=True)]
+    anatomy = mlt.compute_speculation(
+        speculative, voided, spec_verify, []
+    )['void_anatomy']
+    assert anatomy['verify_burned'] == 1
+    assert anatomy['pre_verify'] == 0
+
+
+def test_void_anatomy_tallies_an_unreadable_void_as_unclassifiable():
+    # A void with an unparseable timestamp and one with a NULL task_id cannot
+    # be placed in either arm. They get their own tally rather than riding in
+    # pre_verify, which would silently spend them on the cheap arm — the arm
+    # this module's own conclusion rests on.
+    bad_ts = _vv('U1', 0, 'dispatch')
+    bad_ts['timestamp'] = 'not-a-timestamp'
+    no_task = _vv('U2', 1, 'dispatch')
+    no_task['task_id'] = None
+    anatomy = mlt.compute_speculation(
+        [], [bad_ts, no_task, _vv('U3', 2, 'dispatch')], [], []
+    )['void_anatomy']
+    assert anatomy['unclassifiable'] == 2
+    assert anatomy['pre_verify'] == 1
+    assert anatomy['verify_burned'] == 0
+    # Still counted as chain-dead voids and still tallied into the fan-out:
+    # unreadable for the arm split is not unreadable for everything.
+    assert anatomy['dead_link_distinct'] == 3
+
+
+def test_void_anatomy_arms_partition_the_chain_dead_voids():
+    anatomy = _anatomy_result()
+    assert (
+        anatomy['verify_burned'] + anatomy['pre_verify']
+        + anatomy['unclassifiable']
+    ) == 4
+    # And over the shared fixture, where one voided row carries
+    # reason='other': the anatomy is over CHAIN-DEAD voids only, so the arms
+    # sum to n_voided_chain_dead and not to len(voided_events).
+    result = _spec_result()
+    anatomy = result['void_anatomy']
+    assert (
+        anatomy['verify_burned'] + anatomy['pre_verify']
+        + anatomy['unclassifiable']
+    ) == result['n_voided_chain_dead'] == 3
+
+
+def test_void_anatomy_reports_dead_link_fan_out():
+    # One dead base SHA voided two items; two more voided one each.
+    voided = [
+        _vv_link('F1', 0, 'deadA'), _vv_link('F2', 1, 'deadA'),
+        _vv_link('F3', 2, 'deadB'), _vv_link('F4', 3, 'deadC'),
+    ]
+    anatomy = mlt.compute_speculation([], voided, [], [])['void_anatomy']
+    assert anatomy['dead_link_distinct'] == 3
+    assert anatomy['dead_link_max_voids'] == 2
+
+
+def test_void_anatomy_tallies_a_void_with_no_dead_link_under_the_sentinel():
+    stray = _vv('F5', 4, 'dispatch')
+    del stray['data']['dead_link']
+    anatomy = mlt.compute_speculation(
+        [], [_vv_link('F1', 0, 'deadA'), stray], [], []
+    )['void_anatomy']
+    # The module's UNKNOWN sentinel, same idiom as void_points — not a crash
+    # and not a silent drop.
+    assert anatomy['dead_link_unknown'] == 1
+    # ONE real dead base. The sentinel is counted beside the fan-out, never
+    # among it: rows that name no base at all are not a dead base, and
+    # including them would present N unattributable voids as "N voids from one
+    # base" — the shape a reader takes for cascade amplification.
+    assert anatomy['dead_link_distinct'] == 1
+    assert mlt.UNKNOWN == '(unknown)'
+
+
+def test_void_anatomy_fan_out_max_ignores_a_large_sentinel_bucket():
+    # The failure the exclusion prevents, at the scale that would matter: one
+    # real base voiding a single item, beside three voids naming no base. With
+    # the sentinel included the fan-out would read "max 3 voids from one dead
+    # base" and the diagnosis's cascade-amplification check would fire on rows
+    # that identify no base whatsoever.
+    strays = []
+    for i, task in enumerate(('S1', 'S2', 'S3')):
+        stray = _vv(task, 10 + i, 'dispatch')
+        del stray['data']['dead_link']
+        strays.append(stray)
+    anatomy = mlt.compute_speculation(
+        [], [_vv_link('F1', 0, 'deadA'), *strays], [], []
+    )['void_anatomy']
+    assert anatomy['dead_link_distinct'] == 1
+    assert anatomy['dead_link_max_voids'] == 1
+    assert anatomy['dead_link_unknown'] == 3
+
+
+def test_void_anatomy_fan_out_is_none_when_every_void_lacks_a_dead_link():
+    stray = _vv('S1', 0, 'dispatch')
+    del stray['data']['dead_link']
+    anatomy = mlt.compute_speculation([], [stray], [], [])['void_anatomy']
+    # No REAL base was named, so "the worst base killed n" has no answer —
+    # None, not 0 and not 1, exactly as on an empty window.
+    assert anatomy['dead_link_distinct'] == 0
+    assert anatomy['dead_link_max_voids'] is None
+    assert anatomy['dead_link_unknown'] == 1
+
+
+def test_void_anatomy_is_zero_and_none_shaped_on_an_empty_window():
+    anatomy = mlt.compute_speculation([], [], [], [])['void_anatomy']
+    # Counts are a real 0 (nothing was voided); the max is None, never 0,
+    # because "no void had a dead base" is not "the worst base killed none".
+    assert anatomy == {
+        'verify_burned': 0,
+        'pre_verify': 0,
+        'unclassifiable': 0,
+        'dead_link_distinct': 0,
+        'dead_link_max_voids': None,
+        'dead_link_unknown': 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # compute_queue_depth / compute_mixes
 # ---------------------------------------------------------------------------
 
@@ -1724,6 +2092,98 @@ def test_void_rate_by_project_skips_a_bundle_that_errored(tmp_path, corpus_roots
     assert list(by_project) == [str(root_a)]
 
 
+# ---------------------------------------------------------------------------
+# void_rate_by_project must carry EVERY headline rate the diagnosis quotes.
+#
+# The point of the cross-project section is that ONE block reproduces the
+# two-project headline. A reader who has to go back into each project's own
+# speculation section to assemble the comparison is doing by hand what this
+# section exists to do — and the void rate alone is the rate most likely to be
+# misread, since it says nothing about what the void cost.
+# ---------------------------------------------------------------------------
+
+
+def _by_project(corpus_roots, **kwargs):
+    root_a, root_b = corpus_roots
+    bundles = mlt.collect_projects(
+        [root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT, **kwargs
+    )
+    return str(root_a), str(root_b), mlt.void_rate_by_project(bundles)
+
+
+def test_void_rate_by_project_keeps_the_three_existing_keys_unchanged(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    assert by_project[a]['n_speculative'] == 10
+    assert by_project[a]['n_voided_chain_dead'] == 3
+    assert by_project[a]['void_rate'] == pytest.approx(0.30)
+    assert by_project[b]['n_speculative'] == 12
+    assert by_project[b]['n_voided_chain_dead'] == 7
+    assert by_project[b]['void_rate'] == pytest.approx(7 / 12)
+
+
+def test_void_rate_by_project_carries_both_ahead_shares_side_by_side(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    # Root A: of 13 landings, a07/a08/a09 speculated before landing and none
+    # of them was voided in between — the two measures agree there.
+    assert by_project[a]['speculative_ahead'] == {
+        'matched': 3, 'total': 13, 'share': pytest.approx(3 / 13),
+    }
+    assert by_project[a]['speculative_ahead_adopted'] == {
+        'matched': 3, 'total': 13, 'share': pytest.approx(3 / 13),
+    }
+    # Root B is where they diverge, which is the whole point: b03/b04/b05/b06
+    # each speculated at 04:0i on Aug 12, were VOIDED at 08:0i, and only landed
+    # afterwards. The loose measure credits all four; the strict one credits
+    # none. Only b01 — matched via a speculative merge_verify that was never
+    # voided before its landing — survives.
+    assert by_project[b]['speculative_ahead'] == {
+        'matched': 5, 'total': 6, 'share': pytest.approx(5 / 6),
+    }
+    assert by_project[b]['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 6, 'share': pytest.approx(1 / 6),
+    }
+
+
+def test_void_rate_by_project_carries_the_void_anatomy_split(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    # No merge_verify ran between any item's speculation and its void in
+    # either corpus, so every void is pre-verify: 3 and 7, side by side. The
+    # spread the section reports is now a spread in what was WASTED, not just
+    # in how often.
+    assert by_project[a]['void_anatomy']['pre_verify'] == 3
+    assert by_project[a]['void_anatomy']['verify_burned'] == 0
+    assert by_project[b]['void_anatomy']['pre_verify'] == 7
+    assert by_project[b]['void_anatomy']['verify_burned'] == 0
+    # Fan-out: every void in both corpora carries its own dead_link.
+    assert by_project[a]['void_anatomy']['dead_link_distinct'] == 3
+    assert by_project[b]['void_anatomy']['dead_link_distinct'] == 7
+    assert by_project[a]['void_anatomy']['dead_link_max_voids'] == 1
+
+
+def test_void_rate_by_project_skips_an_errored_bundle_for_the_new_keys_too(
+    tmp_path, corpus_roots
+):
+    root_a, _ = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    bundles = mlt.collect_projects(
+        [root_a, missing], CORPUS_LO_DT, CORPUS_HI_DT, speculation=True
+    )
+    by_project = mlt.void_rate_by_project(bundles)
+    # Same guarantee as the void rate: the unreadable project has no measured
+    # ahead share and no measured anatomy either, so it is ABSENT — never
+    # present with a 0-filled split that would read as "nothing was wasted".
+    assert list(by_project) == [str(root_a)]
+    assert 'speculative_ahead_adopted' in by_project[str(root_a)]
+    assert 'void_anatomy' in by_project[str(root_a)]
+
+
+def test_void_rate_by_project_is_empty_without_the_speculation_flag(corpus_roots):
+    _, _, by_project = _by_project(corpus_roots)
+    # The --json schema contract: no --speculation means no speculation
+    # section anywhere, not a section of zeros.
+    assert by_project == {}
+
+
 def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
     missing = tmp_path / 'no_such_project'
     bundle = mlt.collect_project(missing, CORPUS_LO_DT, CORPUS_HI_DT)
@@ -1969,6 +2429,112 @@ def test_main_speculation_flag_adds_the_section_and_the_by_project_spread(
     assert f'{root_a.resolve()}: 3/10 = 0.300' in tail
     assert f'{root_b.resolve()}: 7/12 = 0.583' in tail
     assert '10/22' not in tail
+
+
+# ---------------------------------------------------------------------------
+# Both output surfaces must carry the new rates.
+#
+# The user-observable signal for the speculation diagnosis is a command whose
+# PRINTED output reproduces the report's headline. A measure that exists only
+# in `--json` (or only in a function's return value) does not satisfy that, so
+# the text report and the JSON payload are pinned together here.
+# ---------------------------------------------------------------------------
+
+
+def test_main_speculation_block_prints_the_strict_ahead_share_distinctly(
+    capsys, corpus_roots
+):
+    root_a, _ = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    block = _project_blocks(out)[str(root_a.resolve())]
+    # Root A: 13 landings, 3 with speculation ahead, none voided in between —
+    # so the two measures agree numerically and only the LABEL separates them.
+    # That is exactly the case where mistakable wording would go unnoticed.
+    assert 'landed with speculation ahead: 3/13 (0.231)' in block
+    assert (
+        'landed with speculation ahead and NOT voided first (strict): '
+        '3/13 (0.231)'
+    ) in block
+
+
+def test_main_speculation_block_prints_the_void_anatomy_and_fan_out(
+    capsys, corpus_roots
+):
+    root_a, root_b = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    blocks = _project_blocks(out)
+    # A void rate on its own invites the reading "that much verify capacity
+    # burned". The split has to be on the same screen as the rate, or the
+    # misreading is the default one.
+    assert (
+        'void anatomy: 3 pre-verify (build discarded before host '
+        'acquisition), 0 verify-burned'
+    ) in blocks[str(root_a.resolve())]
+    assert (
+        'void anatomy: 7 pre-verify (build discarded before host '
+        'acquisition), 0 verify-burned'
+    ) in blocks[str(root_b.resolve())]
+    assert (
+        'dead_link fan-out: 3 distinct dead base(s), max 1 void(s) from one, '
+        '0 with no dead_link'
+    ) in blocks[str(root_a.resolve())]
+
+
+def test_main_cross_project_block_prints_both_shares_and_the_pre_verify_count(
+    capsys, corpus_roots
+):
+    root_a, root_b = corpus_roots
+    code, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    assert code == 0
+    tail = out[out.index(mlt.VOID_RATE_BY_PROJECT_TITLE):]
+    # The existing per-root rate line is unchanged...
+    assert f'{root_a.resolve()}: 3/10 = 0.300' in tail
+    assert f'{root_b.resolve()}: 7/12 = 0.583' in tail
+    # ...and each root now carries its own two shares and its own waste split,
+    # so this one block reproduces the whole two-project headline.
+    assert (
+        'ahead 3/13 (0.231) loose, 3/13 (0.231) strict; '
+        '3 pre-verify void(s), 0 verify-burned'
+    ) in tail
+    assert (
+        'ahead 5/6 (0.833) loose, 1/6 (0.167) strict; '
+        '7 pre-verify void(s), 0 verify-burned'
+    ) in tail
+
+
+def test_main_json_carries_the_new_keys_on_both_surfaces(capsys, corpus_roots):
+    root_a, root_b = corpus_roots
+    _, raw, _ = _run(capsys, *_both(corpus_roots), '--speculation', '--json')
+    payload = json.loads(raw)
+    spec_b = payload['projects'][str(root_b)]['sections']['speculation']
+    assert spec_b['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 6, 'share': pytest.approx(1 / 6),
+    }
+    assert spec_b['void_anatomy']['pre_verify'] == 7
+    assert spec_b['void_anatomy']['verify_burned'] == 0
+    by_project = payload['void_rate_by_project']
+    assert by_project[str(root_a)]['speculative_ahead_adopted']['matched'] == 3
+    assert by_project[str(root_b)]['void_anatomy']['dead_link_distinct'] == 7
+
+
+def test_main_without_the_flag_prints_no_block_and_empties_the_mapping(
+    capsys, corpus_roots
+):
+    # NB the test name deliberately avoids the word this asserts is absent:
+    # pytest derives tmp_path from the test name and the report prints that
+    # path, so a name containing it would make the absence check unfalsifiable.
+    _, out, _ = _run(capsys, *_both(corpus_roots))
+    assert mlt.SECTION_TITLES['speculation'] not in out
+    assert 'void anatomy' not in out
+    assert 'dead_link fan-out' not in out
+    # '(strict)' with its parentheses, not the bare word: the lead-time
+    # section legitimately says "strictly before them" on every run.
+    assert '(strict)' not in out
+    _, raw, _ = _run(capsys, *_both(corpus_roots), '--json')
+    payload = json.loads(raw)
+    # The schema contract: the key is always present and always empty without
+    # the flag — never a section of zeros.
+    assert payload['void_rate_by_project'] == {}
 
 
 def test_main_every_section_header_carries_the_resolved_window(capsys, corpus_roots):

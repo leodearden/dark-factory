@@ -78,6 +78,9 @@ destroys entities and edges exclusively sourced from that episode.\
 # face value. Shared between Stage 1 and Stage 2 because both hold every tool
 # named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
 # DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
+# That precondition is what lets clause (d) name `consolidate_memories`
+# (task 3134): the op sits behind DISALLOW_MEMORY_WRITES, which neither stage
+# folds, so both stages hold it.
 # Placed in the prompt rather than CLAUDE.md because the recon stages are the
 # only consumer of raw episode prose.
 #
@@ -88,7 +91,13 @@ destroys entities and edges exclusively sourced from that episode.\
 # and requires every such example to carry `run_id=`; this section introduces
 # none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
 # stage2.py has no such section; refer to `replacement_memory_id` by
-# parameter name instead, a tool-level fact true in both stages. Not an
+# parameter name instead, a tool-level fact true in both stages. For the same
+# reason MUST NOT reference "## Executing a Cluster Fold" by heading name
+# (task 3134): that section is stage1.py-only, so clause (d) names the op by
+# tool name and the stage-1 section cross-references the op, never the
+# reverse. These four MUST-NOTs are pinned in
+# tests/test_stage1_consolidation_guidance.py::TestSharedNormNamesTheSanctionedPath.
+# Not an
 # f-string: it is interpolated INTO f-strings, and braces inside an
 # interpolated value are not re-parsed by the enclosing f-string, so its own
 # text needs no {{/}} escaping (there are none below regardless).
@@ -123,10 +132,17 @@ for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve 
 problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
 exists precisely to avoid the cascade, so a rejected redaction means fix the \
 `new_content` and retry (b), never escalate to (c).
-(d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
-`mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
-delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
-delete and re-add the survivor.
+(d) **Mem0 cluster consolidation**: to fold a MULTI-record duplicate cluster, call \
+`mcp__fused-memory__consolidate_memories`. It writes the canonical BEFORE any delete, \
+repoints task-metadata citations onto it, tags the retained peers in place (preserving \
+their point ids) and corroborates closure by a deterministic re-read — none of which the \
+hand-rolled sequence guarantees, which is why that sequence nets +1 entry per failed pass. \
+The amend-in-place-then-delete sequence remains right for exactly two cases: (i) \
+superseding a SINGLE record, where `mcp__fused-memory__update_memory` preserves the \
+survivor's id — see the tool listing above for why that matters — and (ii) hand-finishing \
+a `partial` consolidation. In both, amend the SURVIVOR in place FIRST and only THEN delete \
+the redundant entries, naming the survivor via `replacement_memory_id`. Never delete and \
+re-add the survivor.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
@@ -564,6 +580,7 @@ _RECON_REPORT_PLACEHOLDERS = {
     'actionable': '<actionable>',
     'task_id': '<task_id>',
     'flag_type': '<flag_type>',
+    'supersedes': '<finding_id of the earlier finding this one makes historical>',
     'key': '<key>',
     'value': '<value>',
     'delta': '<delta>',
@@ -687,7 +704,11 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' filed, not overriding a verdict a finished stage already closed.'
         ' Structured errors: run_id_unknown / finding_unknown /'
         ' report_already_completed. Retract and re-file rather than filing a'
-        ' correction alongside a finding you know to be wrong.\n'
+        ' correction alongside a finding you know to be wrong — that applies to'
+        ' your OWN stage. To retire an EARLIER stage\'s claim, which this tool'
+        ' refuses, pass `supersedes=<that finding_id>` on `add_finding` instead:'
+        ' it marks the old finding historical and keeps it readable rather than'
+        ' destroying it.\n'
     ),
     'cite_entity': (
         '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
@@ -951,6 +972,7 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
         ('actionable', False),
         ('task_id', False),
         ('flag_type', False),
+        ('supersedes', False),
     ),
     'delete_finding': (('run_id', True), ('finding_id', True)),
     'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),

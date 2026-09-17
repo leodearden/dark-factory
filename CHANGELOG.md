@@ -136,13 +136,162 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   is NOT tombstoned, and it makes the op `partial` — unlike a tombstone shortfall, an
   unprovable closure means the deliverable itself is missing.
 
-Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
-`recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
+Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), `update_memory`'s
 `_apply_memory_metadata_validation` bypass (task 3523 — this op validates the slug at
 entry, bounding but not closing it), and `x_memory_citation_tombstones` on citing tasks
-(task 3893 — a different object in a different store).
+(task 3893 — a different object in a different store). The Stage-1 rewire and the
+`recon-stage-*` guard-exemption retirement, listed here as unclaimed when this op
+landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### Both of `merge_gates.py`'s `--no-renames` diff gates are now rename-aware (task 5342)
+
+**Behaviour change, two sites plus a message.** Both gates built a path-string set
+operation on top of `--no-renames` diffs, which split a rename into two unrelated
+strings. Each therefore read a *relocation* as a *disappearance* and blocked a merge
+that had dropped nothing. The two sites need rename resolution on OPPOSITE ranges — the
+branch side and the merge side — so both now go through one shared `_rename_pairs`
+primitive (a single `git diff -M --name-status`, parsed with the tab-split idiom
+`_rename_pair_for` already used), leaving the module with exactly one way to ask git
+what was renamed between two trees.
+
+- **Post-merge equivalence gate** — before: a branch-touched path was compared unless
+  main touched *that exact path*. After: a path whose rename **source** main touched
+  becomes a *candidate* for exclusion, and is excluded only once the branch's own delta
+  is verified present in the merged blob. So relocating a file main concurrently edited
+  at the old path no longer produces a false `Conflict resolution likely dropped or
+  rewrote work` (measured: reify task 5694, merge `d1d857f43545`, esc-5694-5).
+- **Plan-target drop-guard** — before: every apparently-dropped path the branch had
+  changed was flagged. After: a path that is a rename **source** between task HEAD and
+  the merge commit becomes a *candidate*, excluded only once the same content check
+  confirms the branch's work is at the new name. So a sibling relocating a file the
+  branch *modified* no longer produces a false `Merge commit is missing plan target
+  files` (measured: reify esc-6436-4).
+
+The content check is one shared primitive used by both gates, gathering evidence in
+three ascending steps. First the merged path must **resolve to a blob** at all. Then, if
+the merged blob is **byte-identical** to the one the branch produced (`git diff --quiet`
+between the two blob revisions — it prints nothing, so it answers even for a payload
+that cannot be decoded), the branch's content landed verbatim and nothing need be read. Only otherwise — main edited the same content on top —
+is the branch's delta diffed blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`)
+and reverse-applied against the merged blob with `git apply --check -R`.
+
+The existence step is load-bearing and comes first for a reason a later step cannot
+cover: a **pure relocation**'s delta is *empty*, and an empty patch reverse-applies
+against anything — including a resolution that deleted the file outright. On the
+equivalence gate both halves of such a rename are otherwise invisible (the source is
+discarded by the `main_touched` arm, the target by the suppression arm), so without it
+the compare set is empty and the gate passes a merge that destroyed the branch's work.
+Existence is the whole of a pure relocation's claim, so it is the whole of what is
+checked there.
+
+**A rename pair is not, by itself, evidence the work survived.** Git pairs renames at
+~50% similarity, so a resolution that relocates a file and *discards* the branch's edit
+still pairs (measured `R095`) — suppressing on the bare pair would turn both gates into
+silent work-loss holes, and neither gate backstops the other on this case. Hence the
+content check, and hence two deliberately *different* error directions: an unreadable
+**rename map** fails **open** (uniform with each gate's four existing `rc != 0` arms —
+the gate cannot tell a rename from a drop at all, so it degrades), while an unverifiable
+**content probe** declines to suppress, falling back to pre-change flagging, which by
+construction cannot introduce a false block relative to main. The probe is conservative
+in the same direction throughout: `git apply` matches context with no fuzz, so a
+main-side edit inside the branch hunk's context lines flags rather than silently passes.
+
+**A binary payload must not take either gate out of that error model.** `git_ops._run`
+decodes stdout as strict UTF-8, so reading a merged blob that is binary — or text in a
+legacy encoding — raises `UnicodeDecodeError`, and neither gate catches it:
+`classify_and_merge` re-raises after cleaning up the merge worktree, so the merge would
+die with a traceback instead of failing open OR keeping the flag. The OID step settles
+the common case without reading anything (a binary file only the branch touched
+suppresses on identity), and the read that remains is guarded and flags. An earlier
+draft of this entry claimed binary files "produce a patch `git apply` will not take" —
+that was wrong: control never reached `git apply`.
+
+`-C` is deliberately not passed, since a copy leaves its source in place. All five
+pre-existing diffs are byte-identical; `--no-renames` on the equivalence gate's
+main-touched diff is in fact load-bearing in the new design, because main's own rename
+must stay decomposed for its source to appear in the set the branch's rename sources are
+looked up in.
+
+When a suppression fires, each gate logs one INFO naming the pairs and recording that the
+content was verified at the new name, so a gate that passes says *why*. The complementary case — a block that survives rename
+resolution — now names its triage command **and its direction**
+(`git diff <tip12> <advanced12> -- <path>`, branch tip first) plus the `git log --follow`
+a relocated path requires; reading that diff backwards, and a `--follow`-less history
+that looked empty, are what steered the esc-5694-5 RCA to the opposite of the truth.
+
+The merge-lane ratchet baseline is regenerated accordingly. `merge_gates.py`'s
+`cognitive`/`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content
+probe and their docstrings. Extracting the adapters rather than inlining them actually
+*lowered* both host functions (`_check_post_merge_equivalence` 25→24,
+`_check_plan_targets_in_tree` 16→15), and the four new keys land at 5/8/11/11 against the
+cognitive-15 new-key ceiling. The existence and byte-identity steps then take
+`_branch_delta_survives` 5→10 — still inside that ceiling, and the smallest shape that
+closes both holes: identity is asked with `git diff --quiet` rather than a pair of
+`rev-parse` reads precisely so it costs one branch instead of two.
+
+#### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
+
+**Behaviour change, two sites.** Task 3133 shipped the op; this is the leaf that makes
+the consolidator actually USE it and removes the write-path exemption that existed only
+because it did not.
+
+**The Stage-1 (`memory_consolidator`) prompt now advertises the op and directs folds
+through it.** `mcp__fused-memory__consolidate_memories` is listed in `## Available
+Tools` — the stage always HELD it (`STAGE1_DISALLOWED` never folds
+`DISALLOW_MEMORY_WRITES`), but `--disallowed-tools` omits a denied tool from the agent's
+listing rather than rejecting the call, so a held-but-unadvertised op is
+indistinguishable from inside the stage from one it does not have. A new `## Executing a
+Cluster Fold` section carries what a caller cannot succeed without: the two id arms
+(`supersedes` deletes, `retain` tags in place), the REQUIRED `topic` — a positional
+parameter, so a fold cannot mint an unstamped canonical and the vocabulary stamping stops
+being a step a prompt can forget — the ordering (validate → authorize → `scan_only`
+citation pre-flight → WRITE THE CANONICAL → tag peers → delete each supersede, with the
+byte-identical guarantee stated honestly as covering only the first four steps),
+`survivors` / `survivor_check_failed` as the corroborated closure signal, the no-resume
+rule (`'partial'` is not a retry signal — a second call for the same (project, topic)
+writes a SECOND canonical, which is the ratchet the op exists to end), and `run_id` as
+the DELETING run rather than the victims' own. The TARGET END STATE brief from task
+3112's `## Consolidation Gate` is CROSS-REFERENCED, never restated — a second normative
+copy inside one assembled prompt is resolved arbitrarily by the reader. The shared
+`STALE_KNOWLEDGE_ANNOTATION_NORM` (which renders verbatim into BOTH stage prompts) had
+clause (d) rewritten for the same reason: it prescribed the hand-rolled amend-then-delete
+choreography for a multi-record cluster, and now names the op, while KEEPING that
+sequence for the two cases it is still right for — superseding a SINGLE record (where
+`update_memory` preserves the survivor's id) and hand-finishing a `partial`.
+
+**The `recon-stage-*` exemption is retired at BOTH write sites.** Previously a
+`recon-stage-*` `agent_id` skipped the `add_memory` near-duplicate guards (cosine
+near-duplicate, known-topic-cluster and sufficient-phrase) AND was force-stored by
+`write_triage` without a retrieval round-trip. Both are gone: a recon-stage caller is now
+soft-blocked exactly like anyone else where the guards are live
+(`ProceduralKnowledgeNearDuplicateWriteRejected` /
+`ProceduralKnowledgeKnownTopicClusterWriteRejected`), and ROUTED by band exactly like
+anyone else where `write_triage.enabled` is on. The exemption's stated premise — a merged
+canonical necessarily resembles the duplicates it replaces, with no ordering guarantee
+that those duplicates are deleted first — is precisely what `consolidate_memories`
+supplies, so it no longer holds. **The sanctioned path is unaffected**: the op writes its
+canonical through `memory_service.add_memory`, the SERVICE method, not the guarded MCP
+`add_memory` tool where the guard block lives, so it never meets that guard at all. The
+retirement redirects Stage 1 onto the op rather than blocking it there too, and that
+property is regression-pinned. The prompt states the consequence for the stage in the
+same change: a soft-block is a SIGNAL that the cluster already exists — fold it, or amend
+the incumbent in place — and NOT an occasion for a reflexive
+`metadata={'allow_near_duplicate': True}`, which is how the cluster grew.
+
+**Stage 1's delete discipline now teaches the post-3624 citation gate.** The gate is a
+property of the RECORD, not of who is deleting, so it binds every caller — the prompt
+said nothing about it, leaving a Stage-1 agent facing a plain drop with no stated way
+forward. `metadata={'allow_dangling_citations': True}` is named as the ONE sanctioned
+bypass, with the rules the server actually enforces: only the literal boolean `True`
+counts (a truthy `'yes'`/`1`/`'true'` is IGNORED and the refusal stands), it is scoped to
+a PLAIN DROP where nothing replaces the entry and `replacement_memory_id` cannot express
+that, it is recorded at WARNING with every stranded citer named, and it is an
+individually-reasoned decision per delete rather than a loop default. It is explicitly
+WRONG for a consolidation, which has a survivor by definition and must name it —
+`consolidate_memories` exposes no such escape at all, because its canonical IS the
+repoint target by construction.
 
 #### `related_tasks` blessed into Tier-A, and every Tier-B canonical key is now machine-checked (task 4303)
 

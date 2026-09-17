@@ -365,6 +365,7 @@ from orchestrator.proc_supervision import (
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
+    _wedged_unit_sentinel,
     inspect_systemd_unit,
 )
 from orchestrator.workflow import WorkflowOutcome
@@ -1254,7 +1255,9 @@ class DeterministicRunner:
             return 1, outcome.detail
         return 0, ''
 
-    async def _default_inspect_unit(self, unit: str) -> dict:
+    async def _default_inspect_unit(
+        self, unit: str, *, degradation_sink: dict | None = None,
+    ) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
 
         Task 2119: thin delegate to the hoisted, hardened
@@ -1263,12 +1266,91 @@ class DeterministicRunner:
         minimum: MainPID (int), ActiveState (str), ActiveEnterTimestamp
         (str), ActiveEnterTimestampMonotonic (int). Integers default to 0 on
         parse failure (sentinel-safe).
+
+        ``degradation_sink`` (task 4157 reviewer amendment) is forwarded
+        verbatim: an optional out-dict into which ``inspect_systemd_unit``
+        records WHY it degraded to the sentinel, so the escalation an operator
+        reads can name the cause instead of stranding it in the journal.
         """
         return await inspect_systemd_unit(
             unit,
             timeout_secs=self._inspect_timeout_secs,
             reap_grace_secs=self._reap_grace_secs,
+            degradation_sink=degradation_sink,
         )
+
+    async def _inspect_unit_guarded(
+        self, inspect_fn, unit: str,
+    ) -> tuple[dict, str | None]:
+        """Await the unit inspector, degrading an ``OSError`` to the wedged sentinel.
+
+        Task 4157. Used by ALL THREE ``run()`` call sites that await a unit
+        inspector — the crash-window re-verify, the pre-deploy baseline
+        capture, and (reviewer amendment) the post-deploy verify re-inspect
+        inside ``_capturing_inspector`` — so the guard exists once rather than
+        three times.
+
+        WHY this exists at the call site even though
+        ``systemd_inspect.inspect_systemd_unit`` is itself fail-closed:
+        ``inspect_fn`` resolves to ``self._unit_inspector or
+        self._default_inspect_unit``, and ``_unit_inspector`` is a
+        constructor-injectable seam. The default's contract does not bind an
+        injected inspector, so hardening only the source would leave ``run()``'s
+        documented "always returns BLOCKED, never a raw exception" contract
+        (stated in ``deterministic_runner.py::DeterministicRunner._writeback_deploy_success``'s
+        task-2240 stamp-only fallback, immediately above its ``except
+        IllegalDeployTransition``) false for any caller that uses the seam —
+        and a guarantee that holds only when a documented seam is unused is not
+        a guarantee.
+
+        Catches ``OSError`` ONLY, never a bare ``Exception``: ``run()``
+        deliberately raises ``ValueError`` (the sole entry in its documented
+        ``Raises:`` section) and ``NotImplementedError`` (the "gate resolved
+        but before_done_ran_at is not set" operator guard), and swallowing
+        either into a silent BLOCKED escalation would convert a loud
+        authoring/state defect into a silent one. Note ``TimeoutError`` IS an
+        ``OSError`` subclass and so is covered on purpose: an inspector that
+        times out is degraded, not broken, and belongs on the same fail-closed
+        path.
+
+        Returns ``(state, cause)``:
+
+        * ``state`` — the inspector's dict unchanged on success; on a
+          degradation, :func:`~orchestrator.systemd_inspect._wedged_unit_sentinel`,
+          whose four fields every existing fail-closed consumer already rejects
+          (the verify leg's ``pid > 0`` check, the baseline leg's task-2091
+          ``ActiveState`` gate), so no new downstream branch is needed.
+        * ``cause`` — ``None`` when the reading is trustworthy, else a short
+          string naming the real failure (errno/exception repr, or the timeout
+          budget). The sentinel deliberately renders identically for EMFILE, a
+          missing ``systemctl`` and a hung systemd, so WITHOUT this the three
+          would be indistinguishable in the escalation an operator reads while
+          calling for three different fixes — a fact the emitter held in a
+          variable and dropped, which is what INV-2
+          ``structured-facts-at-failure`` forbids. Callers append it to their
+          own escalation detail; it never enters the sentinel dict, so
+          classification stays byte-identical (reviewer amendment).
+        """
+        # The sink is only meaningful for the DEFAULT delegate, which swallows
+        # its own OSError/timeout inside `inspect_systemd_unit` and would
+        # otherwise have no way to report which mode fired. An INJECTED
+        # inspector is called verbatim, exactly as before — the seam's contract
+        # is `inspect_fn(unit)` and must not silently grow a keyword argument.
+        sink: dict = {}
+        try:
+            if self._unit_inspector is None:
+                state = await self._default_inspect_unit(unit, degradation_sink=sink)
+            else:
+                state = await inspect_fn(unit)
+        except OSError as exc:
+            logger.warning(
+                'DeterministicRunner: unit inspect of %s failed to run (%r) — '
+                'degrading to the MainPID=0 sentinel so the failure routes '
+                'through the existing fail-closed path instead of escaping run()',
+                unit, exc,
+            )
+            return _wedged_unit_sentinel(), f'unit inspect raised {exc!r}'
+        return state, sink.get('cause')
 
     async def _default_run_script(self, before_done: dict) -> tuple[int, str]:
         """Run the deploy script to completion under a timeout.
@@ -2217,6 +2299,43 @@ class DeterministicRunner:
         duplicate L2 escalations.  Stamps ``gate_escalated_at`` so the
         next resume routes through section-1 quiescence.
 
+        Task 4048 (recovered task-2240 review suggestion): on the DEPLOY
+        path (``before_done`` set), the ``gate_escalated_at`` stamp normally
+        rides along with a ``deploy_state.phase`` advance to ``ESCALATED``
+        (DS-1, ζ) — but that advance is SKIPPED when the CURRENT phase is
+        already ``ESCALATED`` or ``DONE``, e.g. the rare crash-resume edge
+        where a prior ``_file_infra_issue_and_block`` advanced phase to
+        ``ESCALATED`` without stamping ``gate_escalated_at`` and a later
+        ``always_escalates=True`` dispatch reaches this gate again. Both
+        ``ESCALATED->ESCALATED`` and ``DONE->ESCALATED`` are pinned-illegal
+        edges, so a bare re-advance would file a spurious born-at-L2
+        ``illegal_deploy_transition`` escalation on top of the
+        ``milestone_gate`` one just filed above. Unlike
+        ``_file_infra_issue_and_block``'s equivalent guard, the skip here
+        does NOT drop the write entirely — ``gate_escalated_at`` is still
+        stamped (stamp-only, no ``deploy_state`` payload), because that
+        stamp is what routes the next dispatch through section-1
+        quiescence/resolve-to-done; dropping it would permanently deny the
+        task that fork rather than merely delay it. This mirrors the
+        stamp-only fallback precedent in
+        ``deterministic_runner.py::DeterministicRunner._writeback_deploy_success``.
+
+        Consequence of that deploy-path write failing (task 4048, mirroring
+        ``_file_infra_issue_and_block``'s equivalent paragraph): both arms
+        above (the stamp-only skip and the legal-edge full advance) are
+        best-effort — a transient failure (e.g. the same severed connection
+        that might be the reason this gate is being filed at all) is caught
+        and logged rather than propagated. The ``milestone_gate`` escalation
+        filed above is already durable on local disk regardless, so a failed
+        write here simply means ``gate_escalated_at`` stays unset — which is
+        exactly the crash-safe file-before-stamp ordering already documented
+        above: the next dispatch finds no stamp, re-files the gate (the
+        dedup guard skips re-submitting since the escalation is still
+        pending) and retries the same write, rather than the exception
+        escaping ``run()`` and leaving the task neither done nor cleanly
+        blocked. Swallowing the exception here converts an escaped raise
+        into this already-designed recovery rather than adding a new one.
+
         Returns:
             ``WorkflowOutcome.BLOCKED``
         """
@@ -2268,11 +2387,56 @@ class DeterministicRunner:
         # (before_done=None) is not a deploy and gets no deploy_state.
         now_iso = datetime.now(UTC).isoformat()
         if metadata.get('before_done') is not None:
-            await self._advance_deploy_phase(
-                task_id, metadata, DeployPhase.ESCALATED,
-                evidence={'gate_escalated_at': now_iso},
-                phase_timestamp=now_iso,
-            )
+            # Task 4048 amendment: pre-bind so both names are defined on every
+            # path into `except` below, including one raised by the
+            # DeployState.from_metadata read itself (see next comment).
+            _already_at_target = False
+            try:
+                # Task 4048 amendment: the read lives inside this try (not
+                # before it) so a corrupted/hand-edited deploy_state slice
+                # (pydantic ValidationError from DeployState.from_metadata)
+                # is caught by the except below instead of escaping — the
+                # write is simply skipped entirely in that case.
+                _current_deploy_state = DeployState.from_metadata(metadata)
+                _already_at_target = (
+                    _current_deploy_state is not None
+                    and _current_deploy_state.phase in (DeployPhase.ESCALATED, DeployPhase.DONE)
+                )
+                if _already_at_target:
+                    assert _current_deploy_state is not None  # implied by _already_at_target (short-circuit `and` above)
+                    # Task 4048: stamp-only skip of a redundant ESCALATED
+                    # advance — see docstring above for the full rationale.
+                    logger.debug(
+                        'DeterministicRunner: task %s deploy_state already at '
+                        'phase=%s — skipping redundant ESCALATED advance, '
+                        'stamping gate_escalated_at only',
+                        task_id, _current_deploy_state.phase,
+                    )
+                    await self.scheduler.update_task(
+                        task_id, {'gate_escalated_at': now_iso}, metadata_mode='merge',
+                    )
+                else:
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.ESCALATED,
+                        evidence={'gate_escalated_at': now_iso},
+                        phase_timestamp=now_iso,
+                    )
+            except Exception as exc:
+                if _already_at_target:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate '
+                        'gate_escalated_at stamp-only write failed (deploy_state '
+                        'already at target phase) (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
+                else:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate deploy_state '
+                        'ESCALATED advance failed (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
         else:
             await self.scheduler.update_task(
                 task_id,
@@ -2773,6 +2937,19 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.DONE  — gate resolved, task driven to done.
             WorkflowOutcome.BLOCKED — gate filed, open escalation, or deploy failure.
+
+        A unit-inspector failure — a spawn error or a timeout — is NOT raised
+        on ANY of the three legs that inspect a unit: the pre-deploy baseline
+        capture, the post-deploy verify re-inspect, and the crash-window
+        re-verify. Task 4157 degrades it to the MainPID=0 sentinel via
+        ``_inspect_unit_guarded``, which routes it into the existing
+        fail-closed escalation for that leg ('Baseline inspect failed before
+        deploy', 'Deploy verify failed', and the crash-window re-escalation
+        respectively) with the real cause named in the detail. This discharges
+        the "always returns BLOCKED, never a raw exception" contract stated in
+        ``DeterministicRunner._writeback_deploy_success``'s task-2240
+        stamp-only fallback on the recovery paths too, and keeps an inspect
+        failure from being reported as a deploy-script failure.
 
         Raises:
             ValueError — if ``always_escalates`` is False with ``before_done=None``
@@ -3365,7 +3542,15 @@ class DeterministicRunner:
                     and deploy_state.verify_baseline is not None
                 ):
                     inspect_fn = self._unit_inspector or self._default_inspect_unit
-                    fresh_state = await inspect_fn(target_unit)
+                    # Task 4157: guarded — an inspector OSError here would
+                    # otherwise escape run() and bypass this very escalation.
+                    # The sentinel it degrades to classifies as 'unconfirmed'
+                    # below under BOTH baseline modes, so control falls
+                    # through to the crash-window escalation with the
+                    # reverify_note enrichment already in place.
+                    fresh_state, reverify_cause = await self._inspect_unit_guarded(
+                        inspect_fn, target_unit,
+                    )
                     verdict = _deterministic_deploy_health_verdict(
                         fresh_state, verify_baseline=deploy_state.verify_baseline,
                     )
@@ -3392,6 +3577,15 @@ class DeterministicRunner:
                         f'unit state: {fresh_state}) — not confirmed fresh enough '
                         f'to recover automatically.'
                     )
+                    if reverify_cause is not None:
+                        # The observed state above is the MainPID=0 sentinel,
+                        # which renders identically for every degradation mode
+                        # — name the real one rather than making the operator
+                        # scrape the journal for it (INV-2).
+                        reverify_note += (
+                            f'\nCause: the re-verify inspect did not return a '
+                            f'trustworthy reading — {reverify_cause}'
+                        )
 
                 # Re-escalate instead of phantom-completing; the deploy is NOT
                 # re-run (I1 once-only) — a human must verify the unit state.
@@ -3646,12 +3840,23 @@ class DeterministicRunner:
 
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
-                baseline = await inspect_fn(target_unit)
+                baseline, baseline_cause = await self._inspect_unit_guarded(
+                    inspect_fn, target_unit,
+                )
 
                 # Task 2091 (baseline-leg hardening): a wedged/failed baseline
                 # inspect returns the same MainPID=0/ActiveState='' sentinel
                 # dict used on the verify leg (see _default_inspect_unit's
-                # TimeoutError branch). On the VERIFY leg that sentinel is
+                # TimeoutError branch).
+                #
+                # Task 4157: that sentinel now also stands in for a SPAWN
+                # failure (missing `systemctl`, or a fork failure under
+                # resource pressure), not only a timeout. Both modes arrive
+                # here via `_inspect_unit_guarded` above — which is what keeps
+                # the gate below reachable at all, since an unguarded OSError
+                # would escape run() entirely and file no escalation.
+                #
+                # On the VERIFY leg that sentinel is
                 # already caught by the `pid > 0` half of the freshness check
                 # below. On the BASELINE leg it is NOT: baseline_monotonic
                 # would silently become 0, and `new_monotonic >
@@ -3666,15 +3871,25 @@ class DeterministicRunner:
                 # once-only), so the deploy is NOT attempted on an untrusted
                 # baseline.
                 if not baseline.get('ActiveState'):
-                    baseline_detail = '\n'.join([
+                    baseline_lines = [
                         description,
                         f'Target unit: {target_unit}',
                         f'Baseline inspect failed/wedged before deploy: {baseline!r}',
+                    ]
+                    if baseline_cause is not None:
+                        # That sentinel repr is identical for EMFILE, a missing
+                        # `systemctl` and a hung systemd — three failures with
+                        # three different fixes (host, install, unit). Name the
+                        # one that actually fired instead of leaving it in the
+                        # journal only (INV-2 structured-facts-at-failure).
+                        baseline_lines.append(f'Cause: {baseline_cause}')
+                    baseline_lines.append(
                         'Cannot establish a trustworthy pre-deploy baseline — '
                         'the deploy was NOT attempted (before_done_ran_at is '
                         'already stamped; I1 once-only — a human must inspect '
                         'the unit and resolve).',
-                    ])
+                    )
+                    baseline_detail = '\n'.join(baseline_lines)
                     return await self._file_infra_issue_and_block(
                         task_id,
                         summary=f'Baseline inspect failed before deploy: {target_unit}',
@@ -3740,7 +3955,23 @@ class DeterministicRunner:
                 captured: dict = {}
 
                 async def _capturing_inspector(unit: str, **_kwargs) -> dict:
-                    state = await inspect_fn(unit)
+                    # Task 4157 (reviewer amendment): guarded like the other
+                    # two inspect legs. An inspector OSError here does NOT
+                    # violate run()'s contract — plan.execute()'s broad
+                    # `except Exception` below already catches it — but it is
+                    # MISATTRIBUTED there as 'Deploy run_fn failed (unexpected
+                    # error)', blaming the deploy script for a systemd-inspect
+                    # failure (INV-2 block-report-misattribution). Degrading to
+                    # the sentinel instead routes it into the verify leg's own
+                    # `pid > 0` / _empty_baseline_fresh rejection, so it lands
+                    # as VERIFY_FAILED -> 'Deploy verify failed: <unit>' — the
+                    # same disposition the DEFAULT inspector already produces
+                    # for this failure, since systemd_inspect swallows the
+                    # OSError into the sentinel before it can be raised. The
+                    # cause is stashed for the escalation detail below.
+                    state, cause = await self._inspect_unit_guarded(inspect_fn, unit)
+                    if cause is not None:
+                        captured['inspect_cause'] = cause
                     captured['new_state'] = state
                     return state
 
@@ -3828,11 +4059,23 @@ class DeterministicRunner:
 
                 if outcome.disposition == RestartDisposition.VERIFY_FAILED:
                     # B7b: verify failed — file infra_issue escalation, set blocked
-                    verify_detail = '\n'.join([
+                    verify_lines = [
                         description,
                         f'Target unit: {target_unit}',
                         outcome.detail,
-                    ])
+                    ]
+                    inspect_cause = captured.get('inspect_cause')
+                    if inspect_cause is not None:
+                        # The verify DID fail, but on a degraded reading rather
+                        # than on evidence the deploy didn't take — the operator
+                        # needs to know which (task 4157 reviewer amendment).
+                        verify_lines.append(
+                            f'Cause: the post-deploy verify inspect did not return '
+                            f'a trustworthy reading — {inspect_cause}. The unit '
+                            f'state above is the MainPID=0 degradation sentinel, '
+                            f'not an observation of the unit.'
+                        )
+                    verify_detail = '\n'.join(verify_lines)
                     return await self._file_infra_issue_and_block(
                         task_id,
                         summary=f'Deploy verify failed: {target_unit}',

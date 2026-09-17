@@ -255,6 +255,8 @@ def _log(message: str, *, stream=None) -> None:
 # find_dropins tests still call mod.find_dropins and are what proves the lift
 # was behaviour-preserving.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
+    _ABSENT,
+    Drift,
     _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
     find_dropins,
     parse_unit_directives,
@@ -264,23 +266,9 @@ from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser c
 # Drift records and unit specs
 # ---------------------------------------------------------------------------
 
-# Rendered in place of a value on whichever side does not declare the
-# directive at all.  Deliberately not '' or None: it appears verbatim in the
-# operator's report, where "<absent>" reads unambiguously and an empty string
-# would look like a directive set to nothing.
-_ABSENT = "<absent>"
-
-
-@dataclasses.dataclass(frozen=True)
-class Drift:
-    """One disagreement between the repo copy and the installed copy."""
-
-    unit: str
-    section: str
-    key: str
-    repo_value: str
-    installed_value: str
-    reason: str
+# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
+# (see the import above). They were code-identical in all three checkers; the
+# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -500,7 +488,7 @@ def _compare_exec_start_flags(
 # directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
 # so that surface stays intact and IS the extraction's regression net.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    environment_map as _environment_map,  # noqa: F401  (re-exported: read by the test suite)
+    environment_map as _environment_map,
 )
 
 

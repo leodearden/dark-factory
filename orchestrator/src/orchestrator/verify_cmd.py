@@ -1869,7 +1869,8 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
 
     The α confirm gate injects this AFTER ``serial_pytest``'s
     ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test
-    ``timeout=60`` default lives in ``[tool.pytest.ini_options]``, NOT in
+    ``timeout`` default (300 since 2026-09-12, 60 before that) lives in
+    ``[tool.pytest.ini_options]``, NOT in
     ``addopts``, so ``-o addopts=`` does not clear it. Without a GENEROUS
     explicit override the isolated confirm re-run could itself starve into a
     false non-suppression (never masking a real red is a hard constraint, but

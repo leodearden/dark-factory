@@ -1957,6 +1957,290 @@ class TestScanSurvivesRecordArchivedMidScan:
         assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
 
 
+class TestGetRetriesRelocationBetweenLocateAndRead:
+    """Task 5118, workstream A: ``get()`` must retry, not raise or return
+    ``None``, when the archive sweep relocates the record between
+    ``_locate_path`` and ``read_text``.
+
+    Unlike the glob-then-read scans above (``get_by_task``, ``get_pending``,
+    ``find_terminal_by_citation``), ``get()`` is ``_locate_path``-then-read:
+    its blast radius is the single record the caller asked about, and the
+    correct repair is re-locate-and-retry rather than "skip and continue" —
+    the record MOVED, it did not vanish.
+    """
+
+    def test_get_recovers_a_record_relocated_between_locate_and_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: ``FileNotFoundError`` escapes ``get()`` entirely
+        once ``_locate_path`` has already returned the (about to be stale)
+        root path.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            result = queue.get('esc-1-1')
+
+        # (a) The record is recovered, not lost — the retry's fresh
+        # _locate_path call finds it at its new archive location.
+        assert result is not None, 'expected the relocated record to be recovered'
+        assert result.id == 'esc-1-1'
+
+        # (b) Loud enough to audit: the retry is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any('esc-1-1' in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG mentioning esc-1-1; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but not loud enough to cry wolf — a mid-read relocation is
+        # expected concurrency, not corruption.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign relocation; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+    def test_get_returns_none_for_a_record_genuinely_deleted_mid_read(
+        self, tmp_path: Path,
+    ):
+        """A record deleted (not relocated) mid-read must still resolve to
+        ``None`` after the retry — no raise, no infinite loop.
+
+        Distinguishes real relocation (recoverable via re-locate) from real
+        deletion (genuinely gone): the interposition here unlinks the file
+        outright instead of moving it into the archive tree, so the retry's
+        fresh ``_locate_path`` call finds nothing anywhere and must fall back
+        to ``None`` cleanly.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            result = queue.get('esc-1-1')
+
+        assert result is None
+
+    def test_get_propagates_a_present_but_unreadable_record(
+        self, tmp_path: Path,
+    ):
+        """A present-but-unreadable record must still raise — boundary pin
+        against the fix over-catching.
+
+        GREEN on main already (the un-fixed ``get()`` never caught
+        ``OSError`` either). Proves the retry loop's handler catches
+        ``FileNotFoundError`` only, never bare ``OSError``: a genuine
+        EACCES/EIO fault must not be degraded into the treatment a routine
+        archival gets (silently retried and then swallowed to ``None``).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            patch.object(Path, 'read_text', flaky),
+            pytest.raises(PermissionError),
+        ):
+            queue.get('esc-1-1')
+
+    def test_get_returns_none_for_a_genuinely_nonexistent_id(self, tmp_path: Path):
+        """An id that never existed still resolves to ``None`` (no retry
+        machinery regression on the ordinary not-found path)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        assert queue.get('esc-1-999') is None
+
+
+class TestGetByTaskRecoversRecordRelocatedMidScan:
+    """Task 5118, workstream B (follow-up to task 5111's amendment 8):
+    ``get_by_task`` must recover — not silently drop — a record relocated
+    root -> archive inside the scan window, for an archive-including scan.
+
+    ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+    record moved out of the root during that loop is in neither the
+    archive-tier snapshot (taken too early) nor the root copy (gone by read
+    time).  Before this fix that produced a silently SHORT listing; the fix
+    re-locates the id and retries the read once.
+    """
+
+    def test_get_by_task_recovers_relocated_record_into_a_complete_listing(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: the relocated record is silently missing from
+        ``results`` instead of being recovered via re-glob.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        # (a) The listing is complete — the relocated record is recovered,
+        # not silently dropped.
+        assert {e.id for e in results} == {'esc-4176-1', 'esc-4176-2'}, (
+            f'Expected both records via re-glob recovery, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) The recovery ITSELF is named at DEBUG for auditability — not
+        # just the (also-DEBUG) 'vanished mid-scan' line read_escalation_for_scan
+        # already logs before the recovery even runs, which also mentions the
+        # path and would satisfy a substring-only check on its own. Assert on
+        # the recovery line's distinguishing wording so weakening or removing
+        # it (while the earlier 'vanished' line stays) still fails this test.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(
+            'recovered' in r.getMessage() and 'esc-4176-2' in r.getMessage()
+            for r in debug_records
+        ), (
+            f'Expected a DEBUG naming the recovery of esc-4176-2; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+    def test_get_by_task_pending_scan_does_not_recover_a_relocated_record(
+        self, tmp_path: Path,
+    ):
+        """A ``status='pending'`` scan does not attempt recovery: the archive
+        is skipped there by design, and a record relocated out of the root
+        is by definition no longer pending — it would be filtered out on
+        status even if recovered, so recovering it would only add archive
+        I/O to the fast path for no behavioural difference.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_by_task('4176', status='pending')
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving pending record, got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_drops_a_record_genuinely_deleted_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The ``relocated is None`` branch: a record DELETED (not
+        relocated) mid-scan on an archive-including scan cannot be
+        recovered — the fresh ``_locate_path`` re-probe finds it nowhere —
+        so the listing must come back one short WITHOUT raising, exactly
+        like the pre-recovery behaviour for a genuine deletion.
+
+        Distinguishes recoverable relocation from real deletion the same
+        way ``TestGetRetriesRelocationBetweenLocateAndRead``'s deletion test
+        does for ``get()``: the interposition unlinks the file outright
+        instead of moving it into the archive tree.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after a genuine mid-scan '
+            f'deletion (no recovery possible, no raise), got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_recovery_reread_failure_logs_reglob_context(
+        self, tmp_path: Path, caplog,
+    ):
+        """The recovery's OWN re-read can itself fail differently from the
+        first vanish — e.g. an EACCES fault at the newly-located archive
+        path.  That failure must be logged through the recovery's distinct
+        ``'queue.get_by_task (re-glob after vanish)'`` context, not silently
+        conflated with the ordinary scan's WARNING wording, and the record
+        must still be dropped (not raise) exactly like any other unreadable
+        file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        relocated_path = archive_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(doomed), str(relocated_path))
+            if self == relocated_path:
+                raise PermissionError(13, 'Permission denied', str(relocated_path))
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the recovery to give up (not raise) after its own '
+            f're-read also fails, got {[e.id for e in results]}'
+        )
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.WARNING
+        ]
+        assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming the re-glob-after-vanish context; got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
@@ -4576,6 +4860,231 @@ class TestUpdatedAtStamp:
         assert from_disk.updated_at > from_disk.triaged_at
 
 
+class TestDeclarePin:
+    """EscalationQueue.declare_pin() stamps the declared-dependency marker (task 4377).
+
+    ``stamp_triage``'s structural twin — an annotation writer on a PENDING
+    record — but with a different consequence: the marker changes what a
+    resolver may do to the record (``escalation/server.py::resolve_issue``
+    refuses every non-``park`` action on a marked record), so a silent no-op
+    stamp would leave the declarer believing a record is protected when it is
+    not.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _make_pending(
+        self, queue: EscalationQueue, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='pending record for the declared-pin marker',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) stamps a pending record and persists to disk ---
+
+    def test_stamps_pending_record_and_returns_it(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.pin_declared_by == [self.DECLARER]
+        assert result.pin_declared_reason == self.REASON
+
+    def test_stamp_is_persisted_to_disk(self, tmp_path: Path):
+        """It went through _rewrite, not just an in-memory mutation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER]
+        assert reread.pin_declared_reason == self.REASON
+
+    def test_stamp_does_not_archive(self, tmp_path: Path):
+        """The file stays in the queue root — a declaration is not a resolution."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert (queue.queue_dir / f'{esc.id}.json').exists()
+
+    # --- (b)/(c) append semantics ---
+
+    def test_second_distinct_declarer_appends_in_declaration_order(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    def test_redeclaring_an_existing_declarer_is_idempotent(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None, (
+            'a wholly-redundant re-declaration adds nothing and must not report success'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER], 'no duplicate entry'
+
+    def test_partially_redundant_declaration_appends_only_the_new_entry(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+
+        result = queue.declare_pin(esc.id, declared_by=['first-gate', 'second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    def test_duplicates_within_one_call_are_collapsed(self, tmp_path: Path):
+        """The shared normalisation (declared_pins.normalise_declarers) de-dups
+        within the incoming list too, not just against what is already there —
+        so the write side and the read-side predicate agree on what the field
+        holds."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(
+            esc.id, declared_by=['gate-a', '  gate-a  ', 'gate-b', 'gate-a'],
+        )
+
+        assert result is not None
+        assert result.pin_declared_by == ['gate-a', 'gate-b']
+
+    # --- (d) asymmetric reason overwrite ---
+
+    def test_reason_is_overwritten_only_when_non_empty(self, tmp_path: Path):
+        """The asymmetric-overwrite contract stamp_triage establishes for triage_note."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason=self.REASON)
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='')
+
+        assert result is not None
+        assert result.pin_declared_reason == self.REASON, (
+            'an empty reason must not silently wipe a previously-recorded one'
+        )
+
+    def test_a_non_empty_reason_replaces_the_previous_one(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason='old reason')
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='new reason')
+
+        assert result is not None
+        assert result.pin_declared_reason == 'new reason'
+
+    # --- (e) blank normalisation; a no-op stamp must not report success ---
+
+    def test_blank_entries_are_dropped_from_declared_by(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=['', '  real-gate  ', '\t'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['real-gate']
+
+    def test_empty_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=[])
+
+        assert result is None, 'loud over silent: a no-op stamp must not report success'
+        assert path.read_bytes() == before, 'the record must be byte-identical on disk'
+
+    def test_all_blank_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=['', '   ', '\t\n'], reason='r')
+
+        assert result is None
+        assert path.read_bytes() == before
+
+    # --- (f)/(g) unknown and archived ids ---
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        assert queue.declare_pin('esc-does-not-exist', declared_by=[self.DECLARER]) is None
+
+    def test_resolved_record_returns_none_and_is_not_resurrected(self, tmp_path: Path):
+        """Root-only load: the Defect-2 class of bug stamp_triage's contract prevents.
+
+        ``self.get()`` falls back to the archive, and ``_rewrite`` always targets
+        the queue root — so loading via ``get()`` here would write an archived
+        record back into the pending pile.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'done')
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'precondition: archived'
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'declare_pin must not resurrect an archived record into the queue root'
+        )
+
+    def test_dismissed_record_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'not a real problem', dismiss=True)
+
+        assert queue.declare_pin(esc.id, declared_by=[self.DECLARER]) is None
+
+    # --- (h) neighbouring fields are untouched ---
+
+    def test_does_not_bump_updated_at_or_touch_status_level_triage(self, tmp_path: Path):
+        """add_members_to_l2 stays the sole updated_at writer (see the design decision)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue, level=2)
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+        triaged_at_before = queue.get(esc.id).triaged_at  # type: ignore[union-attr]
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.updated_at is None, (
+            f'declare_pin must not bump updated_at, got {result.updated_at!r}'
+        )
+        assert result.status == 'pending'
+        assert result.level == 2
+        assert result.triaged_at == triaged_at_before
+        assert result.triaged_by == 'watcher'
+
+
 class TestResolveCascade:
     """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
 
@@ -4710,6 +5219,150 @@ class TestResolveCascade:
         assert result is not None
         assert result.status == 'resolved'
         assert result.resolution == 'Fixed; no members'
+
+
+class TestResolveWarnsOnDeclaredPin:
+    """resolve() WARNS when it closes a record carrying a declared pin (task 4377).
+
+    This is the NAMED RESIDUAL for the ~20 orchestrator-internal
+    ``queue.resolve()`` callers the server-side gate deliberately does not cover
+    (harness self-clearing sentinels, workflow.py / steward.py L0 teardown,
+    dismiss_all_pending).  An audit line, NOT a veto: refusal lives at the
+    ``escalation/server.py::resolve_issue`` chokepoint, because resolve()
+    archives an L2 head BEFORE cascading and most in-repo callers wrap it in a
+    best-effort try/except.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _declared_pending(
+        self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        queue.declare_pin(esc_id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    @staticmethod
+    def _pin_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'DECLARED PIN' in r.getMessage()
+        ]
+
+    # --- (a) the warning names the id, every declarer, and the reason ---
+
+    @pytest.mark.parametrize('dismiss', [False, True])
+    def test_warns_naming_id_declarers_and_reason(self, tmp_path: Path, caplog, dismiss: bool):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        warnings = self._pin_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one declared-pin warning, got {warnings}'
+        assert 'esc-pin-1' in warnings[0]
+        assert self.DECLARER in warnings[0]
+        assert self.REASON in warnings[0]
+
+    def test_warning_names_every_declarer(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+        queue.declare_pin('esc-pin-1', declared_by=['esc-3914-1'])
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it')
+
+        (warning,) = self._pin_warnings(caplog)
+        assert self.DECLARER in warning
+        assert 'esc-3914-1' in warning
+
+    # --- (b) it still CLOSES — an audit line, not a veto ---
+
+    @pytest.mark.parametrize(
+        ('dismiss', 'expected_status'), [(False, 'resolved'), (True, 'dismissed')],
+    )
+    def test_record_is_still_closed_and_archived(
+        self, tmp_path: Path, dismiss: bool, expected_status: str,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        result = queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        assert result is not None
+        assert result.status == expected_status
+        assert not (queue.queue_dir / 'esc-pin-1.json').exists(), 'expected it to be archived'
+
+    def test_declaration_survives_into_the_archive(self, tmp_path: Path):
+        """The archived JSON still carries pin_declared_by — the audit trail persists."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        queue.resolve('esc-pin-1', 'closing it')
+
+        (archived,) = list((queue.queue_dir / 'archive').rglob('esc-pin-1.json'))
+        payload = json.loads(archived.read_text())
+        assert payload['pin_declared_by'] == [self.DECLARER]
+        assert payload['pin_declared_reason'] == self.REASON
+
+    # --- (c) cascade members are covered by the same line, via self-recursion ---
+
+    def test_cascade_member_pin_is_warned_about(self, tmp_path: Path, caplog):
+        """The path that actually spent the specimen: a marked MEMBER of an L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-member-pin', level=1)
+        l2 = Escalation(
+            id='esc-l2-head',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster head, itself unmarked',
+            level=2,
+            members=['esc-member-pin'],
+        )
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-l2-head', 'bulk close', dismiss=True)
+
+        (warning,) = self._pin_warnings(caplog)
+        assert 'esc-member-pin' in warning, (
+            'the cascade must warn about the MEMBER that carried the marker'
+        )
+        assert self.DECLARER in warning
+
+    # --- (d) ordinary closes stay silent ---
+
+    def test_unmarked_record_emits_no_declared_pin_warning(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id='esc-plain-1',
+            task_id='task-1',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='an ordinary record',
+            level=1,
+        )
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-plain-1', 'closing it')
+
+        assert self._pin_warnings(caplog) == []
 
 
 class TestResolveResolutionClassExplicit:

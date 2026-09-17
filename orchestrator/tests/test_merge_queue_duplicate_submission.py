@@ -55,6 +55,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from _merge_lane_census import census_for
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -257,7 +258,7 @@ class TestAdvanceIfAt:
             )
 
         assert result is False
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.FINALIZING
+        assert census_for(worker, rid) == [('finalizing', 'normal')]
         assert fake_eq.submitted == [], (
             f'tolerant no-op must NOT escalate: {fake_eq.submitted!r}'
         )
@@ -308,7 +309,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         )
 
         assert result is False
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.DISPATCHING, (
+        assert census_for(worker, rid) == [('dispatching', 'normal')], (
             'a rejected transition must leave the registry state unchanged'
         )
         assert len(fake_eq.submitted) == 1, (
@@ -337,7 +338,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         )
 
         assert result is False
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING
+        assert census_for(worker, rid) == [('verifying', 'normal')]
         assert len(fake_eq.submitted) == 1
         assert fake_eq.submitted[0].category == 'merge_lifecycle_transition_rejected'
 
@@ -372,7 +373,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
             )
 
         assert result is False
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.MERGING
+        assert census_for(worker, rid) == [('merging', 'normal')]
         assert fake_eq.submitted == [], (
             f'a named-tolerated downstream state must NOT escalate: {fake_eq.submitted!r}'
         )
@@ -424,10 +425,9 @@ class TestBufferOwnedRequestDuplicateDrain:
         assert fake_eq.submitted == [], (
             f'a recognized duplicate/re-entrant drain must not escalate: {fake_eq.submitted!r}'
         )
-        for lane, buf in worker._lane_buffers.items():
-            assert twin not in buf, f'twin must not be buffered in lane {lane!r}: {buf!r}'
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING, (
-            'registry must be untouched by the coalesced duplicate'
+        assert census_for(worker, rid) == [('verifying', 'normal')], (
+            'the coalesced duplicate must neither be buffered into a lane (which '
+            'would surface as a queued entry) nor touch the registry'
         )
         assert worker._live_items[rid] is original, (
             'the live original must not be displaced by the twin'
@@ -468,10 +468,9 @@ class TestBufferOwnedRequestDuplicateDrain:
             f'a duplicate drain onto an already-FINALIZING request_id must not '
             f'escalate: {fake_eq.submitted!r}'
         )
-        for lane, buf in worker._lane_buffers.items():
-            assert twin not in buf, f'twin must not be buffered in lane {lane!r}: {buf!r}'
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.FINALIZING, (
-            'registry must be untouched by the coalesced duplicate'
+        assert census_for(worker, rid) == [('finalizing', 'normal')], (
+            'the coalesced duplicate must neither be buffered into a lane (which '
+            'would surface as a queued entry) nor touch the registry'
         )
         assert worker._live_items[rid] is original, (
             'the live original must not be displaced by the twin — no second '
@@ -692,8 +691,6 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
     async def test_live_original_redrain_does_not_resolve_its_future(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
-
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
         req = _make_request('df3082-live-original', 'df3082-live-original', tmp_path, config)
@@ -705,14 +702,12 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
             f'the LIVE original\'s real waiter must not be handed a fabricated '
             f'outcome: {req.result.result() if req.result.done() else None!r}'
         )
-        assert not any(req in buf for buf in worker._lane_buffers.values()), (
-            'a re-entrant drain must still not be buffered as a divergent second item'
+        census = census_for(worker, rid)
+        assert census == [('verifying', 'normal')], (
+            f'a re-entrant drain must neither be buffered as a divergent second '
+            f'item nor touch the live original\'s registry state; reads {census!r}'
         )
         assert worker._live_items[rid] is req, f'{worker._live_items.get(rid)!r}'
-        current = worker._lifecycle.current(rid)
-        assert current == ItemLifecycleState.VERIFYING, (
-            f'the live original\'s registry state must be untouched; reads {current!r}'
-        )
 
     async def test_live_original_redrain_escalates_loudly(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -789,7 +784,6 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         ``obj.request`` branches, which no other test reaches.
         """
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         fake_es = _FakeEventStore()
@@ -812,12 +806,11 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
             f'outcome when _live_items holds a {shape}: '
             f'{req.result.result() if req.result.done() else None!r}'
         )
-        assert not any(req in buf for buf in worker._lane_buffers.values()), (
-            'a re-entrant drain must still not be buffered as a divergent second item'
-        )
-        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING, (
-            f'the live original\'s registry state must be untouched; reads '
-            f'{worker._lifecycle.current(rid)!r}'
+        census = census_for(worker, rid)
+        assert census == [('verifying', 'normal')], (
+            f'a re-entrant drain must neither be buffered as a divergent second '
+            f'item nor touch the live original\'s registry state, whatever shape '
+            f'_live_items holds; reads {census!r}'
         )
         assert [e.category for e in fake_eq.submitted] == ['merge_coalesce_live_original'], (
             f'the live-original branch must escalate for a wrapping {shape} too: '

@@ -13,9 +13,24 @@ registries -- nothing in refresh_registry, _rebuild_queue, or
 _update_attention (the C5b queue-build/reorder/set_urgency path) calls
 write_record/write_decision/update_decision_state/set_manual_boost. The
 cockpit's ONLY unconditional write target is its own cockpit-ui.json (via
-cockpit.ui_config); C5b's explicit-action keybindings (boost/drop) add
-sanctioned, action-only writes to a DECISION's manual_boost/state via C1's
-set_manual_boost/update_decision_state -- see test_app.py's
+cockpit.ui_config) -- and even that write is DEBOUNCED for the app's whole
+life: the session table's two selection seams (CockpitApp._sync_detail_pane
+on a cursor move, CockpitApp._resync_session_detail on a rebuild) only
+RECORD the live selection in _selected_slug, and CockpitApp._flush_ui_config
+writes from the poll timer (CockpitApp._poll_registry) only when that
+differs from what was last persisted, leaving CockpitApp.on_unmount as the
+single unconditional final write. So neither a keypress nor a table rebuild
+ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
+debounce reduces how OFTEN that synchronous mkdir + mkstemp + json.dump +
+os.replace runs, it does not move it off the event-loop thread the way
+esc-2303-1 threaded the registry scan, and the poll-tick flush still
+performs it inline. The only other event-path I/O is C5b's sanctioned
+decision writes: its explicit-action keybindings (boost/drop) add
+action-only writes to a DECISION's manual_boost/state via C1's
+set_manual_boost/update_decision_state, each of which runs synchronously on
+the event-loop thread and is followed there by a full
+list_decisions(self.fleet_root) re-scan (CockpitApp._apply_boost,
+CockpitApp.action_drop) -- see test_app.py's
 TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
@@ -28,6 +43,7 @@ import os
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from orchestrator.session_registry import (
@@ -50,6 +66,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
+from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback, copy_to_system_clipboard
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
@@ -145,6 +162,22 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
     }
 
 
+class DetailOwner(StrEnum):
+    """Which table's cursor last claimed the detail pane.
+
+    Ownership is a property of the TABLE that moved, never of the record
+    KIND on screen: the queue's own session rows render exactly what the
+    session table renders, so the rendered kind cannot tell the two apart.
+    CLAIMED only by on_data_table_row_highlighted, and released back to
+    SESSION_TABLE -- the default, and the only owner that always has a
+    selection to render -- by _resync_queue_detail when the queue empties.
+    Read only by the two rebuild-time re-syncs.
+    """
+
+    SESSION_TABLE = 'session-table'
+    QUEUE = 'queue'
+
+
 class CockpitApp(App):
     """Fleet Cockpit TUI: decision queue + session table + detail pane, polling for changes."""
 
@@ -191,6 +224,7 @@ class CockpitApp(App):
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
         spawn_script: Path | str | None = None,
+        copy_runner: Callable[[str], CopyAttempt] | None = None,
         priorities: Priorities | None = None,
         **kwargs,
     ) -> None:
@@ -206,6 +240,7 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
+        self._copy_runner = copy_runner if copy_runner is not None else copy_to_system_clipboard
         self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
         # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
         # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
@@ -241,12 +276,24 @@ class CockpitApp(App):
         # in _poll_registry is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
+        # The pane starts on the session-flavoured placeholder (and, when
+        # cockpit-ui.json carries one, the restored session), so the
+        # session table owns it until an operator moves the queue's cursor.
+        self._detail_owner = DetailOwner.SESSION_TABLE
         # Round-tripped through on_mount/_persist_ui_config so a hand-edited
         # cockpit-ui.json value survives a save -- see _persist_ui_config's
         # docstring. Seeded from the constructor kwarg here only so an
         # out-of-order _persist_ui_config call (before on_mount ever runs)
         # has a defined value rather than raising AttributeError.
         self._persisted_poll_interval: float = poll_interval
+        # Debounce baseline for cockpit-ui.json: the last selected_slug
+        # actually handed to save_ui_config, i.e. what the on-disk file
+        # holds. Re-seeded in on_mount from load_ui_config, advanced only in
+        # _persist_ui_config, and read by _flush_ui_config -- see that
+        # method for why this is a baseline and not a "changed" latch.
+        # Seeded here, like _persisted_poll_interval above, only so an early
+        # call has a defined value.
+        self._persisted_selected_slug: str | None = None
         # Keyed by resolved DisplayTarget, NOT by item key -- see
         # _update_attention's docstring: a decision and the AWAITING_INPUT
         # session it links to can resolve to the SAME target, so urgency
@@ -296,12 +343,20 @@ class CockpitApp(App):
         # 4054: no restore path / no CLI override for poll_interval).
         ui_config = load_ui_config(self.fleet_root)
         self._persisted_poll_interval = ui_config.poll_interval
+        # Seeded BEFORE refresh_registry(), so the baseline exists before any
+        # selection is recorded: a restore that succeeds leaves nothing for
+        # the first flush to write, one that fails soft onto row 0 leaves the
+        # stale file for it to correct.
+        self._persisted_selected_slug = ui_config.selected_slug
         self.refresh_registry()
         if ui_config.selected_slug is not None:
             self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
         self.set_interval(self.poll_interval, self._poll_registry)
 
     def on_unmount(self) -> None:
+        # Unconditional, not _flush_ui_config: an app mounted over an empty
+        # registry keeps both _selected_slug and its baseline at None, and
+        # would otherwise never create cockpit-ui.json at all.
         self._persist_ui_config()
 
     def _next_scan_seq(self) -> int:
@@ -430,11 +485,45 @@ class CockpitApp(App):
         the FULL self._records, so outstanding-children counts never
         undercount a visible parent's non-terminal child just because that
         child itself is filtered out of view.
+
+        The rebuild owns the detail pane only while the pane still belongs
+        to the session table: a rebuild refreshes whichever kind currently
+        owns the detail, and only an operator cursor move transfers that
+        ownership (see on_data_table_row_highlighted). Hence the two
+        deliberate moves below -- `prevent` so a programmatic rebuild emits
+        no cursor events at all, and _resync_session_detail so the explicit
+        re-sync that replaces them respects the same ownership rule. The
+        re-sync has always been explicit rather than left to those reposts,
+        because clear()'s cursor reset only reposts when the highlighted row
+        INDEX changes; suppressing them costs nothing and stops a
+        same-content rebuild from stealing a decision an operator is reading.
         """
         visible = self._records if self._show_history else filter_live_sessions(self._records)
         table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(visible, self._now_fn(), all_records=self._records)
-        self._sync_detail_pane(table.highlighted_slug())
+        with self.prevent(DataTable.RowHighlighted):
+            table.replace_rows(visible, self._now_fn(), all_records=self._records)
+        self._resync_session_detail(table.highlighted_slug())
+
+    def _resync_session_detail(self, slug: str | None) -> None:
+        """Rebuild-time counterpart of _sync_detail_pane -- remember, re-render if ours.
+
+        _selected_slug is assigned unconditionally, so cockpit-ui.json's
+        restore seam stays a pure function of the session table's cursor
+        regardless of which pane is on screen. The RE-RENDER is what's
+        gated: a rebuild refreshes the detail only while this table still
+        owns the pane, never stealing it back from a queue row the
+        operator moved to.
+
+        Nothing is written here, even when the rebuild moved the cursor
+        itself (the highlighted session left the live view, say) and no
+        RowHighlighted reports it: recording the slug is enough, because
+        _flush_ui_config compares against what was last persisted rather
+        than waiting to be told of a move, so the next poll tick writes it
+        -- the same unpersisted window a keypress has.
+        """
+        self._selected_slug = slug
+        if self._detail_owner is DetailOwner.SESSION_TABLE:
+            self._show_session_detail(slug)
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
@@ -459,7 +548,19 @@ class CockpitApp(App):
         (main-thread-only, like the flag check above) and hands it to the
         worker, so a stale hand-off can be dropped once it lands -- see
         _apply_scan's stale-scan guard (esc-2517-1).
+
+        Doubles as the flush point for the cockpit-ui.json write debounce
+        (see _flush_ui_config), reusing this timer rather than adding a
+        second recurring wake-up. The flush must run BEFORE the
+        _scan_in_flight early return: a 10k+-session scan routinely outlasts
+        the poll interval, so a flush placed after it would be starved for
+        as long as scans keep overlapping -- the busy-fleet case where the
+        operator is most likely to be moving the cursor.
+        test_app.py::TestUIConfigWriteDebounce::
+        test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
+        placement.
         """
+        self._flush_ui_config()
         if self._scan_in_flight:
             return
         self._scan_in_flight = True
@@ -720,6 +821,17 @@ class CockpitApp(App):
         decision-row boost) call this afterward instead of waiting for the
         next poll tick.
 
+        Like its _rebuild_session_table sibling, this rebuild is
+        programmatic, so it emits no cursor events at all -- replace_rows
+        does clear() + move_cursor, which reposts RowHighlighted on every
+        rebuild whose highlighted row INDEX shifts, and `prevent` stops
+        that repost from handing the detail pane to the queue behind the
+        operator's back. A rebuild refreshes whichever table currently owns
+        the detail; only an operator cursor move transfers that ownership
+        (see on_data_table_row_highlighted). The explicit
+        _resync_queue_detail below is what refreshes the highlighted row in
+        those suppressed reposts' place.
+
         Also prunes self._handling down to the keys still present in the
         freshly-built queue: a key whose item LEFT the queue (resolved/
         dropped, or a session moved off AWAITING_INPUT) stops being
@@ -768,10 +880,39 @@ class CockpitApp(App):
             deferred=self._deferred,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
-        queue.replace_rows(queue_items, now)
+        with self.prevent(DataTable.RowHighlighted):
+            queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
         self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
+        self._resync_queue_detail(queue.highlighted_key())
+
+    def _resync_queue_detail(self, key: str | None) -> None:
+        """Rebuild-time counterpart of _sync_queue_detail -- re-render if ours.
+
+        The queue-side mirror of _resync_session_detail: refreshes the
+        highlighted row's detail with the freshly-scanned record while the
+        queue still owns the pane, and does nothing at all when it doesn't.
+        Must run after self._queue_items_by_key is rebuilt -- that is the
+        index _sync_queue_detail resolves *key* through.
+
+        An EMPTY queue (*key* None) RELEASES ownership rather than holding
+        it. The queue has no row left to own the pane with -- a watcher
+        resolved the last open decision, or the last awaiting-input session
+        was answered -- so holding on would lock the session table's
+        rebuilds out of the pane too, and the operator would be left
+        reading a decision that no longer exists with nothing able to clear
+        it. That is the one place "leave the pane as it is" degrades into a
+        wedged view rather than a transient miss, so the session table
+        takes the pane back and renders its own selection.
+        """
+        if self._detail_owner is not DetailOwner.QUEUE:
+            return
+        if key is None:
+            self._detail_owner = DetailOwner.SESSION_TABLE
+            self._show_session_detail(self._selected_slug)
+            return
+        self._sync_queue_detail(key)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
         """Resolve the focus/arrange backend for *kind* ('wm'/'tmux').
@@ -1035,9 +1176,23 @@ class CockpitApp(App):
         work in the running cockpit -- this is the in-app replacement.
         Mirrors action_drop/action_defer's highlighted-row lookup exactly
         (fail-soft: no highlighted row, or a key not present in the
-        last-built queue, no-ops). Delegates to Textual's own
-        App.copy_to_clipboard, which writes an OSC 52 escape sequence --
-        terminal-native, works over SSH, no xclip/wl-copy subprocess.
+        last-built queue, no-ops).
+
+        A LOCAL clipboard helper (wl-copy/xclip/xsel, via
+        cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard) is tried
+        first, and OSC 52 is only the fallback for when no local helper can
+        reach a clipboard -- the over-SSH case. OSC 52 alone reached no
+        clipboard at all on the operator's terminal; that module's docstring
+        carries the incident account (task 5448).
+
+        This method owns three things and nothing else: the highlighted-row
+        lookup, the guard around the injected seam, and the two side effects
+        cockpit/src/cockpit/clipboard.py::copy_feedback asks for. Which
+        mechanism the toast names, its severity, and whether OSC 52 still
+        runs are all copy_feedback's call. Both outcomes DO toast -- without
+        that, a future capability regression is again invisible at the
+        moment of use.
+
         Strictly READ-ONLY: never calls set_manual_boost/
         update_decision_state, preserving the pure-consumer write-
         discipline invariant (see TestCopyAction).
@@ -1049,7 +1204,19 @@ class CockpitApp(App):
         item = self._queue_items_by_key.get(key)
         if item is None:
             return
-        self.copy_to_clipboard(format_copy_payload(item))
+        payload = format_copy_payload(item)
+        try:
+            attempt = self._copy_runner(payload)
+        except Exception:
+            # copy_runner is caller-injectable, so a keypress handler must
+            # not depend on the bundled implementation's never-raise promise
+            # being kept by whatever was passed in (PRD §2).
+            _log.exception('action_copy: copy runner failed for %r', key)
+            attempt = CopyAttempt(CopyOutcome.HELPER_FAILED)
+        feedback = copy_feedback(attempt)
+        if feedback.write_osc52:
+            self.copy_to_clipboard(payload)
+        self.notify(feedback.message, title='Copy', severity=feedback.severity)
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
@@ -1217,40 +1384,111 @@ class CockpitApp(App):
             return
         self._backend_for(target.kind).focus(target)
 
-    def _sync_detail_pane(self, slug: str | None) -> None:
+    def _show_session_detail(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
 
         Looked up against self._records -- the ordered set from the most
         recent scan -- so this always reflects current data, not whatever
-        object identity a stale event might carry. Also remembers *slug* for
-        _persist_ui_config, since on_unmount runs after the DataTable itself
-        has already been torn down and can no longer be queried.
+        object identity a stale event might carry.
+
+        The render half alone, with no _selected_slug bookkeeping, so the
+        decision queue's own session rows can reuse it without writing the
+        session TABLE's restore seam -- see _sync_queue_detail.
         """
-        self._selected_slug = slug
         record = next((r for r in self._records if r.session_slug == slug), None)
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
 
+    def _sync_detail_pane(self, slug: str | None) -> None:
+        """Render *slug*'s record into the detail pane AND remember it as the selection.
+
+        The session table's path: the render (_show_session_detail) plus
+        remembering *slug* for _persist_ui_config, since on_unmount runs
+        after the DataTable itself has already been torn down and can no
+        longer be queried.
+        """
+        self._selected_slug = slug
+        self._show_session_detail(slug)
+
+    def _sync_queue_detail(self, key: str | None) -> None:
+        """Render the DecisionQueue row *key* into the detail pane.
+
+        Resolves *key* the way every other queue action does -- key ->
+        QueueItem (self._queue_items_by_key) -- so the pane sees the same
+        item identity as focus/boost/copy, with no second index. Both row
+        kinds render: a session row reuses the session render, since the
+        queue truncates its question exactly as it truncates a decision's.
+        A decision row resolves on to its DecisionRecord and renders THAT
+        rather than the QueueItem, because severity/state and the true
+        filed_at live only on the record (the queue's deferred overlay may
+        have shifted the item's).
+
+        Never writes _selected_slug -- that is the session TABLE's restore
+        seam (cockpit-ui.json), and a decision has no session slug to
+        restore to, so the queue renders through _show_session_detail
+        rather than _sync_detail_pane.
+
+        Fail-soft (PRD §2): an empty queue, a key with no QueueItem, or an
+        item whose backing record is gone leaves the pane as it is rather
+        than raising or blanking it.
+        """
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        if item.kind == 'session':
+            self._show_session_detail(item.session_slug)
+            return
+        if item.decision_id is None:
+            return
+        decision = self._decision_by_id(item.decision_id)
+        if decision is None:
+            return
+        detail = self.query_one('#detail', DetailPane)
+        detail.show_decision(decision, self._records, self._now_fn())
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Keep the detail pane in sync with the SessionTable's highlighted row.
+        """Keep the detail pane in sync with whichever table's cursor moved.
 
         Covers interactive cursor moves (e.g. arrow keys, or a test/caller
-        calling move_cursor directly). The complementary rebuild-time sync
-        lives in refresh_registry -- clear()'s cursor reset only reposts
-        this message when the highlighted row index actually changes, so a
-        same-row-different-content rebuild needs its own explicit sync.
+        calling move_cursor directly). SessionTable and DecisionQueue are
+        both DataTable subclasses, so Textual routes both their
+        RowHighlighted messages through this same handler (dispatch is by
+        the base DataTable message namespace, not the subclass) --
+        event.data_table disambiguates, the same way
+        on_data_table_row_selected does.
 
-        SessionTable and DecisionQueue are both DataTable subclasses, so
-        Textual routes both their RowHighlighted messages through this same
-        handler (dispatch is by the base DataTable message namespace, not
-        the subclass) -- event.data_table disambiguates so moving the
-        DecisionQueue's cursor never clobbers the session detail sync.
+        This handler is the ONLY thing that CLAIMS the detail pane for a
+        table: an operator cursor move hands the pane to the table that
+        moved, and a registry rebuild then refreshes whichever one
+        currently owns it (see _rebuild_session_table/_rebuild_queue, both
+        of which suppress their own programmatic cursor events). The one
+        other write to self._detail_owner is _resync_queue_detail's
+        RELEASE back to the session table when the queue empties, which
+        takes ownership away from a table that no longer has a row rather
+        than claiming it on any operator's behalf. Only the session branch
+        touches _selected_slug/cockpit-ui.json -- that restore seam is the
+        session table's alone, and a decision has no session slug to
+        restore to.
+
+        Runs once per cursor-move EVENT, so holding an arrow key down over a
+        large session table fires it continuously -- it must do NO I/O. The
+        selection is only RECORDED here (via _sync_detail_pane); the write
+        (cockpit/src/cockpit/ui_config.py::save_ui_config) is deferred to
+        _flush_ui_config, so a keypress burst costs at most one write per
+        poll interval.
         """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        if event.data_table is queue:
+            self._detail_owner = DetailOwner.QUEUE
+            self._sync_queue_detail(event.row_key.value)
+            return
         table = self.query_one('#session-table', SessionTable)
         if event.data_table is not table:
             return
+        self._detail_owner = DetailOwner.SESSION_TABLE
         self._sync_detail_pane(event.row_key.value)
-        self._persist_ui_config()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Route a DecisionQueue selection (Enter, via DataTable's own
@@ -1275,6 +1513,33 @@ class CockpitApp(App):
             if slug is not None:
                 self._focus_slug(slug, self._records)
 
+    def _flush_ui_config(self) -> None:
+        """Debounced half of the cockpit-ui.json write path; called from _poll_registry.
+
+        Writes only when the live selection differs from what was last
+        persisted, so an idle cockpit does ZERO writes per tick rather than
+        merely trading one write per keypress for one per poll interval.
+
+        The gate asks "is the on-disk file stale", NOT "did the selection
+        change since the last flush", and that is what lets both selection
+        seams (_sync_detail_pane and _resync_session_detail) merely record
+        the slug with no marking: a rebuild that moves the cursor with no
+        RowHighlighted is caught the same way as a keypress, a burst that
+        returns to where it started writes nothing, and a restore at mount
+        that already matches the file writes nothing either.
+
+        There is nothing to retry on. _persist_ui_config advances the
+        baseline immediately after the fail-soft
+        cockpit/src/cockpit/ui_config.py::save_ui_config call, which logs
+        and swallows OSError and returns None either way, so a failed write
+        is dropped exactly as a highlight-time save failure used to be. The
+        next selection change makes the two values differ again, and
+        on_unmount's unconditional write gets one more attempt at shutdown.
+        """
+        if self._selected_slug == self._persisted_selected_slug:
+            return
+        self._persist_ui_config()
+
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
 
@@ -1283,6 +1548,18 @@ class CockpitApp(App):
         Never touches sessions/ or decisions/. Reads self._selected_slug
         (not the DataTable) so this is safe to call from on_unmount, after
         the table has already been torn down.
+
+        The only callers are _flush_ui_config (the debounced poll-tick
+        write) and on_unmount (unconditional, once at shutdown). A new
+        caller on any event path should go through _flush_ui_config
+        instead, so a keypress keeps costing a comparison rather than a
+        write.
+
+        This is also the SINGLE site where _persisted_selected_slug
+        advances, which is what makes _flush_ui_config's comparison mean
+        "the on-disk file is stale". It takes cfg.selected_slug -- what was
+        actually handed to the writer -- so the baseline can never disagree
+        with the bytes that were written.
 
         poll_interval is round-tripped from self._persisted_poll_interval
         (stashed once in on_mount from load_ui_config), NOT taken from
@@ -1299,6 +1576,7 @@ class CockpitApp(App):
             selected_slug=self._selected_slug, poll_interval=self._persisted_poll_interval
         )
         save_ui_config(cfg, self.fleet_root)
+        self._persisted_selected_slug = cfg.selected_slug
 
 
 def main() -> None:

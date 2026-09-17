@@ -50,10 +50,16 @@ orchestrator = { workspace = true }
 
 [tool.pytest.ini_options]
 # Default per-test timeout. Catches deadlocked lock implementations and
-# accidental hangs. signal method is load-bearing: thread method can't
-# interrupt a blocking syscall in the main thread. escalation runs no
-# pytest-xdist so signal is always safe here.
-timeout = 60
+# accidental hangs; slow tests opt out with @pytest.mark.timeout(N).
+# See shared/pyproject.toml for the full rationale, including why this is 300
+# rather than the former 60: the cap is WALL-CLOCK, so a healthy test starved
+# of CPU on a loaded 32-core host trips it, and in the xdist packages that
+# reds a SHIFTING VICTIM rather than the starved test. 300 is INTERIM and
+# judgement-picked, not measured.
+# signal method is load-bearing: thread method can't interrupt a blocking
+# syscall in the main thread. escalation runs no pytest-xdist so signal is
+# always safe here. UNCHANGED by the 60→300 raise, deliberately.
+timeout = 300
 timeout_method = "signal"
 
 [tool.pyright]

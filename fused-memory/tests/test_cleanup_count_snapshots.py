@@ -6,42 +6,20 @@ without sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load cleanup_count_snapshots.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'cleanup_count_snapshots'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cleanup_count_snapshots')
 EdgeMatch = _mod.EdgeMatch
 EntityScanResult = _mod.EntityScanResult
 

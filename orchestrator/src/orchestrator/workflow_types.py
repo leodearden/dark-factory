@@ -270,6 +270,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
         WarmLaneDiskPressure,
+        WarmLaneLockContention,
         WarmLanePoolExhausted,
         WarmLanePoolHardDown,
         WarmLaneRequeue,
@@ -376,6 +377,39 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='warm_lane_pool_hard_down',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Lane-lock contention (task 4211): seed exited 77 under reify's
+        # opt-in --distinct-lock-refusal-rc (reify 5568) because another live
+        # consumer holds <lane_dir>.lock, so it refused rather than seeded.
+        #
+        # An EXPLICIT own-key row, not MRO inheritance, and that is the whole
+        # point of the row.  _lookup_disposition walks __mro__, so a
+        # WarmLaneRequeue subclass with no row of its own resolves to the base
+        # row above — whose reason_prefix is literally
+        # 'warm_lane_disk_pressure (transient infra)'.  Inheriting it would
+        # keep rendering a lane-lock refusal as disk pressure, which is
+        # precisely the operator-facing defect this task fixes (the misleading
+        # string operators read throughout reify esc-5556-1, when seed's two
+        # refusal arms both exited 75 and seed has no disk-pressure exit-75
+        # path at all).  BD-2 completeness does NOT catch this — MRO
+        # resolution already satisfies it — so the guard is the OWN-KEY
+        # assertion in test_block_disposition.py, mirroring the
+        # LaneLockSelfOwnedLeak precedent.
+        #
+        # counts_against_requeue_cap=False: the DISK_PRESSURE / HARD_DOWN /
+        # SOFT_PRESSURE shared-resource shape, deliberately NOT
+        # WarmLaneReseedContaminated's =True.  Per the family comment above,
+        # only per-task DATA-INTEGRITY faults burn the cap; a lock held by
+        # ANOTHER live consumer is a shared-resource condition and no fault of
+        # the requeued task, so charging its cap would punish the wrong party
+        # and recreate the retry-cap-escalation storm task 2988 fixed.
+        WarmLaneLockContention: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_lock_contention (transient contention)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # θ proactive soft-floor throttle (task 2443, §9.5 inv.11): pure

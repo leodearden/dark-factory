@@ -428,6 +428,64 @@ class QueueConfig(BaseModel):
         return self
 
 
+# --- Write journal ---
+
+class WriteJournalConfig(BaseModel):
+    """Retention horizons and prune budgets for the ``write_ops`` journal.
+
+    RESTART-ONLY BY CONSTRUCTION. The prune runs once at startup
+    (``server/main.py``), so no consumer re-reads these values afterwards.
+    ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
+    section is deliberately absent from it, which makes a changed leaf report
+    ``restart_required`` — honest, rather than a leaf advertised hot-reloadable
+    while silently ignoring reloads.
+
+    The three horizons are not interchangeable, and the asymmetry is the whole
+    point: see ``services/write_journal.py::prune_write_ops`` for the measured
+    row-mix that set them.
+    """
+
+    #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
+    #: ``get_external_statuses``) — 97.9% of the table with no downstream
+    #: consumer, so this is incident-forensics headroom and nothing more.
+    read_retention_days: float = Field(default=30.0, gt=0)
+    #: ``search`` reads — 1.36% of the table and the SOLE data source for leaf
+    #: eta's write-after-miss metric (task 3213) and leaf theta's retro corpus
+    #: (task 3214), both of which evaluate over trailing baseline windows.
+    search_retention_days: float = Field(default=365.0, gt=0)
+    #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
+    #: volume, so a long horizon costs essentially nothing.
+    write_retention_days: float = Field(default=730.0, gt=0)
+    #: Rows deleted per transaction. Each batch commits separately so the
+    #: write lock is released between batches.
+    prune_batch_size: int = Field(default=5000, gt=0)
+    #: Ceiling on one startup sweep. A backlog drains over successive restarts
+    #: and each partial run says so at WARNING.
+    prune_max_rows_per_run: int = Field(default=500_000, gt=0)
+    #: Wall-clock ceiling on one sweep, checked between batches. This is the
+    #: bound that actually matters: the watchdog's startup grace is a TIME
+    #: budget, and rows-per-second is not knowable in advance.
+    prune_max_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode='after')
+    def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
+        """Search rows must never be aged out sooner than task-read rows.
+
+        An inversion is silently destructive rather than loudly broken: it
+        would starve the only consumer these rows have while the 97.9% of the
+        table that has no consumer lived longer. Rejected at load time, in the
+        same posture as ``QueueConfig._validate_transient_max_attempts``.
+        """
+        if self.search_retention_days < self.read_retention_days:
+            raise ValueError(
+                f'search_retention_days ({self.search_retention_days}) must be >= '
+                f'read_retention_days ({self.read_retention_days}): search rows are '
+                'the only journalled reads with a downstream consumer (leaf eta), '
+                'so they must not be aged out sooner than consumer-less task reads.'
+            )
+        return self
+
+
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
@@ -1891,7 +1949,7 @@ class ReconciliationConfig(BaseModel):
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
             'by resolve_topic_guard_clusters in server/near_duplicate_guard.py). '
             'Shares the procedural_knowledge_near_dup_guard_enabled kill-switch and '
-            'the recon-stage / allow_near_duplicate exemptions with the cosine guard.'
+            'the allow_near_duplicate exemption with the cosine guard.'
         ),
     )
 
@@ -2716,6 +2774,12 @@ class FusedMemoryConfig(BaseSettings):
     mem0: Mem0BackendConfig = Field(default_factory=Mem0BackendConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage below —
+    # here it buys the INVERSE disposition: reload.py descends into it and
+    # reports every leaf restart_required, which is the honest answer for a
+    # startup-only prune. Nullability would bucket the whole section as one
+    # atomic leaf instead.
+    write_journal: WriteJournalConfig = Field(default_factory=WriteJournalConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)

@@ -189,6 +189,20 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
+    # deliberately DIFFERENT data shapes — read the producer before the payload:
+    #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
+    #     {merge_sha, local_runner, remote_runner, passed, local_category,
+    #     remote_category}.  The two *_category keys are ALWAYS present, carrying
+    #     '' for a clean arm, so a consumer never has to tell an absent key apart
+    #     from a clean result.  A non-empty value such as 'merge_flake_suppressed'
+    #     marks an arm whose green came from a flake-suppression rerun
+    #     (verify.apply_merge_flake_suppression) rather than a clean first pass —
+    #     i.e. the two hosts agreed, but one of them only agreed on a retry.
+    #   - merge_queue's land-time remote-green cross-check emits the same first
+    #     four keys WITHOUT the categories.
+    #   - merge_shadow's warm/cold compare emits a wholly different
+    #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence

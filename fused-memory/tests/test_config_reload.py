@@ -955,3 +955,37 @@ class TestTopicAnchoredRecallReloadTier:
         # Same service object, no reconstruction — the next search skips the I/O.
         await _search()
         assert service.mem0.scroll_by_metadata.await_count == 1
+
+
+class TestWriteJournalIsRestartOnly:
+    """Task 3212: `write_journal.*` is correctly restart-only.
+
+    The prune runs once at startup, so registering a leaf as reloadable would
+    hot-apply a value nothing re-reads — a leaf advertised green while silently
+    ignoring reloads, which is exactly the "restart-only in disguise" failure
+    reload.py's module docstring forbids. `RELOADABLE_FIELDS` is an opt-in
+    allowlist, so this holds by construction; it is asserted so an unexamined
+    future addition has to argue with a test.
+
+    The inverse direction — every allowlisted path resolving to a real leaf —
+    is already covered by test_every_reloadable_field_resolves_to_a_real_leaf.
+    """
+
+    def test_no_write_journal_leaf_is_allowlisted(self):
+        allowlisted = {p for p in RELOADABLE_FIELDS if p.startswith('write_journal.')}
+        assert not allowlisted, (
+            f'RED: write_journal leaves must not be hot-reloadable, found {allowlisted}'
+        )
+
+    def test_changed_write_journal_leaf_lands_in_restart_required(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_journal.read_retention_days
+        object.__setattr__(fresh.write_journal, 'read_retention_days', old + 1)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required['write_journal.read_retention_days'] == {
+            'old': old, 'new': old + 1,
+        }, 'RED: a startup-only knob must be reported restart_required, not applied'
+        assert 'write_journal.read_retention_days' not in d.applied_candidates

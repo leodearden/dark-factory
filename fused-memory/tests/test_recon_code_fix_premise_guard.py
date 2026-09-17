@@ -8,7 +8,10 @@ live source/test re-verification (verify_premise_refuted).
 from __future__ import annotations
 
 import dataclasses
+import types
 from pathlib import Path
+
+import pytest
 
 from fused_memory.middleware.task_curator import CandidateTask
 
@@ -87,6 +90,22 @@ class TestLoadPremiseRegistry:
         assert entries == []
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
+
+    # task-4483 step-01 RED: undecodable-encoding registry
+    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c2) File with bytes that are not valid UTF-8 returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
+
+        bad_encoding = tmp_path / "bad_encoding.yaml"
+        bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
+
+        with caplog.at_level("WARNING"):
+            entries = load_premise_registry(bad_encoding)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(bad_encoding) in warnings[0].message
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -908,3 +927,103 @@ class TestSeedRegistryRealSource:
             result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
             assert result is not None, f"expected a premise-refuted drop for {expected_name!r}"
             assert result.name == expected_name
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-4483 step-03 RED: TestYamlLoaderSelection
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestYamlLoaderSelection:
+    """Pins the fast YAML loader selection in
+    fused_memory.middleware.recon_code_fix_premise_guard: the module resolves
+    to the libyaml-backed CSafeLoader when available (the ~8x speedup this
+    guards against silently regressing), falls back to the pure-Python
+    SafeLoader when it is not, and parse behavior (parity + the
+    yaml.YAMLError contract) is unaffected by the loader swap.
+    """
+
+    def test_module_uses_c_loader_when_available(self):
+        """Anti-regression pin: the module must resolve to CSafeLoader, not SafeLoader."""
+        import yaml
+
+        if not hasattr(yaml, "CSafeLoader"):
+            pytest.skip("libyaml not available in this environment")
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import _YAML_LOADER
+
+        assert _YAML_LOADER is yaml.CSafeLoader
+
+    def test_resolve_yaml_loader_falls_back_when_c_loader_absent(self):
+        """Fallback branch (otherwise unreachable with libyaml present): a
+        yaml-like module exposing SafeLoader but no CSafeLoader resolves to
+        SafeLoader.
+        """
+        import yaml
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import _resolve_yaml_loader
+
+        stub = types.SimpleNamespace(SafeLoader=yaml.SafeLoader)
+        assert _resolve_yaml_loader(stub) is yaml.SafeLoader
+
+    def test_shipped_registry_parses_under_active_loader(self):
+        """Parity/smoke guard on real data: the shipped registry still parses
+        to well-formed entries under whichever loader is active, and the
+        active loader's parse output is identical to the pure-Python
+        SafeLoader's output on that same registry.
+        """
+        import yaml
+
+        if not hasattr(yaml, "CSafeLoader"):
+            pytest.skip("libyaml not available in this environment")
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            _YAML_LOADER,
+            PremiseEntry,
+            SourceAssertion,
+            load_premise_registry,
+        )
+
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "recon_code_fix_premise_registry.yaml"
+        )
+        assert registry_path.exists(), f"shipped registry missing at {registry_path}"
+
+        entries = load_premise_registry(registry_path)
+
+        assert len(entries) > 0
+        for entry in entries:
+            assert isinstance(entry, PremiseEntry)
+            for sa in entry.source_assertions:
+                assert isinstance(sa, SourceAssertion)
+
+        text = registry_path.read_text(encoding="utf-8")
+        assert yaml.load(text, Loader=yaml.SafeLoader) == yaml.load(text, Loader=_YAML_LOADER)
+
+    def test_malformed_yaml_still_degrades_under_active_loader(self, tmp_path, caplog):
+        """A malformed-structure parse error survives the loader swap:
+        CSafeLoader's ParserError on this unclosed-flow-sequence input is
+        still a yaml.YAMLError, so the existing handler catches it without
+        modification.
+
+        Not a full error-type equivalence claim between the two loaders —
+        e.g. for a scalar containing a lone surrogate, CSafeLoader raises
+        UnicodeEncodeError (a ValueError, NOT a yaml.YAMLError) where
+        SafeLoader raises yaml.reader.ReaderError (which IS a YAMLError).
+        That divergence is unreachable via load_premise_registry today only
+        because its input is always strict-UTF-8-decoded text first, which
+        rejects lone surrogates before the parser ever sees them.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_premise_registry(bad_yaml)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1

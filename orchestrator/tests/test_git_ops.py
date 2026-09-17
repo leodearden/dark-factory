@@ -419,6 +419,68 @@ class TestWorktreeLifecycle:
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
 
+    async def test_create_worktree_self_heals_duplicate_hooks_path(
+        self, git_ops: GitOps,
+    ):
+        """create_worktree must converge core.hooksPath even when it is already
+        duplicated in the shared config (task 4570).
+
+        A plain single-value `git config core.hooksPath hooks` is REFUSED by
+        git (exit 5, "cannot overwrite multiple values with a single value")
+        once the key already holds two values — which is exactly the jammed
+        state this self-heal exists to repair. Seed that jam directly (as an
+        external/manual mutation would) and confirm create_worktree both
+        succeeds and collapses the key back to a single "hooks" value.
+        """
+        await _run(['git', 'config', 'core.hooksPath', 'hooks'], cwd=git_ops.project_root)
+        await _run(['git', 'config', '--add', 'core.hooksPath', 'echo'], cwd=git_ops.project_root)
+        rc, dup_values, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert dup_values.strip().splitlines() == ['hooks', 'echo']
+
+        worktree_info = await git_ops.create_worktree('hooks-path-jam')
+        assert worktree_info.path.exists()
+
+        rc, resolved, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert resolved.strip().splitlines() == ['hooks']
+
+    async def test_create_worktree_logs_hooks_path_set_failure(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A failed core.hooksPath write is logged, not silently discarded (4570).
+
+        --replace-all converges from the duplicated-key jam covered above, but
+        not from every failure mode — e.g. `.git/config.lock` contention with a
+        concurrent orchestrator/merge worker, or a read-only shared .git under
+        the OS-sandbox write-set. Silently discarding that rc is precisely what
+        let the exit-5 duplicate-value jam run unnoticed on every
+        worktree-create, so the write must stay best-effort (never raises) while
+        no longer being silent.
+        """
+        async def fake_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'config'] and 'core.hooksPath' in cmd:
+                return (
+                    255, '',
+                    "error: could not lock config file .git/config: File exists\n",
+                )
+            return await _run(cmd, cwd=cwd, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            worktree_info = await git_ops.create_worktree('hooks-path-set-failed')
+
+        # Best-effort: a wrong hooksPath must not block worktree create/dispatch.
+        assert worktree_info.path.exists()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('failed to set core.hooksPath' in r.getMessage() for r in warnings), (
+            f'All warnings: {[r.getMessage() for r in warnings]}'
+        )
+
     async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
         """create_worktree returns WorktreeInfo with path and base_commit."""
         result = await git_ops.create_worktree('feature-wi')

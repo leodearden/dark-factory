@@ -32,7 +32,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -73,7 +73,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
@@ -759,16 +759,34 @@ class TestEnqueueClearWiring:
     """
 
     @pytest.mark.asyncio
-    async def test_submit_clears_durable_stamp_after_enqueue(
-        self, tmp_path: Path, monkeypatch,
-    ):
+    async def test_submit_clears_durable_stamp_after_enqueue(self, tmp_path: Path):
         """RED on main: ``_submit_to_merge_queue`` never clears the durable stamp."""
         import asyncio
 
-        from orchestrator import merge_queue as merge_queue_mod
         from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
 
-        real_queue: asyncio.Queue = asyncio.Queue()
+        class _RecordingQueue(asyncio.Queue):
+            """The real merge queue, keeping a cumulative record of every put.
+
+            Injected through the workflow's own ``merge_queue=`` constructor
+            keyword, so the production enqueue path runs unmodified and what
+            reached the durable journal is a public observation rather than a
+            call count on a substituted module attribute.  Cumulative, because
+            the worker below may already have consumed the item by the time
+            the clear runs — ``qsize()`` would be a race, ``enqueued`` is not.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.enqueued: list = []
+
+            def put_nowait(self, item) -> None:
+                # asyncio.Queue.put() delegates here, so this one override
+                # sees both spellings exactly once.
+                self.enqueued.append(item)
+                super().put_nowait(item)
+
+        real_queue = _RecordingQueue()
         registry = InFlightMergeRegistry()
         wt = tmp_path / 'wt'
         wt.mkdir(parents=True, exist_ok=True)
@@ -789,19 +807,13 @@ class TestEnqueueClearWiring:
         wf._module_configs = []
         wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
-        # Order the durable enqueue against the clear on one parent mock: the
-        # clear must fire AFTER the request is on the crash-safe journal, not
-        # before (a pre-enqueue clear would re-open the false-positive window
-        # the stamp exists to close).
-        parent = MagicMock()
-        enqueue = AsyncMock(
-            side_effect=merge_queue_mod.register_and_enqueue_merge_request,
-        )
-        clear = AsyncMock()
-        parent.attach_mock(enqueue, 'enqueue')
-        parent.attach_mock(clear, 'clear')
-        monkeypatch.setattr(
-            merge_queue_mod, 'register_and_enqueue_merge_request', enqueue,
+        # Order the durable enqueue against the clear by reading the QUEUE at
+        # the moment the clear runs: the clear must fire AFTER the request is
+        # on the crash-safe journal, not before (a pre-enqueue clear would
+        # re-open the false-positive window the stamp exists to close).
+        enqueued_at_clear: list[int] = []
+        clear = AsyncMock(
+            side_effect=lambda: enqueued_at_clear.append(len(real_queue.enqueued)),
         )
         wf._clear_merge_phase_entered = clear  # type: ignore[method-assign]
 
@@ -817,9 +829,12 @@ class TestEnqueueClearWiring:
         clear.assert_awaited_once()
         # Co-located with the in-memory grace clear (task 2753).
         f.scheduler.clear_merge_phase.assert_called_once_with('B')
-        names = [c[0] for c in parent.mock_calls]
-        assert names.index('enqueue') < names.index('clear'), (
-            f'expected enqueue < clear; got {names}'
+        # The REAL request the REAL enqueue path put on the queue.
+        assert [r.task_id for r in real_queue.enqueued] == ['B'], real_queue.enqueued
+        assert real_queue.enqueued[0].branch.full_name == 'task/B'
+        assert enqueued_at_clear == [1], (
+            f'the clear must fire after the request is on the durable queue; '
+            f'saw {enqueued_at_clear} request(s) enqueued at clear time'
         )
 
 

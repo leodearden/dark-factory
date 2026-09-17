@@ -271,6 +271,18 @@ and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line
 every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
 parse.
 
+**Second stderr marker — `WATCHER_NTFY_OUTCOME: FAILED esc=<id> url=<url>: <error>`:** the phone
+push for that escalation was dropped. The queue item itself is **unaffected** — it was still
+printed to stdout and is still pending on disk — and the push failure does not change the exit
+code, so the arm still reports `WATCHER_REARM_OUTCOME: FIRED exit=0` beside it. Nothing is lost
+that you need to recover; what is lost is the user's out-of-band ping, so **tell them their phone
+trigger is down** rather than silently relying on it. One line is emitted per dropped push, which
+is how an outage is counted: a single line is a one-off (a flaky POST), the same marker recurring
+across successive arms is an ntfy outage. There is deliberately no success counterpart — a line
+here always means a drop. The line travels the watcher's logging stream, so it carries its
+level as a prefix (`ERROR: WATCHER_NTFY_OUTCOME: FAILED ...`) — match on the marker as a
+substring rather than anchoring at the start of the line.
+
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
 returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
 `timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
@@ -622,10 +634,27 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
      task_id=..., branch=..., worktree=..., description=..., wait_secs=100
    )
    ```
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A return within the window yields a terminal outcome shape (`status` ∈
-   `done | conflict | blocked | already_merged | unknown_branch | failed`).
+   `done | conflict | blocked | already_merged | done_wip_recovery | unknown_branch |
+   unmerged_state | stash_failed | wip_halted | wip_recovery_no_advance | error |
+   superseded`).
+   <!-- merge-state-vocab:end -->
+   The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
+   `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
+   `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
+   observed by polling — handle them as `blocked`. (`failed`, which this list named
+   until task 4829, is not a value the server ever returns; the real one is `error`.)
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
    A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
    snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
    - `status='attached'` on a coalesced submission means the merge is already queued under the
@@ -636,7 +665,16 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    mcp__escalation__merge_status(request_id=...)
    ```
    Back off 15 s → 60 s, using `eta_seconds` as the hint when present. Terminal states:
-   `done | conflict | blocked | already_merged`. After an orchestrator restart,
+   <!-- merge-state-vocab:begin partition=TERMINAL_STATES
+        Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   `done | conflict | blocked | abandoned | superseded`.
+   <!-- merge-state-vocab:end -->
+   (`already_merged`, which this list named until task 4829, is a *submit* status the
+   server collapses to `done` when observed by polling — see step 1 and
+   `escalation/src/escalation/server.py::_map_terminal_state`.)
+   After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
 
 3. **To abandon** a queued entry before it is picked up:
@@ -1001,13 +1039,25 @@ own framing.** The two are different things and the distinction is the whole poi
 - Framing byte-identical to what the record already says is **not** re-recorded, so every entry
   present is a genuine reframing rather than a re-promote echo.
 
-Two counters say what was NOT kept — check them before treating the list as complete:
+A set of counters says what was NOT kept — check them before treating any of these lists as
+complete. Each is a durable record field you can read straight off `get_escalation(id)`, so the
+loss is always assertable from the record rather than being log-only:
 
 - `amendments_truncated > 0` — older entries were shed at the cap (oldest-first). The record's own
   original framing is unaffected; only intermediate reframings were lost.
 - `amendments_chars_elided > 0` — individual fields were long enough to be clipped at the per-field
   cap. Elision is marked in-band (`[... N char(s) elided ...]`), so a field ending in that marker is
   the head of what was submitted, not all of it.
+- `root_cause_variants_truncated > 0` — the oldest distinct **pre-canonical** root-cause spellings
+  were shed at the 20-entry cap (oldest-first). The TRUE distinct count is
+  `len(root_cause_variants) + root_cause_variants_truncated`. Weigh this one heavily: over-folding
+  is the exact failure this set exists to catch, so a non-zero value means the over-fold evidence is
+  under-reported **precisely when there is most of it**.
+- `dedupe_children_truncated > 0` — the oldest **non-head** child ids were shed at the 200-entry
+  cap, which is head-preserving (the first 20 are always kept). The TRUE provenance total is
+  `len(dedupe_children) + dedupe_children_truncated`. `dedupe_count` — the load-bearing recurrence
+  signal — is **not** capped and is unaffected, so a truncated `dedupe_children` never understates
+  how often the cluster recurred, only which ids you can name.
 
 A sustained burst of truncation files its own `info` infra escalation (under the synthetic
 `l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
@@ -1049,9 +1099,20 @@ question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be cl
 last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
 close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
 `root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
-question are indistinguishable. Until task 4377 lands `pin_declared_by` as the machine-readable
-opt-out, the only protection is reading the record and its companions before proposing any
-disposition.
+question are indistinguishable. The machine-readable marker now exists (task 4377): a record whose
+**`pin_declared_by`** is non-empty has been declared load-bearing, and `resolve_issue` refuses
+every non-`park` action on it — and on any L2 whose cascade would close it — with
+`{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so read it
+on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
+`get_escalation`. Read what `pin_declared_by` NAMES and consult it — `acknowledge_declared_pins`
+exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
+check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
+it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
+companions before proposing any disposition remains the protection. Note also who can WRITE the
+marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
+(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
+likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
+appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
 permission a second time to do the bookkeeping on a decision he has already made and that has
@@ -1079,10 +1140,11 @@ esc-3105-5 fails at item 5 and keeps working exactly as it does today.
    enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
    work landed hours ago with the record still open is terminated for this purpose. If it may still
    be running, leave the record and note it.
-5. **The record is NOT a pin.** `pins_recovery` is empty, `root_cause` is not a
-   `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same task.
-   **This is the protection that must not be weakened** — if any of the three is unclear, treat the
-   record as a pin and stop.
+5. **The record is NOT a pin.** `pin_declared_by` is empty, `pins_recovery` is empty, `root_cause`
+   is not a `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same
+   task. **This is the protection that must not be weakened** — if any of the four is unclear, treat
+   the record as a pin and stop. (A non-empty `pin_declared_by` is refused by `resolve_issue`
+   regardless; `acknowledge_declared_pins` is never the answer on this path.)
 6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
    task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
    look sideways before moving on" under "Resolving Escalations" below).
@@ -1104,7 +1166,7 @@ exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing 
 now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
 briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
 — but that session ran out of context before closing the record, so the L2 sat pending with its
-question already answered. `pins_recovery` empty, `root_cause` the substantive
+question already answered. `pin_declared_by` empty, `pins_recovery` empty, `root_cause` the substantive
 `design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
 `esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
 
@@ -1418,6 +1480,13 @@ mcp__escalation__resolve_issue(
 ```
 
 ### C1 — `action` semantics (single source of truth)
+
+Scope: this is `resolve_issue`'s HANDLER-side `action` parameter (`server.py::RESOLVE_ACTIONS`).
+`escalate_blocker`'s *response* also carries an `action` key, but that is an orthogonal
+filer-facing vocabulary (`terminate_cleanly` / `keep_driving`,
+`escalation.models.FILER_ACTIONS`, described in DESIGN.md) which merely shares the key name —
+you never receive one, since this skill resolves escalations and never files them, and none of
+its values may be passed to `resolve_issue`.
 
 | `action` | Record disposition | Live workflow | Task status effect | Intent |
 |---|---|---|---|---|

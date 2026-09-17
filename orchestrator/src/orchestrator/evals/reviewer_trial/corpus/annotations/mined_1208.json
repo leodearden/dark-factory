@@ -32,5 +32,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Clean up post-task-1204 _HAS_ESCALATION artifacts: drop production flag and simplify TestEscalationBinding",
+      "description": "Task 1204 made `Escalation` unconditionally bound (None on ImportError), rendering both `_HAS_ESCALATION` in production code and the importlib.reload-based TestEscalationBinding test redundant. Remove the production flag and replace the reload test with a lighter verification mechanism in one pass.",
+      "test_strategy": "",
+      "details": "FILES_TO_MODIFY:\n  - fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py\n  - fused-memory/tests/reconciliation/test_stage1_stall_detector.py\n\nDETAILS:\nContext: review suggestions on task 1204 (reviewer_comprehensive). Both items are non-blocking cleanup that must be done together \u2014 removing `_HAS_ESCALATION` from production voids the `mod._HAS_ESCALATION is False` assertion at test line 469, which is the very assertion the reload test exists to verify.\n\n**Part A \u2014 Drop `_HAS_ESCALATION` from production code**\n`fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py` lines 64-69:\n- Remove `_HAS_ESCALATION = True` from the try branch.\n- Remove `_HAS_ESCALATION = False` from the except ImportError branch.\n- The import block then reads: try `from escalation.models import Escalation`; except ImportError: `Escalation = None  # type: ignore[assignment,misc]`.\n- Verify no other modules reference `_HAS_ESCALATION` (confirmed none do at time of spawn).\n\n**Part B \u2014 Replace importlib.reload-based TestEscalationBinding with lighter verification**\n`fused-memory/tests/reconciliation/test_stage1_stall_detector.py` lines 425-479:\n- The current class reloads the entire module with a poisoned sys.modules entry and asserts `mod._HAS_ESCALATION is False` (line 469). The reload blast radius is large \u2014 every module-level attribute is rebound.\n- Preferred replacement (option (a) from reviewer):\n  - Add a top-level `assert hasattr(stage1_stall_detector, 'Escalation')` check (catches regressions that drop the binding when the package IS installed in CI).\n  - Add a static/AST check that the `except ImportError` branch in `stage1_stall_detector.py` contains the literal `Escalation = None` assignment (catches the regression even when CI has escalation installed).\n  - Drop the `sys.modules` injection and the documented reload footgun warning from the class docstring.\n- Alternative (option (b)): keep the reload but enforce ordering so this class runs last in the file; document that no module-level patches may rely on stage1_stall_detector being import-stable across this test.\n- Either way, remove the `mod._HAS_ESCALATION is False` assertion at line 469 \u2014 `_HAS_ESCALATION` no longer exists after Part A.\n\nReviewer: reviewer_comprehensive\nSource: post-merge review of task 1204\nSeverity: non-blocking cleanup",
+      "authored": false,
+      "id": "1208",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-10T19:04:47.522233+00:00",
+        "updated_after_merge": false,
+        "run_time_title_matches": false
+      }
+    },
+    "changed_files": [
+      "fused-memory/tests/reconciliation/test_stage1_stall_detector.py"
+    ],
+    "base_sha": "cfd0948ce7a1b13412b7b7e72c36e4a235de17b3",
+    "branch_sha": "0350938c24176e8773c9efbb4c5fbace45dc2633",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "2a3152ce62c9e1885531bf1a434424db9c125387",
+      "merge_base_sha": "cfd0948ce7a1b13412b7b7e72c36e4a235de17b3",
+      "diff_reproduces_from": "git diff cfd0948ce7 2a3152ce62",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

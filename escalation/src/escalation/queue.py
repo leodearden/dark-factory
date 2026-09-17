@@ -25,13 +25,24 @@ from escalation import archive
 from escalation.canonical import canonical_root_cause
 from escalation.classify import classify_resolver_tier, default_resolution_class_for_resolver
 
+# The declared-pin field's normalisation (strip / drop blanks / order-preserving
+# de-dup) is ONE contract with two sides — this writer and the read-side
+# predicate `declared_pins.blocking_pin_declarations`.  Sharing the helper is
+# what keeps them from drifting; declared_pins is a pure leaf (it imports
+# models only under TYPE_CHECKING), so there is no cycle.  Imported under its
+# real, public name for the same reason as `max_severity` below.
+from escalation.declared_pins import normalise_declarers
+
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
 # stay total over (task 3976), so server.py can share it without reaching for a
 # module-private symbol.  Imported under its real, public name: it is a shared
 # cross-module helper, and spelling it `_max_severity` here would signal the
 # opposite at every use site.
 from escalation.models import (
+    PERSIST_CHECK_ABSENT,
+    PERSIST_CHECK_UNREADABLE,
     RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
     Amendment,
     Escalation,
     LateResolution,
@@ -617,17 +628,18 @@ def read_escalation_for_scan(
       caller, where the record would have been filtered out anyway -- an
       archived record is by definition no longer pending -- so warning would
       only train operators to ignore the channel.  For an ARCHIVE-INCLUDING
-      scan it is a deliberate residual, stated plainly rather than implied:
-      ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
-      record relocated root -> ``archive/<date>/`` inside that window is in
-      NEITHER listing and drops out of the result entirely, reported only at
-      DEBUG.  Such a caller (``server.py``'s ``get_task_escalations`` when its
-      caller passes no status, and ``orchestrator.workflow``'s unfiltered
-      ``get_by_task(self.task_id)`` sweeps) can therefore receive a listing
-      that is silently short by one.  Still strictly better than the
-      pre-change crash, and bounded by the race window -- but recovering the
-      record would take a second archive glob after the root pass, which is
-      tracked as a follow-up rather than smuggled in here.
+      scan, ``get_by_task`` globs the archive tier BEFORE the root read loop,
+      so a record relocated root -> ``archive/<date>/`` inside that window is
+      in NEITHER the snapshot taken for the archive tier NOR the still-live
+      root copy at read time.  Task 5118 closes that residual: such a caller
+      (``get_by_task`` with ``status != 'pending'`` -- e.g. ``server.py``'s
+      ``get_task_escalations`` when its caller passes no status, and
+      ``orchestrator.workflow``'s unfiltered ``get_by_task(self.task_id)``
+      sweeps) re-locates the id via a fresh ``_locate_path`` call and retries
+      the read once before giving up on it, so the listing recovers the
+      record instead of silently coming back short by one.  A
+      ``status='pending'`` caller does not get this recovery -- see above,
+      the record would be filtered out on status anyway.
     - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
       The file IS present and something is genuinely wrong.  Logged at
       WARNING, in wording deliberately disjoint from the parse channel's so
@@ -705,12 +717,17 @@ def read_escalation_for_scan(
     ``orchestrator.digest`` and ``fused_memory.reconciliation.harness``
     (``Exception``).
 
-    EXPLICITLY OUT OF SCOPE: ``EscalationQueue.get`` is ``_locate_path``-then-
-    read rather than glob-then-read.  Its blast radius is the single record
-    the caller asked about rather than a whole listing, and the semantically
-    correct repair is re-locate-and-retry -- the record MOVED, it did not
-    vanish -- which is a different shape from "skip and continue".  Tracked as
-    a follow-up.
+    NOT ROUTED THROUGH THIS HELPER: ``EscalationQueue.get`` is
+    ``_locate_path``-then-read rather than glob-then-read.  Its blast radius
+    is the single record the caller asked about rather than a whole listing,
+    and the semantically correct repair is re-locate-and-retry -- the record
+    MOVED, it did not vanish -- which is a different shape from "skip and
+    continue".  Task 5118 implements exactly that repair directly in
+    ``get()`` (a bare ``FileNotFoundError`` catch around its own
+    locate-then-read sequence, retried once via a fresh ``_locate_path``)
+    rather than by routing through this tri-state helper, which exists for
+    glob-then-read listings and would need a different return shape to fit
+    a single-record caller.
 
     DECODE FAULTS follow the caller's ``parse_errors``, by design and not by
     accident.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
@@ -1041,15 +1058,46 @@ class EscalationQueue:
         that same nonexistent id do not re-scan the archive, at the cost of
         a bounded staleness window that clears on this instance's next
         self-archival.
+
+        TOCTOU retry (task 5118): ``_locate_path`` and ``read_text`` are two
+        separate filesystem operations with no lock held across them, so the
+        archive sweep (or a concurrent ``resolve()``) can relocate the record
+        in between -- ``_locate_path`` can return a path that is gone by the
+        time it is read.  That is a MOVE, not a vanish, so a single retry
+        re-locates (a fresh ``_locate_path`` call, which finds the record at
+        its new location via the archive fallback/re-probe logic above) and
+        re-reads before concluding the id is genuinely absent, rather than
+        raising ``FileNotFoundError`` or silently returning ``None`` on the
+        first miss.  This is the per-record case ``read_escalation_for_scan``'s
+        docstring named "EXPLICITLY OUT OF SCOPE" for that helper (this
+        method's blast radius is one record, not a whole listing); it is
+        handled here instead, with the same re-locate-and-retry shape.
         """
-        path = self._locate_path(escalation_id)
-        if path is None:
-            return None
-        try:
-            return Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-            return None
+        for attempt in range(2):
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
+            try:
+                text = path.read_text()
+            except FileNotFoundError:
+                if attempt == 0:
+                    logger.debug(
+                        f'get: {escalation_id} vanished between locate and read '
+                        '(likely concurrent archive-sweep relocation); '
+                        're-locating and retrying'
+                    )
+                    continue
+                logger.debug(
+                    f'get: {escalation_id} still missing after re-locate retry; '
+                    'treating as genuinely absent'
+                )
+                return None
+            try:
+                return Escalation.from_json(text)
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+        return None  # pragma: no cover - loop always returns within 2 attempts
 
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
@@ -1081,6 +1129,32 @@ class EscalationQueue:
         filter.  Note: the pre-scan covers only the paths that are actually
         scanned — when ``status == 'pending'`` the archive is skipped entirely,
         so a cross-tier duplicate is invisible to the pre-scan in that mode.
+
+        Mid-scan relocation recovery (task 5118): the path list above is a
+        snapshot; nothing holds a lock while the read loop below runs it, so
+        the archive sweep can relocate a record between the snapshot and its
+        read.  ``read_escalation_for_scan`` reports that as ``'vanished'``
+        rather than raising.  For an archive-including scan (``status !=
+        'pending'``) that is recoverable — the record MOVED, it did not
+        vanish — so the read loop re-locates it via a fresh ``_locate_path``
+        call and retries the read once before dropping it, instead of
+        silently returning a listing that is short by one.  For
+        ``status == 'pending'`` no recovery is attempted: the archive is
+        skipped by design there, and a record relocated out of the root is by
+        definition no longer pending, so recovering it would only add
+        archive I/O to the fast path for a record the filter would discard
+        anyway.
+
+        Recovery is further gated to a ``'vanished'`` path whose parent is
+        the queue ROOT (the same root/archive tier test the pre-scan above
+        already makes).  An archive-tier path going ``'vanished'`` is
+        overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
+        subdir wholesale — a genuine deletion recovery cannot help with, not
+        the root -> archive move this recovery targets — and re-locating it
+        anyway would cost a full targeted archive rglob (the archive is
+        shared across every project) plus a negative-cache write for an id
+        that is genuinely gone.  This deliberately leaves a second,
+        archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -1123,6 +1197,35 @@ class EscalationQueue:
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
             # distinguishable from a genuinely faulty file (WARNING).
             esc, reason = read_escalation_for_scan(path, context='queue.get_by_task')
+            if reason == 'vanished' and status != 'pending' and path.parent == self.queue_dir:
+                # Task 5118 (follow-up to task 5111's amendment 8): for an
+                # archive-including scan, a record relocated root -> archive
+                # inside this window landed in NEITHER the pre-scan archive
+                # glob above nor this still-a-hit read, so it would otherwise
+                # drop out of the listing silently.  It MOVED, it did not
+                # vanish -- re-locate it fresh and retry the read once before
+                # giving up on it.
+                #
+                # Gated to the ROOT tier (path.parent == self.queue_dir), the
+                # same root/archive test the pre-scan above already uses.
+                # An ARCHIVE-tier path going 'vanished' is overwhelmingly
+                # archive.prune_archive rmtree-ing its whole dated subdir --
+                # a genuine deletion this recovery cannot help with, not the
+                # root -> archive move it targets. Recovering it anyway would
+                # cost a full targeted rglob (archive.py's archive is shared
+                # across every project) plus a negative-cache write for an id
+                # that is genuinely gone. This deliberately leaves a second,
+                # archive-to-archive relocation (e.g. a re-date) unrecovered.
+                relocated = self._locate_path(path.stem)
+                if relocated is not None:
+                    esc, reason = read_escalation_for_scan(
+                        relocated, context='queue.get_by_task (re-glob after vanish)',
+                    )
+                    if reason == 'ok' and esc is not None:
+                        logger.debug(
+                            f'get_by_task: recovered {path.stem!r} via re-glob after '
+                            f'mid-scan relocation from {path} to {relocated}'
+                        )
             # esc is None iff reason != 'ok'; the second clause narrows the
             # type without relying on an assert (stripped under -O).
             if reason != 'ok' or esc is None:
@@ -1327,6 +1430,28 @@ class EscalationQueue:
         members still pending at callback time; they should re-query member state
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
+
+        **Declared pins (task 4377): this method WARNS but never REFUSES.**
+        Closing a record carrying ``pin_declared_by`` logs a WARNING naming the
+        id, every declarer and the reason — an audit line, so an un-gated close
+        is observable from ANY caller rather than silent.  Cascade members are
+        covered for free by the self-recursion below.
+
+        REFUSAL lives one layer up, at the
+        ``escalation/server.py::resolve_issue`` chokepoint, which consults
+        ``escalation/declared_pins.py::blocking_pin_declarations`` as a
+        PRE-FLIGHT over the target plus every member.  Two mechanical reasons
+        it cannot live here: (i) this method archives the L2 head BEFORE it
+        cascades, so a refusal discovered per-member could only ever produce a
+        half-closed cluster — head archived, members still pending — which is
+        worse than either outcome; and (ii) ``resolve()`` returns
+        ``Escalation | None``, so a refusal is indistinguishable from "not
+        found" unless it raises, and most in-repo callers (harness
+        self-clearing sentinels, workflow.py / steward.py L0 teardown,
+        ``dismiss_all_pending``) wrap this call in a best-effort ``try/except``
+        — a raise would be swallowed into a silent no-op, turning a protection
+        into an invisible one and potentially wedging a sentinel auto-clearing
+        a record it filed itself.
         """
         if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
             raise ValueError(
@@ -1398,6 +1523,18 @@ class EscalationQueue:
             self._archive_resolved(escalation_id, esc.resolved_at)
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
+
+        # Declared-pin AUDIT LINE (task 4377) — see the "Declared pins" section
+        # of this docstring.  Because resolve() recurses into itself for each L2
+        # member below, cascade members are covered by this same line with no
+        # extra code — which matters, since the cascade is the path that spent
+        # the mu-gate specimen on 2026-08-08.
+        if esc.pin_declared_by:
+            logger.warning(
+                'Escalation %s closed (%s) despite a DECLARED PIN — declared_by=%s reason=%r. '
+                'An open escalation preserves its subject task; this close may have spent it.',
+                escalation_id, esc.status, ', '.join(esc.pin_declared_by), esc.pin_declared_reason,
+            )
 
         if self._resolve_callback:
             try:
@@ -2184,6 +2321,95 @@ class EscalationQueue:
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
 
+    def declare_pin(
+        self, escalation_id: str, *, declared_by: list[str], reason: str = '',
+    ) -> Escalation | None:
+        """Declare that something outside the escalation store RELIES on this
+        record staying OPEN (task 4377).
+
+        NOT a triage-class annotation, despite the shared shape.  ``stamp_triage``
+        records that a watcher looked at a record; this CHANGES WHAT A RESOLVER
+        MAY DO to it — ``escalation/server.py::resolve_issue`` refuses every
+        non-``park`` action on a marked record (via
+        ``escalation/declared_pins.py::blocking_pin_declarations``) unless the
+        caller names its id in ``acknowledge_declared_pins``.  That is why a
+        no-op stamp here returns ``None`` rather than quietly succeeding: a
+        declarer who believes a record is protected when it is not is exactly
+        the failure this marker exists to close.
+
+        *declared_by* names WHAT relies on the record — a deviation notice, an
+        operator gate (``'task-3546-second-deviation-notice'``) — NOT who
+        stamped it.  Entries go through
+        ``escalation/declared_pins.py::normalise_declarers`` (stripped, blanks
+        dropped, de-duplicated order-preservingly) — THE one normalisation, so
+        this writer and the read-side predicate cannot drift — and are then
+        filtered against the entries already on the record before being
+        APPENDED in declaration order.  When nothing
+        survives that normalisation (empty, all-blank, or wholly redundant)
+        this returns ``None`` and writes nothing — including when *reason* was
+        supplied, since a reason with no new declarer changes no protection.
+
+        *reason* is the free-text why, overwritten only when NON-EMPTY — the
+        asymmetric-overwrite contract ``stamp_triage`` establishes for
+        ``triage_note``, so appending a second declarer with no new prose does
+        not silently wipe the recorded rationale.
+
+        **Concurrency contract (sidecar flock).**  Serialized per-id by
+        ``escalation_id_lock``, mirroring ``stamp_triage`` /
+        ``add_members_to_l2`` / ``attach_dedupe_child``.
+
+        Loads the record directly from ``queue_dir/{escalation_id}.json``
+        (queue root ONLY) — deliberately NOT ``self.get()``, which falls back
+        to the archive.  Declaring a dependency on an already-closed record is
+        meaningless, and loading via the archive fallback followed by
+        ``_rewrite`` (which always targets the queue root) would RESURRECT an
+        archived record into the pending pile — the Defect-2 class of bug that
+        motivated task 1498's ``add_members_to_l2`` guard.
+
+        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``.
+        ``add_members_to_l2`` remains the SOLE ``updated_at`` writer, so that
+        signal keeps meaning exactly one thing ("real member append"); the
+        protection here is the loud refusal at resolve time, not a freshness
+        bump (see the task's design decision).
+
+        Returns the updated ``Escalation``, or ``None`` when *escalation_id* is
+        not found in the queue root, fails to parse, is not pending, or when
+        *declared_by* normalises to nothing new.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status != 'pending':
+                return None
+
+            existing = list(esc.pin_declared_by)
+            # Shared normalisation (strip / drop blanks / order-preserving
+            # de-dup), then the write-side-only step: drop entries the record
+            # already carries, so a re-declaration never duplicates one.
+            added = [
+                declarer for declarer in normalise_declarers(declared_by)
+                if declarer not in existing
+            ]
+            if not added:
+                return None
+
+            esc.pin_declared_by = existing + added
+            if reason:
+                esc.pin_declared_reason = reason
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'declare_pin: %s is now declared load-bearing by %s (reason=%r)',
+                escalation_id, ', '.join(added), esc.pin_declared_reason,
+            )
+            return esc
+
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
@@ -2919,26 +3145,48 @@ def observed_submit_response(
     still reported to its filer as 'queued'.  The filer then had no way to
     learn its escalation had been swallowed.
 
+    Task 5368 AMENDS that fix.  3236 left the two degraded branches — a re-read
+    that returns ``None``, and one that raises — returning the historical
+    ``'queued'`` shape, byte-identical to the branch that had actually
+    confirmed the record on disk.  That reintroduced 3236's own failure one
+    case over: a filer whose write never landed was told it had.  This function
+    now NEVER reports write intent as observed state on any branch.
+
     Re-reads the persisted record and returns:
     - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
       the persisted level so a caller that asked for ``level=1`` can confirm
-      it landed);
+      it landed).  ``'queued'`` means, and only means, that the re-read found
+      the record pending on disk;
+    - re-read unavailable → ``{'id', 'status': 'accepted_unpersisted',
+      'persist_check', 'level'}``.  The write was accepted but its durability
+      is UNCONFIRMED, so nothing is guaranteed for L1 or L2 to drain and the
+      caller must keep driving the blocked task rather than standing down;
     - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
       already promises, ``{'id', 'status', 'resolution', 'resolved_by',
-      'level'}``, carrying the record's REAL values.  No new status vocabulary
-      is invented, so no consumer needs updating.
+      'level'}``, carrying the record's REAL values.
 
-    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
-    back to the historical ``'queued'`` response and logs a WARNING rather than
-    raising.  A filing must never be lost to a bookkeeping read — that is the
-    very failure mode being fixed here.
+    ``persist_check`` discriminates the two causes, which are materially
+    different for an operator debugging the outage: ``'absent'`` means nothing
+    for that id is on disk — ``queue.get`` exhausted the queue root, the
+    archive, a targeted archive re-probe AND the TOCTOU re-locate retry, and a
+    path re-probe agrees; ``'unreadable'`` means a read was attempted and
+    yielded no record, so the record's state is unknown rather than known to be
+    missing.  ``get`` answers ``None`` for BOTH — a file it cannot parse is a
+    ``None`` too — which is why the ``None`` branch re-probes instead of
+    assuming absence (``_classify_failed_reread``).  It is a structured field
+    rather than two statuses because the distinction does not change what the
+    caller should do.
+
+    STILL FAIL-OPEN, in the sense that matters: a bookkeeping read never raises
+    at the ladder's front door and never costs the caller its escalation id.
+    What it no longer does is launder an unconfirmed write into a confirmation.
 
     ``fallback_level`` is the level the CALLER wrote (i.e. ``esc.level``).  It
-    is echoed on the two fail-open branches so ``level`` is present on EVERY
+    is echoed on the two unpersisted branches so ``level`` is present on EVERY
     response this function can return: the ``level`` echo is documented as the
     way a caller confirms its requested level landed, and a caller written to
-    that contract must not hit a ``KeyError`` in exactly the degraded case the
-    fail-open exists to survive.  It is a fallback, never an override — when
+    that contract must not hit a ``KeyError`` in exactly the degraded case
+    these branches exist to survive.  It is a fallback, never an override — when
     the re-read succeeds, the PERSISTED level is reported even if it differs
     from what the caller asked for (born-at-L2 severity legitimately overrides
     a requested level=1).
@@ -2954,25 +3202,37 @@ def observed_submit_response(
     from the root — i.e. an O(archive) scan is possible on the submit path in
     exactly the resolve+archive race this targets.  Acceptable at current
     volumes; if it ever shows up in a storm profile (e.g. a 30-task infra
-    fan-out), read ``queue_dir/{id}.json`` directly and treat an absent record
-    as the fail-open 'queued' case — that is already this function's documented
-    behaviour for an unreadable record, though it would forfeit the honest
-    observed-state report for a record archived between submit and re-read.
+    fan-out), read ``queue_dir/{id}.json`` directly — but note that a bare
+    root read cannot tell an archived record from an absent one, so it would
+    report ``'accepted_unpersisted'`` for a record that legitimately landed and
+    was archived between submit and re-read.
     """
     try:
         persisted = queue.get(esc_id)
     except Exception as exc:
-        logger.warning(
-            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+        logger.error(
+            'Post-submit re-read of %s failed (%s); its persistence is '
+            'UNCONFIRMED and it may never reach L1 or L2',
             esc_id, exc,
         )
-        return _fail_open_queued(esc_id, fallback_level)
+        return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_UNREADABLE)
     if persisted is None:
-        logger.warning(
-            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
-            esc_id,
-        )
-        return _fail_open_queued(esc_id, fallback_level)
+        persist_check = _classify_failed_reread(queue, esc_id)
+        if persist_check == PERSIST_CHECK_ABSENT:
+            logger.error(
+                'Post-submit re-read of %s found no record in the queue root or '
+                'the archive; the filing did not persist and will never reach '
+                'L1 or L2',
+                esc_id,
+            )
+        else:
+            logger.error(
+                'Post-submit re-read of %s found a file on disk that yielded no '
+                'record (a torn or corrupt write is the likely cause); its '
+                'persistence is UNCONFIRMED and it may never reach L1 or L2',
+                esc_id,
+            )
+        return _unpersisted_response(esc_id, fallback_level, persist_check)
     if persisted.status == 'pending':
         return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
     logger.warning(
@@ -2989,12 +3249,59 @@ def observed_submit_response(
     }
 
 
-def _fail_open_queued(esc_id: str, fallback_level: int | None) -> dict[str, Any]:
-    """The fail-open 'queued' response, carrying *fallback_level* when known.
+def _classify_failed_reread(queue: EscalationQueue, esc_id: str) -> str:
+    """Why a ``None`` re-read yielded nothing: absent, or present-but-unreadable.
+
+    ``EscalationQueue.get`` answers ``None`` for two materially different
+    reasons.  The record may be nowhere — queue root, archive, the targeted
+    archive re-probe and the TOCTOU re-locate retry all missed.  Or a file for
+    that id IS on disk and yields no record: ``get`` warns and returns ``None``
+    when the JSON will not parse into an ``Escalation``, which is the torn or
+    corrupt write — precisely the "accepted but not durable" failure this
+    response exists to name.  Calling that ``'absent'`` would send an operator
+    hunting for a file that is sitting right there, so the path is re-probed to
+    tell the two apart.
+
+    Cheap by construction: the ``_locate_path`` call ``get`` just made
+    negative-caches a genuinely absent id, so this re-probe is a set hit rather
+    than a second archive scan.
+
+    Uses ``queue._locate_path`` because it is the one thing that answers "is
+    anything on disk for this id" without re-reading the record.  That is an
+    intra-module use of the class this module defines, not a reach into another
+    module's internals.
+    """
+    try:
+        located = queue._locate_path(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit path re-probe of %s failed (%s); reporting its persist '
+            'state as unknown rather than as a confirmed absence',
+            esc_id, exc,
+        )
+        return PERSIST_CHECK_UNREADABLE
+    return PERSIST_CHECK_ABSENT if located is None else PERSIST_CHECK_UNREADABLE
+
+
+def _unpersisted_response(
+    esc_id: str,
+    fallback_level: int | None,
+    persist_check: str,
+) -> dict[str, Any]:
+    """The unconfirmed-persist response, carrying *fallback_level* when known.
+
+    *persist_check* is one of ``models.PERSIST_CHECKS`` — see the
+    ``persist_check`` paragraph in ``observed_submit_response``'s docstring for
+    what each verdict claims.
 
     ``level`` is omitted only when the caller supplied no fallback — legacy
     callers that predate the echo contract — so the key is never fabricated.
     """
+    response = {
+        'id': esc_id,
+        'status': STATUS_ACCEPTED_UNPERSISTED,
+        'persist_check': persist_check,
+    }
     if fallback_level is None:
-        return {'id': esc_id, 'status': 'queued'}
-    return {'id': esc_id, 'status': 'queued', 'level': fallback_level}
+        return response
+    return {**response, 'level': fallback_level}

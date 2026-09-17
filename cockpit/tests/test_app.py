@@ -56,6 +56,173 @@ def _snapshot_tree(base: Path) -> dict[str, tuple[int, bytes]]:
     }
 
 
+def _count_ui_config_writes(monkeypatch) -> list[str | None]:
+    """Record every save_ui_config call app.py makes, delegating to the real one.
+
+    Returns the live list of persisted selected_slug values, newest last.
+    The property under test in TestUIConfigWriteDebounce is a COUNT ("one
+    write per burst", "zero per idle rebuild"), and an mtime/bytes diff via
+    _snapshot_tree cannot tell one write from four when every write carries
+    identical content inside the same mtime granule -- exactly the shape of
+    the repeated-rebuild case. Patching the name in cockpit.app (not in
+    cockpit.ui_config) is what intercepts _persist_ui_config: app.py binds
+    the symbol at import time and resolves it from module globals at call
+    time. Delegating to the real function keeps the on-disk half genuine,
+    so a test can still assert load_ui_config(...).selected_slug.
+    """
+    import cockpit.app as app_module
+    from cockpit.ui_config import save_ui_config as _real
+
+    recorded: list[str | None] = []
+
+    def _counting(cfg, root=None):
+        recorded.append(cfg.selected_slug)
+        _real(cfg, root)
+
+    monkeypatch.setattr(app_module, 'save_ui_config', _counting)
+    return recorded
+
+
+def _debounce_running_records() -> list:
+    """Three RUNNING records with distinct, ascending start_ts (no ties).
+
+    order_sessions sorts within a state rank by oldest start_ts first, so
+    these keep a fixed relative row order however they are delivered to the
+    app -- seeded on disk by _seed_debounce_fleet, or returned straight from
+    an injected _CountingRecordsScanner.
+    """
+    return [
+        _make_record(
+            session_slug=f'debounce-run-{n}',
+            status=sr.Status.RUNNING,
+            start_ts=f'2026-07-07T0{n}:00:00+00:00',
+        )
+        for n in (1, 2, 3)
+    ]
+
+
+def _seed_debounce_fleet(tmp_path: Path) -> list:
+    """Seed one AWAITING_INPUT record plus three RUNNING ones; return the RUNNING records.
+
+    order_sessions ranks AWAITING_INPUT above RUNNING, so the blocked record
+    pins row 0 and the three RUNNING records occupy rows 1..3 in the
+    returned order. Every row index is therefore deterministic, which is
+    what lets TestUIConfigWriteDebounce park a cursor on a known NON-zero
+    row.
+    """
+    sr.write_record(
+        _make_record(session_slug='debounce-blocked', status=sr.Status.AWAITING_INPUT),
+        root=tmp_path,
+    )
+    running = _debounce_running_records()
+    for record in running:
+        sr.write_record(record, root=tmp_path)
+    return running
+
+
+async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, rounds, tag):
+    """Park a NON-row-0 cursor, force *rounds* real table rebuilds under it,
+    and assert the whole run costs exactly ONE cockpit-ui.json write.
+
+    Shared body for TestUIConfigWriteDebounce's two rebuild tests, which
+    differ only in how a rebuild is DRIVEN: *drive* is an async
+    ``(app, pilot)`` callable that lands one rebuild plus the flush a real
+    poll tick would have run. Everything else -- the seeding, the
+    non-zero-index parking, the registry rewrite that defeats the snapshot
+    short-circuit, the observability trick and the assertions -- is
+    identical between them, so it lives here once: a change to
+    registry_reader._SNAPSHOT_FIELDS or to which fields
+    session_table.format_title renders then lands in one place rather than
+    having to be mirrored in two ~90-line bodies.
+
+    *tag* distinguishes the escalation_id/title values each caller writes,
+    so a failure message names the driver it came from.
+
+    The closing ``recorded == [parked.session_slug]`` is itself the
+    non-vacuity guard, because it fails from both sides: a gate that
+    suppressed every write would leave ``[]``, and a write per rebuild would
+    leave one entry per round.
+    """
+    from cockpit.app import CockpitApp
+    from cockpit.panes.detail_pane import DetailPane
+    from cockpit.panes.session_table import SessionTable
+
+    running = _seed_debounce_fleet(tmp_path)
+    parked = running[0]
+
+    app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        table = app.query_one(SessionTable)
+        detail = app.query_one(DetailPane)
+
+        # A non-zero row, so every rebuild's clear() resets the cursor away
+        # from the parked selection before move_cursor restores it --
+        # asserted BEFORE the cursor is moved there.
+        assert table.get_row_index(parked.session_slug) != 0
+        table.move_cursor(row=table.get_row_index(parked.session_slug))
+        await pilot.pause()
+        assert table.highlighted_slug() == parked.session_slug
+
+        # Installed after the parking move, so neither the mount's own
+        # initial RowHighlighted nor the parking one is counted -- the
+        # rebuilds are what's under test.
+        recorded = _count_ui_config_writes(monkeypatch)
+
+        for n in range(1, rounds + 1):
+            escalation_id = f'esc-{tag}-{n}'
+            # `title` and `escalation_id` are both
+            # registry_reader._SNAPSHOT_FIELDS members, so rewriting them
+            # defeats _apply_scan's snapshot-unchanged short-circuit;
+            # status/start_ts stay put so order_sessions keeps the row order
+            # -- and the parked cursor's non-zero index -- fixed across the
+            # rebuild. escalation_id is bumped alongside the title purely so
+            # the rebuild is OBSERVABLE below: session_table.format_title
+            # renders 'role:project#task_id' and ignores record.title, so a
+            # title change alone would show up nowhere and the sanity check
+            # would be vacuous.
+            sr.write_record(
+                _make_record(
+                    session_slug=parked.session_slug,
+                    status=parked.status,
+                    start_ts=parked.start_ts,
+                    title=f'{tag}-title-{n}',
+                    escalation_id=escalation_id,
+                ),
+                root=tmp_path,
+            )
+            await drive(app, pilot)
+
+            # sanity: the rebuild really landed in the UI, so this is not
+            # `rounds` short-circuited no-op refreshes.
+            assert escalation_id in detail.rendered_text
+            assert table.highlighted_slug() == parked.session_slug
+
+        # The first round's flush persists the parked cursor (it IS a real
+        # change against the empty on-disk baseline); every later flush
+        # finds the file already holding that selection.
+        assert recorded == [parked.session_slug]
+
+
+class _NoTempFiles:
+    """Stand-in for cockpit.ui_config's module-global `tempfile`, whose
+    mkstemp always raises -- the shape a full or read-only fleet_root has
+    from save_ui_config's point of view.
+
+    Patched as the NAME `tempfile` in cockpit.ui_config's globals rather
+    than as an attribute of the stdlib module, so the breakage is scoped to
+    the one module under test and every other importer's tempfile is
+    untouched. save_ui_config resolves the name from module globals at call
+    time, so the REAL function still runs and takes its real fail-soft
+    `except OSError` branch: logged, swallowed, returns None, no file
+    created -- exactly what _persist_ui_config sees in production.
+    """
+
+    @staticmethod
+    def mkstemp(*args, **kwargs):
+        raise OSError(28, 'No space left on device')
+
+
 class _BlockingScanner:
     """Fake SessionScanner for TestNonBlockingPoll: pins the exact moment a
     threaded poll scan is in-flight, deterministically and without needing
@@ -485,6 +652,68 @@ class TestSelectedSlugRestore:
             assert table.highlighted_slug() == 'target-1'
 
     @pytest.mark.timeout(10)
+    async def test_a_rebuild_that_moves_the_cursor_persists_the_new_slug_on_the_next_tick(
+        self, tmp_path
+    ):
+        """A hard kill must not restore the operator to a session that is gone.
+
+        The rebuild suppresses its own RowHighlighted reposts (see
+        _rebuild_session_table), so no event reports a cursor move it causes
+        itself; the next poll tick's flush must still persist it. Read back
+        from disk INSIDE the app's lifetime -- after on_unmount the value is
+        written either way, which is exactly the gap this pins.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            async def tick():
+                app._poll_registry()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+            table.move_cursor(row=table.get_row_index('session-b'))
+            await pilot.pause()
+            await tick()
+            assert load_ui_config(tmp_path).selected_slug == 'session-b'
+
+            # session-b exits, so filter_live_sessions drops it from the default
+            # view and the rebuild's cursor lands on a DIFFERENT slug -- a move
+            # no operator made, and no RowHighlighted now reports
+            sr.write_record(
+                _make_record(
+                    session_slug='session-b',
+                    status=sr.Status.EXITED,
+                    start_ts='2026-07-07T00:01:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.highlighted_slug() == 'session-a'
+            assert app._selected_slug == 'session-a'
+            # recorded, not written: the rebuild itself does no I/O
+            assert load_ui_config(tmp_path).selected_slug == 'session-b'
+            await tick()
+            assert load_ui_config(tmp_path).selected_slug == 'session-a'
+
+    @pytest.mark.timeout(10)
     async def test_persisted_slug_that_no_longer_exists_degrades_to_row_zero(self, tmp_path):
         """A session selected before a restart may well have exited by the
         next launch; select_slug returns False rather than raising, so the
@@ -511,6 +740,396 @@ class TestSelectedSlugRestore:
             table = app.query_one(SessionTable)
             assert table.get_row_index('live-2') != 0
             assert table.highlighted_slug() == 'live-1'
+
+
+class TestUIConfigWriteDebounce:
+    """cockpit-ui.json is written on a DEBOUNCED schedule -- a poll tick
+    (CockpitApp._flush_ui_config) plus on_unmount's unconditional final
+    write -- never once per cursor move and never once per table rebuild.
+
+    Before this, on_data_table_row_highlighted called _persist_ui_config
+    directly, so holding an arrow key down over a large session table did a
+    full mkdir + mkstemp + json.dump + os.replace
+    (cockpit/src/cockpit/ui_config.py::save_ui_config) per keypress on the
+    event-loop thread, and CockpitApp._resync_session_detail wrote again
+    whenever a rebuild moved the cursor.
+
+    The gate these tests pin is CockpitApp._selected_slug vs
+    CockpitApp._persisted_selected_slug -- "is the on-disk file stale", not
+    "did the selection change since the last flush" -- so a selection that
+    moves and comes back between ticks nets to no write, whichever seam
+    recorded it.
+
+    The round trip these tests must not break is proven next door:
+    TestSelectedSlugRestore (a selection survives a remount) and
+    TestWriteDiscipline (cockpit-ui.json is still created, and is still the
+    ONLY file the cockpit writes). Both stay green because on_unmount's
+    write remains unconditional -- see CockpitApp.on_unmount.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_highlight_burst_writes_nothing_until_shutdown(self, tmp_path, monkeypatch):
+        """A burst of cursor moves does ZERO I/O while the app runs; the one
+        write that lands is on_unmount's, carrying the LAST slug."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config, ui_config_path
+
+        running = _seed_debounce_fleet(tmp_path)
+        slugs = [record.session_slug for record in running]
+
+        # A large poll_interval keeps on_mount's own set_interval timer from
+        # firing a flush tick mid-test (the idiom TestNonBlockingPoll and
+        # TestScanBackpressure use), so the ONLY thing that can resolve the
+        # debounce here is the unmount write below.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            # Installed AFTER the mount, so the mount's own initial
+            # RowHighlighted is never counted -- the burst is what's under test.
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            for slug in slugs:
+                table.move_cursor(row=table.get_row_index(slug))
+                await pilot.pause()
+                # sanity: the highlight really fired, so the empty-`recorded`
+                # assertion below is not vacuously true over a still cursor.
+                assert table.highlighted_slug() == slug
+
+            assert recorded == []
+            assert not ui_config_path(tmp_path).exists()
+
+        # Exactly one write for the whole run: on_unmount's unconditional one.
+        assert recorded == [slugs[-1]]
+        # The on-disk half -- localizes a future failure to save-side vs
+        # restore-side, same convention as TestSelectedSlugRestore.
+        assert load_ui_config(tmp_path).selected_slug == slugs[-1]
+
+    @pytest.mark.timeout(10)
+    async def test_rebuild_that_leaves_the_selection_unchanged_writes_once(
+        self, tmp_path, monkeypatch
+    ):
+        """However many rebuilds run under a parked NON-row-0 cursor,
+        exactly ONE write lands -- the flush that first persists the parked
+        cursor -- because every later flush finds the file already holding
+        that selection.
+
+        Each round FLUSHES rather than merely checking that a rebuild does
+        no I/O of its own: SessionTable.replace_rows' clear() resets the
+        cursor to row 0 before move_cursor puts it back, so a rebuild whose
+        cursor events ever reached a selection seam would move the live
+        selection away and back. Only a flush after the rebuild can tell a
+        comparison against what was last PERSISTED apart from a latch keyed
+        on "the slug changed", which that excursion would set.
+
+        This is the DETERMINISTIC variant: refresh_registry() rebuilds
+        in-thread, so a failure here is never a threading artefact.
+        test_rebuild_bearing_poll_ticks_write_once is the same assertion
+        through the real threaded poll path.
+        """
+
+        async def drive(app, pilot):
+            app.refresh_registry()
+            await pilot.pause()
+            # The flush a real poll tick would have run (this variant drives
+            # refresh_registry directly, so it must do it here).
+            app._flush_ui_config()
+
+        await _assert_rebuilds_cost_one_write(
+            tmp_path, monkeypatch, drive=drive, rounds=3, tag='rebuild'
+        )
+
+    @pytest.mark.timeout(10)
+    async def test_rebuild_bearing_poll_ticks_write_once(self, tmp_path, monkeypatch):
+        """The end-to-end busy-fleet case, through the real threaded poll
+        path: a live fleet churns, so most ticks DO rebuild the table (see
+        test_rebuild_that_leaves_the_selection_unchanged_writes_once for
+        the clear()/move_cursor excursion each one makes). Four rebuild-bearing ticks over
+        a selection the operator never touches cost exactly ONE write --
+        the one that persists the parked cursor -- not one per tick.
+
+        Unlike the deterministic variant above, nothing here calls
+        _flush_ui_config by hand: _poll_registry's own flush is what must
+        fire, so this also pins that the debounce resolves on the real
+        timer callback and not only when a test drives it.
+        """
+
+        async def drive(app, pilot):
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        await _assert_rebuilds_cost_one_write(
+            tmp_path, monkeypatch, drive=drive, rounds=4, tag='tick'
+        )
+
+    @pytest.mark.timeout(10)
+    async def test_burst_is_flushed_once_by_the_next_poll_tick(self, tmp_path, monkeypatch):
+        """The debounce resolves on the poll tick: a whole burst of cursor
+        moves collapses into ONE write carrying the LAST slug, and a further
+        tick over an unchanged selection writes nothing more -- so this is a
+        real debounce, not one-write-per-keypress traded for
+        one-write-per-interval forever."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        running = _seed_debounce_fleet(tmp_path)
+        slugs = [record.session_slug for record in running]
+
+        # poll_interval=60 keeps on_mount's own set_interval timer from
+        # firing: every tick in this test is an explicit _poll_registry()
+        # call, which is what makes the write COUNT exact rather than a race
+        # against the wall clock.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            for slug in slugs:
+                table.move_cursor(row=table.get_row_index(slug))
+                await pilot.pause()
+                assert table.highlighted_slug() == slug
+            assert recorded == []  # precondition: the burst is still debounced
+
+            # _poll_registry launches the real threaded scan worker, so drain
+            # it the way TestThreadedScanReachesUI/TestScanBackpressure do.
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == [slugs[-1]]
+            # The on-disk half, asserted while the app is still RUNNING --
+            # this is the timing change: the file now appears at the tick,
+            # not at the keypress.
+            assert load_ui_config(tmp_path).selected_slug == slugs[-1]
+
+            # A second tick with the registry left STATIC -- the simplest
+            # case: _apply_scan's snapshot-unchanged short-circuit means no
+            # rebuild at all. The flush compares the live selection against
+            # the persisted one, so a tick over an unchanged selection
+            # writes nothing. test_rebuild_bearing_poll_ticks_write_once is
+            # the counterpart that keeps the registry CHANGING.
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert recorded == [slugs[-1]]
+
+    @pytest.mark.timeout(10)
+    async def test_a_failed_write_advances_the_baseline_and_is_never_retried(
+        self, tmp_path, monkeypatch
+    ):
+        """A FAILED save still advances _persisted_selected_slug, so the same
+        selection is never retried. That is a deliberate trade-off, pinned
+        here rather than left implicit in _flush_ui_config's docstring.
+
+        cockpit/src/cockpit/ui_config.py::save_ui_config logs and swallows
+        OSError and returns None either way, so _persist_ui_config cannot
+        tell a failed write from a successful one and advances the baseline
+        regardless. The retry CADENCE did materially change when the write
+        left the highlight handler: a persistently unwritable fleet_root
+        used to be retried on every cursor move, and is now retried never.
+        Recovery is by CHANGE -- the next selection makes the two values
+        differ again -- plus on_unmount's one unconditional final attempt,
+        which fails the same way.
+
+        Deliberately not "fixed" by having save_ui_config report success and
+        gating the baseline on it: cockpit-ui.json is fail-soft UI state
+        whose total loss costs the operator one restored cursor position,
+        and a retry loop over a read-only fleet_root would put the
+        synchronous mkstemp back on every single tick -- reintroducing, in
+        the worst case, exactly the per-tick I/O this debounce removed.
+        """
+        from cockpit import ui_config as ui_config_module
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import ui_config_path
+
+        running = _seed_debounce_fleet(tmp_path)
+        parked, moved_to = running[0], running[1]
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            async def tick():
+                app._poll_registry()
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+            table.move_cursor(row=table.get_row_index(parked.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == parked.session_slug
+
+            recorded = _count_ui_config_writes(monkeypatch)
+            # Break the REAL writer from here on. Everything below observes
+            # what production observes when fleet_root cannot be written.
+            monkeypatch.setattr(ui_config_module, 'tempfile', _NoTempFiles)
+
+            await tick()
+            # The flush ran and attempted the write ...
+            assert recorded == [parked.session_slug]
+            # ... the write really failed, fail-soft: no exception reached
+            # the event loop, and no file was created ...
+            assert not ui_config_path(tmp_path).exists()
+            # ... and the baseline advanced anyway ("persisted" means handed
+            # to the writer, not on disk), so further ticks over the same
+            # selection stay silent: no retry.
+            await tick()
+            await tick()
+            assert recorded == [parked.session_slug]
+
+            # Recovery is by change: moving the cursor makes the live
+            # selection differ from the baseline again, so the flush
+            # attempts once more (and fails again, still fail-soft).
+            table.move_cursor(row=table.get_row_index(moved_to.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == moved_to.session_slug
+            await tick()
+            assert recorded == [parked.session_slug, moved_to.session_slug]
+            assert not ui_config_path(tmp_path).exists()
+
+        # on_unmount's unconditional final attempt is the only other write
+        # this selection ever gets, and it fails the same way -- so a
+        # cockpit run over an unwritable fleet_root leaves no file at all
+        # rather than crashing or spinning.
+        assert recorded == [
+            parked.session_slug,
+            moved_to.session_slug,
+            moved_to.session_slug,
+        ]
+        assert not ui_config_path(tmp_path).exists()
+
+    @pytest.mark.timeout(10)
+    async def test_flush_is_not_starved_by_the_scan_backpressure_drop(self, tmp_path, monkeypatch):
+        """Pins that the flush runs BEFORE _poll_registry's
+        `if self._scan_in_flight: return` drop-tick guard.
+
+        In production a full 10k+-session scan (~4.5s, esc-2303-1) routinely
+        outlasts the 1.5s poll interval, so for that scan's whole duration
+        every tick takes the early return. A flush placed after the guard
+        would be starved for as long as scans keep overlapping -- exactly
+        the busy-fleet case where the operator is most likely to be moving
+        the cursor -- and the selection would sit unpersisted until unmount.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        running = _debounce_running_records()
+        parked = running[1]  # row 1: a NON-zero index, so highlighting it fires
+        scanner = _CountingRecordsScanner(running)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # mount's synchronous scan
+            table = app.query_one(SessionTable)
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            assert table.get_row_index(parked.session_slug) != 0
+            table.move_cursor(row=table.get_row_index(parked.session_slug))
+            await pilot.pause()
+            assert table.highlighted_slug() == parked.session_slug
+            assert recorded == []
+
+            calls_before = scanner.calls
+            try:
+                # Stand in for a slow 10k-session scan still running. The
+                # flag is documented main-thread-only, and this file already
+                # drives _poll_registry/_apply_scan/_next_scan_seq directly,
+                # so setting it beats parking a real worker thread that a
+                # failed assertion could leave wedged.
+                app._scan_in_flight = True
+                app._poll_registry()
+                await pilot.pause()
+
+                # The tick really WAS dropped for scanning -- without this
+                # the test could silently degrade into exercising the
+                # ordinary, un-starved path.
+                assert scanner.calls == calls_before
+                # ... and the flush still ran anyway.
+                assert recorded == [parked.session_slug]
+            finally:
+                app._scan_in_flight = False
+
+    @pytest.mark.timeout(10)
+    async def test_mount_over_a_restored_selection_writes_nothing(self, tmp_path, monkeypatch):
+        """Mounting over a cockpit-ui.json whose selection restores verbatim
+        must not rewrite the file with the value just read off it. The flush
+        gate asks "is the on-disk file stale", not "did the selection
+        change", so a successful restore leaves the live selection already
+        equal to the persisted one and the first tick writes nothing."""
+        from cockpit.app import CockpitApp
+        from cockpit.ui_config import CockpitUIConfig, save_ui_config
+
+        running = _seed_debounce_fleet(tmp_path)
+        restored = running[0]
+        save_ui_config(
+            CockpitUIConfig(selected_slug=restored.session_slug, poll_interval=60), tmp_path
+        )
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            # sanity: the restore really happened. Without it this test
+            # would pass over a cockpit that simply landed on row 0 having
+            # never restored anything.
+            assert app._selected_slug == restored.session_slug
+
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == []
+
+    @pytest.mark.timeout(10)
+    async def test_a_stale_restored_selection_is_still_corrected_by_the_first_flush(
+        self, tmp_path, monkeypatch
+    ):
+        """Over-suppression guard.
+
+        Gating on "does the live selection differ from what is on disk" must
+        still CORRECT a cockpit-ui.json naming a session that no longer
+        exists: the restore fails soft onto row 0, which differs from the
+        stale file, so the first flush rewrites it. Over-suppression is the
+        characteristic failure mode of that gate, and this pins it from the
+        opposite side to
+        test_mount_over_a_restored_selection_writes_nothing -- do not
+        "simplify" it away as a duplicate.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
+
+        _seed_debounce_fleet(tmp_path)
+        save_ui_config(CockpitUIConfig(selected_slug='ghost-gone', poll_interval=60), tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            recorded = _count_ui_config_writes(monkeypatch)
+
+            # SessionTable.select_slug catches RowDoesNotExist and returns
+            # False without moving the cursor, so the cursor stays on row 0
+            # -- _seed_debounce_fleet's AWAITING_INPUT record, which
+            # order_sessions ranks above every RUNNING one.
+            assert app._selected_slug == 'debounce-blocked'
+
+            app._poll_registry()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert recorded == ['debounce-blocked']
+            assert load_ui_config(tmp_path).selected_slug == 'debounce-blocked'
 
 
 class TestDecisionQueueRender:
@@ -1526,15 +2145,49 @@ class TestReorderTargetsAreDeduped:
             assert backend.reorder_calls[-1] == [target_a, target_b]
 
 
+class RecordingCopyRunner:
+    """A CockpitApp `copy_runner` double: records each payload, reports a scripted CopyAttempt.
+
+    The seam CockpitApp actually holds is Callable[[str], CopyAttempt] --
+    the app has no business knowing about argv, `which` or $DISPLAY (those
+    are cockpit.clipboard's own injected knobs, exercised at the process
+    boundary in test_clipboard.py). Recording the payload here is what pins
+    the app half of the leaf signal: which text 'y' hands to the clipboard.
+    """
+
+    def __init__(self, attempt=None):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome
+
+        self.payloads: list[str] = []
+        self._attempt = (
+            attempt if attempt is not None else CopyAttempt(CopyOutcome.COPIED, ('xclip',))
+        )
+
+    def __call__(self, text):
+        self.payloads.append(text)
+        return self._attempt
+
+
 class TestCopyAction:
+    """'y' hands the highlighted row's payload to the clipboard seam.
+
+    These tests previously asserted on `app._clipboard`, Textual's private
+    record of the last copy_to_clipboard call -- the false green task 5448
+    re-opened 2517 to fix (cockpit/src/cockpit/clipboard.py's module
+    docstring says why that attribute cannot answer the question). The
+    replacement asserts on the injected seam (here) and on Textual's PUBLIC
+    copy_to_clipboard/notify (TestCopyFallbackAndFeedback below) -- never a
+    private attribute.
+    """
+
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
-        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) copies the
-        highlighted DecisionQueue row's question text + ids onto the system
-        clipboard via Textual's in-app OSC 52 App.copy_to_clipboard --
-        terminal-native, no xclip/wl-copy subprocess -- and is strictly
-        READ-ONLY, never touching sessions/ or decisions/ (mirrors
-        TestWriteDiscipline's before/after _snapshot_tree diff).
+        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) hands the
+        highlighted DecisionQueue row's question text + ids to the system-
+        clipboard seam (cockpit.clipboard::copy_to_system_clipboard in
+        production, a recorder here), and is strictly READ-ONLY, never
+        touching sessions/ or decisions/ (mirrors TestWriteDiscipline's
+        before/after _snapshot_tree diff).
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
@@ -1558,7 +2211,10 @@ class TestCopyAction:
         sr.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1572,11 +2228,12 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            # (a) the row's question + ids landed on the clipboard.
-            assert app._clipboard
-            assert 'Which port do we bind?' in app._clipboard
-            assert 'esc-42' in app._clipboard
-            assert '2517' in app._clipboard
+            # (a) the row's question + ids reached the clipboard seam, once.
+            assert len(copy_runner.payloads) == 1
+            payload = copy_runner.payloads[0]
+            assert 'Which port do we bind?' in payload
+            assert 'esc-42' in payload
+            assert '2517' in payload
 
             # (b) strictly read-only -- no sessions/ or decisions/ write.
             after = _snapshot_tree(tmp_path)
@@ -1584,8 +2241,8 @@ class TestCopyAction:
 
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_session_puts_slug_and_question_on_clipboard(self, tmp_path):
-        """'y' on a SESSION-backed row (no decision behind it) copies the
-        session slug + question text onto the clipboard. Covers the
+        """'y' on a SESSION-backed row (no decision behind it) hands the
+        session slug + question text to the clipboard seam. Covers the
         app-level action_copy -> highlighted SESSION row -> clipboard path
         end-to-end -- the decision-row case above and format_copy_payload's
         own pure-formatter unit tests don't exercise this branch through
@@ -1604,7 +2261,10 @@ class TestCopyAction:
         sr.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1618,10 +2278,11 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            # (a) the session row's question + slug landed on the clipboard.
-            assert app._clipboard
-            assert 'Which region?' in app._clipboard
-            assert 'awaiting-99' in app._clipboard
+            # (a) the session row's question + slug reached the clipboard seam.
+            assert len(copy_runner.payloads) == 1
+            payload = copy_runner.payloads[0]
+            assert 'Which region?' in payload
+            assert 'awaiting-99' in payload
 
             # (b) strictly read-only -- a session is never cockpit-written.
             after = _snapshot_tree(tmp_path)
@@ -1630,16 +2291,19 @@ class TestCopyAction:
     @pytest.mark.timeout(10)
     async def test_copy_with_empty_queue_is_a_fail_soft_no_op(self, tmp_path):
         """'y' against an EMPTY queue -- highlighted_key() returns None,
-        mirroring action_drop/action_defer's own fail-soft guard -- must
-        not crash and must leave the clipboard untouched (reviewer_comprehensive
-        test_coverage suggestion's optional no-highlight/no-op case).
+        mirroring action_drop/action_defer's own fail-soft guard -- must not
+        crash and must never reach the clipboard seam at all (no stray
+        subprocess, no misleading toast for a row that doesn't exist).
         """
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
         backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        copy_runner = RecordingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=backend, poll_interval=0.05, copy_runner=copy_runner
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1648,7 +2312,237 @@ class TestCopyAction:
             await pilot.press('y')
             await pilot.pause()
 
-            assert app._clipboard == ''
+            assert copy_runner.payloads == []
+
+
+class RecordingOsc52:
+    """Spy for Textual's PUBLIC App.copy_to_clipboard -- i.e. the OSC 52 leg.
+
+    A documented public method, replaced on the instance: a
+    collaborator-boundary assertion, not a reach into internals. The
+    attribute it used to set, `app._clipboard`, is precisely what cannot
+    answer "did the escape actually get written, and did it reach a
+    clipboard" -- see TestCopyAction's class docstring.
+    """
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def __call__(self, text):
+        self.texts.append(text)
+
+
+class RecordingNotify:
+    """Spy for Textual's PUBLIC App.notify; records (message, severity, title) per toast.
+
+    Takes **kwargs rather than notify's exact keyword list so a Textual
+    release adding a parameter widens this spy for free. The message is
+    recorded because it is the deliverable: the operator being told what
+    happened and through which mechanism. Its WORDING is pinned once, in
+    test_clipboard.py::TestCopyFeedback; what these tests pin is that
+    action_copy forwards that exact string rather than some other one.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def __call__(self, message, **kwargs):
+        self.calls.append(
+            (message, kwargs.get('severity', 'information'), kwargs.get('title'))
+        )
+
+
+class ExplodingCopyRunner:
+    """A copy_runner that raises: the seam is caller-injectable, so action_copy guards it.
+
+    The bundled copy_to_system_clipboard never raises, but a keypress
+    handler must not depend on that promise being kept by whatever the
+    constructor was handed (PRD §2 -- a view, never a dependency).
+    """
+
+    def __init__(self):
+        self.payloads: list[str] = []
+
+    def __call__(self, text):
+        self.payloads.append(text)
+        raise RuntimeError('clipboard helper exploded')
+
+
+def _write_copyable_decision(tmp_path):
+    """One highlightable decision row, mirroring TestCopyAction's fixture."""
+    decision = sr.DecisionRecord(
+        id='dec-1',
+        project='df',
+        text='Which port do we bind?',
+        filed_at='2026-07-07T00:00:00+00:00',
+        task_id='2517',
+        escalation_id='esc-42',
+    )
+    assert sr.write_decision(decision, root=tmp_path)
+
+
+def _spy_on_clipboard_surface(monkeypatch, app):
+    """Replace Textual's PUBLIC copy_to_clipboard/notify with recorders; return both."""
+    osc52 = RecordingOsc52()
+    notifications = RecordingNotify()
+    monkeypatch.setattr(app, 'copy_to_clipboard', osc52)
+    monkeypatch.setattr(app, 'notify', notifications)
+    return osc52, notifications
+
+
+class TestCopyFallbackAndFeedback:
+    """action_copy's policy: when OSC 52 still runs, and what the operator is told.
+
+    The incident's primary complaint was that 'y' produced no signal in
+    either direction, which is how a total no-op survived a whole task
+    cycle. Both paths now toast, and the toast names the mechanism.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_a_successful_local_copy_skips_osc52_and_toasts_information(
+        self, tmp_path, monkeypatch
+    ):
+        """A local helper took the payload -- no wasted escape write, and a success toast.
+
+        The toast must carry copy_feedback's own message, naming the
+        mechanism that ran: a regression passing the payload (or a message
+        with the helper name dropped) would otherwise leave every test in
+        this class green while telling the operator nothing useful.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        attempt = CopyAttempt(CopyOutcome.COPIED, ('xclip',))
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=RecordingCopyRunner(attempt),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == []
+            assert notifications.calls == [
+                (copy_feedback(attempt).message, 'information', 'Copy')
+            ]
+            assert 'xclip' in notifications.calls[0][0]
+
+    @pytest.mark.timeout(10)
+    async def test_no_local_helper_falls_back_to_osc52_and_warns(self, tmp_path, monkeypatch):
+        """The over-SSH case: the same payload goes out as OSC 52, and the toast says so."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        attempt = CopyAttempt(CopyOutcome.NO_HELPER)
+        copy_runner = RecordingCopyRunner(attempt)
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=copy_runner,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == copy_runner.payloads
+            assert len(notifications.calls) == 1
+            message, severity, _title = notifications.calls[0]
+            assert severity == 'warning'
+            assert message == copy_feedback(attempt).message
+            assert 'OSC 52' in message
+
+    @pytest.mark.timeout(10)
+    async def test_a_raising_copy_runner_still_falls_back_and_warns(self, tmp_path, monkeypatch):
+        """An exception out of the injected seam must not take the cockpit down.
+
+        The keypress completes, the operator still gets the OSC 52 fallback
+        with the same payload, and the toast reports the failure rather than
+        silently claiming success.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _write_copyable_decision(tmp_path)
+
+        copy_runner = ExplodingCopyRunner()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=copy_runner,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert copy_runner.payloads
+            assert osc52.texts == copy_runner.payloads
+            assert len(notifications.calls) == 1
+            message, severity, _title = notifications.calls[0]
+            assert severity == 'warning'
+            # The guard degrades to a HELPER_FAILED carrying no argv, so the
+            # toast reads as prose rather than naming a helper that never ran.
+            assert message == copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED)).message
+            assert 'OSC 52' in message
+
+    @pytest.mark.timeout(10)
+    async def test_empty_queue_neither_falls_back_nor_toasts(self, tmp_path, monkeypatch):
+        """No highlighted row: nothing was copied, so there is nothing to say about it."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=0.05,
+            copy_runner=RecordingCopyRunner(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one(DecisionQueue).row_count == 0
+
+            osc52, notifications = _spy_on_clipboard_surface(monkeypatch, app)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert osc52.texts == []
+            assert notifications.calls == []
 
 
 class TestDeferResetsAge:
@@ -2867,15 +3761,17 @@ class TestRefreshWriteDiscipline:
         # Scoped to sessions/decisions -- unlike TestWriteDiscipline/
         # TestDeferResetsAge's whole-lifecycle before/after (taken pre-mount,
         # before cockpit-ui.json exists at all), this test's "before" is
-        # taken mid-lifecycle, after cockpit-ui.json already exists (from
-        # on_mount's own initial refresh_registry() call). cockpit-ui.json
-        # is the cockpit's own sanctioned, unconditional write target (PRD
-        # §2/§5) and may legitimately be rewritten by a table rebuild's
-        # RowHighlighted repost (see session_table.py) on every tick --
-        # that's a pre-existing C5a behavior this test doesn't police. The
-        # invariant under test here is narrower and exactly what step-25
-        # specifies: zero sessions/ or decisions/ writes from the automatic
-        # refresh/diff path.
+        # taken mid-lifecycle and may or may not already include
+        # cockpit-ui.json: the debounced flush writes it on a poll tick
+        # (CockpitApp._flush_ui_config), so with poll_interval=0.05 whether
+        # a tick has fired by then is not pinned here. It does not matter,
+        # because cockpit-ui.json is the cockpit's own sanctioned write
+        # target (PRD §2/§5) and this test does not police it either way; a
+        # table rebuild never rewrites it, which TestUIConfigWriteDebounce::
+        # test_rebuild_that_leaves_the_selection_unchanged_writes_once
+        # polices. The invariant under test here is narrower and exactly what
+        # step-25 specifies: zero sessions/ or decisions/ writes from the
+        # automatic refresh/diff path.
         for path, value in before.items():
             if path.startswith(('sessions/', 'decisions/')):
                 assert after.get(path) == value, (
@@ -3030,6 +3926,29 @@ class _RaisingThenOkScanner:
         return []
 
 
+class _CountingRecordsScanner:
+    """Fake SessionScanner for TestUIConfigWriteDebounce's starvation case:
+    counts scan() calls and returns a fixed record list.
+
+    Unlike _BlockingCountingScanner above it never blocks and needs no
+    mount-call carve-out, because that test simulates an in-flight scan by
+    setting the documented main-thread-only _scan_in_flight flag directly
+    rather than by actually holding one -- the property under test there is
+    purely _poll_registry's statement ORDER relative to that flag, nothing
+    about threads. `calls` is what proves the tick really was dropped for
+    scanning, so the test cannot silently degrade into exercising the
+    ordinary path.
+    """
+
+    def __init__(self, records: list) -> None:
+        self.records = records
+        self.calls = 0
+
+    def scan(self) -> list:
+        self.calls += 1
+        return list(self.records)
+
+
 class TestScanBackpressure:
     """C10 tour F1 / esc-2303-1 follow-through: _scan_in_flight (step-12)
     drops an overlapping poll tick instead of piling up worker threads --
@@ -3172,3 +4091,611 @@ class TestStaleScanSequenceGuard:
             await pilot.pause()
 
             assert recorded_seqs == [issued]
+
+
+class TestDecisionQueueDetail:
+    @pytest.mark.timeout(10)
+    async def test_highlighting_a_decision_row_renders_its_full_question(self, tmp_path):
+        """The task's whole signal: a decision's question is truncated to 60 chars
+        in its queue row, so the detail pane is the only place it can be read in
+        full -- and syncing it there must not disturb the session table's own
+        detail sync or the selected-slug restore seam.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        # Two RUNNING sessions: neither joins the queue (order_queue takes
+        # awaiting-input ones only), and the older start_ts takes session-table
+        # row 0, so moving to session-target is a real move -- a move onto the
+        # already-highlighted row posts no RowHighlighted at all.
+        other_session = _make_record(
+            session_slug='session-other', start_ts='2026-07-07T00:00:00+00:00'
+        )
+        target_session = _make_record(
+            session_slug='session-target',
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7001',
+            escalation_id='esc-7001-1',
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for record in (other_session, target_session):
+            sr.write_record(record, root=tmp_path)
+
+        # dec-first outscores the target (manual_boost, TestDecisionQueueRender's
+        # own idiom) so the target is NOT the row highlighted at mount -- a move
+        # onto the already-highlighted row posts no RowHighlighted, which would
+        # make the assertion below vacuous.
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        assert len(long_question) > 60
+        first = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        target = sr.DecisionRecord(
+            id='dec-second', project='df', text=long_question,
+            filed_at='2026-07-07T00:00:00+00:00',
+            task_id='5449', escalation_id='esc-5449-2', severity='blocking',
+        )
+        for decision in (first, target):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            detail = app.query_one(DetailPane)
+
+            # (1) the move below is real: the target is not already highlighted
+            assert queue.highlighted_key() != 'decision:dec-second'
+            assert app._selected_slug == 'session-other'
+
+            # the row itself cannot carry the question -- that is the defect
+            assert long_question not in ' '.join(
+                str(cell) for cell in queue.get_row('decision:dec-second')
+            )
+
+            # (2) highlighting the decision row renders its full detail
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+
+            assert long_question in detail.rendered_text
+            assert 'dec-second' in detail.rendered_text
+            assert 'esc-5449-2' in detail.rendered_text
+
+            # (4) the queue move left the session table's restore seam alone
+            assert app._selected_slug == 'session-other'
+
+            # (3) the session table's own sync still works, unclobbered
+            table = app.query_one(SessionTable)
+            table.move_cursor(row=table.get_row_index('session-target'))
+            await pilot.pause()
+
+            assert 'Which port?' in detail.rendered_text
+            assert '7001' in detail.rendered_text
+            assert 'esc-7001-1' in detail.rendered_text
+            assert app._selected_slug == 'session-target'
+
+    @pytest.mark.timeout(10)
+    async def test_highlighting_a_session_queue_row_renders_that_session(self, tmp_path):
+        """The queue mixes decisions and awaiting-input sessions and truncates both
+        row kinds' questions, so both must populate the pane -- one list where some
+        rows fill the pane and others silently don't is worse than either
+        consistent alternative. The queue's session row still must not write
+        _selected_slug: that restore seam is the session TABLE's alone.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+
+        # Both awaiting, so both are queue rows; session-other's older start_ts
+        # takes session-table row 0, so at mount the pane shows session-other and
+        # the queue move below genuinely has to change it.
+        awaiting = _make_record(
+            session_slug='session-awaiting',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7002',
+            question=sr.Question(
+                text='Which host should the worker bind to?',
+                asked_at='2026-07-07T00:01:00+00:00',
+            ),
+        )
+        other_session = _make_record(
+            session_slug='session-other',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:00:00+00:00',
+            task_id='7003',
+            question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for record in (awaiting, other_session):
+            sr.write_record(record, root=tmp_path)
+
+        # outscores the session row, so the session row is not highlighted at mount
+        decision = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            detail = app.query_one(DetailPane)
+
+            # the move is real: neither the queue cursor nor the pane is there yet
+            assert queue.highlighted_key() != 'session:session-awaiting'
+            assert 'Which host should the worker bind to?' not in detail.rendered_text
+            assert app._selected_slug == 'session-other'
+
+            assert queue.select_key('session:session-awaiting')
+            await pilot.pause()
+
+            assert 'Which host should the worker bind to?' in detail.rendered_text
+            assert '7002' in detail.rendered_text
+            assert app._selected_slug == 'session-other'
+
+    @pytest.mark.timeout(10)
+    async def test_a_registry_rebuild_does_not_yank_the_pane_off_a_decision(self, tmp_path):
+        """Without this the fix is invisible on a live fleet: the first changed
+        poll tick reverts the pane to session detail mid-read. A rebuild that
+        shifts the session cursor's INDEX re-posts SessionTable RowHighlighted,
+        and _rebuild_session_table additionally re-syncs the pane itself.
+
+        A rebuild refreshes whichever pane kind currently owns the detail; only
+        an operator cursor move transfers that ownership. The session table's
+        own restore seam stays a function of the session table alone, rebuild
+        or not.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        first = sr.DecisionRecord(
+            id='dec-first', project='df', text='Short one?',
+            filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+        )
+        target = sr.DecisionRecord(
+            id='dec-second', project='df', text=long_question,
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        for decision in (first, target):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+            assert long_question in detail.rendered_text
+            assert table.highlighted_slug() == 'session-a'
+
+            # an awaiting-input session order_sessions ranks first, so the
+            # highlighted session row's INDEX genuinely shifts on rebuild
+            sr.write_record(
+                _make_record(
+                    session_slug='session-new',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-06T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row_index('session-a') != 0
+
+            # (a) the operator is still reading the decision they highlighted
+            assert long_question in detail.rendered_text
+
+            # (b) cockpit-ui.json's restore seam still tracks the session table
+            assert table.highlighted_slug() == 'session-a'
+            assert app._selected_slug == 'session-a'
+
+        assert load_ui_config(tmp_path).selected_slug == 'session-a'
+
+    @pytest.mark.timeout(10)
+    async def test_at_mount_the_pane_shows_the_highlighted_session_not_the_queue(self, tmp_path):
+        """A rebuild is programmatic, so it must never transfer the pane -- and the
+        queue rebuild is a rebuild exactly as the session table's is.
+
+        DecisionQueue.replace_rows does clear() + move_cursor, so it posts
+        RowHighlighted on every rebuild whose highlighted row INDEX shifts --
+        including the very first one, at mount. Left unprevented that hands the
+        pane to the queue before the operator has touched anything, which is both
+        a regression of startup behaviour and of the cockpit-ui.json restore (the
+        restored slug's own repost fires only when its row index changes).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        # the older start_ts takes session-table row 0, so this is the session
+        # whose detail the pane must be showing when the app settles
+        sr.write_record(
+            _make_record(
+                session_slug='session-row0',
+                start_ts='2026-07-07T00:00:00+00:00',
+                question=sr.Question(
+                    text='AAA row-zero session question?', asked_at='2026-07-07T00:00:00+00:00'
+                ),
+            ),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(session_slug='session-other', start_ts='2026-07-07T00:01:00+00:00'),
+            root=tmp_path,
+        )
+        assert sr.write_decision(
+            sr.DecisionRecord(
+                id='dec-low', project='df', text='ZZZ decision question?',
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+            root=tmp_path,
+        )
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            assert table.highlighted_slug() == 'session-row0'
+            assert 'AAA row-zero session question?' in detail.rendered_text
+            assert 'dec-low' not in detail.rendered_text
+            assert 'ZZZ decision question?' not in detail.rendered_text
+
+    @pytest.mark.timeout(10)
+    async def test_a_new_decision_on_a_poll_tick_does_not_steal_the_session_pane(self, tmp_path):
+        """The same hole on the path an operator actually meets it: a decision
+        filed while they read a session row shifts the queue's highlighted INDEX,
+        and the resulting repost yanks the pane out from under them.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        sr.write_record(
+            _make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(
+                session_slug='session-parked',
+                start_ts='2026-07-07T00:01:00+00:00',
+                question=sr.Question(
+                    text='BBB parked session question?', asked_at='2026-07-07T00:01:00+00:00'
+                ),
+            ),
+            root=tmp_path,
+        )
+        assert sr.write_decision(
+            sr.DecisionRecord(
+                id='dec-existing', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+            root=tmp_path,
+        )
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            # park the operator on a session row that is NOT row 0, so the move
+            # is real -- a move onto the already-highlighted row posts nothing
+            assert table.highlighted_slug() == 'session-a'
+            table.move_cursor(row=table.get_row_index('session-parked'))
+            await pilot.pause()
+            assert 'BBB parked session question?' in detail.rendered_text
+
+            # a newly-filed, boosted decision lands ABOVE the existing one, so the
+            # queue's highlighted row index genuinely shifts on the rebuild
+            assert queue.get_row_index('decision:dec-existing') == 0
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id='dec-new', project='df', text='ZZZ brand new decision?',
+                    filed_at='2026-07-07T00:02:00+00:00', manual_boost=9,
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.get_row_index('decision:dec-existing') == 1
+            assert 'BBB parked session question?' in detail.rendered_text
+            assert app._selected_slug == 'session-parked'
+
+    @pytest.mark.timeout(10)
+    async def test_a_queue_session_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
+        """The pane belongs to whichever TABLE last moved, not to whichever record
+        KIND is on screen.
+
+        A queue SESSION row renders through the same show_record path the session
+        table uses, so arbitrating on the rendered KIND hands the pane straight
+        back to the session table's -- different -- highlighted session on the
+        next rebuild. The parked session-table cursor below is load-bearing: a
+        test that leaves both tables pointing at the same session passes for the
+        wrong reason.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        awaiting = _make_record(
+            session_slug='session-awaiting',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts='2026-07-07T00:01:00+00:00',
+            task_id='7002',
+            question=sr.Question(text='QQQ host bind?', asked_at='2026-07-07T00:01:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        sr.write_record(
+            _make_record(
+                session_slug='session-other',
+                start_ts='2026-07-07T00:00:00+00:00',
+                task_id='7003',
+                question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        # outscores the session row, so the queue's session row is not row 0
+        assert sr.write_decision(
+            sr.DecisionRecord(
+                id='dec-first', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            root=tmp_path,
+        )
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            # park the session table on a DIFFERENT session than the queue row
+            table.move_cursor(row=table.get_row_index('session-other'))
+            await pilot.pause()
+            assert app._selected_slug == 'session-other'
+
+            assert queue.select_key('session:session-awaiting')
+            await pilot.pause()
+            assert 'QQQ host bind?' in detail.rendered_text
+
+            # the queue's own row gets FRESH data on a rebuild -- neither stolen
+            # by the session table's cursor nor left stale
+            sr.write_record(
+                _make_record(
+                    session_slug='session-awaiting',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-07T00:01:00+00:00',
+                    task_id='7002',
+                    question=sr.Question(
+                        text='QQQ host bind, REVISED?', asked_at='2026-07-07T00:03:00+00:00'
+                    ),
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'QQQ host bind, REVISED?' in detail.rendered_text
+            assert '7003' not in detail.rendered_text
+            assert app._selected_slug == 'session-other'
+
+    @pytest.mark.timeout(10)
+    async def test_a_queue_decision_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
+        """The decision-row counterpart of the test above, as a regression guard:
+        a session-table reordering must not pull the pane off the queue's
+        highlighted decision either. Already green -- it stays that way.
+
+        Asserted on REVISED text, like its session-row sibling: "the question is
+        still on screen" alone would also pass for a pane re-rendered from a
+        stale self._decisions, since an unchanged question is exactly what a
+        stale render shows.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
+            sr.write_record(
+                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                root=tmp_path,
+            )
+        long_question = (
+            'Should the reaper close this decision against the other escalation '
+            'queue, or leave it open for the watcher to re-file it?'
+        )
+        for decision in (
+            sr.DecisionRecord(
+                id='dec-first', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            sr.DecisionRecord(
+                id='dec-second', project='df', text=long_question,
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+        ):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            assert queue.select_key('decision:dec-second')
+            await pilot.pause()
+            assert long_question in detail.rendered_text
+
+            # an awaiting-input session order_sessions ranks first, so the
+            # highlighted session row's INDEX genuinely shifts on rebuild
+            sr.write_record(
+                _make_record(
+                    session_slug='session-new',
+                    status=sr.Status.AWAITING_INPUT,
+                    start_ts='2026-07-06T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            # the decision itself is rewritten too -- text is a snapshot field
+            # (_DECISION_SNAPSHOT_FIELDS), so this alone would trigger the
+            # rebuild even without the session above
+            revised_question = long_question.replace('re-file it?', 're-file it, REVISED?')
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id='dec-second', project='df', text=revised_question,
+                    filed_at='2026-07-07T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row_index('session-a') != 0
+            # still the queue's decision, and re-rendered from the fresh scan
+            assert revised_question in detail.rendered_text
+            assert long_question not in detail.rendered_text
+
+    @pytest.mark.timeout(10)
+    async def test_the_queue_emptying_hands_the_pane_back_to_the_session_table(self, tmp_path):
+        """A queue-owned pane must not outlive the queue.
+
+        When a watcher resolves the last open decision while the operator is
+        reading it, the queue empties and its highlighted key becomes None. If
+        ownership stayed with the queue, every later session-table rebuild would
+        decline the pane too, leaving the operator staring at a decision that no
+        longer exists with no rebuild able to clear it -- a wedged pane, not a
+        transient miss. So an empty queue releases ownership.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        # session-parked is NOT session-table row 0, so parking on it is a real
+        # cursor move and the fallback render below is a specific session, not
+        # just "whatever was already there".
+        sr.write_record(
+            _make_record(
+                session_slug='session-first',
+                start_ts='2026-07-07T00:00:00+00:00',
+                question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(
+                session_slug='session-parked',
+                start_ts='2026-07-07T00:01:00+00:00',
+                task_id='7004',
+                question=sr.Question(text='PPP parked question?', asked_at='2026-07-07T00:01:00+00:00'),
+            ),
+            root=tmp_path,
+        )
+        # Two decisions, because a move onto the already-highlighted row 0 posts
+        # no RowHighlighted at all -- with one queue row the queue could never
+        # take ownership and this test would pass vacuously.
+        for decision in (
+            sr.DecisionRecord(
+                id='dec-top', project='df', text='Short one?',
+                filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
+            ),
+            sr.DecisionRecord(
+                id='dec-read', project='df', text='ZZZ the decision being read?',
+                filed_at='2026-07-07T00:00:00+00:00',
+            ),
+        ):
+            assert sr.write_decision(decision, root=tmp_path)
+
+        # a large poll_interval keeps on_mount's own timer from racing the
+        # direct refresh_registry() below -- TestPollRefresh's convention
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            table.move_cursor(row=table.get_row_index('session-parked'))
+            await pilot.pause()
+            assert app._selected_slug == 'session-parked'
+
+            assert queue.select_key('decision:dec-read')
+            await pilot.pause()
+            assert 'ZZZ the decision being read?' in detail.rendered_text
+
+            # a watcher answers every open decision -- the queue empties under
+            # the operator's cursor
+            for decision_id in ('dec-top', 'dec-read'):
+                assert sr.update_decision_state(
+                    decision_id, sr.DecisionState.ANSWERED, root=tmp_path
+                )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 0
+            assert 'ZZZ the decision being read?' not in detail.rendered_text
+            assert 'PPP parked question?' in detail.rendered_text
+
+            # and the pane is not merely cleared once: the session table can
+            # reach it again, so a later rebuild still refreshes it
+            sr.write_record(
+                _make_record(
+                    session_slug='session-parked',
+                    start_ts='2026-07-07T00:01:00+00:00',
+                    task_id='7004',
+                    question=sr.Question(
+                        text='PPP parked question, REVISED?', asked_at='2026-07-07T00:03:00+00:00'
+                    ),
+                ),
+                root=tmp_path,
+            )
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'PPP parked question, REVISED?' in detail.rendered_text

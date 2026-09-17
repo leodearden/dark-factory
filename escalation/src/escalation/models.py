@@ -83,6 +83,40 @@ Filing-identity field (default-None; task 3533, populated by task 3550):
               once on `escalation.pins.classify_pins` (normative source:
               spec docs/task-escalation-state-spec.md S6) — do not restate
               them here.
+
+Declared-dependency marker (default-empty; task 4377):
+  pin_declared_by:
+              WHAT outside the escalation store relies on this record
+              staying OPEN — a deviation notice, an operator gate
+              (e.g. 'task-3546-second-deviation-notice') — NOT who stamped
+              it.  A non-empty list is the marker.
+  pin_declared_reason:
+              free-text WHY.  Not itself a marker: a reason with no
+              declarer blocks nothing.
+
+  WHY THIS EXISTS.  An OPEN escalation record is a PRESERVATION MECHANISM
+  for its subject task: `orchestrator/task_ground_truth.py::_RECOVERY` has
+  no row for the pinned shape (IN_PROGRESS, no live claimant, exists
+  off-main, has_open_escalation=True), so it falls through to
+  `RecoveryAction.LEAVE` and the row survives.  CLOSING the record flips
+  that boolean and the same shape recovers to REVERT_TO_PENDING — so a
+  close is a state-changing act on the subject task even under
+  `action='close_only'`, and even a `resume`/`restart`/`abandon` spends
+  the preservation just as completely.  Before this marker nothing at
+  resolve time could tell that a record was deliberately relied upon: on
+  2026-08-08 an L2 cascade close of the homogeneous 11-member cluster
+  esc-3237-5 dismissed esc-3371-2, the only pin preserving mu-gate
+  validation specimen task 3371, and the specimen is permanently gone.
+
+  NOT `escalation.pins.classify_pins`.  That module answers "does this
+  ALREADY-OPEN record veto recovery?" from an automatic severity/level
+  policy — classification AT RECOVERY TIME, and it protects nothing from
+  being CLOSED.  This marker is protection AT RESOLUTION TIME, driven by
+  an explicit declaration; the two are deliberately separate seams.
+
+  SOLE WRITER: `queue.declare_pin`.  Enforcement:
+  `escalation/declared_pins.py::blocking_pin_declarations` consulted by
+  `escalation/server.py::resolve_issue`.
 """
 
 from __future__ import annotations
@@ -252,6 +286,46 @@ class LateResolution(TypedDict):
     resolved_by: str | None               # the incoming resolver attribution
     dismiss: bool                         # whether the incoming call asked to dismiss
     prior_resolution_class: str | None    # the stamp this capture superseded, or None
+
+
+# The instruction `escalate_blocker` appends to its response, telling the FILER
+# what to do next.  NO CODE READS IT — the only consumer is the agent reading
+# the tool result — so the string itself is the whole contract: it is quoted
+# verbatim, as plain prose, by `orchestrator.agents.roles.ESCALATION_LADDER_CORE`
+# (role prompts cannot be f-strings) and by `escalate_blocker`'s tool docstring.
+# A rename would therefore silently decouple the instruction from the response
+# it describes, raising no import error anywhere; these names exist so the
+# prompt's copy can be pinned against the emission site from across the package
+# boundary (orchestrator/tests/test_roles_escalation_ladder.py).
+#
+# NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side `resolve_issue`
+# disposition (resume/restart/park/abandon/close_only).  That is an orthogonal
+# vocabulary which merely shares a key name; the two must not be merged.
+ACTION_TERMINATE_CLEANLY: str = 'terminate_cleanly'   # persistence was observed
+ACTION_KEEP_DRIVING: str = 'keep_driving'             # persistence is unconfirmed
+FILER_ACTIONS: tuple[str, ...] = (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+
+
+# The `status` a filing carries when the write was ACCEPTED but a post-write
+# re-read could not confirm it landed, and the `persist_check` verdict that
+# says why.  Emitted by `escalation.queue.observed_submit_response`.
+#
+# Unlike FILER_ACTIONS above, CODE reads this status, and across a module
+# boundary: `escalate_blocker` compares it to choose which action to append.
+# So a rename at the emission site would leave the comparison matching nothing
+# and hand an agent `terminate_cleanly` on a filing that never landed — the
+# exact defect the status exists to prevent — while raising no import error
+# anywhere.  Naming it is what makes the emit and the compare the same object.
+STATUS_ACCEPTED_UNPERSISTED: str = 'accepted_unpersisted'
+
+# `absent`: nothing for that id is on disk at all.  `unreadable`: a read was
+# attempted and failed, or a file IS on disk that yields no record (a torn or
+# corrupt write) — either way the record's state is unknown rather than known
+# to be missing.  The distinction is for the operator debugging the outage; it
+# never changes what the filer should do.
+PERSIST_CHECK_ABSENT: str = 'absent'
+PERSIST_CHECK_UNREADABLE: str = 'unreadable'
+PERSIST_CHECKS: tuple[str, ...] = (PERSIST_CHECK_ABSENT, PERSIST_CHECK_UNREADABLE)
 
 
 # Severities that cause an escalation to be created directly at L2,
@@ -576,6 +650,35 @@ class Escalation:
     # machine-internal filing bookkeeping, not triage-facing.
     citation_sha: str | None = None
     refiles_suppressed: int = 0
+    # DECLARED-DEPENDENCY MARKER (task 4377) — what makes a load-bearing record
+    # refusable at resolve time.  See the module docstring's field summary for
+    # the load-bearing semantics; the enforcement seam is
+    # `escalation/declared_pins.py::blocking_pin_declarations`, consulted by
+    # `escalation/server.py::resolve_issue` as a pre-flight over the target AND
+    # every cascade member.
+    #
+    # `pin_declared_by` names WHAT outside the escalation store relies on this
+    # record staying OPEN — a deviation notice, an operator gate
+    # (`'task-3546-second-deviation-notice'`, `'esc-3914-1'`) — NOT who stamped
+    # it.  That asymmetry is deliberate and is why the `declare_pin` MCP tool
+    # does not overwrite this from `X-Escalation-Identity` the way
+    # `resolved_by` / `triaged_by` are overwritten: those are WHO-acted
+    # attributions, this is what a closer must go read before spending the pin.
+    # A non-empty list is the marker; `pin_declared_reason` is the free-text
+    # why and is NOT itself a marker (a reason without a declarer blocks
+    # nothing).
+    #
+    # SOLE WRITER: `queue.declare_pin` (append-order, de-duplicating, blanks
+    # dropped).  Zero migration, same pattern as members / evidence /
+    # train_state / the triage quad / granted_files / filing_claimant_run_id /
+    # amendments / root_cause_variants above: legacy JSON without these keys
+    # deserialises to []/'' via the from_dict __dataclass_fields__ filter
+    # below, the empty defaults keep every existing record bit-identical on
+    # disk, to_dict's asdict() serialises them for free, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    pin_declared_by: list[str] = field(default_factory=list)
+    pin_declared_reason: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)

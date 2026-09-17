@@ -30,9 +30,17 @@ from _verify_config_corpus import (
     ROOT_TYPE_CHECK_COMMAND,
 )
 
-from orchestrator import verify
 from orchestrator import verify_plan as verify_plan_module
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import (
+    _FALLBACK_UV_PROJECT,
+    _executed_fallback_plan,
+    _reproject_str,
+    _scope_to_keyword,
+)
+from orchestrator.verify import _is_collectable_test_file as _legacy_is_collectable_test_file
+from orchestrator.verify import _is_conftest as _legacy_is_conftest
+from orchestrator.verify import _is_test_file as _legacy_is_test_file
 from orchestrator.verify_cmd import (
     ToolKind,
     parse_config_command,
@@ -261,15 +269,15 @@ class TestDerivedPredicates:
 
     def test_is_conftest_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_conftest(path) == verify._is_conftest(path), path
+            assert _is_conftest(path) == _legacy_is_conftest(path), path
 
     def test_is_collectable_test_file_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_collectable_test_file(path) == verify._is_collectable_test_file(path), path
+            assert _is_collectable_test_file(path) == _legacy_is_collectable_test_file(path), path
 
     def test_is_test_file_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_test_file(path) == verify._is_test_file(path), path
+            assert _is_test_file(path) == _legacy_is_test_file(path), path
 
     # -- explicit narrow/broad pin against FileKind membership ----------------
 
@@ -1171,7 +1179,7 @@ class TestScoperTrailingClausePreservation:
         byte-identically, still pointed at the whole ``fused-memory/tests``
         directory they assert an invariant over.
         """
-        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
@@ -1187,7 +1195,7 @@ class TestScoperTrailingClausePreservation:
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
         """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
-        scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
@@ -1202,7 +1210,7 @@ class TestScoperTrailingClausePreservation:
         ``scope_to`` if the whole segment were parsed, so truncating at the
         keyword WITHIN the matched segment stays exactly as it was.
         """
-        scoped = verify._scope_to_keyword('ruff check src/ --select E', 'ruff check', ['a.py'])
+        scoped = _scope_to_keyword('ruff check src/ --select E', 'ruff check', ['a.py'])
         assert scoped == 'ruff check a.py'
         assert '--select' not in scoped
 
@@ -1210,7 +1218,7 @@ class TestScoperTrailingClausePreservation:
         'raw', ['mypy src/', 'true'], ids=['opaque-mypy', 'no-op-true'],
     )
     def test_keyword_absent_returns_byte_identical(self, raw):
-        assert verify._scope_to_keyword(raw, 'ruff check', self._FILES) == raw
+        assert _scope_to_keyword(raw, 'ruff check', self._FILES) == raw
 
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
@@ -1227,7 +1235,7 @@ class TestScoperTrailingClausePreservation:
         surviving ``cd ../orchestrator`` would resolve relative to the
         worktree ROOT and escape the repo.
         """
-        scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        scoped = _scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
         assert 'cd ../orchestrator' not in scoped
         assert 'cd ../dashboard' not in scoped
@@ -1252,7 +1260,7 @@ class TestScoperTrailingClausePreservation:
         to equal ``verify._FALLBACK_UV_PROJECT``; the previous bare ``uv run``
         was the depless-workspace-root shape of regression ef68777a17.
         """
-        scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        scoped = _scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run --project shared pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
@@ -1277,7 +1285,7 @@ class TestScoperTrailingClausePreservation:
         pre-existing one. The character-level grouping check must reject
         these, restoring the byte-identical pre-feature output.
         """
-        scoped = verify._scope_to_keyword(raw, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(raw, 'ruff check', self._FILES)
         assert scoped is not None  # `raw` is a str, so the None passthrough is unreachable
         expected = (
             raw
@@ -1303,7 +1311,7 @@ class TestScoperTrailingClausePreservation:
         Both now route through the shared ``split_chain_tail`` gate, so this
         asserts a property that holds by construction.
         """
-        assert verify._scope_to_keyword(raw, keyword, self._FILES) == render(
+        assert _scope_to_keyword(raw, keyword, self._FILES) == render(
             _scope_prefix_to_keyword(raw, keyword, self._FILES)
         )
 
@@ -1365,7 +1373,7 @@ class TestTailPreservationAllowlist:
         string, so what matters there is the string's PARSE, not the scoper's
         internal shape.
         """
-        scoped = verify._scope_to_keyword(raw, 'pytest', self._FILES)
+        scoped = _scope_to_keyword(raw, 'pytest', self._FILES)
         assert scoped is not None
         parsed = parse_config_command(scoped)
         assert parsed.tool is ToolKind.PYTEST
@@ -1377,7 +1385,7 @@ class TestTailPreservationAllowlist:
 
     def test_lint_slot_still_preserves_its_sibling_checker(self):
         """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
-        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped is not None
         assert (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
@@ -1391,7 +1399,7 @@ class TestTailPreservationAllowlist:
     )
     def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
         """The two scopers must agree here too — the gate is shared, so this is structural."""
-        assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
+        assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
             _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         )
 
@@ -1500,7 +1508,7 @@ class TestDroppedChainClausesAreLogged:
         self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
     ):
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
-            result = verify._scope_to_keyword(raw, keyword, self._FILES)
+            result = _scope_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1572,7 +1580,7 @@ class TestDroppedChainClausesAreLogged:
 
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
-            string_result = verify._scope_to_keyword(raw, keyword, self._FILES)
+            string_result = _scope_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify') == []
 
         # Pin the premise the silence rests on: these really do come back with
@@ -1606,7 +1614,7 @@ class TestDroppedChainClausesAreLogged:
     )
     def test_logging_is_the_only_observable_change(self, raw, keyword):
         """Both scopers' returned commands stay byte-identical, and in lockstep."""
-        string_scoped = verify._scope_to_keyword(raw, keyword, self._FILES)
+        string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
         plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
         assert string_scoped == plan_scoped
 
@@ -1652,7 +1660,7 @@ class TestReprojectStrChainTail:
             'uv run ruff check f.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == (
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == (
             'uv run --project shared ruff check f.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
@@ -1679,7 +1687,7 @@ class TestReprojectStrChainTail:
     )
     def test_single_clause_commands_are_byte_identical_goldens(self, raw, expected):
         """No-tail regression corpus: literal goldens, deliberately not derived."""
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == expected
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == expected
 
     @pytest.mark.parametrize(
         'raw',
@@ -1688,10 +1696,10 @@ class TestReprojectStrChainTail:
     )
     def test_gate_reject_cases_still_no_op(self, raw):
         """A cwd-sequenced / subshell fan-out is returned untouched, never truncated."""
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == raw
 
     def test_none_is_passed_through(self):
-        assert verify._reproject_str(None, verify._FALLBACK_UV_PROJECT) is None
+        assert _reproject_str(None, _FALLBACK_UV_PROJECT) is None
 
     # -- cwd-shifting head + preserved tail must bail (task 3061 step-7) -----
 
@@ -1708,7 +1716,7 @@ class TestReprojectStrChainTail:
         no ``--project`` injection to lose.
         """
         raw = 'uv run --directory sub pyright src/ && python3 tools/check.py d'
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == raw
 
     def test_real_module_lint_command_does_not_double_its_own_path(self):
         """The realistic shape: every module ``lint_command`` is this chain.
@@ -1718,7 +1726,7 @@ class TestReprojectStrChainTail:
         — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
         file" -> a spurious RED verify on a clean tree.
         """
-        result = verify._reproject_str(FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        result = _reproject_str(FM_LINT_COMMAND, _FALLBACK_UV_PROJECT)
         assert result == FM_LINT_COMMAND
         assert 'fused-memory/fused-memory' not in (result or '')
 
@@ -1749,7 +1757,7 @@ class TestReprojectStrChainTail:
         the leading ``cd`` they arrived with. What must never happen is the
         rewrite ADDING one under a tail.
         """
-        result = verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT)
+        result = _reproject_str(raw, _FALLBACK_UV_PROJECT)
         assert result is not None
         if '&&' in result:
             assert result.startswith('cd ') == raw.startswith('cd '), (
@@ -1763,8 +1771,8 @@ class TestReprojectStrChainTail:
         head with nothing chained after it, and predates task 3061. Only the
         TAIL case is being fixed, so this golden must not move.
         """
-        assert verify._reproject_str(
-            'uv run --directory sub pyright src/', verify._FALLBACK_UV_PROJECT,
+        assert _reproject_str(
+            'uv run --directory sub pyright src/', _FALLBACK_UV_PROJECT,
         ) == 'cd sub && uv run pyright src/'
 
 
@@ -2472,7 +2480,7 @@ class TestPlanRecordScopedTargets:
             type_check_command='cd orchestrator && npx pyright',
             test_command='cd orchestrator && uv run pytest tests/test_sweep.py',
         )
-        reconciled = verify._executed_fallback_plan(plan, executed)
+        reconciled = _executed_fallback_plan(plan, executed)
 
         for run in reconciled.runs:
             tool = run.reason.split(':')[0]

@@ -853,6 +853,17 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    Since task 3730 (PRD leaf δ) reachability OUTRANKS freshness: a durable
+    transcript archive corroborates a session on its own, so
+    ``freshness_window_secs`` is consulted only when NO archive exists, and
+    ``absolute_resume_age_secs`` is the unconditional backstop that stops that
+    from meaning "no age limit at all". A session past the backstop reports
+    ``aged_out`` — a distinct, by-design reason from ``stale``, because the two
+    are actioned differently: ``stale`` means "old, with no archive to redeem
+    it" (worth asking why the archive is missing) while ``aged_out`` means "old
+    past the point where resuming is safe regardless of reachability" (the
+    backstop working as designed).
+
     ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
     the ``_invoke`` arm site stops rehydrating a missing transcript from the
     durable archive, but eligibility, corroboration and every
@@ -886,7 +897,16 @@ class SessionResumeConfig(BaseModel):
             'harness guard. With this false, an ineligible resume still '
             'degrades to fresh dispatch and still emits its event, so an '
             'operator can disable restoration without going blind on the '
-            'population it was meant to fix. '
+            'population it was meant to fix — the fallbacks carrying '
+            'archive_available=true, which this switch deliberately does NOT '
+            'suppress. '
+            'Since task 3730 (δ) it also withholds the archive from the '
+            'ELIGIBILITY predicate, so pulling it reverts δ in full: an '
+            'archive-only-reachable session falls back with its pre-δ reasons '
+            'instead of being armed for a resume the arm site would then '
+            'refuse to rehydrate — which would have moved that whole '
+            'population from session_resume_fallback to session_resume and '
+            'made D8\'s ratio read 100% resumed while 0% resumed. '
             'Deliberately does NOT consult transcript_archive.enabled, reusing '
             "Harness._archive_available's recorded argument: with archival off "
             'there is simply nothing on disk to find, and gating on the flag '
@@ -905,9 +925,48 @@ class SessionResumeConfig(BaseModel):
             'its data.reasons list — alongside any OTHER reason the same '
             'session failed, since the reasons are reported as a set rather '
             'than a first match (task 3728). '
-            'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
+            'Must be >= 1, and STRICTLY BELOW absolute_resume_age_secs '
+            '(enforced by a model_validator, so an inverted pair fails at load '
+            'and a hot reload that would invert it is rolled back). '
+            'Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
+        ),
+    )
+    absolute_resume_age_secs: int = Field(
+        default=432000,
+        ge=1,
+        description=(
+            'ABSOLUTE outer bound on a recovered sidecar\'s age: past this many '
+            'seconds a session is never resumed, and the fallback event carries '
+            '"aged_out" in its data.reasons (task 3730 / PRD leaf δ, D3). '
+            'DISTINCT FROM freshness_window_secs, and the pair is what keeps '
+            '"a durable archive outranks age" from becoming "no age limit at '
+            'all": freshness applies ONLY when no durable archive exists (D2 — '
+            'an archive does not decay with wall-clock, so age is the wrong '
+            'question for a session that is still reachable), while this '
+            'backstop applies UNCONDITIONALLY, archive or not. It must '
+            'therefore sit STRICTLY ABOVE freshness_window_secs — at or below '
+            'it, the backstop fires first on the no-archive path too and '
+            'freshness becomes unreachable config — which a model_validator '
+            'enforces rather than leaving to the shipped defaults. '
+            'A DERIVED bound, not a chosen number. Two MEASURED terms: the '
+            'longest legitimate in-flight invocation, plus the longest '
+            'observed orchestrator downtime — a sidecar\'s started_at is '
+            'stamped per invocation, so its age when the guard evaluates it is '
+            'in-flight-time-at-crash PLUS however long the orchestrator was '
+            'down before re-dispatching, and the sidecar accrues that age while '
+            'nothing runs. The derivation, the safety factor and its '
+            'measurement provenance live in '
+            'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR; '
+            'orchestrator/tests/test_resume_age_bound.py re-derives it against '
+            'the live runs.db every run and goes red when the fleet outgrows '
+            'it, so this default tracks measured behaviour rather than sitting '
+            'still. Default 432000 (5 days) is the 2026-09-07 requirement '
+            '(355,803s = 4.12 days) rounded up to the next whole day. Must be '
+            '>= 1: a zero or negative bound would reject every recovered '
+            'session and silently disable the feature through a knob that '
+            'reads as a tuning dial.'
         ),
     )
     max_resumes_per_task: int = Field(
@@ -973,6 +1032,40 @@ class SessionResumeConfig(BaseModel):
             'is considered over.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _reject_backstop_at_or_below_freshness(self) -> 'SessionResumeConfig':
+        """The two age thresholds must stay ORDERED, at any operator setting.
+
+        ``freshness_window_secs`` is consulted only on the no-archive path,
+        ``absolute_resume_age_secs`` unconditionally (D2/D3), so the backstop
+        firing first would make freshness dead config: an operator could
+        retune it with no observable effect and no error anywhere, while
+        fallbacks silently switched from 'stale' to 'aged_out'. Equality is
+        rejected for the same reason — at equal values 'stale' can never fire
+        without 'aged_out' beside it, so the knob is still unreachable.
+
+        Enforced HERE rather than only on the shipped defaults because both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable: this is the boundary where the relation can
+        actually be violated. A reload that would invert the pair fails
+        validation and is rolled back whole by ``apply_reload``.
+        """
+        if self.absolute_resume_age_secs <= self.freshness_window_secs:
+            raise ValueError(
+                'SessionResumeConfig.absolute_resume_age_secs '
+                f'({self.absolute_resume_age_secs}s) must be > '
+                f'freshness_window_secs ({self.freshness_window_secs}s); the '
+                'absolute backstop applies unconditionally while freshness '
+                'applies only when no durable archive exists, so a backstop '
+                'at or below the freshness window fires first on the '
+                'no-archive path too and leaves freshness_window_secs '
+                'unreachable config. Raise absolute_resume_age_secs (it is a '
+                'DERIVED bound — see '
+                'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR) '
+                'or lower freshness_window_secs.'
+            )
+        return self
 
 
 class SpeculationProbeConfig(BaseModel):
@@ -2829,6 +2922,9 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
+    # Sticker rate; codex reports no cached-input split, so this prices every
+    # input token at the uncached rate (an upper bound on the true spend).
+    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -5541,10 +5637,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # whole-submodel-group precedent.
     _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
     # Warm-lane session-resume guard (task γ) — a new dedicated submodel, same
-    # whole-submodel-group idiom as routing/chronic_flake above: the kill switch
-    # and all three ge-bounded knobs (freshness_window_secs / max_resumes_per_task
-    # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit.
+    # whole-submodel-group idiom as routing/chronic_flake above: both kill
+    # switches (enabled / restore_from_archive) and all FIVE ge-bounded knobs
+    # (freshness_window_secs / absolute_resume_age_secs / max_resumes_per_task /
+    # fallback_storm_threshold / storm_window_secs) are green-tier
+    # hot-reloadable with no separate RELOADABLE_FIELDS edit. This comment
+    # undercounted at "all three" until task 3730; the enumeration is
+    # documentation only, since _submodel_leaf_paths reads model_fields, but a
+    # count that drifts reads as a checked claim and is not one — the check is
+    # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the

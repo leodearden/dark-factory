@@ -13,11 +13,11 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import aiosqlite
 import httpx
@@ -72,6 +72,7 @@ from dashboard.data.mcp_fanout import (
     TTLCache,
     describe_exc,
     first_success,
+    reap_detached_refreshes,
 )
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
@@ -114,7 +115,14 @@ from dashboard.data.reconciliation import (
 )
 from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
+from dashboard.data.tasks import (
+    _FETCH_TASKS_TTL_SECONDS,
+    DEFAULT_WHOLE_OPERATION_BUDGET,
+    _CompleteRead,
+    _fetch_tasks_cache,
+    _TasksRead,
+    fetch_tasks,
+)
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
@@ -361,6 +369,9 @@ async def _burndown_loop(
 async def _metrics_loop(
     store: _MetricsStore,
     app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot ephemeral system metrics into metrics.db.
 
@@ -368,13 +379,40 @@ async def _metrics_loop(
     files so a stale connection cannot strand the loop. Each sampler in
     collect_metrics_snapshot has its own try/except, so one failed source
     does not poison the others.
+
+    **The binding invariant (task 3771): handles bind to ARGUMENTS, config
+    binds to ``app.state``.** The asymmetry is deliberate, not an oversight.
+
+    ``pool`` and ``http_client`` belong to the caller — the lifespan that
+    created them — and are never re-read from ``app.state``. ``app.state`` is
+    one mutable namespace shared by every lifespan over this ``app``, and an
+    inner lifespan (starlette runs a full lifespan per ``TestClient`` context,
+    and ~15 module-scoped ``TestClient(app)`` fixtures overlap the
+    function-scoped ``client`` fixture) installs its own handles there and does
+    not restore the outer's on exit. A loop re-reading ``app.state`` therefore
+    spends the rest of the outer lifespan polling the inner's *closed* pool and
+    client — silently, since a closed ``DbPool.get()`` returns ``None`` and a
+    closed ``httpx`` client raises into ``_run_once``'s ``except Exception``,
+    surfacing only as a generic 'Metrics snapshot error'. Both are keyword-only
+    and required: an ``app.state`` fallback default would silently reinstate
+    exactly that cross-talk, so a stale call site fails loudly instead.
+
+    ``config``, by contrast, IS re-read from ``app.state`` every cycle **on
+    purpose** — ~25 tests swap ``client.app.state.config`` mid-test and depend
+    on the swap being picked up.
+
+    Accepted residual: an outer lifespan's loop still reads the INNER's config
+    *object* once the inner has run. Both come from ``DashboardConfig.from_env()``
+    under one environment, so they are value-equivalent and carry no
+    closed-handle hazard; removing it would break the swap-ability above.
+
+    Both halves are pinned by ``dashboard/tests/test_lifespan_resource_binding.py``
+    — change either one and a test there fails.
     """
 
     async def _run_once() -> None:
         conn = store.connection
         config: DashboardConfig = app.state.config
-        pool: DbPool = app.state.db
-        http_client: httpx.AsyncClient = app.state.http_client
         recon_db = await pool.get(config.reconciliation_db)
         tickets_db = await pool.get(config.tickets_db)
         merge_dbs = await _project_scoped_dbs_labeled(
@@ -423,25 +461,57 @@ async def _metrics_loop(
 # `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
 # max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
 #
-# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention and stops
-# the client from racing the server's keep-alive close, while letting the
-# concurrency ceiling track the fleet (see the two-dimensions note below). It
-# does NOT fix the CLOSE-WAIT accumulation — that diagnosis is owned by the
-# task-3857 re-spec, and nothing here should be read as addressing it.
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention, while
+# letting the concurrency ceiling track the fleet (see the two-dimensions
+# note below). It does NOT fix the CLOSE-WAIT accumulation — that diagnosis
+# is owned by the task-3857 re-spec, and nothing here should be read as
+# addressing it.
 #
-# keepalive_expiry is derived from the SMALLER of the two server populations
-# the dashboard talks to, because the smaller one binds:
+# For reference, the two server-side keepalive settings the dashboard talks
+# to:
 #   * escalation MCP servers (one per orchestrator, and the target of most of
 #     the fan-out) are served by uvicorn with NO timeout_keep_alive override
 #     — orchestrator/src/orchestrator/harness.py — and uvicorn's default is 5s.
-#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml),
-#     far looser, so 4.0 clears it comfortably too.
-# httpx's own default is exactly 5.0 — a DEAD TIE with the escalation servers'
-# close, i.e. the client considers a connection reusable at precisely the
-# moment the server may close it. 4.0 buys 1s of margin under that close while
-# staying above the ~3s dashboard poll interval (merge_halt.py names a "3s
-# polling loop"), so a connection still survives one poll cycle rather than
-# reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
+#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml).
+#
+# VERIFIED MECHANISM (checked directly against the installed httpx 0.28.1 /
+# httpcore 1.0.9 — re-check after an upgrade). keepalive_expiry is NOT a race
+# against either server-side setting above, and cannot be one, because
+# httpcore evaluates it lazily — only when the pool is next USED, never on a
+# timer:
+#   * has_expired()'s sole pool-side consumer is
+#     httpcore/_async/connection_pool.py::AsyncConnectionPool._assign_requests_to_connections,
+#     whose own docstring says it is "Called whenever a new request is added
+#     or removed from the pool". Nothing in the pool module schedules a
+#     Thread, create_task or call_later — there is no background reaper — so
+#     an expired idle connection is never proactively closed, and this
+#     setting cannot pre-empt a server-side close that happens while the pool
+#     sits idle.
+#   * httpcore/_async/http11.py::HTTP11Connection.has_expired separately
+#     returns True on `server_disconnected` (state IDLE with the socket
+#     already readable) as a term independent of the `now > self._expire_at`
+#     age term this setting controls. The reap that actually matters —
+#     noticing the server already closed — is not gated on keepalive_expiry
+#     at all, which is why arming it at 4.0 vs 5.0 was measured to produce
+#     IDENTICAL behaviour (task-3857 refutation work): on this install the
+#     age term is empirically inert.
+#
+# What keepalive_expiry actually does: it bounds how stale a pooled
+# connection is allowed to be at the moment it is next REUSED — nothing more.
+# A value at or below the dashboard's own ~3s poll interval (merge_halt.py
+# names a "3s polling loop") would defeat pooling outright, since every poll
+# would find its connection already expired and pay a fresh handshake; 4.0
+# stays above that.
+#
+# 4.0 is KEPT here rather than removed, even though no value was ever shown
+# to beat any other: omitting the argument would leave httpx's own stock
+# 5.0 (httpx 0.28.1), which the measurement two paragraphs above found
+# behaviourally IDENTICAL to 4.0 on this install — the other value already
+# shown not to matter, not a looser or unarmed configuration. The explicit
+# 4.0 is retained NOT because any behavioural difference was demonstrated,
+# but to keep the shipped number pinned and reviewable at this call site,
+# and to keep this correction comment-only rather than moving a runtime
+# value.
 _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 
 # TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
@@ -460,14 +530,18 @@ _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 #     dashboard is ever put in front of a larger audience.
 #
 #     _HTTP_MIN_CONNECTIONS is deliberately httpx's own stock max_connections:
-#     for a small install the derived product lands below it, and this change
-#     must never make the pool TIGHTER than what already shipped. Sizing below
-#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
-#     now that the per-call budget also bounds pool acquisition, would render
-#     as an "offline" pill on a perfectly healthy orchestrator. (When that
-#     does happen it is diagnosable: mcp_fanout.describe_exc names the
-#     exception type, so 'PoolTimeout' in the log distinguishes local
-#     saturation from a dead endpoint.)
+#     the derived product (_HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS
+#     * endpoints, i.e. 12 * endpoints) only overtakes this floor at
+#     endpoints >= 9 (12*8=96 < 100; 12*9=108 > 100). Below that threshold
+#     _build_http_limits returns EXACTLY this stock number and the derived
+#     term is inert — a small install gets a floor, not a fleet-scaled bound.
+#     That is deliberate: this change must never make the pool TIGHTER than
+#     what already shipped. Sizing below stock would convert ordinary queueing
+#     into httpx.PoolTimeout — which, now that the per-call budget also bounds
+#     pool acquisition, would render as an "offline" pill on a perfectly
+#     healthy orchestrator. (When that does happen it is diagnosable:
+#     mcp_fanout.describe_exc names the exception type, so 'PoolTimeout' in
+#     the log distinguishes local saturation from a dead endpoint.)
 #
 #   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
 #     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
@@ -484,6 +558,9 @@ _HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
 
 def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
     """Derive the shared client's connection-pool bound from *config*.
+
+    The sizing constants, and the floor-vs-derived crossover they imply, are
+    documented once where they are defined, directly above.
 
     Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
     limits, so a helper is the only way to test the sizing without asserting
@@ -502,6 +579,41 @@ def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
         ),
         keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     )
+
+
+async def _close_each(*closers: Callable[[], Awaitable[object]]) -> None:
+    """Await every *closer* in turn, then re-raise the first failure.
+
+    Independence is the entire point. These are the handles ``lifespan``
+    opened, and one that refuses to close must not take its neighbours with
+    it: the objects at stake are two writable WAL connections and a
+    ``DbPool``, and a stranded one's finaliser queues work onto a by-then
+    closed loop — the ``RuntimeError: Event loop is closed`` class
+    :func:`lifespan` documents. ``AsyncSqliteBase.close`` awaits
+    ``self._conn.close()``, so a raise here is that same incident class, not a
+    hypothetical.
+
+    Sequential rather than ``asyncio.gather``: nothing at shutdown needs the
+    concurrency, and gathering would quietly discard the order these closes
+    are written in.
+
+    ``Exception``, never ``BaseException``, matching
+    :func:`~dashboard.data.mcp_fanout.reap_detached_refreshes`: a
+    ``CancelledError`` here is the shutdown ITSELF being cancelled, and
+    carrying on through it would make teardown unkillable. Every failure is
+    logged and the first also propagates, for the reason ``lifespan`` lets a
+    failing reap propagate — a close that fails is a real defect, and out of
+    shutdown is its only route to an operator.
+    """
+    failures: list[Exception] = []
+    for closer in closers:
+        try:
+            await closer()
+        except Exception as exc:
+            logger.exception('shutdown close failed')
+            failures.append(exc)
+    if failures:
+        raise failures[0]
 
 
 @asynccontextmanager
@@ -524,14 +636,50 @@ async def lifespan(app: FastAPI):
     and pytest blames whichever unrelated test is running at that instant.
     ``app.state`` stays assigned for request handlers and for tests that swap
     ``app.state.config``; it is simply not the shutdown path's source of truth.
+
+    **Startup binds to locals for the same reason (task 3771).** ``config``,
+    ``pool`` and ``http_client`` are captured here and used directly, rather
+    than read back off ``app.state`` further down. Read-back was not merely
+    untidy: startup assigns ``app.state.config`` and then ``await``\\ s
+    ``burndown_store.open()`` before the reads that consume it, and across that
+    suspension point an interleaving lifespan can install its own config — so
+    this lifespan would wire its stores and loops to a config it never built.
+    ``app.state`` assignment is retained purely for request handlers (which
+    read ``request.app.state.config``) and for the tests that swap it.
+    ``_metrics_loop``'s docstring above states the resulting invariant in full;
+    ``dashboard/tests/test_lifespan_resource_binding.py`` pins it.
+
+    **Shutdown also reaps detached cache refreshes**, which are the one thing
+    it ends that this lifespan did not open.  ``TTLCache`` instances are
+    module-level and so process-global: a bypass refresh abandoned by its
+    caller (``TTLCache._start_bypass``) is deliberately never cancelled while
+    the process runs, because a late store still heals the key for whoever
+    asks next.  No one asks next after shutdown, while the task still pins a
+    connection on the ``http_client`` closed below — and, the caches being
+    global, it outlives this app into the next one.  See
+    ``TTLCache.cancel_live_bypasses`` for why that reap is scoped to the
+    running event loop.
+
+    **Whatever else shutdown does, the resources this lifespan OPENED are
+    closed on every exit path** — one where a teardown step above them raises,
+    and equally one where an earlier CLOSE raises, which is why they go
+    through :func:`_close_each` rather than standing as a flat sequence.  The
+    objects at stake are the two writable WAL connections and the ``DbPool``
+    above: strand one and its finaliser queues work onto a by-then-closed
+    loop, the same ``RuntimeError`` this docstring already describes — so a
+    failure anywhere in teardown must not be able to cause the very condition
+    teardown exists to prevent.  Such a failure still propagates: a reap or a
+    close that raises is a real defect, and out of shutdown is its only route
+    to an operator.
     """
     # Config first: the shared client's pool bound is DERIVED from it (see
     # _build_http_limits above). DashboardConfig.from_env() has no dependency
     # on the client, so evaluating it first is safe.
-    app.state.config = DashboardConfig.from_env()
+    config = DashboardConfig.from_env()
+    app.state.config = config
     http_client = httpx.AsyncClient(
         follow_redirects=True,
-        limits=_build_http_limits(app.state.config),
+        limits=_build_http_limits(config),
     )
     app.state.http_client = http_client
     pool = DbPool()
@@ -539,37 +687,50 @@ async def lifespan(app: FastAPI):
     app.state.start_time = time.monotonic()
 
     # Burndown snapshot collector (writable WAL connection with full durability triad).
-    burndown_path = app.state.config.burndown_db
+    burndown_path = config.burndown_db
     burndown_store = _BurndownStore(burndown_path, busy_timeout_ms=5000)
     await burndown_store.open()
     app.state.burndown_store = burndown_store
     collector_task = asyncio.create_task(
         _burndown_loop(
             burndown_store,
-            app.state.config,
+            config,
             http_client,
         )
     )
 
     # Metrics snapshot collector (separate WAL writer with full durability triad).
-    metrics_path = app.state.config.metrics_db
+    metrics_path = config.metrics_db
     metrics_store = _MetricsStore(metrics_path, busy_timeout_ms=5000)
     await metrics_store.open()
     app.state.metrics_store = metrics_store
     app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
-    metrics_task = asyncio.create_task(_metrics_loop(metrics_store, app))
+    metrics_task = asyncio.create_task(
+        _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
+    )
 
     yield
 
-    for task in (collector_task, metrics_task):
-        task.cancel()
-    for task in (collector_task, metrics_task):
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    await burndown_store.close()
-    await metrics_store.close()
-    await pool.close_all()
-    await http_client.aclose()
+    try:
+        for task in (collector_task, metrics_task):
+            task.cancel()
+        for task in (collector_task, metrics_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        # After the loops above, so THIS app's two pollers cannot enqueue a
+        # fresh refresh behind the reaper; before http_client.aclose() below,
+        # so a cancelled refresh unwinds into a pool that still exists. One
+        # pass over a snapshot, not a barrier: any other caller still in
+        # flight can start a bypass behind it, which is the ordinary
+        # abandon-don't-cancel leak this reap narrows rather than abolishes.
+        await reap_detached_refreshes()
+    finally:
+        await _close_each(
+            burndown_store.close,
+            metrics_store.close,
+            pool.close_all,
+            http_client.aclose,
+        )
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
@@ -607,6 +768,53 @@ _DB_PROBE_TIMEOUT = 0.9
 # verdict is actually deliverable to that caller instead of arriving behind it
 # (measured before this budget existed: 503 delivered at 50.6s).
 _HEALTHZ_TOTAL_BUDGET = 3.0
+
+# Per-request budget for the DATA-PLANE (MCP fan-out) probe. Invariant
+# (machine-checked by test_healthz_data_plane_budget_is_structurally_deliverable):
+#   _DB_PROBE_TIMEOUT * len(_healthz_db_targets(...)) + _MCP_PROBE_TIMEOUT
+#     <= _HEALTHZ_TOTAL_BUDGET
+#   0.9 * 3 + 0.2 = 2.9 <= 3.0, leaving 0.1s of slack.
+#
+# NOTHING WAS WIDENED to make room: _DB_PROBE_TIMEOUT and _HEALTHZ_TOTAL_BUDGET
+# are untouched. 0.2s is sufficient precisely BECAUSE the probe never needs to
+# see a healthy fetch FINISH -- it either finds warmth or grace for free, or it
+# leaves a background task running for the NEXT /healthz to observe. See
+# _probe_mcp_fanout.
+_MCP_PROBE_TIMEOUT = 0.2
+
+# How long a single observed fan-out COMPLETION answers for.
+#
+# Must be at least one ``tasks._FETCH_TASKS_TTL_SECONDS`` (20.0) wide: the warm
+# signal below goes stale every TTL by construction, so a grace narrower than
+# the TTL would let an ordinary expiry between two 3s browser polls read as a
+# wedge. 30.0 gives 1.5 TTLs, which also absorbs the journal's routine ~2.0s
+# ReadTimeout/recovered cycles against localhost:8002 without flipping the
+# verdict.
+_MCP_FANOUT_OK_GRACE_SECONDS = 30.0
+
+# How long a LIVE probe may be outstanding before it is reported as a wedge.
+#
+# WHAT THIS CLOSES, and why it is not a widening of anything. Nothing
+# SERVER-side refreshes the primary root's full-tree cache key: the only
+# steady-state writer is the browser's 3 s
+# ``/api/v2/dashboard/orchestrators`` poll. On an UNATTENDED dashboard the
+# warm signal (one TTL) and the grace (30.0 s) therefore BOTH lapse, so
+# without this bound every later /healthz would launch a probe it cannot
+# possibly observe inside a 0.2 s budget and report ``'timeout'`` — a strict
+# 503/200 alternation on an idle but perfectly healthy dashboard, which is a
+# false alarm on the very signal this check adds.
+#
+# So a probe that is merely YOUNG reports ``'probing'``, not ``'timeout'``: a
+# fan-out started a moment ago has demonstrated nothing yet, and saying
+# otherwise is the same unknown-reported-as-fact the ``degraded`` vs
+# ``offline`` split exists to prevent. Once a probe has been outstanding for a
+# WHOLE TTL without landing it is no longer young — a healthy cold fetch of
+# the largest measured tree costs ~6 s — and the wedge is reported for as long
+# as it lasts, which is the 19.8 h fact nothing reported.
+#
+# Bound to the TTL BY REFERENCE rather than restated: the window this must
+# outlast is exactly the one a stored value is trusted for.
+_MCP_PROBE_OUTSTANDING_LIMIT = _FETCH_TASKS_TTL_SECONDS
 
 
 def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
@@ -718,6 +926,201 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         return 'error'
 
 
+# --- Data-plane probe state (task 4884 / #4790) ------------------------------
+#
+# The single-flight probe, and the loop time at which a fan-out last
+# COMPLETED. Module state rather than app.state because /healthz is the only
+# reader and a test hook resets both; _mcp_probe_state_clear mirrors
+# _task_cards_cache_clear.
+
+
+class _LiveProbe(NamedTuple):
+    """The in-flight fan-out probe task, paired with WHEN it was started.
+
+    One value rather than two globals because the two must move together: a
+    start instant is only meaningful for the task it belongs to, so a clear
+    that forgot the timestamp would date the NEXT probe from the previous
+    one's launch and report a brand-new probe as a wedge.
+    """
+
+    task: asyncio.Task
+    started_at: float
+
+
+_mcp_probe: _LiveProbe | None = None
+_mcp_fanout_last_ok: float | None = None
+
+# Strong references to live probe tasks. The event loop holds only a WEAK
+# reference to a Task, so an unreferenced one can be garbage-collected
+# mid-flight -- the same hazard _ABANDONED_PROBES exists for, and track_task's
+# done-callback removes the entry when it ends.
+_MCP_PROBES: set[asyncio.Task] = set()
+
+
+def _mcp_probe_state_clear() -> None:
+    """Test hook: forget the grace stamp and abandon any live probe task.
+
+    Deliberately DOES cancel, unlike budget expiry (see _probe_mcp_fanout): a
+    test hook's job is to leave no cross-test state behind, whereas expiry's
+    whole point is that the task keeps running for the next call to observe.
+    """
+    global _mcp_probe, _mcp_fanout_last_ok
+    live = _mcp_probe
+    _mcp_probe = None
+    _mcp_fanout_last_ok = None
+    if live is not None and not (task := live.task).done():
+        # Fire-and-forget: track_task already holds the strong reference and
+        # consumes the exception, so do NOT await the unwinding here.
+        task.cancel()
+
+
+async def _fanout_probe_completion(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> float:
+    """Run ONE fan-out fetch; return the loop time at which it COMPLETED.
+
+    Stamping the instant INSIDE the task is what makes
+    ``_MCP_FANOUT_OK_GRACE_SECONDS`` mean what its name says. Nothing consumes
+    a finished probe until the next /healthz happens to run, which can be a
+    watchdog tick — or minutes — later; dating the grace from that OBSERVATION
+    would hand a full fresh window to a fan-out that finished long ago, and so
+    mask a wedge that began in between. The two readings diverge in precisely
+    the case this probe exists to catch.
+    """
+    await fetch_tasks(client, config, config.project_root)
+    return asyncio.get_running_loop().time()
+
+
+async def _probe_mcp_fanout(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    budget: float,
+) -> str:
+    """Probe whether a caller can traverse the MCP fan-out, inside *budget*.
+
+    Returns 'ok' | 'probing' | 'timeout' | 'error', extending
+    :func:`_probe_db`'s verdict-string contract by one value. Never raises for
+    a data-plane failure.
+
+    THE LOAD-BEARING RULE, in the same voice as _probe_db's: ``'timeout'``
+    means the FAN-OUT PATH could not be traversed inside the budget. It is NOT
+    a claim about fused-memory's reachability, and it is NOT a claim that a
+    fetch failed. ``'probing'`` is the fourth value and means strictly less
+    than any of them: a fan-out is in flight and has not yet demonstrated
+    anything either way. It does not flip the verdict, exactly as _probe_db's
+    ``'unavailable'`` does not.
+
+    Both of the obvious probes are wrong, and the 2026-08-27 incident is what
+    proves it. fused-memory was REACHABLE for all 19.8 hours of that wedge --
+    /api/v2/dashboard/{memory,scheduler} served fine from the same MCP server
+    over the same shared httpx client -- so a probe keyed on reachability would
+    have reported healthy throughout, which is exactly the blind spot this
+    closes. Conversely a probe keyed on the fetch SUCCEEDING false-alarms: the
+    journal's routine ReadTimeout/recovered cycles return the
+    ``{'offline': True, ...}`` marker after ~2.0s, longer than any budget that
+    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH the
+    cache in front of the substrate, inside a bound" separates the two, and
+    that is the property the incident actually violated. So a COMPLETED
+    fan-out is 'ok' whatever it returned, the offline marker included.
+
+    Three signals, cheapest first:
+
+    1. WARM -- a fresh entry in ``tasks._fetch_tasks_cache`` for the routes'
+       own key. Free, and conclusive: a stored value proves a refresh COMPLETED
+       inside the TTL. ``get_or_refresh``'s own docstring records that during
+       the incident "nothing was ever stored for the wedged key", which is why
+       this is the right signal rather than a proxy for one. With the browser
+       polling every 3s this is the steady state, so /healthz normally costs
+       ZERO MCP calls.
+    2. GRACE -- a fan-out completion observed within
+       _MCP_FANOUT_OK_GRACE_SECONDS. This is what keeps an occasional 2.0s
+       ReadTimeout, or one expired cache entry between polls, from flipping the
+       verdict.
+    3. PROBE -- start, or JOIN if one is already live, a single-flight
+       background ``fetch_tasks`` and wait at most *budget* using
+       ``asyncio.wait({task}, timeout=...)`` (NOT ``wait_for``, which awaits
+       the cancelled operation's unwinding -- the same reason _probe_db uses
+       this idiom).
+
+    The task is NOT cancelled on expiry and NOT relaunched while live. That is
+    what makes the two cases distinguishable at all: a healthy-but-COLD system
+    reports 'probing' while its background fetch runs (~6s worst case) and
+    'ok' from the moment it lands; a WEDGED key never lands, so once the probe
+    has been outstanding for _MCP_PROBE_OUTSTANDING_LIMIT the verdict becomes
+    'timeout' and STAYS there -- which is precisely the 19.8h fact nothing
+    reported. Cancelling on expiry would instead relaunch a doomed task per
+    watchdog tick, and single-flight is what stops three /healthz calls costing
+    three.
+
+    WHAT WARMTH DOES NOT DO, stated because an earlier version of this
+    docstring claimed the opposite: warmth does NOT carry an unattended
+    dashboard. Nothing server-side refreshes the primary root's key -- the only
+    steady-state writer is the browser's 3s poll -- so with no browser attached
+    both warmth and grace lapse on a healthy system, and the 'probing' verdict
+    is what stops that lapse reading as a wedge. See
+    _MCP_PROBE_OUTSTANDING_LIMIT.
+    """
+    global _mcp_probe, _mcp_fanout_last_ok
+    loop = asyncio.get_running_loop()
+
+    # The SAME read record _fanout_probe_completion's own unnarrowed
+    # ``fetch_tasks(client, config, config.project_root)`` builds (task 5018
+    # made the cache key a structured record): whole tree, no status
+    # narrowing, one unpaginated request.
+    key = _TasksRead(str(config.project_root), None, _CompleteRead(None))
+    if _fetch_tasks_cache.get_fresh(key) is not None:
+        return 'ok'
+
+    last_ok = _mcp_fanout_last_ok
+    if last_ok is not None and (loop.time() - last_ok) < _MCP_FANOUT_OK_GRACE_SECONDS:
+        return 'ok'
+
+    live = _mcp_probe
+    if live is not None and live.task.get_loop() is not loop:
+        # A Task is bound to the loop that CREATED it, and asyncio.wait()
+        # raises on one belonging to another (typically closed) loop instead
+        # of returning -- which would 500 the one handler whose entire
+        # contract is that it always delivers a verdict. Every TestClient
+        # context and every in-process loop restart makes this reachable, so
+        # the invariant is enforced here rather than left to each caller's
+        # teardown. Forget it (its own loop is gone, so nothing here can
+        # await it) and probe afresh.
+        live = None
+    if live is None:
+        task = asyncio.create_task(_fanout_probe_completion(client, config))
+        live = _LiveProbe(task=task, started_at=loop.time())
+        _mcp_probe = live
+        track_task(task, _MCP_PROBES)
+
+    done, _pending = await asyncio.wait({live.task}, timeout=budget)
+    if live.task not in done:
+        # STILL RUNNING -- leave it alone, deliberately (see above). Whether
+        # that is news depends ONLY on how long it has been outstanding.
+        if (loop.time() - live.started_at) < _MCP_PROBE_OUTSTANDING_LIMIT:
+            return 'probing'
+        return 'timeout'  # ONLY an outstanding probe past its limit is a wedge
+
+    # It completed, now or between calls. Consume it exactly once.
+    _mcp_probe = None
+    try:
+        completed_at = live.task.result()
+    except asyncio.CancelledError:
+        # Only _mcp_probe_state_clear or loop shutdown cancels a probe; report
+        # it rather than laundering it into a verdict about the data plane.
+        return 'error'
+    except Exception:
+        # The payload can only carry a status string, so the exception itself
+        # would be unrecoverable if it were not logged here (INV-2
+        # structured-facts-at-failure) -- _probe_db's rationale, verbatim.
+        logger.warning('/healthz MCP fan-out probe raised', exc_info=True)
+        return 'error'
+    # The COMPLETION instant, measured inside the task -- not the instant this
+    # call happened to observe it. See _fanout_probe_completion.
+    _mcp_fanout_last_ok = completed_at
+    return 'ok'
+
+
 @app.get('/healthz')
 async def healthz(request: Request) -> JSONResponse:
     """Deep health check — detects thread leaks and unresponsive DB connections.
@@ -771,6 +1174,67 @@ async def healthz(request: Request) -> JSONResponse:
         # that raised as 'error', which flips healthy above but must not
         # claim the handler blew its budget — folding 'error' back into
         # 'timeout' here would silently re-break this flag.
+        if status == 'timeout':
+            deadline_exceeded = True
+
+    # DATA-PLANE CHECK (task 4884 / #4790), inside the SAME deadline as the DB
+    # probes above.
+    #
+    # THE RESTART DECISION, stated here so it cannot be silently reversed: a
+    # data-plane failure surfaces as this 503 with a named check and
+    # deliberately does NOT trip the watchdog's restart path. Three reasons,
+    # each with its evidence:
+    #
+    #  1. scripts/dashboard-watchdog.py::PROBE_URL already defaults to the
+    #     SHALLOW /api/health handler, not /healthz. The task text's premise
+    #     ("FAIL_STREAK consecutive /healthz failures") does not describe the
+    #     shipped watchdog.
+    #  2. Probing /healthz WAS the 2026-07-30 defect -- 192 restarts in 3
+    #     hours, ~27% downtime, from a service that was serving requests
+    #     throughout -- and moving off it was the fix. This handler's own
+    #     docstring records /healthz as deliberately wired to nothing that
+    #     kills (plans/dashboard-availability-prd.md task epsilon,
+    #     Resolved-decision 1).
+    #  3. Task 4789 has since bounded the refresh latch
+    #     (mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0, plus a tracked
+    #     self-healing bypass), so the specific unbounded wedge a restart once
+    #     cleared can no longer persist. The residual is a slow or hung MCP
+    #     SUBSTRATE, which is not in this process -- restarting the dashboard
+    #     does not fix it, and MAX_RESTARTS/RATE_WINDOW_SECS would merely
+    #     rate-limit the flapping.
+    #
+    # THE COUNTER-ARGUMENT, named so a future reader can re-open this on
+    # evidence rather than rediscover it: a restart DID clear the 2026-08-27
+    # wedge. It no longer applies, for reason 3 -- what a restart cleared then
+    # was the never-released latch, which cannot recur. If a wedge is ever
+    # observed that a restart clears AND that 4789's bypass does not, that is
+    # new evidence and this decision should be re-opened, not worked around.
+    #
+    # Pinned by test_watchdog_probes_the_shallow_endpoint_not_healthz.
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        checks['mcp_fanout'] = 'deadline_exceeded'
+        healthy = False
+        deadline_exceeded = True
+    else:
+        http_client: httpx.AsyncClient = request.app.state.http_client
+        status = await _probe_mcp_fanout(
+            http_client, config, min(remaining, _MCP_PROBE_TIMEOUT),
+        )
+        checks['mcp_fanout'] = status
+        # 'probing' is NOT a claim of ill-health, exactly as the DB loop's
+        # 'unavailable' is not: a fan-out started moments ago has demonstrated
+        # nothing yet, and an unattended dashboard reaches that state on every
+        # cache expiry. Folding it into the verdict would 503 an idle but
+        # perfectly healthy dashboard on a fixed cadence forever — a false
+        # alarm on the exact signal this check adds. See
+        # _MCP_PROBE_OUTSTANDING_LIMIT for the bound that keeps 'probing' from
+        # absorbing a real wedge.
+        if status not in ('ok', 'probing'):
+            healthy = False
+        # Load-bearing, exactly as in the DB loop: keyed on 'timeout' ALONE.
+        # An 'error' verdict flips healthy but must not claim the handler blew
+        # its budget.
         if status == 'timeout':
             deadline_exceeded = True
 
@@ -2022,6 +2486,7 @@ __all__: Sequence[str] = (
     '_performance_resources',
     '_burndown_dbs',
     '_task_cards_cache_clear',
+    '_mcp_probe_state_clear',
     '_load_task_cards',
     '_analytics_cache_clear',
     '_memory_evals_cache_clear',

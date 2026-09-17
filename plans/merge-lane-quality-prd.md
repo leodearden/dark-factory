@@ -37,8 +37,8 @@ climbing back. Operator-observable outcome when the batch lands:
 ## Background
 
 Definition ratified 2026-09-03: **quality is the cost and risk of the next change,
-and here the next change is made by an agent.** Leo's fourteen heuristics (memory
-`user-code-quality-heuristics`) are the review vocabulary for every task in this
+and here the next change is made by an agent.** Leo's fourteen heuristics
+(`docs/code-quality.md`, the single normative copy) are the review vocabulary for every task in this
 batch; the ones this PRD leans on hardest are *small function scopes*, *minimum data
 access scopes and lifetimes*, *deep modules with narrow interfaces*, *files make
 internal sense in isolation*, *no file too large — and no cheating by stitching
@@ -581,3 +581,57 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    "skip when nothing changed" gate (INV-10/INV-11) and never a narrower domain.
    Until σ lands the per-verify-leg tax is accepted as measured. Task 5048's
    details carry the constraints.
+   [Left as written: two of this paragraph's claims were disproven on
+   2026-09-13 and are corrected immediately below, not edited here.]
+
+   **Corrected and partly discharged by task 5101** (2026-09-13). Two factual
+   corrections to the paragraph above, both measured on the branch:
+
+   - "13s is 22 separate complexipy **subprocesses**" is wrong on both count and
+     mechanism. It was **50 in-process `complexipy.file_complexity` calls over 25
+     resolved files** — two per file, because `build_report` asked for the file
+     total and the per-function map separately and each fetched its own result.
+     `CLUSTER_PATHS` has 23 entries, two of which are globs, resolving to 25
+     files. No subprocess is involved.
+   - σ's "one complexipy invocation for the whole cluster" is **not available as
+     a drop-in**. complexipy 6.2.0's Python API, as used by
+     `scripts/merge_lane_metrics.py`, exposes only single-path entry points
+     (`file_complexity(file_path: str, check_script=False, no_ignore=False)` and
+     `code_complexity(...)`); there is no multi-path/one-JSON entry point.
+     Reaching for the CLI instead would trade 25 in-process calls for a
+     subprocess and a JSON parse — a design change, not a dedupe. σ should price
+     it that way or drop the constraint.
+
+   DISCHARGED by 5101: one live measurement per session with every anchor
+   reading it (the two real-tree anchors and the `--check` CLI test were
+   each taking their own full sweep), and each cluster file measured by
+   complexipy once instead of twice. Both are held by work-counting guards
+   (`TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once` and
+   the `no_private_tree_scan` fixture) rather than by discipline.
+
+   Measured on one unchanged tree: 215 items in **237.09s** before; 219 items in
+   **62.45s, 90.60s and 113.87s** over three runs after, and 218 items in
+   **76.79s** once the review amendments had deduped one item and collapsed a
+   third double-measure of merge_queue.py (`--check` alone: 27.66s). Every AFTER sample is
+   reported rather than the flattering one, because the spread between them is
+   as large as the effect. The load-independent figure, taken WITHIN the single
+   BEFORE run so every item saw the same load: the three folded items cost
+   46.78s + 32.88s + 26.41s = **106.07s of that run's 237.09s — 45% of the
+   module** — and now all three fall below pytest's 0.005s reporting floor.
+
+   STILL σ's: the CLI tests on a small committed fixture tree, the session-scope
+   hoist, and the ≤ 60s ceiling assertion itself — which is the reason 5101 does
+   not claim the ceiling. No AFTER sample is under 60s, and wall clock on
+   this host is too noisy to claim it either way: a four-run A/B of `--check`
+   over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and 43.4s. σ will
+   need a load-independent way to assert its ceiling, or it will assert a
+   coin flip. The remaining floor
+   σ must attack is the single `build_report` (27.19s of the fastest AFTER run,
+   55.46s of the slowest), plus the radon MI recomputed in each of the five
+   `TestReportCli` items. (The 6–7s in
+   `test_merge_queue_anchor_reproduces_the_prd_background_numbers` was a third
+   double-measure of merge_queue.py — through `cognitive_complexity` and
+   `file_cognitive_total` — and 5101 closed it on review by deleting both
+   now-callerless accessors and reading `file_cognitive_measures` once.) The
+   ceiling and the INV-10/INV-11 prohibitions above are unchanged — this is a
+   correction of measured facts, not a renegotiation.

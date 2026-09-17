@@ -270,7 +270,44 @@ class MergeVerifySpec:
     verify_commands     : one VerifyCommand per module, scoped to task_files
     unscoped_typecheck  : the _run_unscoped_typechecks gate spec
     task_files          : files in the merge commit (None → full verify)
-    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
+    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …).
+                          APPLIED ONTO the consuming host's config in
+                          run_merge_verify_on_worktree (task 5496): the spec wins
+                          on conflict, host keys absent from the spec are
+                          preserved. Neither 'replace' nor 'ignore' — the spec is
+                          dispatcher-shaped, while a remote runner's own --config
+                          carries per-host local necessities no dispatcher-built
+                          spec can know (a narrower verify-only host widening its
+                          own per-host-measured timeout budgets is the live case).
+                          MERGE-DECIDING, not cosmetic: these keys SELECT TESTS,
+                          so a remote green reached under a different env is the
+                          task-2822 false-green class, not a performance detail.
+                          Path-valued keys ship VERBATIM and resolve against the
+                          REMOTE filesystem — no rewrite, no denylist, on purpose:
+                          the per-module path already ships them verbatim, and a
+                          name-based filter would put one project's vocabulary
+                          inside generic transport code and re-diverge the two
+                          paths task 5496 unified. Which keys a project sets, and
+                          why any of them is deliberately absolute, stays in that
+                          project's own dark-factory-orchestrator.yaml — its single
+                          home (INV-9), and the file to read before assuming what a
+                          key here means.
+                          Residual risk on a REMOTE dispatch is wasted wall-clock,
+                          not a false green. The measured case is the retry env
+                          from
+                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
+                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
+                          paths to UNTRACKED files that git push does not carry, so
+                          the remote finds them missing — and reify's consumer then
+                          refuses to narrow, loudly, and runs that profile FULL (an
+                          independent tree-OID guard refuses the same way on a
+                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
+                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
+                          by that guard, and are sound here: the remote verifies the
+                          same pushed tree and consumes no dispatcher build artefacts.
+                          Making the filter files shippable needs merge_queue.py
+                          (outside task 5496's scope); follow-up ticket
+                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
@@ -592,6 +629,46 @@ async def run_merge_verify_on_worktree(
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
+    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
+    # config: the spec wins on conflict, host keys absent from the spec are
+    # preserved. Without this the zero-module-config path (spec.verify_commands
+    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
+    # has NO consumer and the remote decides the merge under its own config's
+    # test-selection env — the task-2822 false-green class, since these keys
+    # select which tests run.
+    #
+    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
+    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
+    # local necessities, which are by construction absent from any
+    # dispatcher-built spec: a remote runner is dispatched against its OWN
+    # --config, and a narrower verify-only host widens its per-host-measured
+    # timeout budgets there — values the dispatching workstation never measured
+    # and cannot ship, which 'replace' would silently narrow back to the
+    # workstation's. The spec is dispatcher-shaped and the host config is
+    # host-shaped; only a merge carries both.
+    #
+    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
+    # already computes exactly {**config.verify_env, **module_config.verify_env}
+    # on the per-module path. The merge here is therefore byte-identical there —
+    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
+    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
+    # makes the ONE existing rule uniform across both paths.
+    #
+    # Spelling constraints:
+    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
+    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
+    #    dict object as the caller's — the same hazard the task-4536 registry
+    #    comment below spells out. An in-place write would corrupt the config
+    #    cli.py loaded from disk and may still use.
+    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
+    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
+    #    writes the verify_env FIELD, because the property is read-only and
+    #    _resolve_verify_env — the sole builder of the executed env — reads the
+    #    field.
+    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
+    #    env", which under this rule already leaves every host key intact, so a
+    #    guard would buy a branch with no behavioural difference.
+    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
     # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
     # global full-gate commands; apply them onto the reconstructed remote config
     # so the remote runs the SAME gate as local (the module_configs=[] Site-2
@@ -2711,6 +2788,17 @@ class DriftCheckResult:
     verdict:       AGREE / DIVERGE / INCONCLUSIVE.
     local_passed:  bool verdict from the local runner (None when INCONCLUSIVE).
     remote_passed: bool verdict from the remote runner (None when INCONCLUSIVE).
+    local_category:  VerifyResult.category from the local runner, defaulting to ''.
+    remote_category: VerifyResult.category from the remote runner, defaulting to ''.
+                   Both are always populated when a comparison actually happened,
+                   and both stay '' when INCONCLUSIVE (nothing was compared --
+                   `verdict` is the disambiguator, exactly as it is for
+                   local_passed/remote_passed, which stay None there even when
+                   the local arm genuinely produced a result).  '' is ALSO the
+                   ordinary value for a clean verify result carrying no sentinel
+                   category, so '' never means "missing".  A non-empty value such
+                   as 'merge_flake_suppressed' marks an arm whose verdict came
+                   from a sentinel path rather than a clean first-pass run.
     escalated:     True when a new divergence escalation was submitted.
     quarantined:   True when the remote runner was quarantined.
     """
@@ -2718,6 +2806,10 @@ class DriftCheckResult:
     verdict: DriftVerdict
     local_passed: bool | None = None
     remote_passed: bool | None = None
+    # Field order mirrors ParityRow (local_passed, remote_passed, local_category,
+    # remote_category) -- the sibling record of the same two-arm comparison.
+    local_category: str = ''
+    remote_category: str = ''
     escalated: bool = False
     quarantined: bool = False
 
@@ -2766,7 +2858,9 @@ class DriftDetector:
         """Run *merge_sha* on both runners and compare verdicts.
 
         Returns DriftCheckResult.  Side-effects:
-        - AGREE   → emit verdict_parity_ok event (None-safe).
+        - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
+          merge_sha, local_runner, remote_runner, passed, and both arms'
+          local_category / remote_category ('' for a clean, sentinel-free arm).
         - DIVERGE → dedup'd L1 escalation (None-safe) + quarantine remote.
         - INCONCLUSIVE → no side-effects.
         """
@@ -2789,6 +2883,12 @@ class DriftDetector:
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
+        # Same defensive getattr form run_verdict_parity uses: merge_drift wraps
+        # this whole check in a broad `except Exception`, so a bare .category
+        # AttributeError against an odd result object would silently kill the
+        # detective control rather than degrade one telemetry field.
+        local_category = getattr(local_result, 'category', '')
+        remote_category = getattr(remote_result, 'category', '')
 
         if local_passed == remote_passed:
             # Agree — emit verdict_parity_ok event.
@@ -2802,6 +2902,12 @@ class DriftDetector:
                         'local_runner': local.name,
                         'remote_runner': remote.name,
                         'passed': local_passed,
+                        # Emitted UNCONDITIONALLY ('' for a clean arm) so the
+                        # payload shape is uniform across every drift parity
+                        # event -- a consumer never has to tell an absent key
+                        # apart from a clean result.
+                        'local_category': local_category,
+                        'remote_category': remote_category,
                     },
                 )
             return DriftCheckResult(
@@ -2809,12 +2915,31 @@ class DriftDetector:
                 verdict=DriftVerdict.AGREE,
                 local_passed=local_passed,
                 remote_passed=remote_passed,
+                local_category=local_category,
+                remote_category=remote_category,
             )
 
         # Diverge — dedup'd escalation + quarantine.
         escalated = False
         if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
             from escalation.models import Escalation
+            # Explain the suppression sentinel ONLY when an arm actually carries it.
+            # The structured local_category=/remote_category= echo below stays
+            # unconditional (that is the task's always-populated contract); it is
+            # just this ~40-word operator footnote that would otherwise dilute
+            # every divergence escalation with hypothetical guidance.
+            # The literal is matched, not imported: the only cycle-safe home for a
+            # shared constant is verify.py, which this task does not own.  A rename
+            # there degrades to "footnote not shown" -- never to a lost signal, since
+            # the raw category is still echoed verbatim in the structured fields.
+            suppression_note = ''
+            if 'merge_flake_suppressed' in (local_category, remote_category):
+                suppression_note = (
+                    ' A category of "merge_flake_suppressed" on either arm means that '
+                    "arm's green came from an isolated flake-suppression rerun "
+                    '(verify.apply_merge_flake_suppression), not a clean first-pass '
+                    'run -- weigh that when deciding which host is wrong.'
+                )
             esc = Escalation(
                 id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
                 task_id=_DRIFT_SENTINEL,
@@ -2828,8 +2953,11 @@ class DriftDetector:
                 ),
                 detail=(
                     f'merge_sha={merge_sha!r} local_runner={local.name!r} '
-                    f'({local_passed}) remote_runner={remote.name!r} ({remote_passed}). '
+                    f'({local_passed}, local_category={local_category!r}) '
+                    f'remote_runner={remote.name!r} '
+                    f'({remote_passed}, remote_category={remote_category!r}). '
                     f'A remote PASS / local FAIL split can land unverified code on main.'
+                    f'{suppression_note}'
                 ),
                 suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
             )
@@ -2844,6 +2972,8 @@ class DriftDetector:
             verdict=DriftVerdict.DIVERGE,
             local_passed=local_passed,
             remote_passed=remote_passed,
+            local_category=local_category,
+            remote_category=remote_category,
             escalated=escalated,
             quarantined=True,
         )

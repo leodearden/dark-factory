@@ -305,11 +305,6 @@ _ALLOWED_RENAMERS = {
         'own docstring says the mechanism is copied \'(β does the same)\' — '
         'same shared artifact root, same mkstemp + os.replace, same candidacy. '
         'Migrate the two together or the copy-from-a-neighbour habit survives.',
-    ('scripts/consume_redispatch_requests.py', 'archive_request'):
-        'MOVES an existing file: os.replace of an APPLIED request into the '
-        '``consumed/`` subdirectory, to keep an audit trail of what was '
-        'actioned that the snapshot directory cannot provide. Same class as '
-        'escalation sweep._atomic_move / queue._archive_resolved.',
     ('scripts/dashboard-watchdog.py', 'save_state'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
         'recorded above for session_registry._atomic_write_text, so that '

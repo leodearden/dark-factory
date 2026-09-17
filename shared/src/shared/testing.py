@@ -50,16 +50,21 @@ def make_gate_mock(**overrides) -> MagicMock:
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
     ``gate.confirm_account_ok.assert_called_with(...)``, etc.
-    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
-    on a truthy hit it calls ``release_probe_slot`` and then settles
-    (task 4096). ``report(outcome)``
+    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`'s
+    release/settle behaviour: on a truthy hit it calls ``release_probe_slot``
+    and then settles (task 4096). Its ``gate.detect_cap_hit(...)`` call does
+    NOT yet forward ``scope=slot.scope`` the way production does (task 4234
+    follow-up — see the comment in ``_slot_detect_cap_hit`` below).
+    ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
-    CapHit→``_handle_cap_detected``+``release_probe_slot`` (task 4096),
+    CapHit→``_handle_cap_detected`` (forwarding ``scope=slot.scope``, task
+    4234)+``release_probe_slot`` (task 4096),
     AuthFailed→``_handle_auth_failure`` (reason rendered by the single-sourced
     ``invocation_outcome.auth_failure_reason``, so it cannot drift from
     production — task 4042),
-    NearCap→``_handle_near_cap_warning``+``release_probe_slot``, everything
+    NearCap→``_handle_near_cap_warning`` (forwarding ``scope=slot.scope``,
+    task 4234)+``release_probe_slot``, everything
     else→``release_probe_slot``; always settling in a ``finally``. Kept in step
     with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
     ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the slot
@@ -79,14 +84,18 @@ def make_gate_mock(**overrides) -> MagicMock:
 
     def _make_invoke_slot_cm(*_a, **_kw):
         holder: dict = {'slot': None}
-        # Prod now calls invoke_slot(scope=...) (PRD task β). Accept and ignore
-        # the kwarg (additive — behavior unchanged), mirroring the scope onto
-        # the slot so a caller can still read slot.scope. Captured here (not via
-        # _aenter_impl's own **_kw, which __aenter__ is called with no args).
+        # Prod now calls invoke_slot(scope=...) (PRD task β). Captured here
+        # (not via _aenter_impl's own **_kw, which __aenter__ is called with
+        # no args) and mirrored onto the slot so a caller can read
+        # slot.scope. Forwarded into before_invoke() below for scope-aware
+        # account selection (PRD task γ, task 2857) and from the slot into
+        # report()'s CapHit/NearCap arms (task 4234) — but NOT yet into the
+        # detect_cap_hit(...) proxy; see the comment in _slot_detect_cap_hit
+        # below.
         _scope = _kw.get('scope')
 
         async def _aenter_impl(*_args, **_akw):
-            token = await gate.before_invoke()
+            token = await gate.before_invoke(scope=_scope)
             slot = MagicMock(spec=InvokeSlot)
             slot.token = token
             # Mirror InvokeSlot.__init__: None → '' so tests can rely on
@@ -96,6 +105,15 @@ def make_gate_mock(**overrides) -> MagicMock:
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):
+                # Deliberately omits scope=slot.scope, unlike production
+                # InvokeSlot.detect_cap_hit (task 4234 follow-up): adding it
+                # would change this call's shape, and
+                # test_cap_retry.py::test_detect_cap_hit_called_with_correct_args
+                # asserts gate.detect_cap_hit.call_args with no scope kwarg —
+                # that file is outside this task's locked scope, so the two
+                # edits would need to land together. Tracked as a follow-up
+                # rather than left silently inconsistent with the
+                # now-scope-forwarding report() arms above.
                 hit = gate.detect_cap_hit(
                     stderr,
                     output,
@@ -136,12 +154,16 @@ def make_gate_mock(**overrides) -> MagicMock:
                     if isinstance(outcome, OK):
                         gate.confirm_account_ok(token)
                     elif isinstance(outcome, CapHit):
-                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                        gate._handle_cap_detected(
+                            outcome.reason, outcome.resets_at, token, scope=slot.scope,
+                        )
                         gate.release_probe_slot(token)
                     elif isinstance(outcome, AuthFailed):
                         gate._handle_auth_failure(auth_failure_reason(outcome), token)
                     elif isinstance(outcome, NearCap):
-                        gate._handle_near_cap_warning(outcome.reason, token)
+                        gate._handle_near_cap_warning(
+                            outcome.reason, token, scope=slot.scope,
+                        )
                         gate.release_probe_slot(token)
                     else:
                         gate.release_probe_slot(token)

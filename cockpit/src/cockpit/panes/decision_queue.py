@@ -31,6 +31,7 @@ from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
 
 from cockpit.backends import DisplayTarget
+from cockpit.panes.placeholders import ABSENT_PLACEHOLDER
 from cockpit.panes.session_table import format_age
 from cockpit.priority import Priorities, ScoringItem, score
 
@@ -179,6 +180,13 @@ class QueueItem:
     escalation_id: the backing record's escalation_id, or None -- not
         rendered by format_queue_row, but consumed by format_copy_payload
         (the copy affordance, task 2517).
+    session_slug: the backing SessionRecord's slug for a session item, None
+        for a decision item. Carried as its own field rather than decoded
+        back out of *key*: order_queue already holds the record the slug
+        comes from, so encoding it into a string only to write a parser for
+        it would be the meaningful-string shape heuristic 12 rules out --
+        and the parser's fail-soft branch would be dead code, since every
+        session key this codebase builds comes from _session_key.
     """
 
     key: str
@@ -192,16 +200,22 @@ class QueueItem:
     target: DisplayTarget | None
     handling: bool
     escalation_id: str | None
+    session_slug: str | None
 
 
-_ID_PLACEHOLDER = '(none)'
 
-# Some terminals silently DROP an over-long OSC 52 clipboard write rather
-# than truncating it (App.copy_to_clipboard's caller in app.py), so an
-# unbounded question could otherwise land on the clipboard as nothing at
-# all with no operator-visible feedback (task 2517 amendment). Sized
-# generously above any realistic question length and comfortably under the
-# payload limits reported by common terminals.
+# Bounds the clipboard payload on BOTH copy legs, because there is only one
+# payload: cockpit/src/cockpit/app.py::CockpitApp.action_copy formats it once,
+# before it knows which leg will run. Only the OSC 52 leg needs the cap --
+# some terminals silently DROP an over-long OSC 52 write rather than
+# truncating it, so an unbounded question could land on the clipboard as
+# nothing at all (task 2517 amendment). The local-helper leg
+# (cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard, task 5448) has
+# no payload limit and still receives the truncated question: a truncation it
+# does not need, paid so that whichever leg runs puts byte-identical text on
+# the clipboard. Sized generously above any realistic question length and
+# comfortably under the payload limits reported by common terminals, so the
+# unnecessary truncation is unreachable for a real question anyway.
 _COPY_QUESTION_MAX_CHARS = 4000
 
 
@@ -228,14 +242,17 @@ def format_copy_payload(item: QueueItem) -> str:
     escalation_id degrades to a placeholder, never the literal string
     'None'. The trailing id line is derived from item.kind/item.key --
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
-    session (slug = item.key after its 'session:' prefix). The question
+    session (QueueItem.session_slug). The question
     line is defensively capped (_cap_for_clipboard) so a pathologically
-    long question can't silently vanish from the clipboard on a terminal
-    that drops rather than truncates an over-long OSC 52 payload.
+    long question can't silently vanish on a terminal that drops rather
+    than truncates an over-long OSC 52 payload. One payload serves both
+    copy legs, so the cap applies even when the local helper --
+    cockpit/src/cockpit/clipboard.py::copy_to_system_clipboard, which has
+    no payload limit of its own -- is the leg that takes it (see
+    _cap_for_clipboard's comment).
     """
     if item.kind == 'session':
-        slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
-        id_line = f'session: {slug}'
+        id_line = f'session: {item.session_slug}'
     else:
         id_line = f'decision_id: {item.decision_id}'
     question = _cap_for_clipboard(item.question or _QUESTION_PLACEHOLDER)
@@ -243,8 +260,8 @@ def format_copy_payload(item: QueueItem) -> str:
         [
             f'question: {question}',
             f'project: {item.project}',
-            f'task_id: {item.task_id or _ID_PLACEHOLDER}',
-            f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
+            f'task_id: {item.task_id or ABSENT_PLACEHOLDER}',
+            f'escalation_id: {item.escalation_id or ABSENT_PLACEHOLDER}',
             id_line,
         ]
     )
@@ -366,6 +383,7 @@ def order_queue(
                 target=resolve_target(decision, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=decision.escalation_id,
+                session_slug=None,
             )
         )
 
@@ -392,6 +410,7 @@ def order_queue(
                 target=resolve_target(session, sessions_by_slug),
                 handling=key in handling_set,
                 escalation_id=session.escalation_id,
+                session_slug=session.session_slug,
             )
         )
 
