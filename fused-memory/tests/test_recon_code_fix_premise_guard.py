@@ -1007,6 +1007,36 @@ class TestSeedRegistryRealSource:
             "guard are untested."
         )
 
+    def test_the_same_filter_proposed_for_a_different_query_is_not_dropped(self):
+        """Over-broad-anchoring guard, the case a generic description anchor
+        would have failed: the SAME claim — add `AND e.expired_at IS NULL` —
+        against a query this premise was never refuted against.
+
+        The architect refuted the filter for the VALID-EDGE queries, on evidence
+        specific to them (the restore hooks clear `invalid_at`, so an expired_at
+        condition would re-hide exactly the edges they restore). That evidence
+        says nothing about any other query, so a proposal naming another one has
+        to reach a human. An anchor like "expired_at IS NULL" would have dropped
+        it — it appears verbatim in this candidate's description.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Add expired_at IS NULL to the episode-fetch query",
+            description=(
+                "get_episodes returns episodes graphiti_core has expired; the "
+                "query should read AND e.expired_at IS NULL. This is the same "
+                "expired_at filter, on a different query."
+            ),
+        )
+
+        assert match_candidate(candidate, entries) is None
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
     def test_the_entry_self_corrects_once_the_filter_genuinely_lands(self, tmp_path):
         """The registry header's own promise, made executable: a premise stops
         being refuted the moment its evidence changes, with no operator action.
@@ -1043,10 +1073,15 @@ class TestSeedRegistryRealSource:
             "being dropped and reach a human again"
         )
 
-    def test_all_four_incidents_via_premise_refuted_entry(self):
-        """premise_refuted_entry composes match + verify for all four incidents
-        at once against the real source root — the end-to-end shape the curator
-        actually calls.
+    def test_all_five_incidents_via_premise_refuted_entry(self):
+        """premise_refuted_entry composes match + verify for every shipped
+        incident at once against the real source root — the end-to-end shape
+        the curator actually calls.
+
+        The coverage assertion below is derived from the registry rather than
+        counted by hand, so a SIXTH entry reds this test until someone writes
+        the candidate that proves it drops what it claims to. A count in a test
+        name is trusted exactly as readily as the assertion under it.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
 
@@ -1098,12 +1133,30 @@ class TestSeedRegistryRealSource:
                 ),
                 "deterministic_gate_escalation_record_archived_not_missing",
             ),
+            (
+                CandidateTask(
+                    title=(
+                        "Add missing expired_at validity filter to the "
+                        "valid-edge queries"
+                    ),
+                    description=(
+                        "get_valid_edges_for_node returns edges graphiti_core has "
+                        "already expired; the query should also exclude them."
+                    ),
+                ),
+                self._EXPIRED_AT_ENTRY,
+            ),
         ]
 
         for candidate, expected_name in cases:
             result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
             assert result is not None, f"expected a premise-refuted drop for {expected_name!r}"
             assert result.name == expected_name
+
+        assert {name for _, name in cases} == {e.name for e in entries}, (
+            "every shipped registry entry needs a case here — add the candidate "
+            "phrasing that entry is meant to drop rather than relaxing this"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

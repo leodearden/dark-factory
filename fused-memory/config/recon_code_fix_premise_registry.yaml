@@ -74,16 +74,20 @@
     proposal about those functions that does NOT propose the filter still reaches the
     architect. Self-corrects the moment the filter genuinely lands (see the
     must_not_contain assertion below). The SINGLE title anchor is deliberate:
-    match_candidate ANDs title_substrings, so more tokens could only narrow it;
-    `expired_at` is codebase-rare, and the four ORed description anchors carry the
-    discrimination the header's operator guidance asks for.
+    match_candidate ANDs title_substrings, so more tokens could only narrow it, and
+    `expired_at` is codebase-rare. ALL the discrimination therefore sits in the two
+    ORed description anchors, and they are deliberately the two QUERY SURFACES this
+    premise was refuted against — nothing else. A generic anchor such as
+    "expired_at IS NULL" or "expired_at filter" would have matched a proposal to add
+    that condition to ANY query anywhere, silently dropping a candidate this
+    architect never examined; that is precisely the false positive the header's
+    operator guidance warns about, and the entry's own claim to be anchored on "the
+    two specific query surfaces" would have been false.
   title_substrings:
     - "expired_at"
   description_substrings:
     - "get_valid_edges_for_node"
     - "_ALL_VALID_EDGES_MATCH"
-    - "expired_at IS NULL"
-    - "expired_at filter"
   source_assertions:
     - file: src/fused_memory/backends/graphiti_client.py
       must_contain:
