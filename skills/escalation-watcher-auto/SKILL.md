@@ -64,6 +64,10 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
 - RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
 
+**Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
+- Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
+- Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the pinning escalation: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
+
 ## Shallow-by-default → Deepen-on-signal RCA
 
 RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — the top-level rotation now runs on sonnet/high-effort (task 2629), sized for cheap mechanical triage on a quiet queue, under a $50/day ceiling. When a signal below does call for deepening, delegate the deep dive itself to an opus subagent (see [Delegating deep RCA to an opus subagent](#delegating-deep-rca-to-an-opus-subagent)) rather than deepening in the top-level context.
@@ -801,6 +805,10 @@ The same `detail` names the REAL task id (`Task: <id>`), plus `Veto site:`, `Con
 
 Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>"`. When multiply pinned, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different pin-sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
 
+**When nothing pins.** If the `Pinning escalations:` line is absent, reads `(none recorded)`, or yields no id once the age parentheticals are stripped, there is no pin to key on. This is a reachable branch, not a malformed record — the alarm is generic over veto shapes, and `unmapped_shape` for one holds a task with nothing pinning it. Fall back to the **bare stem** `"recovery-veto-streak-noise-from-pending-l2-pin"`. You may suffix the veto `site` read from `detail` (`"recovery-veto-streak-noise-from-pending-l2-pin:site-<site>"`) to keep unrelated sites apart; pick one form and apply it consistently across a rotation, or the two spellings will not fold together.
+
+**Never** interpolate the literal `(none recorded)`, or any empty or punctuation-only fragment, into the key. `"...-pending-l2-pin:(none"` is stable and wrong: it would quietly become a NEW over-fold bucket, the same defect wearing a different name. A punctuation-ONLY key cannot be filed at all — `promote_to_l2` rejects a `root_cause` that canonicalises to the empty string (the `canonical_root_cause` guard in `escalation/src/escalation/server.py`), so that one fails the call loudly rather than degrading quietly. The bare stem is deliberately the SAME key these streaks already fold under, so unpinned streaks keep clustering exactly as they do today: this rule changes behaviour only where there IS a pin to split on.
+
 ```python
 mcp__escalation__promote_to_l2(
   task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
@@ -835,7 +843,7 @@ These require human judgment. Apply shallow RCA: sibling tasks of the same PRD p
 
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
-- `risk_identified`: `"risk:<module-or-area-slug>"`
+- `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) above and must NOT take this generic key.
 
 ```python
 mcp__escalation__promote_to_l2(
