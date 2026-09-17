@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1192,6 +1192,226 @@ class TestDecisionQueueRender:
             high_index = queue.get_row_index('decision:dec-high')
             low_index = queue.get_row_index('decision:dec-low')
             assert high_index < low_index
+
+
+    @pytest.mark.timeout(10)
+    async def test_a_wide_terminal_gives_the_question_the_leftover_width(self, tmp_path):
+        """The question column is sized from the width the other three columns
+        leave, not from a hardcoded cap -- so a wide terminal shows a long
+        question instead of parking most of the line in a blank gutter.
+
+        At terminal width 200 the fixed columns render at their LABEL widths
+        ('score' 5, 'age' 3, 'project#task' 12 -- each wider than its cell
+        here), which with one padding cell either side is 26. The question
+        column takes the remaining 200 - 26 - 2 == 172.
+
+        filed_at is three days back rather than a fixed calendar date so the
+        age cell stays two characters forever: a fixed date would eventually
+        render '100d', widen the age column past its label and silently move
+        this arithmetic by one.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        assert len(long_question) > 300
+
+        decision = sr.DecisionRecord(
+            id='dec-wide',
+            project='df',
+            text=long_question,
+            filed_at=(datetime.now(UTC) - timedelta(days=3)).isoformat(),
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            question_cell = queue.get_row('decision:dec-wide')[3]
+
+            # far past the old hardcoded 60-cell cap, and exactly the leftover
+            assert len(question_cell) > 60
+            assert len(question_cell) == 172
+
+            # the formatting contract survived the wider bound
+            assert question_cell.endswith('\u2026')
+            assert '\n' not in question_cell
+
+            # no blank gutter and no overflow: the columns fill the width exactly
+            assert queue.scrollable_content_region.width == 200
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
+
+
+    @pytest.mark.timeout(10)
+    async def test_a_terminal_resize_reflows_the_question_column_both_ways(self, tmp_path):
+        """Narrowing the terminal reflows the question SHORTER rather than
+        overflowing, and widening it back reflows longer -- with the
+        operator's selection and the rendered ages untouched.
+
+        Textual's auto-width only ever grows, so giving cells BACK is the
+        half of this that a formatter-only cap cannot do. Widths: 200 - 26
+        fixed - 2 padding == 172, and 100 - 26 - 2 == 72.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                    manual_boost=boost,
+                ),
+                root=tmp_path,
+            )
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+
+            # park the operator on the second row, so a yanked cursor would show
+            assert queue.select_key('decision:dec-low')
+            assert queue.highlighted_key() == 'decision:dec-low'
+            _, wide_age, _, wide_question = queue.get_row('decision:dec-low')
+            assert len(wide_question) == 172
+
+            await pilot.resize_terminal(100, 40)
+            await pilot.pause()
+
+            _, narrow_age, _, narrow_question = queue.get_row('decision:dec-low')
+
+            # the column gave width back instead of ratcheting
+            assert len(narrow_question) == 72
+            assert len(narrow_question) < len(wide_question)
+
+            # nothing overflows and no gutter opens at the new width
+            assert queue.scrollable_content_region.width == 100
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
+
+            # a window drag is not a selection change, and not a clock read
+            assert queue.highlighted_key() == 'decision:dec-low'
+            assert narrow_age == wide_age
+
+            await pilot.resize_terminal(200, 40)
+            await pilot.pause()
+
+            _, rewide_age, _, rewide_question = queue.get_row('decision:dec-low')
+
+            assert len(rewide_question) == len(wide_question)
+            assert queue.virtual_size.width == queue.scrollable_content_region.width == 200
+            assert queue.highlighted_key() == 'decision:dec-low'
+            assert rewide_age == wide_age
+
+    @pytest.mark.timeout(10)
+    async def test_a_queue_that_grows_past_its_height_pays_for_its_scrollbar(self, tmp_path):
+        """A rebuild that grows the queue past its visible height brings in a
+        vertical scrollbar, and the columns must give it back its two cells.
+
+        The bound is necessarily derived BEFORE the new rows land, so the
+        measurement cannot see a scrollbar those rows are about to cause --
+        and Textual posts no Resize for a scrollbar appearing, so the
+        overflow would stand until some later content change happened to
+        re-derive. Growing the queue (rather than seeding it full) is what
+        puts the measurement on the wrong side of the scrollbar: seeded full,
+        the rows are already in place when the first Resize measures.
+        Widths: 200 - 26 fixed - 2 padding == 172 with no scrollbar, 170 once
+        two cells go to one.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+
+        def write(index):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=f'dec-{index:02d}',
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                ),
+                root=tmp_path,
+            )
+
+        write(0)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test(size=(200, 20)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+
+            # one row in 20 lines: no scrollbar, so the question gets all 172
+            assert queue.scrollable_content_region.width == 200
+            assert len(queue.get_row('decision:dec-00')[3]) == 172
+
+            for index in range(1, 60):
+                write(index)
+            app.refresh_registry()
+            await pilot.pause()
+
+            # 60 rows in 20 lines: the scrollbar showed up, and was paid for
+            assert queue.row_count == 60
+            assert queue.scrollable_content_region.width == 198
+            assert queue.virtual_size.width == queue.scrollable_content_region.width
+            assert len(queue.get_row('decision:dec-00')[3]) == 170
+
+    @pytest.mark.timeout(10)
+    async def test_a_height_only_resize_does_not_reflow_and_keeps_the_scroll(self, tmp_path):
+        """A resize that leaves the question bound alone must cost nothing on
+        screen: a reflow re-declares the columns through clear(columns=True),
+        which resets the scroll position, so an operator reading row 30 of a
+        long queue would be thrown back to the top by a height-only drag.
+
+        60 rows scroll at both heights, so the scrollbar -- and with it the
+        derived bound -- is identical before and after; only the guard keeps
+        the reflow from running anyway.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        long_question = 'Which port should the worker bind to, and why that one? ' * 6
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for index in range(60):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=f'dec-{index:02d}',
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                ),
+                root=tmp_path,
+            )
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test(size=(200, 20)) as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            queue.scroll_to(y=10, animate=False)
+            await pilot.pause()
+            assert queue.scroll_y == 10
+
+            await pilot.resize_terminal(200, 15)
+            await pilot.pause()
+
+            # the bound did not move, so no reflow ran and the scroll survived
+            assert queue.scrollable_content_region.width == 198
+            assert len(queue.get_row('decision:dec-00')[3]) == 170
+            assert queue.scroll_y == 10
 
 
 class TestSignalDontMove:
@@ -4438,6 +4658,88 @@ class TestDecisionQueueDetail:
             assert queue.get_row_index('decision:dec-existing') == 1
             assert 'BBB parked session question?' in detail.rendered_text
             assert app._selected_slug == 'session-parked'
+
+    @pytest.mark.timeout(10)
+    async def test_a_terminal_resize_does_not_steal_the_pane_from_the_session_table(
+        self, tmp_path
+    ):
+        """A window drag is not an operator selection, so it must not transfer
+        the pane -- the same contract as a rebuild, on the one path the widget
+        originates itself.
+
+        A resize reflow re-enters the cursor through clear(columns=True) +
+        move_cursor, so it posts RowHighlighted from inside DecisionQueue,
+        where app.py's own prevent() block cannot reach it. Left unsuppressed
+        that hands the pane to the queue mid-drag, off a session row the
+        operator deliberately parked on.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.detail_pane import DetailPane
+        from cockpit.panes.session_table import SessionTable
+
+        sr.write_record(
+            _make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
+            root=tmp_path,
+        )
+        sr.write_record(
+            _make_record(
+                session_slug='session-parked',
+                start_ts='2026-07-07T00:01:00+00:00',
+                question=sr.Question(
+                    text='BBB parked session question?', asked_at='2026-07-07T00:01:00+00:00'
+                ),
+            ),
+            root=tmp_path,
+        )
+        long_question = 'ZZZ decision question? ' + ('padded out to overflow the column. ' * 8)
+        filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=long_question,
+                    filed_at=filed_at,
+                    manual_boost=boost,
+                ),
+                root=tmp_path,
+            )
+
+        # a large poll_interval keeps on_mount's own timer out of the resize
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            detail = app.query_one(DetailPane)
+
+            # claim the pane for the QUEUE first, from a row that is not row 0
+            assert queue.select_key('decision:dec-low')
+            await pilot.pause()
+            assert 'ZZZ decision question?' in detail.rendered_text
+
+            # then hand it back to the SESSION table -- this is where the
+            # operator is parked when the window gets dragged
+            table.move_cursor(row=table.get_row_index('session-parked'))
+            await pilot.pause()
+            assert 'BBB parked session question?' in detail.rendered_text
+            assert 'ZZZ decision question?' not in detail.rendered_text
+
+            wide_question = queue.get_row('decision:dec-low')[3]
+
+            await pilot.resize_terminal(100, 40)
+            await pilot.pause()
+
+            # the pane stayed where the operator put it
+            assert 'BBB parked session question?' in detail.rendered_text
+            assert 'ZZZ decision question?' not in detail.rendered_text
+
+            # ... and the reflow did run, and restored the cursor by key
+            assert len(queue.get_row('decision:dec-low')[3]) < len(wide_question)
+            assert queue.highlighted_key() == 'decision:dec-low'
+
 
     @pytest.mark.timeout(10)
     async def test_a_queue_session_row_survives_and_refreshes_across_a_rebuild(self, tmp_path):
