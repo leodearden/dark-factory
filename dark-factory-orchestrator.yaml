@@ -75,13 +75,43 @@ lock_depth: 12
 # --timeout=300 (a CLI --timeout overrides each subproject's pyproject.toml
 # `[tool.pytest.ini_options].timeout`, which was 60 when this was written and
 # is now itself 300 — see shared/pyproject.toml, 2026-09-12):
-# orchestrator/fused-memory run pytest-xdist, and
+# some segments run pytest-xdist, and
 # under host CPU oversubscription a starved xdist worker crosses that ceiling,
 # gets os._exit()'d by pytest-timeout's thread method, and
 # --max-worker-restart=0 turns that into a false-failing per-test "node down"
-# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
-# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
-# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# on whatever test happens to be running. A uniform ``-n`` cap on THIS chain was
+# rejected and stays rejected: ``-n`` errors with "unrecognized arguments" on any
+# segment whose member does not declare pytest-xdist, and not every member does.
+# Task 5408 shrank that set without emptying it — dashboard, escalation and
+# cockpit joined orchestrator and fused-memory. WHICH members do is deliberately
+# not restated here, because a list like that drifts silently. What is gated
+# instead, stated at exactly its real width: a pytest leg that DECLARES ``-n``
+# in its own config — the module config's own argv, or the addopts of the member
+# its uv selector names — must declare the plugin. That is derived structurally
+# from the module-config walk by
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_every_pytest_leg_running_workers_declares_the_plugin.
+#
+# READ THAT NARROWLY, because it is NOT the whole population of legs that end up
+# running ``-n``, and the difference is live today. ``verify_admission_pytest_n``
+# below is set to "8", and verify.py's ``_with_pytest_numprocesses_str`` appends
+# ``-n 8`` to EVERY pytest leg at the roles ``shared.verify_admission
+# .is_gated_role`` names (task, background) — a leg that declares the flag
+# nowhere still receives it. MEASURED on the task-5408 tree by running the
+# production parser over the live commands: sampler's
+# ``uv run --directory sampler pytest tests/ ...`` renders as
+# ``cd sampler && uv run pytest ... -n 8 tests/`` while
+# sampler/pyproject.toml's dev group lists no pytest-xdist at all. It survives
+# only by the same ``uv sync --all-packages`` accident recorded for
+# psutil/sampler further down, and the guard above cannot see it. Filed as
+# follow-up ticket tkt_0RTMJWCW8D5E60N72FATP7EC8F (curator-assigned task id
+# pending), which proposes both halves: declare the plugin for sampler, and
+# widen the guard to count the injected ``-n`` when this knob is a literal. When
+# that lands, widen this paragraph back with it. The worker count
+# belongs in each member's own addopts regardless: there it travels with that
+# member's own timeout/dist settings and also governs a bare
+# ``cd <member> && uv run pytest tests/``, which a flag added here would not.
+# A 6th segment now also runs
 # the repo-root tests/scripts/ suite (not a workspace member, so never covered
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
@@ -133,10 +163,16 @@ lock_depth: 12
 # ``pytest tests/scripts/ scripts/tests/`` — the same two-directory form,
 # in the same order, as this segment — so a scripts/** diff is gated on
 # BOTH directories by its owning module config, under FULL_SUITE and under
-# merge-role merge_verify_breadth="full" alike. The two are kept spelled
-# identically deliberately, so this path and that one cannot drift into
+# merge-role merge_verify_breadth="full" alike. The two TARGET LISTS are kept
+# spelled identically deliberately, so this path and that one cannot drift into
 # different notions of "the scripts suites"; if you widen one, widen the
-# other. That coupling is GATED, not merely asserted here —
+# other. Their FLAGS are not coupled and never were — that module config carries
+# --tb=short/-q/--import-mode=importlib this segment does not, and task 5408
+# added `-n auto --dist loadgroup` there without parallelising this fallback
+# chain (doing so would need every member in it to declare pytest-xdist, which
+# is the same reason the uniform `-n` cap above stays rejected).
+# The TARGET-LIST coupling — and only that one; the flags above are explicitly
+# NOT coupled — is GATED, not merely asserted here:
 # tests/scripts/test_scripts_module_config.py::
 # test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
 # this segment through the production config loader and fails if either side
@@ -652,9 +688,21 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #                                                 -------
 #     honest green path (at orchestrator p50)      ~2645
 #
-# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
-# and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s, and the
+# dashboard and cockpit estimates above were derived from it precisely because
+# those two segments also ran serial. TASK 5408 ENDED THAT: dashboard, escalation
+# and cockpit each declare pytest-xdist and carry `-n auto --dist loadgroup` in
+# their own addopts now, joining orchestrator and fused-memory. So three of the
+# figures above are OVER-estimates rather than wrong — measured on the 5408 tree
+# under those addopts: dashboard 2299 passed / 1 xfailed in 95.07s (estimated
+# ~190), escalation 1721 passed / 2 xfailed in 49.63s (estimated from its 123.29s
+# serial run), cockpit 346 passed in 16.78s (estimated ~44).
+# THE SUM IS DELIBERATELY NOT RE-DERIVED from those three. It already mixes
+# measured and estimated segments of two provenances, and 5408 re-measured only
+# the three segments it changed; the honest statement is that the headroom below
+# can only have moved in the SAFE direction. Whether 3600s can now be narrowed is
+# a measurement question for a whole-fleet run, not an arithmetic one.
+# 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
 # the 4902 re-measurement, and the margin has since collapsed.
 #
 # THE LOAD VARIANCE THAT HEADROOM HAS TO COVER is far wider than this comment

@@ -119,10 +119,24 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # stay CLOSED to only value-taking flags — listing a boolean flag (e.g.
 # -x/-s/-v/-q/-l) here would make the walk swallow the following target
 # token, a silent, worse failure than the stranded-value bug this fixes.
+#
+# OMITTING a value-taking flag is the other direction of the same defect,
+# and task 5408 measured what it costs on a live config. With `--dist`
+# unlisted, parse_config_command on scripts/orchestrator.yaml::test_command
+# stranded `--dist` at the end of base_flags and admitted its value
+# `loadgroup` as a TEST TARGET; with_junitxml then rendered
+# `... -n auto --dist --junitxml /tmp/j.xml ... loadgroup`, which exits rc=4
+# with `argument --dist: expected one argument` — on the merge gate's own
+# path, since verify.py injects --junitxml for role=='merge' with
+# merge_verify_breadth=='full'. So the whole xdist worker-flag family is
+# listed here: `--numprocesses`/`--maxprocesses` are xdist's long spellings
+# for the worker count and its cap, and a set that binds `-n` but not `-n`'s
+# own long spelling is the same latent defect one config rename away.
 _PYTEST_VALUE_FLAGS = frozenset({
     '-k', '-m', '-p', '-o', '-c', '-n', '-W',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
+    '--dist', '--numprocesses', '--maxprocesses',
 })
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
@@ -1726,34 +1740,154 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     return ''.join(out)
 
 
+# The pytest-xdist worker flags a serial recovery must SHED, not merely
+# neutralise. Every one is also in _PYTEST_VALUE_FLAGS, so the parse has
+# already bound each to its value as an adjacent pair and the strip below
+# can drop the pair by position rather than re-deriving the grammar.
+#
+# DELIBERATELY NARROWER than xdist's full option surface, which also carries
+# --max-worker-restart --tx --px --rsyncdir --rsyncignore --testrunuid
+# --maxschedchunk -d --loadscope-reorder --no-loadscope-reorder. Those reach
+# pytest only through a pyproject `addopts` today, where the appended
+# `-o addopts=` already clears them; measured across all nine discovered
+# module configs, the only xdist flags on ARGV are the worker count and its
+# distribution mode. Widening this set is not free — a flag added here that
+# takes a SEPARATE value token must join _PYTEST_VALUE_FLAGS in the same
+# edit, or the strip drops the flag and leaves its value behind as a
+# phantom test target, which is the defect one direction over.
+_XDIST_WORKER_FLAGS = frozenset({'-n', '--numprocesses', '--dist', '--maxprocesses'})
+
+
+def _is_xdist_worker_flag(token: str) -> bool:
+    """True for an xdist worker flag in either spelling.
+
+    THE one place "is this token a worker flag" is decided, consulted by both
+    the structured strip and the raw refusal screen so they cannot disagree
+    about what they are looking for. Covers the bare form (``-n``, whose
+    value is a separate token) and the attached ``--dist=loadgroup`` form
+    (one token, and so NOT a ``_PYTEST_VALUE_FLAGS`` member — see that set's
+    comment). Deciding how WIDE the resulting drop is stays with the caller,
+    because only the separate-token form owns a following token.
+    """
+    return token in _XDIST_WORKER_FLAGS or any(
+        token.startswith(f'{flag}=') for flag in _XDIST_WORKER_FLAGS
+    )
+
+
+def _strip_xdist_worker_flags(base_flags: tuple[str, ...]) -> tuple[str, ...]:
+    """Return *base_flags* with every xdist worker flag (and its value) removed.
+
+    Same left-to-right walk as ``_split_pytest_args``, and it consults the
+    same ``_PYTEST_VALUE_FLAGS`` to decide whether a flag owns the following
+    token — so the two cannot drift on what "takes a value" means. ALL
+    occurrences go, not just the first: ``verify.py`` can apply the worker
+    cap BEFORE forcing serial, which leaves a doubled ``-n auto ... -n 8`` on
+    argv, and a first-occurrence-only strip would leave the identical usage
+    error behind.
+    """
+    kept: list[str] = []
+    i = 0
+    n = len(base_flags)
+    while i < n:
+        token = base_flags[i]
+        if not _is_xdist_worker_flag(token):
+            kept.append(token)
+            i += 1
+        elif token in _PYTEST_VALUE_FLAGS and i + 1 < n:
+            i += 2  # bare flag: its value is the bound adjacent token
+        else:
+            i += 1  # attached `--flag=value`, or a trailing bare flag
+    return tuple(kept)
+
+
+def _raw_pytest_carries_xdist_worker_flag(raw: str) -> bool:
+    """True when a real pytest invocation in *raw* names an xdist worker flag.
+
+    The raw chain's REFUSAL screen for ``serial_pytest``, mirroring
+    ``_has_unspliceable_pytest_invocation``'s role for the appender: a chain
+    that already carries ``-n``/``--dist`` on argv cannot be made serial by
+    appending ``-p no:xdist``, and there is no sound blind surgery that would
+    remove it (``_unspliceable_pytest_spans`` records, with measured
+    counterexamples, why regex edits to a raw chain silently run the WRONG
+    TESTS). Refusing costs that one retry its recovery flags, loudly.
+
+    Tokenised with ``shlex`` rather than by whitespace, so a worker flag
+    spelled inside another argument — ``pytest -k 'a -n b' tests/`` — is not
+    mistaken for one on argv; over-refusing would silently disable serial
+    recovery for a command that never had the defect, which is the failure
+    ``_pytest_invocation_spans`` exists to avoid on the other axis. A span
+    that will not tokenise ends mid-quote, and ``_unspliceable_pytest_spans``
+    already refuses the whole string for that, so answering True there cannot
+    change the outcome.
+    """
+    for match in _pytest_invocation_spans(raw):
+        try:
+            tokens = shlex.split(match.group(0))
+        except ValueError:
+            return True
+        if any(_is_xdist_worker_flag(token) for token in tokens):
+            return True
+    return False
+
+
 def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
 
-    Appends ``-p no:xdist -o addopts=`` (clears any pyproject-level
-    ``addopts``, e.g. ``-n auto`` — the ``-o addopts=""`` workaround task
-    2045 proved recovers a shared-venv-mutation transient; ``-p no:xdist``
-    is belt-and-suspenders) to a structured command's ``base_flags``, or —
-    for a raw-retained pytest chain — to every ``pytest`` invocation's
-    arguments in ``raw`` via a localised regex rewrite (moved from
-    ``_force_serial_pytest``), so each chained invocation recovers
-    independently. No-ops unless ``cmd.tool is ToolKind.PYTEST`` (covers
-    OPAQUE and every other tool — P1).
+    Appends ``-p no:xdist -o addopts=`` (the ``-o addopts=""`` workaround
+    task 2045 proved recovers a shared-venv-mutation transient; ``-p
+    no:xdist`` is belt-and-suspenders) to a structured command's
+    ``base_flags``, or — for a raw-retained pytest chain — to every
+    ``pytest`` invocation's arguments in ``raw`` via a localised regex
+    rewrite (moved from ``_force_serial_pytest``), so each chained
+    invocation recovers independently. No-ops unless ``cmd.tool is
+    ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1).
 
-    Also a no-op on the raw path when the appender REFUSES (task 4121 — see
-    ``_unspliceable_pytest_spans``). Returning *cmd* ITSELF rather than an
-    equal ``replace`` copy is deliberate: the caller's ``is`` identity guard
+    ``-o addopts=`` reaches only a PYPROJECT-level ``-n auto``, and that
+    limit is load-bearing rather than incidental: a worker flag already on
+    ARGV survives it, and ``-p no:xdist`` then UNREGISTERS the option that
+    flag names. Measured on the live ``scripts`` leg (task 5408)::
+
+        pytest ... -n auto --dist loadgroup -p no:xdist -o addopts= <target>
+        pytest: error: unrecognized arguments: -n --dist          (rc=4)
+
+    So the structured path SHEDS those flags via
+    ``_strip_xdist_worker_flags`` before appending the recovery pair. This is
+    the mirror of ``_is_serial_forced``, which stops a later
+    ``apply_pytest_numprocesses`` ADDING ``-n`` after the fact; read the two
+    together — they close the same plugin/option interaction from opposite
+    directions, and neither alone is sufficient.
+
+    Two no-ops on the raw path, both returning *cmd* ITSELF rather than an
+    equal ``replace`` copy: the caller's ``is`` identity guard
     (``verify._serial_pytest_str``'s ``if rewritten is parsed: return cmd``)
     only fires on identity, and it is what hands back the operator's own
     command string BYTE-identically instead of an argv-equivalent re-render.
+
+    * The appender REFUSES (task 4121 — see ``_unspliceable_pytest_spans``).
+    * A pytest invocation in the chain already carries a worker flag
+      (``_raw_pytest_carries_xdist_worker_flag``). There is no raw
+      counterpart to the structured strip, and inventing one would mean the
+      blind regex surgery ``_unspliceable_pytest_spans`` documents as WORSE
+      than doing nothing; refusing costs that retry its recovery flags,
+      rendering a guaranteed rc=4 would cost it the run AND misreport the
+      cause. Defensive only — measured across all nine discovered module
+      configs, every ``test_command`` parses structured.
     """
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
+        if _raw_pytest_carries_xdist_worker_flag(cmd.raw):
+            return cmd
         rewritten = _append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
+    return replace(
+        cmd,
+        base_flags=(
+            *_strip_xdist_worker_flags(cmd.base_flags), '-p', 'no:xdist', '-o', 'addopts=',
+        ),
+    )
 
 
 def _is_serial_forced(cmd: VerifyCmd) -> bool:
@@ -1767,6 +1901,11 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
     ``apply_pytest_numprocesses`` consults this to stay a no-op on any
     already-serial command (the env-transient and flaky-scoped recovery
     re-runs both pass such commands back through the injection site).
+
+    That is one direction of the interaction. The other — a worker flag
+    already on argv when the command is forced serial — is closed in
+    ``serial_pytest``, which strips it there rather than relying on ``-o
+    addopts=`` (which cannot reach argv). The two docstrings are one account.
 
     ``no:xdist`` is checked across both ``base_flags`` and ``targets``: a
     freshly ``serial_pytest``-ed structured command carries the ``-p

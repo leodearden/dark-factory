@@ -1195,10 +1195,21 @@ def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     failing the caller outright would trade an inert budget for a red suite.
 
     LOAD-PER-CORE, not worker count, is the right signal for the two test
-    roots that use this: they run SERIALLY (no xdist, no random ordering), so
-    the contention that stretches their subprocess spawns is EXTERNAL -- other
-    suites' workers on the same 32-core host. A worker-count heuristic would
-    see nothing and scale by 1.
+    roots that use this, and it STAYS right now that they run under xdist.
+    Task 5408 put ``-n auto --dist loadgroup`` on the ``scripts`` module's
+    test_command, which is the command that runs both ``tests/scripts/`` and
+    ``scripts/tests/``, so the clause this paragraph used to carry -- "they run
+    SERIALLY (no xdist, no random ordering)" -- is false and is corrected rather
+    than softened.
+    Nothing about the function changes, for two independent reasons. Loadavg is
+    a WHOLE-HOST signal, so it already counts this suite's own workers
+    alongside every other suite's -- the contention is no longer purely
+    EXTERNAL, but it is still fully visible, which is all this reads it for.
+    And the result is a FLOOR: at ``factor == 1.0`` it returns ``base_secs``
+    exactly, so every call site can only be LENGTHENED under contention, never
+    shortened. A worker-count heuristic would still be the wrong signal: it
+    would see this root's own 8 workers and nothing of the other suites sharing
+    the 32-core host.
 
     Returns an ``int``: callers stringify these budgets into env vars that
     bash's integer operators compare, and those reject ``30.0`` -- the same
