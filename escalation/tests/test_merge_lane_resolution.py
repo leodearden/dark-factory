@@ -20,13 +20,14 @@ discarding live operator intent is the defect task 4888 exists to fix).
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
 from escalation.merge_lane_resolution import (
     InvalidMergeLane,
     LaneChoice,
+    MergeLane,
     resolve_merge_lane,
     validate_requested_lane,
 )
@@ -40,6 +41,18 @@ try:
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
     MERGE_LANES: Any = None  # type: ignore[assignment,misc]
+
+
+# MODULE-level, not per-class.  Both public functions do their
+# ``from orchestrator.merge_queue import ...`` INSIDE the function body (see
+# that module's docstring for why the imports are runtime-only), so without
+# orchestrator installed EVERY test here raises ImportError rather than
+# skipping — a class-level guard on the one class that names ``MERGE_LANES``
+# would advertise a robustness the file does not have.  Same shape as
+# ``test_merge_request_lane.py``'s ``pytestmark``.
+pytestmark = pytest.mark.skipif(
+    not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed'
+)
 
 
 class TestValidateRequestedLane:
@@ -80,7 +93,7 @@ class TestValidateRequestedLane:
             validate_requested_lane('higgh')
         err = excinfo.value
         assert err.value == 'higgh'
-        assert tuple(err.valid_lanes) == tuple(MERGE_LANES or err.valid_lanes)
+        assert tuple(err.valid_lanes) == tuple(MERGE_LANES)
 
     def test_invalid_merge_lane_is_a_value_error(self):
         """So a caller that does not know this type still catches it."""
@@ -146,7 +159,6 @@ class TestLaneChoiceShape:
             choice.lane = 'normal'  # type: ignore[misc]
 
 
-@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestVocabularyIsNotForked:
     """The module must never mint a lane vocabulary of its own."""
 
@@ -170,6 +182,17 @@ class TestVocabularyIsNotForked:
     def test_validate_accepts_exactly_the_merge_lanes_vocabulary(self):
         for lane in MERGE_LANES:
             assert validate_requested_lane(lane) == lane
+
+    def test_the_literal_alias_matches_the_runtime_vocabulary(self):
+        """``MergeLane`` is a STATIC copy of a runtime tuple — pin the two.
+
+        ``MERGE_LANES`` stays the single runtime source of truth and every
+        check in the module keys on it, but it is ``tuple[str, ...]`` and
+        carries no static information, so the module spells the vocabulary a
+        second time as a ``Literal`` to type the resolved lane.  Nothing in
+        the type system ties the two together; this assertion is what does.
+        """
+        assert set(get_args(MergeLane)) == set(MERGE_LANES)
 
     def test_lane_source_vocabulary_is_closed(self):
         sources = {
