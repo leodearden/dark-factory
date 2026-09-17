@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.shadow_ruling import (
     DETECTABLE_GATES,
     FIRST_TRANCHE_CLASSES,
@@ -35,6 +39,7 @@ from escalation.shadow_ruling import (
     REVERSIBLE_ACTIONS,
     SHADOW_RULING_MARKER,
     ShadowRuling,
+    agreement_report,
     mechanically_gated,
     parse_shadow_ruling,
 )
@@ -361,3 +366,439 @@ class TestMechanicalGateSpot:
             if slug is not None
         }
         assert observed == DETECTABLE_GATES
+
+
+# ---------------------------------------------------------------------------
+# Archive round-trip and the weekly agreement report (step-5)
+# ---------------------------------------------------------------------------
+
+_MICROSECOND = timedelta(microseconds=1)
+_BRANCH_BEHIND = 'risk_identified_branch_behind_main'
+_VETO_STREAK = 'risk_identified_recovery_veto_streak'
+_SEMANTIC_COLLISION = 'design_concern_semantic_collision'
+
+
+def _ruling(ruling_class: str = _BRANCH_BEHIND, action: str = 'close_only') -> ShadowRuling:
+    return ShadowRuling(
+        ruling_class=ruling_class, proposed_action=action,
+        evidence='probe output quoted verbatim', confidence=0.8,
+    )
+
+
+def _stamped_note(ruling: ShadowRuling) -> str:
+    """A real note: the freshness predicate/probe PLUS the marker on its own
+    line. Never the marker alone — that would delete the contract the note
+    already carries."""
+    return f'{_FRESHNESS_NOTE}\n{ruling.to_note_line()}'
+
+
+class _Fixture:
+    """Builds records through the REAL queue: submit -> stamp_triage -> resolve.
+
+    Hand-written archive JSON would make every assertion below a statement about
+    this file's beliefs rather than about production code paths — and the
+    load-bearing premise of the whole measurement is precisely that the real
+    paths preserve the stamp into the archive.
+    """
+
+    def __init__(self, tmp_path: Path, seq: int = 0):
+        self.queue = EscalationQueue(tmp_path / 'escalations')
+        self._seq = seq
+
+    def submit(
+        self, *, category: str = 'risk_identified', agent_role: str = 'claude-task-1-implementer',
+        resolution_action: str | None = None,
+    ) -> Escalation:
+        self._seq += 1
+        record = Escalation(
+            id=f'esc-5374-{self._seq}', task_id='5374', agent_role=agent_role,
+            severity='info', category=category, summary='shadow measurement subject',
+            level=2, resolution_action=resolution_action,
+        )
+        self.queue.submit(record)
+        return record
+
+    def stamp(self, record: Escalation, ruling: ShadowRuling, *, by: str) -> None:
+        stamped = self.queue.stamp_triage(
+            record.id, triaged_by=by, triage_note=_stamped_note(ruling),
+        )
+        assert stamped is not None, 'stamp_triage refused a pending record'
+
+    def resolve(self, record: Escalation, *, by: str, dismiss: bool = True) -> Escalation:
+        resolved = self.queue.resolve(
+            record.id, 'ruled', dismiss=dismiss, resolved_by=by,
+        )
+        assert resolved is not None
+        return resolved
+
+    def stamped_and_resolved(
+        self, ruling: ShadowRuling, *, observed_action: str | None, stamped_by: str = 'watcher-a',
+        resolved_by: str = 'interactive', category: str = 'risk_identified',
+        agent_role: str = 'claude-task-1-implementer',
+    ) -> Escalation:
+        record = self.submit(
+            category=category, agent_role=agent_role, resolution_action=observed_action,
+        )
+        self.stamp(record, ruling, by=stamped_by)
+        return self.resolve(record, by=resolved_by, dismiss=observed_action == 'close_only')
+
+    def report(self, *, since: datetime | None = None, until: datetime | None = None):
+        return agreement_report(
+            self.queue.queue_dir,
+            since=since or datetime(2000, 1, 1, tzinfo=UTC),
+            until=until or datetime(2100, 1, 1, tzinfo=UTC),
+        )
+
+
+class TestStampSurvivesIntoTheArchive:
+    """THE LOAD-BEARING PREMISE, asserted end to end on the real queue.
+
+    Everything downstream — the weekly count, the adoption threshold, the whole
+    measurement half of task 5374 — is worthless if `resolve` loses the stamp.
+    """
+
+    def test_archived_record_still_carries_the_marker_beside_the_outcome(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        ruling = _ruling()
+        record = fixture.stamped_and_resolved(
+            ruling, observed_action='close_only', stamped_by='watcher-a',
+            resolved_by='interactive',
+        )
+
+        archived_paths = [
+            p for p in iter_all_escalation_paths(fixture.queue.queue_dir)
+            if p.stem == record.id
+        ]
+        assert archived_paths, 'the resolved record vanished from the root+archive sweep'
+        assert 'archive' in archived_paths[0].parts, 'expected the record to have been archived'
+
+        reloaded = Escalation.from_json(archived_paths[0].read_text())
+        assert parse_shadow_ruling(reloaded.triage_note) == ruling
+        assert _FRESHNESS_NOTE in reloaded.triage_note, (
+            'the marker must COMPOSE with the freshness note, not replace it'
+        )
+        assert reloaded.triaged_by == 'watcher-a'
+        assert reloaded.resolved_by == 'interactive'
+        assert reloaded.resolved_at is not None
+        assert reloaded.resolution_action == 'close_only'
+        assert reloaded.status == 'dismissed', 'close_only dismisses rather than resolves'
+
+
+class TestAgreementBuckets:
+    def test_matching_action_is_agreed(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='close_only'), observed_action='close_only')
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (1, 0, 0)
+        assert klass.comparable == 1
+        assert klass.total == 1
+        assert klass.agreement_rate == 1.0
+
+    def test_differing_action_is_diverged(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='close_only'), observed_action='resume')
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 1, 0)
+        assert klass.agreement_rate == 0.0
+
+    @pytest.mark.parametrize('task_side', ['add_dependency', 'update_task_amendment', 'file_task'])
+    def test_task_side_proposals_are_not_comparable(self, tmp_path: Path, task_side: str):
+        """Three of the five reversible actions leave `resolution_action` unset.
+        Folding them into `diverged` would wrongly revert a class; folding them
+        into `agreed` would inflate it; dropping them would shrink the
+        denominator the threshold is read off without saying so."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action=task_side), observed_action=None)
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 1)
+        assert klass.comparable == 0
+        assert klass.total == 1
+
+    def test_the_comparable_denominator_is_reported_so_the_threshold_is_decidable(
+        self, tmp_path: Path,
+    ):
+        """"95% or better over at least 10 items" must be decidable from the
+        output alone — which needs the denominator, not only the rate."""
+        fixture = _Fixture(tmp_path)
+        for _ in range(3):
+            fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        fixture.stamped_and_resolved(_ruling(action='file_task'), observed_action=None)
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert klass.comparable == 3
+        assert klass.total == 4
+        assert klass.agreement_rate == 1.0
+
+    def test_agreement_rate_is_none_when_nothing_is_comparable(self, tmp_path: Path):
+        """A class whose proposals are all task-side is visibly NOT YET
+        MEASURABLE rather than falsely 0% or falsely 100%."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='add_dependency'), observed_action=None)
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert klass.agreement_rate is None
+
+    def test_classes_are_counted_separately(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(_BRANCH_BEHIND), observed_action='close_only')
+        fixture.stamped_and_resolved(
+            _ruling(_VETO_STREAK, action='resume'), observed_action='close_only',
+        )
+
+        report = fixture.report()
+        branch = report.for_class(_BRANCH_BEHIND)
+        veto = report.for_class(_VETO_STREAK)
+        assert branch is not None and veto is not None
+        assert branch.agreed == 1 and branch.diverged == 0
+        assert veto.agreed == 0 and veto.diverged == 1
+
+    def test_close_only_dismissed_records_are_counted(self, tmp_path: Path):
+        """`close_only` resolves with dismiss=True, so status is 'dismissed',
+        not 'resolved'. It is the MAJORITY outcome — a counter that only looked
+        at 'resolved' would be vacuous."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.status == 'dismissed'
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1
+
+
+class TestSelfResolvedBucket:
+    """The bucket task 5361 made necessary.
+
+    `escalation/src/escalation/classify.py::_HUMAN_RESOLVERS` contains
+    `escalation-watcher`, so a watcher that stamps a proposal and then closes
+    the record itself is read back in the SAME tier as a Leo ruling. Without
+    this bucket the session inflates its own class toward its own adoption
+    threshold, silently.
+    """
+
+    def test_watcher_is_classified_human_which_is_why_the_bucket_exists(self):
+        """The fact that makes the bucket load-bearing rather than defensive.
+        Pinned against the live function so that if the tier table ever stops
+        calling the watcher human, this fails and a reader is sent to re-judge
+        whether the bucket is still needed — instead of the justification
+        quietly rotting in a comment."""
+        assert classify_resolver_tier('escalation-watcher') == 'human'
+
+    def test_a_5361_shaped_self_close_is_self_resolved_not_agreed(self, tmp_path: Path):
+        """The exact shape: stamp as `escalation-watcher`, then close as
+        `escalation-watcher` with action='close_only'."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(_SEMANTIC_COLLISION, action='close_only'), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+
+        report = fixture.report()
+        assert report.self_resolved == 1
+        klass = report.for_class(_SEMANTIC_COLLISION)
+        assert klass is None or (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 0), (
+            'a self-close must not be counted as an agreement even though its '
+            'observed action matches the stamped proposal'
+        )
+
+    def test_a_self_close_does_not_move_the_rate(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(_SEMANTIC_COLLISION, action='close_only'), observed_action='resume',
+            stamped_by='watcher-a', resolved_by='interactive',
+        )
+        before = fixture.report().for_class(_SEMANTIC_COLLISION)
+        assert before is not None
+
+        fixture.stamped_and_resolved(
+            _ruling(_SEMANTIC_COLLISION, action='close_only'), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+        after_report = fixture.report()
+        after = after_report.for_class(_SEMANTIC_COLLISION)
+        assert after is not None
+        assert after.agreement_rate == before.agreement_rate
+        assert (after.agreed, after.diverged, after.total) == (
+            before.agreed, before.diverged, before.total,
+        )
+        assert after_report.self_resolved == 1
+
+    def test_an_independent_adjudicator_stays_comparable(self, tmp_path: Path):
+        """The NEGATIVE, so the bucket cannot over-capture: stamped by the AUTO
+        watcher and resolved by the interactive watcher is the legitimate
+        independent-adjudicator case."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only',
+            stamped_by='orchestrator-escalation-watcher-auto', resolved_by='escalation-watcher',
+        )
+
+        report = fixture.report()
+        assert report.self_resolved == 0
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1
+
+    def test_two_none_attributions_are_not_self_agreement(self, tmp_path: Path):
+        """`None == None` must not read as a session agreeing with itself."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit(resolution_action='close_only')
+        stamped = fixture.queue.stamp_triage(
+            record.id, triaged_by=None, triage_note=_stamped_note(_ruling()),
+        )
+        assert stamped is not None and stamped.triaged_by is None
+        resolved = fixture.queue.resolve(record.id, 'ruled', dismiss=True, resolved_by=None)
+        assert resolved is not None and resolved.resolved_by is None
+
+        report = fixture.report()
+        assert report.self_resolved == 0
+
+
+class TestExclusionsAndWindow:
+    def test_pending_records_are_unresolved_never_diverged(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit(resolution_action=None)
+        fixture.stamp(record, _ruling(), by='watcher-a')
+
+        report = fixture.report()
+        assert report.unresolved == 1
+        assert report.for_class(_BRANCH_BEHIND) is None, (
+            'a still-open record must not appear in any outcome bucket'
+        )
+
+    def test_a_gated_stamp_is_reported_not_averaged_away(self, tmp_path: Path):
+        """A stamp the watcher should never have produced — made visible rather
+        than folded into a rate."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+        )
+
+        report = fixture.report()
+        assert report.gated_stamps == 1
+        assert report.for_class(_BRANCH_BEHIND) is None
+
+    def test_a_gated_stamp_by_role_is_also_reported(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', agent_role='orchestrator-deterministic',
+        )
+        assert fixture.report().gated_stamps == 1
+
+    def test_gating_wins_over_self_resolution(self, tmp_path: Path):
+        """Order is part of the contract: gated -> self_resolved -> ... so a
+        gated stamp is never ALSO counted somewhere that reads as a sample."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+
+        report = fixture.report()
+        assert report.gated_stamps == 1
+        assert report.self_resolved == 0
+
+    def test_a_record_resolved_inside_the_window_is_counted_on_both_edges(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        klass = fixture.report(since=at, until=at).for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1, 'both window edges are inclusive'
+
+    def test_a_record_resolved_before_the_window_is_excluded(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        report = fixture.report(since=at + _MICROSECOND, until=at + timedelta(days=1))
+        assert report.for_class(_BRANCH_BEHIND) is None
+        assert report.classes == ()
+
+    def test_a_record_resolved_after_the_window_is_excluded(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        report = fixture.report(since=at - timedelta(days=1), until=at - _MICROSECOND)
+        assert report.for_class(_BRANCH_BEHIND) is None
+
+    def test_a_cascade_resolver_is_reported_in_its_tier_not_as_a_human_agreement(
+        self, tmp_path: Path,
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', resolved_by='l2-cascade:esc-9-1',
+        )
+
+        report = fixture.report()
+        assert report.for_class(_BRANCH_BEHIND) is None, (
+            'a cascade close is not a human ruling and must not inflate the rate'
+        )
+        assert report.resolver_tiers.get('cascade') == 1
+
+    def test_a_sweep_resolver_is_reported_in_its_tier(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', resolved_by='auto-dismissed',
+        )
+
+        report = fixture.report()
+        assert report.for_class(_BRANCH_BEHIND) is None
+        assert report.resolver_tiers.get('reaper-sweep') == 1
+
+    def test_human_resolutions_are_reported_in_the_human_tier(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert fixture.report().resolver_tiers.get('human') == 1
+
+
+class TestSweepRobustness:
+    def test_a_missing_queue_dir_yields_an_empty_report_without_raising(self, tmp_path: Path):
+        report = agreement_report(
+            tmp_path / 'does-not-exist',
+            since=datetime(2000, 1, 1, tzinfo=UTC), until=datetime(2100, 1, 1, tzinfo=UTC),
+        )
+        assert report.classes == ()
+        assert (report.gated_stamps, report.self_resolved, report.unresolved) == (0, 0, 0)
+
+    def test_an_empty_queue_dir_yields_an_empty_report(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+        assert fixture.report().classes == ()
+
+    def test_a_record_with_no_marker_is_skipped_silently(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit(resolution_action='close_only')
+        fixture.queue.stamp_triage(record.id, triaged_by='watcher-a', triage_note=_FRESHNESS_NOTE)
+        fixture.resolve(record, by='interactive')
+
+        report = fixture.report()
+        assert report.classes == ()
+        assert (report.gated_stamps, report.self_resolved, report.unresolved) == (0, 0, 0)
+
+    def test_an_unstamped_record_is_skipped_silently(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit(resolution_action='close_only')
+        fixture.resolve(record, by='interactive')
+        assert fixture.report().classes == ()
+
+    def test_the_report_and_its_class_rows_are_frozen(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        report = fixture.report()
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            report.gated_stamps = 5  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            klass.agreed = 5  # type: ignore[misc]
