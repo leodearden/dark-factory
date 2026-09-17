@@ -33,14 +33,20 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import httpcore
 import httpx
 import pytest
+from _dashboard_helpers import apply_isolated_env
+from fastapi import FastAPI
+from starlette.datastructures import State
 
 from dashboard import http_pool
+from dashboard.app import lifespan
 
 # The shipped pool's shape, for a small install where
 # ``app.py::_HTTP_MIN_CONNECTIONS`` is the binding term. Copied as literals
@@ -805,4 +811,235 @@ class TestPoolSaturationAlarm:
         assert len(_messages(caplog, logging.WARNING)) == 1, (
             'saturating again after a recovery must warn again; a latch that never '
             're-arms reports only the first incident a process ever sees'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lifespan wiring
+#
+# Driven through `lifespan` directly rather than a TestClient — the recipe from
+# tests/test_app_http_limits.py::TestLifespanWiresTheLimits. The conftest
+# `client` fixture is function-scoped while ~15 modules hold module-scoped
+# TestClient(app) fixtures that clobber app.state, so a TestClient here would
+# be asserting against whichever app.state won the race.
+# ---------------------------------------------------------------------------
+
+
+class _StateThatNeverReturnsTheClient(State):
+    """An ``app.state`` whose ``http_client`` READS hand back a sentinel.
+
+    This is what makes task 3771's split-binding invariant falsifiable rather
+    than merely asserted. ``app.state`` is one mutable namespace shared by
+    every overlapping lifespan over an app, so a handle read back from it can
+    belong to someone else — which is why handles must bind to ARGUMENTS.
+    Against this state, a call site that passed ``app.state.http_client``
+    captures the sentinel and fails; one that passed its local captures the
+    real client and passes.
+
+    Writes still land normally, so the rest of ``lifespan`` is untouched. Only
+    request handlers read this key back, and none of them run here.
+    """
+
+    def __getattr__(self, key: str) -> Any:
+        if key == 'http_client':
+            return _NOT_THE_LIFESPANS_CLIENT
+        return super().__getattr__(key)
+
+
+_NOT_THE_LIFESPANS_CLIENT = object()
+
+
+def _task_state(task: asyncio.Task | None) -> dict[str, bool]:
+    """What was true of *task* at this instant."""
+    return {
+        'exists': task is not None,
+        'done': task is not None and task.done(),
+        'cancelled': task is not None and task.cancelled(),
+    }
+
+
+@dataclass
+class _LifespanRun:
+    """What one full lifespan did with its reaper."""
+
+    app: FastAPI
+    constructed: list[httpx.AsyncClient] = field(default_factory=list)
+    reaper_client: object = None
+    reaper_task: asyncio.Task | None = None
+    at_detached_reap: dict[str, bool] = field(default_factory=dict)
+    at_aclose: dict[str, bool] = field(default_factory=dict)
+
+
+async def _run_lifespan_with_a_recording_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app: FastAPI | None = None
+) -> _LifespanRun:
+    """Run one full lifespan, observing the reaper task at each teardown step.
+
+    The two ``at_*`` readings are OBSERVATIONS of the running system rather
+    than readings of ``lifespan``'s source, so the ordering claims they support
+    survive a later refactor of it — the technique
+    ``tests/test_app_lifespan_reap.py`` uses for the same reason.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    run = _LifespanRun(app=app if app is not None else FastAPI(lifespan=lifespan))
+    real_async_client = httpx.AsyncClient
+
+    def _recording_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        # A REAL client, so the pool and aclose() behave normally; only the
+        # moment of closing is instrumented.
+        client = real_async_client(*args, **kwargs)
+        run.constructed.append(client)
+        real_aclose = client.aclose
+
+        async def _observing_aclose() -> None:
+            run.at_aclose = _task_state(run.reaper_task)
+            return await real_aclose()
+
+        client.aclose = _observing_aclose
+        return client
+
+    async def _recording_reaper_loop(client: object, *args: Any, **kwargs: Any) -> None:
+        run.reaper_client = client
+        run.reaper_task = asyncio.current_task()
+        await asyncio.Event().wait()  # park until shutdown cancels it
+
+    async def _observing_reap_detached() -> None:
+        run.at_detached_reap = _task_state(run.reaper_task)
+
+    with (
+        patch('dashboard.app.httpx.AsyncClient', _recording_async_client),
+        patch('dashboard.app.reaper_loop', _recording_reaper_loop),
+        patch('dashboard.app.reap_detached_refreshes', _observing_reap_detached),
+        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+    ):
+        async with lifespan(run.app):
+            await _step_until(
+                lambda: run.reaper_task is not None, what='the reaper task starting'
+            )
+    return run
+
+
+class TestLifespanWiresTheReaper:
+    """A reaper nobody starts, or one pointed at the wrong pool, fixes nothing.
+
+    The module above proves the reaper WORKS; this proves it is WIRED — the
+    same pairing ``test_app_http_limits.py`` makes between the pure sizing
+    helper and the lifespan that must actually pass its result.
+    """
+
+    async def test_the_reaper_runs_against_the_client_the_lifespan_constructed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_lifespan_with_a_recording_reaper(tmp_path, monkeypatch)
+
+        assert len(run.constructed) == 1, (
+            f'lifespan must construct exactly one shared client, got {run.constructed}'
+        )
+        assert run.reaper_client is run.constructed[0], (
+            'the reaper must sweep the pool the rest of the app is using; against a '
+            'client of its own it would run forever and reclaim nothing'
+        )
+        assert run.reaper_client is run.app.state.http_client
+
+    async def test_the_reaper_binds_to_the_argument_not_to_app_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task 3771's split-binding invariant: handles bind to ARGUMENTS.
+
+        Stated in full in ``_metrics_loop``'s docstring and pinned for the
+        other two loops by ``tests/test_lifespan_resource_binding.py``. An
+        ``app.state`` read-back would hand the reaper an overlapping
+        lifespan's client — closed, in this suite — and the sweep would fail
+        silently for the rest of the process.
+        """
+        app = FastAPI(lifespan=lifespan)
+        app.state = _StateThatNeverReturnsTheClient()
+
+        run = await _run_lifespan_with_a_recording_reaper(tmp_path, monkeypatch, app=app)
+
+        assert run.reaper_client is run.constructed[0], (
+            'the reaper was handed something other than the local http_client — an '
+            'app.state read-back binds it to whichever lifespan wrote there last'
+        )
+
+    async def test_shutdown_leaves_no_reaper_task_pending(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_lifespan_with_a_recording_reaper(tmp_path, monkeypatch)
+
+        assert run.reaper_task is not None
+        assert run.reaper_task.cancelled(), (
+            'the reaper must be cancelled AND awaited by the lifespan that started '
+            'it; a task left pending outlives its client and, since every '
+            'TestClient(app) runs its own loop, outlives the loop it was bound to'
+        )
+
+    async def test_the_reaper_stops_before_the_detached_cache_reap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same reason the existing two cancels sit above it.
+
+        ``reap_detached_refreshes`` makes one pass over a snapshot, not a
+        barrier. A poller still running behind it can start a fresh bypass the
+        reap has already walked past.
+        """
+        run = await _run_lifespan_with_a_recording_reaper(tmp_path, monkeypatch)
+
+        assert run.at_detached_reap.get('cancelled'), (
+            'the reaper must already be cancelled when reap_detached_refreshes() '
+            f'runs; observed at that instant: {run.at_detached_reap}'
+        )
+
+    async def test_the_reaper_stops_before_the_shared_client_is_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sweep unwinding against a closed pool is the failure this prevents."""
+        run = await _run_lifespan_with_a_recording_reaper(tmp_path, monkeypatch)
+
+        assert run.at_aclose.get('cancelled'), (
+            'the reaper must already be cancelled when http_client.aclose() is '
+            f'entered; observed at that instant: {run.at_aclose}'
+        )
+
+
+class TestWiringTheReaperKeepsTheExitPathGuarantee:
+    """Adding a third task must not strand what the lifespan opened.
+
+    ``tests/test_app_lifespan_reap.py::TestLifespanClosesItsResourcesEvenIfTheReapFails``
+    pins this for the teardown as it stood. The reaper's cancel goes inside the
+    same ``try:``, so a raise from anywhere above must still reach
+    ``finally: _close_each(...)`` — otherwise the hook added here would be
+    capable of causing the very ``RuntimeError: Event loop is closed`` that
+    ``lifespan``'s docstring records for task 3466.
+    """
+
+    _BOOM = 'the detached reap itself blew up'
+
+    async def test_a_failing_teardown_step_still_closes_the_shared_client(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        apply_isolated_env(monkeypatch, tmp_path)
+        # Held, not inlined: app.state is the observable and must outlive the
+        # context.
+        app = FastAPI(lifespan=lifespan)
+
+        with (
+            patch(
+                'dashboard.app.reap_detached_refreshes',
+                new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
+            ),
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(RuntimeError, match=self._BOOM),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert app.state.http_client.is_closed, (
+            'aclose() is LAST in _close_each, so this one observable stands for the '
+            'burndown store, the metrics store and the DB pool too'
         )
