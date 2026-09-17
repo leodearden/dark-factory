@@ -4253,12 +4253,21 @@ class TestSessionResumeStorm:
     async def test_storm_l1_never_sends_the_operator_to_ntp(self, harness: Harness):
         """The misdirection task 3728 removed must not come back (INV-2).
 
-        Pinned two ways, deliberately. BEHAVIOURALLY: neither the detail nor
-        the suggested action of an actually-filed L1 may mention clock skew or
-        NTP — the streak's feeder is archive-restore failure, which has nothing
-        to do with either. MECHANICALLY: the literal that used to carry it is
-        absent from harness.py at all, so a regression fails a test here rather
-        than only the task's delivered-check gate.
+        Pinned where the misdirection would actually reach an operator: in the
+        text of an L1 that was really filed. Neither its detail nor its
+        suggested action may mention clock skew or NTP — the streak's feeder is
+        archive-restore failure, which has nothing to do with either.
+
+        Deliberately NOT pinned by searching harness.py's source for the
+        literal that used to carry it. That assertion matched raw module text,
+        comments included, so it failed in both directions at once: harness.py
+        discusses clock skew on purpose (the monotonic-clock rationale in the
+        rolling-window decay, and in ``note_resume_failed``), so a legitimate
+        comment would have turned the suite red for no defect, while any
+        reworded misdirection — "check NTP sync", "the wall clock may have
+        jumped" — is the regression this row exists to stop and would have
+        stayed green. The task's delivered-check gate is where that literal's
+        absence is enforced, and it runs on every task.
         """
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=1, storm_window_secs=60,
@@ -4269,11 +4278,6 @@ class TestSessionResumeStorm:
         esc = harness._escalation_queue.submit.call_args.args[0]
         operator_text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
         assert not re.search('clock skew|NTP', operator_text, re.IGNORECASE)
-
-        import inspect  # noqa: PLC0415
-
-        import orchestrator.harness as harness_mod  # noqa: PLC0415
-        assert 'clock skew (NTP)' not in inspect.getsource(harness_mod)
 
 
 @pytest.mark.asyncio
