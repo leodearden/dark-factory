@@ -8599,6 +8599,13 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assert call_req.branch.full_name == 'task/42'
         assert call_es is event_store_mock
 
+        # task-1923 belt-and-braces rebind, re-pinned by task 5461: the merge
+        # worker resolves the queued branch by NAME (merge_to_main ->
+        # resolve_queued_branch_ref), so dropping this rebind is silent.
+        workflow.git_ops.rebind_branch_to_head.assert_awaited_once_with(
+            workflow.worktree, 'task/42',
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestEscalationServerUsesEnqueueHelper — step-13 test
