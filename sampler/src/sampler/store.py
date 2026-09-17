@@ -26,15 +26,20 @@ production caller of its own -- see its docstring.
 Retention policy
 ----------------
 - cleanup_old(now): DELETE rows outside ±30 days of now — the future half
-  prunes clock-skew rows a past-only cutoff can never reach. Called every tick, but
-  gated by meta.last_cleanup_ts to run at most once per 24h — the DELETE is a
-  full table SCAN and cannot be index-backed (see cleanup_old's docstring for
-  the measurement and the rejected alternative).
+  prunes clock-skew rows a past-only cutoff can never reach. Called every
+  tick, gated by meta.last_cleanup_ts to at most once per 24h because the
+  DELETE is a full table SCAN and cannot be index-backed.
 - maybe_vacuum(now): VACUUM at most once per 24h, gated by meta.last_vacuum_ts
-  AND by there being >=10% free pages to reclaim — at the 30-day size the
-  rewrite costs 15.5s and a steady-state day reclaims 0.17%, because free pages
-  are reused (see maybe_vacuum's docstring for both measurements).
+  AND by a floor on the free-page fraction, because at the 30-day size a
+  steady-state VACUUM stalls a tick for seconds to reclaim almost nothing.
   VACUUM runs outside a transaction to satisfy SQLite constraints.
+- Both gates read _is_due, which treats a stamp in the FUTURE as due — a
+  forward clock step must not be able to disable either sweep.
+
+Every number behind those two policies lives on the method that implements it
+(``cleanup_old``, ``maybe_vacuum``): the scan cost and the rejected ts index,
+the VACUUM's cost and what a steady-state day actually reclaims. They are not
+restated here, so there is one copy to keep true.
 
 The 30-day window is what the threshold calibration in PRD
 ``plans/load-throttle-harmonisation-prd.md`` D11 needs: a fortnight of

@@ -345,13 +345,12 @@ async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking
     rows fall outside the window.  Those cards then return the placeholder
     shape, where the unbounded query kept serving hour-old values.
 
-    That is INTENDED, and it is why the anchor stays global.  /api/load is
-    polled every 5 s and the frontend renders ``current`` as the live number,
-    so a value last written over an hour ago is not a stale reading of the
-    host's load — it is a reading of a collector that has stopped, and saying
-    "no data" is the honest answer.  The whole-sampler-down case above is
-    genuinely different: there the anchor moves with the data, so nothing is
-    claimed to be fresher than anything else.
+    That blanking is INTENDED rather than incidental; the argument for it, and
+    why the anchor stays global, lives with the statement it constrains —
+    ``dashboard/src/dashboard/data/load.py::_ANCHOR_SQL``.  The
+    whole-sampler-down case above is genuinely different: there the anchor
+    moves with the data, so nothing is claimed to be fresher than anything
+    else.
     """
     db_path = tmp_path / 'partial-degrade.db'
     conn_sync = sqlite3.connect(str(db_path))
@@ -393,8 +392,8 @@ async def test_the_anchor_is_computed_over_the_allowlist_not_the_whole_table(
     ``runqueue_read_ok``, ``own_cpu_some10:<leaf>`` and ``own_read_ok:<leaf>``
     alongside the nine metrics KNOWN_METRICS admits, and none of those four is
     served here (PRD section 9 dropped the load-view panel).  The anchor
-    subquery therefore carries its own ``WHERE metric IN (...)``, which is the
-    whole reason the statement binds the allowlist TWICE (_QUERY_PARAMS).
+    subquery therefore carries its own ``WHERE metric IN (...)``, spelling the
+    same named allowlist group the outer filter uses.
 
     Without that scoping the partial-degrade semantics the module docstring
     claims invert: a still-ticking load group would advance the anchor past

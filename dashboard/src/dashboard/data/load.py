@@ -19,14 +19,12 @@ placeholder shape
 
 TWO things produce that placeholder, and only the first is "absent from the
 DB".  The second is a metric whose newest row is older than
-``_RECENCY_SLACK_SECONDS`` before the newest row of ANY served metric — see
-the recency-bound note below.  ``sampler/__main__.py`` degrades each
-collection group independently, so one group can stall while its siblings
-keep writing every 5 s, and after the slack elapses the stalled group's cards
-go to the placeholder.  That is intended: /api/load is polled every 5 s and
-the frontend renders ``current`` as the live number, so an hour-old value is
-not a stale reading of host load but a reading of a collector that has
-stopped, and "no data" is the honest answer.  Pinned by
+``_RECENCY_SLACK_SECONDS`` before the newest row of ANY served metric — so a
+collection group that stalls while its siblings keep ticking goes to the
+placeholder once the slack elapses.  That is intended, and it is the caller-
+facing consequence of a query design whose reasoning and measurements have
+one home: ``dashboard/src/dashboard/data/load.py::_ANCHOR_SQL``.  Read that
+before changing the bound.  Pinned by
 ``test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking``.
 
 PSI window columns
@@ -113,7 +111,13 @@ def _default_result() -> dict[str, dict[str, Any]]:
 # Public API
 # ---------------------------------------------------------------------------
 
-_PLACEHOLDERS_SQL = ','.join('?' * len(KNOWN_METRICS))
+# The allowlist as NAMED parameters, bound once by name.  The statement below
+# spells this group twice -- once for the anchor subquery, once for the outer
+# filter -- and with positional `?` that forced the caller to repeat the tuple
+# as many times as the statement happened to contain the group, a coupling
+# invisible at both sites and silently misaligning every parameter if either
+# changed.  Named parameters let the same group appear any number of times.
+_PLACEHOLDERS_SQL = ','.join(f':m{i}' for i in range(len(KNOWN_METRICS)))
 
 # Slack, in seconds, for the recency bound below.  The sparkline is 60 samples
 # at the sampler's 5s tick = 300s, so an hour is 12x headroom: it absorbs
@@ -144,8 +148,10 @@ _RECENCY_SLACK_SECONDS = 3600
 # difference shows in the PARTIAL degrade: one collection group stalls while
 # its siblings keep writing, the siblings advance the anchor, and after the
 # slack the stalled group's cards go to the placeholder.  Kept global
-# deliberately -- see the module docstring for why "no data" is the honest
-# answer there, and the test that pins it.  A per-metric bound
+# deliberately.  /api/load is polled every 5 s and the frontend renders
+# `current` as the live number, so a value last written an hour ago is not a
+# stale reading of host load -- it is a reading of a collector that has
+# STOPPED, and "no data" is the honest answer.  A per-metric bound
 # (`ts >= (SELECT MAX(ts) FROM samples s2 WHERE s2.metric = samples.metric)`)
 # would instead report each stalled metric's last value as current forever,
 # and makes the scalar subquery correlated.
@@ -187,12 +193,7 @@ WHERE rn <= 60
 ORDER BY metric, ts ASC
 """
 
-# TWO placeholder groups, so the allowlist is bound TWICE -- once for the anchor
-# subquery and once for the outer filter. Named rather than spelled
-# `KNOWN_METRICS + KNOWN_METRICS` at the call site, where the doubling reads as
-# a typo and a "cleanup" back to a single tuple would silently misalign every
-# parameter in the statement.
-_QUERY_PARAMS: tuple[str, ...] = KNOWN_METRICS * 2
+_QUERY_PARAMS: dict[str, str] = {f'm{i}': m for i, m in enumerate(KNOWN_METRICS)}
 
 
 async def get_load_metrics(
