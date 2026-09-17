@@ -139,6 +139,29 @@ def _assert_only_the_target_finding_moved(before: dict[str, Any], after: dict[st
     }
 
 
+async def _assert_refused_before_any_io(
+    journal: Any, memory: FakeMemoryLookup, *, before: dict[str, Any], **call: Any
+) -> dict[str, Any]:
+    """Drive one repair call and pin that it refused without touching anything.
+
+    A shape gate earns its place at the top of the function only if it fires
+    ahead of BOTH reads, so the three facts that say so are asserted together:
+    no Mem0 lookup, no journal read, and a byte-identical durable blob. Returns
+    the outcome so the caller asserts which refusal it was.
+    """
+    original_get_run = journal.get_run
+    spy = AsyncMock(wraps=original_get_run)
+    journal.get_run = spy
+    try:
+        outcome = await citation_repair.repair_memory_citation(journal, memory, **call)
+    finally:
+        journal.get_run = original_get_run
+    assert memory.calls == []
+    assert spy.await_count == 0
+    assert _dump(await journal.get_run(RUN_ID)) == before
+    return outcome
+
+
 class TestRepairHappyPath:
     """A confirmed-dangling citation on a completed run is re-pointed durably."""
 
@@ -469,6 +492,191 @@ class TestRepairCorroborationGates:
             assert outcome['error_type'] == 'ReconCitationVerificationError'
             # The raised type is carried as a FACT, not folded into prose.
             assert outcome['exception_type'] == 'TimeoutError'
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+
+class TestRepairReasonGate:
+    """The two defect classes assert OPPOSITE facts, and each one is checked.
+
+    ``reason`` is written verbatim into the durable ``citation_repairs``
+    record, so it is a factual claim about the citation rather than a mode
+    switch. Each class therefore has its own corroboration and its own refusal,
+    and each refusal's hint names the OTHER class — an operator who picked the
+    wrong one is told which applies instead of having to guess.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrong_memory_on_an_absent_victim_is_refused(self, tmp_path):
+        """An id that does not resolve is the OTHER class, not this one.
+
+        The exact inverse of ``citation_not_dangling``. Stamping
+        ``reason: wrong_memory`` on an id that does not exist would put a false
+        statement into the one durable record of the repair.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['error'] == 'citation_not_resolving'
+            assert outcome['error_type'] == 'ReconCitationNotResolving'
+            assert 'status' not in outcome
+            assert outcome['target_run_id'] == RUN_ID
+            assert outcome['finding_id'] == 'f-1'
+            assert outcome['memory_id'] == DANGLING
+            # The hint must route the operator to the class that DOES apply.
+            assert 'memory_not_found' in outcome['hint']
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reason_kwargs',
+        [{}, {'reason': 'memory_not_found'}],
+        ids=['default', 'explicit'],
+    )
+    async def test_memory_not_found_on_a_live_victim_is_still_refused(
+        self, tmp_path, reason_kwargs
+    ):
+        """The pre-existing gate is unchanged, and it is still the DEFAULT.
+
+        Adding a second class must not widen the first one: an unqualified call
+        still cannot touch a citation that resolves.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                **reason_kwargs,
+            )
+
+            assert outcome['error'] == 'citation_not_dangling'
+            assert outcome['error_type'] == 'ReconCitationNotDangling'
+            # Mirrored pointer: this operator wanted the other class.
+            assert 'wrong_memory' in outcome['hint']
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_reason_is_refused_before_any_io(self, tmp_path):
+        """A typo must be a loud refusal, never a silent wrong corroboration.
+
+        The MCP tool gets schema-level rejection from its ``Literal`` type, but
+        the operator script and any in-process caller have no such boundary. A
+        ``reason`` that fell through to whichever branch the ``if`` happened to
+        default to would perform the WRONG check — the worst failure this path
+        has — so the enum is re-checked here, and refuses ahead of both reads.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='detach',
+            )
+
+            assert outcome['error'] == 'invalid_reason'
+            assert outcome['error_type'] == 'ReconCitationInvalidReason'
+            assert outcome['reason'] == 'detach'
+            assert outcome['accepted'] == ['memory_not_found', 'wrong_memory']
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('reason', 'justification'),
+        [('memory_not_found', None), ('wrong_memory', WHY_WRONG)],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    async def test_raised_victim_lookup_licenses_neither_class(
+        self, tmp_path, reason, justification
+    ):
+        """A RAISED read is unknown: neither confirmed-absent nor confirmed-present.
+
+        The third branch wins over BOTH classes. Collapsing a Qdrant blip into
+        either verdict would let a transient backend failure license exactly one
+        of them at random.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: TimeoutError('qdrant read timed out'), SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'verification_error'
+            assert outcome['error_type'] == 'ReconCitationVerificationError'
+            assert outcome['exception_type'] == 'TimeoutError'
+            assert outcome['role'] == 'victim'
+            assert 'status' not in outcome
             assert _dump(await journal.get_run(RUN_ID)) == before
         finally:
             await journal.close()
