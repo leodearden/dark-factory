@@ -10,6 +10,7 @@ prd: plans/inv12-exceptions-owned-or-ratified-prd.md
 schema_version: 1
 tasks:
   - label: "α"
+    task_id: 5599
     title: "INV-12 exceptions-owned-or-ratified in the pinned invariant sites"
     capabilities:
       - name: "inv12-heading-defines-the-slug"
@@ -29,6 +30,7 @@ tasks:
           paths: ["docs/legibility/design-invariants-fixtures.md"]
           expect: present
   - label: "β"
+    task_id: 5600
     title: "shared.governed_exceptions vocabulary + shared.ratchet multiset kernel"
     capabilities:
       - name: "governed-exceptions-declaration-fn"
@@ -54,6 +56,7 @@ tasks:
           kind: manual
           reason: "absence of an add-key path is a property of the API surface, judged by β's tests"
   - label: "γ1"
+    task_id: 5601
     title: "Inline suppression scanner, consumer model and multiset ratchet CLI"
     capabilities:
       - name: "inline-ratchet-cli"
@@ -77,6 +80,7 @@ tasks:
           kind: manual
           reason: "rejection quality is judged by γ1's fixture scenarios"
   - label: "γ2"
+    task_id: 5602
     title: "Exception register: static discovery, closed-world Policy check, report"
     capabilities:
       - name: "register-cli"
@@ -96,6 +100,7 @@ tasks:
           paths: ["docs/legibility/exception-ratifications.yaml"]
           expect: present
   - label: "δ"
+    task_id: 5603
     title: "INV-12 day-one rulings (operator decision)"
     capabilities:
       - name: "day-one-rulings-on-main"
@@ -107,6 +112,7 @@ tasks:
           paths: ["docs/legibility/exception-ratifications.yaml"]
           expect: present
   - label: "ε1"
+    task_id: 5604
     title: "Declare the governed lists of orchestrator/ and scripts/"
     capabilities:
       - name: "orchestrator-declarations"
@@ -124,6 +130,7 @@ tasks:
           kind: manual
           reason: "scripts/tests/ already carries governed_exceptions( in γ2's own register tests before ε1 lands, so no grep there is specific to ε1; judged from exception_register.py --report"
   - label: "ε2"
+    task_id: 5605
     title: "Declare the governed lists of shared/, fused-memory/ and dashboard/"
     capabilities:
       - name: "fused-memory-declarations"
@@ -149,6 +156,7 @@ tasks:
           kind: manual
           reason: "shared/tests/ already carries governed_exceptions( in β's own tests before ε2 lands, so no grep there is specific to ε2; judged from exception_register.py --report"
   - label: "λ"
+    task_id: 5606
     title: "Tell implementer and reviewer roles the INV-12 forms and blockers"
     capabilities:
       - name: "role-prompts-carry-the-forms"
@@ -160,6 +168,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/agents/roles.py"]
           expect: present
   - label: "κ1"
+    task_id: 5607
     title: "Seed the inline-suppression baseline on main (operator action)"
     capabilities:
       - name: "baseline-committed"
@@ -171,6 +180,7 @@ tasks:
           paths: ["scripts/inline_suppression_baseline.json"]
           expect: present
   - label: "ζb"
+    task_id: 5609
     title: "Apply the day-one rulings to declarations, class table and baseline"
     capabilities:
       - name: "no-disposition-cites-the-docket"
@@ -180,6 +190,7 @@ tasks:
           kind: manual
           reason: "the pattern embeds δ's task id, unknown until commit_planning; judged from --report"
   - label: "η"
+    task_id: 5608
     title: "Owner-liveness sweep, timer pair and installer"
     capabilities:
       - name: "sweep-with-own-key-idempotence"
@@ -191,6 +202,7 @@ tasks:
           paths: ["scripts/exception_owner_sweep.py"]
           expect: present
   - label: "κ2"
+    task_id: 5610
     title: "Activate the owner-liveness sweep timer (operator action)"
     capabilities:
       - name: "timer-enabled-on-host"
@@ -200,6 +212,7 @@ tasks:
           kind: manual
           reason: "systemd user-unit state is outside the tree; θ's real-report signal proves it"
   - label: "θ"
+    task_id: 5611
     title: "INV-12 integration gate: real-tree report, planted red, live dry-run, runbook"
     capabilities:
       - name: "operations-runbook-section"
