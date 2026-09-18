@@ -447,3 +447,133 @@ class TestPendingSinceThroughStatusWriters:
         )
         assert result['tasks'][0]['newStatus'] == TaskStatus.PENDING
         assert await self._anchor(backend, project_root, dto['id']) is None
+
+
+class TestPendingSinceThroughTheAuditWriter:
+    """The audit-carrying writer stamps identically (task 3816, D1).
+
+    ``_do_set_task_status_write`` routes to ``set_status_and_stamp_audit``
+    whenever ``audit_fields`` is non-empty, and ``audit_fields`` is populated
+    exactly by ``reopen_reason``/``reopen_from``/``reopen_at`` and
+    ``done_provenance``. A reopen IS a ``blocked|cancelled -> pending`` move —
+    the highest-value transition class for this contract, and the one carrying
+    D3's only reset. Wiring only the PRD-named ``set_task_status`` would leave
+    every reopened task silently anchorless.
+    """
+
+    _AUDIT = {
+        'reopen_reason': 'requeued by the steward',
+        'reopen_from': 'cancelled',
+        'reopen_at': '2026-09-18T11:59:00.000000+00:00',
+    }
+
+    async def _metadata(self, backend, project_root, task_id) -> dict:
+        one = await backend.get_task(task_id, project_root=project_root)
+        return one['metadata'] or {}
+
+    @pytest.mark.asyncio
+    async def test_reopen_from_cancelled_resets_anchor_and_keeps_audit(
+        self, backend, tmp_path
+    ):
+        """The D3 reset and the audit merge coexist in the one blob."""
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='reopened')
+        original = (await self._metadata(backend, project_root, dto['id']))[
+            'pending_since'
+        ]
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.CANCELLED, project_root=project_root
+        )
+
+        await backend.set_status_and_stamp_audit(
+            str(dto['id']), TaskStatus.PENDING, project_root,
+            audit_fields=dict(self._AUDIT),
+        )
+
+        merged = await self._metadata(backend, project_root, dto['id'])
+        assert merged['pending_since'] > original, 'un-cancelling must reset (D3)'
+        for key, value in self._AUDIT.items():
+            assert merged[key] == value, f'audit field {key} lost to the stamp'
+
+    @pytest.mark.asyncio
+    async def test_reopen_from_blocked_keeps_the_existing_anchor(
+        self, backend, tmp_path
+    ):
+        """Not every reopen is a reset — only un-cancelling is."""
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='unblocked')
+        original = (await self._metadata(backend, project_root, dto['id']))[
+            'pending_since'
+        ]
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.BLOCKED, project_root=project_root
+        )
+
+        await backend.set_status_and_stamp_audit(
+            str(dto['id']), TaskStatus.PENDING, project_root,
+            audit_fields={**self._AUDIT, 'reopen_from': 'blocked'},
+        )
+
+        merged = await self._metadata(backend, project_root, dto['id'])
+        assert merged['pending_since'] == original
+        assert merged['reopen_reason'] == self._AUDIT['reopen_reason']
+
+    @pytest.mark.asyncio
+    async def test_done_provenance_write_never_clears_the_anchor(
+        self, backend, tmp_path
+    ):
+        """A ``* -> done`` audit write leaves the anchor exactly as found."""
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='finishing')
+        original = (await self._metadata(backend, project_root, dto['id']))[
+            'pending_since'
+        ]
+
+        await backend.set_status_and_stamp_audit(
+            str(dto['id']), TaskStatus.DONE, project_root,
+            audit_fields={'done_provenance': {'kind': 'merged', 'commit': 'a' * 40}},
+        )
+
+        merged = await self._metadata(backend, project_root, dto['id'])
+        assert merged['pending_since'] == original
+        assert merged['done_provenance']['kind'] == 'merged'
+
+    @pytest.mark.asyncio
+    async def test_a_reopen_routes_to_the_audit_writer(self, tmp_path):
+        """Pins the test above to the REAL production path.
+
+        Without this, the three tests above could be asserting the behaviour
+        of a writer nothing actually calls for a reopen. Mirrors the routing
+        idiom in test_task_interceptor.py.
+        """
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'cancelled', 'title': 'T'}
+        )
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+        taskmaster.set_task_status = AsyncMock(return_value={'success': True})
+        taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
+        reconciler = AsyncMock()
+        reconciler.reconcile_task = AsyncMock(return_value={'actions': []})
+        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        try:
+            interceptor = TaskInterceptor(taskmaster, reconciler, buf)
+            await interceptor.set_task_status(
+                '1', TaskStatus.PENDING, str(tmp_path),
+                reopen_reason='requeued by the steward',
+            )
+        finally:
+            await buf.close()
+
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+        audit_fields = taskmaster.set_status_and_stamp_audit.call_args.kwargs[
+            'audit_fields'
+        ]
+        assert audit_fields['reopen_from'] == 'cancelled'
+        taskmaster.set_task_status.assert_not_called()
