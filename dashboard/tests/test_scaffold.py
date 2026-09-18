@@ -114,6 +114,11 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
         monkeypatch.setenv('DASHBOARD_PORT', '9090')
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
+        # The suite's session-scoped isolation SETS DASHBOARD_FUSED_MEMORY_URLS
+        # (apply_isolated_env, task 5185), and an operator shell may set it too.
+        # Delete it so the assertion below exercises from_env()'s own fallback
+        # rather than whatever the ambient environment happens to hold.
+        monkeypatch.delenv('DASHBOARD_FUSED_MEMORY_URLS', raising=False)
 
         cfg = DashboardConfig.from_env()
         assert cfg.host == '0.0.0.0'

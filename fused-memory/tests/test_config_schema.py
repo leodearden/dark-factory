@@ -3692,3 +3692,69 @@ def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
         'lever 2 raises the steady-state batch on the explicit premise that '
         'max_staleness_seconds still bounds per-event latency independently'
     )
+
+
+class TestWriteJournalConfig:
+    """Task 3212 item 4: `write_ops` retention is operator-tunable and its
+    read/search asymmetry is enforced, not merely documented.
+
+    Measured 2026-09-11 on a never-pruned journal: 35,428,715 rows / 16 GB, of
+    which 97.9% are task-read rows with no downstream consumer and 1.36% are
+    `search` rows that are leaf eta's (task 3213) SOLE data source. A future
+    edit that inverted the two horizons would silently starve that metric while
+    leaving the config looking reasonable, so the ordering is asserted here AND
+    rejected at load time.
+    """
+
+    def test_write_journal_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        section = FusedMemoryConfig().write_journal
+        assert isinstance(section, WriteJournalConfig), (
+            'RED: write_journal must be a BARE (non-Optional) submodel — reload.py '
+            'descends only into required submodels'
+        )
+        assert section.read_retention_days == 30.0
+        assert section.search_retention_days == 365.0
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 5000
+        assert section.prune_max_rows_per_run == 500_000
+        assert section.prune_max_seconds == 30.0
+
+    def test_search_rows_outlive_task_read_rows(self):
+        section = FusedMemoryConfig().write_journal
+        assert section.search_retention_days > section.read_retention_days, (
+            'RED: search rows are 1.36% of the table and the only rows with a '
+            'consumer; task-read rows are 97.9% and have none. Inverting this '
+            'starves leaf eta while the config still looks plausible.'
+        )
+
+    def test_inverted_horizons_are_rejected_at_load_time(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(read_retention_days=400.0, search_retention_days=30.0)
+        assert 'search_retention_days' in str(excinfo.value), (
+            'RED: the rejection must name the field an operator has to fix'
+        )
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal': {
+                'read_retention_days': 7.0,
+                'search_retention_days': 90.0,
+                'prune_max_seconds': 5.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal
+
+        assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
+        assert section.search_retention_days == 90.0
+        assert section.prune_max_seconds == 5.0
+        # Unmentioned leaves keep their defaults rather than being clobbered.
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 5000

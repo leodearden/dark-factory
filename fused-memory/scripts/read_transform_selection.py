@@ -2332,21 +2332,46 @@ async def fetch_production_rankings(
     if openai_provider is not None:
         openai_provider.api_key = None
     qdrant_url = config.mem0.qdrant_url
+    # Resolved HERE, before the first acquisition below — never in the `with`
+    # header further down, where it would sit after `mkdtemp` and after
+    # `MemoryService(...)` but before the `try` that releases them.
+    # `load_cleanup_script()` can raise (`_load_sibling_script` raises
+    # `FixtureError` when the spec cannot be built), and a raise in that one
+    # window leaks the queue directory and skips `close()`.  `run_bake_off`
+    # carries the same hoist for the same reason.
+    reaper = bake.load_cleanup_script()
+
     queue_dir = tempfile.mkdtemp(prefix='read-transform-queue-')
     config.queue.data_dir = queue_dir
 
     memory = MemoryService(config)
-    try:
-        bake.drop_collections([collection], qdrant_url=qdrant_url)
-        await memory.initialize()
-        await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
-        fetched = await bake.fetch_arm(
-            memory.mem0, seeded, list(production_queries), [], limit=search_limit,
-        )
-    finally:
-        await memory.close()
-        bake.drop_collections([collection], qdrant_url=qdrant_url)
-        shutil.rmtree(queue_dir, ignore_errors=True)
+    # The in-use lease that stops `scripts/cleanup_test_collections.py` — a
+    # 6-hourly cron job — deleting this pass's collection between the seed
+    # above and the fetch below.  `collection` sits under
+    # `bake.ephemeral_collection_prefix()`, which that sweep reaps
+    # unconditionally, so this site carries exactly `run_bake_off`'s exposure
+    # and needs its own lease: under pytest both are simply held at once
+    # (separate files, independent flocks), and this one is the only cover
+    # the `__main__` CLI below has.
+    #
+    # Reached through the same `bake` delegation this function already uses
+    # for `ephemeral_collections`, `drop_collections` and `seed_arm` (resolved
+    # above), so there stays exactly ONE path to the reaper rather than two.
+    #
+    # OUTSIDE the try: live before the pre-run drop creates anything, and
+    # released only after the teardown has finished dropping.
+    with reaper.hold_lease(owner=f'read_transform_selection {bake.worker_suffix()}'):
+        try:
+            bake.drop_collections([collection], qdrant_url=qdrant_url)
+            await memory.initialize()
+            await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+            fetched = await bake.fetch_arm(
+                memory.mem0, seeded, list(production_queries), [], limit=search_limit,
+            )
+        finally:
+            await memory.close()
+            bake.drop_collections([collection], qdrant_url=qdrant_url)
+            shutil.rmtree(queue_dir, ignore_errors=True)
 
     return {
         'shape': shape,

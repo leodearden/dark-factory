@@ -52,6 +52,43 @@ Safety properties:
 - Only ever calls EscalationQueue methods (get_pending, get, submit, resolve);
   never enumerates, moves, or deletes raw files directly.
 - Blocking escalations (infra_issue, recon_failure, etc.) are never touched.
+- The queue directory must ALREADY EXIST; ``run()`` refuses otherwise.  See the
+  section below.
+
+WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
+-------------------------------------------------------------
+:func:`run` refuses, before the scan, unless ``--queue-dir`` names a directory
+that ALREADY exists.  The default is the RELATIVE
+``./data/reconciliation/escalations``, so a run from anywhere but the project
+root -- a task worktree in particular -- manufactures an empty queue and reports
+``"pending_before": 0``, a false all-clear that ``main()`` below would hand back
+as exit 0.
+
+See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
+for the mechanism, the probe-vs-existence argument, the prior art and the
+placement rules -- that module is the single normative copy, and this note
+deliberately does not restate it.
+
+A RESIDUAL THIS TASK RECORDED AND DELIBERATELY DID NOT GUARD (task 4319)
+-------------------------------------------------------------------------
+:func:`apply_plan` is not transactional.  Per group it stamps the canonical via
+``queue.submit()`` and THEN dismisses N children in a loop, with no rollback
+between the two.  Its own idempotency guard skips any canonical that already
+carries dedupe state, so a failure landing between the submit and the last
+``queue.resolve`` would strand the remaining children PERMANENTLY: the re-run
+sees the stamped canonical and skips the whole group.
+
+That is recorded rather than fixed here because under a uniform write-deny it
+is unreachable.  The first write-requiring syscall in every mutating queue path
+is the lockfile ``os.open(..., O_CREAT | O_RDWR)`` in
+``escalation/queue.py::escalation_id_lock``, taken outside any handler, so a
+denial aborts on record #1 before anything is written.  The premise that would
+make it reachable, and that a later reader should re-check: a PARTIAL policy
+that grants the queue root but denies a subtree — e.g. ``archive/``, where
+``escalation/queue.py::EscalationQueue._archive_resolved`` swallows ``OSError``
+into a ``logger.warning`` by deliberate no-data-loss choice.  Landlock does not
+produce that shape (its rules are path-prefix based), which is why it is a
+premise and not an observation.
 """
 
 from __future__ import annotations
@@ -68,6 +105,8 @@ from pathlib import Path
 from escalation.dedupe import DedupeConfig, compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+from fused_memory.utils.target_store_preflight import assert_queue_dir_exists
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +321,13 @@ def run(
 
     Returns a report dict.  When ``apply`` is False (dry-run, the default),
     no writes are performed.
+
+    Refuses with ``TargetStoreMissing`` when *queue_dir* does not exist — see
+    the module docstring.  The check lives here rather than in ``main()`` so
+    programmatic callers inherit it too.
     """
+    assert_queue_dir_exists(queue_dir, operation='backfill_recon_escalations')
+
     queue = EscalationQueue(Path(queue_dir))
     pending = queue.get_pending()
     plan = build_plan(pending)

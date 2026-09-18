@@ -32,23 +32,33 @@ from shared.merge_state import MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
+from escalation import git_authority
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.canonical import canonical_root_cause
+from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
+from escalation.merge_lane_resolution import (
+    InvalidMergeLane,
+    resolve_merge_lane,
+    validate_requested_lane,
+)
 from escalation.models import (
+    ACTION_KEEP_DRIVING,
+    ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     EvidenceEntry,
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import AmendmentOutcome, EscalationQueue
+from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
@@ -438,6 +448,31 @@ _COMPACT_ESCALATION_FIELDS = (
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
     'root_cause', 'member_ids',
+    # pin_declared_by (task 4377) — the declared-dependency marker.
+    #
+    # WHY IT IS PROJECTED: a bulk closer that drains COMPACT rows must be able
+    # to tell a declared pin from an ordinary homogeneous cluster member BEFORE
+    # it acts.  On 2026-08-08 all eleven members of esc-3237-5 were
+    # indistinguishable by id, level, category, severity, agent_role and
+    # summary, and the sole marker on esc-3371-2 lived in prose nothing linked
+    # from; the cascade close spent it and mu-gate specimen task 3371 is gone.
+    # Same class of finding as task 3997's dedup-critical fields.
+    #
+    # ITS COST, named: it rides EVERY compact row as `[]` for the overwhelming
+    # majority of records (~22 bytes), including the dashboard's
+    # fetch_pins_recovery poll.  In practice the populated form is short too — a
+    # handful of short declarer strings — which is the actual basis for
+    # including it rather than an assertion that it is free.
+    #
+    # WHY pin_declared_reason IS NOT PROJECTED: unbounded free text, the same
+    # property that keeps `detail` out.  The projected declarer list is the
+    # signal to pull the full record via get_escalation.
+    #
+    # WHY IT IS ALWAYS PROJECTED, never conditionally omitted: `pins_recovery`
+    # already gives ABSENCE a specific meaning here ("could not be computed"),
+    # and giving absence a second, different meaning on a neighbouring key would
+    # be exactly the legibility trap that contract exists to prevent.
+    'pin_declared_by',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -1137,9 +1172,16 @@ def create_server(
           e.g. a concurrent sweep won the race): ``{'id', 'status',
           'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
           function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
-          post-write state rather than write intent, and fail open to
-          ``'queued'`` — carrying ``esc.level`` — when the re-read is
-          unavailable.
+          post-write state rather than write intent.
+        - Unpersisted: ``{'id', 'status': 'accepted_unpersisted',
+          'persist_check', 'level'}`` when the post-write re-read could not
+          confirm the write, so the filer keeps driving its blocked task rather
+          than standing down; see
+          ``escalation/src/escalation/dedupe.py::submit_or_dedupe``, which
+          produces it, and through it
+          ``queue.py::observed_submit_response`` (task 5368).  Local to THIS
+          function: the L2 branch above never consults the dedupe gate, so an
+          L2 re-file cannot fold either.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id,
                             'level': esc.level}``
@@ -1154,8 +1196,8 @@ def create_server(
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc_id = queue.submit(esc)
             # Task 3236: this branch does NOT route through dedupe, so it needs
-            # the observed-state response separately.  Fail-open to 'queued'
-            # (still carrying esc.level, so the 'level' echo is never missing).
+            # the observed-state response separately (still carrying esc.level,
+            # so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
@@ -1543,6 +1585,14 @@ def create_server(
           with the record's REAL status — the response reports observed
           post-write state, never write intent (task 3236).
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level}``.  A post-write re-read could not confirm the
+          write, so nothing is guaranteed on disk for a drain to find.
+          ``persist_check`` is ``'absent'`` (nothing for that id is on disk)
+          or ``'unreadable'`` (a read was attempted and yielded no record — a
+          torn write reads this way — so its state is unknown).  This path carries no
+          ``action`` key — that is only on the blocker path — so an info filer
+          simply carries on, as it already does on every other branch.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1583,9 +1633,13 @@ def create_server(
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
     ) -> dict[str, Any]:
-        """Report a blocking problem. After calling this, commit any in-progress work,
-        log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-        and you will be re-invoked.
+        """Report a blocking problem. After calling this, follow the response's
+        ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
+        iteration, and STOP — do NOT retry, the handler will resolve the issue and you
+        will be re-invoked.  On ``'keep_driving'`` nothing is confirmed on disk, so do
+        NOT stop: keep driving the task and re-file ONCE on your next iteration, then
+        terminate cleanly regardless (see the Unpersisted response shape below for why
+        the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
@@ -1602,7 +1656,8 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
-        normally).  action='terminate_cleanly' is still returned.
+        normally).  It does not by itself change the returned ``action``, which
+        follows the observed persist state like every other filing.
 
         *level* — the escalation ladder rung this filing is born at.  Defaults to
         ``0`` (agent → steward).  Pass ``level=1`` to file a level-1
@@ -1639,8 +1694,8 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape always includes ``action='terminate_cleanly'`` and
-        ``level`` (on EVERY branch, including the fail-open one) plus:
+        Response shape always includes ``action`` and ``level`` (on EVERY
+        branch, including the degraded one) plus:
         - Queued:        ``{id, status, level, action}``  where status='queued'
         - Deduped:       ``{id, status, parent_id, child_id, level, action}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -1649,12 +1704,32 @@ def create_server(
           sweep won the race): ``{id, status, resolution, resolved_by, level,
           action}`` with the record's REAL status.  Task 3236: the response
           reports observed post-write state, never write intent — a
-          ``status='queued'`` reply now means the record really was pending
+          ``status='queued'`` reply means the record really was pending
           after the write.  ``level`` echoes the level actually persisted
           (falling back to the level written when a post-write re-read is
           unavailable), so a caller that passed ``level=1`` can confirm it
           landed without risking a ``KeyError`` on a degraded path.
           Callers needing the full record can call get_escalation(id).
+        - Unpersisted (task 5368): ``{id, status: 'accepted_unpersisted',
+          persist_check, level, action: 'keep_driving'}``.  The write was
+          accepted but a post-write re-read could not confirm it, so NOTHING
+          is guaranteed on disk for L1 or L2 to drain.  DO NOT terminate on
+          this branch — that would remove the task from every recovery path
+          in exchange for an escalation no handler will ever see.  Keep
+          driving the blocked task, re-file ONCE on the next iteration, then
+          terminate cleanly regardless — the repeat is NOT generally folded,
+          so the retry has to be bounded here rather than by the dedupe gate.
+          ``_submit_or_dedupe`` folds only the categories in this server's
+          ``DedupeConfig`` (stock: ``('infra_issue',)``, 600s window), and a
+          born-at-L2 severity bypasses dedupe altogether; on every other path
+          a repeat mints a NEW record, and on that one a NEW page to the
+          human.  Bounding at one retry is what stops a persistent re-read
+          outage from minting one record per agent iteration.
+          ``persist_check`` is
+          ``'absent'`` (nothing for that id is on disk) or ``'unreadable'`` (a
+          read was attempted and yielded no record — a torn write reads this
+          way — so its state is unknown).  ``action`` is
+          ``'terminate_cleanly'`` on every OTHER branch above.
         """
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -1699,7 +1774,16 @@ def create_server(
             level=level,
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
-        return {**result, 'action': 'terminate_cleanly'}
+        # The instruction must follow the observed state, not the intent to
+        # file.  When persistence is unconfirmed there may be nothing on disk
+        # for L1 or L2 to drain, so standing the filer down would strand its
+        # task in silence (task 5368).
+        action = (
+            ACTION_KEEP_DRIVING
+            if result.get('status') == STATUS_ACCEPTED_UNPERSISTED
+            else ACTION_TERMINATE_CLEANLY
+        )
+        return {**result, 'action': action}
 
     # --- Handler-side tools ---
 
@@ -1712,6 +1796,7 @@ def create_server(
         resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        acknowledge_declared_pins: list[str] | None = None,
         escalate_model: bool = False,
         terminate: Any = None,
     ) -> dict[str, Any]:
@@ -1773,6 +1858,27 @@ def create_server(
         otherwise. Not forwarded to the ``park`` action (the record stays
         open at L2, unclassified until eventually resolved).
 
+        **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
+        (task 4495).  ``queue.resolve``'s status check is an atomic
+        check-and-set, so if an automated sweep (the W9-δ steward auto-dismiss,
+        the orphan reaper, the revalidation sweep) closed the record microseconds
+        before this call arrived, that close WINS: ``status`` / ``resolution`` /
+        ``resolved_at`` / ``resolved_by`` are left exactly as the sweep left them,
+        because downstream waiters have already consumed them.  Your text is not
+        discarded, though — it is appended to the record's ``late_resolutions``,
+        and a ``'benign'`` stamp the sweep DERIVED is corrected (see
+        ``escalation.classify.default_resolution_class_for_resolver``).
+
+        Read ``late_resolution_captured`` in the returned dict rather than
+        assuming a non-error return means the resolution took effect: the
+        returned record looks identically healthy on both paths.  The key is
+        always present (``False`` on the ordinary applied path); a
+        ``late_resolution_reason`` string naming the sweep that won is added only
+        when it is ``True``.  Note the compact projection
+        ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
+        NOT widened by any of this — ``late_resolutions`` is forensic detail for
+        a full-record read, not triage-facing.
+
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
         resolver best-effort pre-increments the task's
@@ -1810,6 +1916,86 @@ def create_server(
         not ``illegal_transition`` — no record is mutated by either gate, so
         this ordering is an error-reporting precedence only, not a correctness
         difference.
+
+        **Declared-pin gate** (task 4377).  A record carrying
+        ``pin_declared_by`` has something OUTSIDE the escalation store relying
+        on it staying OPEN — a deviation notice, an operator gate.  That
+        matters because an open escalation is a PRESERVATION MECHANISM for its
+        subject task: ``orchestrator/task_ground_truth.py::_RECOVERY`` has no
+        row for the pinned shape, so it falls through to
+        ``RecoveryAction.LEAVE`` and the row survives; closing the record flips
+        ``has_open_escalation`` and the same shape recovers to
+        REVERT_TO_PENDING.  So closing a marked record is a state-changing act
+        on its subject task even under ``action='close_only'``.
+
+        Any such close is refused with
+        ``{'error': ..., 'code': 'declared_pin_refused', 'declared_pins':
+        [{escalation_id, declared_by, reason}, ...]}`` — structured as well as
+        prose, per INV-2, so a caller never has to parse the message to recover
+        a fact the emitter held in a variable.  The predicate is
+        ``escalation/declared_pins.py::blocking_pin_declarations``.
+
+        The check covers the TARGET **and EVERY MEMBER** of an L2 cluster.
+        Both halves are load-bearing.  ``queue.resolve`` archives the head
+        BEFORE it cascades, so a per-member check inside the cascade could only
+        ever half-close a cluster — head archived, members still pending —
+        which is why this is a PRE-FLIGHT here rather than a refusal down
+        there.  And the bulk close of a homogeneous cluster is precisely the
+        operation that hides a member serving double duty as a pin: on
+        2026-08-08 all eleven members of esc-3237-5 were indistinguishable by
+        id, level, category, severity, agent_role and summary, and the sole
+        marker on esc-3371-2 lived in prose nothing linked from.  A member
+        ``queue.get`` cannot return is treated as unmarked and skipped, matching
+        the cascade's existing best-effort contract (see the in-code note for
+        the named limitation).
+
+        Only records this resolve could ACTUALLY CLOSE are considered — the
+        target and each member are both filtered to ``status == 'pending'``.
+        An already-closed record's pin cannot be spent again (``queue.resolve``
+        no-ops on a non-pending record, and its cascade no-ops over an
+        already-archived member), so refusing on one would name a record the
+        close could not touch and would re-block an operator who already spent
+        that pin deliberately.  A spurious refusal is the thing that teaches a
+        rotation to acknowledge reflexively.
+
+        ``acknowledge_declared_pins`` is the deliberate override.  It must NAME
+        each escalation id whose declared pin is being spent — a list, not a
+        boolean, because a boolean is one keystroke and is exactly what a
+        rotation working through a homogeneous cluster would set reflexively to
+        make an unexpected error go away, reproducing the incident with an extra
+        parameter.  A PARTIAL acknowledgement still refuses and reports only the
+        remainder, which is the property that stops a bulk closer from waving a
+        whole cluster through on the one id the error happened to mention first.
+        Naming an id that is not blocked is a harmless no-op.
+
+        This acknowledgement is the ONLY release valve: this task ships no
+        un-declare verb, deliberately — withdrawal then happens at the moment of
+        the close, named in the resolution, by the party actually spending the
+        pin, rather than as a separate untraceable write that leaves the record
+        looking as though it was never protected.  A caller reaching for it
+        should first go READ what ``pin_declared_by`` names and consult it, not
+        silence it.
+
+        No extra logging is needed here: ``queue.resolve`` emits one WARNING per
+        pin actually spent — for the head and, via its cascade recursion, for
+        every marked member — so an acknowledged close is loud in the log even
+        though it is permitted.
+
+        COVERS every action EXCEPT ``park``: ``resume``, ``restart``,
+        ``abandon`` and ``close_only`` all run ``queue.resolve()`` and archive
+        the record, flipping the boolean identically — a ``resume`` would spend
+        a pin just as completely as the ``close_only`` cascade that spent the
+        mu-gate specimen on 2026-08-08, and would additionally re-dispatch the
+        very task the pin preserves.  ``park`` keeps ``status='pending'`` and
+        never archives, so it cannot spend a pin; the exemption is encoded
+        POSITIONALLY (the gate sits after park's early return) so it cannot be
+        got wrong by a later edit.
+
+        In the **Gate precedence** ordering this gate runs LAST: after
+        ``bad_capability_header`` / ``level_forbidden`` and after
+        ``illegal_transition``, so a caller failing several gates learns about
+        the capability and legality problems first.  None of the four mutates
+        the record, so the ordering is an error-reporting precedence only.
 
         NOTE: the ``target_status`` values above are not yet written by
         resolve_issue — this call changes only the escalation record; the
@@ -1964,6 +2150,70 @@ def create_server(
                 return {'error': f'Escalation {escalation_id} not found'}
             return esc.to_dict()
 
+        # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
+        # this docstring.  Its POSITION is load-bearing in two ways.  It sits
+        # AFTER the `park` early-return above, so park is structurally exempt
+        # with no `action != 'park'` condition that a later edit could get wrong
+        # — park keeps the record OPEN and never archives it, so it cannot spend
+        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
+        # refusal persists nothing (INV-1), exactly as the capability and Table B
+        # gates do.
+        #
+        # Classifies the TARGET plus EVERY member of an L2 cluster, because the
+        # BULK CLOSE of a homogeneous cluster is precisely the operation that
+        # hides a member serving double duty as a pin.  A member `queue.get`
+        # cannot return is treated as UNMARKED and skipped, deliberately
+        # matching queue.resolve's best-effort cascade contract (pinned by
+        # test_queue.py::TestResolveCascade::test_cascade_to_nonexistent_member_
+        # is_best_effort): a record that does not exist cannot carry a marker,
+        # and refusing a whole resolve on a dangling member id would break
+        # behaviour the cascade tests already pin.  NAMED LIMITATION: queue.get
+        # collapses "absent" and "unparseable" into None, so a CORRUPT member
+        # file reads as unmarked — the opposite fail-direction from
+        # escalation/pins.py (records=None => store_unavailable).  Distinguishing
+        # them would require changing queue.get's return contract; out of scope.
+        #
+        # COST, considered: one queue.get per member on a resolve.  A resolve is
+        # a rare, human/watcher-driven operation and `get` memoises its archive
+        # listing, so this is not an unconsidered N+1.
+        #
+        # Only records this resolve could ACTUALLY CLOSE are candidates, hence
+        # the `status == 'pending'` filter on both the target and each member.
+        # An already-closed record's pin cannot be spent again: queue.resolve
+        # early-returns as a no-op on `status != 'pending'`, and its cascade
+        # no-ops over an already-archived member the same way.  Refusing on one
+        # would be a pure false positive that names a record the close could not
+        # touch — and, worse, it would force an operator who ALREADY spent that
+        # pin deliberately (naming it in acknowledge_declared_pins on the close
+        # that archived it) to re-acknowledge it on every subsequent operation
+        # on the cluster.  That erodes exactly the signal this gate exists to
+        # make trustworthy: a rotation that learns the refusal is routinely
+        # spurious starts acknowledging reflexively, which is the failure mode
+        # acknowledge_declared_pins-as-a-list was shaped to prevent.  The target
+        # needs the filter for the same reason a member does — queue.get falls
+        # back to the ARCHIVE, so `rec` itself may already be closed.
+        candidates = [rec] if rec.status == 'pending' else []
+        for member_id in rec.members:
+            member = queue.get(member_id)
+            if member is not None and member.status == 'pending':
+                candidates.append(member)
+        blocked = blocking_pin_declarations(
+            candidates, acknowledged=acknowledge_declared_pins or (),
+        )
+        if blocked:
+            return {
+                'error': format_refusal(blocked),
+                'code': 'declared_pin_refused',
+                'declared_pins': [
+                    {
+                        'escalation_id': d.escalation_id,
+                        'declared_by': list(d.declared_by),
+                        'reason': d.reason,
+                    }
+                    for d in blocked
+                ],
+            }
+
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
         # Guard: only rewrite pending records — archived records must not be resurrected.
@@ -1976,11 +2226,16 @@ def create_server(
             rec.resolution_action = action
             queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
+        resolve_outcome: ResolveOutcome = {
+            'applied': False, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
             granted_files=granted_files,
+            outcome=resolve_outcome,
         )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -2006,7 +2261,27 @@ def create_server(
                         '(non-fatal): %s',
                         rec.task_id, _e,
                     )
-        return esc.to_dict()
+        # Tell the caller whether its text APPLIED or was merely CAPTURED — the
+        # returned record looks identically healthy either way (task 4495).  The
+        # flag is always present so a caller can index it rather than `.get()` a
+        # default that would read a typo'd key as "fine"; the human-readable
+        # reason is added only when there is something to explain.
+        payload = esc.to_dict()
+        payload['late_resolution_captured'] = resolve_outcome['late_resolution_captured']
+        if resolve_outcome['late_resolution_captured']:
+            corrected = resolve_outcome['resolution_class_corrected']
+            payload['late_resolution_reason'] = (
+                f'Escalation {escalation_id} was ALREADY {resolve_outcome["prior_status"]} '
+                f'by {resolve_outcome["prior_resolved_by"]!r} when this call arrived, so '
+                'its terminal state (status/resolution/resolved_at/resolved_by) was NOT '
+                'changed. Your resolution text was preserved on the record in '
+                '`late_resolutions` rather than discarded'
+                + (
+                    f', and resolution_class was corrected to {corrected!r}.'
+                    if corrected else '.'
+                )
+            )
+        return payload
 
     @mcp.tool()
     async def get_pending_escalations(
@@ -2303,6 +2578,132 @@ def create_server(
             triaged_by = identity
         esc = queue.stamp_triage(escalation_id, triaged_by=triaged_by, triage_note=triage_note)
         if esc is None:
+            return {'error': f'Escalation {escalation_id} not found or not pending'}
+        return esc.to_dict()
+
+    @mcp.tool()
+    def declare_pin(
+        escalation_id: str,
+        declared_by: list[str],
+        reason: str = '',
+    ) -> dict[str, Any]:
+        """Declare that something outside the escalation store RELIES on this
+        pending record staying OPEN (task 4377).
+
+        An open escalation is a PRESERVATION MECHANISM for its subject task:
+        ``orchestrator/task_ground_truth.py::_RECOVERY`` has no row for the
+        pinned shape, so the row falls through to ``RecoveryAction.LEAVE``.
+        Closing the record flips ``has_open_escalation`` and the task reverts —
+        which makes a close a state-changing act on the subject task even under
+        ``action='close_only'``.  This tool is what makes that dependency
+        DECLARABLE on the record itself, instead of living in prose (a deviation
+        notice, an operator gate) that a bulk closer never reads.
+
+        Once marked, ``resolve_issue`` REFUSES every action except ``park``
+        (``resume`` / ``restart`` / ``abandon`` / ``close_only`` all archive the
+        record) for this record AND for any L2 whose cascade would close it,
+        unless the caller names its id in ``acknowledge_declared_pins``.  That
+        acknowledgement is the ONLY release valve — this ships no un-declare
+        verb, deliberately: withdrawal then happens at the moment of the close,
+        named in the resolution, by the party actually spending the pin.
+
+        *declared_by* names WHAT relies on the record staying open
+        (``'task-3546-second-deviation-notice'``), NOT who stamped it.  Entries
+        are stripped, blanks dropped, already-present entries dropped, then
+        APPENDED in declaration order.  *reason* is the free-text why,
+        overwritten only when non-empty.
+
+        WHO CAN CALL THIS, stated because it is a real limitation and not an
+        oversight: declaring is **operator/steward/interactive-session only**
+        in this task's scope.  The escalation-watcher-auto rotation — the agent
+        most likely to *notice* that a record is load-bearing — CANNOT declare
+        one: ``orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS``
+        grants it ``stamp_triage`` (the ungated-annotation precedent this tool
+        mirrors) but not ``declare_pin``, and dispatched task agents hold only
+        ``escalate_info`` / ``escalate_blocker``
+        (``orchestrator/src/orchestrator/agents/roles.py``).  Wiring the
+        rotation as a writer is deliberately OUT OF SCOPE here — this task holds
+        no lock on the orchestrator package — so until that follow-up lands, a
+        watcher that spots a candidate pin REPORTS it (its skill says so) and a
+        human or steward runs this tool.  Consequence worth naming: the refusal
+        gate can only fire for records a human has actually marked, so the
+        surviving sibling pin esc-3105-3 stays protected by prose until someone
+        declares it.
+
+        Two deliberate departures from ``stamp_triage``, its structural twin:
+
+        - **NOT level-gated**, for ``stamp_triage``'s stated reason: a
+          declaration is restrictive-only — it can never widen what a
+          connection may do, only narrow it — so gating it would let a
+          level-capped connection OBSERVE a pin it is forbidden to declare.
+        - **The ``X-Escalation-Identity`` header is NOT read** to override
+          *declared_by*.  ``resolved_by`` / ``triaged_by`` are WHO-acted
+          attributions and the non-spoofable server override is right for
+          those; ``pin_declared_by`` answers a different question — WHAT
+          outside the store relies on this record — and overwriting it with a
+          connection identity would destroy the single fact the field exists to
+          carry, silently converting every declaration into "the watcher
+          connection declared this", which names nothing a closer could go
+          consult.  The asymmetry is deliberate; please do not "fix" it.
+
+        Returns the updated record as a full dict on success.  The THREE
+        non-success outcomes are distinguished so a caller is not left guessing
+        — ``queue.declare_pin`` collapses them all into ``None``:
+
+        - ``{'error': ..., 'code': 'empty_declared_by'}`` — *declared_by*
+          normalises to nothing (checked here, before the queue is touched: a
+          silent no-op would leave the declarer believing the record is
+          protected when it is not).
+        - ``{'error': ..., 'code': 'already_declared', 'pin_declared_by': [...],
+          'pin_declared_reason': ...}`` — the record is found and pending and
+          ALREADY carries every declarer named, so nothing was added.  An
+          idempotent retry is the natural thing for an operator or a script to
+          do, and reporting "not found" for it would be false about the record;
+          the current declarers come back structurally (INV-2) so the caller
+          need not parse the message.  NOTE this outcome also means *reason* was
+          not updated — a wholly-redundant call writes nothing at all, so a
+          rationale correction needs a declarer that is not already present.
+        - ``{'error': ...}`` — the record is not in the queue root, is
+          unparseable, or is not pending.
+        """
+        if not [entry for entry in declared_by if entry.strip()]:
+            return {
+                'error': (
+                    f'declare_pin on {escalation_id} names no declarer: declared_by must '
+                    'carry at least one non-blank entry naming WHAT relies on this record '
+                    'staying open (e.g. "task-3546-second-deviation-notice"). '
+                    'Nothing was stamped — the record is NOT protected.'
+                ),
+                'code': 'empty_declared_by',
+            }
+        esc = queue.declare_pin(escalation_id, declared_by=declared_by, reason=reason)
+        if esc is None:
+            # queue.declare_pin collapses several outcomes into None, and one of
+            # them — a WHOLLY REDUNDANT re-declaration — is not a missing record
+            # at all: the record is found, pending, and already carries every
+            # declarer named.  Reporting "not found or not pending" for it would
+            # be factually false about the record, and an idempotent retry (the
+            # natural thing for an operator or a script to do) is exactly when
+            # it happens.  So re-read before choosing the message.  A record
+            # resolved between the two calls reads as non-pending here and
+            # correctly falls through to the generic message.
+            existing = queue.get(escalation_id)
+            if existing is not None and existing.status == 'pending':
+                return {
+                    'error': (
+                        f'Escalation {escalation_id} is ALREADY declared by '
+                        f'{", ".join(existing.pin_declared_by)}; nothing was added. '
+                        'The record IS protected — resolve_issue already refuses '
+                        'every non-park action on it. NOTE: a wholly-redundant '
+                        'call does not update `reason` either; to record a '
+                        'different rationale, name a declarer not already present.'
+                    ),
+                    'code': 'already_declared',
+                    # Structural, per INV-2 — a caller should never have to parse
+                    # the message to recover what the record already carries.
+                    'pin_declared_by': list(existing.pin_declared_by),
+                    'pin_declared_reason': existing.pin_declared_reason,
+                }
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
@@ -2661,6 +3062,7 @@ def create_server(
         wait_secs: int = 0,
         verified_green: bool = False,
         retry_failed_only: bool = False,
+        lane: str | None = None,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
@@ -2674,7 +3076,8 @@ def create_server(
         - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
-          queue_depth, eta_seconds}``.
+          queue_depth, eta_seconds, lane, lane_source, lane_applied}``, where
+          ``position`` is ``int | None`` (see the Queued shape below).
         - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
           wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
           Resolves within clamp → terminal outcome shape.
@@ -2701,6 +3104,67 @@ def create_server(
         the retry-set primitive that consumes this flag ships separately
         (reify, PRD task D2), so today every value leaves behavior unchanged.
 
+        *lane* — which merge-queue priority lane this submission belongs in:
+        ``'high'`` or ``'normal'``.  Omit it (the default ``None``) to inherit
+        the submitting task's ``metadata.merge_lane``.  Precedence is
+        **``lane`` > ``metadata.merge_lane`` > ``'normal'``**, and an explicit
+        argument wins even when it EQUALS the default — passing
+        ``lane='normal'`` deliberately holds a ``metadata.merge_lane='high'``
+        task back to the normal lane.
+
+        Omitting it is not free: honouring ``metadata.merge_lane`` means
+        reading the task, which costs one Taskmaster ``get_task`` with an
+        internal ``timeout=15``, so a wedged task store delays every
+        no-explicit-lane submission by up to that much before degrading the
+        lane to ``'normal'``.  Passing *lane* explicitly skips the read
+        entirely — reach for it if submissions are slow, or on a hotfix whose
+        lane you are not willing to have degrade.
+
+        Named ``lane``, not ``merge_lane``, because that is the word the whole
+        merge-queue boundary already uses: ``MergeRequest.lane``,
+        ``orchestrator/src/orchestrator/merge_queue.py::MERGE_LANES``, and the
+        ``lane`` field ``get_merge_queue`` emits per queue item.  The TASK
+        METADATA key stays ``merge_lane`` because task metadata is one flat
+        global namespace in which a bare ``lane`` would collide with the warm,
+        offline and merge-worktree lanes this repo also has.
+
+        An unrecognised value here is REJECTED — ``{error,
+        code='invalid_lane', hint}``, nothing enqueued — while an unrecognised
+        ``metadata.merge_lane`` still normalises silently to ``'normal'``.
+        That asymmetry is deliberate — live caller intent must not be silently
+        discarded; an inherited value must never be able to fail a submission
+        — and the reason is stated once, in ``escalation/src/escalation/
+        merge_lane_resolution.py``, which the other surfaces carrying this
+        behaviour cite rather than restate.
+
+        NOT separately access-gated, and deliberately so.
+        ``mcp__escalation__merge_request`` appears in exactly ONE agent role's
+        allow-list — ``orchestrator/src/orchestrator/agents/roles.py::STEWARD``
+        — which the SDK enforces as a ceiling, so no rank-and-file agent role
+        can reach this parameter to self-declare urgency.  Task 1689's
+        anti-starvation constraint (``'high'`` is for the rare, gated
+        hotfix/main-health class) is carried by that existing restriction plus
+        the ``lane``/``lane_source`` audit echo on the response below, rather
+        than by a second gate over an already-restricted set.
+
+        That echo exists because the lane a submission GOT is otherwise
+        unobservable to the submitter: omit *lane* and nothing in the response
+        said whether ``metadata.merge_lane`` had been honoured, which is half
+        of why the key could sit inert unnoticed.  ``lane_source`` rides with
+        it because ``'normal'`` alone cannot distinguish "the task asked for
+        normal" from "nothing asked at all".  The rest of the audit trail is
+        elsewhere, and deliberately so: ``get_merge_queue`` already carries
+        ``lane`` per queue item (from the worker snapshot,
+        ``orchestrator/src/orchestrator/merge_queue.py::
+        SpeculativeMergeWorker::snapshot``), while the ``merge_queued`` EVENT
+        does NOT and cannot — ``merge_queue.py`` is frozen by
+        ``orchestrator/tests/test_merge_lane_ratchet.py`` against a
+        line/prose/cognitive baseline that a single added line would break, so
+        extending the event is unavailable at any price this change can pay
+        (task 4888 design decision 4).  The response covers the half
+        ``get_merge_queue`` cannot: which source won, and anything at all
+        about a coalesced submission that never becomes a queue item.
+
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
           push_status}`` (plus optional ``failure_diagnostic`` on failure).
@@ -2712,13 +3176,33 @@ def create_server(
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
         - Queued: ``{status='queued', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
-          (or wait_secs timeout expired).
+          position, queue_depth, eta_seconds, lane, lane_source,
+          lane_applied}``.  Branch was
+          freshly dispatched (or wait_secs timeout expired).  ``lane`` is the
+          resolved merge lane and ``lane_source`` names which input won it —
+          ``'argument'``, ``'task_metadata'`` or ``'default'`` (task 4888).
+          ``lane_applied`` is True here: the lane rode the enqueued request.
+          ``position`` is ``int | None``;
+          ``None`` means the live merge-worker snapshot was unavailable, so
+          render it as "unknown" — NEVER as front-of-queue (task 5368).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, inflight_task_id, source,
-          inflight_request_id, poll_by, pollable}``.  Branch is
+          position, queue_depth, eta_seconds, lane, lane_source, lane_applied,
+          inflight_task_id, source, inflight_request_id, poll_by, pollable}``.
+          Branch is
           already in-flight; request_id is the *existing* entry's id (D8), not
-          the submitting call's id.  ``inflight_task_id`` is the authoritative
+          the submitting call's id.  ``lane``/``lane_source`` describe THIS
+          submission's resolution, not the in-flight entry's own lane —
+          attaching does not move that entry between lanes, so
+          ``lane_applied`` is **False** here and the resolution is audit only.
+          Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
+          hotfix that coalesced is riding a possibly-``'normal'`` in-flight
+          entry.  To actually get the high lane, ``merge_cancel`` the
+          in-flight entry and resubmit, or wait for it and resubmit after.
+          The in-flight entry's OWN lane is not echoed here — this arm can
+          reach a foreign or pre-restart merger for which no in-process entry
+          exists at all (``poll_by='branch'``), so it is not knowable
+          uniformly; read it from ``get_merge_queue`` instead.
+          ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
           ``source`` names which coalesce arm attached (``'registry'`` /
           ``'worktree'``).  ``inflight_request_id`` is the in-flight entry's id
@@ -2753,6 +3237,11 @@ def create_server(
           supersede a live verify.  ``existing_mr``/``existing_sha`` identify the
           in-flight entry's request_id/tip (D8); ``verify_age_secs`` is how long
           that verify has been running.  Cancel it (merge_cancel) then resubmit.
+        - Invalid-lane reject (task 4888): ``{error, code='invalid_lane',
+          hint}``.  Returned when *lane* is not a ``MERGE_LANES`` member.
+          Nothing is enqueued, no future is created, and no git or task-metadata
+          work is done — validation is pure and runs first, so a typo costs the
+          caller only the round-trip that told them about it.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main AND the branch is not degenerate — i.e.
@@ -2774,6 +3263,29 @@ def create_server(
             return {'error': 'Merge queue not available — orchestrator not running'}
         if orch_config is None:
             return {'error': 'Merge queue available but no orchestrator config — cannot verify'}
+
+        # Lane validation, ordered FIRST among this tool's real work: before
+        # git_ops_for_scan is resolved and before any await, so a typo'd lane
+        # pays no ref read and no Taskmaster get_task round-trip (task 4888,
+        # pinned by test_merge_request_lane.py).  It sits just BELOW the two
+        # availability guards rather than above them because it needs the
+        # orchestrator-side MERGE_LANES vocabulary, and a non-None merge_queue
+        # is what proves the orchestrator package is importable here — above
+        # them, a standalone server would raise ImportError instead of
+        # returning its 'not available' answer.
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            # Same {error, code, hint} envelope as the duplicate_in_verify
+            # reject below; callers branch on `code`, never on the prose.  The
+            # hint renders the vocabulary carried on the exception, so it can
+            # never drift from the tuple the check keyed on.
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid} (omit it to inherit metadata.merge_lane)',
+            }
 
         # Runtime-only reverse import: orchestrator depends on escalation, not
         # vice versa, so this lazy import deliberately avoids a static cycle. It
@@ -2808,9 +3320,43 @@ def create_server(
         # emits its unknown_branch outcome, preserving existing semantics.
         # git_ops=None (standalone) skips the fast-path entirely.
         # The resolved tip is also stored as merge_req.snapshot_tip (β1 D8).
+        #
+        # full_branch and the metadata memo are hoisted ABOVE the block because
+        # the lane fallback (task 4888) needs both on the standalone path too,
+        # where git_ops is None and the fast path never runs.  Neither hoisted
+        # line does any work: canonical_queued_branch_name is pure, and
+        # _task_metadata_once() is only DEFINED here, never called.
+        full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
+
+        _task_metadata: git_authority.TaskMetadataResult | None = None
+
+        async def _task_metadata_once() -> git_authority.TaskMetadataResult:
+            """The task's metadata, read AT MOST ONCE per merge_request call.
+
+            ``git_authority.task_metadata`` is uncached — every call is a fresh
+            ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+            ``timeout=15`` (``orchestrator/src/orchestrator/scheduler.py::
+            Scheduler::get_task``).  It has two consumers here, the degeneracy
+            probe and the lane fallback, and this memo is what keeps the count
+            per call at 0 or 1 and makes 2 unreachable
+            (test_merge_request_lane.py::TestMetadataReadIsPaidAtMostOnce).
+
+            The tid is derived from the BRANCH, never from the caller-supplied
+            ``task_id`` parameter (review #6) — see ``_declined()`` below for
+            why that distinction is load-bearing.  ``site='merge_request'``
+            (review #3) names this writer in the degradation warning.
+            """
+            nonlocal _task_metadata
+            if _task_metadata is None:
+                _task_metadata = await git_authority.task_metadata(
+                    harness,
+                    full_branch.removeprefix(orch_config.git.branch_prefix),
+                    site='merge_request',
+                )
+            return _task_metadata
+
         resolved_tip: str | None = None
         if git_ops_for_scan is not None:
-            full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
             resolved_tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
             # Shape converged with worker-path already_merged (suggestion 1).
             # request_id is absent: the fast-path short-circuits before any
@@ -2839,14 +3385,52 @@ def create_server(
             #
             # Evaluated LAST in each arm, and memoized across the two (review
             # #1).  The guard's only power is to SUPPRESS an already_merged
-            # return, so it is pure cost on the overwhelmingly common
-            # submission where neither arm hits.  Hoisting it above the block
-            # made every merge_request pay a scheduler.get_task round-trip —
-            # a Taskmaster MCP dispatch with an internal timeout=15
-            # (scheduler.py:2485) — on the submit path.  Ordering it after the
-            # arm test is logically identical (`not degenerate and (A or B)`
-            # ≡ `(A and not degenerate) or (B and not degenerate)`) and pays
-            # that cost only when an arm is about to return.
+            # return, so running it before the arm test would be pure cost on
+            # the overwhelmingly common submission where neither arm hits.
+            # Ordering it after the arm test is logically identical
+            # (`not degenerate and (A or B)` ≡ `(A and not degenerate) or
+            # (B and not degenerate)`) and keeps the PROBE — the git work —
+            # off that common path.
+            #
+            # What the metadata read costs, stated as it now is (task 4888).
+            # At most ONE `scheduler.get_task` per merge_request call — a
+            # Taskmaster MCP dispatch with an internal timeout=15
+            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler::
+            # get_task`) — shared via `_task_metadata_once()` between this
+            # probe and the lane fallback.  It is never paid twice, and never
+            # paid at all when the caller supplies an explicit `lane`; it IS
+            # paid on every no-explicit-lane submission, including the common
+            # one where neither arm hits, because honouring
+            # `metadata.merge_lane` requires reading the metadata.  That is
+            # accepted: the submit path already awaits resolve_branch_sha, an
+            # is_ancestor, a `git cherry` patch-id scan and an on-disk
+            # `_merge-*` worktree scan, so one bounded MCP read is the same
+            # order as work already here.  (A previous version of this comment
+            # claimed the read was paid "only when an arm is about to return";
+            # that stopped being true when the lane fallback landed.)
+            #
+            # THE TAIL, stated because the mean is not the whole cost.  That
+            # timeout=15 is the read's WORST case, not its typical one: a
+            # wedged or merely slow task store makes every no-explicit-lane
+            # submission block up to ~15s before `task_metadata` fails open to
+            # {} and the lane degrades to 'normal' — including the high-lane
+            # hotfix submissions this parameter exists for, on a path that paid
+            # zero task-store reads before task 4888.  The escape hatch is the
+            # precedence rule itself and needs no new machinery: an explicit
+            # `lane=` skips the read entirely, which the parameter's own
+            # docstring now says so a caller who cannot afford the tail can act
+            # on it.  A SHORTER timeout for this arm alone (`asyncio.wait_for`,
+            # ~2s) was considered and declined — it would turn a store that is
+            # merely slow into a silent lane downgrade at a threshold no
+            # measurement here justifies, and report it as
+            # `lane_source='default'`, i.e. "nothing asked at all" when the
+            # truth is "we could not find out".  That conflation is present
+            # today on the 15s failure too and is recorded as a known gap
+            # (esc-4888 amendment pass): `task_metadata` returns
+            # `TaskMetadataResult.unavailable`, so the honest source is
+            # available to a later change that widens the `lane_source`
+            # vocabulary; this pass does not, because that vocabulary is
+            # pinned as closed across four surfaces.
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
@@ -2921,10 +3505,16 @@ def create_server(
                     # what resolved_tip was read from.
                     _degenerate_verdict = await branch_is_degenerate(
                         git_ops_for_scan, full_branch,
-                        await _git_authority_task_metadata(
-                            full_branch.removeprefix(orch_config.git.branch_prefix),
-                            site='merge_request',
-                        ),
+                        # `.metadata` only, DISCARDING `.unavailable`:
+                        # preserves today's fail-open exactly (a metadata
+                        # fault degrades this one guard, not the whole
+                        # submission).  Task 4651's periodic writer is the
+                        # consumer that will read the flag instead, to tell
+                        # "no degeneracy observed" from "degeneracy
+                        # unverifiable".  The lane fallback below reads the
+                        # same memo and makes the same choice, for the same
+                        # reason — neither consumer branches on the flag.
+                        (await _task_metadata_once()).metadata,
                         branch_tip_sha=resolved_tip,
                     )
                 except Exception:
@@ -2953,6 +3543,19 @@ def create_server(
             ) and not await _declined()):
                 return already_merged_response
 
+        # Lane resolution (task 4888): `lane` argument > metadata.merge_lane >
+        # 'normal'.  The metadata arm is read ONLY when the caller supplied no
+        # lane — an explicit argument makes the metadata irrelevant by the
+        # precedence rule, so it never triggers a read.  task_metadata returns
+        # {} on every failure mode and never raises, so this can degrade a lane
+        # to 'normal' but can never fail a submission.
+        lane_choice = resolve_merge_lane(
+            requested=validated_lane,
+            task_metadata=(
+                None if validated_lane is not None else (await _task_metadata_once()).metadata
+            ),
+        )
+
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
         # See OrchestratorConfig.module_configs_or_empty (config.py) for details.
@@ -2969,6 +3572,7 @@ def create_server(
             result=future,
             snapshot_tip=resolved_tip,
             retry_failed_only=retry_failed_only,
+            lane=lane_choice.lane,
         )
 
         # Build a live_snapshot provider from the live worker handle so the
@@ -3075,10 +3679,39 @@ def create_server(
             request_id; falls back to merge_queue.qsize() when no worker is
             reachable (standalone / unit tests that wire a bare asyncio.Queue).
             eta_seconds from the in-flight registry; generation is always 0 in β1.
+
+            ``position`` is ``int | None``.  ``None`` means the live worker
+            snapshot was unavailable, i.e. NOBODY COMPUTED A POSITION — render
+            it as "unknown", never as front-of-queue.  It is never omitted, so
+            a caller keying on it reads that verdict rather than hitting a
+            KeyError.  The two branches that fall back to
+            ``max(0, queue_depth - 1)`` are not fabrications: the request was
+            just enqueued, so "last in a queue of this depth" is an honest
+            derivation from a real ``queue_depth``.
+
+            ``lane``/``lane_source`` are the audit echo (task 4888).  They are
+            captured from the enclosing call rather than taken as a parameter
+            because one ``merge_request`` call resolves exactly ONE lane —
+            unlike ``status``/``req``, which genuinely differ between the
+            queued and attached call sites.
+
+            ``lane_applied`` says whether that resolution took EFFECT, and is
+            what makes the queued/attached difference BRANCHABLE rather than
+            merely documented.  True on ``'queued'``: the lane rode the
+            enqueued ``MergeRequest``.  False on ``'attached'``: the
+            submission coalesced onto an in-flight entry which keeps its own
+            lane and is never moved between lanes, so the resolution is
+            reported for audit and changes nothing.  Without it the bare word
+            ``lane`` invites the natural and wrong reading "the lane my merge
+            is in", and an operator's ``lane='high'`` on a hotfix could
+            evaporate while the response appeared to confirm it — the same
+            silent-loss-of-lane-intent defect this parameter exists to
+            remove, one level up.  Derived from ``status`` rather than passed,
+            so neither call site can forget it or disagree with it.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
             worker = _get_merge_worker(harness)
-            position: int = 0
+            position: int | None = None
             queue_depth: int = merge_queue.qsize()  # type: ignore[union-attr]
             if worker is not None:
                 try:
@@ -3091,8 +3724,15 @@ def create_server(
                             break
                     else:
                         position = max(0, queue_depth - 1)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # position stays None: the snapshot is the only source that
+                    # could have told us, so reporting any number here would be
+                    # inventing one.
+                    logger.warning(
+                        'Live merge-worker snapshot failed for request_id=%s (%s); '
+                        'reporting position as unknown',
+                        request_id_val, exc,
+                    )
             else:
                 # No live worker: queue_depth already holds merge_queue.qsize() from
                 # the initialiser above; only position needs to be set.
@@ -3106,6 +3746,9 @@ def create_server(
                 'position': position,
                 'queue_depth': queue_depth,
                 'eta_seconds': eta,
+                'lane': lane_choice.lane,
+                'lane_source': lane_choice.source,
+                'lane_applied': status == 'queued',
             }
 
         if dispatch.rejected:
@@ -3836,97 +4479,6 @@ def create_server(
 
         return None
 
-    def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
-        """Build the git-authority Tier-3.5 done/found_on_main response.
-
-        ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
-        explicit exception stated below (task 3103):
-
-        - **Live-branch path** (``is_ancestor`` hit): the citation commit
-          discovered by ``validate_landing_evidence`` — a commit on main
-          whose subject cites the task.
-        - **Deleted-branch path** (``find_merge_marker`` hit): the
-          merge-commit SHA found on main via ``git log``.
-
-        Both are effect-present-checked against current main HEAD before
-        being returned, so ``merge_sha`` is safe to record as provenance
-        as-is.  (Before task 3103 the live-branch path returned the *branch
-        tip*, which for a ``--no-ff`` merge is a distinct commit that is not
-        on main's first-parent chain — callers were told to prefer the
-        deleted-branch path's value.  That caveat no longer applies.)
-
-        **The one exception — ``git.commit_citation_pattern == ''``.**  That
-        is the documented per-project opt-out for projects with no citation
-        convention (config.py; ``find_task_citation_commit`` honours it by
-        returning None for everything, so running the gate would reject
-        unconditionally and turn this tier into dead code).  On that setting
-        the live-branch path skips the citation gate entirely and
-        ``merge_sha`` is the raw BRANCH TIP, neither citation-discovered nor
-        effect-present-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
-        deliberately retained as the price of the opt-out (the degeneracy
-        guard still applies).  Do not read the paragraphs above as
-        unconditional: on such a project a caller stamping ``merge_sha`` as
-        provenance is recording a branch tip, and a reverted landing is
-        indistinguishable from a live one (review #4).  The opt-out is
-        ``''`` only; ``None`` means "use the built-in default pattern" and
-        keeps the full guarantee.  Both SKILL.md runbooks carry the same
-        exception.
-        """
-        return {
-            'state': MergeState.done,
-            'request_id': request_id,
-            'generation': 1,
-            'kind': 'found_on_main',
-            'merge_sha': merge_sha,
-            'outcome': 'found_on_main',
-        }
-
-    async def _git_authority_task_metadata(tid: str, *, site: str) -> dict[str, Any]:
-        """Best-effort task metadata for the git-authority guards (task 3103).
-
-        Returns ``{}`` on EVERY failure mode — no harness, no ``scheduler``
-        attribute, ``get_task`` raising, or a None/metadata-less task — and
-        never raises.  A scheduler fault must degrade a single guard, not
-        swallow the whole probe.
-
-        ``{}`` deliberately FAILS OPEN out of the degeneracy check.  On the
-        ``merge_status`` path it then falls THROUGH to the citation gate,
-        which is git-only and needs no task metadata; on the
-        ``merge_request`` fast path there is no citation gate, so the block
-        simply reverts to its pre-3103 ancestry/patch-id behaviour.  Either
-        way this is exact parity with the harness, which treats an absent or
-        non-40-hex ``branch_base_sha`` as "no degeneracy signal" rather than
-        as grounds to reject: a metadata fault must never fabricate a
-        confident answer, and must never hard-fail a genuinely merged branch.
-
-        Args:
-            tid: Bare task id (no ``task/`` prefix).  Both callers derive it
-                from the branch ref they resolved the tip from, so the
-                metadata and the tip always describe the same branch.
-            site: The calling tool (``'merge_status'`` / ``'merge_request'``),
-                interpolated into the degradation warning.  Without it a
-                scheduler fault on the SUBMIT path was logged as a
-                merge_status failure, so an operator grepping for a
-                submit-path degradation would not find it (review #3).
-        """
-        if harness is None:
-            return {}
-        scheduler = getattr(harness, 'scheduler', None)
-        if scheduler is None:
-            return {}
-        try:
-            task = await scheduler.get_task(tid)
-        except Exception:
-            logger.warning(
-                '%s: scheduler.get_task(%s) failed — proceeding without task '
-                'metadata (degeneracy check skipped)',
-                site, tid, exc_info=True,
-            )
-            return {}
-        if not task:
-            return {}
-        return task.get('metadata') or {}
-
     @mcp.tool()
     async def merge_status(
         request_id: str | None = None,
@@ -3942,51 +4494,16 @@ def create_server(
             → git-authority (is_ancestor / find_merge_marker against main)
             → {state:'unknown', hint}
 
-        The git-authority tier (Tier-3.5) fires when the durable tiers miss.
-        It derives the full branch ref from the passed ``branch`` or
-        ``task_id`` via ``canonical_queued_branch_name`` (prepending
-        ``orch_config.git.branch_prefix`` unless the value already starts
-        with the prefix — the same shape-tolerant rule shared with
-        ``recover_pending_merges``), then:
-        - If the branch still exists: calls ``is_ancestor(tip, main)``, then
-          applies THREE guards in order (task 3103 brought the last two to
-          parity with the orchestrator harness's already-landed dispatch
-          gate, which has had them since task 1226):
-            1. ``tip != main_tip`` — a branch sitting at exactly main's HEAD
-               satisfies ``is_ancestor`` trivially (a commit is its own
-               ancestor) but nothing has been merged;
-            2. NOT degenerate — a tip still equal to the recorded
-               ``branch_base_sha`` proves zero commits were ever pushed, so
-               the branch is merely parked at an OLD main commit (which IS an
-               ancestor of main and IS distinct from main_tip, so guard 1
-               does not catch it);
-            3. ``validate_landing_evidence`` DISCOVERY mode — a commit on
-               main must positively cite the task and its effect must still
-               be present at main HEAD.
-          On hit → state='done', kind='found_on_main',
-          merge_sha=<the citation commit on main>.
-          Guards 2 and 3 are independent and both required: a re-seeded
-          branch is non-degenerate yet uncited, while a degenerate branch may
-          still have a citing commit on main.  When
-          ``git.commit_citation_pattern`` is ``''`` (the documented
-          per-project opt-out) guard 3 is skipped and merge_sha is the branch
-          tip — not a commit on main, and not effect-present-checked; guard 2
-          still applies.  See ``_found_on_main_response`` for what that costs
-          a caller stamping merge_sha as provenance.
-        - If the branch ref is gone (tip is None): calls ``find_merge_marker``
-          which searches git log for the merge commit subject.  On hit, two
-          further guards (task 3103, mirroring the harness marker arm):
-          the marker must NOT predate the recorded ``branch_base_sha`` (else
-          the branch was deleted and recreated under the same id and the
-          marker belongs to a previous incarnation), and
-          ``validate_landing_evidence`` CANDIDATE mode must find the marker's
-          effect still present at main HEAD (the marker's subject match
-          already establishes attribution).
-          On hit → state='done', kind='found_on_main',
-          merge_sha=<merge-commit SHA on main>.
-        Fire-safe: any git failure degrades to the honest Tier-4 unknown
-        (``logger.warning(exc_info=True)``), never raises.  The tier is skipped
-        when ``harness.git_ops`` or ``orch_config`` are absent.
+        The git-authority tier (Tier-3.5) fires when the durable tiers miss,
+        and is skipped entirely when ``harness.git_ops`` or ``orch_config``
+        are absent.  Its guards, their ordering and its fire-safety live in
+        ``escalation/src/escalation/git_authority.py::probe_landing`` and are
+        NOT restated here — merge_status only RENDERS the verdict it returns:
+        a ``found_on_main`` outcome becomes the done response below, while
+        BOTH ``landed_unconfirmed`` and ``no_signal`` become the Tier-4
+        unknown.  What a returned ``merge_sha`` may be stamped as, and the
+        one config setting that weakens it, are stated once in
+        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
 
         Returns a dict with at minimum:
             state, request_id, generation (always 1 in α3).
@@ -4003,7 +4520,8 @@ def create_server(
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
             merge_sha=<a commit ON MAIN — the discovered citation or the
-            merge marker; see ``_found_on_main_response``>,
+            merge marker; see
+            ``escalation/src/escalation/git_authority.py::found_on_main_response``>,
             outcome='found_on_main'.
         Unknown carries: hint.
         """
@@ -4078,146 +4596,27 @@ def create_server(
         if git_ops is not None and orch_config is not None:
             key = branch if branch is not None else task_id
             if key is not None:
-                try:
-                    prefix = orch_config.git.branch_prefix
-                    full_branch = canonical_queued_branch_name(key, prefix)
-                    tip = await git_ops.resolve_branch_sha(full_branch)
-                    main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
-                    tid = full_branch.removeprefix(prefix)
-                    # Runtime-only reverse import: orchestrator depends on escalation,
-                    # not vice versa, so this lazy import deliberately avoids a static
-                    # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
-                    # at runtime because the escalation server is hosted inside the
-                    # orchestrator process.  An ImportError is an Exception and therefore
-                    # already degrades to the honest Tier-4 unknown via the wrapper below.
-                    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
-                        branch_is_degenerate,
-                        is_valid_sha_40,
-                        validate_landing_evidence,
+                verdict = await git_authority.probe_landing(
+                    git_ops, key, orch_config=orch_config, harness=harness,
+                )
+                # `merge_sha is not None` is belt-and-braces: found_on_main
+                # always carries one, but found_on_main_response's merge_sha
+                # is a hard `str`, so a contract violation must degrade to
+                # Tier-4 unknown rather than emit a `done` with a null sha.
+                if (verdict.outcome is git_authority.GitAuthorityOutcome.found_on_main
+                        and verdict.merge_sha is not None):
+                    return git_authority.found_on_main_response(
+                        request_id, verdict.merge_sha,
                     )
-                    if (tip is not None and tip != main_tip
-                            and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
-                        # Live branch is already an ancestor of main (normal merged case).
-                        # tip != main_tip guards against the no-op case: a branch sitting at
-                        # exactly main's HEAD satisfies is_ancestor trivially (a commit is
-                        # its own ancestor) but nothing has been merged.
-                        # Degeneracy guard (task 3103): a tip still equal to the
-                        # recorded branch_base_sha proves ZERO commits were ever
-                        # pushed beyond the creation point.  Such a branch is parked
-                        # at an OLD main commit, which makes it an ancestor of main
-                        # AND distinct from main_tip — both conjuncts above pass — so
-                        # without this guard the tier stamps a confident `done`
-                        # against a commit containing none of the task's work.  A
-                        # degenerate branch falls through to the honest Tier-4
-                        # unknown.  Runs FIRST and independently of the citation gate:
-                        # a degenerate branch whose task DOES have a citing commit on
-                        # main (reify 5493) is caught only by this ordering.
-                        # branch_tip_sha=tip: the probe judges degeneracy
-                        # against the SAME tip the is_ancestor check above
-                        # just ran on, instead of re-reading the ref (review
-                        # #2) — one subprocess fewer, and no window for a
-                        # warm-lane reseed to split the two observations.
-                        metadata = await _git_authority_task_metadata(
-                            tid, site='merge_status',
-                        )
-                        if not await branch_is_degenerate(
-                            git_ops, full_branch, metadata, branch_tip_sha=tip,
-                        ):
-                            # Citation gate.  Read the pattern off orch_config.git for
-                            # consistency with the adjacent .main_branch / .branch_prefix
-                            # reads (same object as git_ops.config in production).
-                            pattern = orch_config.git.commit_citation_pattern
-                            if pattern == '':
-                                # Documented per-project opt-out (config.py
-                                # commit_citation_pattern): '' disables the citation
-                                # check entirely for projects without citation
-                                # conventions, and find_task_citation_commit honours it
-                                # by returning None for EVERYTHING.  Running the gate
-                                # here would therefore reject unconditionally and turn
-                                # Tier 3.5 into dead code rather than merely un-gated —
-                                # a silent capability loss for an explicit opt-in.
-                                # Note: None means "use the built-in
-                                # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
-                                # opt-out.  The degeneracy guard above still applies in
-                                # this mode.
-                                # The returned merge_sha is therefore the raw BRANCH
-                                # TIP — not a commit on main, and NOT effect-present
-                                # checked.  That is the price of the opt-out, and it is
-                                # called out explicitly in _found_on_main_response's
-                                # docstring and in both SKILL.md runbooks so a caller
-                                # on such a project does not stamp it as verified
-                                # provenance (review #4).
-                                return _found_on_main_response(request_id, tip)
-                            # DISCOVERY mode: a commit on main must positively cite the
-                            # task (FIX 2) AND its effect must still be present at main
-                            # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
-                            # accepted evidence_sha is a commit ON MAIN, which also
-                            # retires the old wart of answering with the branch tip.
-                            # No escalation on reject — mirrors the harness ancestor
-                            # arm's silent-False, and merge_status is a read-only probe.
-                            verdict = await validate_landing_evidence(
-                                git_ops, tid, full_branch,
-                                branch_tip_sha=tip,
-                                pattern_template=pattern,
-                            )
-                            # `accepted` implies a non-None evidence_sha (see
-                            # LandingEvidenceVerdict), but assert it explicitly:
-                            # _found_on_main_response's merge_sha is a hard `str`,
-                            # and a contract violation must degrade to Tier-4
-                            # unknown rather than emit a `done` with a null sha.
-                            if verdict.accepted and verdict.evidence_sha is not None:
-                                return _found_on_main_response(
-                                    request_id, verdict.evidence_sha,
-                                )
-                    elif tip is None:
-                        # Branch ref gone — the canonical 4352 deleted-branch shape.
-                        # find_merge_marker internally gates on branch existence so it only
-                        # fires when the ref is gone (consistent with the cheaper-common-path
-                        # ordering: cheaper is_ancestor check first, find_merge_marker only
-                        # when the branch has been deleted).
-                        # merge_sha = merge-commit SHA on main (via git log scan).
-                        marker = await git_ops.find_merge_marker(full_branch)
-                        if marker is not None:
-                            metadata = await _git_authority_task_metadata(
-                                tid, site='merge_status',
-                            )
-                            branch_base_sha = metadata.get('branch_base_sha')
-                            # Predates-this-incarnation veto (task 3103, mirroring
-                            # the harness marker arm): the branch was deleted and
-                            # recreated under the SAME task id, so a marker older
-                            # than this incarnation's base attributes a previous
-                            # run's merge to the current task.  is_valid_sha_40 sits
-                            # on the LEFT of the `and` so a missing or malformed
-                            # base never reaches is_ancestor with a bad argument.
-                            if not (
-                                is_valid_sha_40(branch_base_sha)
-                                and await git_ops.is_ancestor(marker, branch_base_sha)
-                            ):
-                                # CANDIDATE mode: the marker's subject match already
-                                # establishes attribution, so only the FIX 1'
-                                # effect-present guard remains — closing the
-                                # task-1175 clobber where a reverted merge still
-                                # read as a genuine landing.  No escalation on
-                                # reject (unlike the harness marker path):
-                                # merge_status is a read-only probe with no write
-                                # side, so a reject degrades to Tier-4 unknown.
-                                verdict = await validate_landing_evidence(
-                                    git_ops, tid, full_branch,
-                                    branch_tip_sha=None,
-                                    candidate_sha=marker,
-                                )
-                                # Same non-None assertion as the ancestor arm
-                                # above: reject a null evidence sha into Tier-4
-                                # unknown rather than into a `done` response.
-                                if verdict.accepted and verdict.evidence_sha is not None:
-                                    return _found_on_main_response(
-                                        request_id, verdict.evidence_sha,
-                                    )
-                except Exception:
-                    logger.warning(
-                        'merge_status: git-authority probe failed, returning unknown',
-                        exc_info=True,
-                    )
+                # `landed_unconfirmed` and `no_signal` BOTH fall through to the
+                # UNCHANGED bare Tier-4 unknown below.  Collapsing them here is
+                # deliberate and is what makes this extraction
+                # behaviour-preserving: the two are genuinely different
+                # propositions (see GitAuthorityVerdict), but the merge_status
+                # response vocabulary belongs to task 4831
+                # (plans/merge-status-durable-non-landed-prd.md label β), which
+                # splits them onto its epistemic states and reason codes.  Do
+                # not add a response field here to carry the distinction.
 
         # Tier 4: honest unknown
         return {

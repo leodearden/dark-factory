@@ -29,6 +29,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,6 +48,7 @@ from fused_memory.services.memory_service import (
     ReferentFinding,
     ReferentStats,
 )
+from fused_memory.services.write_journal import WriteJournal
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
@@ -83,6 +85,10 @@ def _finding(**overrides) -> ReferentFinding:
         'old_endpoint_name': 'Task 2520',
         'endpoint_referent': Referent(number='2520'),
         'referent_set': ('Task 2519',),
+        # The group every test in this module drives the pass with, so a
+        # helper-built expectation and a production-built finding compare equal.
+        'group_id': 'dark_factory',
+        'project_id': 'dark_factory',
     }
     fields.update(overrides)
     return ReferentFinding(**fields)
@@ -167,6 +173,111 @@ class TestReferentRecordVocabulary:
 
     def test_to_dict_renders_an_absent_intended_referent_as_none(self):
         assert _finding().to_dict()['intended_referent'] is None
+
+
+class TestReferentFindingCarriesItsProjectScope:
+    """A finding names the project it was diagnosed in, on the record itself.
+
+    One process serves nine projects, and the 2026-08-31 audit read findings
+    against the wrong one because the record carried no discriminator at all.
+    Both fields are REQUIRED rather than defaulted so that record — a finding
+    with no project scope — is unrepresentable instead of merely discouraged.
+
+    Constructs `ReferentFinding` DIRECTLY rather than through `_finding()`: the
+    requirement being pinned is the DATACLASS's, and routing through a helper
+    that fills the pair would hide a later default behind the fixture.
+    """
+
+    #: Every required field EXCEPT the scope pair, so the omission tests below
+    #: fail on exactly the two names they are about.
+    _BASE: dict = {
+        'edge_uuid': 'edge-1',
+        'which_end': 'source',
+        'check': 'set-membership',
+        'old_endpoint_uuid': 'node-1',
+        'old_endpoint_name': 'Task 2520',
+        'endpoint_referent': Referent(number='2520'),
+        'referent_set': ('Task 2519',),
+    }
+
+    def _scoped(self, **overrides) -> ReferentFinding:
+        fields = dict(self._BASE)
+        fields.update(group_id='dark_factory', project_id='dark_factory')
+        fields.update(overrides)
+        return ReferentFinding(**fields)
+
+    def test_omitting_the_scope_pair_raises_naming_both_fields(self):
+        with pytest.raises(TypeError) as excinfo:
+            ReferentFinding(**self._BASE)
+
+        message = str(excinfo.value)
+        assert 'group_id' in message
+        assert 'project_id' in message
+
+    def test_each_scope_field_is_required_on_its_own(self):
+        """Pinned per-field as well as pair-wise, so a later refactor that
+        silently defaults ONE of them cannot slip past the assertion above."""
+        with pytest.raises(TypeError, match='project_id'):
+            ReferentFinding(**self._BASE, group_id='dark_factory')
+
+        with pytest.raises(TypeError, match='group_id'):
+            ReferentFinding(**self._BASE, project_id='dark_factory')
+
+    def test_to_dict_emits_both_keys_with_the_constructed_values(self):
+        """DISTINCT values — as a DISCRIMINATOR, not as a claim about what the
+        system emits. The production path aliases the pair (the sole
+        construction site passes `project_id=group_id`, having no Scope to read
+        a separate one from), so equal values here would pass just as well
+        against a `to_dict` that echoed one field into both keys, or derived
+        one from the other. What is pinned is the RECORD's ability to carry a
+        pair that disagrees, which is what task 3335's cross-project split and
+        the durable journal rows written before it will need.
+        """
+        payload = self._scoped(
+            group_id='graph_scope', project_id='write_scope',
+        ).to_dict()
+
+        assert payload['group_id'] == 'graph_scope'
+        assert payload['project_id'] == 'write_scope'
+
+    def test_the_key_set_contract_still_holds_with_the_scope_pair(self):
+        """They are REAL FIELDS, not aliases injected into the payload — which
+        is what keeps the live `set(payload) == {field names}` assertions green
+        by construction rather than by each being widened by hand."""
+        payload = self._scoped(
+            intended_referent=Referent(number='2519'),
+            new_endpoint_uuid='node-2',
+            resolvable=True,
+        ).to_dict()
+
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+        assert {'group_id', 'project_id'} <= set(payload)
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_replace_carries_the_scope_pair_through_the_second_pass(self):
+        """`_verify_episode_referents`' second pass rebuilds every resolvable
+        finding with `dataclasses.replace` to stamp `new_endpoint_uuid`; a
+        field that did not survive that would be stamped and then dropped.
+
+        Distinct values again as the discriminator (see above): with the pair
+        aliased, a `replace` that rebuilt one field from the other would carry
+        both through unnoticed.
+        """
+        finding = self._scoped(
+            group_id='graph_scope',
+            project_id='write_scope',
+            intended_referent=Referent(number='2519'),
+            resolvable=True,
+        )
+
+        replaced = dataclasses.replace(
+            finding, new_endpoint_uuid='node-2', uuid_lookup_degraded=True,
+        )
+
+        assert replaced.group_id == 'graph_scope'
+        assert replaced.project_id == 'write_scope'
+        assert replaced.to_dict()['group_id'] == 'graph_scope'
+        assert replaced.to_dict()['project_id'] == 'write_scope'
 
 
 class TestReferentStatsVocabulary:
@@ -363,7 +474,19 @@ class TestSetMembershipCheck:
     async def test_a_cross_project_endpoint_is_a_different_referent(self, service):
         """The qualifier is a DIFFERENT-project signal and is never normalized
         away — flattening 'reify:132' onto 'Task 132' is precisely the
-        cross-project collapse utils/cross_project_refs.py exists to detect."""
+        cross-project collapse utils/cross_project_refs.py exists to detect.
+
+        REGISTERING 'reify' IS NOW LOAD-BEARING (task 4985), not scene-setting.
+        The set-membership arm skips a foreign-qualified endpoint whose
+        qualifier names no project the registry knows, so against the empty
+        registry this test's subject — the PARSE — would never be reached and
+        the assertion would pass for the wrong reason. Registering it keeps the
+        parse under test AND pins the guard's in-registry boundary from the
+        other side.
+        """
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
         result = _episode(
             edges=[_edge('e1', source='n-r132', target='n-x')],
             nodes=[MockNode(name='reify:132', uuid='n-r132'),
@@ -2450,6 +2573,139 @@ def _records_for(caplog, edge_uuid: str) -> list[logging.LogRecord]:
             if f"'edge_uuid': '{edge_uuid}'" in r.getMessage()]
 
 
+class TestTargetCitedTellsTheTwoEvidenceArmsApart:
+    """`ReferentFinding.target_cited` — WHICH EVIDENCE ARM nominated this target.
+
+    `_candidate_pool` returns `cited & referents` whenever that intersection is
+    non-empty and the whole declared set otherwise, so a target drawn from the
+    whole-set FALLBACK can never be in `cited` (if it were, the intersection
+    would have been non-empty) and a target drawn from the INTERSECTION always
+    is.  The arm is therefore readable off the record with no stored flag.
+
+    The structural twin of `corroborated` one property up: same class, same
+    rendered-`node_name` comparison, same "a stored boolean is a second site
+    that must agree with `_candidate_pool` byte-for-byte" rationale (the INV-5
+    lockstep duplication that produced esc-3671-3's blocking bug), and the same
+    injectivity precondition, already pinned by
+    `test_node_name_is_injective_over_the_registered_kinds`.
+
+    Its consumer is the repair pass's target-plausibility guard, which applies
+    ONLY on the fallback arm.
+    """
+
+    def test_true_when_the_fact_cites_the_target(self):
+        """(1) The INTERSECTION arm."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=('Task 3127',),
+            resolvable=True,
+        ).target_cited is True
+
+    def test_false_when_the_fact_cites_nothing(self):
+        """(2) The whole-set fallback on a paraphrased fact naming no task
+        number — `_candidate_pool`'s own docstring calls this "the routine
+        extraction outcome"."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=(),
+            resolvable=True,
+        ).target_cited is False
+
+    def test_false_when_the_citations_name_only_other_referents(self):
+        """(3) The fallback reached because `cited & referents` was empty."""
+        assert _finding(
+            intended_referent=Referent(number='3127'),
+            cited=('Task 9999',),
+            resolvable=True,
+        ).target_cited is False
+
+    def test_false_when_no_target_was_nominated(self):
+        """(4) An unresolvable finding nominates no target, and the fail-closed
+        answer is "not cited" — the direction that REFUSES."""
+        assert _finding(
+            intended_referent=None, cited=('Task 3127',),
+        ).target_cited is False
+
+    def test_it_compares_canonical_node_names_not_spellings(self):
+        """(5) The same discrimination the `corroborated` sibling pins: a
+        foreign-qualified citation does not match a bare local target of the
+        same number, and vice versa."""
+        assert _finding(
+            intended_referent=Referent(number='132'),
+            cited=('reify:132',),
+            resolvable=True,
+        ).target_cited is False
+
+        assert _finding(
+            intended_referent=Referent(number='132', project_id='reify'),
+            cited=('Task 132',),
+            resolvable=True,
+        ).target_cited is False
+
+        assert _finding(
+            intended_referent=Referent(number='132', project_id='reify'),
+            cited=('reify:132',),
+            resolvable=True,
+        ).target_cited is True
+
+    @pytest.mark.parametrize(('referents', 'cited', 'endpoint', 'ambiguous', 'source'), [
+        # INTERSECTION arm: the fact cites a declared referent.
+        (('3127', '3129'), ('3127',), '3200', (), 'derived'),
+        (('3127',), ('3127', '9999'), '3200', (), 'metadata'),
+        # FALLBACK arm: the fact cites nothing, or nothing declared.
+        (('3127',), (), '3200', (), 'derived'),
+        (('3127',), ('9999',), '3200', (), 'declared'),
+        # VETO 1 — an ambiguous endpoint empties the pool.
+        (('3127',), ('3127',), '3200', ('3200',), 'derived'),
+        # VETO — the fact cites the endpoint itself (corroboration).
+        (('3127',), ('3127', '3200'), '3200', (), 'derived'),
+        # VETO 2 — a source='metadata' fallback.
+        (('3127',), (), '3200', (), 'metadata'),
+    ])
+    def test_it_is_equivalent_to_the_pool_having_taken_the_intersection_arm(
+        self, referents, cited, endpoint, ambiguous, source,
+    ):
+        """(6) DERIVED FROM `_candidate_pool`, not restated from it.
+
+        This is what makes "target in cited <=> intersection arm" a CHECKED
+        property of the pool rather than a claim in a comment: a future change
+        to the pool reds here instead of silently re-licensing the repair
+        pass's plausibility guard.
+        """
+        referent_set = frozenset(Referent(number=n) for n in referents)
+        cited_set = frozenset(Referent(number=n) for n in cited)
+        endpoint_ref = Referent(number=endpoint)
+        ambiguous_set = frozenset(Referent(number=n) for n in ambiguous)
+
+        pool = memory_service_module._candidate_pool(
+            referents=referent_set, cited=cited_set, endpoint=endpoint_ref,
+            ambiguous=ambiguous_set, source=source,
+        )
+        candidates = memory_service_module._candidate_targets(
+            referents=referent_set, cited=cited_set, endpoint=endpoint_ref,
+            other_endpoint=None, ambiguous=ambiguous_set, source=source,
+        )
+        if len(candidates) != 1:
+            # A VETO ROW. It nominates no target at all, so the guard this
+            # property feeds is never reached — which is the assertion, not a
+            # reason to skip: a veto that stopped emptying the pool would show
+            # up here as a survivor appearing where none may.
+            assert not pool
+            return
+
+        finding = _finding(
+            endpoint_referent=endpoint_ref,
+            referent_set=tuple(sorted(r.node_name for r in referent_set)),
+            cited=tuple(sorted(r.node_name for r in cited_set)),
+            intended_referent=candidates[0],
+            resolvable=True,
+        )
+        took_the_intersection_arm = bool(cited_set & referent_set) and (
+            pool == (cited_set & referent_set)
+        )
+        assert finding.target_cited is took_the_intersection_arm
+
+
 class TestCorroboratedFindingsAreNotOperatorWarnings:
     """S1 (esc-3671-3): the membership arm's counterpart of the discipline the
     pairing arm already keeps.
@@ -2960,3 +3216,425 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
                 referents=(Referent(number='3127'),),
             )
 
+
+async def _wired_journal(service, data_dir) -> WriteJournal:
+    """A REAL journal over *data_dir*, wired the way `server/main.py` wires it.
+
+    Real rather than mocked because the property under test is DURABILITY: a
+    stub would prove only that a method was called, which is the one thing an
+    in-memory `ReferentStats` already did.
+    """
+    journal = WriteJournal(data_dir)
+    await journal.initialize()
+    service.set_write_journal(journal)
+    return journal
+
+
+def _episode_with_identity(result, uuid: str = 'ep-real'):
+    """Stamp the EpisodicNode graphiti_core actually minted onto *result*.
+
+    `MockAddEpisodeResult.episode` defaults to None, which `_episode_uuid_of`
+    correctly reads as `''`; a row that has to name its episode needs the real
+    thing.
+    """
+    result.episode = SimpleNamespace(uuid=uuid)
+    return result
+
+
+def _one_resolvable_one_unresolvable_episode() -> MockAddEpisodeResult:
+    """Two findings under ONE declared pair, split by each edge's own fact.
+
+    e1's fact names Task 10, so its candidate pool narrows to one and the
+    finding resolves; e2's fact names nothing, so both declared referents
+    survive and zeta refuses to guess between them.
+    """
+    return _episode(
+        edges=[_edge('e1', fact='Task 10 supersedes this',
+                     source='n-99', target='n-lane'),
+               _edge('e2', fact='the deploy pipeline was retried',
+                     source='n-98', target='n-x')],
+        nodes=[MockNode(name='Task 99', uuid='n-99'),
+               MockNode(name='Task 98', uuid='n-98'),
+               MockNode(name='merge lane', uuid='n-lane'),
+               MockNode(name='deploy pipeline', uuid='n-x')],
+    )
+
+
+class TestResolvableFindingsAreJournalledDurably:
+    """A diagnosis that does not outlive the process is one nobody can act on.
+
+    zeta's findings were returned in-process and then gone, so the census edges
+    it fully diagnosed and could not repair left nothing behind for a later
+    pass. The row is what phase-5 replay reads; the counters and the returned
+    `ReferentStats` are untouched by its presence or its absence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_finding_lands_one_row_carrying_the_full_payload(
+        self, service, tmp_path,
+    ):
+        """The payload is the SECOND-PASS finding. `new_endpoint_uuid` is
+        stamped by `dataclasses.replace` after the loop that builds the
+        findings, so a row written any earlier would persist a payload missing
+        the very target the replay pass exists to act on."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+        journal = await _wired_journal(service, tmp_path)
+
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(rows) == 1
+        assert rows[0]['payload'] == stats.findings[0].to_dict()
+        assert rows[0]['payload']['new_endpoint_uuid'] == 'n-3127'
+        assert rows[0]['payload']['uuid_lookup_degraded'] is False
+        assert rows[0]['payload']['group_id'] == 'dark_factory'
+        assert rows[0]['payload']['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_the_row_names_its_group_and_its_episode(
+        self, service, tmp_path,
+    ):
+        """A real episode uuid, not the `''` `_episode_uuid_of` fails closed to
+        — and filterable by the project discriminator the 2026-08-31 audit
+        lacked."""
+        journal = await _wired_journal(service, tmp_path)
+
+        await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        scoped = await journal.get_referent_findings(group_id='dark_factory')
+        elsewhere = await journal.get_referent_findings(group_id='reify')
+        await journal.close()
+
+        assert [r['group_id'] for r in rows] == ['dark_factory']
+        assert [r['episode_uuid'] for r in rows] == ['ep-real']
+        assert scoped == rows
+        assert elsewhere == []
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_finding_is_recorded_everywhere_but_here(
+        self, service, tmp_path,
+    ):
+        """PERSIST THE ACTIONABLE. The journal's only declared consumer is the
+        replay pass, which can act on nothing that names no intended referent —
+        an unresolvable row would be a backlog entry nothing could ever drain.
+        It costs no in-memory signal: the finding, its counter buckets and its
+        WARNING all stay exactly as they were."""
+        journal = await _wired_journal(service, tmp_path)
+
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_resolvable_one_unresolvable_episode()),
+            group_id='dark_factory',
+            referents=(Referent(number='10'), Referent(number='11')),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert [f.resolvable for f in stats.findings] == [True, False]
+        assert [r['payload']['edge_uuid'] for r in rows] == ['e1']
+        assert service.referent_finding_counts()['set-membership'] == 2
+        assert service.referent_finding_counts()['unresolvable'] == 1
+
+    @pytest.mark.asyncio
+    async def test_every_finding_is_journalled_even_past_the_warning_cap(
+        self, service, tmp_path, caplog,
+    ):
+        """`_REFERENT_FINDING_WARN_CAP` is a log-VOLUME policy, documented as
+        being on the log and on nothing else. A suppressed finding is still a
+        diagnosis that has to survive, so persistence sits outside the cap
+        exactly as the counters do — putting it inside would silently discard
+        the rows a storm makes most worth keeping."""
+        cap = _warn_cap()
+        journal = await _wired_journal(service, tmp_path)
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _episode_with_identity(_finding_storm_episode(cap + 5)),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert len(stats.findings) == cap + 5
+        assert {r['payload']['edge_uuid']: r['payload'] for r in rows} == {
+            f.edge_uuid: f.to_dict() for f in stats.findings
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_storm_episode_costs_one_commit_not_one_per_finding(
+        self, service, tmp_path, monkeypatch,
+    ):
+        """This loop runs INSIDE the per-group identity lock, which serializes
+        same-group writes, and every journal commit is a `synchronous=FULL`
+        fsync. Since the finding count has no ceiling here — the cap above is
+        log-only — a row-at-a-time write would make a storm episode hold that
+        lock for the sum of its fsyncs. One episode, one commit.
+
+        Counts commits on the connection because the commit count IS the
+        property under test: the rows it produces are identical either way.
+        """
+        cap = _warn_cap()
+        journal = await _wired_journal(service, tmp_path)
+        commits = 0
+        db = journal._require_db()
+        real_commit = db.commit
+
+        async def _counting_commit():
+            nonlocal commits
+            commits += 1
+            await real_commit()
+
+        monkeypatch.setattr(db, 'commit', _counting_commit)
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_finding_storm_episode(cap + 5)),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        rows = await journal.get_referent_findings()
+        await journal.close()
+
+        assert len(stats.findings) == cap + 5
+        assert len(rows) == cap + 5
+        assert commits == 1
+
+    @pytest.mark.asyncio
+    async def test_the_pass_is_unchanged_by_an_absent_or_failing_journal(
+        self, service, tmp_path,
+    ):
+        """DEGRADES, NEVER FAILS THE WRITE.
+
+        The episode write has already committed by the time this pass runs, so
+        a journal fault must cost a row and never a finding. The `None` case is
+        skipped SILENTLY — the counters remain the unconditional INV-4 escape,
+        and a per-finding warning for an unconfigured journal would be a storm
+        rather than a signal.
+        """
+        async def _findings() -> list[dict]:
+            stats = await service._verify_episode_referents(
+                _episode_with_identity(_one_membership_finding_episode()),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+            return [f.to_dict() for f in stats.findings]
+
+        assert service.write_journal is None
+        unwired = await _findings()
+
+        # Never initialized, so the REAL method's own fire-and-forget guard is
+        # what absorbs the fault — the call site deliberately has none.
+        failing = WriteJournal(tmp_path / 'never_initialized')
+        service.set_write_journal(failing)
+        faulted = await _findings()
+
+        working = await _wired_journal(service, tmp_path / 'working')
+        journalled = await _findings()
+        rows = await working.get_referent_findings()
+        await working.close()
+
+        assert unwired == faulted == journalled
+        assert len(unwired) == 1
+        assert [r['payload'] for r in rows] == journalled
+        assert failing.journal_drop_stats() == {
+            'dropped_total': 1, 'by_operation': {'referent_finding': 1},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_row_survives_a_service_restart(self, service, tmp_path):
+        """End to end, not merely the journal unit: the row this PASS wrote is
+        still readable by a process that never saw the episode."""
+        journal = await _wired_journal(service, tmp_path)
+        stats = await service._verify_episode_referents(
+            _episode_with_identity(_one_membership_finding_episode()),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+        await journal.close()
+
+        reopened = WriteJournal(tmp_path)
+        await reopened.initialize()
+        rows = await reopened.get_referent_findings(group_id='dark_factory')
+        await reopened.close()
+
+        assert [r['payload'] for r in rows] == [
+            f.to_dict() for f in stats.findings
+        ]
+
+
+class TestTheUnregisteredQualifierGuard:
+    """Guard (a) — the set-membership arm SKIPS a foreign-qualified endpoint
+    whose qualifier names no project this instance knows (task 4985).
+
+    Restores cancelled task 3335's guard-3 protection class in zeta's own
+    idiom; guard 3 died silently in the 3666 cherry-pick and is not portable
+    (it asked whether the episode touched a node named 'Task N', while zeta
+    inverts the direction and starts from an ENDPOINT).
+
+    The permissive scan is currently the ONLY thing protecting the live reify
+    node 'localhost:3939', and narrowing the producer (task 3881) would convert
+    it from protected to repairable — which is why this guard is prerequisite
+    to that narrowing.
+
+    Confined to the MEMBERSHIP arm: the pairing arm fires only when the
+    endpoint IS declared, where the qualifier carries no such signal.
+    """
+
+    @staticmethod
+    def _qualified_episode(name='redis:6379', uuid='n-redis', fact=''):
+        return _episode(
+            edges=[_edge('e1', fact=fact, source=uuid, target='n-x')],
+            nodes=[MockNode(name=name, uuid=uuid),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_qualifier_is_skipped_but_counted(self, service):
+        """(1) No finding — and the skip is LEGIBLE as a skip, never as an
+        agreement. `endpoints_checked` counts both, so a skipped endpoint
+        recorded nowhere would be indistinguishable from one that AGREED."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(), group_id='dark_factory',
+            referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+        assert stats.endpoints_unregistered_qualifier == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_a_registered_qualifier_is_checked_exactly_as_today(self, service):
+        """(2) The guard's boundary is the REGISTRY, not the qualifier's mere
+        presence."""
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='reify:132', uuid='n-r132'),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].check == 'set-membership'
+        assert stats.findings[0].endpoint_referent == Referent(
+            number='132', project_id='reify',
+        )
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_it_is_fail_closed_on_an_empty_registry(self, service):
+        """(3) NOT relaxed to "permissive until the registry is populated".
+
+        MemoryService is constructed BEFORE build_known_projects_map runs, so
+        `{}` is a real window; a permissive relaxation would leave exactly the
+        pre-registry window unprotected, which is the opposite of what a safety
+        guard is for. Skipping costs a detection, never a wrong repair.
+        """
+        assert service._known_projects == {}
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(), group_id='dark_factory',
+            referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bare_own_project_endpoint_is_untouched(self, service):
+        """(4a) project_id is empty, so the guard cannot fire. The dominant
+        live shape."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='Task 1251', uuid='n-1251'),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(number='1251')
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_a_self_qualified_endpoint_is_untouched(self, service):
+        """(4b) `local_referent` reclassifies a SELF-qualified spelling to the
+        bare local referent, so project_id is '' by the time the guard reads it
+        — own-project endpoints can never be skipped even if the registry
+        somehow lacks their own key."""
+        service.set_known_projects({})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='dark_factory:3127', uuid='n-df3127'),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(number='3127')
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_pairing_arm_is_untouched(self, service):
+        """(5) A foreign-qualified endpoint that IS in the declared referent
+        set, on an edge whose fact cites a DIFFERENT declared referent, still
+        yields a pairing finding even though its qualifier is unregistered."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        declared = (Referent(number='6379', project_id='redis'),
+                    Referent(number='3127'))
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(fact='This is really about Task 3127.'),
+            group_id='dark_factory', referents=declared,
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].check == 'per-edge-pairing'
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_counter_stays_zero_on_a_clean_episode(self, service):
+        """(6) And it is a plain ReferentStats field defaulting to 0."""
+        assert ReferentStats().endpoints_unregistered_qualifier == 0
+
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(name='Task 3127', uuid='n-3127'),
+            group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 0
+
+    @pytest.mark.asyncio
+    async def test_the_live_regression_shape(self, service):
+        """(7) NAMED FOR A FUTURE READER. The reify node 'localhost:3939' is the
+        only non-project qualified-shape node in the fleet, and its two edges
+        differ only in whether the paraphrase happens to cite the endpoint.
+        Pre-fix it is repairable; post-fix it is skipped.
+
+        This is the protection class task 3335's guard 3 lost in the 3666
+        cherry-pick, and the one task 3881's registry narrowing depends on:
+        without it, narrowing the producer converts protected endpoints into
+        repairable ones.
+        """
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._verify_episode_referents(
+            self._qualified_episode(
+                name='localhost:3939', uuid='n-localhost',
+                fact='The dashboard was served without incident.',
+            ),
+            group_id='dark_factory', referents=(Referent(number='1251'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unregistered_qualifier == 1
+        assert_never_repaired(service)

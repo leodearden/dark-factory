@@ -10,6 +10,87 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `merge_request` gained a `lane` parameter, and `merge_lane` is blessed into Tier-A (task 4888)
+
+**`metadata.merge_lane` was inert for every MCP-submitted merge.** Exactly one
+`MergeRequest(...)` construction in the repo passed `lane=` — the orchestrator's own
+submit path, `workflow.py::TaskWorkflow::_submit_to_merge_queue`. The one in
+`escalation/src/escalation/server.py::merge_request` omitted it and took the dataclass
+default `'normal'`, so a main-health fix task carrying `merge_lane='high'` was silently
+enqueued behind every routine merge whenever its merge came through the MCP tool.
+`merge_request` now honours the key, and gained an explicit `lane` parameter to set one
+directly. Precedence is **`lane` > `metadata.merge_lane` > `'normal'`**, and the argument
+wins even when it EQUALS the default — `lane='normal'` deliberately holds a `'high'` task
+back to the normal lane, the case a truthiness-based implementation gets wrong.
+
+**The parameter is `lane`; the metadata key stays `merge_lane`.** Two namespaces, two
+right answers. At the merge-queue boundary every existing name for this concept is the
+bare word — `MergeRequest.lane`, `MERGE_LANES`, the `lane` field `get_merge_queue` emits
+per queue item — so a submitter correlating its request against the queue would otherwise
+have to translate. Task metadata is one flat global dict shared by every subsystem, and
+this repo has at least three other things called lanes (warm, offline, merge-worktree); a
+bare `lane` there would be ambiguous on sight. Renaming the metadata key to match was
+rejected — it is machine-written at three live sites and buys nothing but a migration.
+
+**An invalid CALLER-supplied lane is rejected loudly; an invalid INHERITED one still
+normalises silently.** `lane='higgh'` returns `{error, code='invalid_lane', hint}` and
+enqueues nothing; the same spelling in `metadata.merge_lane` still becomes `'normal'`.
+The asymmetry is the point: an inherited value was written by another actor at another
+time and a lane resolution must never be able to FAIL a merge submission, whereas the
+argument is live operator intent and silently downgrading a main-health hotfix is exactly
+the defect the parameter exists to remove. The caller-supplied check is deliberately NOT
+routed through `_normalize_lane`, whose defining behaviour — map anything unrecognised to
+`'normal'` — would reproduce that defect one level up; both halves still key on the same
+`MERGE_LANES` tuple, so there is one vocabulary and no second normaliser. (This entry is a
+dated release note and states the reasoning in full for a reader who has only the release
+notes; the LIVE copy every in-tree surface cites is the module docstring of
+`escalation/src/escalation/merge_lane_resolution.py`.)
+
+**The parameter is not separately access-gated, because the tool carrying it already is.**
+Measured, not assumed: `mcp__escalation__merge_request` appears in exactly ONE agent
+role's `allowed_tools` — `roles.py::STEWARD` — which the SDK enforces as a ceiling, so no
+rank-and-file agent role can reach the parameter to self-declare urgency. Task 1689's
+anti-starvation reservation of `'high'` for the rare, gated hotfix/main-health class is
+carried by that existing restriction plus attribution: the resolved lane and the source
+that won it are echoed back as `lane`/`lane_source` on both the queued and the attached
+submit response, and `get_merge_queue` already shows the lane per queue item. A third key,
+`lane_applied`, makes the queued/attached difference machine-branchable: it is `True` on
+the queued arm, where the lane rode the enqueued request, and `False` on the attached arm,
+where the submission coalesced onto an in-flight entry that keeps its own lane — so a
+`lane='high'` hotfix that coalesced cannot read as confirmed high-lane. That echo is
+what closes the loop for a caller who passed no argument — without it there was no way to
+learn whether the task's own `merge_lane` had been honoured, which is half of why the key
+could sit inert unnoticed. It lands on the RESPONSE rather than on the `merge_queued`
+event because `merge_queue.py` is frozen by the merge-lane quality PRD's ratchet
+(`orchestrator/tests/test_merge_lane_ratchet.py`) against a line/prose/cognitive baseline
+that one added line — or one added comment — would break.
+
+Cost is bounded: the submit path's degeneracy probe and the new lane fallback share ONE
+memoized task-metadata read, so the count per `merge_request` call is 0 or 1 and 2 is
+unreachable; an explicit `lane=` skips it entirely, and a rejected typo pays nothing
+because validation is pure and runs before any git or metadata work. The remaining single
+read on a no-explicit-lane submission is accepted rather than engineered away — it is
+unavoidable if the precedence rule exists at all, and it can degrade a lane to `'normal'`
+but never fail a submission. The rule itself lives in a new pure module,
+`escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
+server, a queue, a registry and a fake worker.
+
+**`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
+`code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
+means and why `'high'` stays reserved. Blessed rather than promoted to a typed
+`Literal['normal', 'high']`, despite the vocabulary being closed and tiny — which is the
+fork `execution_class` (task 3780) is already recorded in that same §8 as the worked
+example for. A `Literal` raises on
+every metadata write to an out-of-vocabulary carrier under `direction='write',
+enforce=True`, permanently, since terminal tasks are unrepairable under the
+`done_provenance` write-authority floor; this task deliberately GROWS the carrier
+population via the new parameter, so the form that cannot strand a future carrier is the
+conservative one, and blessing can be tightened later where a raising `Literal` cannot be
+loosened. The typo the stronger form would have caught is caller intent — and that path is
+now guarded where it actually lives. The carrier census at blessing time (four tasks,
+measured 2026-08-20) is recorded once, in the frozenset annotation itself, which also
+records why the blessing ground here is LOAD-BEARING plus STABLE rather than corpus volume.
+
 #### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
 
 Replaces the hand-rolled write-then-delete choreography that made consolidation a
@@ -144,6 +225,92 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### Both of `merge_gates.py`'s `--no-renames` diff gates are now rename-aware (task 5342)
+
+**Behaviour change, two sites plus a message.** Both gates built a path-string set
+operation on top of `--no-renames` diffs, which split a rename into two unrelated
+strings. Each therefore read a *relocation* as a *disappearance* and blocked a merge
+that had dropped nothing. The two sites need rename resolution on OPPOSITE ranges — the
+branch side and the merge side — so both now go through one shared `_rename_pairs`
+primitive (a single `git diff -M --name-status`, parsed with the tab-split idiom
+`_rename_pair_for` already used), leaving the module with exactly one way to ask git
+what was renamed between two trees.
+
+- **Post-merge equivalence gate** — before: a branch-touched path was compared unless
+  main touched *that exact path*. After: a path whose rename **source** main touched
+  becomes a *candidate* for exclusion, and is excluded only once the branch's own delta
+  is verified present in the merged blob. So relocating a file main concurrently edited
+  at the old path no longer produces a false `Conflict resolution likely dropped or
+  rewrote work` (measured: reify task 5694, merge `d1d857f43545`, esc-5694-5).
+- **Plan-target drop-guard** — before: every apparently-dropped path the branch had
+  changed was flagged. After: a path that is a rename **source** between task HEAD and
+  the merge commit becomes a *candidate*, excluded only once the same content check
+  confirms the branch's work is at the new name. So a sibling relocating a file the
+  branch *modified* no longer produces a false `Merge commit is missing plan target
+  files` (measured: reify esc-6436-4).
+
+The content check is one shared primitive used by both gates, gathering evidence in
+three ascending steps. First the merged path must **resolve to a blob** at all. Then, if
+the merged blob is **byte-identical** to the one the branch produced (`git diff --quiet`
+between the two blob revisions — it prints nothing, so it answers even for a payload
+that cannot be decoded), the branch's content landed verbatim and nothing need be read. Only otherwise — main edited the same content on top —
+is the branch's delta diffed blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`)
+and reverse-applied against the merged blob with `git apply --check -R`.
+
+The existence step is load-bearing and comes first for a reason a later step cannot
+cover: a **pure relocation**'s delta is *empty*, and an empty patch reverse-applies
+against anything — including a resolution that deleted the file outright. On the
+equivalence gate both halves of such a rename are otherwise invisible (the source is
+discarded by the `main_touched` arm, the target by the suppression arm), so without it
+the compare set is empty and the gate passes a merge that destroyed the branch's work.
+Existence is the whole of a pure relocation's claim, so it is the whole of what is
+checked there.
+
+**A rename pair is not, by itself, evidence the work survived.** Git pairs renames at
+~50% similarity, so a resolution that relocates a file and *discards* the branch's edit
+still pairs (measured `R095`) — suppressing on the bare pair would turn both gates into
+silent work-loss holes, and neither gate backstops the other on this case. Hence the
+content check, and hence two deliberately *different* error directions: an unreadable
+**rename map** fails **open** (uniform with each gate's four existing `rc != 0` arms —
+the gate cannot tell a rename from a drop at all, so it degrades), while an unverifiable
+**content probe** declines to suppress, falling back to pre-change flagging, which by
+construction cannot introduce a false block relative to main. The probe is conservative
+in the same direction throughout: `git apply` matches context with no fuzz, so a
+main-side edit inside the branch hunk's context lines flags rather than silently passes.
+
+**A binary payload must not take either gate out of that error model.** `git_ops._run`
+decodes stdout as strict UTF-8, so reading a merged blob that is binary — or text in a
+legacy encoding — raises `UnicodeDecodeError`, and neither gate catches it:
+`classify_and_merge` re-raises after cleaning up the merge worktree, so the merge would
+die with a traceback instead of failing open OR keeping the flag. The OID step settles
+the common case without reading anything (a binary file only the branch touched
+suppresses on identity), and the read that remains is guarded and flags. An earlier
+draft of this entry claimed binary files "produce a patch `git apply` will not take" —
+that was wrong: control never reached `git apply`.
+
+`-C` is deliberately not passed, since a copy leaves its source in place. All five
+pre-existing diffs are byte-identical; `--no-renames` on the equivalence gate's
+main-touched diff is in fact load-bearing in the new design, because main's own rename
+must stay decomposed for its source to appear in the set the branch's rename sources are
+looked up in.
+
+When a suppression fires, each gate logs one INFO naming the pairs and recording that the
+content was verified at the new name, so a gate that passes says *why*. The complementary case — a block that survives rename
+resolution — now names its triage command **and its direction**
+(`git diff <tip12> <advanced12> -- <path>`, branch tip first) plus the `git log --follow`
+a relocated path requires; reading that diff backwards, and a `--follow`-less history
+that looked empty, are what steered the esc-5694-5 RCA to the opposite of the truth.
+
+The merge-lane ratchet baseline is regenerated accordingly. `merge_gates.py`'s
+`cognitive`/`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content
+probe and their docstrings. Extracting the adapters rather than inlining them actually
+*lowered* both host functions (`_check_post_merge_equivalence` 25→24,
+`_check_plan_targets_in_tree` 16→15), and the four new keys land at 5/8/11/11 against the
+cognitive-15 new-key ceiling. The existence and byte-identity steps then take
+`_branch_delta_survives` 5→10 — still inside that ceiling, and the smallest shape that
+closes both holes: identity is asked with `git diff --quiet` rather than a pair of
+`rev-parse` reads precisely so it costs one branch instead of two.
 
 #### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
 

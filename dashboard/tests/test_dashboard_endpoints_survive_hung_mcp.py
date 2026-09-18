@@ -114,7 +114,11 @@ def hung_mcp(monkeypatch, tmp_path):
         orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', _TINY_BUDGET,
     )
     # The Tasks tab is already compliant; shrink it too so it does not
-    # dominate the sweep's wall time.
+    # dominate the sweep's wall time. _TASKS_PER_CALL_TIMEOUT is shrunk for
+    # the same reason and is NOT optional: it was widened to 4.4 s for real
+    # 5 000-task trees (task 4884), and against a stub that never returns the
+    # sweep would otherwise pay it per call per root.
+    monkeypatch.setattr(active_tasks, '_TASKS_PER_CALL_TIMEOUT', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_PER_PROJECT_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 

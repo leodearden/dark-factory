@@ -399,10 +399,10 @@ def storm_detail(
         '',
         # BOUNDARY-SCOPED, not universal, and no longer this filer's to
         # phrase. The route to a per-event answer differs per registration
-        # site — plan-tools journals every fact to a file, verdict-tools has
-        # no durable journal yet — so each site declares its own sentence in
-        # ``MarkupSinkSpec.attribution_source`` (task 4744, which also landed
-        # the plan-tools journal). This filer is shared, so a sentence baked
+        # site — plan-tools and verdict-tools each journal every fact to
+        # their own file (tasks 4744 and 4917), the escalation server only
+        # logs — so each site declares its own sentence in
+        # ``MarkupSinkSpec.attribution_source``. This filer is shared, so a sentence baked
         # in here would be silently inherited as a falsehood in a level-1
         # operator record by the next site registered.
         'For per-event corroboration — one line per call rather than the '

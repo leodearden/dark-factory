@@ -138,15 +138,39 @@ _ESCALATION_TOOLS = [
 # concatenation, like every other splice in this file -- these prompts are
 # deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
 # Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+#
+# The two `action` values quoted verbatim in the escalate_blocker bullet --
+# `terminate_cleanly` and `keep_driving` -- are WIRE TOKENS defined in
+# `escalation.models.FILER_ACTIONS` and emitted by `escalate_blocker`. NO CODE
+# READS THEM: this prose is the only thing that tells an agent what the key it
+# receives means, so a rename at the emission site would silently decouple the
+# instruction from the response. Exactly like MANDATED_STAGING_COMMAND, that
+# constant is a *test anchor*, not a shared template -- this prompt is not an
+# f-string, so the copy below must be updated with it, and
+# test_roles_escalation_ladder.py catches the drift after the fact rather than
+# preventing it structurally (task 5368).
 ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
 
 - **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
-- **`escalate_blocker(...)`** — Blocking problem. Report it, then commit any in-progress
-  work, log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-  and you will be re-invoked.
+- **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
+  of the response and do what it says.
+  - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
+    iteration, and STOP. Do NOT retry — the handler will resolve the issue and you will
+    be re-invoked.
+  - `keep_driving` — accompanies `status: accepted_unpersisted`. Your filing was accepted
+    but a post-write re-read could not confirm it landed, so there may be no record on
+    disk for any handler to drain. Stopping here would remove your task from every
+    recovery path in exchange for an escalation nobody will ever see. So do NOT stop:
+    keep driving the blocked task as best you can, and re-file ONCE on your next
+    iteration — then terminate cleanly regardless of what that second filing returns.
+    Re-file exactly ONCE because the repeat is NOT generally folded: the dedupe gate
+    covers only `category='infra_issue'` inside a short (600s) window, and a
+    `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
+    repeat mints a NEW record, and on that one a NEW page to the human. One retry
+    buys a second chance at durability; a retry every iteration is a storm.
 
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.
@@ -308,6 +332,14 @@ Use when you need context not in your briefing:
 - Before making assumptions about conventions or patterns
 - When encountering unfamiliar code or entities
 - When you need context about prior decisions
+
+Parameters:
+- `caller_agent_id`: Use the agent_id from your Agent Identity section
+- `caller_task_id`: Use your task id from the Agent Identity section
+
+These two record WHO IS ASKING so a read can be attributed. They are NOT the
+`agent_id` parameter, which is a FILTER restricting results to one authoring
+agent — passing your own id there would hide everyone else's memories from you.
 """
 
 # The canonical staging command that every role's "## CRITICAL: Git Staging
@@ -992,6 +1024,113 @@ SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
 SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
 
 
+# Inlined from docs/code-quality.md, which remains the single normative copy
+# (INV-9). The inline copy exists at all because a dispatched agent's system
+# prompt cannot follow a cross-reference, the same reason this module already
+# carries its own copy of the refs/stash prohibition.
+#
+# CARRIED HERE, and nothing else: the fourteen headline TOKENS; both stances;
+# and the do-not-steer-by list. The Tests stance deliberately FOLDS IN the three
+# measurable symptoms the doc lists under heuristic 13's reading (reach-back
+# imports, cycle-breaking function-local imports, re-export shims), because a
+# reviewer meets all five symptoms as one test-shaped finding rather than as two
+# separate lookups. NOT carried: the agreed reading of every other headline.
+#
+# orchestrator/tests/test_code_quality_guidance_parity.py is the drift guard: it
+# parses BOTH the doc and the production-RENDERED prompt with one parser, and
+# compares the headline tokens and both bullet lists' LABELS as ordered
+# equalities, so those are provably derived rather than a second source. The
+# folded symptom list is NOT guarded -- labels are compared, bullet bodies are
+# not -- so it is the one place where an edit to heuristic 13's reading in the
+# doc must be mirrored here by hand. Cited by FILE PATH, not by test class name,
+# because test_cited_test_class_drift.py requires every cited Test<CamelCase>
+# identifier in src prose to resolve to a real class.
+#
+# Interpolation-safe by contract: this reaches _REVIEWER_HEURISTICS_TEMPLATE's
+# str.format() call, so it must carry no literal brace.
+CODE_QUALITY_GUIDANCE = """
+## Code quality — judge against this definition
+
+Code quality is the expected cost and risk of the next change. In a
+factory-operated codebase the next change is made by an agent working from a
+partial view of the code, reviewed by an agent, and verified by machine. So
+quality means two things: how cheaply and safely an agent can make a correct
+change, and how likely a wrong change is to be caught before it lands.
+
+The mechanical gates — pytest, ruff, pyright — are the FLOOR. This definition
+is the BAR. A change can pass every gate and still be correctly rejected
+against it.
+
+## The fourteen heuristics
+
+1. **Informative names.**
+2. **Simple control flows.**
+3. **Carefully factored orthogonal dimensions of variability.**
+4. **Small function scopes.**
+5. **Minimum data access scopes and lifetimes.**
+6. **Well-defined purpose for each entity.**
+7. **Prefer stateless interactions between modules.**
+8. **Prefer immutable data.**
+9. **Deep modules with appropriate nesting and coherent narrow interfaces.**
+10. **Clear invariants, informatively, redundantly, uniformly enforced.**
+11. **SPOT — single point of truth.**
+12. **Structured data instead of meaningful strings.**
+13. **Files make internal sense in isolation.**
+14. **No file too large.**
+
+The agreed reading of each headline lives in `docs/code-quality.md` when the
+repository under review carries that file — read it there rather than guessing
+at a headline's intent. The readings are deliberately not restated here so that
+doc stays the one normative copy.
+
+Name the heuristic you are applying — say "heuristic 13, files make internal
+sense in isolation" — whenever a finding or a design decision turns on it. An
+unnamed appeal to "quality" is neither reviewable nor actionable.
+
+## Two stances
+
+- **Comments.** Aim for code that is clear with no or low comments. Needing
+  abundant and escalating amounts of commenting is a symptom of poor clarity,
+  and comments drift away from the code they describe. Rationale that must
+  persist belongs in memory or in the incident record, with a pointer from the
+  code. This does not license deleting existing rationale during unrelated work.
+- **Tests.** Test access to a module's internals is an interface design smell:
+  such a test pins implementation rather than behaviour, and the seam it reaches
+  through is usually the real defect. Five symptoms, each reportable as an
+  interface-design finding rather than a style nit: monkeypatching a private
+  name by dotted path; reading a private attribute from a test; a
+  reach-back import into a parent module; a function-local import placed to
+  break an import cycle; and a re-export shim that exists only to keep an old
+  path resolving.
+
+## Do not steer by
+
+- **Raw line count.** Comments and docstrings can be most of a file; one large
+  module in this factory's own code measured 55% prose.
+- **Average complexity.** A file can average a good grade while eight of its
+  functions score the worst one.
+- **Line coverage under autouse stubs.** A suite that stubs the thing under test
+  into passing reports coverage of paths it cannot fail.
+- **Test count or test-to-code ratio.** Tests that pin implementation are a
+  liability carrying a green tick.
+"""
+
+
+# Architect-only, and deliberately NOT admitted into the shared constant above:
+# a reviewer variant and an architect variant would each carry their own copy of
+# the fourteen headlines, which is the exact defect that constant exists to
+# prevent. Public rather than underscore-private so its drift guard can assert
+# against a NAMED CONSTANT rather than a prose literal.
+ARCHITECT_CODE_QUALITY_ADDENDUM = """
+## Splitting or extracting a module
+
+When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
+split is legitimate only when every resulting file makes internal sense in
+isolation: size is necessary, not sufficient. Small satellites that are
+function-bags over a parent's private state fail 13 while passing 14.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -1094,7 +1233,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -1289,7 +1428,7 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Style, naming, or structural preferences
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
-
+""" + CODE_QUALITY_GUIDANCE + """
 ## Your Specialization: {specialization}
 """
 
@@ -2169,9 +2308,9 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 1. **Read before judging.** Understand the code's intent before flagging issues.
 2. **Respect known gaps.** If the briefing says something is intentionally deferred, don't flag it.
 3. **Be specific.** Every finding must have a file location and concrete description.
-4. **Don't flag style.** Naming preferences, formatting, comment style — these are noise.
+4. **Don't flag cosmetics.** Formatting and layout preferences are noise. Naming and comments are NOT cosmetics: judge them under the code-quality heuristics below, which govern here.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,

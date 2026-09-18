@@ -30,10 +30,19 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import install_identity_mocks
-from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
+from _fm_helpers import MockNode, install_identity_mocks
+from test_referent_verification import (
+    _WRITE_PRIMITIVES,
+    _edge,
+    _episode,
+    assert_never_repaired,
+)
 
-from fused_memory.backends.graphiti_client import ActiveEdgesError, EdgeNotFoundError
+from fused_memory.backends.graphiti_client import (
+    ActiveEdgesError,
+    AmbiguousEntityError,
+    EdgeNotFoundError,
+)
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -42,9 +51,14 @@ from fused_memory.services.memory_service import (
     ReferentRepair,
     ReferentRepairStats,
     ReferentStats,
+    _implausible_target_reason,
 )
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
+
+#: The module logger the success-line assertions below scope their
+#: `caplog.at_level` to, so an unrelated logger's INFO cannot leak in.
+_MEMORY_SERVICE_LOGGER = 'fused_memory.services.memory_service'
 
 
 def _repair(**overrides) -> ReferentRepair:
@@ -302,6 +316,12 @@ def _finding(**overrides) -> ReferentFinding:
         'intended_referent': Referent(number='3127'),
         'new_endpoint_uuid': 'n-3127',
         'resolvable': True,
+        # DELIBERATELY not the `group_id='dark_factory'` these tests pass to
+        # `_repair_episode_referents`: eta is told its scope by its caller, so
+        # anything that reads the scope off a FINDING instead reads 'reify'
+        # here and is visible rather than silently agreeing.
+        'group_id': 'reify',
+        'project_id': 'reify',
     }
     fields.update(overrides)
     return ReferentFinding(**fields)
@@ -374,7 +394,7 @@ class TestTheEpisodeIdentityParameter:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -400,7 +420,7 @@ class TestTheRepairSequence:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -784,7 +804,7 @@ class TestNeverGuess:
         )
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -1724,6 +1744,249 @@ class TestPerFindingFailureContainment:
             )
 
 
+class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
+    """The thing this pass EXISTS to do was the one thing it never said.
+
+    zeta's findings are WARNINGs, and eta's refusals, failures and deletions
+    all log — but moving an endpoint, the cure itself, was silent, so 4 of 5
+    real repairs left zero trace and an operator reading syslog saw only the
+    diagnosis. INFO rather than WARNING, matching the emptied-node DELETE line
+    one arm over: a strictly more destructive COMPLETED action already at INFO,
+    and the level `server/main.py` sets as the deployed root, so the line
+    genuinely lands.
+    """
+
+    @staticmethod
+    def _success_lines(caplog) -> list[logging.LogRecord]:
+        """Keyed on the FORMAT STRING, never on the rendered message, so the
+        emptied-node delete — INFO, on this very path — cannot be miscounted
+        as a repair announcement."""
+        return [
+            r for r in caplog.records
+            if isinstance(r.msg, str)
+            and r.msg.startswith('Referent repair executed')
+        ]
+
+    @staticmethod
+    def _payload(record: logging.LogRecord) -> dict:
+        """The structured dict, read off `record.args` rather than parsed back
+        out of the message.
+
+        `logging` unwraps a lone non-empty Mapping argument onto `record.args`
+        directly instead of wrapping it in a 1-tuple, so this is the dict the
+        call site passed, byte for byte.
+        """
+        assert isinstance(record.args, dict)
+        return record.args
+
+    @pytest.mark.asyncio
+    async def test_one_info_line_carries_the_whole_repair_as_structured_data(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repaired == 1
+        lines = self._success_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        payload = self._payload(lines[0])
+
+        assert payload['edge_uuid'] == 'e1'
+        assert payload['which_end'] == 'source'
+        assert payload['old_endpoint_uuid'] == 'n-3129'
+        assert payload['old_endpoint_name'] == 'Task 3129'
+        assert payload['new_endpoint_uuid'] == 'n-3127'
+        assert payload['intended_referent'] == 'Task 3127'
+        assert payload['check'] == 'set-membership'
+        assert payload['minted'] is False
+        # THE SCOPE THE CALLER NAMED, not the one the finding happens to
+        # carry: nine projects interleave in one log, and eta is told its
+        # scope by its caller. `_finding()` stamps 'reify' precisely so a
+        # line that read scope off the record would be visible here.
+        assert payload['group_id'] == 'dark_factory'
+        assert _finding().group_id == 'reify'
+        # The payload IS the audit record, MINUS the one field that is not yet
+        # determined when the line is emitted, PLUS exactly the two facts the
+        # record does not hold.
+        assert set(payload) == (
+            set(stats.repairs[0].to_dict()) - {'deleted_emptied_node'}
+        ) | {'group_id', 'old_endpoint_name'}
+        # `intended_referent` already IS the new endpoint's canonical
+        # `node_name`, so a `new_endpoint_name` key would be the same value
+        # twice in one payload under two names.
+        assert 'new_endpoint_name' not in payload
+
+    @pytest.mark.asyncio
+    async def test_the_line_omits_the_field_that_is_not_settled_yet(
+        self, service, caplog,
+    ):
+        """`deleted_emptied_node` is stamped onto the record by
+        `_cleanup_emptied_nodes` STRICTLY AFTER this line is emitted, so on the
+        line it would read `''` for every repair ever logged — including this
+        one, whose old endpoint IS then deleted. A key that is constant by
+        construction is worse than a missing one: it invites a consumer to
+        aggregate over it and it contradicts the delete's own INFO line.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        # The cleanup really did fire for this repair — otherwise the omission
+        # below would be pinning the uninteresting half of the case.
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert 'deleted_emptied_node' in stats.repairs[0].to_dict()
+        payload = self._payload(self._success_lines(caplog)[0])
+        assert 'deleted_emptied_node' not in payload
+        # And the deletion still announces itself on its own line.
+        assert any(
+            isinstance(r.msg, str) and 'emptied' in r.msg
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_old_endpoint_uuid_is_the_reread_not_the_findings_copy(
+        self, service, caplog,
+    ):
+        """`reassign_edge` re-reads the edge under the lock. The finding's copy
+        is this episode's PRE-NORMALIZATION view and can name a node that lost
+        a merge — so the line must say where the edge actually came FROM."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-reread'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _finding().old_endpoint_uuid == 'n-3129'
+        assert self._payload(self._success_lines(caplog)[0])[
+            'old_endpoint_uuid'
+        ] == 'n-reread'
+        assert stats.repairs[0].old_endpoint_uuid == 'n-reread'
+
+    @pytest.mark.asyncio
+    async def test_the_line_count_equals_repair_stats_repaired(
+        self, service, caplog,
+    ):
+        """Four records, ONE executed repair, one line.
+
+        The gate is `moved` — the same discriminator
+        `ReferentRepairStats.repaired` already uses — so "one line per executed
+        repair" and that property agree BY CONSTRUCTION rather than by two
+        sites staying in lockstep.
+        """
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=['n-3127', 'n-3127', RuntimeError('falkor down')],
+        )
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e-moved'),
+            _reassigned(uuid='e-noop', moved=False),
+        ])
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(
+                    _finding(edge_uuid='e-moved'),
+                    _finding(edge_uuid='e-noop'),
+                    _finding(edge_uuid='e-failed'),
+                    _finding(
+                        edge_uuid='e-unrepairable',
+                        intended_referent=None,
+                        new_endpoint_uuid=None,
+                        resolvable=False,
+                        reason='no candidate target could be determined',
+                    ),
+                ),
+                group_id='dark_factory',
+            )
+
+        assert [r.outcome for r in stats.repairs] == [
+            'repaired', 'repaired', 'failed', 'unrepairable',
+        ]
+        # The no-op is `reassign_edge`'s corroborate-before-acting arm: the
+        # edge was already correct and NOTHING was written, so it is not an
+        # executed repair and announces nothing.
+        assert [r.moved for r in stats.repairs] == [True, False, False, False]
+        assert stats.repaired == 1
+
+        lines = self._success_lines(caplog)
+        assert len(lines) == stats.repaired
+        assert self._payload(lines[0])['edge_uuid'] == 'e-moved'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('new_endpoint_uuid', 'expected_minted'),
+        [('n-3127', False), (None, True)],
+    )
+    async def test_minted_on_the_line_agrees_with_the_audit_record(
+        self, service, caplog, new_endpoint_uuid, expected_minted,
+    ):
+        """`minted` is the one field an operator cannot re-derive from the
+        graph afterwards, so the line must carry the RECORD's value rather than
+        re-compute a second one that can drift from it."""
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding(new_endpoint_uuid=new_endpoint_uuid)),
+                group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].minted is expected_minted
+        assert self._payload(
+            self._success_lines(caplog)[0],
+        )['minted'] is expected_minted
+
+    @pytest.mark.asyncio
+    async def test_a_failed_finding_warns_exactly_as_before_and_announces_nothing(
+        self, service, caplog,
+    ):
+        """ADDITIVE: the new line neither displaces nor duplicates the
+        existing failure WARNING."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.failed == 1
+        assert stats.repaired == 0
+        assert self._success_lines(caplog) == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'e1' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_committed_move_whose_backstop_failed_still_announces_itself(
+        self, service, caplog, monkeypatch,
+    ):
+        """BOTH lines, at their own levels: the WARNING that the summary
+        regeneration is in doubt, and the INFO that the move stands."""
+        async def _boom(*_a, **_kw):
+            raise TypeError('malformed reassign_edge result')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _boom)
+
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        assert stats.repaired == 1
+        assert len(self._success_lines(caplog)) == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'committed' in warnings[0].getMessage()
+
+
 @pytest.mark.asyncio
 class TestReferentRepairStreakSemantics:
     """INV-4: the consecutive-repair streak, per group_id.
@@ -2375,7 +2638,7 @@ class TestEndToEndThroughTheWritePath:
         await service._execute_graphiti_write('add_episode', self._payload())
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
-            'Task 3127', group_id='dark_factory',
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
         )
         service.graphiti.reassign_edge.assert_awaited_once_with(
             'e1', 'n-3127', which_end='source', group_id='dark_factory',
@@ -2456,3 +2719,535 @@ class TestEndToEndThroughTheWritePath:
             'ensure_entity_node ran OUTSIDE the per-group identity lock — '
             "alpha's contract is violated by placement"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-3/4: a no-merge refusal lands as 'unrepairable', never 'failed'
+# ---------------------------------------------------------------------------
+
+class TestTheDuplicateNameRefusal:
+    """Guard (c) at the repair pass: a >=2-match target is REFUSED, not merged.
+
+    The repair pass passes `merge_duplicates=False`, so the backend raises
+    AmbiguousEntityError rather than collapsing a duplicate-name group into a
+    survivor.  A collapse is irreversible and is only ever a deliberate act,
+    never a side effect of a repair (Ratified Decision 1).
+
+    The disposition is a THIRD position beside 'failed' and the NEVER-GUESS
+    'unrepairable': we did not refuse to guess — a target WAS determined — and
+    the backend did not fail.  It REFUSED an irreversible collapse this path is
+    not licensed to trigger.  Booking that as 'failed' would put a refusal in
+    the same bucket as a FalkorDB outage and feed leaf iota's rate a fault that
+    never happened.
+    """
+
+    @staticmethod
+    def _ambiguous() -> AmbiguousEntityError:
+        return AmbiguousEntityError(
+            "Multiple entities found with name 'Task 3127': ['u-a', 'u-b']",
+            name='Task 3127', group_id='dark_factory', uuids=('u-a', 'u-b'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_forbids_the_collapse_at_the_call(self, service):
+        """(1) The refusal is WIRED, not merely available: merge_duplicates=False
+        is on the awaited call."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        _, kwargs = service.graphiti.ensure_entity_node.await_args
+        assert kwargs['merge_duplicates'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_recorded_as_unrepairable_naming_the_group(self, service):
+        """(2) The record names the duplicate-name group — both uuids and the
+        name — so an operator can adjudicate it by hand without the log."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert record.intended_referent == 'Task 3127'
+        assert 'Task 3127' in record.reason
+        assert 'u-a' in record.reason and 'u-b' in record.reason
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_writes_absolutely_nothing(self, service):
+        """(2) No edge moved, nothing merged, no summary touched."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_it_counts_as_flagged_unrepairable_not_failed(self, service):
+        """(3) The disposition must read as "we refused", so a FalkorDB outage
+        and a duplicate-name group stay distinguishable in leaf iota's rate."""
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=self._ambiguous())
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.flagged_unrepairable == 1
+        assert stats.failed == 0
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_contains_to_that_finding(self, service):
+        """(4) Per-finding containment, not a batch abort: a sibling finding on
+        a DIFFERENT edge still repairs."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[self._ambiguous(), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+
+    @pytest.mark.asyncio
+    async def test_any_other_exception_still_records_failed(self, service):
+        """(5) The new arm narrowed NOTHING: a backend fault is still 'failed'."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'failed'
+        assert 'falkor down' in stats.repairs[0].reason
+        assert stats.failed == 1
+        assert stats.flagged_unrepairable == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-7/8: _implausible_target_reason — the pure plausibility rule
+# ---------------------------------------------------------------------------
+
+_LIVE_REGISTRY = {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'}
+
+
+class TestImplausibleTargetReason:
+    """The pure rule deciding whether a nominated repair target is plausible.
+
+    `_candidate_pool`'s whole-set fallback nominates a target from the DECLARED
+    set with no test of its plausibility, so a junk derived referent surviving
+    the pool's three vetoes becomes a phantom node with a real edge repointed
+    onto it.  Executed live: referents={redis:6379}, cited={}, endpoint=Task
+    1251 yields candidates=('redis:6379',) and resolvable=True.
+
+    Unit-tested in isolation from the walk that drives it, the same discipline
+    `_candidate_pool` / `_candidate_targets` / `_unresolvable_reason` follow and
+    the stated reason those three are module-level.
+
+    '' means PLAUSIBLE, so the fail-closed direction is the non-empty string.
+    """
+
+    def test_a_registered_qualifier_is_plausible(self):
+        """(i) The qualifier names a project the registry knows, so the node
+        belongs to a real cross-project reference."""
+        assert _implausible_target_reason(
+            Referent(number='132', project_id='reify'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        ) == ''
+
+    def test_a_bare_own_project_task_is_plausible_whatever_the_registry_says(self):
+        """(ii) The dominant live shape. A bare `Task N` referent names this
+        project's own task, and no registry lookup can say otherwise."""
+        for registry in (_LIVE_REGISTRY, {}):
+            assert _implausible_target_reason(
+                Referent(number='3127'),
+                known_projects=registry,
+                target_node_exists=False,
+            ) == ''
+
+    def test_an_existing_node_is_its_own_evidence(self):
+        """(iii) A node with that exact name already exists in the group, so
+        repointing onto it MINTS NOTHING — which is what the guard exists to
+        prevent. The qualifier being unregistered does not outrank that."""
+        assert _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=True,
+        ) == ''
+
+    def test_an_unregistered_qualifier_with_no_node_is_refused(self):
+        """THE LIVE DEFECT. 'redis:6379' names no project the registry knows and
+        no node that exists, so a repair would MINT one."""
+        reason = _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        )
+        assert reason
+        assert 'redis:6379' in reason
+
+    def test_the_reason_says_both_things_that_make_it_implausible(self):
+        """(6) A whole sentence an operator can act on: the qualifier names no
+        known project AND no such node exists, so the repair would mint one."""
+        reason = _implausible_target_reason(
+            Referent(number='6379', project_id='redis'),
+            known_projects=_LIVE_REGISTRY,
+            target_node_exists=False,
+        )
+        assert 'redis' in reason
+        assert 'mint' in reason.lower()
+        # Carried VERBATIM onto the record, like _unresolvable_reason's output:
+        # no leading/trailing formatting of its own beyond the target name.
+        assert reason == reason.strip()
+        assert not reason.startswith(('-', '*', '['))
+
+    def test_it_is_fail_closed_on_an_unpopulated_registry(self):
+        """(5) A qualified referent is refused even when it names a project that
+        WOULD be in a fully-populated registry. MemoryService is constructed
+        before build_known_projects_map runs, so `{}` is a real window, and
+        "permissive until populated" would leave exactly that window open."""
+        assert _implausible_target_reason(
+            Referent(number='132', project_id='reify'),
+            known_projects={},
+            target_node_exists=False,
+        ) != ''
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-9/10: guard (b) wired into the repair pass
+# ---------------------------------------------------------------------------
+
+class TestTheTargetPlausibilityGuard:
+    """The repair pass refuses an implausible target BEFORE any write.
+
+    Applies ONLY on the whole-set-fallback arm (`not finding.target_cited`).
+    The discrimination is exact and needs no new state: the pool is
+    `cited & referents` whenever that is non-empty, so the fallback was taken
+    iff the chosen target is NOT among the fact's citations.
+
+    zeta is UNCHANGED — it still records these findings as `resolvable=True`.
+    eta is what refuses, at the one place a mint can actually happen.
+    """
+
+    @pytest.fixture
+    def service(self, service):
+        service.set_known_projects(
+            {'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root'},
+        )
+        return service
+
+    @staticmethod
+    def _junk(**overrides) -> ReferentFinding:
+        """ROUTE 1: the whole-set fallback with a junk target — the live defect.
+
+        A paraphrased fact citing no task number at all, a derived referent set
+        holding only 'redis:6379', and an edge on a 'Task 1251' node.
+        """
+        fields = {
+            'old_endpoint_uuid': 'n-1251',
+            'old_endpoint_name': 'Task 1251',
+            'endpoint_referent': Referent(number='1251'),
+            'cited': (),
+            'referent_set': ('redis:6379',),
+            'intended_referent': Referent(number='6379', project_id='redis'),
+            'new_endpoint_uuid': None,
+            'resolvable': True,
+        }
+        fields.update(overrides)
+        return _finding(**fields)
+
+    @pytest.mark.asyncio
+    async def test_route_1_a_junk_fallback_target_mints_nothing(self, service):
+        """(1) THE HEADLINE. Nothing is minted, nothing is moved, no summary is
+        touched, and the refusal is recorded naming the target."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert 'redis:6379' in record.reason
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert stats.nodes_minted == 0
+        assert stats.flagged_unrepairable == 1
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_route_2_the_intersection_arm_still_repairs(self, service):
+        """(2) A fact that NAMES the target is materially stronger evidence than
+        the whole declared set, and that arm is out of scope by ratified
+        decision. It must repair exactly as it does today."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(cited=('Task 3127',), intended_referent=Referent(number='3127'))),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        service.graphiti.reassign_edge.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_plus_a_registered_qualifier_still_repairs(self, service):
+        """(3) Condition (i): the fallback arm is not closed wholesale — a
+        qualified target whose project IS registered is a real cross-project
+        reference."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(
+                referent_set=('reify:132',),
+                intended_referent=Referent(number='132', project_id='reify'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_fallback_plus_a_bare_own_project_target_still_repairs(self, service):
+        """(4) Condition (ii). THE DOMINANT LIVE SHAPE — this is what the
+        referent-fidelity PRD exists to repair, and it must not regress."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(
+                referent_set=('Task 3127',),
+                intended_referent=Referent(number='3127'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_fallback_onto_an_existing_node_still_repairs(self, service):
+        """(5) Condition (iii): zeta found exactly one node already carrying
+        that name, so repointing onto it mints nothing."""
+        stats = await service._repair_episode_referents(
+            _stats(self._junk(new_endpoint_uuid='n-redis')),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].minted is False
+
+    @pytest.mark.asyncio
+    async def test_the_guard_runs_ahead_of_the_write_guard(self, service):
+        """(6) A junk target produces no 'failed' record even when the write
+        would have raised — because the write is never reached."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(self._junk()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert 'redis:6379' in stats.repairs[0].reason
+        assert 'falkor down' not in stats.repairs[0].reason
+        assert stats.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_the_never_guess_arm_is_untouched(self, service):
+        """(7) The new guard ADDED a disposition; it did not re-route the old
+        one. An unresolvable finding still carries zeta's own reason verbatim."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(
+                resolvable=False,
+                intended_referent=None,
+                reason="zeta's own words",
+            )),
+            group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert stats.repairs[0].reason == "zeta's own words"
+        assert stats.repairs[0].intended_referent == ''
+
+
+class TestTheUserObservableSignalEndToEnd:
+    """THE TASK'S HEADLINE, driven through the REAL zeta then the REAL eta.
+
+    Every other class in this file hand-builds a `ReferentFinding` and feeds it
+    to eta alone. That is the right unit for a disposition rule, but it cannot
+    catch a pipeline defect: a guard that reads a field zeta never populates the
+    way the test assumed would pass every one of those tests and still mint a
+    phantom node in production. So these rows build an EPISODE, run
+    `_verify_episode_referents` on it, and hand ITS OUTPUT — unmodified — to
+    `_repair_episode_referents`.
+
+    The pipeline property being pinned is a DIVISION OF LABOUR, not just an
+    outcome: zeta's detect-and-record contract is UNCHANGED by this task (it
+    still records the junk row as `resolvable=True`), and eta is what refuses.
+    A future change that "fixed" the defect by making zeta stop recording would
+    pass an outcome-only test while silently deleting the detection leaf iota's
+    rate is computed from.
+    """
+
+    @pytest.fixture
+    def service(self, service):
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        return service
+
+    @staticmethod
+    def _paraphrased(endpoint_name='Task 1251', endpoint_uuid='n-1251'):
+        """One edge on *endpoint_name*, whose fact cites NO task number.
+
+        The routine extraction outcome, and the exact shape of the live defect:
+        `_candidate_pool` has no citations to intersect with, so it falls back
+        to the whole declared set and nominates whatever is in it.
+        """
+        return _episode(
+            edges=[_edge('e1', fact='The deploy pipeline was retried.',
+                         source=endpoint_uuid, target='n-x')],
+            nodes=[MockNode(name=endpoint_name, uuid=endpoint_uuid),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+    async def _pipeline(self, service, *, referents, source='derived',
+                        endpoint_name='Task 1251', endpoint_uuid='n-1251'):
+        found = await service._verify_episode_referents(
+            self._paraphrased(endpoint_name, endpoint_uuid),
+            group_id='dark_factory', referents=referents,
+            referent_source=source,
+        )
+        repaired = await service._repair_episode_referents(
+            found, group_id='dark_factory',
+        )
+        return found, repaired
+
+    @pytest.mark.asyncio
+    async def test_the_headline_row_records_and_mints_nothing(self, service):
+        """(1) referents={redis:6379}, cited={}, endpoint=Task 1251 — executed
+        live, and pre-fix this minted 'redis:6379' and repointed a real edge
+        onto it."""
+        found, stats = await self._pipeline(
+            service, referents=(Referent(number='6379', project_id='redis'),),
+        )
+
+        # zeta is UNCHANGED: it still detects, and still calls it resolvable.
+        assert len(found.findings) == 1
+        assert found.findings[0].check == 'set-membership'
+        assert found.findings[0].resolvable is True
+        assert found.findings[0].intended_referent == Referent(
+            number='6379', project_id='redis',
+        )
+
+        # eta REFUSES.
+        assert len(stats.repairs) == 1
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert 'redis:6379' in stats.repairs[0].reason
+        assert stats.nodes_minted == 0
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 1
+
+        # No new node, no edge moved, nothing merged, nothing deleted.
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_declared_behaves_identically_to_derived(self, service):
+        """(2a) The whole-set fallback is licensed for BOTH sources, so the
+        guard that refuses its output must cover both."""
+        _, stats = await self._pipeline(
+            service, referents=(Referent(number='6379', project_id='redis'),),
+            source='declared',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert 'redis:6379' in stats.repairs[0].reason
+        assert stats.nodes_minted == 0
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metadata_still_stops_at_the_pre_existing_veto(self, service):
+        """(2b) The new guard did not SHADOW an existing one.
+
+        `source='metadata'` never reaches the plausibility rule at all: veto 2
+        empties the pool one layer up, so zeta records the finding as
+        UNRESOLVABLE and eta's pre-existing NEVER-GUESS arm carries veto 2's own
+        words through verbatim. Reading the plausibility reason here would mean
+        the new guard had taken over a case that was already handled — the same
+        row booked under the wrong cause.
+        """
+        found, stats = await self._pipeline(
+            service, referents=(Referent(number='6379', project_id='redis'),),
+            source='metadata',
+        )
+
+        assert found.findings[0].resolvable is False
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert "metadata['task_id']" in stats.repairs[0].reason
+        assert 'not plausible' not in stats.repairs[0].reason
+        assert stats.repairs[0].intended_referent == ''
+        assert stats.nodes_minted == 0
+
+    @pytest.mark.asyncio
+    async def test_the_control_route_still_repairs_end_to_end(self, service):
+        """(3) THE CONTROL. The guards refuse the junk route without closing the
+        legitimate one — a bare own-project Task-N target is plausible on the
+        fallback arm (condition ii), which is the dominant live shape."""
+        _, stats = await self._pipeline(
+            service, referents=(Referent(number='3127'),),
+            endpoint_name='Task 3129', endpoint_uuid='n-3129',
+        )
+
+        assert stats.repaired == 1
+        assert stats.repairs[0].outcome == 'repaired'
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory', merge_duplicates=False,
+        )
+        service.graphiti.reassign_edge.assert_awaited_once()
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_name_target_refuses_and_merges_nothing(
+        self, service,
+    ):
+        """(4) The third pin, end to end: the legitimate route reaches the
+        backend, and the backend REFUSES because the target name resolves to two
+        nodes. A refusal is not a fault — it must not read as one."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=AmbiguousEntityError(
+                "2 nodes named 'Task 3127'",
+                name='Task 3127', group_id='dark_factory',
+                uuids=('u-a', 'u-b'),
+            ),
+        )
+
+        _, stats = await self._pipeline(
+            service, referents=(Referent(number='3127'),),
+            endpoint_name='Task 3129', endpoint_uuid='n-3129',
+        )
+
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert 'Task 3127' in stats.repairs[0].reason
+        assert 'u-a' in stats.repairs[0].reason
+        assert 'u-b' in stats.repairs[0].reason
+        assert stats.failed == 0
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 1
+        service.graphiti.merge_entities.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()

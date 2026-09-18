@@ -755,35 +755,44 @@ class TestAddEpisode:
         assert call_kwargs['payload']['project_id'] == 'test'
 
     @pytest.mark.asyncio
-    async def test_enqueue_payload_contains_uuid(self, service):
-        """The enqueue payload must include 'uuid' matching the returned episode_id."""
-        result = await service.add_episode(
+    async def test_enqueue_payload_omits_uuid(self, service):
+        """The enqueue payload must NOT carry 'uuid' (task 3561).
+
+        Inverted from the old contract ("payload must include 'uuid' matching
+        the returned episode_id"), which was fatal: graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so a
+        freshly-minted one is unconditionally NodeNotFoundError. The uuid is
+        minted by graphiti_core and read back off result.episode.uuid.
+        """
+        await service.add_episode(
             content='User discussed auth changes',
             project_id='test',
         )
         call_kwargs = service.durable_queue.enqueue.call_args[1]
         payload = call_kwargs['payload']
-        assert 'uuid' in payload, "Payload must include 'uuid' field"
-        assert payload['uuid'] == result.episode_id
+        assert 'uuid' not in payload, (
+            "Payload must not carry 'uuid' — graphiti_core would try to LOAD "
+            f'that node and raise NodeNotFoundError; got {payload.get("uuid")!r}'
+        )
 
 
 class TestExecuteGraphitiWrite:
     @pytest.mark.asyncio
-    async def test_uuid_passed_to_graphiti_backend(self, service):
-        """_execute_graphiti_write must forward uuid from payload to graphiti.add_episode."""
-        test_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-        payload = {
-            'uuid': test_uuid,
-            'name': 'episode_aaaaaaaa',
-            'content': 'test content',
-            'source': 'text',
-            'group_id': 'test',
-            'source_description': '',
-        }
+    async def test_none_uuid_passed_to_graphiti_backend(self, service):
+        """The enqueue->execute path must reach graphiti.add_episode with uuid=None.
+
+        Inverted from the old contract ("must forward uuid from payload to
+        graphiti.add_episode", task 3561). uuid=None is the only value
+        graphiti_core's CREATE branch accepts — any other value is read as
+        "LOAD this existing episode" and raises NodeNotFoundError.
+        """
+        await service.add_episode(content='test content', project_id='test')
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+
         await service._execute_graphiti_write('add_episode', payload)
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == test_uuid
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_missing_uuid_passes_none(self, service):
@@ -5202,6 +5211,7 @@ class TestReconcileEpisodeIdentity:
             old_endpoint_uuid='n-3129', old_endpoint_name='Task 3129',
             endpoint_referent=Referent(number='3129'),
             referent_set=('Task 3127',),
+            group_id='test', project_id='test',
         ))
         mock_result = MockAddEpisodeResult()
         service._dedup_episode_edges = AsyncMock(return_value=1)
@@ -6313,13 +6323,24 @@ class TestExecuteGraphitiWritePlanningRegistration:
     @pytest.mark.asyncio
     async def test_planning_episode_registered_in_registry(self, service):
         """After successful graphiti.add_episode with temporal_context='planning',
-        the episode UUID should be registered in the planned_episode_registry."""
+        the MINTED episode UUID (result.episode.uuid) is registered.
+
+        Task 3561: registration used to key on payload['uuid'], a caller-minted
+        value that named no graph node — so the search filter could never match
+        it. It now keys on the uuid graphiti_core actually created.
+        """
+        from types import SimpleNamespace
+
+        from _fm_helpers import MockAddEpisodeResult
+
         mock_registry = MagicMock()
         mock_registry.register = AsyncMock()
         service.planned_episode_registry = mock_registry
+        service.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid='real-uuid'))
+        )
 
         payload = {
-            'uuid': 'episode-plan-uuid',
             'name': 'episode_plan',
             'content': 'PRD content',
             'source': 'text',
@@ -6329,7 +6350,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
         }
         await service._execute_graphiti_write('add_episode', payload)
 
-        mock_registry.register.assert_called_once_with('episode-plan-uuid', 'myproject')
+        mock_registry.register.assert_called_once_with('real-uuid', 'myproject')
 
     @pytest.mark.asyncio
     async def test_no_temporal_context_skips_registration(self, service):
@@ -7504,6 +7525,62 @@ class TestGetStatusScoping:
         assert result['queue'] == fixed_stats, (
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
+
+
+class TestGetStatusSurfacesDeadByOperation:
+    """`get_status()['queue']` must carry the per-operation dead breakdown.
+
+    This is the health-probe half of the dead-letter signal: the escalation
+    pushes, this confirms. `get_status` assigns `get_stats(group_id=project_id)`
+    straight through, so a REAL queue is used here rather than the fixture's
+    mocked `get_stats` — mocking the return value would assert only that a dict
+    survives the assignment, which was already true before this key existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queue_section_carries_dead_by_operation(self, service, tmp_path):
+        """A dead `add_episode` shows up attributed, scoped to the project."""
+        from _fm_helpers import poll_until
+
+        from fused_memory.services.durable_queue import DurableWriteQueue
+
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        queue = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await queue.initialize()
+        service.durable_queue = queue
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        try:
+            await queue.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'ep', 'group_id': 'proj1', 'name': 'ep'},
+            )
+
+            async def _has_a_dead_row():
+                stats = await queue.get_stats(group_id='proj1')
+                return stats['counts'].get('dead', 0) >= 1
+
+            await poll_until(_has_a_dead_row, timeout=5.0, interval=0.05)
+
+            result = await service.get_status(project_id='proj1')
+
+            assert result['queue']['dead_by_operation'] == {'add_episode': 1}, (
+                'get_status must pass the per-operation breakdown through; got '
+                f'{result["queue"].get("dead_by_operation")!r}'
+            )
+        finally:
+            await queue.close()
 
 
 # ---------------------------------------------------------------------------
@@ -13426,3 +13503,206 @@ class TestListChildIds:
         service.mem0.delete.assert_not_awaited()
         journal.log_write_op.assert_not_awaited()
         buffer.push.assert_not_awaited()
+
+
+class TestQueueGroupIdToProjectId:
+    """`_project_id_from_queue_group_id`: the queue's group_id -> a project_id.
+
+    The dead-letter alarm needs a `project_root`, which resolves from a
+    `project_id` through the injected `_known_projects` map. The item PAYLOAD
+    cannot supply one uniformly — `add_episode`'s carries `project_id`,
+    `add_memory_graphiti`'s does not — but `group_id` is present on EVERY queue
+    item and is derivable: `Scope.graphiti_group_id` IS the project_id, and
+    `_dual_write_callback` writes `f'mem0_{project_id}'`.
+    """
+
+    def test_a_graphiti_group_id_is_the_project_id(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert service._project_id_from_queue_group_id('dark_factory') == 'dark_factory'
+
+    def test_a_mem0_group_id_has_its_prefix_stripped(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert (
+            service._project_id_from_queue_group_id('mem0_dark_factory')
+            == 'dark_factory'
+        )
+
+    def test_an_exact_registry_match_outranks_the_prefix_strip(self, service):
+        """The load-bearing ambiguity.
+
+        A project literally NAMED `mem0_thing` has a Graphiti group_id of
+        `mem0_thing`, which is indistinguishable by shape from the Mem0 group
+        of a project named `thing`. An exact match against the injected
+        registry is the only evidence that settles it, so it wins.
+        """
+        service.set_known_projects({'mem0_thing': '/root/mem0_thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'mem0_thing'
+
+    def test_the_prefix_strip_applies_when_only_the_stripped_form_is_known(
+        self, service,
+    ):
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'thing'
+
+    def test_an_unknown_group_id_is_returned_unchanged(self, service):
+        """So the caller reaches its documented unresolvable-root WARNING
+        rather than silently filing into the wrong project."""
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('nobody') == 'nobody'
+
+    def test_an_unknown_mem0_group_id_still_strips(self, service):
+        """The map may be empty or stale, and a prefix the codebase itself
+        writes is better evidence than nothing."""
+        service.set_known_projects({})
+        assert service._project_id_from_queue_group_id('mem0_ghost') == 'ghost'
+        assert service._project_id_from_queue_group_id('ghost') == 'ghost'
+
+
+class TestDeadLetterAlarmWiring:
+    """`initialize()` wires the alarm; `_report_queue_dead_letter` files it."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_wires_the_bound_report_method(self, service):
+        """A BOUND METHOD, for the same call-time-resolution reason
+        `_record_queue_terminal_outcome`'s docstring gives: `server/main.py`
+        calls `initialize()` BEFORE `set_known_projects()`, so the map is still
+        empty at the moment the hook is constructed."""
+        service.graphiti.initialize = AsyncMock()
+        await service.initialize()
+        try:
+            assert (
+                service.durable_queue._on_dead_letter
+                == service._report_queue_dead_letter
+            )
+        finally:
+            await service.durable_queue.close()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_files_nothing_and_warns(
+        self, service, caplog, monkeypatch,
+    ):
+        """No cwd fallback, ever.
+
+        `config.taskmaster.project_root` defaults to `'.'`, so a fallback would
+        file into the server's cwd where no operator watches and report success
+        doing it — a silent misfile is strictly worse than a logged refusal,
+        because it also destroys the evidence the alarm ever fired.
+        """
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        emitted = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: emitted.append((a, kw)),
+        )
+        service.set_known_projects({'somewhere_else': '/root/elsewhere'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='orphan', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'x'}, post_execute=False,
+        )
+        with caplog.at_level(logging.WARNING, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert emitted == [], 'nothing may be filed against a guessed root'
+        assert caplog.records, 'the refusal must stay recoverable from logs'
+        assert 'orphan' in caplog.text, caplog.text
+        assert 'add_episode' in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_project_emits_off_the_event_loop(
+        self, service, monkeypatch,
+    ):
+        """`EscalationQueue.submit` is blocking file I/O and this hook runs on
+        the event loop inside the queue worker, so the emit must go through
+        `asyncio.to_thread` — the same discipline as `_record_entity_mint`."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        threads = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *a, **kw):
+            threads.append(fn)
+            return await real_to_thread(fn, *a, **kw)
+
+        monkeypatch.setattr(asyncio, 'to_thread', spy_to_thread)
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'lost content'}, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        args, kwargs = calls[0]
+        assert args == ('/root/proj1',), 'project_root is passed positionally'
+        assert kwargs['project_id'] == 'proj1'
+        assert kwargs['operation'] == 'add_episode'
+        assert kwargs['group_id'] == 'proj1'
+        assert kwargs['item_id'] == 3
+        assert kwargs['attempts'] == 5
+        assert kwargs['write_op_id'] == 'W1'
+        assert kwargs['post_execute'] is False
+        assert kwargs['content_preview'] == 'lost content'
+        assert memory_service.emit_dead_letter_escalation in threads, (
+            'the blocking escalation write must not run on the event loop'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_emit_never_reaches_the_queue_worker(
+        self, service, monkeypatch, caplog,
+    ):
+        """Belt to the escalator's own never-raise braces."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        def _explode(*_a, **_kw):
+            raise OSError('escalation queue is on fire')
+
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation', _explode
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        with caplog.at_level(logging.ERROR, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert caplog.records, 'a swallowed failure must still be visible'
+
+    @pytest.mark.asyncio
+    async def test_a_missing_payload_still_files(self, service, monkeypatch):
+        """`payload` is None when the queue row would not parse; the alarm is
+        needed MORE in that case, not less."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='mem0_proj1',
+            operation='mem0_classify_and_add', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        assert calls[0][1]['project_id'] == 'proj1'
+        assert calls[0][1]['content_preview'] == ''

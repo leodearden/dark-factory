@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from orchestrator import session_registry as sr
 
 
@@ -273,15 +274,114 @@ class TestOrderSessions:
 
         assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
 
+    def test_focusable_sorts_ahead_of_headless_within_a_status_band(self):
+        """Under focus_first, a row Enter can act on comes first in its band."""
+        from cockpit.panes.session_table import order_sessions
+
+        focusable = _make_record(
+            session_slug='focusable',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+        )
+        headless = _make_record(
+            session_slug='headless', status=sr.Status.RUNNING, display=None
+        )
+
+        for order in ([headless, focusable], [focusable, headless]):
+            ordered = order_sessions(order, focus_first=True)
+            assert [r.session_slug for r in ordered] == ['focusable', 'headless']
+
+    def test_focusability_is_opt_in_so_chronological_consumers_keep_their_order(self):
+        """spawn_tree.py orders sibling groups with this same function, where
+        oldest-first IS the signal (the spawn sequence). The flag is the
+        whole difference, on one pair, in both directions."""
+        from cockpit.panes.session_table import order_sessions
+
+        older_headless = _make_record(
+            session_slug='older-headless',
+            status=sr.Status.RUNNING,
+            display=None,
+            start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        )
+        newer_focusable = _make_record(
+            session_slug='newer-focusable',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        records = [newer_focusable, older_headless]
+
+        assert [r.session_slug for r in order_sessions(records)] == [
+            'older-headless',
+            'newer-focusable',
+        ]
+        assert [r.session_slug for r in order_sessions(records, focus_first=True)] == [
+            'newer-focusable',
+            'older-headless',
+        ]
+
+    def test_state_rank_still_dominates_focusability(self):
+        """Blocked-on-you stays the top signal: a HEADLESS awaiting-input
+        session outranks a FOCUSABLE running one. Focusability is a
+        tiebreak inside a band, never a reordering across bands."""
+        from cockpit.panes.session_table import order_sessions
+
+        headless_blocked = _make_record(
+            session_slug='headless-blocked',
+            status=sr.Status.AWAITING_INPUT,
+            display=None,
+        )
+        focusable_running = _make_record(
+            session_slug='focusable-running',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+        )
+
+        ordered = order_sessions([focusable_running, headless_blocked], focus_first=True)
+
+        assert [r.session_slug for r in ordered] == [
+            'headless-blocked',
+            'focusable-running',
+        ]
+
+    def test_age_still_breaks_ties_below_focusability(self):
+        """Two records alike in band and focusability still order oldest
+        first -- focusability is inserted between the two existing keys,
+        it does not replace the age tiebreak."""
+        from cockpit.panes.session_table import order_sessions
+
+        newer = _make_record(
+            session_slug='newer',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        older = _make_record(
+            session_slug='older',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t'),
+            start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        )
+
+        ordered = order_sessions([newer, older], focus_first=True)
+
+        assert [r.session_slug for r in ordered] == ['older', 'newer']
+
 
 class TestFilterLiveSessions:
+    """The live band, and how much of it the cap hid.
+
+    filter_live_sessions returns a LiveSessions(visible, total) view: total
+    is the live count BEFORE the cap.
+    """
+
     def test_terminal_statuses_are_dropped(self):
         from cockpit.panes.session_table import filter_live_sessions
 
         exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
         failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
 
-        assert filter_live_sessions([exited, failed]) == []
+        assert filter_live_sessions([exited, failed]).visible == []
 
     def test_non_terminal_statuses_are_all_kept(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -292,7 +392,7 @@ class TestFilterLiveSessions:
         idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
         records = [awaiting, running, launching, idle]
 
-        kept = filter_live_sessions(records)
+        kept = filter_live_sessions(records).visible
 
         assert [r.session_slug for r in kept] == [r.session_slug for r in records]
 
@@ -301,7 +401,7 @@ class TestFilterLiveSessions:
 
         foreign = _make_record(session_slug='s-foreign', status='some-foreign-status')
 
-        assert filter_live_sessions([foreign]) == [foreign]
+        assert filter_live_sessions([foreign]).visible == [foreign]
 
     def test_relative_order_of_kept_records_is_preserved(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -312,14 +412,17 @@ class TestFilterLiveSessions:
         idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
         ordered_input = [awaiting, exited, running, idle]
 
-        kept = filter_live_sessions(ordered_input)
+        kept = filter_live_sessions(ordered_input).visible
 
         assert [r.session_slug for r in kept] == ['s-awaiting', 's-running', 's-idle']
 
-    def test_empty_input_returns_empty_list(self):
+    def test_empty_input_returns_empty_view(self):
         from cockpit.panes.session_table import filter_live_sessions
 
-        assert filter_live_sessions([]) == []
+        view = filter_live_sessions([])
+
+        assert view.visible == []
+        assert view.total == 0
 
     def test_explicit_cap_keeps_only_the_first_n_by_input_order(self):
         from cockpit.panes.session_table import filter_live_sessions
@@ -328,7 +431,7 @@ class TestFilterLiveSessions:
             _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
         ]
 
-        kept = filter_live_sessions(records, cap=3)
+        kept = filter_live_sessions(records, cap=3).visible
 
         assert [r.session_slug for r in kept] == ['s-0', 's-1', 's-2']
 
@@ -340,9 +443,177 @@ class TestFilterLiveSessions:
             for i in range(_DEFAULT_VISIBLE_CAP + 10)
         ]
 
-        kept = filter_live_sessions(records)
+        kept = filter_live_sessions(records).visible
 
         assert len(kept) == _DEFAULT_VISIBLE_CAP
         assert [r.session_slug for r in kept] == [
             f's-{i}' for i in range(_DEFAULT_VISIBLE_CAP)
         ]
+
+    def test_total_reports_the_live_count_the_cap_hid(self):
+        """The number an operator could otherwise never see: reading exactly
+        `cap` rows told you nothing about how many live sessions there
+        really were."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+        ]
+
+        view = filter_live_sessions(records, cap=3)
+
+        assert len(view.visible) == 3
+        assert view.total == 5
+
+    def test_terminal_records_are_excluded_from_total_too(self):
+        """total counts the LIVE band, not the scanned set -- otherwise the
+        notice would claim the cap hid history rows the view never intended
+        to show in the first place."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug='live-0', status=sr.Status.RUNNING),
+            _make_record(session_slug='dead-0', status=sr.Status.EXITED),
+            _make_record(session_slug='live-1', status=sr.Status.IDLE),
+            _make_record(session_slug='dead-1', status=sr.Status.FAILED_TO_START),
+            _make_record(session_slug='dead-2', status=sr.Status.EXITED),
+        ]
+
+        view = filter_live_sessions(records)
+
+        assert view.total == 2
+        assert len(view.visible) == 2
+
+    def test_under_the_cap_total_equals_visible(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(4)
+        ]
+
+        view = filter_live_sessions(records, cap=10)
+
+        assert view.total == len(view.visible) == 4
+
+    def test_visible_never_exceeds_total(self):
+        """The view's own invariant, checked across the cap boundary rather
+        than at one convenient point."""
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(6)
+        ]
+
+        for cap in range(0, 9):
+            view = filter_live_sessions(records, cap=cap)
+
+            assert len(view.visible) <= view.total
+
+
+class TestFormatVisibleCount:
+    """The cap notice: '' means "nothing to say", never "unknown"."""
+
+    def test_truncated_reports_both_numbers(self):
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(200, 412) == 'showing 200 of 412'
+
+    def test_nothing_hidden_renders_nothing(self):
+        """When the whole live band fits, the view must not add a notice --
+        a complete table claiming "showing 39 of 39" is noise that trains
+        an operator to stop reading the line that matters."""
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(39, 39) == ''
+
+    def test_empty_table_renders_nothing(self):
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(0, 0) == ''
+
+    def test_impossible_pair_renders_nothing_fail_soft(self):
+        """More shown than exist is not a state this module can produce,
+        but a view must degrade rather than render a backwards count --
+        mirroring state_glyph/_is_terminal fail-soft (PRD §2)."""
+        from cockpit.panes.session_table import format_visible_count
+
+        assert format_visible_count(5, 3) == ''
+
+
+class TestFocusMarker:
+    """The per-row focusability cue: can Enter raise a terminal for this row?
+
+    `display` is the only thing that makes a row focusable, and
+    session_table restates that rule rather than importing decision_queue
+    (which imports session_table -- a reverse import would be a cycle), so
+    test_agrees_with_resolve_target below is what keeps the two honest.
+    """
+
+    def test_record_with_display_is_focusable(self):
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=sr.Display(kind='wm', wm_title='t'))
+
+        assert is_focusable(record) is True
+        assert focus_marker(record) == '▸'
+
+    def test_record_without_display_is_not_focusable(self):
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=None)
+
+        assert is_focusable(record) is False
+        assert focus_marker(record) == '·'
+
+    def test_markers_are_distinct_single_chars_outside_the_status_vocabulary(self):
+        """The cue must read in BOTH directions and must never be confusable
+        with a status glyph -- the two dimensions are orthogonal. The
+        exclusion set is READ from _GLYPHS rather than respelled here, so a
+        glyph added to the status vocabulary later is checked too."""
+        from cockpit.panes.session_table import _FALLBACK_GLYPH, _GLYPHS, focus_marker
+
+        status_vocabulary = set(_GLYPHS.values()) | {_FALLBACK_GLYPH}
+        focusable = focus_marker(_make_record(display=sr.Display(kind='wm')))
+        headless = focus_marker(_make_record(display=None))
+
+        assert focusable != headless
+        for marker in (focusable, headless):
+            assert len(marker) == 1
+            assert marker not in status_vocabulary
+
+    def test_unrecognized_display_kind_still_reads_focusable_fail_soft(self):
+        """An unrecognized kind is still a real terminal somewhere, so it
+        must never be mislabelled unactionable (fail-soft, PRD §2)."""
+        from cockpit.panes.session_table import focus_marker, is_focusable
+
+        record = _make_record(display=sr.Display(kind='weird', wm_title='t'))
+
+        assert is_focusable(record) is True
+        assert focus_marker(record) == '▸'
+
+    @pytest.mark.parametrize(
+        'display',
+        [
+            sr.Display(kind='wm', wm_title='t'),
+            sr.Display(kind='tmux', tmux_target='sess:0.1'),
+            sr.Display(kind='weird', wm_title='t'),
+            None,
+        ],
+        ids=['wm', 'tmux', 'unrecognized-kind', 'headless'],
+    )
+    def test_agrees_with_resolve_target(self, display):
+        """SPOT guard: the cue must mean exactly what Enter does.
+
+        resolve_target is imported HERE only -- production session_table
+        must not import decision_queue (import cycle). Every display shape
+        the tests above assert on is checked in BOTH directions, so a kind
+        allowlist appearing on either side (resolve_target delegates to
+        _to_display_target, and app.py routes on target.kind) fails loudly
+        rather than leaving the table quietly lying to the operator.
+        """
+        from cockpit.panes.decision_queue import resolve_target
+        from cockpit.panes.session_table import is_focusable
+
+        record = _make_record(display=display)
+
+        assert is_focusable(record) == (resolve_target(record, {}) is not None)

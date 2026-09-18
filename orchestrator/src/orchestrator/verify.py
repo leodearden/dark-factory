@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
-from shared.verify_admission import acquire_task_slot, nice_prefix
+from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
@@ -649,9 +649,8 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 # Two consumers, both of which benefit — kept as ONE constant deliberately, a
 # parallel undecorated-only pattern would recreate the very
 # two-places-that-must-stay-in-sync drift task 4066 exists to fix:
-#   * _is_bare_xdist_worker_crash's no-FAILED-lines fallback, where a wider
-#     match strictly INCREASES strictness (it can only flip True -> False,
-#     never mask more).
+#   * _is_bare_xdist_worker_crash's veto set, where a wider match strictly
+#     INCREASES strictness (it can only flip True -> False, never mask more).
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
 #     match.
@@ -679,84 +678,27 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 )
 
 
-# Small, ENUMERATED allow-list of known load-induced test flakes (esc-2496-3),
-# grounded in the same config.yaml task-2361 worker-kill-catalog reasoning as
-# _XDIST_WORKER_CRASH_RE above: under host CPU oversubscription, a bare
-# second-worker hard-crash ([gwN] node down) can co-occur with an unrelated,
-# already-known load-induced flake in a DIFFERENT test — one whose ``FAILED``
-# line would otherwise defeat _is_bare_xdist_worker_crash's veto below and
-# misroute a code-complete task to the debugger instead of the bounded infra
-# retry (task 2496). Kept to a single entry today — the PGID-liveness race in
-# test_verify_merge_cancel_end_to_end — to minimize the accepted fail-safe
-# tradeoff documented on _is_bare_xdist_worker_crash below.
-#
-# Patterns are anchored on the full repo-relative node-id path (not just the
-# bare filename) since pytest is invoked with cwd=config.project_root and the
-# orchestrator verifies multiple projects — a bare ``test_cli.py::...`` match
-# would also discount a same-named test living anywhere else, including in an
-# unrelated project's own test suite. Future entries should follow the same
-# repo-path-anchored convention.
-_KNOWN_LOAD_FLAKE_NODEID_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r'(?:^|/)orchestrator/tests/test_cli\.py::test_verify_merge_cancel_end_to_end\b'),
-)
-
-
-def _is_known_load_flake_nodeid(nodeid: str) -> bool:
-    """Return True iff *nodeid* matches an enumerated known load-flake test."""
-    return any(rx.search(nodeid) for rx in _KNOWN_LOAD_FLAKE_NODEID_RES)
-
-
 def _is_bare_xdist_worker_crash(output: str) -> bool:
     """Return True when *output* is a bare xdist worker crash with no real failure.
 
     A hard ``os._exit()`` worker kill (task 2361) produces no assertion
-    traceback, so the presence of a genuine pytest failure marker normally
-    indicates a real failure occurred alongside the crash. However, under
-    host CPU oversubscription a bare crash can co-occur with an unrelated,
-    already-known load-induced test flake (esc-2496-3) whose own ``^FAILED
-    `` line would otherwise defeat this discriminator and misroute a
-    code-complete task to the debugger (task 2496).
+    traceback, so ANY genuine pytest failure surface alongside the crash
+    signature means a real failure occurred and this returns ``False`` —
+    never mask a real failure. The surfaces are one flat veto set: a
+    ``^FAILED `` line, an ``^E   `` traceback line, a failure summary, an
+    ``INTERNALERROR>`` line, or either ``ERROR`` short-summary form (node-id
+    or bare-file).
 
-    To stay strict while accommodating that case: once the crash signature
-    is present, every ``^FAILED `` line is inspected individually. If ANY
-    names a test that is not on the narrow, enumerated
-    ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list (or has no extractable
-    node-id), this returns ``False`` — never mask a real failure. A
-    co-occurring ``INTERNALERROR>`` line or ``ERROR`` short-summary line
-    (a fixture/setup error or a whole-module collection failure) is
-    likewise never attributable to a known FAILED-line flake, so either one
-    also forces ``False`` even when every FAILED line is allow-listed —
-    those failure surfaces produce no FAILED line of their own, so the
-    per-FAILED-line check alone would never see them. Only when there is at
-    least one ``FAILED`` line, every one of them is an allow-listed known
-    flake, AND no such ERROR/INTERNALERROR surface is present, are the
-    accompanying ``^E   `` traceback lines and ``=== N failed ===`` summary
-    treated as attributable to those flakes and this returns ``True``. When
-    there are NO ``FAILED`` lines at all, the fallback vetoes on the SAME
-    set of surfaces as the branch above — an ``^E   `` traceback line, a
-    failure summary, an ``INTERNALERROR>`` line, or either ``ERROR``
-    short-summary form (node-id or bare-file) — any one of which suppresses
-    reclassification.
+    The set is flat on purpose. It used to be two branches keyed on whether
+    a ``FAILED`` line was present, and they drifted (task 4066): verify-log
+    2829 — 8 genuine failures, 47 ``^INTERNALERROR>`` lines, and zero
+    ``^FAILED ``/``^E   `` lines because the INTERNALERROR aborted the
+    session before pytest printed its short summary — was reclassified as
+    transient infra by the branch that lacked the INTERNALERROR veto.
 
-    That last sentence used to name only the first two (task 4066): the two
-    branches had drifted apart, since tasks 3514/3597 added the
-    INTERNALERROR/ERROR veto to the FAILED-lines branch alone. verify-log
-    2829 is the real captured run that billed for the drift — 8 genuine
-    failures, 47 ``^INTERNALERROR>`` lines, and (because the INTERNALERROR
-    aborted the session before pytest could print its short-summary and
-    decorated stats lines) zero ``^FAILED `` lines and zero ``^E   ``
-    lines, which the old fallback reclassified as transient infra.
-
-    Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
-    known-flake test, co-occurring with a crash, is discounted here and
-    goes to the bounded infra-retry; if it recurs (a real regression
-    doesn't self-heal, unlike a load flake) the retry window is exhausted
-    and it lands in infra_hold + escalate_to_human instead of the debugger
-    — a human sees it, nothing is silently greened.
-
-    Second accepted tradeoff, in the OPPOSITE direction, deliberately
-    taken by task 4066: the ``INTERNALERROR>`` veto keys on a surface the
-    worker crash can itself PRODUCE. Under ``--max-worker-restart=0`` a
+    Accepted tradeoff, deliberately taken by task 4066: the
+    ``INTERNALERROR>`` veto keys on a surface the worker crash can itself
+    PRODUCE. Under ``--max-worker-restart=0`` a
     node-down can trip xdist's own scheduler — verify-log 2829's is
     ``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``,
     an artefact of the node-down handling, not of any test. So a truly
@@ -775,10 +717,11 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     ``test_crash_induced_loadscope_internalerror_is_false_by_design``
     pins this verdict so a future reader knows it is a decision.
 
-    The opposite-direction case — an UNLISTED co-occurring load flake that
-    defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
-    by broadening the allow-list; see ``_main_probe_failure_is_isolated_flake``
-    (task 3597) for the downstream confirm gate that catches it instead.
+    The opposite-direction case — a load flake co-occurring with the crash,
+    whose ``FAILED`` line defeats this veto (esc-2496-3, esc-3514-2) — is
+    deliberately NOT fixed by exempting named tests here: no test is exempt.
+    See ``_main_probe_failure_is_isolated_flake`` (task 3597) for the
+    downstream confirm gate that catches it instead.
 
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
@@ -787,28 +730,9 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
-    failed_lines = _PYTEST_FAILED_LINE_RE.findall(output)
-    if failed_lines:
-        if (
-            _PYTEST_INTERNALERROR_RE.search(output)
-            or _ERROR_LINE_NODEID_RE.search(output)
-            or _ERROR_LINE_FILE_RE.search(output)
-        ):
-            # A collection/fixture/internal error produces no FAILED line
-            # of its own, so the per-line allow-list check below would
-            # never see it — veto here instead of silently masking it.
-            return False
-        for line in failed_lines:
-            match = _FAILED_LINE_NODEID_RE.match(line)
-            if match is None or not _is_known_load_flake_nodeid(match.group(1)):
-                return False
-        return True
-    # Same three surfaces the FAILED-lines branch vetoes on above. They
-    # produce no FAILED line of their own — which is precisely why they land
-    # in THIS branch, so omitting them here (as this fallback did until task
-    # 4066) leaves the very outputs the veto exists for unguarded.
     return not (
-        _PYTEST_TRACEBACK_E_RE.search(output)
+        _PYTEST_FAILED_LINE_RE.search(output)
+        or _PYTEST_TRACEBACK_E_RE.search(output)
         or _PYTEST_FAILURE_SUMMARY_RE.search(output)
         or _PYTEST_INTERNALERROR_RE.search(output)
         or _ERROR_LINE_NODEID_RE.search(output)
@@ -5245,62 +5169,65 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
 async def _admission_slot(role: str, config: OrchestratorConfig):
     """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
 
-    Gates only the test leg of a verify (callers decide that; this CM itself
-    is role-agnostic and always attempts acquisition uniformly — T1's
-    ``acquire_task_slot`` internally no-ops for ``role`` values other than
-    ``'task'``/``'background'`` and always yields ``held=False`` immediately
-    for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
-    is owned entirely by T1, not re-implemented here).
+    Callers gate only a verify's test leg; WHICH roles that gate actually
+    acquires for is T1's ``is_gated_role`` to decide, never re-derived here.
 
-    T1 never creates ``slots_dir`` itself (fails open when absent) and never
-    even inspects it for roles it can't acquire for (its own role check
-    short-circuits first), so this CM only mkdirs it for roles that actually
-    attempt acquisition (``task``/``background``) — leaving ``merge`` (and any
-    other role) with no filesystem side effect. The mkdir and the blocking,
-    potentially-unbounded ``acquire_task_slot(...).__enter__`` (a synchronous
-    flock poll-loop) both run on the dedicated ``_admission_executor`` so the
-    wait never blocks the event loop nor contends with unrelated
-    ``asyncio.to_thread`` work — a loop-blocking acquire would otherwise stall
-    the holder's own subprocess-exit callback from ever firing on this same
-    loop, deadlocking cross-verify contention.
+    Gated role — the mkdir (T1 never creates ``slots_dir`` itself, and fails
+    open when it is absent) and the blocking, potentially-unbounded
+    ``__enter__`` (a synchronous flock poll-loop) both run on the dedicated
+    ``_admission_executor``, so the wait neither blocks the event loop nor
+    contends with unrelated ``asyncio.to_thread`` work: a loop-blocking
+    acquire would stall the current holder's own subprocess-exit callback
+    from ever firing on this same loop, deadlocking cross-verify contention.
+    The await is shielded because cancellation (shutdown, or a sibling
+    verify's failure cancelling this one via ``asyncio.gather``) cannot
+    interrupt that worker thread mid-``time.sleep`` — a bare cancel would
+    leave the slot acquired-but-never-released if the thread goes on to
+    succeed, so a done-callback releases it instead. That release race, and
+    its adjacent never-entered-CM guard, are pinned by
+    ``test_verify_admission_cancel_release.py``.
 
-    The acquire await is shielded from cancellation (``asyncio.shield``): if
-    the awaiting coroutine is cancelled mid-wait (e.g. orchestrator shutdown,
-    or a sibling verify's failure cancelling this one via ``asyncio.gather``),
-    the worker thread's poll loop keeps running in the background regardless
-    — it cannot be interrupted mid-``time.sleep`` — so a bare cancellation
-    would otherwise leave a slot acquired-but-never-released if the thread
-    goes on to succeed after we stopped waiting. A done-callback releases it
-    in that case instead. Release on the normal path (``os.close`` under the
-    hood) is synchronous and instant, so it runs directly in ``finally``
-    without needing an executor thread.
+    Ungated role — ``__enter__`` is a synchronous no-op (T1's own role check
+    short-circuits before any I/O), so it runs inline on the event loop
+    thread and ``slots_dir`` is never even created. Routing it through the
+    executor instead would subject a role T1 guarantees is instant to that
+    shared pool's queueing delay, reintroducing inside this CM the very
+    head-of-line ``merge`` starvation T1's no-op exists to prevent
+    (C-merge-priority; task 5424).
 
+    Release (``os.close`` under the hood) is synchronous and instant on both
+    paths, so it runs directly in ``finally`` without an executor thread.
     Fails open (runs ungated) on any ``OSError`` — most commonly a
     ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
     fail-open contract for acquisition itself).
     """
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
-    loop = asyncio.get_running_loop()
-    executor = _admission_executor()
     cm = None
     try:
-        if role in {'task', 'background'}:
+        # Constructing the CM runs none of acquire_task_slot's body (it is a
+        # @contextlib.contextmanager generator function); only __enter__ does,
+        # and the branch below differs solely in HOW that __enter__ is invoked.
+        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+        if is_gated_role(role):
+            loop = asyncio.get_running_loop()
+            executor = _admission_executor()
             await loop.run_in_executor(
                 executor, lambda: slots_dir.mkdir(parents=True, exist_ok=True),
             )
-        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
-        enter_future = loop.run_in_executor(executor, cm.__enter__)
-        try:
-            await asyncio.shield(enter_future)
-        except asyncio.CancelledError:
-            def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
-                if cm is None or fut.cancelled() or fut.exception() is not None:
-                    return
-                with contextlib.suppress(OSError):
-                    cm.__exit__(None, None, None)
-            enter_future.add_done_callback(_release_if_acquired)
-            raise
+            enter_future = loop.run_in_executor(executor, cm.__enter__)
+            try:
+                await asyncio.shield(enter_future)
+            except asyncio.CancelledError:
+                def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
+                    if cm is None or fut.cancelled() or fut.exception() is not None:
+                        return
+                    with contextlib.suppress(OSError):
+                        cm.__exit__(None, None, None)
+                enter_future.add_done_callback(_release_if_acquired)
+                raise
+        else:
+            cm.__enter__()
     except OSError:
         cm = None
     try:
@@ -5663,13 +5590,14 @@ async def run_verification(
         # the `-n` gate reads it and must itself precede that wrap; it
         # depends on nothing but config/label, so the move is inert.
         admission = _verify_admission_active(config) and label == 'test'
-        # -n cap (task 2394 T6): applies only to roles {task, background} —
-        # 'merge' is never -n-capped (bypasses admission slot-counting,
-        # latency-critical). No-op when the knob is '' or 'auto' (the
-        # apply_pytest_numprocesses no-op guard) — byte-identical to today.
-        # config_cmd above intentionally stays un-rewritten (same treatment
-        # as the nice prefix: an execution detail layered onto cmd, not the
-        # persisted config command).
+        # -n cap (task 2394 T6): capping is a property of the SAME role set
+        # the slot semaphore gates, so it asks T1's is_gated_role rather than
+        # re-deriving that set (task 5424) — 'merge' bypasses slot-counting
+        # and, being latency-critical, is never -n-capped either. No-op when
+        # the knob is '' or 'auto' (the apply_pytest_numprocesses no-op
+        # guard) — byte-identical to today. config_cmd above intentionally
+        # stays un-rewritten (same treatment as the nice prefix: an execution
+        # detail layered onto cmd, not the persisted config command).
         #
         # Hoisted into ONE local (task 3478) because the segmented branch
         # below applies the same cap per segment: a second copy of this
@@ -5677,7 +5605,7 @@ async def run_verification(
         # disagree between the segmented and unsegmented paths.
         pytest_n_capped = (
             admission
-            and role in {'task', 'background'}
+            and is_gated_role(role)
             and config.verify_admission_pytest_n not in {'', 'auto'}
         )
         # _with_pytest_numprocesses_str identity-checks the mutation before
@@ -5691,7 +5619,7 @@ async def run_verification(
         # /bin/bash -c '...'` string that parse_config_command can no longer
         # see as pytest, so the cap would silently vanish. Both gates are
         # disjoint today (governance resolves only for role=='merge', the cap
-        # only for role in {'task','background'}), so this is defence in
+        # only for the admission-gated roles), so this is defence in
         # depth; ordering it identically to _run_one_segment below is what
         # keeps the two paths from disagreeing if either gate ever widens.
         if pytest_n_capped:
@@ -5934,8 +5862,8 @@ async def run_verification(
             #   The guard above warns if either gate ever relaxes.
             #
             # - apply_pytest_numprocesses IS now applied per segment, inside
-            #   _run_one_segment. Its gate's roles ({'task','background'}) are
-            #   exactly the segmented-path roles, so it was never exempt —
+            #   _run_one_segment. Its gate's roles (the admission-gated ones)
+            #   are exactly the segmented-path roles, so it was never exempt —
             #   just silently dropped, the rewrite landing on `cmd` while
             #   segments are built from `config_cmd`. Segments run
             #   sequentially, so a per-segment `-n N` keeps its single-command

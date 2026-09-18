@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from shared import toolcall_markup
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     ENVELOPE_LITERALS,
@@ -283,6 +284,112 @@ class TestParameterAwareDetection:
         assert detect_for(self._SILENT_RATIONALE, param) is None
 
 
+class TestTheWidenedGateCostsWhatItClaims:
+    """The COST contract of ``detect_for``, on the 99.7%-clean path.
+
+    This class reaches module internals, which is normally an interface smell.
+    It is the deliberate exception: cost is not observable through the public
+    interface — ``detect_for`` returns the same answer whether it allocates
+    three frozensets per call or none — so a contract about allocation and
+    caching can only be stated against the mechanism. Everything about the
+    ANSWER stays pinned through the public predicate in the class above.
+
+    Why it is worth pinning at all: this predicate sits on a per-tool-call
+    boundary and returns ``None`` for 99.7% of the values it sees, so the
+    whole of its cost on the dominant path is setup that finds nothing. The
+    rows below pin the three properties that keep that setup bounded.
+    """
+
+    #: Reused from the class above, so the cost rows and the answer rows are
+    #: measured against the same specimen rather than two that could drift.
+    _SILENT_RATIONALE = TestParameterAwareDetection._SILENT_RATIONALE
+
+    def test_the_normalization_is_cached_across_identical_calls(self):
+        """(1) Repeated identical calls normalize ONCE.
+
+        Asserted on ``cache_info()`` deltas, never on wall-clock: a timing
+        assertion on a shared machine is a flake generator, and the property
+        that matters is "did it do the work again", which the counters answer
+        exactly.
+        """
+        toolcall_markup._extra_names.cache_clear()
+
+        for _ in range(20):
+            detect_for(self._SILENT_RATIONALE, 'rationale', ('decision', 'rationale'))
+
+        info = toolcall_markup._extra_names.cache_info()
+        assert info.misses == 1, 'the normalization ran once for twenty calls'
+        assert info.hits == 19
+
+    def test_a_param_already_in_the_literal_set_reaches_the_module_pattern(self):
+        """(2) The zero-allocation short-circuit, asserted by IDENTITY.
+
+        ``content``'s closer is already in :data:`ENVELOPE_LITERALS`, so with
+        no schema there is nothing to add and the widened set is empty. An
+        empty set must resolve to the module-level ``_ENVELOPE_RE`` OBJECT —
+        the identity guarantee ``_widened_re``'s own docstring already makes —
+        so the widest-used call shape compiles nothing and allocates nothing
+        beyond the two cache lookups.
+        """
+        names = toolcall_markup._extra_names('content', frozenset())
+
+        assert names == frozenset(), 'a closer already in the set is not re-added'
+        assert toolcall_markup._widened_re(names) is toolcall_markup._ENVELOPE_RE
+
+        # ...and the public answer is unchanged by the short-circuit.
+        value = 'body' + closer_for('content')
+        assert detect_for(value, 'content') == detect(value) == closer_for('content')
+
+    @pytest.mark.parametrize(
+        'param',
+        ['not-an-identifier', 'a b', '9lives', 'a/b', 'a.b', 'a-b', 'has\nnewline'],
+    )
+    def test_a_param_outside_the_tag_name_shape_never_becomes_a_needle(self, param):
+        """(3) The cache-thrash bound, and the coherence argument behind it.
+
+        ``param`` is CALLER-CONTROLLED: ``_first_markup_argument`` passes each
+        key of the caller's ``arguments`` mapping straight through, so a caller
+        sending unknown argument names would otherwise evict the bounded
+        ``_widened_re`` cache with a fresh ``re.compile`` per name.
+
+        The bound is the ``_TAG_NAME`` identifier shape rather than a bigger
+        cache, because it answers something stronger: ``repair`` qualifies a
+        mis-close candidate through ``_CLOSER_RE``, whose name group is
+        ``[A-Za-z_]\\w*``. A needle built for a name outside that shape can be
+        DETECTED and can never be QUALIFIED for repair, so spelling it would
+        manufacture detections that are unrepairable by construction — routing
+        authored text into the human queue for nothing.
+        """
+        value = 'prose ' + closer_for(param) + ' tail ' + INVOKE_CLOSER
+
+        assert detect_for(value, param) == detect(value) == INVOKE_CLOSER
+        assert param not in toolcall_markup._extra_names(param, frozenset())
+
+    def test_an_identifier_param_is_still_widened_onto(self):
+        """The bound's other side: a REAL parameter name is never dropped.
+
+        MCP parameter names are Python function parameters and are therefore
+        already identifiers, which is why the bound costs nothing in coverage.
+        """
+        assert detect_for(self._SILENT_RATIONALE, 'rationale') == closer_for('rationale')
+        assert toolcall_markup._extra_names('rationale', frozenset()) == frozenset(
+            {'rationale'}
+        )
+
+    def test_a_schema_name_outside_the_shape_is_dropped_too(self):
+        """One rule, not two: the bound is on every name that becomes a needle.
+
+        ``schema_params`` is not the caller-controlled vector — it is resolved
+        from the invoked tool's own schema — but it lands in the same widened
+        set and therefore the same cache key, and ``repair`` cannot qualify a
+        non-identifier from it either. Filtering in one place keeps the gate's
+        widening vocabulary exactly equal to the repairer's candidate grammar.
+        """
+        names = toolcall_markup._extra_names('rationale', frozenset({'a-b', 'decision'}))
+
+        assert names == frozenset({'rationale', 'decision'})
+
+
 def test_this_module_spells_no_raw_envelope_literal():
     """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
 
@@ -522,14 +629,23 @@ class TestRepairSpecimens:
         assert result.pattern == _CANONICAL_CLOSER
         assert result.misclose == _CANONICAL_CLOSER
 
-    def test_pattern_is_the_envelope_literal_misclose_is_the_wrong_tag(self):
-        """The two fields differ whenever the mis-closed name is not a literal.
+    def test_pattern_names_the_HEAD_of_the_leak_not_the_literal_trailing_it(self):
+        """PRD section 2.2's diagnostic ambiguity, and its resolution.
 
-        PRD section 2.2's diagnostic ambiguity in miniature: ``/rationale`` is
-        a real drift but is not in the literal set, so ``pattern`` reports the
-        envelope literal that actually matched (the trailing invoke closer,
-        earliest by text position among the literals) while ``misclose``
-        reports the tag that actually went wrong.
+        ``/rationale`` is a real drift and is not in the FIXED literal set, so
+        this specimen used to report ``pattern`` as the trailing invoke closer
+        — earliest by text position among the fixed literals, and about 60
+        characters downstream of where the envelope actually starts. That is
+        section 2.2's complaint verbatim: a guard reporting whatever follows.
+
+        MOVED BY TASK 5283 (expectation ``INVOKE_CLOSER`` -> the ``rationale``
+        closer). ``pattern`` is now derived from ``detect_for`` on the same
+        ``(value, param, schema_params)`` triple the candidate qualification
+        above already uses, so it names the earliest needle over the literals
+        WIDENED by those names — here the self-name closer that opens the leak.
+        ``misclose`` is unchanged and still reports the tag that went wrong;
+        the two coincide on this specimen because the head of the leak IS the
+        mis-close, which is the common case rather than a special one.
         """
         clean = 'Because the split is calibrated in opposite directions.'
         value = (
@@ -549,7 +665,11 @@ class TestRepairSpecimens:
         assert result is not None
         assert_repair_invariants(value, result)
         assert result.misclose == _closer('rationale')
-        assert result.pattern == INVOKE_CLOSER
+        assert result.pattern == _closer('rationale')
+        assert value.index(result.pattern) < value.index(INVOKE_CLOSER), (
+            'the reported pattern must be the HEAD of the leak — the trailing '
+            'invoke closer is what this row used to report'
+        )
         assert result.recovered == {'agent_id': 'claude-interactive'}
 
 

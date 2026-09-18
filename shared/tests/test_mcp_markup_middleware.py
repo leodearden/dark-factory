@@ -1016,10 +1016,18 @@ class TestB3StrandRiskTierForwards:
         assert warning['outcome'] == 'repaired'
 
     async def test_the_warning_names_the_pattern_and_the_misclose(self):
+        """MOVED BY TASK 5283: ``INVOKE_CLOSER`` -> the ``detail`` closer.
+
+        This specimen's leak opens with ``detail``'s own closer and the invoke
+        closer merely terminates the swallowed tail, so the old expectation
+        named a literal ~40 characters downstream of the defect. Both channels
+        now derive ``matched_pattern`` from ``detect_for`` over the same
+        ``(value, param, schema_params)`` triple, which reports the HEAD.
+        """
         _, result = await self._forward()
 
         warning = meta_of(result)['markup_repair']
-        assert warning['matched_pattern'] == INVOKE_CLOSER
+        assert warning['matched_pattern'] == _closer('detail')
         assert warning['misclose'] == _closer('detail')
 
     async def test_fastmcps_own_meta_is_preserved_not_replaced(self):
@@ -3703,13 +3711,17 @@ class TestSelfNameCloserIsSeenAtTheBoundary:
         assert payload['recovered_params'] == []
 
     async def test_the_two_pattern_channels_AGREE(self):
-        """``matched_pattern`` and the fact's ``pattern`` are fed differently.
+        """``matched_pattern`` and the fact's ``pattern`` name one literal.
 
-        ``matched_pattern`` comes from ``Repair.pattern``, which falls back to
-        the misclose when no literal is present — so it already reported the
-        self-name closer even while the gate was blind. The fact's ``pattern``
-        is fed DIRECTLY by the boundary scan, so it is the one that goes red
-        today. Asserting both in one place is what pins them together.
+        ``matched_pattern`` comes from ``Repair.pattern`` and the fact's
+        ``pattern`` from the boundary scan, so the two are fed through
+        different code paths and this row is where they are pinned together.
+
+        This specimen carries NO fixed literal, so it is the easy half: both
+        derivations fall through to the same self-name closer whatever they
+        ask. ``TestOnePatternPerEvent`` covers the hard half — a value where a
+        fixed literal TRAILS the leak, which is where the two used to
+        disagree — and records why they now cannot.
         """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
@@ -3794,6 +3806,128 @@ class TestSelfNameCloserIsSeenAtTheBoundary:
         }
         assert h.facts == []
         assert h.escalations == []
+
+
+class TestOnePatternPerEvent:
+    """One leak, one answer: every channel names the SAME literal.
+
+    ``matched_pattern`` has two derivations today, and they are not the same
+    expression. The gate asks ``detect_for(value, param)``; ``repair`` asks the
+    blanket, param-free ``detect``. Where a fixed literal happens to TRAIL the
+    leak, the two disagree — so one event is published with two different
+    answers, the fact stream naming the head and the caller's payload naming
+    the tail.
+
+    That is exactly the diagnostic PRD section 2.2 exists to close: a guard
+    that reports "whatever follows" rather than where the envelope actually
+    starts. Task 4696 closed it on the unrepairable arm, where there is no
+    ``Repair`` to read a pattern off; these rows close it on the REPAIRED arm,
+    where there is.
+
+    THE SPECIMEN is the PRD's own partial-drift shape: prose, the absorbing
+    parameter's SELF-NAME closer, then a canonical opener naming a sibling
+    whose value the harness parser swallowed. Measured at HEAD before the fix,
+    with ``param='how'`` and ``schema=('what','how','where')``::
+
+        detect(value)                 '\\x3cparameter name='   offset 39
+        detect_for(value, 'how')      the ``how`` closer       offset 33
+        repair(...).pattern           '\\x3cparameter name='   offset 39
+
+    so the self-name closer is the HEAD of the leak and the canonical opener
+    merely trails it by six characters. Both tiers are covered because they
+    read ``Repair.pattern`` through different keys — ``_reject``'s flat
+    ``matched_pattern`` and ``_forward``'s ``meta['markup_repair']`` block —
+    and a fix that reached only one of them would leave the other divergent.
+    """
+
+    #: The absorbing parameter's own closer, then the swallowed sibling in the
+    #: canonical dialect. A genuine repair: ``where`` really is recovered, so
+    #: these rows exercise the arm that HAS a ``Repair`` to read a pattern off,
+    #: which is what distinguishes them from the unrepairable rows above.
+    MIXED_HOW = (
+        'Reuse the declared table directly.'
+        + _closer('how')
+        + '\n'
+        + _canonical_opener('where')
+        + 'plan_tools'
+        + _closer('parameter')
+    )
+    MIXED_HOW_CLEAN = 'Reuse the declared table directly.'
+
+    def test_the_specimen_really_does_carry_BOTH_dialects(self):
+        """Otherwise these rows would pass for the wrong reason.
+
+        The divergence only exists when a fixed literal is present AND a
+        widened needle precedes it. A specimen that lost either half would make
+        the two channels agree trivially, by the misclose fallback, which is
+        the case already pinned by ``test_the_two_pattern_channels_AGREE``.
+        """
+        assert detect(self.MIXED_HOW) == '\x3cparameter name='
+        assert self.MIXED_HOW.index(_closer('how')) < self.MIXED_HOW.index(
+            '\x3cparameter name='
+        ), 'the self-name closer must PRECEDE the fixed literal'
+
+    async def test_reject_tier_publishes_one_pattern(self):
+        """(1) REJECT_WITH_REPAIR: the fact and the payload agree, on the HEAD."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.MIXED_HOW},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+
+        assert payload['matched_pattern'] == fact['pattern'], (
+            'one event may not be published with two different answers'
+        )
+        assert fact['pattern'] == _closer('how'), (
+            'and the answer is the HEAD of the leak, not the literal trailing it'
+        )
+        assert fact['misclose'] == _closer('how')
+
+    async def test_forward_tier_publishes_one_pattern(self):
+        """(2) FORWARD_REPAIR: the same property through the other key."""
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'add_reuse_item',
+            {'what': 'the declared table', 'how': self.MIXED_HOW},
+        )
+
+        warning = meta_of(result)['markup_repair']
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+
+        assert warning['matched_pattern'] == fact['pattern']
+        assert fact['pattern'] == _closer('how')
+        assert fact['misclose'] == _closer('how')
+
+    async def test_the_repair_itself_is_unchanged(self):
+        """The pattern is a DIAGNOSTIC; changing it may not change the repair.
+
+        Stated as its own row because the change under test edits ``repair``'s
+        return value, and a reader needs the recovery half pinned independently
+        of the reporting half.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.MIXED_HOW},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['repaired_call'] == {
+            'what': 'the declared table',
+            'how': self.MIXED_HOW_CLEAN,
+            'where': 'plan_tools',
+        }
+        assert payload['recovered_params'] == ['where']
 
 
 def test_this_module_spells_no_raw_envelope_literal():

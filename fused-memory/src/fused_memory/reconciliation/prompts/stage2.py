@@ -489,6 +489,21 @@ current metadata, convert and merge the reshaped hints into it locally, then wri
 COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
 key while replacing only the legacy hint shape.
 
+`append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
+to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
+any of them with `append=True` is now REJECTED by the backend with a \
+`TASKMASTER_TOOL_ERROR` (`error_type` `AppendUnsupportedFieldError`) naming the offending \
+field. Before that guard the pair was accepted silently and OVERWROTE the column: a \
+caller who passed `description='\\n\\n--- addendum ---'` with `append=True` believing they \
+were extending the field destroyed the entire original description instead, with no error \
+and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
+as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
+project_root=<project_root>)` to read the FULL current text, concatenate your addition \
+locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
+genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
+it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
+`update_task` call.
+
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
@@ -658,7 +673,9 @@ window (even if `run_id` was omitted by the Stage 1 producer), appear in the \
 "Stage 1 Flagged Items" section above. Any markers from prior cycles that \
 failed FIX C deletion are excluded from the section above and garbage-collected \
 deterministically by the reconciliation ledger (TTL expiry or terminal-task match, \
-not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept`. \
+not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept` — \
+a count of reconciliation-ledger rows, NOT of Mem0 records, so do not read it as a \
+signal about the Mem0 marker pool. \
 You do NOT need to search for, re-process, or \
 count prior-cycle markers — every flag in this section is current-cycle and is your \
 responsibility to process and delete.
@@ -752,6 +769,24 @@ lifecycle.
    the build succeeds, the orchestrator will merge automatically. A manual merge \
    instruction competes with the live pipeline and can produce a race condition or a \
    double-merge.
+
+4. **Never CANCEL an existing human-gate carrier because its subject showed a live \
+   signal.** A liveness flicker is transient; cancelling the carrier and re-minting one \
+   next cycle is what orphaned esc-5881-1 / esc-5902-1 / esc-5916-1 as \
+   permanently-pending L2 escalations, and what produced three carriers \
+   (5902 -> 5916 -> 5929) for the single subject 5879. Instead, AMEND the carrier in \
+   place with `update_task` — refresh its evidence and bump \
+   `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
+   cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
+   "## Source-Completion" section is the authority for that canonical key and its \
+   read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
+   amending one is a read-modify-write — READ the current text first, then write the \
+   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
+   reflects it. Pairing `description` with `append=True` is REJECTED; the \
+   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
+   and is the authority for it. Re-filing is not an escape \
+   from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
+   whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
 — i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \

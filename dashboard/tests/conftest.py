@@ -132,7 +132,7 @@ def two_url_config(tmp_path):
     """Create a DashboardConfig with two test URLs (ports 9000, 9001).
 
     Port 9000 is used as the failing server in fallback tests; port 9001
-    responds successfully. Using ports distinct from the default (8002)
+    responds successfully. Using ports distinct from the suite-wide default
     makes the test intent explicit.
     """
     from dashboard.config import DashboardConfig
@@ -147,8 +147,13 @@ def two_url_config(tmp_path):
 def client():
     """Create a TestClient for the dashboard FastAPI app.
 
-    Its lifespan runs against the session-scoped ``_isolated_project_root``
-    temp dir, never the operator's live checkout (task 3503).
+    Its lifespan is isolated on BOTH axes by the session-scoped
+    ``_isolated_project_root`` fixture: the DB paths it opens resolve under a
+    pytest-owned temp dir rather than the operator's live checkout (task
+    3503), and its fused-memory fan-out dials a measured-dead loopback port
+    rather than the operator's live instance on 8002 (task 5185).  The second
+    half is not cosmetic: without it every lifespan here makes two real MCP
+    round trips, and one slow response wedges ``TestClient.__exit__``.
     """
     from dashboard.app import app
 

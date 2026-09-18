@@ -428,6 +428,64 @@ class QueueConfig(BaseModel):
         return self
 
 
+# --- Write journal ---
+
+class WriteJournalConfig(BaseModel):
+    """Retention horizons and prune budgets for the ``write_ops`` journal.
+
+    RESTART-ONLY BY CONSTRUCTION. The prune runs once at startup
+    (``server/main.py``), so no consumer re-reads these values afterwards.
+    ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
+    section is deliberately absent from it, which makes a changed leaf report
+    ``restart_required`` — honest, rather than a leaf advertised hot-reloadable
+    while silently ignoring reloads.
+
+    The three horizons are not interchangeable, and the asymmetry is the whole
+    point: see ``services/write_journal.py::prune_write_ops`` for the measured
+    row-mix that set them.
+    """
+
+    #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
+    #: ``get_external_statuses``) — 97.9% of the table with no downstream
+    #: consumer, so this is incident-forensics headroom and nothing more.
+    read_retention_days: float = Field(default=30.0, gt=0)
+    #: ``search`` reads — 1.36% of the table and the SOLE data source for leaf
+    #: eta's write-after-miss metric (task 3213) and leaf theta's retro corpus
+    #: (task 3214), both of which evaluate over trailing baseline windows.
+    search_retention_days: float = Field(default=365.0, gt=0)
+    #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
+    #: volume, so a long horizon costs essentially nothing.
+    write_retention_days: float = Field(default=730.0, gt=0)
+    #: Rows deleted per transaction. Each batch commits separately so the
+    #: write lock is released between batches.
+    prune_batch_size: int = Field(default=5000, gt=0)
+    #: Ceiling on one startup sweep. A backlog drains over successive restarts
+    #: and each partial run says so at WARNING.
+    prune_max_rows_per_run: int = Field(default=500_000, gt=0)
+    #: Wall-clock ceiling on one sweep, checked between batches. This is the
+    #: bound that actually matters: the watchdog's startup grace is a TIME
+    #: budget, and rows-per-second is not knowable in advance.
+    prune_max_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode='after')
+    def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
+        """Search rows must never be aged out sooner than task-read rows.
+
+        An inversion is silently destructive rather than loudly broken: it
+        would starve the only consumer these rows have while the 97.9% of the
+        table that has no consumer lived longer. Rejected at load time, in the
+        same posture as ``QueueConfig._validate_transient_max_attempts``.
+        """
+        if self.search_retention_days < self.read_retention_days:
+            raise ValueError(
+                f'search_retention_days ({self.search_retention_days}) must be >= '
+                f'read_retention_days ({self.read_retention_days}): search rows are '
+                'the only journalled reads with a downstream consumer (leaf eta), '
+                'so they must not be aged out sooner than consumer-less task reads.'
+            )
+        return self
+
+
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
@@ -1324,6 +1382,14 @@ class ReconciliationConfig(BaseModel):
         return data
 
     enabled: bool = Field(default=True)
+    # data_dir MAY be RELATIVE, and the default is (task 4592).  Nothing
+    # absolutizes it, so a standalone/systemd launch anchors it at the PROCESS
+    # cwd; every in-process consumer shares that anchor and so agrees by
+    # construction.  The per-run CLI config dir derived from it does NOT get to
+    # inherit the relativity — it crosses a process boundary as
+    # CLAUDE_CONFIG_DIR — and is absolutized exactly once, at
+    # reconciliation/cli_stage_runner.py::recon_config_base_dir, which carries
+    # the full deployment story and rationale.
     data_dir: str = Field(default='./data/reconciliation')
 
     # Buffer triggers
@@ -1468,6 +1534,15 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Entries MUST be ABSOLUTE paths.  A relative entry is DROPPED rather than
+    #   honoured — from the containment verdict AND from the --writable grant
+    #   alike, with a logger.warning naming it — by
+    #   reconciliation/sandbox_guard.py::_absolute_writable_extras, because the
+    #   parent verifies it in its own cwd while landlock-exec / bwrap resolve the
+    #   granted token in the child's.  See that function, and
+    #   reconciliation/cli_stage_runner.py::recon_config_base_dir for the
+    #   parent/child cwd divergence it comes from (task 4592).
     #
     #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
     #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which
@@ -2093,11 +2168,15 @@ class CuratorConfig(BaseModel):
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
-    # any success or on a non-ZOT failure — the batch path's missing reset
-    # was fixed in task 4143).
+    # any successful LLM call; a non-ZOT failure neither increments nor
+    # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
-    # before allowing a half-open probe.
+    # before allowing a half-open probe; a successful LLM call (including a
+    # concurrent batch round-trip) closes the breaker early rather than
+    # waiting out the cooldown — see
+    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
@@ -2716,6 +2795,12 @@ class FusedMemoryConfig(BaseSettings):
     mem0: Mem0BackendConfig = Field(default_factory=Mem0BackendConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage below —
+    # here it buys the INVERSE disposition: reload.py descends into it and
+    # reports every leaf restart_required, which is the honest answer for a
+    # startup-only prune. Nullability would bucket the whole section as one
+    # atomic leaf instead.
+    write_journal: WriteJournalConfig = Field(default_factory=WriteJournalConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
