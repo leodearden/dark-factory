@@ -3886,6 +3886,7 @@ class TestWithheldReachesTheLlmPrompt:
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=mock):
             decision = await curator.curate(candidate, 'p', '/x')
+        assert mock.await_args is not None
         return decision, mock.await_args.kwargs['prompt']
 
     @pytest.mark.asyncio
@@ -3990,6 +3991,7 @@ class TestWithheldReachesTheLlmPrompt:
             decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
 
         assert len(decisions) == 2
+        assert mock.await_args is not None
         prompt = mock.await_args.kwargs['prompt']
         # Exactly one fact, in Beta's own section.
         assert prompt.count('pool_truncated:') == 1
@@ -4004,6 +4006,7 @@ class TestWithheldReachesTheLlmPrompt:
         with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=mock):
             await curator.curate_batch_prepared(prepared, 'p', '/x')
+        assert mock.await_args is not None
         assert 'pool_truncated' not in mock.await_args.kwargs['prompt']
 
     @pytest.mark.asyncio
