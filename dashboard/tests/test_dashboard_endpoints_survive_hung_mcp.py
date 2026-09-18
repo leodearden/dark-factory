@@ -80,7 +80,6 @@ def hung_mcp(monkeypatch, tmp_path):
     stub recorded, so a caller can assert the hang was genuinely exercised.
     """
     from dashboard.api.escalations import _task_cards_cache_clear
-
     from dashboard.app import _analytics_cache_clear
     from dashboard.data import active_tasks, merge_queue, orchestrator, tasks
 
