@@ -83,3 +83,40 @@ def test_render_ends_with_the_dual_export_block() -> None:
 def test_render_terminates_with_a_newline() -> None:
     """A committed text artifact ends with a newline; byte equality pins it."""
     assert gen_dashboard_task_vocab.render_task_vocab_js().endswith("\n")
+
+
+# ---------------------------------------------------------------------------
+# The parity guard: the committed artifact must be exactly what the generator
+# renders today. This is what catches a census.py edit landing without a
+# regeneration — the repo root's merge_verify_breadth: full runs it on every
+# merge regardless of which files a branch touched.
+# ---------------------------------------------------------------------------
+
+COMMITTED_TASK_VOCAB = REPO_ROOT / "dashboard/src/dashboard/static/redux/task_vocab.js"
+
+REGENERATE_COMMAND = (
+    "python3 scripts/gen_dashboard_task_vocab.py "
+    "--output dashboard/src/dashboard/static/redux/task_vocab.js"
+)
+
+
+def test_committed_task_vocab_exists() -> None:
+    """The artifact is committed, not generated at serve time."""
+    assert COMMITTED_TASK_VOCAB.is_file(), (
+        f"{COMMITTED_TASK_VOCAB} is missing. Generate it with:\n    {REGENERATE_COMMAND}"
+    )
+
+
+def test_generator_reproduces_the_committed_file_byte_for_byte(tmp_path) -> None:
+    """Drive the CLI and compare bytes — a replayed render would be a third spelling.
+
+    If this fails, census.py or task_statuses.py changed without the JS being
+    regenerated. Re-render with the command in the assertion message; do not
+    hand-edit the artifact.
+    """
+    rendered_path = tmp_path / "task_vocab.js"
+    assert gen_dashboard_task_vocab.main(["--output", str(rendered_path)]) == 0
+    assert rendered_path.read_bytes() == COMMITTED_TASK_VOCAB.read_bytes(), (
+        f"{COMMITTED_TASK_VOCAB} has drifted from the Python vocabulary that "
+        f"generates it. Regenerate with:\n    {REGENERATE_COMMAND}"
+    )
