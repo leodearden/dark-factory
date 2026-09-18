@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from verify_budget_census import parse_record_path
@@ -985,14 +986,36 @@ class TestLegsAreFilteredToTheResolvedWindow:
         assert within_window(legs, window) == ()
 
 
-def _load_record(cpu: float | None = 1.0, cpu60: float | None = None, runqueue: float = 0.5):
+# "Whatever the start instant reads" — a sentinel, because `None` is itself a
+# MEANINGFUL end reading here (a degraded component) and cannot double as the
+# default.
+_MIRROR_START: Any = object()
+
+
+def _load_record(
+    cpu: float | None = 1.0,
+    cpu60: float | None = None,
+    runqueue: float = 0.5,
+    end_cpu: float | None = _MIRROR_START,
+    end_cpu60: float | None = _MIRROR_START,
+):
+    """One `load` record as `verify._load_sample`/`_xdist_workers` emit it.
+
+    The end instant MIRRORS the start unless a case says otherwise, which is
+    the shape a stable host leaves behind.
+    """
+    end = cpu if end_cpu is _MIRROR_START else end_cpu
     return {
         'start': {
             'cpu_some10': cpu,
             'cpu_some60': cpu if cpu60 is None else cpu60,
             'runqueue_ratio': runqueue,
         },
-        'end': {'cpu_some10': cpu, 'cpu_some60': cpu, 'runqueue_ratio': runqueue},
+        'end': {
+            'cpu_some10': end,
+            'cpu_some60': end if end_cpu60 is _MIRROR_START else end_cpu60,
+            'runqueue_ratio': runqueue,
+        },
         'xdist': {'n_flag': None, 'auto_num_workers': None},
     }
 
@@ -1124,6 +1147,200 @@ def _idle_band_name():
     from verify_budget_census import PSI_BANDS  # noqa: PLC0415
 
     return PSI_BANDS[0].name
+
+
+def _heavy_band_name():
+    from verify_budget_census import band_for  # noqa: PLC0415
+
+    return band_for(75.0)
+
+
+class TestTheBandStatisticSpansTheRun:
+    """A leg is banded by the HIGHER of its two readings, not by the start alone.
+
+    The start sample is taken immediately BEFORE the command. For the population
+    being censused — full-suite runs with a p50 near 3000s — that 10-second
+    window describes the host during the QUEUE WAIT, not during the run. The end
+    sample is stamped precisely to cover the other end of the interval, so
+    banding that read nothing from it rested the report's central claim ("a
+    duration figure, banded by the load it ran under") on its weakest available
+    reading.
+    """
+
+    def _banded(self, tmp_path, *entries):
+        from verify_budget_census import (  # noqa: PLC0415
+            by_load_band,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, *entries)
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        ).legs
+        return by_load_band(legs)
+
+    def test_a_run_that_started_quiet_and_ended_busy_bands_busy(self, tmp_path):
+        """The case start-banding got wrong: an hour of contention filed as idle."""
+        bands = self._banded(
+            tmp_path,
+            _leg(duration_secs=4600.0, load=_load_record(cpu=1.0, end_cpu=75.0)),
+        )
+
+        assert bands[_idle_band_name()]['durations']['n'] == 0
+        assert bands[_heavy_band_name()]['durations']['max'] == 4600.0
+
+    def test_the_peak_counts_whichever_end_it_falls_on(self, tmp_path):
+        """A run that started busy and ended quiet is not a quiet run either."""
+        bands = self._banded(
+            tmp_path,
+            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=1.0)),
+        )
+
+        assert bands[_idle_band_name()]['durations']['n'] == 0
+        assert bands[_heavy_band_name()]['durations']['max'] == 4600.0
+
+    @pytest.mark.parametrize(
+        ('start', 'end'), [(75.0, None), (None, 75.0)], ids=['end-null', 'start-null'],
+    )
+    def test_one_knowable_reading_still_bands_the_leg(self, tmp_path, start, end):
+        """A half-degraded record carries a real reading; discarding it would be
+        the silent-fail-soft shape `unstamped` exists to avoid in reverse."""
+        bands = self._banded(
+            tmp_path,
+            _leg(duration_secs=4600.0, load=_load_record(cpu=start, end_cpu=end)),
+        )
+
+        assert bands['unstamped']['durations']['n'] == 0
+        assert bands[_heavy_band_name()]['durations']['max'] == 4600.0
+
+    def test_the_statistic_is_the_max_of_the_two_instants(self):
+        """Stated directly, since the whole report rests on this one choice.
+
+        The MAX, not the mean: a band says "measured under AT LEAST this much
+        contention", and a mean would let a run that started quiet and ended
+        saturated file as merely moderate.
+        """
+        from verify_budget_census import band_pressure  # noqa: PLC0415
+
+        assert band_pressure(_load_record(cpu=1.0, end_cpu=75.0)) == 75.0
+        assert band_pressure(_load_record(cpu=75.0, end_cpu=1.0)) == 75.0
+        assert band_pressure(_load_record(cpu=None, end_cpu=None)) is None
+        assert band_pressure(None) is None
+
+    def test_the_smoothed_window_is_not_folded_into_the_band(self):
+        """`cpu_some60` is a DIFFERENT averaging window, and the band edges were
+        argued for avg10 — mixing them would make the edges mean something
+        nobody stated. It is reported by `load_movement` instead."""
+        from verify_budget_census import band_pressure  # noqa: PLC0415
+
+        load = _load_record(cpu=1.0, cpu60=90.0, end_cpu=2.0, end_cpu60=95.0)
+
+        assert band_pressure(load) == 2.0
+
+
+class TestHostMovementIsReported:
+    """The end reading reaches a reader, not just the banding statistic.
+
+    A band alone cannot show that a run began idle and ended saturated, and that
+    movement is what tells an operator whether a duration is a statement about
+    the suite or about the fleet's occupancy while it ran.
+    """
+
+    def _movement(self, tmp_path, *entries):
+        from verify_budget_census import (  # noqa: PLC0415
+            load_movement,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(tmp_path, *entries)
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        ).legs
+        return load_movement(legs)
+
+    def test_a_rise_across_bands_is_counted_as_a_rise(self, tmp_path):
+        movement = self._movement(
+            tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=75.0)),
+        )
+
+        assert movement['rose'] == 1
+        assert movement['held'] == movement['fell'] == 0
+
+    def test_a_fall_across_bands_is_counted_as_a_fall(self, tmp_path):
+        movement = self._movement(
+            tmp_path, _leg(load=_load_record(cpu=75.0, end_cpu=1.0)),
+        )
+
+        assert movement['fell'] == 1
+        assert movement['held'] == movement['rose'] == 0
+
+    def test_a_move_inside_one_band_is_held(self, tmp_path):
+        """Counted in BANDS, because a 3-point rise inside one band is not a fact
+        anyone would act on."""
+        movement = self._movement(
+            tmp_path, _leg(load=_load_record(cpu=60.0, end_cpu=63.0)),
+        )
+
+        assert movement['held'] == 1
+        assert movement['rose'] == movement['fell'] == 0
+
+    def test_a_half_degraded_record_is_not_knowable_yet_still_banded(self, tmp_path):
+        """The two counts differ DELIBERATELY: a movement needs both instants, a
+        band needs only one. Asserted together so neither drifts into the other."""
+        from verify_budget_census import (  # noqa: PLC0415
+            by_load_band,
+            load_movement,
+            load_records,
+            select_full_suite_legs,
+        )
+
+        _corpus_with(
+            tmp_path,
+            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=None)),
+        )
+        legs = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        ).legs
+
+        assert load_movement(legs)['not_knowable'] == 1
+        assert by_load_band(legs)['unstamped']['durations']['n'] == 0
+
+    def test_the_smoothed_end_of_run_reading_is_surfaced(self, tmp_path):
+        """`cpu_some60` at the END is the one reading describing an INTERVAL of
+        the run itself rather than an instant before or after it."""
+        movement = self._movement(
+            tmp_path,
+            _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=40.0)),
+            _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=60.0)),
+        )
+
+        assert movement['end_cpu_some60']['n'] == 2
+        assert movement['end_cpu_some60']['max'] == 60.0
+
+    def test_a_degraded_smoothed_reading_is_absent_not_zero(self, tmp_path):
+        movement = self._movement(
+            tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=None)),
+        )
+
+        assert movement['end_cpu_some60'] == {
+            'n': 0, 'p50': None, 'p90': None, 'max': None,
+        }
+
+    def test_it_rides_in_the_report_and_prints(self, tmp_path, capsys):
+        _corpus_with(tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=75.0)))
+
+        _rc, out, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
+        )
+        assert json.loads(out)['load_movement']['rose'] == 1
+
+        _rc, text, _err = _main(
+            capsys, '--root', str(tmp_path), '--module', 'orchestrator',
+        )
+        assert 'HOST MOVEMENT DURING THE RUN' in text
+        assert 'rose 1' in text
 
 
 class TestColdSeparabilityIsReportedNotInferred:

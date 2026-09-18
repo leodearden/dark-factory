@@ -803,8 +803,8 @@ def band_for(cpu_some10: float) -> str:
     return PSI_BANDS[-1].name
 
 
-def _start_pressure(load: dict | None) -> float | None:
-    """The host CPU pressure a leg STARTED under, or ``None`` if not knowable.
+def _instant_pressure(load: dict | None, instant: str) -> float | None:
+    """The host CPU ``some avg10`` at *instant* (``'start'``/``'end'``), or ``None``.
 
     ``None`` covers an absent record, a malformed one, and a null reading
     inside a present one — the last being ``_load_sample``'s own
@@ -813,15 +813,56 @@ def _start_pressure(load: dict | None) -> float | None:
     """
     if not isinstance(load, dict):
         return None
-    start = load.get('start')
-    if not isinstance(start, dict):
+    sample = load.get(instant)
+    if not isinstance(sample, dict):
         return None
-    value = start.get('cpu_some10')
+    value = sample.get('cpu_some10')
     return float(value) if _is_real_number(value) else None
+
+
+def band_pressure(load: dict | None) -> float | None:
+    """The pressure a leg is BANDED by: the higher of its start and end readings.
+
+    THE CHOICE, stated here the way the band edges state theirs, because it is
+    the weakest link in "a duration figure, banded by the load it ran under".
+    Every reading available is a 10-second kernel moving average at ONE instant,
+    while the population being censused runs for THOUSANDS of seconds — so no
+    statistic here is an interval average, and the honest question is only which
+    instants get a vote.
+
+    ``start`` alone was the first implementation and is the wrong answer: sampled
+    immediately BEFORE the command, it describes the host during the QUEUE WAIT,
+    not during the run. The ``end`` sample is stamped precisely to cover the
+    other end of the interval, and reading nothing from it left the report's
+    central claim resting on its weakest available evidence.
+
+    The MAX, not the mean of the two: a band is being used to say "this duration
+    was measured under at least this much contention", so the peak of the
+    observed instants is the reading that cannot understate it, and a mean would
+    let a run that started quiet and ended saturated file as merely moderate.
+
+    ``cpu_some60`` is deliberately NOT folded in. It is a different averaging
+    window, and ``PSI_BANDS``' edges were argued for avg10 — mixing windows into
+    one statistic would make the band edges mean something nobody stated. It
+    stays in the record, and ``load_movement`` below surfaces it.
+
+    ``None`` only when NEITHER instant is knowable: a half-degraded record still
+    carries one real reading, and discarding it would be the silent-fail-soft
+    shape ``UNSTAMPED`` exists to avoid in the other direction.
+    """
+    readings = [
+        p
+        for p in (_instant_pressure(load, 'start'), _instant_pressure(load, 'end'))
+        if p is not None
+    ]
+    return max(readings) if readings else None
 
 
 def by_load_band(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
     """Summarise *legs* per load band, with ``unstamped`` as its own row.
+
+    Banded by ``band_pressure`` — the higher of the start and end readings, for
+    the reasons stated there, NOT by the start sample alone.
 
     Every band is present even when empty, so a reader can see that a band was
     measured and found empty rather than guessing whether it was reported at
@@ -830,10 +871,48 @@ def by_load_band(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
     buckets: dict[str, list[Leg]] = {band.name: [] for band in PSI_BANDS}
     buckets[UNSTAMPED] = []
     for leg in legs:
-        pressure = _start_pressure(leg.load)
+        pressure = band_pressure(leg.load)
         key = UNSTAMPED if pressure is None else band_for(pressure)
         buckets[key].append(leg)
     return {name: summarise_legs(group) for name, group in buckets.items()}
+
+
+def load_movement(legs: Iterable[Leg]) -> dict[str, Any]:
+    """How far the host moved DURING each run, in the report's own band terms.
+
+    Surfaces the ``end`` sample, which otherwise reaches no reader: a band alone
+    cannot show that a run began idle and ended saturated, and that movement is
+    what tells an operator whether a duration is a statement about the suite or
+    about the fleet's occupancy while it ran.
+
+    Counted in BANDS rather than as a raw delta because the bands are the unit
+    the rest of the report is read in, and a 3-point rise inside one band is not
+    a fact anyone would act on.
+
+    ``not_knowable`` here is NOT ``by_load_band``'s ``unstamped`` and the two
+    counts legitimately differ: a movement needs BOTH instants, while a band
+    needs only one. ``end_cpu_some60`` rides along as the one smoothed reading
+    that describes the run's own final minute rather than an instant — reported,
+    never folded into the band statistic (see ``band_pressure``).
+    """
+    counts = {'rose': 0, 'held': 0, 'fell': 0, 'not_knowable': 0}
+    smoothed: list[float] = []
+    for leg in legs:
+        start = _instant_pressure(leg.load, 'start')
+        end = _instant_pressure(leg.load, 'end')
+        if start is None or end is None:
+            counts['not_knowable'] += 1
+        elif band_for(end) == band_for(start):
+            counts['held'] += 1
+        elif end > start:
+            counts['rose'] += 1
+        else:
+            counts['fell'] += 1
+        if isinstance(leg.load, dict) and isinstance(leg.load.get('end'), dict):
+            value = leg.load['end'].get('cpu_some60')
+            if _is_real_number(value):
+                smoothed.append(float(value))
+    return {**counts, 'end_cpu_some60': _series(smoothed)}
 
 
 def cold_separability(legs: Iterable[Leg]) -> dict[str, Any]:
@@ -1012,6 +1091,7 @@ def build_report(
         'overall': summarise_legs(legs),
         'by_day': by_day(legs),
         'by_load_band': by_load_band(legs),
+        'load_movement': load_movement(legs),
         'cold_separability': cold_separability(legs),
         'merge_gate': merge_gate_budget(roots[0]),
         'budget_check': budget_check(summarise_legs(legs)),
@@ -1064,7 +1144,11 @@ def format_report(report: dict[str, Any]) -> str:
             'are "not measured", NOT a fast suite.',
         )
 
-    lines += ['', 'BY LOAD BAND (host cpu some avg10 at command START)']
+    lines += [
+        '',
+        'BY LOAD BAND (host cpu some avg10 — the HIGHER of the start and end '
+        'samples)',
+    ]
     for band in PSI_BANDS:
         lines.append(_format_row(band.name, report['by_load_band'][band.name]))
     lines.append(_format_row(UNSTAMPED, report['by_load_band'][UNSTAMPED]))
@@ -1072,6 +1156,17 @@ def format_report(report: dict[str, Any]) -> str:
         '  NOTE: unstamped = load not knowable (record predates the stamp, or '
         'the PSI read degraded). NOT an idle host.',
     )
+
+    move = report['load_movement']
+    lines += [
+        '',
+        'HOST MOVEMENT DURING THE RUN (band at the end sample vs. at the start)',
+        f"  rose {move['rose']}  held {move['held']}  fell {move['fell']}  "
+        f"not knowable {move['not_knowable']}",
+        f"  end-of-run cpu some avg60   {_format_series(move['end_cpu_some60'])}",
+        '  NOTE: every reading is a 10s (or 60s) average at ONE instant, not an '
+        'average over the run.',
+    ]
 
     if report['by_day']:
         lines += ['', 'BY DAY (UTC)']
