@@ -20,6 +20,7 @@ multipliers — see the module docstring for why neither is a ratio anyone chose
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -98,8 +99,13 @@ def _enough(anchor: datetime, gap: timedelta = timedelta(hours=6)) -> list[timed
 
 @pytest.fixture
 def anchor() -> datetime:
-    """A recent instant, comfortably inside the sampler's trailing window."""
-    return datetime.now(UTC) - timedelta(days=30)
+    """A recent instant, comfortably inside the sampler's trailing window.
+
+    Ten days rather than thirty: the trailing window is now this module's own
+    narrower one (see ``swb.SAMPLE_WINDOW_DAYS``), and a corpus anchored at its
+    exact edge would be sampled or not depending on microseconds.
+    """
+    return datetime.now(UTC) - timedelta(days=10)
 
 
 # ---------------------------------------------------------------------------
@@ -251,19 +257,87 @@ def test_sampler_opens_the_db_read_only(tmp_path, anchor):
     assert not (tmp_path / 'runs.db-wal').exists()
 
 
-def test_the_runs_db_locator_is_shared_with_resume_age_bound():
-    """ONE runs.db locator and ONE trailing window for every derived-bound
-    guard in this submodel.
+def test_the_sampler_excludes_the_outcomes_the_streak_carves_out(
+    tmp_path, anchor,
+):
+    """A row the CLASSIFIER ignores must not shorten a measured gap.
 
-    Two locators would be two answers to "which database is the fleet?", and
-    two trailing windows would let the two bounds be derived from corpora that
-    do not overlap while both claiming to describe the same fleet.
+    ``harness._BY_DESIGN_RESTORE_OUTCOMES`` never increments a streak, so
+    sampling those rows would measure a population the bound is not about. The
+    error is one-sided and easy to mistake for caution: a superset chains
+    LONGER runs (stricter on the no-false-alarm side) but yields a SMALLER
+    minimum gap, which makes the not-inert necessary condition easier to
+    satisfy — anti-conservative exactly where the derivation leans on it.
+
+    A cli-stage rejection carries no ``restore`` at all and IS a feeder, so an
+    absent key must be KEPT; that is the arm the coalesce in the SELECT exists
+    for, and dropping it would sample nothing at all on today's live corpus.
+    """
+    from orchestrator.harness import (  # noqa: PLC0415
+        _BY_DESIGN_RESTORE_OUTCOMES,
+    )
+
+    feeders = _spaced(anchor, _enough(anchor))
+    rows: list[dict] = _failures(feeders)
+    # One carved-out row wedged a minute after each feeder: were it sampled,
+    # the minimum gap would collapse from six hours to one minute.
+    for outcome in sorted(_BY_DESIGN_RESTORE_OUTCOMES):
+        rows += [
+            {'timestamp': (when + timedelta(minutes=1)).isoformat(),
+             'event_type': 'session_resume_failed',
+             'data': {'stage': 'pre_flight', 'restore': outcome}}
+            for when in feeders
+        ]
+    # ...and a genuine pre_flight fault, which DOES feed and is kept.
+    genuine = feeders[-1] + timedelta(hours=6)
+    rows.append({'timestamp': genuine.isoformat(),
+                 'event_type': 'session_resume_failed',
+                 'data': {'stage': 'pre_flight', 'restore': 'fault'}})
+
+    sample = swb.observed_storm_window_inputs(_make_db(tmp_path / 'c.db', rows))
+    assert sample is not None
+    assert sample.gap_rows == swb.MIN_GAP_ROWS + 1
+    assert sample.min_gap_secs == timedelta(hours=6).total_seconds()
+
+
+def test_the_runs_db_locator_is_shared_with_resume_age_bound():
+    """ONE runs.db locator and ONE timestamp parser for every derived-bound
+    guard in this submodel — but not necessarily one slice width.
+
+    Two locators would be two answers to "which database is the fleet?" and
+    two parsers two answers to "what does a timestamp mean", so those are
+    imported, never redeclared.
+
+    The TRAILING WINDOW is deliberately this module's own and NARROWER, because
+    a genuine storm contaminates this bound's null corpus and would otherwise
+    hold the whole fleet's verify red for a quarter. The original rationale for
+    sharing it — that two bounds must not be derived from corpora that do not
+    overlap while both claiming to describe one fleet — is preserved by
+    NESTING: a strictly narrower window is a subset of the wider one by
+    construction, so the corpora always overlap.
     """
     from orchestrator import resume_age_bound as rab  # noqa: PLC0415
 
     assert swb.default_runs_db_path is rab.default_runs_db_path
-    assert swb.SAMPLE_WINDOW_DAYS is rab.SAMPLE_WINDOW_DAYS
     assert swb.parsed_utc is rab.parsed_utc
+    assert 0 < swb.SAMPLE_WINDOW_DAYS < rab.SAMPLE_WINDOW_DAYS
+
+
+def test_the_trailing_window_is_wide_enough_to_stay_measurable():
+    """...and narrowing it must not quietly make the live guard decorative.
+
+    Below ``MIN_GAP_ROWS + 1`` arrivals the sampler returns None and the guard
+    SKIPS, which is correct behaviour and useless signal. The floor is not a
+    chosen ratio: it is the sampler's own minimum divided by the measured
+    arrival rate, so this row goes red if either end of that derivation moves.
+    """
+    needed_days = (swb.MIN_GAP_ROWS + 1) / swb.MEASURED_ARRIVALS_PER_DAY
+    assert needed_days <= swb.SAMPLE_WINDOW_DAYS, (
+        f'a {swb.SAMPLE_WINDOW_DAYS}-day trailing window holds fewer than '
+        f'{swb.MIN_GAP_ROWS + 1} arrivals at the measured '
+        f'{swb.MEASURED_ARRIVALS_PER_DAY:.2f}/day, so the live guard would '
+        'skip rather than measure'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,24 +400,70 @@ def test_the_no_false_alarm_side_can_fail(tmp_path, anchor):
     assert swb.longest_chained_run(sample.gaps_secs, narrow) < threshold
 
 
+def test_the_recorded_table_is_what_the_function_says():
+    """Every recorded number is RE-DERIVED from the recorded series.
+
+    The provenance constants used to claim this and not do it: the table was
+    only ever indexed, never regenerated, so four of its five entries — and
+    the floor, and the ceiling — were unverifiable prose wearing a dict. What
+    made the check impossible was that the gap SERIES itself lived in a
+    comment; recording it as ``MEASURED_GAPS_SECS`` is what turns every other
+    constant into a function of something checkable.
+
+    It bites: the recorded ceiling was 190_806.542, rounded UP off the gap it
+    is derived from, and at that window the null already chains 7 — so the
+    "open upper end" was on the wrong side of itself. This row is what catches
+    that class of copy error.
+    """
+    gaps = swb.MEASURED_GAPS_SECS
+    assert len(gaps) == swb.MEASURED_ROWS - 1, (
+        'N arrivals produce exactly N-1 inter-arrivals'
+    )
+    assert min(gaps) == swb.MEASURED_MIN_GAP_SECS
+
+    rederived = {
+        window: swb.longest_chained_run(gaps, window)
+        for window in swb.MEASURED_LONGEST_RUN_BY_WINDOW
+    }
+    assert rederived == swb.MEASURED_LONGEST_RUN_BY_WINDOW
+
+    # The ceiling is the exact boundary, pinned from BOTH sides: at it the null
+    # stays under the threshold, and one float above it does not.
+    threshold = SessionResumeConfig().fallback_storm_threshold
+    ceiling = swb.MEASURED_RUN_REACHES_FIVE_ABOVE_SECS
+    assert swb.longest_chained_run(gaps, ceiling) < threshold
+    assert swb.longest_chained_run(
+        gaps, math.nextafter(ceiling, math.inf)
+    ) >= threshold
+
+
 def test_the_shipped_pair_sits_inside_the_recorded_admissible_interval():
     """The provenance constants and the shipped defaults agree.
 
-    ``MEASURED_*`` record the 2026-09-16 derivation as CODE rather than prose,
-    so a re-derivation updates one place and this row re-checks the conclusion
-    the config comment states. Arithmetic over module constants, host-free:
-    the LIVE guard below is what re-measures.
+    ``MEASURED_*`` record the derivation as CODE rather than prose, so a
+    re-derivation updates one place and this row re-checks the conclusion the
+    config comment states. Arithmetic over module constants, host-free: the
+    LIVE guard below is what re-measures.
     """
     config = SessionResumeConfig()
     floor, ceiling = (
         swb.MEASURED_MIN_GAP_SECS, swb.MEASURED_RUN_REACHES_FIVE_ABOVE_SECS,
     )
     assert floor <= config.storm_window_secs < ceiling
-    # ...and the recorded run-by-window table agrees with the pure function at
-    # the shipped window, so the table cannot drift from the code that made it.
-    assert swb.MEASURED_LONGEST_RUN_BY_WINDOW[config.storm_window_secs] < (
-        config.fallback_storm_threshold
+    # ...and the recorded run-by-window table agrees at the shipped window.
+    # Read with .get and an explicit message: retuning storm_window_secs to a
+    # value the table does not cover is a real and expected edit, and it should
+    # say which constant to extend rather than raise a bare KeyError.
+    recorded_run = swb.MEASURED_LONGEST_RUN_BY_WINDOW.get(
+        config.storm_window_secs
     )
+    assert recorded_run is not None, (
+        f'session_resume.storm_window_secs is {config.storm_window_secs}s, '
+        'which storm_window_bound.MEASURED_LONGEST_RUN_BY_WINDOW does not '
+        'record a null run for. Re-derive the table at the new window and '
+        'add the entry in the same commit as the retune.'
+    )
+    assert recorded_run < config.fallback_storm_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +494,12 @@ def test_storm_window_is_derived_from_live_runs_db():
     magic number wearing a formula"). Re-measured every run, so a fleet whose
     failures start arriving in tighter bursts trips this test instead of
     quietly filing a false storm.
+
+    NOTHING EXCLUDES A GENUINE INCIDENT from the null corpus, so a real
+    session-resume storm reddens this row for every task until it ages out of
+    the trailing window. That is why the window is this module's own narrower
+    one, and why the no-false-alarm message below names both causes and the
+    action for each rather than asserting a mis-tuned default.
     """
     db = swb.default_runs_db_path()
     if not db.is_file():
@@ -404,15 +530,22 @@ def test_storm_window_is_derived_from_live_runs_db():
     window = config.storm_window_secs
     threshold = config.fallback_storm_threshold
     longest = swb.longest_chained_run(sample.gaps_secs, window)
+    tightest = ', '.join(
+        f'{gap / 3600:.2f}h' for gap in sorted(sample.gaps_secs)[:5]
+    )
     recipe = (
         f'  runs.db .......... {db}\n'
         f'  sample ........... {sample.gap_rows} session_resume_failed '
-        f'inter-arrivals over {sample.span_days:.1f} days\n'
+        f'inter-arrivals over {sample.span_days:.1f} days, trailing '
+        f'{swb.SAMPLE_WINDOW_DAYS} days\n'
         f'  min inter-arrival  {sample.min_gap_secs:.0f}s '
         f'({sample.min_gap_secs / 3600:.2f}h)\n'
+        f'  tightest 5 gaps .. {tightest}\n'
         f'  shipped window ... {window}s ({window / 3600:.2f}h)\n'
         f'  shipped threshold  {threshold}\n'
         f'  longest null run . {longest} at the shipped window\n'
+        f'  recorded floor ... {swb.MEASURED_MIN_GAP_SECS:.0f}s from '
+        f'{swb.MEASUREMENT_DATE} ({swb.MEASURED_ROWS} rows)\n'
         'Provenance for the numbers the defaults were derived from is in the '
         'MEASURED_* constants of '
         'orchestrator/src/orchestrator/storm_window_bound.py — re-measure '
@@ -428,8 +561,56 @@ def test_storm_window_is_derived_from_live_runs_db():
         'green, and measuring nothing.\n' + recipe
     )
     assert longest < threshold, (
-        'at the shipped window the fleet\'s ORDINARY failure arrivals already '
-        'chain a run as long as fallback_storm_threshold, so the storm L1 '
-        'would page an operator for the background rate rather than for a '
-        'systematic failure.\n' + recipe
+        'at the shipped window the SAMPLED failure arrivals already chain a '
+        'run as long as fallback_storm_threshold. TWO causes, and they need '
+        'opposite actions:\n'
+        '  (1) A GENUINE SESSION-RESUME STORM inside the sampled trailing '
+        f'{swb.SAMPLE_WINDOW_DAYS} days — i.e. exactly the event INV-4\'s L1 '
+        'exists to page for. Nothing excludes an incident from this NULL '
+        'corpus, so a real one reddens this row for every task until it ages '
+        'out. ACTION: look for an open session-resume storm L1 (sentinel '
+        'harness.py::_SESSION_RESUME_STORM_SENTINEL) and fix the '
+        'archive-restore cause it names; this row goes green on its own once '
+        'the incident leaves the window. It is NOT a reason to widen the '
+        'threshold or narrow the window — that would disable the alarm '
+        'because it fired.\n'
+        '  (2) A MIS-TUNED DEFAULT — the fleet\'s ORDINARY background rate '
+        'now chains that far, so the L1 would page for the background rather '
+        'than for a systematic failure. ACTION: re-derive the pair and update '
+        'SessionResumeConfig plus the MEASURED_* constants in one commit.\n'
+        'Tell them apart from the gap series below: an incident is a tight '
+        'cluster inside an otherwise sparse series, a mis-tuned default is a '
+        'uniformly tighter one.\n' + recipe
+    )
+
+    # PROVENANCE, re-checked by the same run that re-derives the bound. The
+    # MEASURED_* constants are a DATED RECORD of one derivation, not a live
+    # mirror, so "recorded == measured" is the wrong check: a trailing window
+    # moves the recorded floor every time a row ages in or out (it halved
+    # between two derivations two days apart), and a tolerance band on that
+    # would redden every task's verify for no defect, no incident and no
+    # mis-tuned default — the failure mode the message above exists to avoid.
+    #
+    # What must never drift is the VERDICT the record is CONSUMED for:
+    # test_the_shipped_pair_sits_inside_the_recorded_admissible_interval
+    # validates the shipped window against the RECORDED interval, so the record
+    # and the live fleet have to agree about whether that window clears the
+    # not-inert floor. When they disagree, the record is what is wrong — the
+    # live measurement is re-taken above.
+    #
+    # REACHABLE, and it is the case the host-free row CANNOT diagnose. The
+    # not-inert assert above already fires when the LIVE floor exceeds the
+    # window, so the only state left for this one is: live clears, recorded does
+    # not. That is a stale record — and it is what the host-free row would
+    # report as a mis-tuned default, because with no runs.db it cannot tell the
+    # two apart. This row can, and says so.
+    assert (sample.min_gap_secs <= window) == (
+        window >= swb.MEASURED_MIN_GAP_SECS
+    ), (
+        'the RECORDED derivation and the LIVE fleet now disagree about '
+        'whether session_resume.storm_window_secs clears the not-inert floor, '
+        'so the MEASURED_* provenance constants have gone stale exactly the '
+        'way the 3600s config comment they replaced did. RE-DERIVE THEM AND '
+        'UPDATE THEM IN THIS COMMIT (the sampler in storm_window_bound.py is '
+        'what produced them).\n' + recipe
     )

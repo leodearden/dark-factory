@@ -4232,9 +4232,9 @@ class TestSessionResumeStorm:
         The other storm rows all pick a small window and drive it, which proves
         the mechanism but says nothing about whether the SHIPPED number can
         ever fire. At the pre-ε 3600 s it could not: the smallest interval
-        between two eligible-but-FAILED resumes the fleet has ever produced is
-        5.82 h, so no two of them chained at ANY threshold and INV-4's escape
-        was green and unfireable.
+        between two eligible-but-FAILED resumes the fleet has produced is
+        hours, not minutes, so no two of them chained at ANY threshold and
+        INV-4's escape was green and unfireable.
 
         The spacing is read from ``storm_window_bound.MEASURED_MIN_GAP_SECS``
         rather than re-typed here, so this row and the derivation cannot drift
