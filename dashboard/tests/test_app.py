@@ -69,7 +69,7 @@ def test_health_endpoint(client):
 def test_orchestrators_returns_orchestrators_and_projects(client):
     """Even with no running orchestrators the response carries both keys."""
     with patch(
-        'dashboard.app.discover_orchestrators',
+        'dashboard.api.orchestrators.discover_orchestrators',
         new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/orchestrators')
