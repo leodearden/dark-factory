@@ -32,7 +32,10 @@ This module reads no clock and performs no I/O.
 from __future__ import annotations
 
 import enum
+from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -83,3 +86,57 @@ TONES: MappingProxyType[TaskStatus, str] = MappingProxyType(
         TaskStatus.CANCELLED: 'fg3',
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCensus:
+    """How many tasks sit in each status, and in each named view of them.
+
+    Attributes:
+        counts: Every ``TaskStatus`` member, always all nine keys — a status
+            nobody is in is present at zero rather than absent, so no consumer
+            has to distinguish "none" from "not reported".
+        total: ``sum(counts.values())``.
+        views: The three-view partition; sums to ``total``.
+        sub_views: The narrowing views, currently ``running`` alone. Kept
+            apart from ``views`` so the partition's sum stays honest.
+    """
+
+    counts: Mapping[TaskStatus, int]
+    total: int
+    views: Mapping[TaskView, int]
+    sub_views: Mapping[TaskView, int]
+
+
+def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
+    """Tally *status_map* into a :class:`TaskCensus`.
+
+    Pure: reads no clock, performs no I/O, and mutates nothing it was handed.
+
+    Args:
+        status_map: ``{task id: status value}``, the shape
+            ``tasks.py::fetch_statuses`` returns. Ids are carried only so an
+            off-vocabulary value can name the row that held it, so the key
+            type is deliberately unconstrained. It is spelled ``Any`` rather
+            than ``object`` because ``Mapping``'s key parameter is INVARIANT:
+            ``Mapping[object, str]`` would reject the very ``dict[int, str]``
+            this docstring describes.
+
+    Returns:
+        A census whose ``counts`` carry all nine members, seeded at zero.
+    """
+    counts = dict.fromkeys(TaskStatus, 0)
+    for status in status_map.values():
+        counts[TaskStatus(status)] += 1
+
+    def tally(members: frozenset[TaskStatus]) -> int:
+        return sum(counts[member] for member in members)
+
+    return TaskCensus(
+        counts=MappingProxyType(counts),
+        total=sum(counts.values()),
+        views=MappingProxyType({view: tally(members) for view, members in VIEWS.items()}),
+        sub_views=MappingProxyType(
+            {view: tally(members) for view, members in SUB_VIEWS.items()}
+        ),
+    )
