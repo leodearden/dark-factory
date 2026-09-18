@@ -2891,6 +2891,107 @@ class TestBuildBatchUserPrompt:
 
 
 # ----------------------------------------------------------------------
+# The pool-truncation fact reaches the prompt
+# ----------------------------------------------------------------------
+
+
+class TestPromptCarriesPoolTruncation:
+    """A truncated pool must SAY it is truncated, in the prompt itself."""
+
+    def _census(self) -> PoolWithheld:
+        return PoolWithheld(
+            by_source={'module': 5, 'embedding': 20, 'dependency': 3, 'total_cap': 0},
+            caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
+        )
+
+    def _guidance_present(self, rendered: str) -> bool:
+        return 'not proof' in rendered.lower()
+
+    def test_single_prompt_carries_the_fact_and_the_guidance(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_user_prompt(
+            CandidateTask(title='T'), pool, withheld=self._census(),
+        )
+        assert 'pool_truncated:' in rendered
+        assert self._guidance_present(rendered)
+
+    def test_batch_section_carries_the_fact_and_the_guidance(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_batch_section(
+            CandidateTask(title='T'), pool, 0, withheld=self._census(),
+        )
+        assert 'pool_truncated:' in rendered
+        assert self._guidance_present(rendered)
+
+    def test_fact_follows_the_pool_block(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        rendered = curator._build_user_prompt(
+            CandidateTask(title='T'), pool, withheld=self._census(),
+        )
+        assert rendered.index('# Pool (') < rendered.index('pool_truncated:')
+
+    def test_omitted_when_the_census_is_empty(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        for rendered in (
+            curator._build_user_prompt(
+                CandidateTask(title='T'), pool, withheld=PoolWithheld(),
+            ),
+            curator._build_batch_section(
+                CandidateTask(title='T'), pool, 0, withheld=PoolWithheld(),
+            ),
+        ):
+            assert 'pool_truncated' not in rendered
+
+    def test_omitted_when_the_census_is_not_passed_at_all(self):
+        """The parameter is keyword-only with a default — positional callers
+        are unaffected and quiet calls stay quiet."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        pool = _pool_with_ids(('10', 'pending'))
+        for rendered in (
+            curator._build_user_prompt(CandidateTask(title='T'), pool),
+            curator._build_batch_section(CandidateTask(title='T'), pool, 0),
+        ):
+            assert 'pool_truncated' not in rendered
+
+    def test_batch_prompt_places_each_fact_in_its_own_section(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        only_second = PoolWithheld(
+            by_source={'module': 7}, caps={'module': 15},
+        )
+        rendered = curator._build_batch_user_prompt(
+            candidates, pools, withheld_list=[PoolWithheld(), only_second],
+        )
+
+        # Exactly one fact, and it sits inside candidate 1's section — not
+        # emitted once for the whole batch.
+        assert rendered.count('pool_truncated:') == 1
+        assert rendered.index('# Candidate batch_index=1') < rendered.index('pool_truncated:')
+
+    def test_batch_prompt_tolerates_an_absent_withheld_list(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        assert 'pool_truncated' not in curator._build_batch_user_prompt(candidates, pools)
+
+    def test_batch_prompt_tolerates_a_short_withheld_list(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
+        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+        rendered = curator._build_batch_user_prompt(
+            candidates, pools, withheld_list=[self._census()],
+        )
+        assert rendered.count('pool_truncated:') == 1
+        assert rendered.index('# Candidate batch_index=0') < rendered.index('pool_truncated:')
+        assert rendered.index('pool_truncated:') < rendered.index('# Candidate batch_index=1')
+
+
+# ----------------------------------------------------------------------
 # Truncation symmetry between the pool side and the candidate side
 # ----------------------------------------------------------------------
 
