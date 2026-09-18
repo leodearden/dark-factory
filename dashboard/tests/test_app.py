@@ -85,7 +85,7 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], [], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -106,7 +106,7 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
 def test_tasks_endpoint_includes_done_counts(client):
     """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -118,7 +118,7 @@ def test_tasks_endpoint_includes_done_counts(client):
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -146,7 +146,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     }
     mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
 
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
@@ -187,7 +187,7 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
 
     mock = AsyncMock(return_value=([], [], {}, [], []))
 
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
@@ -247,8 +247,8 @@ def _tasks_body(
             list(degraded_projects), list(count_unknown_projects),
         )
     )
-    with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
-        'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector), patch(
+        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(total_roots)
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200

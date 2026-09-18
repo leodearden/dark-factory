@@ -51,6 +51,7 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
         '_cost_dbs',
         '_burndown_dbs',
     ),
+    'dashboard.api.tasks': ('api_tasks',),
     'dashboard.loops': (
         '_SAMPLE_INTERVAL_SECONDS',
         '_DOWNSAMPLE_INTERVAL_SECONDS',
@@ -64,13 +65,16 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
 }
 
 # URL path -> (module dotted path, handler name) for every extracted route.
-MOVED_ROUTES: dict[str, tuple[str, str]] = {}
+MOVED_ROUTES: dict[str, tuple[str, str]] = {
+    '/api/v2/dashboard/tasks': ('dashboard.api.tasks', 'api_tasks'),
+}
 
 # Repo-relative path of every file this extraction created.
 NEW_MODULES: tuple[str, ...] = (
     'dashboard/src/dashboard/api/window.py',
     'dashboard/src/dashboard/project_dbs.py',
     'dashboard/src/dashboard/loops.py',
+    'dashboard/src/dashboard/api/tasks.py',
 )
 
 _REACH_BACK = 'dashboard.app'
