@@ -2524,6 +2524,114 @@ class TestBuildBatchUserPrompt:
 
 
 # ----------------------------------------------------------------------
+# Truncation symmetry between the pool side and the candidate side
+# ----------------------------------------------------------------------
+
+
+class TestPromptClipSymmetry:
+    """The same over-cap text renders identically wherever it appears.
+
+    The pool side marked its truncation with a bare ellipsis; the candidate
+    side clipped SILENTLY. A reader of the prompt (the curator LLM) therefore
+    could not tell a candidate that genuinely had a two-line description from
+    one whose description had been cut off mid-sentence.
+    """
+
+    def _caps(self, config) -> tuple[int, int]:
+        return (
+            config.curator.entry_description_chars,
+            config.curator.entry_details_chars,
+        )
+
+    def _over_cap_texts(self, config) -> tuple[str, str]:
+        desc_cap, details_cap = self._caps(config)
+        return ('D' * (desc_cap + 777), 'X' * (details_cap + 313))
+
+    def _entry_with(self, description: str, details: str) -> _PoolEntry:
+        return _PoolEntry(
+            task_id='pool-1',
+            title='pool entry',
+            description=description,
+            details=details,
+            files_to_modify=[],
+            module_keys=[],
+            status='pending',
+            priority='medium',
+            source='module',
+            combine_eligible=True,
+        )
+
+    def test_same_text_renders_identically_on_both_sides(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+
+        expected_desc = clip_for_prompt(desc, desc_cap)
+        expected_details = clip_for_prompt(details, details_cap)
+
+        pool_rendered = self._entry_with(desc, details).render(desc_cap, details_cap)
+        single = curator._build_user_prompt(candidate, [])
+        section = curator._build_batch_section(candidate, [], 0)
+
+        for rendered in (pool_rendered, single, section):
+            assert expected_desc in rendered
+            assert expected_details in rendered
+
+    def test_candidate_block_is_no_longer_silent(self):
+        """Direct regression: the candidate side emitted a bare `[:cap]` slice."""
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+
+        for rendered in (
+            curator._build_user_prompt(candidate, []),
+            curator._build_batch_section(candidate, [], 0),
+        ):
+            # The clipped text is present but is NOT the whole story, and the
+            # prompt says so — with the exact number of characters withheld.
+            assert f'  description: {desc[:desc_cap]}\n' not in rendered
+            assert f'  details: {details[:details_cap]}\n' not in rendered
+            assert str(len(desc) - desc_cap) in rendered
+            assert str(len(details) - details_cap) in rendered
+
+    def test_elided_counts_agree_across_all_three_renderings(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        desc, details = self._over_cap_texts(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description=desc, details=details)
+        pool = [self._entry_with(desc, details)]
+
+        marker_desc = clip_for_prompt(desc, desc_cap)[desc_cap:]
+        marker_details = clip_for_prompt(details, details_cap)[details_cap:]
+
+        single = curator._build_user_prompt(candidate, pool)
+        section = curator._build_batch_section(candidate, pool, 0)
+        for rendered in (single, section):
+            # Once for the candidate block, once for the single pool entry.
+            assert rendered.count(marker_desc) == 2
+            assert rendered.count(marker_details) == 2
+
+    def test_under_cap_text_is_never_marked(self):
+        config = _make_config()
+        desc_cap, details_cap = self._caps(config)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title='C', description='short', details='also short')
+        pool = [self._entry_with('short', 'also short')]
+
+        for rendered in (
+            curator._build_user_prompt(candidate, pool),
+            curator._build_batch_section(candidate, pool, 0),
+            pool[0].render(desc_cap, details_cap),
+        ):
+            assert 'elided' not in rendered
+
+
+# ----------------------------------------------------------------------
 # TaskCurator._call_llm_batch — timeout / turns scaling
 # ----------------------------------------------------------------------
 
