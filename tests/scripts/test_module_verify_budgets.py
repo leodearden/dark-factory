@@ -573,6 +573,17 @@ def test_module_carries_its_own_measured_verify_budget(
         ``orchestrator/orchestrator.yaml``'s provenance block. Every other
         prefix keeps the fall-through contract in full.
 
+    (f) COVERS THE TASK/BACKGROUND COLD LANE ONLY. ``_resolve_verify_timeout``
+        has TWO cold lanes and its cold track tries
+        ``merge_verify_cold_command_timeout_secs`` FIRST, ahead of any module
+        knob. So for ``orchestrator`` the declared 10800 is returned at
+        ``is_merge_verify=False`` and SHADOWED at ``is_merge_verify=True``,
+        which resolves to 7200 — equal to its warm budget, on the strictly
+        costlier path. That carve-out is asserted below rather than merely
+        described, so closing it (or forgetting it) turns a test red. Closing
+        it needs a repo-root ceiling raise, which ruling D17 places outside
+        this task.
+
     SCOPE, STATED HONESTLY — this guard's advertised reach must equal its real
     reach, because a guard that overstates itself is the same defect wearing a
     test's clothes (the standard
@@ -822,6 +833,26 @@ def test_module_carries_its_own_measured_verify_budget(
             f'verify_cold_command_timeout_secs={declared_cold}. The value is '
             f'in the yaml but the cascade is not reaching it, so the cold lane '
             f'is still running on some other budget'
+        )
+
+        # The OTHER cold lane, pinned as the carve-out it is. The cold track
+        # tries merge_verify_cold_command_timeout_secs BEFORE the module knob,
+        # so on a cold MERGE verify this module's declaration is shadowed. The
+        # yaml block says so; this asserts it, so the prose cannot drift from
+        # the resolver and a future closing of the lane cannot land silently.
+        merge_cold = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=True,
+        )
+        root_merge_cold = root_config.merge_verify_cold_command_timeout_secs
+        assert merge_cold == root_merge_cold, (
+            f'_resolve_verify_timeout(is_cold=True, is_merge_verify=True) '
+            f'returned {merge_cold} for {prefix}, not the repo-root '
+            f'merge_verify_cold_command_timeout_secs={root_merge_cold}. The '
+            f'cold MERGE lane is a documented carve-out (esc-3353-20): the '
+            f'module cold declaration is shadowed there. If this lane was '
+            f'deliberately closed, update this assertion AND the '
+            f'orchestrator.yaml provenance block together — the finding they '
+            f'both record would no longer be true'
         )
 
         # A cold verify pays verify_cold_preprovision_command and unwarmed

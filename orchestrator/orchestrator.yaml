@@ -43,9 +43,29 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # BASIS FOR 7200: ~1.6x headroom over the ~4400s loaded extrapolation from
 # task 4176's contended run.
 #
-# THE COLD LANE IS NOW CLOSED HERE — see verify_cold_command_timeout_secs at
-# the bottom of this block. It was deliberately left open until scope D', and
-# this records why it is closed now and on what basis.
+# THE TASK/BACKGROUND COLD LANE IS NOW CLOSED HERE — see
+# verify_cold_command_timeout_secs at the bottom of this block. It was
+# deliberately left open until scope D', and this records why it is closed now
+# and on what basis.
+#
+# THE COLD MERGE LANE IS NOT CLOSED, and saying otherwise was wrong. Measured
+# against the real configs with the real resolver (esc-3353-20):
+#   is_cold=True, is_merge_verify=False -> 10800   (the declaration below)
+#   is_cold=True, is_merge_verify=True  ->  7200   (defaults.yaml:105)
+# _resolve_verify_timeout's cold track tries merge_verify_cold_command_timeout_
+# secs FIRST, ahead of the module knob, so a COLD MERGE verify of this module
+# runs on 7200 — exactly EQUAL to its warm budget, on the path that pays the
+# cold preprovision command and unwarmed caches on top of everything the warm
+# run pays. That is the same hazard shape the declaration below exists to
+# prevent, still live on the merge lane.
+#
+# NOT FIXED HERE, DELIBERATELY. Closing it means raising a REPO-ROOT ceiling
+# (merge_verify_cold_command_timeout_secs), and ruling D17 puts root ceilings
+# out of scope for this task — "report it in the census; do not change it here
+# without an operator ruling" — under a standing constraint that a timeout is
+# never widened as a fix (commit 36c4c71eb4: "the next raise should be
+# refused"). So this is recorded as a measured FINDING for an operator, and
+# the census's MERGE GATE section reports the figure on every run.
 #
 # WHY IT COULD NOT STAY OPEN. Per verify._resolve_verify_timeout's cascade an
 # unset module cold knob does NOT inherit the warm budget: a COLD verify falls
@@ -115,6 +135,9 @@ verify_command_timeout_secs: 7200
 # GATED BY the same guard, assertion (f)'s
 # RULED_COLD_BUDGET_DECLARATIONS branch, which additionally pins that a cold
 # budget may never sit BELOW the warm one (a cold verify pays strictly more)
-# and that the RESOLVER actually returns this value rather than the cascade
-# shadowing it.
+# and that the resolver returns this value ON THE TASK/BACKGROUND COLD LANE
+# (is_merge_verify=False) rather than the cascade shadowing it. On the COLD
+# MERGE lane the cascade DOES shadow it — see the finding at the top of this
+# block — and the guard pins that shadowing too, so the carve-out cannot be
+# closed or forgotten without a test going red.
 verify_cold_command_timeout_secs: 10800

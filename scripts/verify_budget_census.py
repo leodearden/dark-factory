@@ -49,7 +49,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import yaml
 
@@ -245,10 +245,20 @@ def _read_payload(path: Path) -> tuple[dict | None, str | None]:
     permission problem, a truncated mid-write read), it read but is not JSON (a
     partial write — the common one, since a summary is written while the fleet
     runs), or it is JSON but not an object (a shape this census cannot use).
+
+    ``UnicodeDecodeError`` is caught alongside ``OSError`` because it is the
+    torn-read case this docstring already claimed to cover, not a separate
+    exotic one: summaries are written ``ensure_ascii=False``
+    (``verify.py::_build_summary_payload``'s writers), so a read landing
+    mid-multibyte-character raises it. It is a ``ValueError``, so ``OSError``
+    alone let it escape this function, escape ``load_records``' per-record
+    loop, and abort the census with a traceback — discarding every record
+    already parsed, which is the one failure a corpus walk over a live tree
+    must not have.
     """
     try:
         text = path.read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None, 'unreadable'
     try:
         payload = json.loads(text)
@@ -359,7 +369,7 @@ def read_module_test_command(root: Path, prefix: str) -> str | None:
     path = root / prefix / 'orchestrator.yaml'
     try:
         data = yaml.safe_load(path.read_text(encoding='utf-8'))
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     if not isinstance(data, dict):
         return None
@@ -475,6 +485,16 @@ def _reject_reason(entry: object, expected: str | None, label: str) -> str | Non
     ``command_mismatch`` because it is a different fact about the corpus: the
     command matched, but it ran as a sequence of separately-timed subprojects,
     so the duration describes a different execution topology of the same chain.
+
+    EVERY field the caller then indexes must be validated HERE, because this
+    function is what makes the ``Corpus``/``Selection`` totality invariant
+    hold: an entry is selected or counted under a reason, never neither. A
+    field left unchecked is not a lenient read — it is a ``KeyError`` that
+    aborts the whole census and discards every record already parsed. ``rc``
+    was that field: validated nowhere, indexed unconditionally at the
+    ``Leg(...)``, and a JSON ``"rc": null`` was worse than the crash because it
+    was ACCEPTED and then filed under ``failed`` by ``summarise_legs``'
+    ``leg.rc != 0``, turning an unusable record into evidence of a failing run.
     """
     if not isinstance(entry, dict):
         return 'malformed_entry'
@@ -488,9 +508,32 @@ def _reject_reason(entry: object, expected: str | None, label: str) -> str | Non
         return 'no_declared_command'
     if _normalise_command(str(entry['cmd'])) != _normalise_command(expected):
         return 'command_mismatch'
-    if not isinstance(entry.get('duration_secs'), (int, float)):
+    if not _is_real_number(entry.get('duration_secs')):
         return 'no_duration'
+    if not _is_real_int(entry.get('rc')):
+        return 'no_rc'
     return None
+
+
+def _is_real_int(value: object) -> TypeGuard[int]:
+    """An ``int`` that is not a ``bool``.
+
+    ``bool`` is a subclass of ``int``, so a bare ``isinstance(v, int)`` admits
+    ``True``/``False``. For ``rc`` that would make ``True`` a non-zero exit
+    code — a leg silently filed under ``failed`` — so the two are separated
+    here rather than at each call site.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_real_number(value: object) -> TypeGuard[int | float]:
+    """An ``int`` or ``float`` that is not a ``bool``, for the same reason.
+
+    Without the ``bool`` exclusion ``duration_secs: true`` becomes a
+    1.0-second suite and ``cpu_some10: true`` a 1.0 pressure reading — both
+    accepted silently, both wrong, and neither visible in a rejection count.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +817,7 @@ def _start_pressure(load: dict | None) -> float | None:
     if not isinstance(start, dict):
         return None
     value = start.get('cpu_some10')
-    return float(value) if isinstance(value, (int, float)) else None
+    return float(value) if _is_real_number(value) else None
 
 
 def by_load_band(legs: Iterable[Leg]) -> dict[str, dict[str, Any]]:
@@ -853,7 +896,7 @@ def merge_gate_budget(root: Path) -> dict[str, Any]:
         path = root / relative
         try:
             data = yaml.safe_load(path.read_text(encoding='utf-8'))
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
             continue
         if isinstance(data, dict) and _MERGE_BUDGET_KEY in data:
             return {

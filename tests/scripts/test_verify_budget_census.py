@@ -1790,3 +1790,81 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         assert check['derived_floor'] is None
         assert 'unavailable' in check['note'].lower()
         assert check['exceeds_refusal_ceiling'] is False
+
+
+class TestATornOrMalformedRecordIsCountedNotFatal:
+    """The walk stays TOTAL: a bad record is counted, never a traceback.
+
+    Both shapes here aborted the whole census before esc-3353-20, discarding
+    every record already parsed — the one failure a read-only walk over a LIVE
+    tree must not have, and the exact case the module docstring advertises
+    safety for.
+    """
+
+    def test_a_read_torn_mid_multibyte_character_is_unreadable(self, tmp_path):
+        """Summaries are written `ensure_ascii=False`, so this is reachable."""
+        from verify_budget_census import _read_payload  # noqa: PLC0415
+
+        raw = json.dumps({'cmd': 'pytest — dash'}, ensure_ascii=False).encode('utf-8')
+        torn = tmp_path / 'attempt-1.orchestrator.summary.json'
+        torn.write_bytes(raw[:raw.find('—'.encode()) + 1])
+
+        assert _read_payload(torn) == (None, 'unreadable')
+
+    def test_a_torn_module_yaml_is_none_not_a_traceback(self, tmp_path):
+        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+
+        module_yaml = tmp_path / 'orchestrator' / 'orchestrator.yaml'
+        module_yaml.parent.mkdir(parents=True)
+        module_yaml.write_bytes('test_command: "pytest —'.encode()[:-1])
+
+        assert read_module_test_command(tmp_path, 'orchestrator') is None
+
+    def test_an_entry_without_rc_is_rejected_not_indexed(self, tmp_path):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        entry = _leg()
+        del entry['rc']
+        _corpus_with(tmp_path, entry)
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        )
+
+        assert selection.legs == ()
+        assert selection.rejected_entries['no_rc'] == 1
+
+    def test_a_null_rc_is_rejected_rather_than_counted_as_a_failure(self, tmp_path):
+        """The worse half: `rc: null` was ACCEPTED and filed under `failed`.
+
+        `summarise_legs` partitions on `leg.rc != 0`, so None — an unusable
+        record — became evidence of a failing run in the very distribution a
+        budget is derived from.
+        """
+        from verify_budget_census import (  # noqa: PLC0415
+            load_records,
+            select_full_suite_legs,
+            summarise_legs,
+        )
+
+        _corpus_with(tmp_path, _leg(rc=None))
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        )
+
+        assert selection.rejected_entries['no_rc'] == 1
+        assert summarise_legs(selection.legs)['failed'] == 0
+
+    def test_a_bool_is_not_a_duration(self, tmp_path):
+        """`bool` subclasses `int`, so `True` was admitted as a 1.0s suite."""
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        _corpus_with(tmp_path, _leg(duration_secs=True))
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        )
+
+        assert selection.legs == ()
+        assert selection.rejected_entries['no_duration'] == 1
