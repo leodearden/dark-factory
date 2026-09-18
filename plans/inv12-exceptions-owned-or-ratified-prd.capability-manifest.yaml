@@ -3,7 +3,9 @@
 # (shared/src/shared/capability_manifest.py::CapabilityManifestDoc).
 # task_id stays null until commit_planning stamps it. Every grep pattern below
 # was checked ABSENT from main 890be05658 on 2026-09-18, so no producer reads as
-# delivered before it lands.
+# delivered before it lands. Decompose re-checked at b40ca3abf2 (2026-09-18) and
+# narrowed ε1/ε2 to paths no prerequisite writes (β's and γ2's own tests carry
+# governed_exceptions( in shared/tests/ and scripts/tests/).
 prd: plans/inv12-exceptions-owned-or-ratified-prd.md
 schema_version: 1
 tasks:
@@ -107,25 +109,45 @@ tasks:
   - label: "ε1"
     title: "Declare the governed lists of orchestrator/ and scripts/"
     capabilities:
-      - name: "orchestrator-and-scripts-declarations"
+      - name: "orchestrator-declarations"
         binding: "producer:β upstream; containers and live owners verified 2026-09-18"
         verdict: PASS
         delivered_check:
           kind: grep
           pattern: "governed_exceptions\\("
-          paths: ["orchestrator/tests/", "scripts/tests/"]
+          paths: ["orchestrator/tests/"]
           expect: present
+      - name: "scripts-declarations"
+        binding: "producer:β upstream; containers verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "scripts/tests/ already carries governed_exceptions( in γ2's own register tests before ε1 lands, so no grep there is specific to ε1; judged from exception_register.py --report"
   - label: "ε2"
     title: "Declare the governed lists of shared/, fused-memory/ and dashboard/"
     capabilities:
-      - name: "shared-fused-memory-dashboard-declarations"
+      - name: "fused-memory-declarations"
         binding: "producer:β upstream; containers and live owners verified 2026-09-18"
         verdict: PASS
         delivered_check:
           kind: grep
           pattern: "governed_exceptions\\("
-          paths: ["shared/tests/", "fused-memory/tests/", "dashboard/tests/"]
+          paths: ["fused-memory/tests/"]
           expect: present
+      - name: "dashboard-declarations"
+        binding: "producer:β upstream; container verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "governed_exceptions\\("
+          paths: ["dashboard/tests/"]
+          expect: present
+      - name: "shared-declarations"
+        binding: "producer:β upstream; containers verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "shared/tests/ already carries governed_exceptions( in β's own tests before ε2 lands, so no grep there is specific to ε2; judged from exception_register.py --report"
   - label: "λ"
     title: "Tell implementer and reviewer roles the INV-12 forms and blockers"
     capabilities:
@@ -134,7 +156,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "debt: task"
+          pattern: "debt: task|governed_exceptions"
           paths: ["orchestrator/src/orchestrator/agents/roles.py"]
           expect: present
   - label: "κ1"

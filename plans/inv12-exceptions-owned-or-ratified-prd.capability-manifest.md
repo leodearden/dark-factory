@@ -61,9 +61,21 @@ Machine-readable twin: `inv12-exceptions-owned-or-ratified-prd.capability-manife
 - Live owners cited exist and are non-terminal as of 2026-09-18: 5149, 5034,
   4354, 4920, 5215 `pending`; 5578 `merge-deferred`. Each leaf re-checks at
   implementation. PASS.
+- Delivered checks are pinned to paths no prerequisite writes (decompose
+  re-check, 2026-09-18): ε1 greps `orchestrator/tests/`, ε2 greps
+  `fused-memory/tests/` and `dashboard/tests/` separately. The `scripts/tests/`
+  and `shared/tests/` halves are `manual` — γ2's and β's own tests put
+  `governed_exceptions(` there before ε1/ε2 land, so a grep would read as
+  delivered early. PASS.
 - No production module or bare-`python3` script gains an import: declarations
   live in test modules (D4). Anti-regression of the two hosts that would break:
   `check_bare_magicmock_config.py`, `check_dashboard_unit_parity.py`. PASS.
+
+## λ — tell the agents
+- The accepted marker forms render from β's public constant in
+  `shared.governed_exceptions` (INV-5, SPOT); `roles.py` already imports
+  from `shared` (`shared.prompt_artifact`). The delivered check accepts the
+  import or the literal form (`debt: task|governed_exceptions`). PASS.
 
 ## η — sweep
 - Store resolver: `scripts/_task_db_scan.py::tasks_db_path` (a plain join on
@@ -83,6 +95,9 @@ Machine-readable twin: `inv12-exceptions-owned-or-ratified-prd.capability-manife
   relied on: idempotence is the sweep's own key lookup. PASS.
 
 ## κ2 — sweep activation
+- Ordered after ζb (decompose, 2026-09-18): δ closes on `resume` before ζb
+  replaces the `TaskRef(δ)` citations, so a sweep live in that window would
+  report δ as a dead owner on every list citing it. PASS (DAG-direction).
 - `execution_class: "operational"` → deterministic pure gate
   (`docs/task-authoring.md` §4). A `before_done` predicate was declined:
   `fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done`

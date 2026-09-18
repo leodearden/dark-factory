@@ -422,7 +422,8 @@ written to the state path the report reads.
 
 **Ordering invariants.** λ lands before κ1, so the forms are known before
 anything is red. The ratification table exists (γ2) before δ dispatches. ζb runs
-after δ, ε1, ε2 and κ1. The pure-gate leaves (δ, κ1, κ2) go `done` on `resume`
+after δ, ε1, ε2 and κ1. κ2 follows ζb, so the sweep never runs while a
+declaration still cites the closed δ. The pure-gate leaves (δ, κ1, κ2) go `done` on `resume`
 — `orchestrator/src/orchestrator/deterministic_runner.py` does not consult
 `delivered_checks` — so what holds their dependents is the producer's
 `delivered_checks` in the scheduler's delivered-check cache: ζb does not
@@ -542,7 +543,10 @@ no new reach).
   a corroborated finding list and writes nothing. Unlocks κ2.
 - **κ2 — Sweep activation (operator action).** `metadata.execution_class:
   "operational"`. Run η's installer on the host, wait for one timer run, confirm
-  `--report` shows a sweep age. Prereq η. Unlocks θ.
+  `--report` shows a sweep age. Prereqs η, ζb — ζb because δ goes `done` on
+  `resume` while ε1/ε2's declarations still cite `TaskRef(δ)` until ζb lands,
+  and a sweep running in that window would read δ as a dead owner on every list
+  citing it (added at decompose, 2026-09-18). Unlocks θ.
 - **θ — Integration gate.** On the real tree: `--report` shows every part 1 list
   with a disposition, a grandfathered headline, slack and a sweep age under one
   period; a planted branch with one bare suppression fails
