@@ -308,3 +308,142 @@ class TestStampPendingSinceTransitionTable:
             )
         assert result is None
         assert [r for r in caplog.records if 'malformed metadata' in r.message] != []
+
+
+class TestPendingSinceThroughStatusWriters:
+    """The user-observable boundary rows (PRD :496-498), through the real backend.
+
+    Driven against ``SqliteTaskBackend`` directly and observed through
+    ``get_task`` — the product read path. The transition-LEGALITY gate lives
+    in the interceptor, not the backend, so driving the backend is the right
+    scope for the write rules themselves.
+    """
+
+    async def _anchor(self, backend, project_root, task_id) -> str | None:
+        one = await backend.get_task(task_id, project_root=project_root)
+        return (one['metadata'] or {}).get('pending_since')
+
+    @pytest.mark.asyncio
+    async def test_anchor_survives_a_requeue(self, backend, tmp_path):
+        """Boundary row 1: dispatched then requeued keeps the accrued wait.
+
+        The scored age must be measured from the ORIGINAL landing, not from
+        the requeue — a task that has already waited must not lose that wait
+        because the machine dropped it (D3 continuity).
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='requeued')
+        original = await self._anchor(backend, project_root, dto['id'])
+        assert original is not None
+
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.IN_PROGRESS, project_root=project_root
+        )
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.PENDING, project_root=project_root
+        )
+        assert await self._anchor(backend, project_root, dto['id']) == original
+
+    @pytest.mark.asyncio
+    async def test_only_un_cancelling_resets_the_anchor(self, backend, tmp_path):
+        """Boundary row 2: the reset and the non-reset asserted side by side.
+
+        Kept in ONE test so the CONTRAST is the assertion. Two separate tests
+        could drift apart, leaving the ``cancelled`` exception asserted while
+        the ``blocked`` rule silently acquired it too.
+        """
+        project_root = str(tmp_path)
+        cancelled = await backend.add_task(project_root=project_root, title='cancel me')
+        blocked = await backend.add_task(project_root=project_root, title='block me')
+        before_cancel = await self._anchor(backend, project_root, cancelled['id'])
+        before_block = await self._anchor(backend, project_root, blocked['id'])
+
+        for task, away in (
+            (cancelled, TaskStatus.CANCELLED),
+            (blocked, TaskStatus.BLOCKED),
+        ):
+            await backend.set_task_status(
+                str(task['id']), away, project_root=project_root
+            )
+            await backend.set_task_status(
+                str(task['id']), TaskStatus.PENDING, project_root=project_root
+            )
+
+        after_cancel = await self._anchor(backend, project_root, cancelled['id'])
+        after_block = await self._anchor(backend, project_root, blocked['id'])
+        assert after_cancel != before_cancel, (
+            'cancelled -> pending is the ONE reset (D3); the anchor must move'
+        )
+        assert after_cancel is not None and after_cancel > before_cancel
+        assert after_block == before_block, (
+            'blocked -> pending must keep the accrued wait, unlike un-cancelling'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exit_status', (TaskStatus.DONE, TaskStatus.CANCELLED))
+    async def test_exiting_pending_never_clears_the_anchor(
+        self, backend, tmp_path, exit_status
+    ):
+        """Row 4: ``pending -> *`` leaves the key present AND unchanged."""
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='exiting')
+        original = await self._anchor(backend, project_root, dto['id'])
+
+        await backend.set_task_status(
+            str(dto['id']), exit_status, project_root=project_root
+        )
+        assert await self._anchor(backend, project_root, dto['id']) == original
+
+    @pytest.mark.asyncio
+    async def test_anchorless_task_reaching_pending_gains_an_anchor(
+        self, backend, tmp_path
+    ):
+        """A row that predates the anchor is repaired on its next landing."""
+        project_root = str(tmp_path)
+        dto = await backend.add_task(
+            project_root=project_root, title='legacy', status=TaskStatus.DEFERRED,
+        )
+        assert await self._anchor(backend, project_root, dto['id']) is None
+
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.IN_PROGRESS, project_root=project_root
+        )
+        assert await self._anchor(backend, project_root, dto['id']) is None
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.PENDING, project_root=project_root
+        )
+        assert await self._anchor(backend, project_root, dto['id']) is not None
+
+    @pytest.mark.asyncio
+    async def test_corrupt_metadata_row_can_still_leave_pending(
+        self, backend, tmp_path
+    ):
+        """The fail-safe, end to end: a corrupt blob must not wedge a row.
+
+        Before this key existed a corrupt blob could not block a status write
+        at all — ``set_task_status`` never touched the metadata column. A
+        stamping scheme that raised would mean one corrupt row could no longer
+        be moved out of ``pending``: a new wedge, and a loud regression of an
+        unrelated invariant.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='corrupt')
+        conn = await backend._get_connection(project_root)
+        await conn.execute(
+            "UPDATE tasks SET metadata = 'NOT_JSON_ANCHOR' WHERE id = ?",
+            (int(dto['id']),),
+        )
+        await conn.commit()
+
+        result = await backend.set_task_status(
+            str(dto['id']), TaskStatus.BLOCKED, project_root=project_root
+        )
+        assert result['tasks'][0]['newStatus'] == TaskStatus.BLOCKED
+
+        # And the re-entry: still no raise, still no anchor invented from a
+        # blob that cannot be merged into.
+        result = await backend.set_task_status(
+            str(dto['id']), TaskStatus.PENDING, project_root=project_root
+        )
+        assert result['tasks'][0]['newStatus'] == TaskStatus.PENDING
+        assert await self._anchor(backend, project_root, dto['id']) is None
