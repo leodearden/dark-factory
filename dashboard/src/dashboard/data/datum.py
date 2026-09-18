@@ -105,8 +105,8 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
         served_at: The instant the payload carrying *datum* is being shaped.
             Required and injected rather than read from the clock here: the
             contract's freshness invariant is about the one ``served_at`` the
-            payload actually carries, not about whenever this runs. Unused by
-            the unknown-triad check below.
+            payload actually carries, not about whenever this runs. None of the
+            invariants below reads it today.
 
     Raises:
         DatumContractError: Naming the invariant and the offending values.
@@ -123,4 +123,11 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
             f'state, value and as_of disagree on whether a measurement exists: '
             f'state={datum.state.value!r}, value={datum.value!r}, '
             f'as_of={datum.as_of!r} ({expectation})',
+        )
+
+    if datum.state is not DatumState.FRESH and not (datum.reason or '').strip():
+        raise DatumContractError(
+            DatumInvariant.REASON_REQUIRED,
+            f'a datum in state {datum.state.value!r} must carry a non-empty reason, '
+            f'got reason={datum.reason!r}',
         )
