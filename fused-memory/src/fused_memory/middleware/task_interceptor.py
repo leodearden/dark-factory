@@ -33,8 +33,10 @@ except ImportError:
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.sqlite_task_backend import _now as _backend_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -1051,6 +1053,21 @@ class TaskInterceptor:
         if ',' in task_id:
             ids = [t.strip() for t in task_id.split(',') if t.strip()]
             results: list[dict] = []
+            # One `metadata.pending_since` clock for the whole batch (task
+            # 3816, PRD §C1 invariants / rule 5). A CSV flip -- what
+            # `commit_planning` issues -- is ONE atomic release, so it must
+            # read as one instant: per-id `_now()` calls drift by tens of ms
+            # across a batch of gated transactions, and under the scheduler's
+            # age term that spread is a real score delta, enough to order the
+            # batch by commit sequence when intra-batch order is required to
+            # fall through to CPM and then numeric id. Computed from the
+            # BACKEND's `_now()` -- the same format `updated_at` uses -- not
+            # this module's `datetime.now(UTC).isoformat()` helper, whose
+            # offset-suffixed microsecond shape would give the live-stamped
+            # and back-filled populations two incommensurable string shapes.
+            batch_pending_since = (
+                _backend_now() if status == TaskStatus.PENDING else None
+            )
             for tid in ids:
                 per_result = await self._apply_status_transition(
                     task_id=tid,
@@ -1062,6 +1079,7 @@ class TaskInterceptor:
                     claimant_run_id=claimant_run_id,
                     heartbeat_at=heartbeat_at,
                     agent_id=agent_id,
+                    pending_since_now=batch_pending_since,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1098,12 +1116,19 @@ class TaskInterceptor:
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
+        pending_since_now: str | None = None,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
         Extracted so the public ``set_task_status`` can loop over CSV ids
         and apply the gates per-id. Holds the write lock across
         read→check→write, emits the event outside the lock.
+
+        ``pending_since_now`` is a pure pass-through to the backend's wait-
+        anchor stamp (task 3816): the CSV branch above supplies one value for
+        a whole batch, and the single-id branch leaves it ``None`` so the
+        backend computes its own clock, exactly as before. No gate logic,
+        event payload, or reconciliation behaviour keys on it.
         """
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
@@ -1468,6 +1493,12 @@ class TaskInterceptor:
             # the default call stays byte-identical to every existing caller.
             claimant_kwargs: dict[str, Any] = _maybe_kwargs(
                 _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            )
+            # Same tri-state forwarding shape, one more kwarg: omitted unless
+            # a batch clock was supplied, so the single-id call stays
+            # byte-identical to a pre-3816 one (task 3816).
+            claimant_kwargs.update(
+                _maybe_kwargs(None, pending_since_now=pending_since_now),
             )
 
             async def _do_set_task_status_write() -> Any:
