@@ -47,14 +47,16 @@ from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
     ReconcileStats,
-    ReferentFinding,
     ReferentRepair,
     ReferentRepairStats,
-    ReferentStats,
-    _implausible_target_reason,
 )
 from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_verification import (
+    ReferentFinding,
+    ReferentStats,
+    _implausible_target_reason,
+)
 
 #: The module logger the success-line assertions below scope their
 #: `caplog.at_level` to, so an unrelated logger's INFO cannot leak in.

@@ -41,16 +41,16 @@ from _fm_helpers import (
 )
 
 from fused_memory.services import memory_service as memory_service_module
-from fused_memory.services.memory_service import (
+from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.write_journal import WriteJournal
+from fused_memory.utils import canonical_labels, referent_verification
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_verification import (
     REFERENT_CHECKS,
     REFERENT_FINDING_AXES,
-    MemoryService,
     ReferentFinding,
     ReferentStats,
 )
-from fused_memory.services.write_journal import WriteJournal
-from fused_memory.utils import canonical_labels
-from fused_memory.utils.canonical_labels import Referent
 
 
 @pytest.fixture
@@ -100,6 +100,26 @@ class TestReferentRecordVocabulary:
     def test_check_vocabulary_is_closed_and_exactly_the_two_named_checks(self):
         """The single normative site for "WHICH CHECK FIRED" (INV-5)."""
         assert REFERENT_CHECKS == ('set-membership', 'per-edge-pairing')
+
+    def test_the_check_vocabulary_lives_at_exactly_one_site(self):
+        """INV-5/SPOT across the leaf split: `memory_service` RE-IMPORTS the
+        vocabulary from `utils.referent_verification`, it does not keep a copy.
+
+        Identity, not equality, and that is the whole point: two tuples spelled
+        the same in two modules compare equal on the day they are written and
+        drift silently afterwards. `MemoryService.__init__` seeds
+        `_referent_finding_counts` from these names while `ReferentFinding`
+        validates against them, so a second copy would let a counter bucket and
+        a record validator disagree about what a check is called.
+        """
+        assert (
+            memory_service_module.REFERENT_CHECKS
+            is referent_verification.REFERENT_CHECKS
+        )
+        assert (
+            memory_service_module.REFERENT_FINDING_AXES
+            is referent_verification.REFERENT_FINDING_AXES
+        )
 
     def test_required_fields_construct_and_defaults_are_fail_closed(self):
         finding = _finding()
@@ -1151,7 +1171,7 @@ class TestCandidateTargetSelection:
 
     def test_the_pool_is_the_fact_cited_intersection_when_it_is_non_empty(self):
         """Mode (iii): the fact cites 3075, the edge sits on 3074."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1164,7 +1184,7 @@ class TestCandidateTargetSelection:
     def test_it_falls_back_to_the_declared_set_when_the_intersection_is_empty(self):
         """The MEMBERSHIP shape: the endpoint is outside the declared set, so
         subtracting it is a no-op and the sole declared referent survives."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='10')}),
@@ -1175,7 +1195,7 @@ class TestCandidateTargetSelection:
         ) == (Referent(number='10'),)
 
     def test_the_other_endpoint_is_subtracted_so_no_repair_forms_a_self_loop(self):
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='2519')}),
@@ -1188,7 +1208,7 @@ class TestCandidateTargetSelection:
     def test_the_order_is_deterministic_and_not_frozenset_iteration_order(self):
         """A finding must be stable across runs and diffable in eta's audit;
         frozenset iteration order is not stable across processes."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         refs = frozenset({
             Referent(number='11'), Referent(number='10'),
@@ -1221,7 +1241,7 @@ class TestCandidateTargetSelection:
         records `resolvable=False` with a reason, which is the fail-closed
         "recorded and left alone" direction.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074')}),
@@ -1233,7 +1253,7 @@ class TestCandidateTargetSelection:
 
     def test_both_endpoints_are_subtracted_together(self):
         """Neither end of an edge can ever be its own repair target."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1247,7 +1267,7 @@ class TestCandidateTargetSelection:
         """Asserted rather than merely argued: the pool is always a SUBSET of
         `referents`, and membership fires precisely when the endpoint is NOT in
         `referents`, so the subtraction provably cannot bite on that arm."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='10'), Referent(number='11')}),
@@ -1269,7 +1289,7 @@ class TestCandidateTargetSelection:
         node it landed on — the strongest possible evidence the attachment is
         CORRECT — so the declared set {3668} must not be mined for a target.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3668')}),
@@ -1296,7 +1316,7 @@ class TestCandidateTargetSelection:
         endpoint undeclared and pairing needs it uncited — and so pinned the
         wrong behaviour on an input no arm can reach.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3668')}),
@@ -1314,7 +1334,7 @@ class TestCandidateTargetSelection:
         below still decides, and the fact's citation of `Task 3075` remains the
         repair target.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1333,7 +1353,7 @@ class TestUnresolvableReason:
     """
 
     def test_more_than_one_candidate_names_the_ambiguity(self):
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (Referent(number='10'), Referent(number='11')),
@@ -1349,7 +1369,7 @@ class TestUnresolvableReason:
 
     def test_zero_candidates_names_the_endpoint_already_attached_condition(self):
         """The pool held only the flagged endpoint itself."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1366,7 +1386,7 @@ class TestUnresolvableReason:
 
     def test_zero_candidates_still_names_the_self_loop_for_the_live_2519_row(self):
         """referents {2519}, endpoints (Task 2519, Task 2520), a unary fact."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1381,7 +1401,7 @@ class TestUnresolvableReason:
         assert 'self-loop' in reason
 
     def test_the_two_zero_candidate_reasons_are_distinguishable(self):
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         already_attached = _unresolvable_reason(
             (), cited=frozenset(), pool=frozenset({Referent(number='3074')}),
@@ -1401,7 +1421,7 @@ class TestUnresolvableReason:
         """Tested against the PRE-subtraction pool rather than inferred from
         `other_endpoint is None`, which is what keeps the message HONEST when
         both ends were subtracted."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1419,7 +1439,7 @@ class TestUnresolvableReason:
         """"The fact names the node it landed on" is the reason an operator and
         leaf eta need; it cannot be inferred from the pool, which the guard
         deliberately empties."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -2492,7 +2512,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         edge, which is the entire reason it is derived from `cited` rather than
         stored beside it.
         """
-        from fused_memory.services.memory_service import _candidate_pool
+        from fused_memory.utils.referent_verification import _candidate_pool
 
         stats = await service._verify_episode_referents(
             _corroborated_membership_episode(), group_id='dark_factory',
@@ -2801,7 +2821,7 @@ def _warn_cap() -> int:
     locally, the idiom this file already uses for module-private symbols
     (`_candidate_targets`).
     """
-    from fused_memory.services.memory_service import _REFERENT_FINDING_WARN_CAP
+    from fused_memory.utils.referent_verification import _REFERENT_FINDING_WARN_CAP
 
     return _REFERENT_FINDING_WARN_CAP
 
