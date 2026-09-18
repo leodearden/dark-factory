@@ -267,6 +267,70 @@ async def test_second_window_folds_into_the_one_pending_record(
 
 
 @pytest.mark.asyncio
+async def test_fold_refreshes_the_parents_live_condition(event_buffer, tmp_path):
+    """A folded parent must state TODAY's condition, not the first filing's.
+
+    ``attach_dedupe_child`` bumps the count and rewrites nothing else, so
+    without a deliberate refresh a record folded for days keeps the count it
+    was born with. That stale line is exactly what a steward triages from: a
+    compact drain keeps ``summary`` and drops ``detail``
+    (``_COMPACT_ESCALATION_FIELDS``, escalation/server.py).
+    """
+    await _seed_buffered(event_buffer, 'proj', n=12)
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    clock = {'now': 1_000_000.0}
+
+    def now() -> float:
+        return clock['now']
+
+    policy = BacklogPolicy(
+        event_buffer,
+        _StubQueue(),
+        lambda _: True,
+        hard_limit=10,
+        rate_limit_seconds=900.0,
+        time_provider=now,
+    )
+    v1 = await policy.check('proj', project_root=str(project_root))
+    assert v1.escalation_path is not None
+    first = json.loads(Path(v1.escalation_path).read_text(encoding='utf-8'))
+    assert first['summary'].endswith('12/10'), first['summary']
+    # Nothing has folded yet, so the watcher's "changed since I triaged it"
+    # marker must still be unset.
+    assert first.get('updated_at') is None
+
+    # The condition GROWS while the record sits pending, then a second window
+    # opens and folds.
+    await _seed_buffered(event_buffer, 'proj', n=18)
+    clock['now'] += 901.0
+    v2 = await policy.check('proj', project_root=str(project_root))
+    assert v2.escalation_path == v1.escalation_path
+
+    esc_dir = project_root / 'data' / 'escalations'
+    esc_files = sorted(esc_dir.glob('esc-*.json'))
+    assert len(esc_files) == 1, [p.name for p in esc_files]
+    body = json.loads(esc_files[0].read_text(encoding='utf-8'))
+
+    assert body['dedupe_count'] == 1
+    assert body['summary'].endswith('30/10'), body['summary']
+    assert '12/10' not in body['summary'], body['summary']
+    # Refreshing summary WITHOUT detail would leave a record contradicting
+    # itself, so both move together.
+    assert '= 30 vs threshold 10' in body['detail'], body['detail']
+    assert '= 12 vs threshold 10' not in body['detail'], body['detail']
+    assert body['backlog'] == 30
+    assert body['threshold'] == 10
+
+    # The first-seen anchor is NOT refreshed — it is what makes "how long has
+    # this been going on" answerable. ``updated_at`` is the field that moves,
+    # stamped by attach_dedupe_child, and it is what the watcher's
+    # ``updated_at > triaged_at`` re-verify rule reads.
+    assert body['timestamp'] == first['timestamp']
+    assert body['updated_at'] is not None
+
+
+@pytest.mark.asyncio
 async def test_on_judge_halt_writes_escalation(event_buffer, tmp_path):
     """Judge halt routes through escalation path when orchestrator is live."""
     project_root = tmp_path / 'proj_root'
