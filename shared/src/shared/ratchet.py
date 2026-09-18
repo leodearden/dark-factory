@@ -61,6 +61,7 @@ via the fully-qualified path, consistent with the ``task_statuses`` /
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import Counter
 from collections.abc import Mapping
@@ -297,7 +298,19 @@ class Enumeration:
                     'would make dump/load non-canonical.'
                 )
 
-        params = {key: _normalised_param(key, value) for key, value in dict(self.params).items()}
+        params = {}
+        for key, value in dict(self.params).items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f'Enumeration: params key {key!r} must be a str — the params block is '
+                    'written to and read from a JSON object, whose keys are strings by the '
+                    "format's definition. A non-str key survives dump only by being "
+                    'rewritten as its JSON spelling, so the reloaded block differs from the '
+                    'one in memory and every later comparison refuses with a spurious '
+                    'mismatch — or sorts against a str and raises a bare TypeError, which '
+                    'is outside the RatchetError family a consumer catches.'
+                )
+            params[key] = _normalised_param(key, value)
         unreadable = tuple(self.unreadable)
         if self.complete is True and unreadable:
             raise ValueError(
@@ -312,23 +325,43 @@ class Enumeration:
         object.__setattr__(self, 'unreadable', unreadable)
 
 
+def _is_json_scalar(value: object) -> bool:
+    """Whether JSON can express *value* as a literal.
+
+    ``float`` is admitted only when FINITE, and that exclusion is the same rule
+    :data:`_JSON_SCALARS` states rather than a second one.  ``json.dumps`` writes
+    ``nan`` and ``inf`` as the bare tokens ``NaN`` and ``Infinity``, which RFC 8259
+    has no literal for — so the committed baseline a human is told to review is a
+    file strict readers reject — and ``nan != nan``, so a params block carrying one
+    refuses every later comparison with a spurious mismatch.  That is precisely the
+    round-trip failure the scalar restriction exists to prevent, so letting the
+    value through the type check would leave the rule half-enforced.
+    """
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, _JSON_SCALARS)
+
+
 def _normalised_param(key: str, value: object) -> object:
     """Check *value* is JSON-expressible and normalise a sequence to a tuple."""
-    if isinstance(value, _JSON_SCALARS):
+    if _is_json_scalar(value):
         return value
     if isinstance(value, (list, tuple)):
         for item in value:
-            if not isinstance(item, _JSON_SCALARS):
+            if not _is_json_scalar(item):
                 raise ValueError(
-                    f'Enumeration: params[{key!r}] contains {item!r}, which is not a JSON '
-                    'scalar. The params block round-trips through a JSON file verbatim.'
+                    f'Enumeration: params[{key!r}] contains {item!r}, which JSON cannot '
+                    'express as a literal. The params block round-trips through a JSON file '
+                    'verbatim.'
                 )
         return tuple(value)
     raise ValueError(
-        f'Enumeration: params[{key!r}]={value!r} is a {type(value).__name__}, which is not a '
-        'JSON scalar or a sequence of them. The params block round-trips through a JSON file '
-        'verbatim, so a value JSON cannot express would make every later comparison refuse '
-        'with a spurious params mismatch.'
+        f'Enumeration: params[{key!r}]={value!r} is a {type(value).__name__}, which JSON '
+        'cannot express as a literal, and it is not a sequence of such values either. The '
+        'params block round-trips through a JSON file verbatim, so a value JSON cannot '
+        'express would make every later comparison refuse with a spurious params mismatch. '
+        'A non-finite float is excluded for exactly that reason: JSON has no literal for '
+        'NaN or Infinity, and nan != nan.'
     )
 
 
@@ -492,9 +525,13 @@ def dump(enumeration: Enumeration, path: str | os.PathLike[str]) -> None:
     blocks = [
         f'  "_README": {json.dumps(BASELINE_README)}',
         f'  "schema_version": {json.dumps(SCHEMA_VERSION)}',
-        '  "params": ' + json.dumps(dict(enumeration.params), indent=2, sort_keys=True).replace(
-            '\n', '\n  '
-        ),
+        # allow_nan=False is the second, redundant enforcement of the rule
+        # _is_json_scalar states: params is the one block that can carry a float,
+        # and json.dumps would otherwise emit the non-RFC-8259 tokens NaN and
+        # Infinity into a file a reviewer is told to read.
+        '  "params": ' + json.dumps(
+            dict(enumeration.params), indent=2, sort_keys=True, allow_nan=False
+        ).replace('\n', '\n  '),
         f'  "complete": {json.dumps(enumeration.complete)}',
         '  "unreadable": ' + json.dumps(list(enumeration.unreadable), indent=2).replace(
             '\n', '\n  '

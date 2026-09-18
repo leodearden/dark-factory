@@ -163,13 +163,49 @@ class TestEnumerationRejects:
         """Keys are opaque identity tokens, and JSON object keys are strings."""
         assert repr(key) in self._message(counts={key: 1})
 
+    @pytest.mark.parametrize('key', [17, None, ('a', 'b')])
+    def test_a_non_str_params_key(self, key):
+        """A JSON object key is a string, and this block IS a JSON object.
+
+        Both consequences escaped the RatchetError family the base class promises
+        one ``except`` clause for.  ``dump`` raised a bare ``TypeError`` out of
+        ``json.dumps(sort_keys=True)`` when the keys were of mixed type; and a
+        block that did dump came back with the key rewritten as its JSON spelling,
+        so ``load(p) == e`` was False and the next comparison sorted a str against
+        an int and raised a bare ``TypeError`` rather than ParamsMismatch.  A
+        caller mapping ``except RatchetError`` to exit 2 got a traceback instead.
+        """
+        assert repr(key) in self._message(params={key: 'x'})
+
     @pytest.mark.parametrize('value', [{'a': 1}, {1, 2}, object()])
     def test_a_params_value_that_is_not_json(self, value):
         """The params block is written to and read from a JSON file verbatim."""
         assert 'p' in self._message(params={'p': value})
 
+    @pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+    def test_a_non_finite_float_in_params(self, value):
+        """The value the round-trip argument is ABOUT, and it was let through.
+
+        ``_JSON_SCALARS`` exists because a value JSON cannot express would not
+        survive the round trip and would make every post-reload comparison refuse
+        with a spurious mismatch.  A non-finite float is precisely that value:
+        ``json.dumps`` writes the bare token ``NaN``, which is not RFC 8259 and
+        which strict readers reject in the committed file a human is told to
+        review, and ``nan != nan`` refuses every later comparison FOREVER.
+        """
+        assert repr(value) in self._message(params={'p': value})
+
+    def test_a_tuple_containing_a_non_finite_float(self):
+        """Enforced at both depths, so the scalar rule has one reading."""
+        assert 'p' in self._message(params={'p': (1.0, float('inf'))})
+
     def test_a_tuple_of_non_scalars_in_params(self):
         assert 'p' in self._message(params={'p': ({'a': 1},)})
+
+    @pytest.mark.parametrize('value', [1.5, -0.0, 1e308])
+    def test_a_finite_float_is_still_accepted(self, value):
+        """The over-correction guard: only NON-finite floats are excluded."""
+        assert Enumeration(counts={}, params={'p': value}).params['p'] == value
 
     def test_complete_true_with_a_non_empty_unreadable(self):
         """THE CONTRADICTION INV-11 EXISTS TO FORBID, refused rather than corrected.
