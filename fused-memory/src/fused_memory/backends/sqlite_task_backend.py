@@ -2602,6 +2602,27 @@ class SqliteTaskBackend:
                 _max_row = await cursor.fetchone()
                 assert _max_row is not None  # aggregate MAX always returns one row
                 next_id = (_max_row[0] or 0) + 1
+
+                # Wait anchor (task 3816, PRD
+                # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1).
+                # BEFORE _validate_metadata_on_write deliberately: that call
+                # must see the blob that is actually persisted, or enforce-mode
+                # validates a different value than the one on disk. One hoisted
+                # `now` is bound to BOTH the anchor and the INSERT's
+                # updated_at, so a freshly inserted pending row satisfies
+                # `pending_since == updated_at` exactly -- the same identity the
+                # one-shot v4->v5 back-fill establishes for the legacy
+                # population, rather than two `_now()` calls a millisecond
+                # apart. `candidate_key` above stays on the pre-stamp value: it
+                # keys off title + metadata['files'] only.
+                now = _now()
+                stamped = stamp_pending_since(
+                    metadata, old_status=None, new_status=status, now=now,
+                    project_root=project_root, tag=tag, task_id=next_id,
+                )
+                if stamped is not None:
+                    metadata = stamped
+
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
                 )
@@ -2648,7 +2669,7 @@ class SqliteTaskBackend:
                     (
                         tag, next_id, title,
                         description or '', details or '',
-                        status, priority or 'medium', metadata, _now(),
+                        status, priority or 'medium', metadata, now,
                         candidate_key,
                     ),
                 )
