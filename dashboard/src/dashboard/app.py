@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import tasks as api_tasks_routes
@@ -32,10 +33,6 @@ from dashboard.api.window import _parse_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
-from dashboard.data.burndown import (
-    aggregate_burndown_projects,
-    aggregate_burndown_series,
-)
 from dashboard.data.cap_history import (
     AccountsSummary,
     CapInterval,
@@ -115,19 +112,11 @@ from dashboard.data.write_journal import (
 )
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
-from dashboard.project_dbs import _burndown_dbs, _cost_dbs, _project_scoped_dbs_labeled
+from dashboard.project_dbs import _cost_dbs, _project_scoped_dbs_labeled
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
 logger = logging.getLogger(__name__)
-
-_BURNDOWN_WINDOWS: dict[str, int] = {
-    '24h': 1,
-    '7d': 7,
-    '30d': 30,
-    '90d': 90,
-}
-
 
 # ---------------------------------------------------------------------------
 # Task-cards TTL cache (mirrors load_task_titles pattern in merge_queue.py)
@@ -541,6 +530,7 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 # module owns its own router and declares its own literal path, so a path
 # and the handler serving it stay in one file.
 app.include_router(api_tasks_routes.router)
+app.include_router(api_burndown_routes.router)
 app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 
@@ -1842,28 +1832,6 @@ async def api_scheduler_evict_park(request: Request) -> JSONResponse:
         {'task_id': task_id, 'project_root': project_root},
         treat_not_found_as_404=False,
     )
-
-
-@app.get('/api/v2/dashboard/burndown')
-async def api_burndown(request: Request) -> JSONResponse:
-    """BURNDOWN + BURNDOWN_BY_PROJECT — per-project status time series."""
-    config: DashboardConfig = request.app.state.config
-    pool: DbPool = request.app.state.db
-    dbs = await _burndown_dbs(config, pool)
-    window_raw = request.query_params.get('window', '30d')
-    days = _BURNDOWN_WINDOWS.get(window_raw, 30)
-
-    try:
-        projects = await aggregate_burndown_projects(dbs)
-        now = datetime.now(UTC)  # clock-exempt: single-capture route
-        per_pid = await asyncio.gather(
-            *(aggregate_burndown_series(dbs, pid, days=days, now=now) for pid in projects)
-        )
-        series: dict[str, dict] = dict(zip(projects, per_pid, strict=True))
-    except Exception:
-        logger.warning('Error fetching burndown data', exc_info=True)
-        series = {}
-    return JSONResponse(redux_api.shape_burndown(series))
 
 
 @app.get('/api/load')
