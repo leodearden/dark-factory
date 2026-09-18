@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.app import _parse_window
+from dashboard.api.window import _parse_window
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
