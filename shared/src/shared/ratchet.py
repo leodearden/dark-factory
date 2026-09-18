@@ -91,6 +91,15 @@ __all__ = [
 # and would make every post-reload comparison refuse with a spurious mismatch.
 _JSON_SCALARS = (str, int, float, bool, type(None))
 
+_ABSENT = object()
+"""The marker for a params key that is not there at all.
+
+None cannot double as that marker, because None is a legal params VALUE (it is
+in :data:`_JSON_SCALARS`).  A bare ``object()`` is unequal to everything but
+itself, and both sides of a params comparison draw their keys from the union of
+the two blocks, so an absent-versus-absent pair can never arise.
+"""
+
 SCHEMA_VERSION: int = 1
 """The KERNEL's on-disk format version, deliberately separate from the params
 block, which is the SCANNER's measurement parameters.  Two orthogonal reasons a
@@ -115,6 +124,21 @@ handle they have on it is a statement, at the top of the file they opened, of
 what a legal change to it looks like.  The
 ``scripts/merge_lane_metrics.py::BASELINE_README`` convention, matched rather
 than imported (D13)."""
+
+
+def _found(raw: Mapping[str, object], name: str) -> str:
+    """Render *name*'s value for a refusal message, or the word ``absent``.
+
+    A field that is missing and a field that is present and wrong are different
+    mistakes with different fixes, and a message that renders the first as
+    ``None`` sends the reader looking for a null they never wrote.  Both places
+    that distinction is reported share this one renderer: the file boundary in
+    :func:`_require_baseline_shape`, and the params comparison in
+    :class:`ParamsMismatch`, where a null is a value the operator may genuinely
+    have written.  Returns an ALREADY-REPR'D string, so a caller must not
+    re-apply ``!r``.
+    """
+    return repr(raw[name]) if name in raw else 'absent'
 
 
 class RatchetError(Exception):
@@ -150,7 +174,8 @@ class ParamsMismatch(RatchetError):
         self.baseline_params = baseline_params
         self.differing = differing
         rendered = ', '.join(
-            f'{key}: baseline={baseline_params.get(key)!r} current={current_params.get(key)!r}'
+            f'{key}: baseline={_found(baseline_params, key)} '
+            f'current={_found(current_params, key)}'
             for key in differing
         )
         super().__init__(
@@ -331,6 +356,12 @@ def _require_comparable(current: Enumeration, baseline: Enumeration) -> None:
     unpopulated flag must refuse rather than read as "probably fine", which is
     the spelling ``scripts/merge_lane_metrics.py::_require_complete_enumeration``
     uses for the same reason.
+
+    The params comparison passes :data:`_ABSENT` to both ``.get`` calls because
+    the params block is the one mapping in this module where None is a legal
+    VALUE rather than a sentinel for missing; a bare ``.get`` would let a params
+    block that GAINED or LOST a null-valued key compare as matching and proceed,
+    which is the silent fail-soft this refusal exists to prevent.
     """
     incomplete = tuple(
         side
@@ -352,7 +383,7 @@ def _require_comparable(current: Enumeration, baseline: Enumeration) -> None:
         sorted(
             key
             for key in set(current.params) | set(baseline.params)
-            if current.params.get(key) != baseline.params.get(key)
+            if current.params.get(key, _ABSENT) != baseline.params.get(key, _ABSENT)
         )
     )
     if differing:
@@ -471,16 +502,6 @@ def dump(enumeration: Enumeration, path: str | os.PathLike[str]) -> None:
         _render_counts(enumeration.counts),
     ]
     atomic_write_text(path, '{\n' + ',\n'.join(blocks) + '\n}\n', mkdir=True)
-
-
-def _found(raw: Mapping[str, object], name: str) -> str:
-    """Render *name*'s value for a refusal message, or the word ``absent``.
-
-    A field that is missing and a field that is present and wrong are different
-    mistakes with different fixes, and a message that renders the first as
-    ``None`` sends the reader looking for a null they never wrote.
-    """
-    return repr(raw[name]) if name in raw else 'absent'
 
 
 def _require_baseline_shape(raw: object, path: str | os.PathLike[str]) -> None:
