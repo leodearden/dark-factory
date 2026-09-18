@@ -3429,6 +3429,19 @@ _BACKFILL_ROWS: list[tuple[int, str, str, str | None, str]] = [
 _BACKFILL_UPDATED_AT = {row[0]: row[4] for row in _BACKFILL_ROWS}
 
 
+def _backfilled_metadata(state: dict[int, str | None], task_id: int) -> dict:
+    """Parse one seeded row's blob, failing loudly if the column went NULL.
+
+    The back-fill rewrites ``metadata`` in place, so a NULL here would mean the
+    migration erased a blob rather than merging into it — a distinct and much
+    worse failure than a wrong value, and one a bare ``json.loads`` would
+    report only as an opaque TypeError.
+    """
+    raw = state[task_id]
+    assert raw is not None, f'row {task_id} lost its metadata blob entirely'
+    return json.loads(raw)
+
+
 def _read_backfill_state(db_path: Path) -> tuple[dict[int, str | None], int]:
     """Return ``({id: metadata_raw}, user_version)`` via a fresh connection."""
     import sqlite3
@@ -3479,10 +3492,10 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
     # (a) exactly the two anchorless pending rows are anchored from their OWN
     # updated_at and marked as back-filled.
     for task_id in (1, 2):
-        parsed = json.loads(after[task_id])
+        parsed = _backfilled_metadata(after, task_id)
         assert parsed['pending_since'] == _BACKFILL_UPDATED_AT[task_id]
         assert parsed['pending_since_backfilled'] is True
-    assert json.loads(after[2])['source'] == 'keep me', 'siblings must survive'
+    assert _backfilled_metadata(after, 2)['source'] == 'keep me', 'siblings must survive'
 
     # (b) the already-anchored pending row keeps its own value and gains no marker.
     assert after[3] == before[3]

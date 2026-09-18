@@ -357,6 +357,10 @@ class TestPendingSinceThroughStatusWriters:
         blocked = await backend.add_task(project_root=project_root, title='block me')
         before_cancel = await self._anchor(backend, project_root, cancelled['id'])
         before_block = await self._anchor(backend, project_root, blocked['id'])
+        assert before_cancel is not None and before_block is not None, (
+            'both rows land in `pending`, so the insert must have anchored both '
+            f'before either leaves: {before_cancel!r}, {before_block!r}'
+        )
 
         for task, away in (
             (cancelled, TaskStatus.CANCELLED),
@@ -639,9 +643,12 @@ class TestPendingSinceBatchIdentity:
 
             anchors = await self._anchors(backend, project_root, ids)
             assert None not in anchors, f'every batch member must be anchored: {anchors}'
-            assert len(set(anchors)) == 1, (
+            # Re-bound as a narrowed list so the diagnostic below can sort it;
+            # the assertion above is what makes dropping the None arm sound.
+            stamped = [one for one in anchors if one is not None]
+            assert len(set(stamped)) == 1, (
                 'a commit_planning batch must stamp ONE identical anchor; got '
-                f'{sorted(set(anchors))} — per-id _now() drift would order the '
+                f'{sorted(set(stamped))} — per-id _now() drift would order the '
                 'batch by commit sequence instead of falling through to CPM'
             )
         finally:
