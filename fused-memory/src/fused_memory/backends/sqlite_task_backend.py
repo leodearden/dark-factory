@@ -2140,6 +2140,7 @@ class SqliteTaskBackend:
         *,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping/clearing the claimant columns.
 
@@ -2164,6 +2165,23 @@ class SqliteTaskBackend:
         mismatch (the write silently didn't take) returns an explicit
         ``{'success': False, 'error': 'status_write_not_persisted', ...}``
         error dict instead of a false success.
+
+        Stamps ``metadata.pending_since`` on a ``pending`` landing (task 3816,
+        PRD §C1) via :func:`stamp_pending_since`, which owns the whole
+        transition table: stamp when absent, overwrite ONLY on
+        ``cancelled -> pending`` (D3), leave a present anchor alone on any
+        other origin, and never clear it on an exit. Inside the same ``_txn``
+        as the status column, so the anchor and the status commit or roll back
+        together. The metadata column is appended to the UPDATE only when a
+        stamp is genuinely owed, so every non-stamping transition emits the
+        same SQL it did before task 3816.
+
+        ``pending_since_now`` supplies the stamp's clock. ``None`` (the
+        default, and every single-id caller) means "compute ``_now()`` here".
+        The interceptor's CSV branch passes ONE value for the whole batch so a
+        ``commit_planning`` commit lands identical anchors and intra-batch
+        order falls through to CPM then numeric id (PRD rule 5) instead of
+        being decided by millisecond commit sequence.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -2177,7 +2195,7 @@ class SqliteTaskBackend:
         try:
             async with self._write_lock(project_root), self._txn(project_root) as conn:
                 cursor = await conn.execute(
-                    'SELECT status, candidate_key FROM tasks WHERE tag = ? AND id = ?',
+                    'SELECT status, metadata, candidate_key FROM tasks WHERE tag = ? AND id = ?',
                     (tag, tid),
                 )
                 row = await cursor.fetchone()
@@ -2191,6 +2209,26 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, _now()]
+                # Wait anchor (task 3816, PRD §C1). Appended only when a
+                # stamp is owed, so the overwhelming majority of status
+                # writes -- every `pending` exit, and every re-entry whose
+                # anchor is already present -- emit byte-identical SQL to a
+                # pre-3816 write. The stamp is assembled HERE rather than in
+                # the shared `_write_status_and_verify` tail, which receives
+                # `set_columns`/`set_values` already built and holds neither
+                # `old_status` nor the row metadata: stamping there would
+                # mean string-matching 'metadata = ?' and patching a
+                # positionally-parallel list.
+                stamped = stamp_pending_since(
+                    row['metadata'],
+                    old_status=old_status,
+                    new_status=status,
+                    now=pending_since_now or _now(),
+                    project_root=project_root, tag=tag, task_id=tid,
+                )
+                if stamped is not None:
+                    set_columns.append('metadata = ?')
+                    set_values.append(stamped)
                 persisted_status = await self._write_status_and_verify(
                     conn,
                     set_columns=set_columns,
