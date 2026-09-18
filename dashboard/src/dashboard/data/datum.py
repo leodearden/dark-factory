@@ -21,9 +21,21 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Generic, TypeVar
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
+
+
+@runtime_checkable
+class WireShaped(Protocol):
+    """A payload that knows its own wire shape.
+
+    :meth:`Datum.to_wire` delegates to this when the payload satisfies it. A
+    declared Protocol rather than a bare ``hasattr`` check because it is
+    self-documenting and pyright-visible.
+    """
+
+    def to_wire(self) -> dict[str, object]: ...
 
 
 class DatumState(enum.StrEnum):
@@ -63,9 +75,19 @@ class Datum(Generic[T]):
     freshness_bound_seconds: int
 
     def to_wire(self) -> dict[str, object]:
-        """Render the five contract keys as JSON-serialisable values."""
+        """Render the five contract keys as JSON-serialisable values.
+
+        A payload satisfying :class:`WireShaped` renders itself; anything else
+        passes through unchanged.
+
+        Note that ``datum.py`` imports NOTHING from ``census.py`` — the
+        dependency runs the other way. The Protocol is what keeps the envelope
+        and its payload families orthogonal: a new payload family is added by
+        writing a ``to_wire()`` beside its own type, never by adding a branch
+        here.
+        """
         return {
-            'value': self.value,
+            'value': self.value.to_wire() if isinstance(self.value, WireShaped) else self.value,
             'as_of': None if self.as_of is None else self.as_of.isoformat(),
             'state': self.state.value,
             'reason': self.reason,
