@@ -60,6 +60,7 @@ via the fully-qualified path, consistent with the ``task_statuses`` /
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -69,6 +70,9 @@ __all__ = [
     'IncompleteEnumeration',
     'ParamsMismatch',
     'RatchetError',
+    'excess',
+    'slack',
+    'tighten',
 ]
 
 # The JSON scalar types a params value may be, or be a tuple of.  Not a
@@ -227,3 +231,43 @@ def _normalised_param(key: str, value: object) -> object:
         'verbatim, so a value JSON cannot express would make every later comparison refuse '
         'with a spurious params mismatch.'
     )
+
+
+def excess(current: Enumeration, baseline: Enumeration) -> Counter[str]:
+    """What *current* has beyond *baseline* — the VIOLATION REPORT.
+
+    Empty means the gate passes: equality and shrinkage are both green, and
+    ``Counter``'s saturating ``-`` drops non-positive results, so neither needs
+    a clamp.
+
+    Its keys may include keys the baseline never had.  That is not a leak in
+    the no-add-key property — it IS the finding, and the caller renders it as
+    one.  Nothing in this module ever writes a report back to a baseline.
+    """
+    return Counter(current.counts) - Counter(baseline.counts)
+
+
+def slack(current: Enumeration, baseline: Enumeration) -> Counter[str]:
+    """What *baseline* still permits and *current* does not use — the HEADROOM.
+
+    Non-empty slack is what files a tighten task: an un-tightened baseline lets
+    an identical line in where one was removed, so the headroom is a standing
+    invitation nobody meant to leave open.  The mirror of :func:`excess`, and
+    saturating for the same reason.
+    """
+    return Counter(baseline.counts) - Counter(current.counts)
+
+
+def tighten(current: Enumeration, baseline: Enumeration) -> Counter[str]:
+    """The pointwise minimum — THE ONLY baseline-producing function.
+
+    ``Counter.__and__`` IS the pointwise minimum, so the result's keys are a
+    subset of the baseline's by construction.  That is how "no function can add
+    a key to an existing baseline" is enforced STRUCTURALLY rather than by a
+    check someone could forget to call: a key absent from the baseline has
+    multiplicity 0 there, and the minimum of anything and 0 is 0.
+
+    Idempotent by the same property: tightening against an already-tightened
+    baseline changes nothing.
+    """
+    return Counter(current.counts) & Counter(baseline.counts)

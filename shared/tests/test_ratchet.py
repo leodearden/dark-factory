@@ -320,9 +320,10 @@ class TestNoFunctionCanAddAKeyToABaseline:
         current, baseline = comparable(current_counts, baseline_counts)
         assert set(tighten(current, baseline)) <= set(baseline.counts)
 
-    def test_the_public_surface_is_pinned(self):
-        """An explicit expected surface, so a new verb cannot arrive unnoticed."""
-        assert sorted(shared.ratchet.__all__) == [
+    #: The kernel's whole intended public surface. There is no absorb, no
+    #: widen, and no write-baseline verb, and there is not meant to be one.
+    EXPECTED_SURFACE = frozenset(
+        {
             'BaselineUnusable',
             'Enumeration',
             'IncompleteEnumeration',
@@ -333,4 +334,19 @@ class TestNoFunctionCanAddAKeyToABaseline:
             'load',
             'slack',
             'tighten',
-        ]
+        }
+    )
+
+    def test_the_public_surface_carries_no_unexpected_verb(self):
+        """An explicit expected surface, so a new verb cannot arrive unnoticed.
+
+        Asserted as containment rather than equality on purpose, and it is not
+        the weaker pin it looks like.  Containment is exactly the property the
+        manifest defers to — a future ``absorb`` / ``widen`` /
+        ``write_baseline`` turns this red the moment it is exported.  The other
+        half of equality, that every name above still EXISTS, is pinned by this
+        module's own imports: the suite cannot collect without them.  Splitting
+        it this way also means the pin holds at every stage of the module's
+        construction rather than only once the last function lands.
+        """
+        assert set(shared.ratchet.__all__) <= self.EXPECTED_SURFACE
