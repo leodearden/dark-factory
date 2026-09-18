@@ -13810,3 +13810,71 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
         })
         await service.replay_from_store(source_project_id='test')
         assert self._batched_refs(service) == [self.REIFY_REF]
+
+
+class TestSetKnownProjectsLogsTheWireUp:
+    """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
+
+    `set_known_projects` is the single injection point every caller goes
+    through (`server/main.py` plus tests), so a future second caller cannot
+    bypass the report by wiring the registry somewhere else.
+
+    The PERMISSIVE arm is logged too, and is the one an operator most needs:
+    `MemoryService` is constructed before `build_known_projects_map` runs, so
+    an empty registry is a real and easily-missed window — and while it lasts,
+    every producer scan silently stays permissive.
+    """
+
+    @staticmethod
+    def _records(caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'narrow' in r.getMessage().lower()
+        ]
+
+    @staticmethod
+    def _fields(record: logging.LogRecord) -> dict:
+        """The structured payload, not a prose sentence an operator must parse.
+
+        Mirrors the sibling `logger.info` in `_verify_episode_referents`'
+        unregistered-qualifier arm: a message template plus ONE dict argument.
+        """
+        assert record.args, f'no structured argument on the wire-up record: {record!r}'
+        fields = record.args[0] if isinstance(record.args, tuple) else record.args
+        assert isinstance(fields, dict), f'expected a structured dict, got {fields!r}'
+        return fields
+
+    def test_a_populated_registry_reports_narrowing_active(self, service, caplog):
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects({f'proj{n}': f'/root/proj{n}' for n in range(9)})
+
+        records = self._records(caplog)
+        assert len(records) == 1, records
+        fields = self._fields(records[0])
+        assert fields['known_project_count'] == 9
+        assert fields['referent_narrowing'] == 'active'
+
+    @pytest.mark.parametrize('registry', [{}, None], ids=['empty', 'none'])
+    def test_an_unpopulated_registry_still_reports_and_says_permissive(
+        self, service, caplog, registry
+    ):
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects(registry)
+
+        records = self._records(caplog)
+        assert len(records) == 1, records
+        fields = self._fields(records[0])
+        assert fields['known_project_count'] == 0
+        assert fields['referent_narrowing'] == 'permissive'
+
+    def test_a_rewire_reports_the_last_call_not_a_stale_one(self, service, caplog):
+        """Called twice, the second report describes the state the second call
+        left behind — a re-wire must not read stale."""
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects({'proj1': '/root/proj1'})
+            service.set_known_projects({})
+
+        records = self._records(caplog)
+        assert len(records) == 2, records
+        assert self._fields(records[-1])['known_project_count'] == 0
+        assert self._fields(records[-1])['referent_narrowing'] == 'permissive'
