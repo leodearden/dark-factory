@@ -1275,3 +1275,200 @@ class TestOnJudgeUnhalt:
             r.getMessage() for r in caplog.records if r.name == logger_name
         )
         assert 'nope' in text
+
+
+# ── Fold isolation: what the fingerprint must keep apart ──────────────────
+
+
+class TestFoldIsolation:
+    """The invariant the whole fold mechanism is answerable for.
+
+    Before this change, per-kind independence rested only on the separate
+    rate-limit buckets. Now it also rests on ``kind`` sitting in the dedupe
+    fingerprint, and per-project independence rests on ``project_id`` sitting
+    there too. All three kinds carry ``category='infra_issue'``, so the
+    category alone separates nothing — these tests are what fails if anyone
+    simplifies the key back to the default ``summary_dedupe_key``, whose
+    first-three-token key is identical for every project.
+
+    Driven entirely through the public surface: no test reaches into
+    ``_maybe_write_escalation``.
+    """
+
+    @staticmethod
+    def _pending(esc_dir: Path) -> dict[str, dict]:
+        """Every pending record in ``esc_dir``, keyed by id."""
+        out = {}
+        for path in sorted(esc_dir.glob('esc-*.json')):
+            body = json.loads(path.read_text(encoding='utf-8'))
+            if body.get('status') == 'pending':
+                out[body['id']] = body
+        return out
+
+    @pytest.mark.asyncio
+    async def test_judge_halt_does_not_fold_into_a_pending_backlog_parent(
+        self, event_buffer, tmp_path,
+    ):
+        """A halt is its own fault class — it must never be absorbed as backlog
+        noise, even inside the backlog's rate-limit window. Task 2920 (a), now
+        enforced by the key rather than only by the separate buckets."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        clock = {'now': 1_000_000.0}
+
+        def now() -> float:
+            return clock['now']
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=now,
+        )
+        backlog_verdict = await policy.check('proj', project_root=str(project_root))
+        # No clock advance: the halt arrives INSIDE the backlog's window.
+        halt_verdict = await policy.on_judge_halt('proj', reason='serious verdict')
+
+        assert backlog_verdict.outcome == 'escalated'
+        assert halt_verdict.outcome == 'escalated'
+        assert halt_verdict.escalation_path is not None
+        assert halt_verdict.escalation_path != backlog_verdict.escalation_path
+
+        esc_dir = project_root / 'data' / 'escalations'
+        pending = self._pending(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+
+        backlog_ids = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
+        halt_ids = [i for i in pending if i.startswith('esc-reconciliation-halt-')]
+        assert len(backlog_ids) == 1, sorted(pending)
+        assert len(halt_ids) == 1, sorted(pending)
+
+        assert pending[halt_ids[0]]['error_type'] == 'ReconciliationJudgeHalted'
+        # The halt was filed as its OWN record, not counted onto the backlog.
+        assert pending[backlog_ids[0]]['dedupe_count'] == 0
+        assert pending[halt_ids[0]]['dedupe_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_two_projects_over_limit_do_not_fold_into_each_other(
+        self, event_buffer, tmp_path,
+    ):
+        """Two projects sharing ONE escalation directory keep separate records.
+
+        Cross-folding projects is the one unrecoverable failure mode: the
+        merged record can attribute its condition to neither. This is the test
+        that fails if the content fingerprint is swapped for the default
+        summary key, since 'Reconciliation backlog exceeded for <any project>'
+        normalises to the same first three tokens.
+        """
+        await _seed_buffered(event_buffer, 'proj_a', n=12)
+        await _seed_buffered(event_buffer, 'proj_b', n=12)
+        # ONE tree, so both projects' records land in the same directory and a
+        # cross-fold is actually reachable rather than prevented by isolation.
+        shared_root = tmp_path / 'shared_root'
+        shared_root.mkdir()
+        clock = {'now': 1_000_000.0}
+
+        def now() -> float:
+            return clock['now']
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=now,
+        )
+        # The 1s offsets are LOAD-BEARING, not cosmetic. The escalation id is
+        # derived from ``kind`` and the clock alone (``_ESC_ID_PREFIXES`` +
+        # isoformat), with nothing project-scoped in it, so two projects
+        # escalating at the SAME clock reading mint the same id and the second
+        # submit overwrites the first at the same path. That id collision
+        # predates this fold mechanism (it is byte-identical at base
+        # 63a2984c65) and is unreachable in production, where ``time.time()``
+        # resolves to microseconds; a frozen test clock is what makes it
+        # certain. Offsetting keeps this test measuring FOLD isolation instead
+        # of that collision — see the follow-up filed for the id scheme.
+        await policy.check('proj_a', project_root=str(shared_root))
+        clock['now'] += 1.0
+        await policy.check('proj_b', project_root=str(shared_root))
+        clock['now'] += 901.0
+        v_a = await policy.check('proj_a', project_root=str(shared_root))
+        clock['now'] += 1.0
+        v_b = await policy.check('proj_b', project_root=str(shared_root))
+        assert v_a.escalation_path != v_b.escalation_path
+
+        esc_dir = shared_root / 'data' / 'escalations'
+        pending = self._pending(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        by_project = {body['project_id']: body for body in pending.values()}
+        assert set(by_project) == {'proj_a', 'proj_b'}
+        # Each project folded its OWN second window into its OWN parent.
+        assert by_project['proj_a']['dedupe_count'] == 1
+        assert by_project['proj_b']['dedupe_count'] == 1
+        # The keys that kept them apart are genuinely distinct.
+        assert (
+            by_project['proj_a']['dedupe_fingerprint']
+            != by_project['proj_b']['dedupe_fingerprint']
+        )
+
+    @pytest.mark.asyncio
+    async def test_unstamped_foreign_infra_issue_l1_is_never_a_fold_parent(
+        self, event_buffer, tmp_path,
+    ):
+        """An agent-filed infra_issue L1 shares this policy's category and
+        level, but carries no ``dedupe_fingerprint`` — so it keys to None,
+        which can never equal the policy's own fingerprint. (Symmetrically, an
+        unstamped CANDIDATE is short-circuited by find_dedupe_parent's falsy-key
+        guard.) Nothing outside this policy can be absorbed into its records.
+        """
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        esc_dir = project_root / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+
+        foreign_id = 'esc-4242-1'
+        foreign_path = esc_dir / f'{foreign_id}.json'
+        # The shape every agent-filed escalate_blocker has: no
+        # dedupe_fingerprint key at all.
+        foreign_path.write_text(
+            json.dumps({
+                'id': foreign_id,
+                'task_id': '4242',
+                'agent_role': 'implementer',
+                'severity': 'blocking',
+                'category': 'infra_issue',
+                'summary': 'Reconciliation backlog exceeded for proj: 99/10',
+                'detail': 'filed by an agent, not by this policy',
+                'suggested_action': 'drain_reconciliation',
+                'timestamp': '2026-07-28T00:00:00+00:00',
+                'status': 'pending',
+                'level': 1,
+            }, indent=2),
+            encoding='utf-8',
+        )
+        before = foreign_path.read_text(encoding='utf-8')
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+        )
+        verdict = await policy.check('proj', project_root=str(project_root))
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is not None
+        assert Path(verdict.escalation_path).name != foreign_path.name
+
+        pending = self._pending(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        own = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
+        assert len(own) == 1, sorted(pending)
+
+        # The foreign record is not merely un-folded — it is untouched.
+        assert foreign_path.read_text(encoding='utf-8') == before
+        assert pending[foreign_id].get('dedupe_count', 0) == 0
