@@ -2309,6 +2309,27 @@ async def _run(
     Note that ``_run`` passes no ``timeout``: callers that want one wrap this
     call in their own ``asyncio.wait_for``, and that cancellation path is
     exactly what the kill+reap above covers.
+
+    CONCURRENCY: UNBOUNDED, deliberately (``bounded=False``).  ``run_git``
+    offers a per-loop spawn bound sized for fused-memory's live-workflow
+    fan-out — short-lived git probes, hundreds of them.  ``_run`` is not that
+    caller and must not share that queue.  It is the orchestrator's general
+    subprocess runner: ``delivered_checks.run_script_check`` puts
+    operator-supplied SCRIPT checks through it and gathers them CONCURRENTLY,
+    ``merge_skew_tripwire`` runs its config-driven oracle command through it,
+    and ``verify`` runs ``scripts/verify-pipeline-guard.sh``.  Two things break
+    if those share an 8-slot queue with every merge-lane and scheduler git
+    call.  (1) The semaphore is acquired INSIDE ``run_git``, so queue time
+    lands inside each caller's own ``asyncio.wait_for`` window: a delivered
+    check that would pass gets reported ERRORED, and the tripwire oracle fails
+    open — contention rendered as a verdict.  (2) ``merge_skew_tripwire``
+    deliberately ABANDONS a timed-out oracle task because its kill+reap "can
+    vastly outlast timeout_secs"; an abandoned task would hold a global slot
+    for that whole period, so a few hung oracles could head-of-line block the
+    merge lane — against that module's own I6 ("never block/delay the
+    advance").  The orchestrator never had such a bound and does not acquire
+    one here; ``test_a_long_running_script_cannot_delay_a_concurrent_git_call``
+    pins that.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
@@ -2316,7 +2337,7 @@ async def _run(
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
     try:
-        result = await run_git(cmd, cwd, input_text=input_text)
+        result = await run_git(cmd, cwd, input_text=input_text, bounded=False)
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
         # Re-classify as WorktreeMissing if cwd is now gone; otherwise the

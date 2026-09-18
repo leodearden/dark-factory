@@ -21,7 +21,7 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
-from shared.git_async import GitResult
+from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 
 from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
@@ -13945,6 +13945,79 @@ class TestRunDelegatesToSharedGitAsync:
             await _run(['git', 'status'], cwd=tmp_path)
 
         assert not isinstance(exc.value, WorktreeMissing)
+
+    async def test_a_long_running_script_cannot_delay_a_concurrent_git_call(
+        self,
+    ) -> None:
+        """``_run`` opts OUT of the shared per-loop spawn bound.
+
+        ``run_git``'s ``MAX_CONCURRENT_SPAWNS`` bound is sized for
+        fused-memory's live-workflow fan-out (hundreds of short-lived git
+        probes).  ``_run`` is the orchestrator's GENERAL subprocess runner:
+        ``delivered_checks`` puts operator-supplied script checks through it
+        and gathers them concurrently, ``merge_skew_tripwire`` runs its oracle
+        through it, and it also runs every merge-lane and scheduler git call.
+        If those shared one 8-slot queue, a handful of slow or abandoned
+        scripts would head-of-line block the merge lane.
+
+        Causal, not wall-clock: the fake children stay alive until an Event
+        this test controls, so the git call can only have spawned by NOT
+        having queued behind them.
+        """
+        released = asyncio.Event()
+        spawned: list[str] = []
+
+        class _Blocking:
+            returncode = 0
+
+            def __init__(self, tag: str) -> None:
+                self._tag = tag
+
+            async def communicate(self, input: bytes | None = None):  # noqa: A002
+                spawned.append(self._tag)
+                await released.wait()
+                return b'', b''
+
+            def kill(self) -> None:
+                return None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def _fake_spawn(*args: object, **kwargs: object) -> object:
+            return _Blocking('git' if args and args[0] == 'git' else 'script')
+
+        # Comfortably more scripts than the shared bound, so a bound that
+        # applied here would certainly be saturated.
+        script_count = MAX_CONCURRENT_SPAWNS * 2
+
+        with patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+            scripts = [
+                asyncio.create_task(_run(['sh', '-c', 'sleep forever']))
+                for _ in range(script_count)
+            ]
+            git_call = asyncio.create_task(_run(['git', 'rev-parse', 'HEAD']))
+            try:
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while (
+                    'git' not in spawned
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+
+                assert spawned.count('script') == script_count, (
+                    'script checks queued on a spawn bound _run must not have'
+                )
+                assert 'git' in spawned, (
+                    'the git call never spawned: _run is queueing behind '
+                    'long-running script children (it must pass bounded=False)'
+                )
+            finally:
+                released.set()
+                await asyncio.wait_for(
+                    asyncio.gather(git_call, *scripts, return_exceptions=True),
+                    timeout=5,
+                )
 
 class TestGitOpsHoldsNoSecondSpawnPrimitive:
     """Source-level guard against a REGROWN duplicate of the spawn primitive.

@@ -28,6 +28,31 @@ child's whole RUNTIME. What bounds the residual fork cost is
 on one loop, so a caller that fans out over hundreds of tasks cannot
 convert its fan-out directly into loop-thread fork storms.
 
+WHO SHOULD OPT OUT OF THE BOUND (``bounded=False``). The bound is sized for
+what it was built for: SHORT-LIVED git probes issued in a wide fan-out. It
+is a shared queue, so anything that holds a slot for a long time starves
+everything else on that loop. Two kinds of caller must therefore opt out:
+
+  - callers whose child is not a quick git query at all. ``git_ops._run``
+    is the live example — besides git it runs operator-supplied
+    ``delivered_checks`` SCRIPT checks (gathered CONCURRENTLY), the
+    ``merge_skew_tripwire`` oracle command, and ``verify-pipeline-guard.sh``.
+    Parking those in an 8-slot queue shared with every merge-lane and
+    scheduler git call would let a handful of slow scripts head-of-line
+    block the merge lane.
+  - callers that already impose their OWN deadline from outside. The
+    semaphore is acquired INSIDE this function, so queue time lands inside
+    any caller-side ``asyncio.wait_for`` window: a bounded call can be
+    reported as timed-out purely from contention, never having spawned.
+    ``merge_skew_tripwire`` fails OPEN on that (oracle disabled) and
+    ``delivered_checks`` reports ERRORED — both would be contention
+    masquerading as a verdict. (This function's OWN *timeout* is unaffected:
+    it starts after the slot is acquired and so measures the child only.)
+
+Opting out is not a loophole to reach for when a bounded caller feels slow.
+A fan-out caller that opts out is back to the task-3778 defect this module
+exists to prevent.
+
 LOCALE IS LOAD-BEARING. ``LC_ALL=C``/``LANG=C`` are forced in the child so
 git always emits English-locale diagnostics. ``git_ops._git_clean_failure_
 is_benign`` substring-matches that English warning text; under a translated
@@ -131,6 +156,7 @@ async def run_git(
     *,
     input_text: str | None = None,
     timeout: float | None = None,
+    bounded: bool = True,
 ) -> GitResult:
     """Spawn *cmd* asynchronously and return its :class:`GitResult`.
 
@@ -147,11 +173,20 @@ async def run_git(
         a non-zero returncode) rather than raised — see "fail-open vs raise"
         in the module docstring. ``None`` waits indefinitely.
 
-    :raises FileNotFoundError: the binary (or *cwd*) does not exist.
+    :param bounded: whether this call counts against the per-loop spawn
+        bound. ``True`` (the default) is for FAN-OUT callers — at most
+        :data:`MAX_CONCURRENT_SPAWNS` such calls are in flight per event
+        loop and the excess waits on the semaphore. ``False`` opts out
+        entirely: the spawn happens immediately and occupies no slot. See
+        "who should opt out" in the module docstring — the short version is
+        that the bound is sized for short-lived git probes, so a caller
+        whose children are long-lived or operator-supplied must pass
+        ``False`` rather than park them in the probes' queue.
 
-    Concurrency: at most :data:`MAX_CONCURRENT_SPAWNS` calls are in flight
-    per event loop; excess callers wait on the semaphore.
+    :raises FileNotFoundError: the binary (or *cwd*) does not exist.
     """
+    if not bounded:
+        return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
     async with _semaphore_for_running_loop():
         return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
 

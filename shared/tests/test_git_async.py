@@ -17,6 +17,7 @@ bodies need no ``@pytest.mark.asyncio`` marker.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
@@ -216,3 +217,129 @@ def test_semaphore_is_resolved_per_running_loop() -> None:
 
     assert first.returncode == 0
     assert second.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# (i) the bound is opt-OUT-able, and opting out shares no queue with it
+# ---------------------------------------------------------------------------
+
+
+async def _settle_until(predicate, timeout: float = 2.0) -> None:
+    """Yield to the loop until *predicate* holds, or *timeout* elapses.
+
+    Bounded so that a REGRESSION (a call that queues when it should not)
+    reports as the assertion that follows, rather than parking the loop
+    until pytest-timeout kills the whole test.
+    """
+    async def _spin() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(_spin(), timeout=timeout)
+
+
+class _BlockingProc:
+    """A spawned child that stays alive until *released* is set."""
+
+    pid = -1
+
+    def __init__(self, released: asyncio.Event, entered: list[str], tag: str) -> None:
+        self.returncode = 0
+        self._released = released
+        self._entered = entered
+        self._tag = tag
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002
+        self._entered.append(self._tag)
+        await self._released.wait()
+        return b'', b''
+
+    def kill(self) -> None:
+        return None
+
+    async def wait(self) -> int:
+        return 0
+
+
+async def test_bounded_false_spawns_without_taking_a_slot() -> None:
+    """``bounded=False`` must not queue behind a saturated bound.
+
+    Causal, not wall-clock: the bounded blockers are held open by an Event
+    that is never set until the assertion has been made, so the unbounded
+    call can only have reached the spawn by NOT having queued.  If it took a
+    slot this would hang rather than fail slowly.
+    """
+    released = asyncio.Event()
+    entered: list[str] = []
+
+    async def _fake_spawn(*args: object, **kwargs: object) -> _BlockingProc:
+        argv = args[0] if args else ''
+        return _BlockingProc(released, entered, 'free' if argv == 'free' else 'blocker')
+
+    with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+        blockers = [
+            asyncio.create_task(run_git(['git', 'status']))
+            for _ in range(MAX_CONCURRENT_SPAWNS)
+        ]
+        free = asyncio.create_task(run_git(['free'], bounded=False))
+        # One more BOUNDED call, to pin that the bound still binds for it.
+        queued = asyncio.create_task(run_git(['git', 'status']))
+        pending = [free, queued, *blockers]
+        try:
+            await _settle_until(
+                lambda: entered.count('blocker') >= MAX_CONCURRENT_SPAWNS,
+            )
+            await asyncio.wait_for(asyncio.sleep(0.05), timeout=1)
+
+            assert 'free' in entered, (
+                'the bounded=False call never spawned: it queued on the semaphore'
+            )
+            assert entered.count('blocker') == MAX_CONCURRENT_SPAWNS, (
+                'the bound stopped binding for ordinary bounded callers'
+            )
+            assert not queued.done()
+        finally:
+            # Unblock every fake child unconditionally, so an assertion
+            # failure fails FAST instead of leaving the loop parked on tasks
+            # that can never complete.
+            released.set()
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=5,
+            )
+
+
+async def test_bounded_calls_do_not_queue_behind_unbounded_ones() -> None:
+    """The converse: an unbounded long-lived child must not consume the bound.
+
+    Otherwise opting out would merely move the starvation — an operator
+    script held open forever would still eat a probe's slot.
+    """
+    released = asyncio.Event()
+    entered: list[str] = []
+
+    async def _fake_spawn(*args: object, **kwargs: object) -> _BlockingProc:
+        return _BlockingProc(released, entered, 'any')
+
+    with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+        unbounded = [
+            asyncio.create_task(run_git(['slow-script'], bounded=False))
+            for _ in range(MAX_CONCURRENT_SPAWNS * 2)
+        ]
+        probes = [
+            asyncio.create_task(run_git(['git', 'status']))
+            for _ in range(MAX_CONCURRENT_SPAWNS)
+        ]
+        try:
+            await _settle_until(lambda: len(entered) >= MAX_CONCURRENT_SPAWNS * 2)
+            await asyncio.wait_for(asyncio.sleep(0.05), timeout=1)
+
+            assert len(entered) == MAX_CONCURRENT_SPAWNS * 3, (
+                'bounded probes were starved by unbounded children holding slots'
+            )
+        finally:
+            released.set()
+            await asyncio.wait_for(
+                asyncio.gather(*unbounded, *probes, return_exceptions=True),
+                timeout=5,
+            )
