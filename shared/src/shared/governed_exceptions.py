@@ -52,6 +52,7 @@ pins.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -62,13 +63,18 @@ __all__ = [
     'Disposition',
     'GovernedList',
     'INLINE_MARKER_FORMS',
+    'MalformedDeclaration',
     'MalformedDisposition',
     'Policy',
     'TaskRef',
     'TicketRef',
+    'UndisposedException',
     'governed_exceptions',
     'parse_disposition_marker',
 ]
+
+# A dotted, globally unique list id: non-empty segments joined by single dots.
+_LIST_ID_RE = re.compile(r'^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$')
 
 # THE OPERAND PATTERNS, each written once and consumed twice — by the
 # dataclass that validates a hand-written value, and by the marker form that
@@ -352,6 +358,59 @@ the grammar; ``shared/tests/test_governed_exceptions.py`` asserts the
 exception's message really carries every form."""
 
 
+class MalformedDeclaration(Exception):
+    """A declaration is broken, so nothing about it can be judged.
+
+    An INSTRUMENT failure — exit 2 downstream, and the operator fixes the
+    declaration rather than the code it governs.  Deliberately shares no base
+    class with :class:`UndisposedException`: that one is the invariant
+    violation itself (exit 1), and a single ``except`` that caught both would
+    report a real INV-12 breach as a broken tool, which is the conflation the
+    two exit codes exist to prevent.
+
+    Attributes:
+        value: The offending value, verbatim, for the caller to render.
+    """
+
+    def __init__(self, message: str, *, value: object) -> None:
+        self.value = value
+        super().__init__(message)
+
+
+class UndisposedException(Exception):
+    """A governed entry has no disposition — the INV-12 violation itself.
+
+    Exit 1 downstream, and the fix is an agent's: add an override, or increment
+    the count beside the disposition the entry is borrowing.
+
+    Attributes:
+        list_id: The declaring list.
+        keys: The undisposed keys, sorted.
+        covered: How many keys actually have no override.
+        default_covers: How many the declaration says the default covers, or
+            ``None`` when there is no default.
+    """
+
+    def __init__(
+        self,
+        *,
+        list_id: str,
+        keys: tuple[str, ...],
+        covered: int,
+        default_covers: int | None,
+    ) -> None:
+        self.list_id = list_id
+        self.keys = keys
+        self.covered = covered
+        self.default_covers = default_covers
+        super().__init__(
+            f'governed_exceptions: {list_id} declares default_covers={default_covers}, but '
+            f'{covered} key(s) have no override — these are undisposed: {list(keys)}. Add an '
+            'override for each, or increment default_covers beside the disposition they '
+            'borrow. Accepted forms:\n  ' + '\n  '.join(DECLARATION_FORMS)
+        )
+
+
 @dataclass(frozen=True)
 class GovernedList:
     """One governed exception list, with a disposition reachable for every key.
@@ -437,12 +496,121 @@ def governed_exceptions(
     ``dispositions`` defaults to an empty ``MappingProxyType`` rather than
     ``{}``: ruff's B006 forbids a mutable default, and the immutable proxy is
     the shape the field stores anyway.
+
+    THE ONE COUNT RULE, recorded here so a later reader does not re-split it
+    into two.  Let ``covered`` be the number of keys with no override, and
+    ``declared`` be ``default_covers`` when a default is present and ``0``
+    otherwise.  Then:
+
+    * ``declared == covered`` — every entry has a disposition.  Accept.
+    * ``covered > declared`` — entries beyond the declared count are genuinely
+      undisposed.  :class:`UndisposedException` (exit 1): an agent adds an
+      override or increments the literal.
+    * ``covered < declared`` — the literal over-claims.  No entry's disposition
+      is broken; the list merely shrank without the count following.
+      :class:`MalformedDeclaration` (exit 2): fix the instrument.
+
+    That single invariant is what makes boundary scenario 12 — a defaulted list
+    that gains a key with ``default_covers`` unchanged — fall out rather than
+    be special-cased, and treating a list with no default as ``declared = 0``
+    is what folds the plain missing-override case into the same arm.  Two
+    separate checks with a bespoke branch for scenario 12 would put the same
+    fact in two places and invite them to drift.
+
+    Raises:
+        MalformedDeclaration: the declaration itself is broken (exit 2).
+        UndisposedException: the declaration is well formed and an entry has no
+            disposition (exit 1).  The two are checked in that order, and the
+            order is load-bearing: a duplicate key makes every count downstream
+            of it meaningless, so reporting undisposed keys first would hand
+            back a wall of noise whose one real cause is a line the reader can
+            see.
     """
-    return GovernedList(
+    if not isinstance(list_id, str) or not _LIST_ID_RE.match(list_id):
+        raise MalformedDeclaration(
+            f'governed_exceptions: list_id={list_id!r} must be a dotted, globally unique '
+            "id such as 'orchestrator.tests.timeout_marker_grandfathered' — non-empty "
+            'segments joined by single dots.',
+            value=list_id,
+        )
+    if not isinstance(rule, str) or not rule.strip():
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} declares rule={rule!r}, but the rule is the '
+            'one sentence an operator judges a NEW entry against, so it cannot be blank.',
+            value=rule,
+        )
+
+    for key, disposition in dispositions.items():
+        if not isinstance(disposition, Debt | Policy):
+            raise MalformedDeclaration(
+                f'governed_exceptions: {list_id} gives key {key!r} the override '
+                f'{disposition!r}, which is not a Debt or a Policy. Accepted forms:\n  '
+                + '\n  '.join(DECLARATION_FORMS),
+                value=disposition,
+            )
+    if default is not None and not isinstance(default, Debt | Policy):
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} declares default={default!r}, which is not a '
+            'Debt or a Policy. Accepted forms:\n  ' + '\n  '.join(DECLARATION_FORMS),
+            value=default,
+        )
+
+    declared_keys = tuple(keys)
+    duplicates = sorted(key for key, count in Counter(declared_keys).items() if count > 1)
+    if duplicates:
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} declares {duplicates} more than once. A key '
+            'appears once, so that its disposition has one home and the counts below mean '
+            'something.',
+            value=duplicates,
+        )
+
+    strays = sorted(set(dispositions) - set(declared_keys))
+    if strays:
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} overrides {strays}, which the list does not '
+            'declare. An override restates its entry key, so a stray one means the entry '
+            'was removed or renamed and its disposition was left behind.',
+            value=strays,
+        )
+
+    if (default is None) != (default_covers is None):
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} declares default={default!r} and '
+            f'default_covers={default_covers!r}; both are present or both are absent. A '
+            'default with no count would cover an unbounded number of future entries '
+            'silently, which is the whole thing D4 makes the count a literal to prevent.',
+            value=(default, default_covers),
+        )
+
+    covered = len(declared_keys) - len(dispositions)
+    # A list with no default declares that it covers nothing by default, which is
+    # what folds the plain missing-override case into the same arm as scenario 12.
+    # Both-or-neither is enforced just above, so keying on default_covers here is
+    # the same predicate as keying on default — and the one a type checker follows.
+    declared = 0 if default_covers is None else default_covers
+    if covered == declared:
+        return GovernedList(
+            list_id=list_id,
+            rule=rule,
+            keys=declared_keys,
+            default=default,
+            default_covers=default_covers,
+            overrides=dispositions,
+        )
+
+    if covered < declared:
+        raise MalformedDeclaration(
+            f'governed_exceptions: {list_id} declares default_covers={default_covers} but '
+            f'only {covered} key(s) have no override. The list shrank and the literal was '
+            'not decremented — every remaining entry still has a disposition, so this is a '
+            'stale count, not a violation.',
+            value=default_covers,
+        )
+
+    raise UndisposedException(
         list_id=list_id,
-        rule=rule,
-        keys=tuple(keys),
-        default=default,
+        keys=tuple(sorted(set(declared_keys) - set(dispositions))),
+        covered=covered,
         default_covers=default_covers,
-        overrides=dispositions,
     )

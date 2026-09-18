@@ -473,18 +473,26 @@ class TestGovernedListAccepts:
         assert declaration.disposition_for(path) == Policy('inv12-day-one-test-doubles')
 
     def test_keys_are_a_tuple_in_declaration_order(self):
-        assert governed_exceptions(LIST_ID, RULE, ['z', 'a', 'm']).keys == ('z', 'a', 'm')
+        declaration = governed_exceptions(
+            LIST_ID, RULE, ['z', 'a', 'm'], default=Policy('inv12-x'), default_covers=3
+        )
+        assert declaration.keys == ('z', 'a', 'm')
 
     def test_accepts_any_iterable_of_keys(self):
         """The Contract types ``keys`` as an Iterable, not a list."""
-        assert governed_exceptions(LIST_ID, RULE, (k for k in ('a', 'b'))).keys == ('a', 'b')
+        declaration = governed_exceptions(
+            LIST_ID, RULE, (k for k in ('a', 'b')), default=Policy('inv12-x'), default_covers=2
+        )
+        assert declaration.keys == ('a', 'b')
 
 
 class TestGovernedListIsImmutable:
     """A declaration is a value: nothing downstream can edit one."""
 
     def test_is_frozen(self):
-        declaration = governed_exceptions(LIST_ID, RULE, ['a'])
+        declaration = governed_exceptions(
+            LIST_ID, RULE, ['a'], dispositions={'a': Policy('inv12-x')}
+        )
         with pytest.raises(dataclasses.FrozenInstanceError):
             declaration.rule = 'something else'  # type: ignore[misc]
 
