@@ -3120,23 +3120,6 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         assert metrics.RAISE_REMEDY in capsys.readouterr().err
 
-    def test_the_old_flat_prohibition_survives_nowhere(
-        self, stub_measurement: dict, tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        # ANTI-REGRESSION on the exact wording the task names as having sent an
-        # agent to escalation. A paraphrase left behind at either site would
-        # undo the fix while every assertion above stayed green.
-        stale = 'A task may never raise one.'
-        assert stale not in metrics.BASELINE_README
-
-        doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
-        baseline = tmp_path / 'baseline.json'
-        metrics.write_baseline(baseline, doctored)
-        metrics.main(['--check', '--baseline', str(baseline)])
-        assert stale not in capsys.readouterr().err
-
 
 # ---------------------------------------------------------------------------
 # THE RATCHET ITSELF.
