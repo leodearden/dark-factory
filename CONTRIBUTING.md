@@ -196,6 +196,24 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout, which every pyproject.toml in
+     the repo declares at the same value. Pinned by
+     tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
+     and this paragraph goes red until it is updated to match. -->
+  Every pytest config caps a single test at `540` seconds of WALL CLOCK (not CPU
+  time), a value DERIVED FROM MEASUREMENT rather than picked — see
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
+  the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
+  All eight configs carry it, the repo root included, so a bare root-bound
+  `pytest` is no longer uncapped: pytest reads exactly ONE inifile — the
+  rootdir's — and never merges across `pyproject.toml` files, so a member's
+  setting does nothing for a run rooted elsewhere. Opt a slow test up with
+  `@pytest.mark.timeout(N)`, but note that the marker OVERRIDES the budget in
+  both directions rather than raising a floor under it, so an `N` below the
+  value silently TIGHTENS the run — `orchestrator/tests/_orch_helpers.py`'s
+  constant block is the single home of that reasoning.
+<!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
      Mirrors the `ruff check` leg of `lint_command` in
      dark-factory-orchestrator.yaml. Pinned by
