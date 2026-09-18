@@ -16,10 +16,10 @@ from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
     ReferentRepairStats,
-    ReferentStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
 )
+from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
 # _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
@@ -5202,8 +5202,8 @@ class TestReconcileEpisodeIdentity:
         observable, not merely counted."""
         from _fm_helpers import MockAddEpisodeResult
 
-        from fused_memory.services.memory_service import ReferentFinding
         from fused_memory.utils.canonical_labels import Referent
+        from fused_memory.utils.referent_verification import ReferentFinding
 
         populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
         populated.findings.append(ReferentFinding(
