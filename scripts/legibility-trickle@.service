@@ -27,10 +27,15 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
 # The multi-account pool (task 5488). account_pool.build_pool resolves each
 # entry of config/usage-accounts.yaml (max-b..max-h) to its
-# CLAUDE_OAUTH_TOKEN_* value out of os.environ, so without these the gate
-# resolves ZERO accounts and falls back to ~/.claude/.credentials.json as an
-# account literally named 'default' -- one login for the whole night, which is
-# the failure this unit's 2026-09-14 stopgap drop-in was papering over.
+# CLAUDE_OAUTH_TOKEN_* value out of os.environ; resolve none of them and the
+# gate falls back to ~/.claude/.credentials.json as an account literally named
+# 'default' -- one login for the whole night, the failure this unit's
+# 2026-09-14 stopgap drop-in was papering over.
+# BELT AND BRACES, not the pool's only loader: build_pool's own load_dotenv
+# reads this same file, and measurably resolves all seven accounts with no
+# CLAUDE_OAUTH_TOKEN_* in the environment at all -- so deleting this line does
+# not strand the gate. It is kept so the unit states the dependency it runs on
+# instead of burying it in Python.
 # EnvironmentFile rather than a token pin: WHICH account each invocation uses
 # is the gate's decision, made per invocation, not this file's.
 EnvironmentFile=/home/leo/src/dark-factory/.env

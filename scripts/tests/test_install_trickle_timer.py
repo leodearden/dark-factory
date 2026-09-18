@@ -333,11 +333,13 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     must supply the account POOL and pin no single account out of it.
 
     Two positives and one negative, and the NEGATIVE is the load-bearing one.
-    `EnvironmentFile=` is how CLAUDE_OAUTH_TOKEN_B..H reach the process at all
-    -- `account_pool.build_pool` resolves each roster entry's token out of
-    os.environ, and a unit without them degrades to the ~/.claude fallback
-    account this task exists to remove. `UnsetEnvironment=ANTHROPIC_API_KEY`
-    is the other half: the CLI prefers an API key over the OAuth token, so a
+    `EnvironmentFile=` is belt and braces rather than the pool's lifeline --
+    measured: with no CLAUDE_OAUTH_TOKEN_* in the environment at all,
+    `build_pool`'s own `load_dotenv` of that same file resolves all seven
+    accounts, so deleting the directive does not strand the gate. It is
+    asserted so the unit states the dependency it runs on rather than burying
+    it in Python. `UnsetEnvironment=ANTHROPIC_API_KEY` is the half that
+    genuinely cannot move: the CLI prefers an API key over the OAuth token, so a
     key inherited from the manager's environment would silently authenticate
     every invocation as one identity while the failover still LOOKED like it
     worked. And re-pinning one account here -- which is exactly what the
@@ -348,8 +350,9 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
 
     env_files = _service_directive(service_text, "EnvironmentFile")
     assert env_files == [PRODUCTION_ENV_FILE], (
-        f"The trickle @.service must read the project .env so the gate can "
-        f"resolve the CLAUDE_OAUTH_TOKEN_* pool; got EnvironmentFile="
+        f"The trickle @.service must name the project .env as the source of "
+        f"the CLAUDE_OAUTH_TOKEN_* pool (build_pool loads it in-process too; "
+        f"the unit is where the dependency is stated); got EnvironmentFile="
         f"{env_files!r}"
     )
 
