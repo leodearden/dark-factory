@@ -18,16 +18,19 @@ instrument is the SCALAR ratchet idiom and is owned by other tasks; its
 conventions are matched here, its code is not reached for.
 
 TDD pair 1: the Enumeration value (GREEN on impl step-10).
+TDD pair 2: excess / slack / tighten + the no-add-key property (GREEN on impl step-12).
 """
 from __future__ import annotations
 
 import ast
 import dataclasses
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from shared.ratchet import Enumeration
+import shared.ratchet
+from shared.ratchet import Enumeration, excess, slack, tighten
 
 # Same src-root expression as shared/tests/conftest.py and
 # test_pure_stdlib_leaves.py — read the LOCAL tree, never an installed copy.
@@ -178,3 +181,156 @@ class TestModuleStructure:
             + '\n  '.join(offenders)
             + '\nPRD D4 requires that importing this module define things and do nothing else.'
         )
+
+
+def comparable(current_counts, baseline_counts, params=None):
+    """Two enumerations that differ only in their counts.
+
+    Every arithmetic test below builds its pair through this helper, so no test
+    accidentally exercises the comparability preconditions instead of the
+    arithmetic it names.
+    """
+    shared_params = PARAMS if params is None else params
+    return (
+        Enumeration(counts=current_counts, params=shared_params),
+        Enumeration(counts=baseline_counts, params=shared_params),
+    )
+
+
+class TestExcess:
+    """The violation report: what the current run has beyond the baseline."""
+
+    def test_reports_growth_and_new_keys(self):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1})
+        assert excess(current, baseline) == Counter({'a': 2, 'b': 1})
+
+    def test_equality_is_empty(self):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 3, 'b': 1})
+        assert excess(current, baseline) == Counter()
+
+    def test_shrinkage_is_empty_not_negative(self):
+        """Counter's saturating subtraction is what makes "lowering is fine" free."""
+        current, baseline = comparable({'a': 1}, {'a': 3, 'b': 2})
+        assert excess(current, baseline) == Counter()
+
+
+class TestSlack:
+    """The un-spent headroom: what the baseline still permits and nobody uses."""
+
+    def test_reports_the_unused_multiplicity(self):
+        current, baseline = comparable({'a': 1}, {'a': 3})
+        assert slack(current, baseline) == Counter({'a': 2})
+
+    def test_a_key_gone_from_current_shows_its_full_baseline_multiplicity(self):
+        current, baseline = comparable({'a': 1}, {'a': 1, 'gone': 4})
+        assert slack(current, baseline) == Counter({'gone': 4})
+
+    def test_equality_is_empty(self):
+        current, baseline = comparable({'a': 3}, {'a': 3})
+        assert slack(current, baseline) == Counter()
+
+
+class TestTighten:
+    """The only baseline-producing function: the pointwise minimum."""
+
+    def test_admits_no_new_key_and_drops_a_departed_one(self):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        assert tighten(current, baseline) == Counter({'a': 1})
+
+    def test_is_idempotent(self):
+        """The second ``--tighten`` of boundary scenario 5 changes nothing."""
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        tightened = Enumeration(counts=dict(tighten(current, baseline)), params=PARAMS)
+        assert tighten(current, tightened) == Counter(tightened.counts)
+
+
+class TestTheKernelIsAMultisetNotASet:
+    """Repeated multiplicities survive every operation.
+
+    Mirrors ``shared/tests/test_loop_blocking_gate.py::
+    test_ratchet_is_a_multiset_not_a_set``, and for the same reason: under set
+    semantics a SECOND site sharing a key with an already-blessed one slips in
+    silently.  D7 accepts that 67% of sites share a key with another site, so
+    multiplicity is the only thing standing between the baseline and a free
+    extra suppression per key.  Nobody "simplifies" this to sets.
+    """
+
+    def test_a_second_site_under_an_existing_key_is_excess(self):
+        current, baseline = comparable({'a': 2}, {'a': 1})
+        assert excess(current, baseline) == Counter({'a': 1})
+
+    def test_multiplicity_survives_slack_and_tighten(self):
+        current, baseline = comparable({'a': 2}, {'a': 5})
+        assert slack(current, baseline) == Counter({'a': 3})
+        assert tighten(current, baseline) == Counter({'a': 2})
+
+
+class TestOperationsAreSideEffectFree:
+    """All three return a fresh Counter and mutate neither argument."""
+
+    @pytest.mark.parametrize('operation', [excess, slack, tighten])
+    def test_arguments_are_unchanged(self, operation):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        operation(current, baseline)
+        assert dict(current.counts) == {'a': 3, 'b': 1}
+        assert dict(baseline.counts) == {'a': 1, 'c': 5}
+
+    @pytest.mark.parametrize('operation', [excess, slack, tighten])
+    def test_the_result_is_a_fresh_counter(self, operation):
+        current, baseline = comparable({'a': 3}, {'a': 1})
+        result = operation(current, baseline)
+        assert isinstance(result, Counter)
+        result['a'] = 99
+        assert dict(current.counts) == {'a': 3}
+        assert dict(baseline.counts) == {'a': 1}
+
+
+class TestNoFunctionCanAddAKeyToABaseline:
+    """The surface pin the capability manifest's `manual` check defers to.
+
+    The PRD's Contract says "no function can add a key to an existing
+    baseline".  That is asserted two ways here, because the property has two
+    halves.  ARITHMETICALLY, :func:`tighten` is the only baseline-producing
+    function and its keys are a subset of the baseline's by construction
+    (``Counter.__and__`` is the pointwise minimum), so the property is
+    structural rather than a check anyone could forget.  BY SURFACE, no other
+    verb exists — and a future ``absorb`` / ``widen`` / ``write_baseline``
+    cannot appear without turning ``test_the_public_surface_is_pinned`` red.
+
+    :func:`excess`'s output legitimately contains keys the baseline never had.
+    That is not a counter-example: excess is a VIOLATION REPORT, never a
+    baseline, and a new key in it IS the finding.
+    """
+
+    PAIRS = [
+        ({}, {}),
+        ({'a': 1}, {}),
+        ({}, {'a': 1}),
+        ({'a': 1}, {'b': 1}),  # disjoint
+        ({'a': 1, 'b': 2}, {'a': 1}),  # current is a superset
+        ({'a': 1}, {'a': 1, 'b': 2}),  # baseline is a superset
+        ({'a': 5}, {'a': 5}),  # equal
+        ({'a': 9, 'b': 9, 'c': 9}, {'b': 1}),  # growth everywhere
+    ]
+
+    @pytest.mark.parametrize(('current_counts', 'baseline_counts'), PAIRS)
+    def test_tighten_never_admits_a_key_the_baseline_lacks(
+        self, current_counts, baseline_counts
+    ):
+        current, baseline = comparable(current_counts, baseline_counts)
+        assert set(tighten(current, baseline)) <= set(baseline.counts)
+
+    def test_the_public_surface_is_pinned(self):
+        """An explicit expected surface, so a new verb cannot arrive unnoticed."""
+        assert sorted(shared.ratchet.__all__) == [
+            'BaselineUnusable',
+            'Enumeration',
+            'IncompleteEnumeration',
+            'ParamsMismatch',
+            'RatchetError',
+            'dump',
+            'excess',
+            'load',
+            'slack',
+            'tighten',
+        ]
