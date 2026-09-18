@@ -2086,6 +2086,278 @@ class TestBuildCorpus:
 
 
 # ----------------------------------------------------------------------
+# Build-corpus withheld census
+# ----------------------------------------------------------------------
+
+
+class TestBuildCorpusWithheldCensus:
+    """`_build_corpus` reports what each cap kept OUT of the pool.
+
+    The census must count at every cap, not only at the final `_trim_pool`
+    pass: under stock config a maximal pool is 29 entries against a total cap
+    of 30, so a census keyed on the final trim alone never fires.
+    """
+
+    MODULE_FILE = 'src/parser.py'
+
+    def _module_task(self, tid: str) -> dict:
+        return {
+            'id': tid,
+            'title': f'Module task {tid}',
+            'description': '',
+            'details': '',
+            'status': 'pending',
+            'priority': 'medium',
+            'files_to_modify': [self.MODULE_FILE],
+        }
+
+    def _dependent_task(self, tid: str, anchor_id: str) -> dict:
+        return {
+            'id': tid,
+            'title': f'Dependent task {tid}',
+            'description': '',
+            'details': '',
+            'status': 'pending',
+            'priority': 'medium',
+            'files_to_modify': ['src/elsewhere.py'],
+            'dependencies': [anchor_id],
+        }
+
+    def _anchor_task(self, tid: str) -> dict:
+        return {
+            'id': tid,
+            'title': 'Anchor',
+            'description': '',
+            'details': '',
+            'status': 'in-progress',
+            'priority': 'high',
+            'files_to_modify': [self.MODULE_FILE],
+        }
+
+    def _taskmaster(self, tasks: list[dict]) -> AsyncMock:
+        by_id = {t['id']: t for t in tasks}
+
+        async def get_task(tid, project_root=None, **kw):
+            return by_id.get(str(tid))
+
+        tm = AsyncMock()
+        tm.get_task = AsyncMock(side_effect=get_task)
+        tm.get_tasks = AsyncMock(return_value={'tasks': tasks})
+        return tm
+
+    def _neighbor_ids(self, n: int) -> list[str]:
+        return [str(9000 + i) for i in range(n)]
+
+    def _qdrant_results(self, ids: list[str]) -> MagicMock:
+        points = []
+        for tid in ids:
+            point = MagicMock()
+            point.payload = {
+                'task_id': tid,
+                'title': f'Neighbor {tid}',
+                'description': '',
+                'files_to_modify': [],
+            }
+            points.append(point)
+        results = MagicMock()
+        results.points = points
+        return results
+
+    async def _corpus(
+        self,
+        curator: TaskCurator,
+        candidate: CandidateTask,
+        *,
+        neighbor_ids: list[str] | None = None,
+    ):
+        if neighbor_ids is None:
+            async def fail_collection(*a, **k):
+                raise RuntimeError('no qdrant')
+
+            with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
+                return await curator._build_corpus(
+                    candidate, project_id='p', project_root='/x',
+                )
+        client = AsyncMock()
+        client.query_points = AsyncMock(return_value=self._qdrant_results(neighbor_ids))
+        embedder = AsyncMock()
+        embedder.create = AsyncMock(return_value=[0.1] * 10)
+        with patch.object(curator, '_ensure_collection', return_value='task_curator_p'), \
+             patch.object(curator, '_get_embedder', return_value=embedder), \
+             patch.object(curator, '_get_qdrant', return_value=client):
+            return await curator._build_corpus(
+                candidate, project_id='p', project_root='/x',
+            )
+
+    @pytest.mark.asyncio
+    async def test_module_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert sizes['module'] == cap
+        assert withheld.by_source['module'] == 5
+        assert withheld.by_source['embedding'] == 0
+        assert withheld.by_source['dependency'] == 0
+        assert withheld.by_source['total_cap'] == 0
+
+    @pytest.mark.asyncio
+    async def test_embedding_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 20)
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert sizes['embedding'] == cap
+        # The cap broke out of the neighbour loop; the neighbours it never
+        # visited are exactly what the pool lost.
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.by_source['module'] == 0
+
+    @pytest.mark.asyncio
+    async def test_dependency_cap_excess_is_counted(self):
+        config = _make_config()
+        cap = config.curator.pool_dependency_cap
+        anchor = self._anchor_task('100')
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(cap + 4)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster([anchor, *deps]))
+
+        pool, sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', spawned_from='100'),
+        )
+
+        assert sizes['dependency'] == cap
+        assert withheld.by_source['dependency'] == 4
+
+    @pytest.mark.asyncio
+    async def test_caps_are_reported_alongside_the_counts(self):
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert withheld.caps == {
+            'module': config.curator.pool_module_cap,
+            'embedding': config.curator.pool_embedding_cap,
+            'dependency': config.curator.pool_dependency_cap,
+            'total_cap': config.curator.pool_total_cap,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_full_pool_never_reaches_the_total_cap(self):
+        """FINDING 1: a census keyed only on `_trim_pool` would report nothing.
+
+        anchor(1) + module(15) + embedding(10) + dependency(3) = 29 <= 30, so
+        the final trim short-circuits even when every stream overflowed.
+        """
+        config = _make_config()
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(20)]
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
+        neighbor_ids = self._neighbor_ids(30)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+
+        pool, sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
+            neighbor_ids=neighbor_ids,
+        )
+
+        assert len(pool) == 29
+        assert len(pool) <= config.curator.pool_total_cap
+        assert withheld.by_source['total_cap'] == 0
+        # ...and yet 28 eligible entries were withheld.
+        assert withheld.by_source['module'] == 5
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.by_source['dependency'] == 3
+        assert withheld.total == 28
+        assert withheld.render() is not None
+
+    @pytest.mark.asyncio
+    async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
+        config = _make_config()
+        config.curator.pool_total_cap = 20
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(20)]
+        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
+        neighbor_ids = self._neighbor_ids(30)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
+            neighbor_ids=neighbor_ids,
+        )
+
+        assert len(pool) == 20
+        assert withheld.by_source['total_cap'] == 29 - 20
+        assert withheld.caps['total_cap'] == 20
+
+    @pytest.mark.asyncio
+    async def test_an_untruncated_pool_yields_a_quiet_census(self):
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(3)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert withheld.total == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_pool_sizes_shape_is_untouched(self):
+        """The census must not leak into `pool_sizes` (owned by task 4718)."""
+        config = _make_config()
+        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+
+        _pool, sizes, _withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        assert set(sizes) == {'anchor', 'module', 'embedding', 'dependency'}
+        assert sizes == {
+            'anchor': 0,
+            'module': config.curator.pool_module_cap,
+            'embedding': 0,
+            'dependency': 0,
+        }
+
+
+# ----------------------------------------------------------------------
 # Batch config fields
 # ----------------------------------------------------------------------
 
