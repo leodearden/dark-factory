@@ -35,6 +35,7 @@ here.
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,7 @@ import tempfile
 import tomllib
 
 import pytest
+import verify_command_invariants as vci
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -405,4 +407,252 @@ def test_every_pytest_config_declares_the_same_timeout() -> None:
         'not a positive whole number of seconds. pytest-timeout reads this as a '
         'wall-clock budget; 0 disables the cap outright and a non-integer is not '
         'what any of the surrounding comments describe.'
+    )
+
+
+CONTRIBUTING_PATH = REPO_ROOT / 'CONTRIBUTING.md'
+
+# A marker pair of its own rather than "the span matching a number", because
+# CONTRIBUTING.md carries other, deliberately-GENERIC timeout spans — the
+# pre-commit hook's 300000ms budget in §4 and the --no-verify bullet in §8 —
+# which must never be pinned to this config. Any first-matching-span extractor
+# would silently re-target onto one of them on a doc reorder.
+#
+# The `*-mirror:begin/end` spelling follows the idiom the two existing
+# CONTRIBUTING mirrors established (`lint-command-mirror`,
+# `type-check-command-mirror`) rather than inventing a second convention; the
+# naming slot was free.
+MIRROR_BEGIN = 'pytest-timeout-mirror:begin'
+MIRROR_END = 'pytest-timeout-mirror:end'
+
+# An inline-code span of PURE DIGITS. Deliberately not "any number in the span":
+# the prose around it names other figures (`--timeout=300`, a section reference),
+# and requiring the backticks plus a digits-only body is what keeps exactly one
+# match inside the markers — which is the condition `marked_span` asserts.
+_MARKED_SECONDS = re.compile(r'`(\d+)`')
+
+
+def _documented_per_test_timeout(markdown_text: str) -> int:
+    """The per-test timeout documented inside the mirror markers, as an int.
+
+    The four marker assertions — exactly one begin, exactly one end, exactly one
+    match in the slice between them (which is also what catches INVERTED
+    markers), and a non-blank match — are ``verify_command_invariants.marked_span``'s,
+    IMPORTED rather than copied beside it: that module's docstring forbids the
+    next copy in as many words, and every failure it raises is a loud
+    ``AssertionError`` naming the marker literal and CONTRIBUTING.md rather than
+    a quiet ``''``. That is the vacuity hazard and the whole point — an extractor
+    that silently yields nothing turns the drift assertion green while pinning
+    nothing at all.
+    """
+    return int(
+        vci.marked_span(
+            markdown_text,
+            begin=MIRROR_BEGIN,
+            end=MIRROR_END,
+            pattern=_MARKED_SECONDS,
+            what='inline-code span of digits',
+            source='CONTRIBUTING.md',
+            label=(
+                "the Tests bullet's documented per-test timeout in CONTRIBUTING.md "
+                'that mirrors [tool.pytest.ini_options].timeout in every '
+                'pyproject.toml'
+            ),
+            task='5442',
+        )
+    )
+
+
+# Extractor fixtures are hand-written markdown, never the real CONTRIBUTING.md,
+# so they stay stable under any future edit to that file's content. They spell
+# the marker literals out in full rather than interpolating the constants above:
+# a rename must not be able to silently keep a broken parser agreeing with its
+# own fixtures. Same convention, and the same reason, as
+# test_contributing_lint_command_drift.py's.
+
+# (a) Happy path, modelled on the real block: a fenced ```bash example ABOVE the
+# marker carrying its own number, and — the hazard that decides the pattern —
+# an inline-code span inside the marked prose that is NOT pure digits.
+_HAPPY_DOC = """\
+- **Tests** run per-package with `pytest`, e.g.:
+  ```bash
+  cd orchestrator && uv run pytest tests/ --timeout=300
+  ```
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout in every pyproject.toml. Pinned by
+     tests/scripts/test_pytest_per_test_timeout_policy.py. -->
+  Every pytest config caps a single test at `480` seconds of wall clock; opt a
+  slow test up with `@pytest.mark.timeout(N)`.
+<!-- pytest-timeout-mirror:end -->
+- **Lint**: `uv run ruff check alpha beta`
+"""
+
+_HAPPY_SECONDS = 480
+
+# (b) No marker at all — deleted, or the section renamed. The doc still CONTAINS
+# a plausible-looking number: the extractor must not fall back to "find
+# something that looks right".
+_NO_MARKER_DOC = """\
+- **Tests** run per-package with `pytest --timeout=300`.
+
+Give a slow hook a timeout of at least `300000` ms.
+"""
+
+# (c) Two marker blocks — e.g. a section duplicated in a bad merge. Picking the
+# first silently pins one mirror and lets the other rot unwatched.
+_DUPLICATE_MARKER_DOC = """\
+<!-- pytest-timeout-mirror:begin -->
+Every pytest config caps a single test at `480` seconds.
+<!-- pytest-timeout-mirror:end -->
+
+## Some later section
+
+<!-- pytest-timeout-mirror:begin -->
+Every pytest config caps a single test at `300` seconds.
+<!-- pytest-timeout-mirror:end -->
+"""
+
+# (d) Inverted markers. They yield an EMPTY slice, so the match assertion catches
+# them — but only if it is really made, which is what this fixture pins.
+_INVERTED_MARKER_DOC = """\
+<!-- pytest-timeout-mirror:end -->
+Every pytest config caps a single test at `480` seconds.
+<!-- pytest-timeout-mirror:begin -->
+"""
+
+# (e) Decoy immunity. §4's pre-commit hook budget and §8's --no-verify bullet are
+# GENERIC advice about a different gate, and CONTRIBUTING.md really carries them
+# — before AND after the marked span, so neither a "first span" nor a "last span"
+# heuristic passes by accident. Pinning either to this config would be wrong
+# twice over: it would fail immediately, and "fixing" it would destroy correct,
+# audience-appropriate advice.
+_DECOY_DOC = """\
+pyright can exceed two minutes — give those a timeout of at least `300000` ms.
+
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout in every pyproject.toml. -->
+Every pytest config caps a single test at `480` seconds of wall clock.
+<!-- pytest-timeout-mirror:end -->
+
+Don't skip the hook with `--no-verify`; if a check is genuinely too slow, raise
+the timeout to `300000` instead.
+"""
+
+
+def test_documented_per_test_timeout_extracts_the_marked_span() -> None:
+    """(a) Only the marked span's number is returned, backticks stripped.
+
+    Also the specific failure of an extractor keyed on "a number in the span":
+    it would return the `--timeout=300` of the fenced example above the marker,
+    or a fragment of the begin comment's own prose — each a plausible-looking
+    figure, so the mistake would not announce itself.
+    """
+    assert _documented_per_test_timeout(_HAPPY_DOC) == _HAPPY_SECONDS
+
+
+@pytest.mark.parametrize(
+    ('markdown_text', 'case'),
+    [
+        (_NO_MARKER_DOC, 'missing'),
+        (_DUPLICATE_MARKER_DOC, 'duplicated'),
+        (_INVERTED_MARKER_DOC, 'inverted'),
+    ],
+)
+def test_documented_per_test_timeout_fails_loudly_on_a_broken_marker(
+    markdown_text: str, case: str
+) -> None:
+    """(b, c, d) A broken marker RAISES — never '' or None.
+
+    Missing is the vacuity hazard: an extractor that silently returns nothing
+    turns every downstream assertion green while pinning nothing at all.
+    Duplicated is the same failure one level down — silently taking the first
+    leaves the second mirror unpinned and free to drift. Inverted yields an empty
+    slice, which would otherwise extract nothing just as quietly. Every message
+    must tell a human what to restore and where.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        _documented_per_test_timeout(markdown_text)
+
+    message = str(excinfo.value)
+    assert MIRROR_BEGIN in message, case
+    assert 'CONTRIBUTING.md' in message, case
+
+
+def test_documented_per_test_timeout_is_immune_to_the_generic_hook_decoy() -> None:
+    """(e) The pre-commit hook's millisecond budget is never extracted.
+
+    §4's "give those a timeout of at least 300000ms" and §8's --no-verify bullet
+    describe `hooks/pre-commit`, a different gate on a different clock. Pinning
+    either to the pytest configs would be wrong twice over: it would fail
+    immediately, and "fixing" it would destroy correct advice.
+    """
+    assert _documented_per_test_timeout(_DECOY_DOC) == _HAPPY_SECONDS
+
+
+def test_contributing_mirrors_the_configured_per_test_timeout() -> None:
+    """CONTRIBUTING.md's documented cap must equal the one the configs declare.
+
+    Reads BOTH sides live from the committed artifacts. This is a value MIRROR,
+    not a prose test: it asserts that one extracted NUMBER equals a config value,
+    and says nothing about docstrings, comment wording, or whether any prose
+    mentions a topic. It must stay green if every sentence around the marker is
+    reworded.
+
+    The harm it prevents is the one both sibling CONTRIBUTING mirrors were filed
+    for, measured rather than predicted on those: prose pointing at prose does
+    not hold. A contributor who reads a stale number here plans a test's budget
+    against a cap that no longer exists.
+
+    MEASURED RED at base 832d6faf16: CONTRIBUTING.md carried no such marker pair
+    and documented no per-test timeout at all, so `marked_span` raised its
+    missing-marker AssertionError.
+    """
+    timeouts = set(
+        ini_options['timeout']
+        for ini_options in discovered_pytest_configs().values()
+        if 'timeout' in ini_options
+    )
+    documented = _documented_per_test_timeout(
+        CONTRIBUTING_PATH.read_text(encoding='utf-8')
+    )
+
+    # (a) NON-VACUITY, both sides. Neither an empty config sweep nor a
+    # non-positive documented figure may let this invariant pass by comparing
+    # nothing. (The documented side cannot be absent — `marked_span` raises
+    # rather than returning '' — so what is left to check is that it is a
+    # sensible number.)
+    assert timeouts, (
+        'no discovered pytest config declares a `timeout` at all (task 5442), so '
+        'this mirror would pass vacuously. Fix '
+        'test_every_pytest_config_declares_a_per_test_timeout first.'
+    )
+    assert documented > 0, (
+        f'CONTRIBUTING.md documents a per-test timeout of {documented} inside the '
+        f'{MIRROR_BEGIN!r} marker (task 5442), which is not a positive number of '
+        'seconds'
+    )
+
+    # (b) SEMANTIC — the configs must agree with each other before the doc can
+    # mirror "the" value at all. Its own guard owns the diagnosis; this reports
+    # only that the comparison cannot be made.
+    assert len(timeouts) == 1, (
+        f'the pytest configs declare {len(timeouts)} different timeouts '
+        f'({sorted(timeouts)}), so there is no single value for CONTRIBUTING.md '
+        'to mirror (task 5442). '
+        'test_every_pytest_config_declares_the_same_timeout names which files '
+        'disagree.'
+    )
+
+    # (c) EXACT.
+    (configured,) = timeouts
+    assert documented == configured, (
+        f"CONTRIBUTING.md's Tests bullet documents a per-test timeout of "
+        f'{documented}s, but every pytest config declares {configured}s (task '
+        f'5442). A contributor reading the doc sizes a @pytest.mark.timeout(N) '
+        f'against a cap that does not exist — and since that marker OVERRIDES the '
+        f'default in both directions rather than raising a floor under it, an N '
+        f'chosen from a stale number silently TIGHTENS the run that gates their '
+        f'merge. Update the number inside the {MIRROR_BEGIN!r} marker in '
+        f'CONTRIBUTING.md to match the configs; the value\'s provenance is '
+        f'plans/pytest-per-test-timeout-measurement-2026-09-17.md.'
     )
