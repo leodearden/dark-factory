@@ -486,20 +486,22 @@ def census(path: Path) -> int:
 
 ### PRD-leaf-shaped (`INV-12-PRD`)
 
-> Add a `legacy_shape` exemption to
-> `shared/tests/config_dir_archival_allowlist.py`: append the new archived
-> directory's name to the list so the archival-parity guard stops flagging
-> it. The row's only justification is "matches the existing pattern" — no
-> task or ticket is cited, and no row is added to
-> `docs/legibility/exception-ratifications.yaml`.
+> The new `TaskConfigDir` construction site destroys its dir without
+> archiving the transcripts first. Add an `UNARCHIVED_GAP` entry for that
+> site to `shared/tests/config_dir_archival_allowlist.py` so the
+> archival-parity guard stops flagging it. The entry's `follow_up` reads
+> "matches the existing pattern" — no task or ticket is cited, and no
+> ratification row is added.
 
 **Expected disposition**: `flag: exceptions-owned-or-ratified`
 
-**Redesign that clears it**: Cite the task or ticket that owns removing the
-exemption (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`), or — if the
-exemption is a deliberate, permanent ruling rather than debt — add a row to
-`docs/legibility/exception-ratifications.yaml` and cite its id
-(`Policy(ratified)`); an entry may never carry neither.
+**Redesign that clears it**: Name the task or ticket that owns removing the
+exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`) —
+today the only available disposition, because the ratification table
+(`docs/legibility/exception-ratifications.yaml`) lands with the mechanism
+and is not in the tree yet. Once it is, an exemption that is a deliberate,
+permanent ruling rather than debt may instead add a row there and cite its
+id (`Policy(ratified)`). An entry may never carry neither.
 
 ### Code-snippet-shaped (`INV-12-CODE`)
 
