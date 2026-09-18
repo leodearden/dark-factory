@@ -196,13 +196,23 @@ async def test_rate_limit_prevents_spam(event_buffer, tmp_path):
     # Only the first wrote a file; second returned escalated verdict with no path.
     assert v1.escalation_path is not None
     assert v2.escalation_path is None
-    esc_files = list((project_root / 'data' / 'escalations').iterdir())
+    esc_files = list((project_root / 'data' / 'escalations').glob('esc-*.json'))
     assert len(esc_files) == 1
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_allows_after_window(event_buffer, tmp_path):
-    """Advance clock past the rate window → second trigger writes another file."""
+async def test_second_window_folds_into_the_one_pending_record(
+    event_buffer, tmp_path,
+):
+    """Past the rate window a still-live condition FOLDS — it does not mint.
+
+    The rate limit still decides WHEN the policy acts; what changed is what
+    happens once the gate opens. A second window that finds the condition
+    still over limit routes through ``escalation.dedupe.submit_or_dedupe`` and
+    lands as ``dedupe_count += 1`` on the one pending record, instead of the
+    sibling L1 the old behaviour minted every 900s (342 of them for a single
+    incident, each re-triaged under a fresh id).
+    """
     await _seed_buffered(event_buffer, 'proj', n=12)
     project_root = tmp_path / 'proj_root'
     project_root.mkdir()
@@ -223,11 +233,37 @@ async def test_rate_limit_allows_after_window(event_buffer, tmp_path):
     clock['now'] += 901.0  # just past window
     v2 = await policy.check('proj', project_root=str(project_root))
 
+    esc_dir = project_root / 'data' / 'escalations'
+    esc_files = sorted(esc_dir.glob('esc-*.json'))
+    assert len(esc_files) == 1, [p.name for p in esc_files]
+
+    # A fold reports the PARENT's path. harness._notify_judge_halt claims its
+    # per-process halt sentinel only when escalation_path is not None, so a
+    # fold returning None would re-enter that callback every ~5s forever.
     assert v1.escalation_path is not None
-    assert v2.escalation_path is not None
-    assert v1.escalation_path != v2.escalation_path
-    esc_files = sorted((project_root / 'data' / 'escalations').iterdir())
-    assert len(esc_files) == 2
+    assert v2.escalation_path == v1.escalation_path
+
+    body = json.loads(esc_files[0].read_text(encoding='utf-8'))
+    assert body['dedupe_count'] == 1
+    assert len(body['dedupe_children']) == 1
+    child_id = body['dedupe_children'][0]
+    assert child_id.startswith('esc-reconciliation-backlog-'), child_id
+    # A distinct child id is what proves the second tick FOLDED rather than
+    # being dropped by the rate limit.
+    assert child_id != body['id']
+
+    # The four policy-only keys survive the fold: neither Escalation.to_json()
+    # (submit) nor from_json -> _rewrite (attach_dedupe_child) round-trips
+    # them, so both branches must re-merge.
+    assert body['project_id'] == 'proj'
+    assert body['error_type'] == 'ReconciliationBacklogExceeded'
+    assert body['backlog'] == 12
+    assert body['threshold'] == 10
+
+    # A fold must not move the record off the L1 rung, whose consumer by
+    # contract is escalation-watcher-auto.
+    assert body['status'] == 'pending'
+    assert body['level'] == 1
 
 
 @pytest.mark.asyncio
@@ -247,7 +283,7 @@ async def test_on_judge_halt_writes_escalation(event_buffer, tmp_path):
 
     assert verdict.outcome == 'escalated'
     assert verdict.error_type == 'ReconciliationJudgeHalted'
-    files = list((project_root / 'data' / 'escalations').iterdir())
+    files = list((project_root / 'data' / 'escalations').glob('esc-*.json'))
     assert len(files) == 1
     body = json.loads(files[0].read_text())
     assert body['error_type'] == 'ReconciliationJudgeHalted'
@@ -279,7 +315,7 @@ async def test_on_watchdog_wedge_writes_escalation_with_wedge_error_type(
     v = verdicts[0]
     assert v.outcome == 'escalated'
     assert v.error_type == 'SqliteDrainerWedged'
-    files = list((project_root / 'data' / 'escalations').iterdir())
+    files = list((project_root / 'data' / 'escalations').glob('esc-*.json'))
     assert len(files) == 1
     body = json.loads(files[0].read_text())
     assert body['error_type'] == 'SqliteDrainerWedged'
@@ -406,7 +442,7 @@ async def test_watchdog_wedge_survives_count_buffered_failure(tmp_path, caplog):
     assert {v.project_id for v in verdicts} == {'explicit', 'seeded'}
     assert all(v.outcome == 'escalated' for v in verdicts)
     for root in roots.values():
-        files = list((root / 'data' / 'escalations').iterdir())
+        files = list((root / 'data' / 'escalations').glob('esc-*.json'))
         assert len(files) == 1
         # buffered is None → the escalation reports the global queue pressure
         # alone (5) rather than a fabricated per-project count.
@@ -924,7 +960,7 @@ class TestDistinctLoudHaltEscalation:
         assert v_backlog.outcome == 'escalated'
         assert v_halt.outcome == 'escalated'
         assert v_halt.escalation_path is not None
-        esc_files = sorted((project_root / 'data' / 'escalations').iterdir())
+        esc_files = sorted((project_root / 'data' / 'escalations').glob('esc-*.json'))
         assert len(esc_files) == 2, [p.name for p in esc_files]
         ids = [json.loads(p.read_text())['id'] for p in esc_files]
         assert any(i.startswith('esc-reconciliation-halt-') for i in ids), ids
@@ -956,7 +992,7 @@ class TestDistinctLoudHaltEscalation:
 
         assert v1.escalation_path is not None
         assert v2.escalation_path is None
-        esc_files = list((project_root / 'data' / 'escalations').iterdir())
+        esc_files = list((project_root / 'data' / 'escalations').glob('esc-*.json'))
         assert len(esc_files) == 1
 
 
