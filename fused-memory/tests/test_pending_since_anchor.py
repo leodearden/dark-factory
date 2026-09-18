@@ -577,3 +577,136 @@ class TestPendingSinceThroughTheAuditWriter:
         ]
         assert audit_fields['reopen_from'] == 'cancelled'
         taskmaster.set_task_status.assert_not_called()
+
+
+class TestPendingSinceBatchIdentity:
+    """One identical anchor across a ``commit_planning`` batch (PRD rule 5).
+
+    ``commit_planning`` (server/tools.py) does not write status itself: it
+    hands a CSV to ``task_interceptor.set_task_status``, which splits it and
+    loops ``_apply_status_transition`` per id. Each per-id backend call would
+    otherwise compute its own ``_now()``, and since each id runs a full gated
+    transaction the anchors drift by tens of milliseconds across a batch.
+
+    That drift is NOT a tie. Under task beta's
+    ``age(t) = AGE_BUDGET·a/(a+AGE_HALF_SECS)`` a 50 ms spread is a ~1e-4
+    score delta — enough for the ``(-score, numeric_id, task_id)`` sort to
+    order the batch by COMMIT SEQUENCE, when PRD rule 5 requires intra-batch
+    order to fall through to CPM and then numeric id. So the assertion below
+    is on set CARDINALITY, not on a tolerance window: a millisecond spread is
+    exactly what a tolerance-based assertion would wave through.
+    """
+
+    async def _stack(self, tmp_path):
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+
+        cfg = TaskmasterConfig(project_root=str(tmp_path))
+        backend = SqliteTaskBackend(cfg)
+        await backend.start()
+        event_buffer = EventBuffer(
+            db_path=tmp_path / 'batch_eb.db', buffer_size_threshold=100,
+        )
+        await event_buffer.initialize()
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        return interceptor, backend, event_buffer
+
+    async def _anchors(self, backend, project_root, ids) -> list[str | None]:
+        out = []
+        for task_id in ids:
+            one = await backend.get_task(task_id, project_root=project_root)
+            out.append((one['metadata'] or {}).get('pending_since'))
+        return out
+
+    @pytest.mark.asyncio
+    async def test_csv_flip_to_pending_stamps_one_identical_anchor(self, tmp_path):
+        """The batch is one atomic flip, so it must read as one instant."""
+        project_root = str(tmp_path)
+        interceptor, backend, event_buffer = await self._stack(tmp_path)
+        try:
+            ids = []
+            for n in range(4):
+                dto = await backend.add_task(
+                    project_root=project_root, title=f'parked {n}',
+                    status=TaskStatus.DEFERRED,
+                )
+                ids.append(str(dto['id']))
+            assert await self._anchors(backend, project_root, ids) == [None] * 4
+
+            await interceptor.set_task_status(
+                ','.join(ids), TaskStatus.PENDING, project_root,
+            )
+
+            anchors = await self._anchors(backend, project_root, ids)
+            assert None not in anchors, f'every batch member must be anchored: {anchors}'
+            assert len(set(anchors)) == 1, (
+                'a commit_planning batch must stamp ONE identical anchor; got '
+                f'{sorted(set(anchors))} — per-id _now() drift would order the '
+                'batch by commit sequence instead of falling through to CPM'
+            )
+        finally:
+            await backend.close()
+            await event_buffer.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'target', (TaskStatus.DEFERRED, TaskStatus.CANCELLED)
+    )
+    async def test_csv_flip_to_a_non_pending_status_writes_no_anchor(
+        self, tmp_path, target
+    ):
+        """The batch clock must not leak into non-landing transitions."""
+        project_root = str(tmp_path)
+        interceptor, backend, event_buffer = await self._stack(tmp_path)
+        try:
+            ids = []
+            for n in range(3):
+                dto = await backend.add_task(
+                    project_root=project_root, title=f'held {n}',
+                    status=TaskStatus.BLOCKED,
+                )
+                ids.append(str(dto['id']))
+
+            await interceptor.set_task_status(
+                ','.join(ids), target, project_root,
+            )
+            assert await self._anchors(backend, project_root, ids) == [None] * 3
+        finally:
+            await backend.close()
+            await event_buffer.close()
+
+    @pytest.mark.asyncio
+    async def test_batch_member_with_an_existing_anchor_keeps_its_own(self, tmp_path):
+        """The batch clock supplies ``now``; it does not override the table.
+
+        A member that already waited must not be dragged forward to the batch
+        stamp — that would erase its accrued wait, which is exactly what D3
+        forbids.
+        """
+        project_root = str(tmp_path)
+        interceptor, backend, event_buffer = await self._stack(tmp_path)
+        try:
+            veteran = await backend.add_task(project_root=project_root, title='veteran')
+            older = (
+                await backend.get_task(veteran['id'], project_root=project_root)
+            )['metadata']['pending_since']
+            await backend.set_task_status(
+                str(veteran['id']), TaskStatus.BLOCKED, project_root=project_root
+            )
+            newcomer = await backend.add_task(
+                project_root=project_root, title='newcomer',
+                status=TaskStatus.DEFERRED,
+            )
+
+            await interceptor.set_task_status(
+                f'{veteran["id"]},{newcomer["id"]}', TaskStatus.PENDING, project_root,
+            )
+
+            kept, stamped = await self._anchors(
+                backend, project_root, [str(veteran['id']), str(newcomer['id'])]
+            )
+            assert kept == older, 'an existing anchor must survive the batch flip'
+            assert stamped is not None and stamped > older
+        finally:
+            await backend.close()
+            await event_buffer.close()
