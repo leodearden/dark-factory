@@ -1753,6 +1753,14 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
         def account_count(self):
             return 7
 
+        @property
+        def active_account_name(self):
+            # The gate's public "is any account still usable" predicate.
+            # None here says every one of the seven is genuinely capped,
+            # which is what makes this an exhausted POOL rather than a
+            # digest the pool merely refused.
+            return None
+
     def must_not_run(*args, **kwargs):  # pragma: no cover - guard
         raise AssertionError(
             "the CLI must never be invoked once the pool is exhausted"

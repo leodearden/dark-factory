@@ -17,9 +17,10 @@ while six live accounts sat idle — and the deferral was indistinguishable
 from a genuinely exhausted fleet.
 
 THE NARROW INTERFACE IT CONSUMES, and the only reason it can live outside
-``shared``: six gate members, all synchronous — ``try_lease`` (the sync,
+``shared``: seven gate members, all synchronous — ``try_lease`` (the sync,
 non-blocking selection knob added for exactly this caller),
-``account_count`` (how the exhaustion reason says WHICH exhaustion), and
+``account_count`` and ``active_account_name`` (how the exhaustion reason
+says WHICH exhaustion), and
 ``detect_cap_hit`` / ``confirm_account_ok`` / ``on_agent_complete`` /
 ``release_probe_slot`` (reached through the real ``InvokeSlot``, whose
 constructor is a plain ``def``; ``UsageGate.invoke_slot`` is async only
@@ -175,8 +176,8 @@ CLI printed; this one is not a banner at all -- it is the gate reporting
 that no account remains -- and saying so is the honest spelling."""
 
 
-def _exhaustion_reason(gate) -> str:
-    """Say WHICH exhaustion this is, because the two need different
+def _exhaustion_reason(gate, tried) -> str:
+    """Say WHICH exhaustion this is, because the three need different
     operator responses.
 
     "all N pool accounts capped" self-clears at the weekly reset and is
@@ -184,8 +185,24 @@ def _exhaustion_reason(gate) -> str:
     fault that will never clear on its own -- it is the state
     ``UsageGate._init_accounts`` degrades to when no token env var resolves,
     which is also the state whose silent fallback to ``~/.claude`` this task
-    exists to remove. Folding the second into the first would send an
-    operator to wait for a reset that never comes.
+    exists to remove. Folding either into the other would send an operator
+    to wait for a reset that never comes.
+
+    THE THIRD STATE exists only because termination is enforced by the
+    caller's exclusion set rather than by the gate's cap transitions: every
+    account refused this digest while the gate still considers one usable.
+    Nothing is capped, so "all N pool accounts capped" would be false — and
+    false in the costly direction, since it names a weekly reset that will
+    never arrive because there is nothing to reset. The account the gate
+    still calls usable is named, because that fact is what makes "capped"
+    the wrong word.
+
+    WHICH state it is, is read off the gate's PUBLIC predicates.
+    ``active_account_name`` is already the gate's answer to "is any account
+    still usable" (None iff no non-capped, non-auth-failed account remains);
+    recomputing it by walking ``gate._accounts`` would reach past a
+    published answer into another module's internals to derive what it
+    already says.
     """
     count = gate.account_count
     if not count:
@@ -194,7 +211,16 @@ def _exhaustion_reason(gate) -> str:
             "supplies the CLAUDE_OAUTH_TOKEN_* vars named in "
             "config/usage-accounts.yaml"
         )
-    return f"all {count} pool accounts capped"
+    live = gate.active_account_name
+    if live is None:
+        return f"all {count} pool accounts capped"
+    return (
+        f"no account in the pool completed this digest ({len(tried)} of "
+        f"{count} tried) and the gate still considers {live} usable — so "
+        f"this is not a capacity limit and will not clear at the weekly "
+        f"reset; the run's per-digest failures say what each account "
+        f"reported"
+    )
 
 
 def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
@@ -246,6 +272,16 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     (heuristic 11) — the rotation-beside-the-gate this module exists not to
     become.
 
+    AND THE DEFERRAL STAYS HONEST ABOUT WHICH EXHAUSTION IT WAS. Because
+    the bound is the caller's and not the gate's, a digest can now run out
+    of accounts while none of them is capped, so ``_exhaustion_reason``
+    distinguishes three states rather than two: no accounts resolved (a
+    config fault), all accounts capped (clears at the weekly reset), and
+    every account tried while the gate still considers one usable (not a
+    capacity limit at all, and it will never clear on its own). Same
+    requirement as the existing "all capped" vs "no accounts resolved"
+    split, extended to the state this change makes reachable.
+
     ONLY THE GATE'S STRICT DETECTOR ROTATES. ``coder``'s loose
     OR-substring matcher keeps its own job — labelling an already-FAILED
     invocation as a per-digest defer — while ``slot.detect_cap_hit`` (prefix
@@ -281,7 +317,7 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             lease = gate.try_lease(reverse=reverse, exclude=tried)
             if lease is None:
                 raise coder.CoderCapExhausted(
-                    f"legibility trickle: {_exhaustion_reason(gate)}",
+                    f"legibility trickle: {_exhaustion_reason(gate, tried)}",
                     marker=_EXHAUSTED_MARKER,
                 )
             tried.add(lease.name)

@@ -1526,9 +1526,13 @@ legibility-trickle@<project>`):
 
 - `legibility account pool: 7 accounts — max-b, ...` at startup. Names only,
   never tokens.
-- `account max-h is capped — retrying this digest on the next account in the
-  pool`, alongside the gate's own `Account max-h CAPPED: <banner>`: ordinary
-  weather. The digest is retried on the next account, not lost.
+- `account max-h did not complete this digest and the gate recorded a cap
+  signal against it — retrying this digest on the next account in the pool`:
+  ordinary weather. The digest is retried on the next account, not lost. The
+  line deliberately does not say *capped*, because only the gate knows which
+  transition it took — a cap hit caps the account (look for its own `Account
+  max-h CAPPED: <banner>` alongside), while a near-cap warning only annotates
+  one that stays perfectly usable.
 - `legibility trickle coder DEFERRED: all accounts capped, N/M digests
   returned a usage-limit banner instead of a model turn` — **exit 0**, a
   deferral rather than an incident (task 4736), with a WARNING-level
@@ -1536,9 +1540,17 @@ legibility-trickle@<project>`):
   accounts capped`. This one self-clears at the weekly reset; nothing to do.
 - `legibility trickle: no pool accounts resolved — check that the unit's
   EnvironmentFile supplies the CLAUDE_OAUTH_TOKEN_* vars named in
-  config/usage-accounts.yaml` — the OTHER exhaustion, and a config fault that
+  config/usage-accounts.yaml` — the SECOND exhaustion, and a config fault that
   will never clear on its own. Paired with a loud `legibility account pool
   resolved NO usable accounts` warning naming the roster it failed to resolve.
+- `legibility trickle: no account in the pool completed this digest (7 of 7
+  tried) and the gate still considers max-c usable — so this is not a capacity
+  limit ...` — the THIRD, and the only one that is neither weather nor a
+  missing token: every account was tried and every one refused, while the gate
+  says the pool is fine. Nothing will clear at the weekly reset because
+  nothing is capped. Read the run's per-digest failures for what each account
+  actually reported — a fleet-wide near-cap warning and a backend fault both
+  land here.
 
 ### Nightly canonical/topic coverage census (05:00)
 
