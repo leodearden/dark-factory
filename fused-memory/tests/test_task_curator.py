@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +49,7 @@ from fused_memory.middleware.task_curator import (
     _task_files,
     _to_pool_entry,
     _trim_pool,
+    clip_for_prompt,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -203,6 +205,48 @@ class TestFlattenTaskTree:
 
     def test_empty(self):
         assert flatten_task_tree({}) == []
+
+class TestClipForPrompt:
+    """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
+
+    Both the pool side (`_PoolEntry.render`) and the candidate side
+    (`_build_user_prompt` / `_build_batch_section`) route through it, so the
+    marker cannot drift between them.
+    """
+
+    def test_under_cap_returned_unchanged(self):
+        assert clip_for_prompt('abc', 10) == 'abc'
+
+    def test_empty_returned_unchanged(self):
+        assert clip_for_prompt('', 10) == ''
+
+    def test_exactly_at_cap_is_not_marked(self):
+        text = 'x' * 10
+        assert clip_for_prompt(text, 10) == text
+
+    def test_one_over_cap_is_marked(self):
+        text = 'x' * 11
+        clipped = clip_for_prompt(text, 10)
+        assert clipped.startswith('x' * 10)
+        assert clipped != text
+        # The count is reconstructed, never hard-coded.
+        assert str(len(text) - 10) in clipped
+
+    def test_marker_carries_the_exact_elided_count(self):
+        text = 'y' * 3000
+        cap = 2000
+        clipped = clip_for_prompt(text, cap)
+        assert clipped[:cap] == text[:cap]
+        marker = clipped[cap:]
+        elided = len(text) - cap
+        assert str(elided) in marker
+        # No other integer is smuggled into the marker.
+        assert [int(n) for n in re.findall(r'\d+', marker)] == [elided]
+
+    def test_marker_keeps_the_ellipsis_prefix(self):
+        clipped = clip_for_prompt('z' * 50, 10)
+        assert clipped[10] == '\u2026'
+
 
 class TestTrimPool:
     def _entry(self, task_id: str, source: str) -> _PoolEntry:
