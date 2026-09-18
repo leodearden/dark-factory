@@ -8,10 +8,12 @@ these tests read no clock, exactly as the code under test does not.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 from datetime import UTC, datetime
 
 import pytest
+
 from dashboard.data.datum import Datum, DatumState
 
 # A fixed measurement instant, named rather than inlined so a reader can see
@@ -21,7 +23,7 @@ AS_OF = datetime(2026, 9, 18, 12, 0, 0, tzinfo=UTC)
 WIRE_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
 
 
-def fresh_datum(value=7):
+def fresh_datum(value: object = 7):
     """A conforming ``fresh`` Datum carrying *value*, measured at ``AS_OF``."""
     return Datum(
         value=value,
@@ -32,7 +34,7 @@ def fresh_datum(value=7):
     )
 
 
-def unknown_datum(reason='not yet fetched'):
+def unknown_datum(reason: str | None = 'not yet fetched'):
     """A conforming ``unknown`` Datum — no value, no measurement instant."""
     return Datum(
         value=None,
@@ -62,8 +64,8 @@ def test_datum_state_vocabulary_is_exactly_the_contract_four():
 def test_datum_is_frozen():
     """A served envelope is immutable — the SPA stores and renders, never mutates."""
     datum = fresh_datum()
-    with pytest.raises(AttributeError):
-        datum.value = 8
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        datum.value = 8  # type: ignore[misc]
 
 
 def test_to_wire_emits_exactly_the_five_contract_keys():
