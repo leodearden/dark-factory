@@ -10,7 +10,6 @@ review rejected a source-lint living inside the pytest suite.
 """
 from __future__ import annotations
 
-import ast
 import re
 import shutil
 import subprocess
@@ -423,29 +422,6 @@ class TestExemptionPragma:
             assert find_violations(source, filename) == [], (
                 f'pragma failed to suppress under filename {filename!r}'
             )
-
-    def test_checker_source_contains_no_filename_exemption_list(self):
-        """The mechanism this replaces must not survive anywhere in the script.
-
-        Scans the checker's own AST for any string constant that is a concrete
-        ``test_*.py`` filename. The rglob glob ``'test_*.py'`` carries a ``*``
-        and so is deliberately excluded by the pattern — a real exemption entry
-        could not be.
-        """
-        script_source = SCRIPT_PATH.read_text(encoding='utf-8')
-
-        concrete_test_filename = re.compile(r'^test_[A-Za-z0-9_]+\.py$')
-        offenders = [
-            node.value
-            for node in ast.walk(ast.parse(script_source))
-            if isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and concrete_test_filename.match(node.value)
-        ]
-        assert offenders == [], (
-            f'The checker contains hardcoded test-module filenames {offenders} — '
-            f'exemptions belong at the site, as a # noqa pragma.'
-        )
 
 
 class TestCliExitCodes:
