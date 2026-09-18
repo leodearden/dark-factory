@@ -70,9 +70,28 @@ PYTEST_NO_TESTS_COLLECTED_RC = 5
 # ``inipath=None`` — pytest took the args' own ancestor, so the run read no
 # inifile at all and the probe would have been asserting about nothing.
 #
+# It nests one level deeper, inside ``.pytest-tmp/``, because the fixture's
+# ``finally`` does NOT run on SIGKILL, on pytest-timeout's ``os._exit()`` worker
+# kill, or on an interrupted session — and REPO_ROOT is the machine-operated
+# ``project_root`` checkout, where a stray untracked directory can ride a
+# ``git add -- .`` into a commit. That is not hypothetical: .gitignore records a
+# marker-probe leftover of exactly this shape riding a WIP commit onto a task
+# branch and breaking a directory-wide ruff sweep (task 3581).
+# ``.gitignore``'s ``.pytest-tmp/`` rule is this repo's existing,
+# deliberately-unanchored home for pytest scratch inside a checkout, so a
+# leftover here is already unstageable — and ``_ignored_scratch_root`` refuses
+# to create anything if that stops being true rather than trusting this comment.
+# MEASURED: a probe at ``<repo>/.pytest-tmp/<dir>/test_*.py`` resolves
+# ``inipath=<repo>/pyproject.toml`` and ``rootpath=<repo>``, identical to one
+# written directly at the repo root — so the extra level costs the invariant
+# under test nothing.
+PROBE_SCRATCH_ROOT = REPO_ROOT / '.pytest-tmp'
+
 # Dot-prefixed so no OTHER pytest run can collect it while it exists: pytest's
 # default ``norecursedirs`` skips ``.*``, and passing this probe's path
-# explicitly is what still lets THIS run reach it.
+# explicitly is what still lets THIS run reach it. Redundant with the dot on
+# ``.pytest-tmp`` itself, deliberately: the property has to keep holding wherever
+# the scratch root is next pointed.
 PROBE_DIR_PREFIX = '.pytest-root-timeout-probe-'
 
 # The probe asserts from INSIDE a real root-bound session, which is the only
@@ -106,15 +125,47 @@ def test_the_resolved_config_carries_a_per_test_timeout(request):
 '''
 
 
+def _ignored_scratch_root() -> pathlib.Path:
+    """``PROBE_SCRATCH_ROOT``, created — but only after git confirms it is ignored.
+
+    Asked BEFORE the directory is created, so a path git would offer to stage is
+    never materialised at all. ``git check-ignore`` answers for a path that does
+    not exist yet, which is what makes that ordering available.
+    """
+    relative = PROBE_SCRATCH_ROOT.relative_to(REPO_ROOT)
+    probed = subprocess.run(
+        ['git', 'check-ignore', '-q', f'{relative}/probe'],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probed.returncode == 0, (
+        f'{relative}/ is no longer git-ignored (`git check-ignore` exit '
+        f'{probed.returncode}), so this guard would drop scratch into the working '
+        f'tree of a machine-operated checkout — where the fixture\'s `finally` '
+        f'does NOT run on SIGKILL or on an interrupted session, and a leftover can '
+        f'ride a `git add -- .` into a commit (task 5442; the same shape broke a '
+        f'directory-wide ruff sweep in task 3581). Restore the `.pytest-tmp/` rule '
+        f'in .gitignore, or point PROBE_SCRATCH_ROOT at another ignored path under '
+        f'the repo root.\nstderr:\n{probed.stderr}'
+    )
+    PROBE_SCRATCH_ROOT.mkdir(exist_ok=True)
+    return PROBE_SCRATCH_ROOT
+
+
 @pytest.fixture
 def root_bound_probe():
-    """A throwaway probe test file inside REPO_ROOT, removed afterwards.
+    """A throwaway probe test file under REPO_ROOT, removed afterwards.
 
-    Inside the repo, not in ``tmp_path``: see ``PROBE_DIR_PREFIX`` for the
-    measurement that rules ``tmp_path`` out. Removed in a ``finally`` so a failing
-    probe cannot leave a stray ``test_*.py`` in the working tree.
+    Inside the repo, not in ``tmp_path``: see ``PROBE_SCRATCH_ROOT`` for the
+    measurement that rules ``tmp_path`` out, and for why it nests inside an
+    already-ignored scratch root. The ``finally`` covers the runs that reach it;
+    the ignored scratch root is what covers the runs that never do.
     """
-    directory = pathlib.Path(tempfile.mkdtemp(dir=REPO_ROOT, prefix=PROBE_DIR_PREFIX))
+    directory = pathlib.Path(
+        tempfile.mkdtemp(dir=_ignored_scratch_root(), prefix=PROBE_DIR_PREFIX)
+    )
     try:
         probe = directory / 'test_root_bound_timeout_probe.py'
         probe.write_text(_PROBE_SRC, encoding='utf-8')
@@ -333,6 +384,75 @@ def test_every_pytest_config_declares_a_per_test_timeout() -> None:
         'test_every_pytest_config_declares_the_same_timeout enforces. The value\'s '
         'provenance is plans/pytest-per-test-timeout-measurement-2026-09-17.md; '
         'the rationale for the setting is shared/pyproject.toml.'
+    )
+
+
+# pytest-timeout's ENTIRE legal domain for this setting, read from the installed
+# package rather than assumed: `_validate_method` is `if method not in ["signal",
+# "thread"]: raise ValueError`, and the `--timeout-method` option declares the
+# same two as its argparse `choices`.
+#
+# This is why the value-agnostic principle this file defends does NOT reach
+# here. That principle protects `timeout` — a MEASURED number that must stay
+# free to move without a guard going red. `timeout_method` is not measured and
+# cannot move: it is a two-element enumeration, so naming both members costs the
+# next re-measurement nothing.
+SUPPORTED_TIMEOUT_METHODS = frozenset({'signal', 'thread'})
+
+
+def test_every_pytest_config_declares_a_supported_timeout_method() -> None:
+    """A typo'd method is caught HERE, once, not one wedged suite at a time.
+
+    Presence is not enough. `timeout_method = "sginal"` satisfies
+    ``test_every_pytest_config_declares_a_per_test_timeout`` above and the
+    behavioural probe's non-blank check, while pytest-timeout raises
+    ``ValueError: Invalid method sginal from config file`` at session start — so
+    EVERY run whose rootdir resolves to that config dies before a single test
+    executes. Loud, but discovered one suite at a time by whoever next ran it,
+    and for the ROOT config that is every root-bound invocation in the repo.
+
+    Which method each config declares is deliberately NOT asserted: `signal` and
+    `thread` are a live trade with measured evidence on both sides
+    (``fused-memory/pyproject.toml`` records signal proving unreliable under
+    xdist workers; ``escalation/pyproject.toml`` records signal measured green
+    under the identical flags), and pinning a winner here would settle that trade
+    by guard rather than by measurement. This asserts only that the declared
+    value is one pytest-timeout will accept.
+    """
+    declared = {
+        name: ini_options['timeout_method']
+        for name, ini_options in sorted(discovered_pytest_configs().items())
+        if 'timeout_method' in ini_options
+    }
+
+    # Presence is the sweep above's job, not this one's — but a mapping that came
+    # back empty would satisfy the membership check below by comparing nothing.
+    assert declared, (
+        'no discovered pytest config declares a `timeout_method` at all (task '
+        '5442), so this guard would pass by checking nothing. Fix '
+        'test_every_pytest_config_declares_a_per_test_timeout first.'
+    )
+
+    unsupported = {
+        name: method
+        for name, method in declared.items()
+        if method not in SUPPORTED_TIMEOUT_METHODS
+    }
+
+    assert not unsupported, (
+        'these pytest configs declare a `timeout_method` pytest-timeout does not '
+        f'accept (task 5442); the legal domain is exactly '
+        f'{sorted(SUPPORTED_TIMEOUT_METHODS)}:\n'
+        + '\n'.join(
+            f'  {name}/pyproject.toml — timeout_method = {method!r}'
+            for name, method in unsupported.items()
+        )
+        + '\n\npytest-timeout validates this at session start and raises '
+        '`ValueError: Invalid method <value> from config file`, so every run '
+        'whose rootdir resolves to one of the files above dies before collecting '
+        'a single test. Fix the spelling; which of the two to pick for a given '
+        'config follows that config\'s execution shape, and the trade between '
+        'them is recorded in fused-memory/pyproject.toml.'
     )
 
 
