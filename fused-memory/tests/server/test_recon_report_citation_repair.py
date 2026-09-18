@@ -44,6 +44,17 @@ SUCCESSOR_RECORD: dict[str, Any] = {
 }
 
 
+# A victim that RESOLVES — the wrong-but-resolving class's fixture, and the
+# prose account that class requires.
+LIVE_VICTIM_RECORD: dict[str, Any] = {
+    'id': DANGLING,
+    'content': 'a live entry that does not back this finding',
+    'metadata': {'category': 'observations_and_summaries'},
+}
+
+WHY_WRONG = 'mis-cites the task 168 rolling summary; confirmed via get_task(182)'
+
+
 def _finding(finding_id: str, memory_id: str) -> dict[str, Any]:
     return {
         'finding_id': finding_id,
@@ -288,6 +299,206 @@ class TestStateRepairMemoryCitation:
             await journal.close()
 
 
+class TestStateForwardsTheDefectClass:
+    """``reason``/``justification`` reach the repair through the state wrapper.
+
+    The wrapper adds no branching of its own — the gates live in
+    ``citation_repair`` and are tested there. What has to hold HERE is that
+    both parameters arrive, and that omitting them preserves today's behaviour
+    exactly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrong_memory_repairs_a_victim_that_resolves(self, tmp_path):
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['reason'] == 'wrong_memory'
+            run = await journal.get_run(TARGET_RUN)
+            assert run is not None
+            report = run.stage_reports['memory_consolidator']
+            assert isinstance(report, StageReport)
+            record = report.items_flagged[0]['citation_repairs'][0]
+            # The caller's own run still supplies the attribution, unchanged.
+            assert record['repaired_by'] == f'run:{CALLER_RUN}'
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_omitting_both_is_exactly_todays_behaviour(self, tmp_path):
+        """The defaults keep every existing caller on the dangling-only path."""
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            # A live victim under the default class is still refused.
+            assert outcome['error'] == 'citation_not_dangling'
+        finally:
+            await journal.close()
+
+
+class TestRepairLivenessIsPerEntry:
+    """A run is live iff it holds an IN-PROGRESS entry — not merely a resident one.
+
+    The caller, not ``citation_repair``, decides what "live" means. It used to
+    mean "this process holds any report state for the run", which keeps a run
+    live for the whole ``recon_report_state_ttl_seconds`` window (300s by
+    default) after its last stage completed and its journal row already reads
+    ``completed``.
+
+    ``completed_at is None`` is not a new discriminator: it is exactly what
+    ``tick()`` uses to decide what may be evicted, and an in-progress entry is
+    immortal by design. So the narrowed set is precisely the set of runs a stage
+    can still write through.
+
+    Scope of what this changes, so the tests below are not read as saying more
+    than they do: this wrapper is the ONLY caller that supplies a non-empty
+    ``live_run_ids``. The operator script passes none at all, so no repair run
+    from a human's shell has ever reached this gate — including the
+    cross-project one task 5552 came from, which the MCP tool refuses on
+    ``project_mismatch`` well before liveness is considered.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_entry_not_yet_evicted_no_longer_blocks(self, tmp_path):
+        """Row says completed, entry lingers, repair runs.
+
+        ``clock=lambda: 0.0`` means no TTL has elapsed, so ``tick()`` has not
+        swept the entry — the entry is resident and completed, which is the
+        state every finished run passes through for minutes. That is the window
+        the old resident-entry set refused blanket, for every same-project
+        in-agent caller, whatever the journal row said.
+        """
+        journal = await _seeded_journal(tmp_path, status='completed')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.start_report(
+                run_id=TARGET_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.complete(run_id=TARGET_RUN, summary='done')
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert 'error' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_in_progress_entry_still_blocks(self, tmp_path):
+        """A stage that has NOT completed can still rewrite the whole blob.
+
+        The narrowing must not become a blanket removal: this is the case the
+        guard exists for, and the refusal has to fire before any Mem0 read.
+        """
+        journal = await _seeded_journal(tmp_path, status='completed')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            state.start_report(
+                run_id=TARGET_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
+            # The journal row is terminal, so the in-process half is the ONLY
+            # thing refusing — which is what the hint has to say.
+            assert outcome['run_status'] == 'completed'
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_row_is_refused_with_no_entry_at_all(self, tmp_path):
+        """The row-status allowlist is independent and still has to pass.
+
+        Narrowing the in-process half must not weaken the other half: a
+        ``running`` row is refused even when this process holds no state for
+        that run whatsoever.
+        """
+        journal = await _seeded_journal(tmp_path, status='running')
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['run_status'] == 'running'
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+
 class TestRepairToolViaFastMCP:
     """The MCP surface: registration, boundary validation, end-to-end call, docs."""
 
@@ -395,6 +606,93 @@ class TestRepairToolViaFastMCP:
 
             assert result['status'] == 'repaired'
             assert result['replacement_memory_id'] == SUCCESSOR
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_defect_class_is_exposed_and_optional_in_the_schema(self):
+        """Both new parameters are optional over the wire, ``reason`` defaulted.
+
+        Read off the generated schema rather than the annotation source, for the
+        same reason the bad-store test calls the tool: under ``from __future__
+        import annotations`` the annotation is only a string.
+        """
+        mcp = create_recon_report_server(_state())
+        tool = next(
+            t for t in await mcp.list_tools() if t.name == 'repair_memory_citation'
+        )
+        schema = tool.inputSchema
+
+        assert 'reason' not in schema['required']
+        assert 'justification' not in schema['required']
+        assert schema['properties']['reason']['default'] == 'memory_not_found'
+
+    @pytest.mark.asyncio
+    async def test_bad_reason_rejected_at_the_schema_boundary(self, tmp_path):
+        """An out-of-enum ``reason`` never reaches the helper's own gate.
+
+        Same boundary the ``store`` Literal already provides: rejected before
+        the body runs, so no backend read is attempted. The helper still
+        re-checks the enum for the operator script and in-process callers, which
+        have no such boundary.
+        """
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            with pytest.raises(ToolError):
+                await mcp._tool_manager.call_tool(
+                    'repair_memory_citation',
+                    {
+                        'run_id': CALLER_RUN,
+                        'target_run_id': TARGET_RUN,
+                        'finding_id': 'f-1',
+                        'memory_id': DANGLING,
+                        'store': 'mem0',
+                        'replacement_memory_id': SUCCESSOR,
+                        'reason': 'detach',
+                    },
+                )
+
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_wrong_memory_tool_call(self, tmp_path):
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            result = await mcp._tool_manager.call_tool(
+                'repair_memory_citation',
+                {
+                    'run_id': CALLER_RUN,
+                    'target_run_id': TARGET_RUN,
+                    'finding_id': 'f-1',
+                    'memory_id': DANGLING,
+                    'store': 'mem0',
+                    'replacement_memory_id': None,
+                    'reason': 'wrong_memory',
+                    'justification': WHY_WRONG,
+                },
+            )
+
+            assert result['status'] == 'repaired'
+            assert result['reason'] == 'wrong_memory'
+            assert result['cited_memories'] == []
         finally:
             await journal.close()
 

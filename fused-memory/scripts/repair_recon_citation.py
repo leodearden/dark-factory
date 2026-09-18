@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""One-shot repair: re-point (or drop) a dangling cited memory id on a finding
-owned by an already-COMPLETED reconciliation run (task 3065).
+"""One-shot repair: re-point (or drop) a defective cited memory id on a finding
+owned by an already-COMPLETED reconciliation run (task 3065, task 5552).
 
 Why a script exists at all
 --------------------------
@@ -27,23 +27,22 @@ run's findings, so that is what gets rewritten.
 
 What it cannot do
 -----------------
-It can only repair provenance, never rewrite a live claim. The victim citation
-must be CONFIRMED absent from Mem0 (else ``citation_not_dangling``) and the
-replacement must resolve (else ``replacement_not_found``); a backend read that
-RAISES is ``verification_error``, never a repair — unknown is not absent. A run
-that is still live is refused outright, because the harness rewrites the whole
-``stage_reports`` blob at each stage end and would silently clobber the repair.
+Nothing this script passes is taken on trust: every gate — which defect class
+``--reason`` asserts and the corroboration it then owes, the required
+``--justification``, the replacement's own checks, the terminal-run allowlist —
+is stated and enforced in ONE place,
+``citation_repair.py::repair_memory_citation``. Read it there rather than here;
+a second copy of that contract would only drift out of step with it.
 
-Journal I/O that raises is reported too, not thrown: ``journal_error`` carries
-the ``phase`` that failed (read / write / verify) and a hint saying whether
-anything was written — a read-only data dir is the failure this path has
-actually hit. And a repair that IS written but does not survive the
-read-after-write check (another writer rewrote the whole blob in between) is
-reported as ``repair_clobbered`` rather than a false ``repaired``. Every one of
-those exits 1; only ``status: repaired`` / ``status: dry_run`` exits 0.
+What is this script's own business is the exit code: every refusal is a
+structured ``error`` dict, printed as JSON and exiting 1. Only ``status:
+repaired`` (a write that was made and verified) and ``status: dry_run`` exit 0.
+Backend failures are refusals like any other, not tracebacks — a read-only
+``data/`` raises inside the journal and comes back as ``journal_error`` with the
+``phase`` that failed, which is the one this path has actually hit.
 
-The incident this was written for
----------------------------------
+The incident this was written for (task 3065 — ``memory_not_found``)
+--------------------------------------------------------------------
 Run ``06a4466d-cdc0-49ac-8e99-e6723be39392`` (project ``reify``, completed
 2026-07-26), finding ``5e85117e-51fc-4a7f-8ca7-e26078dbd3f2``, whose two cited
 memories were both destroyed by a Stage-1 supersession. The surviving successor
@@ -100,6 +99,23 @@ Rollback artifact (the pre-repair blob) is at
 across a reboot. Run 1 before 2 was and remains the required order: after 1
 the successor is already cited, which is why 2 is drop-only rather than a
 second re-point.
+
+The incident that added ``--reason wrong_memory`` (task 5552)
+-------------------------------------------------------------
+Run ``cd2af61a-fe12-4222-b58c-9eb5a2070c44`` (project
+``solar_challenge_platform``), finding ``7750fd64-f862-4ad8-8b1f-a9a08b1494d0``:
+a single cited memory that RESOLVES but backs a different claim entirely, with
+nothing to re-point to. A detach is the whole repair, and the flag shape is
+
+    --reason wrong_memory --justification '<why it does not back the finding>'
+
+with no ``--replacement-memory-id``. NOT APPLIED: it needs write access to
+``data/`` in the main checkout, which a task agent does not have (see the
+task-3065 note above for the error that produces). The run is also CROSS-PROJECT
+relative to this repo, which is why it is the script's example and not the MCP
+tool's — the tool passes its own ``caller_project_id`` and would refuse with
+``project_mismatch``. The script passes none; that bypass exists for exactly
+this correction.
 """
 
 from __future__ import annotations
@@ -139,13 +155,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--memory-id', dest='memory_id', required=True,
-        help='The dangling cited memory id to remove (must be confirmed absent)',
+        help='The defective cited memory id to remove. Its required state is '
+             'whichever --reason names: absent, or resolving-but-wrong.',
     )
     parser.add_argument(
         '--replacement-memory-id', dest='replacement_memory_id', default=None,
         help='Live successor to cite instead (must resolve). Omit for a '
              'drop-only repair, which removes the dangling citation and cites '
              'nothing in its place.',
+    )
+    parser.add_argument(
+        '--reason', default='memory_not_found',
+        choices=['memory_not_found', 'wrong_memory'],
+        help="The citation's DEFECT CLASS, which selects the corroboration the "
+             "repair demands (default: memory_not_found). 'memory_not_found' "
+             'asserts the cited id is CONFIRMED ABSENT from Mem0; '
+             "'wrong_memory' asserts it RESOLVES but does not back the "
+             'finding. Naming the wrong one is a refusal pointing at the '
+             'other, never a silent reclassification. Orthogonal to drop vs '
+             'swap, which is --replacement-memory-id.',
+    )
+    parser.add_argument(
+        '--justification', default=None,
+        help='Why the cited memory does not back the finding. REQUIRED with '
+             '--reason wrong_memory, which removes a citation that still '
+             'resolves: the citation_repairs record is then the only surviving '
+             'account of the change, so state what the citation should have '
+             'backed and how the claim was independently confirmed. Optional '
+             'for --reason memory_not_found, whose confirmed absence is its '
+             'own account, but recorded when given.',
     )
     parser.add_argument(
         '--store', default='mem0', choices=['mem0', 'graphiti'],
@@ -180,6 +218,8 @@ async def run(args: argparse.Namespace, *, journal: Any, memory: Any) -> dict[st
         memory_id=args.memory_id,
         store=args.store,
         replacement_memory_id=args.replacement_memory_id,
+        reason=args.reason,
+        justification=args.justification,
         repaired_by=REPAIRED_BY,
         apply=args.apply,
     )
