@@ -18,6 +18,7 @@ from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
     _REPLACE_ONLY_FIELDS,
+    _SCHEMA_VERSION,
     SqliteTaskBackend,
     _classify_residual_group,
     _emit_schema_warning,
@@ -4467,6 +4468,52 @@ async def test_reaudit_candidate_key_index_builds_on_live_connection_without_res
         assert result2.get('already_at_v4') is True, result2
     finally:
         await b.close()
+
+
+@pytest.mark.asyncio
+async def test_reaudit_candidate_key_index_reports_the_actual_user_version(tmp_path):
+    """The short-circuit must REPORT the version, not restate a constant.
+
+    ``reaudit_candidate_key_index`` returns early on ``current_version >= 4``
+    and used to hand back the LITERAL ``'user_version': 4``. Once v5 exists
+    (task 3816) that is a fabricated observation about the store's own state
+    — and one the method's own docstring contradicts ("Returns ... merged
+    with the final ``user_version``"). A caller inspecting the dict to decide
+    whether a store still needs migrating must not be handed a stale 4 for a
+    v5 DB.
+
+    ``already_at_v4`` stays True and keeps its name: it means "at or past
+    v4", which remains accurate and is what the ``>= 4`` gate tests.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # A fresh DB chains the whole migration to _SCHEMA_VERSION.
+        await b.get_tasks(project_root=project_root)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            actual_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+
+        result = await b.reaudit_candidate_key_index(project_root)
+    finally:
+        await b.close()
+
+    assert actual_version == _SCHEMA_VERSION, (
+        f'Precondition: a fresh DB must chain to the top; got {actual_version}'
+    )
+    assert result['user_version'] == actual_version, (
+        'the re-audit must report the version PRAGMA user_version actually '
+        f'reports ({actual_version}), not a hardcoded literal; got {result}'
+    )
+    assert result['already_at_v4'] is True, result
 
 
 # ── index-independent write-path dedup (fm-task-dedup self-heal amendment) ──
