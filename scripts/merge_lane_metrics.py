@@ -9,11 +9,16 @@ from tests. The committed baseline lives at
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
 enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
-Ratchet contract: the gate FAILS on any measure that rises above its baseline;
-raising a measure is not allowed, only lowering one is. Equality is permitted --
-this is a ratchet, not a day-one gate. The two ceilings (``FILE_LINE_CEILING``,
-``NEW_FUNCTION_COGNITIVE_CEILING``) apply only to paths and qualnames ABSENT
-from the baseline, so the grandfathering can only ever shrink.
+Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
+``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
+absorbed by regenerating the file that would have caught it. An AUTHORIZED one
+is permitted and recorded -- ``--authorize-raise <task-id> --reason <text>``
+appends the exact per-measure delta to ``LEDGER_RELPATH``, so net-additive work
+lands as a reviewed diff rather than as a number nobody saw move. Lowering needs
+no ceremony and equality is permitted -- this is a ratchet, not a day-one gate.
+The two ceilings (``FILE_LINE_CEILING``, ``NEW_FUNCTION_COGNITIVE_CEILING``)
+apply only to paths and qualnames ABSENT from the baseline, so the
+grandfathering can only ever shrink.
 
 INV-11, no silent fail-soft -- and note the polarity
 ----------------------------------------------------
@@ -55,7 +60,11 @@ Exit codes
 ----------
 0  clean -- measures taken, and (under ``--check``) no ratchet violation.
 1  ratchet violations -- one or more measures rose above the baseline, or a new
-   file/function exceeded a ceiling. Violations are printed to stderr.
+   file/function exceeded a ceiling. Violations are printed to stderr. This
+   covers BOTH faces of the gate: ``--check`` finding a raise, and
+   ``--write-baseline`` REFUSING to absorb one for want of an
+   ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
+   subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
 2  instrument failure (``MetricsError``) -- an unparseable cluster file,
    complexipy missing or out of range, a missing/malformed baseline, or a
    baseline whose recorded parameters no longer match this tree. Deliberately
@@ -70,6 +79,7 @@ import dataclasses
 import json
 import sys
 import tokenize
+from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
 
@@ -1053,6 +1063,42 @@ def derive_totals(report: dict) -> dict[str, int]:
 # asserted by a test rather than left to formatting habit -- see
 # ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
 
+# The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
+# baseline holds the frozen measures; its sidecar ledger holds the provenance of
+# every raise that was ever authorized against them. Both paths are named here,
+# above the README that cites them, because the remedy text an agent reads when
+# the gate goes red is composed from them.
+BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
+LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
+
+#: THE ONE COPY of what to do when a measure rose. Composed into every site
+#: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
+#: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
+#: and the pytest gate's assertion message. Three near-copies used to say only
+#: that raising was forbidden, and the copy that mattered sent an implementer to
+#: escalation rather than to a sanctioned path (task 5342, esc-5342-1).
+RAISE_REMEDY = (
+    'Remedy: LOWER the measure. A task that legitimately lowers one regenerates '
+    'the baseline in the SAME commit:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH}\n'
+    'RAISING a measure is not forbidden -- it is never SILENT. Net-additive '
+    'work (a bug fix that adds a guard, a widened CLUSTER_PATHS) records the '
+    'raise as a reviewed diff:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH} '
+    '--authorize-raise <task-id> '
+    '--reason "<why this is net-additive work, not a refactor that failed>"\n'
+    f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
+    'task and the reason, so the raise lands as a diff a reviewer reads rather '
+    'than as a number nobody saw move. Without those flags --write-baseline '
+    'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
+    'place cannot widen the ratchet. What no gate can see is a baseline deleted '
+    'first, or written elsewhere and copied over: with nothing to compare '
+    'against, every frozen measure resets and every ceiling is re-grandfathered, '
+    'unrefused and unrecorded. That is not a way past this gate -- it is a '
+    'wholesale reset of the file, visible to nobody but the reviewer reading '
+    'the diff. --authorize-raise is the way past.'
+)
+
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
@@ -1060,16 +1106,16 @@ BASELINE_README = (
     '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
     'frozen at its value on the commit that recorded it: the gate '
     'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
-    'RISES above these numbers. Equality is fine, lowering is the point. NEVER '
-    'regenerate this file merely to make a test pass -- that silently widens '
-    'the ratchet for every downstream task. The enumeration block below is the '
-    'CLUSTER half only: the instrument also sweeps every .py under '
+    'RISES above these numbers. Equality is fine, lowering is the point. The '
+    'enumeration block below is the CLUSTER half only: the instrument also '
+    'sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
-    'arriving never touches these bytes. A task that legitimately LOWERS a '
-    'measure regenerates the baseline in the SAME commit: '
-    'python scripts/merge_lane_metrics.py --write-baseline '
-    'orchestrator/tests/merge_lane_ratchet_baseline.json'
+    'arriving never touches these bytes.\n'
+    # Composed, never paraphrased: this is the one string in the instrument that
+    # changes what a blocked agent does next, and the copy that mattered was
+    # always the one in THIS file.
+    + RAISE_REMEDY
 )
 
 #: The three per-path maps whose entries get one line each.
@@ -1162,18 +1208,135 @@ def render_baseline(report: dict) -> str:
     return '{\n' + ',\n'.join(entries) + '\n}\n'
 
 
-def write_baseline(path: Path, report: dict) -> Path:
-    """Render *report* and write it to *path* atomically.
+class UnauthorizedRaise(Exception):
+    """``write_baseline`` refused to absorb a raise nobody authorized.
+
+    NOT a ``MetricsError``, deliberately. ``main()`` maps every MetricsError to
+    exit 2 ("the instrument is broken"), and a refused regeneration is not a
+    broken instrument -- it is a measure that rose, discovered at write time
+    instead of at check time, which is squarely exit 1. Subclassing would
+    silently reclassify a real regression as a broken tool, collapsing the one
+    distinction the exit ladder exists to keep.
+
+    Carries the measured ``violations`` so ``main()`` can print the same
+    per-violation lines ``--check`` prints, and so the ledger record for an
+    AUTHORIZED raise is derived from the same comparison that would have
+    refused it.
+    """
+
+    def __init__(self, violations: Sequence[Violation]) -> None:
+        self.violations: tuple[Violation, ...] = tuple(violations)
+        super().__init__(
+            f'refusing to write a baseline that RAISES {len(self.violations)} '
+            'measure(s):\n'
+            + '\n'.join(f'  {v.message}' for v in self.violations)
+            + f'\n{RAISE_REMEDY}'
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BaselineWrite:
+    """What one write actually did: where the bytes landed, and what it recorded.
+
+    ``record`` is the ledger entry this write appended, or None when it appended
+    none -- which is every unauthorized write, and an authorized one over a
+    report that raised nothing. Returning it is what lets a caller REPORT the
+    outcome instead of re-deriving it: the alternative is reading the ledger
+    before and after and diffing the lengths, which is three reads of one file
+    and misreports the moment anything else appends concurrently.
+    """
+
+    path: Path
+    record: dict | None
+
+
+def write_baseline(
+    path: Path,
+    report: dict,
+    *,
+    authorization: RaiseAuthorization | None = None,
+    ledger: Path | None = None,
+) -> BaselineWrite:
+    """Render *report* and write it to *path* atomically, refusing silent raises.
 
     THE TEXT IS RENDERED BEFORE THE DESTINATION IS TOUCHED, so a rendering
     failure leaves the committed baseline byte-for-byte intact instead of
     truncated -- a truncated baseline would be a *widened* ratchet, the one
     failure mode this instrument must never produce silently.
+
+    THE WRITE GATE, and why it lives here rather than in the comparator. The
+    pytest gate pins the committed baseline to equal a fresh measurement of the
+    tree, so in every COMMITTED state the comparator is trivially clean; a raise
+    is red only between editing the code and regenerating, and regeneration used
+    to absorb it silently because this function read nothing before overwriting.
+    Regeneration is therefore the ratchet's real enforcement point. If the
+    destination already holds a baseline, the raises this report would introduce
+    are measured against it, and without an *authorization* the write is REFUSED
+    with ``UnauthorizedRaise`` -- the destination untouched, exit 1 at the CLI.
+
+    DELIBERATELY NOT APPLIED here: ``_require_matching_params``. Both it and
+    ``resolve_cluster_paths`` instruct the reader to edit ``CLUSTER_PATHS`` and
+    regenerate the baseline in one commit, so routing regeneration through that
+    precondition would break the one workflow those messages prescribe. Widening
+    the cluster still raises the derived totals, so it still needs an
+    authorization -- which is honest, the totals really did rise.
+
+    THE OTHER ARM OF THAT PRECONDITION, complexipy version drift, reaches this
+    gate the same way and is easy to misread. A new version re-reads every
+    cognitive number at once -- the same merge_queue.py measures 2031 at 3.0.0,
+    2092 at 5.0.0 and 2133 at 6.x/7.x -- so a post-drift regeneration arrives as
+    a wall of raises and needs one authorization. It is recorded as a raise
+    because that is what the numbers did; the ledger reason is what tells a
+    reviewer the INSTRUMENT moved rather than the code, which is why
+    ``_require_matching_params`` asks for the version in it.
+
+    With an *authorization*, the raises are recorded in the append-only ledger
+    at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
+    ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
+    a crash between the two writes leaves a recorded authorization over an
+    unchanged baseline -- the gate stays red, nothing was widened, and the
+    orphaned record is visible -- rather than an unrecorded raise sitting in the
+    committed baseline, which is the exact silent widening this prevents. Both
+    texts are rendered before either file is touched, extending the
+    render-before-write property above across the pair.
+
+    An authorization over a report that raises NOTHING is ignored and appends no
+    record: the ledger holds raises, not intentions. The returned
+    ``BaselineWrite`` says which of the two happened, so a caller reports the
+    outcome from the write itself rather than re-reading the ledger to guess.
+
+    A MISSING destination is a first write with nothing to compare against, and
+    that is the gate's exact limit -- ``RAISE_REMEDY`` says so too, because the
+    agent reading it is the one most likely to go looking for the hole. Deleting
+    the committed baseline, or writing to a scratch path and copying it over,
+    resets every frozen measure and re-grandfathers every ceiling, unrefused and
+    unrecorded. Closing that would mean comparing against the copy in git HEAD:
+    a git dependency in an instrument that has none, plus a special case for the
+    commit that introduces the baseline, bought against a move that already
+    lands as a wholesale diff a reviewer cannot miss. The boundary is drawn
+    rather than overclaimed -- the write gate stops a raise being ABSORBED,
+    review stops a RESET.
+
+    A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
+    rather than being overwritten: a previous baseline you cannot read is one
+    whose raises you cannot see.
     """
     text = render_baseline(report)
     target = Path(path)
+    raises = (
+        _measure_raises(report, load_baseline(target)) if target.exists() else []
+    )
+    record = None
+    if raises:
+        if authorization is None:
+            raise UnauthorizedRaise(raises)
+        record = authorization_record(authorization, raises)
+        append_authorization(
+            Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
+            record,
+        )
     safe_io.atomic_write_text(target, text, mkdir=True)
-    return target
+    return BaselineWrite(path=target, record=record)
 
 
 def load_baseline(path: Path) -> dict:
@@ -1210,6 +1373,193 @@ def load_baseline(path: Path) -> dict:
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# Authorized raises -- the ratchet's reviewed escape hatch.
+#
+# Placed here, immediately after the baseline's own rule, because a reader who
+# opens this file to find out why a regeneration was refused must meet the rule
+# and its escape hatch together. Splitting the enforcement away from the thing
+# it enforces to keep a line count down is precisely the move this mechanism
+# exists to stop rewarding.
+
+
+def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
+    value = getattr(authorization, field)
+    if not isinstance(value, str) or not value.strip():
+        raise MetricsError(
+            f'authorized raise is missing {field}: {value!r}. An authorization '
+            f'with no {field} is not an authorization -- the ledger entry exists '
+            'to tell a reviewer WHO raised a measure and WHY, and an entry that '
+            'answers neither is worse than no entry at all.'
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RaiseAuthorization:
+    """Permission to record ONE set of raises, granted by one invocation.
+
+    An ACT, not a standing permission. It authorizes exactly the raises present
+    in the report it accompanies and nothing else; the ledger entry it produces
+    is provenance a reviewer reads, never an ACL this instrument consults. If a
+    landed record could license a later raise, the natural next move -- pre-write
+    a record, then regenerate -- would be indistinguishable from the silent
+    widening the ratchet exists to prevent. Per-invocation means the default is
+    always refusal, a stale record licenses nothing, and each raise costs one
+    deliberate, attributed command.
+
+    BOTH FIELDS ARE CHECKED AT CONSTRUCTION, so an unattributed authorization
+    never exists to be passed anywhere. Enforcing it further down -- where the
+    record is rendered -- would make the same value valid or invalid depending
+    on whether the report it accompanied happened to raise anything, and a blank
+    ``--reason`` over a lowering run would pass unremarked (heuristic 10).
+    """
+
+    task_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _require_non_blank(self, 'task_id')
+        _require_non_blank(self, 'reason')
+
+
+#: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
+LEDGER_SCHEMA_VERSION = 1
+
+#: Emitted as the ledger's leading key, for the same reason BASELINE_README is:
+#: the rule belongs in the file a reader has open.
+LEDGER_README = (
+    'This is the APPEND-ONLY provenance of every raise ever authorized against '
+    'the merge-lane ratchet baseline '
+    '(orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a '
+    'permission list: nothing in this file grants a future raise, and no entry '
+    'here will ever let --write-baseline absorb one. Authorization is an act, '
+    'not a standing entry -- rerun --authorize-raise for each raise, and it '
+    'appends one more record. Each entry\'s "measures" block is DERIVED from the '
+    'measured raises the write gate computed, never hand-written, so it is '
+    'mechanically incapable of disagreeing with the baseline diff it '
+    'accompanies. There is no timestamp: git already carries the date, and a '
+    'clock would churn this file on every rewrite. Written by '
+    'scripts/merge_lane_metrics.py --write-baseline '
+    'orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise '
+    '<task-id> --reason "<why>".'
+)
+
+
+def authorization_record(
+    authorization: RaiseAuthorization, raises: Sequence[Violation]
+) -> dict:
+    """One ledger entry: who authorized it, why, and exactly what rose.
+
+    A PURE PROJECTION -- it validates nothing, because a ``RaiseAuthorization``
+    that exists is already attributed. ``measures`` is projected off the
+    Violations the write gate measured, in their already-sorted order, reusing
+    ``Violation``'s field names so the audit record and the failure message
+    describe a raise in one vocabulary. Nothing here is typed by the agent, so
+    the record cannot drift from the diff.
+    """
+    return {
+        'task_id': authorization.task_id,
+        'reason': authorization.reason,
+        'measures': [
+            {
+                'measure': violation.measure,
+                'key': violation.key,
+                'baseline': violation.baseline,
+                'current': violation.current,
+            }
+            for violation in raises
+        ],
+    }
+
+
+def empty_ledger() -> dict:
+    """A ledger that has authorized nothing -- the day-one and fail-closed state."""
+    return {
+        '_README': LEDGER_README,
+        'schema_version': LEDGER_SCHEMA_VERSION,
+        'raises': [],
+    }
+
+
+def render_ledger(ledger: dict) -> str:
+    """Serialize *ledger* as the committed file's exact bytes.
+
+    Idempotent, like ``render_baseline``: the ``_README`` is re-emitted from
+    ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
+    rather than a churned file.
+
+    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
+    one-line-per-entry writer. That writer exists for one stated reason -- ten
+    parallel PRD gamma branches each editing different per-path measures would
+    conflict inside indent=2's six-line-per-path hunks. An append-only file
+    gaining one entry per authorizing task has no such shape, so inheriting the
+    custom writer would cargo-cult a constraint that does not apply and cost
+    legibility for it.
+    """
+    body = {key: value for key, value in ledger.items() if key != '_README'}
+    return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
+
+
+def load_ledger(path: Path) -> dict:
+    """Load the authorized-raise ledger. ABSENT is empty; MALFORMED is fatal.
+
+    THE POLARITY IS THE OPPOSITE OF ``load_baseline``'s on absence, deliberately,
+    because absence means opposite things. An absent BASELINE would compare clean
+    against every measure -- a silent disarming, so it must fail hard (INV-11).
+    An absent LEDGER means no raise was ever authorized, which is the fail-CLOSED
+    state: nothing is permitted by it, and hard-failing would only break the
+    day-one and fresh-tmp-path cases for no safety gain.
+
+    Corruption is different in kind. A ledger that cannot be parsed is one whose
+    entries cannot be audited, and reading it as empty would hide history, so
+    every malformed shape fails hard and names the file. Do not "fix" the split
+    by copying the neighbour -- this module already carries one deliberate
+    fail-soft/fail-hard seam that neighbours were tempted to flatten.
+    """
+    target = Path(path)
+    try:
+        text = target.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return empty_ledger()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} could not be read: '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise MetricsError(
+            f'authorized-raise ledger {target} holds a '
+            f'{type(loaded).__name__} at top level, expected a JSON object'
+        )
+    if not isinstance(loaded.get('raises'), list):
+        raise MetricsError(
+            f'authorized-raise ledger {target} has no "raises" list -- a ledger '
+            'whose entries cannot be read is one whose history cannot be '
+            'audited, which must never read as "nothing was authorized"'
+        )
+    return loaded
+
+
+def append_authorization(path: Path, record: dict) -> Path:
+    """Append one record to the ledger at *path*, preserving every prior entry.
+
+    Append-only: history is never rewritten, so a reviewer reading the file
+    reads every raise this baseline has ever absorbed.
+    """
+    target = Path(path)
+    ledger = load_ledger(target)
+    ledger['schema_version'] = LEDGER_SCHEMA_VERSION
+    ledger['raises'] = [*ledger['raises'], record]
+    safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -1310,7 +1660,13 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
             '2031 at 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x -- so a silent '
             'drift rewrites every number at once and leaves the ratchet '
             'comparing two incomparable measurements. Pin the dev group '
-            f'({COMPLEXIPY_REQUIRED}) or regenerate the baseline deliberately.'
+            f'({COMPLEXIPY_REQUIRED}), or regenerate the baseline deliberately '
+            '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
+            'cannot tell the difference: every number the new version reads '
+            'higher is a raise it will refuse. Pass --authorize-raise with a '
+            f'--reason naming the version change, so the {LEDGER_RELPATH} entry '
+            'reads as a change of instrument rather than as a task that grew '
+            'the cluster.'
         )
 
     recorded = list(_params(baseline, 'baseline').get('cluster_paths', ()))
@@ -1437,6 +1793,35 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
     return violations
 
 
+def _measure_raises(current: dict, previous: dict) -> list[Violation]:
+    """Every RAISE *current* introduces over *previous*, sorted by (measure, key).
+
+    A "raise" is any state the baseline may not silently acquire. That is the
+    four rise arms, and it is also a CEILING BREACH -- a new path over
+    ``FILE_LINE_CEILING`` or a new function over
+    ``NEW_FUNCTION_COGNITIVE_CEILING``. The two belong together because
+    regeneration is *how* a ceiling breach would be acquired: ceilings apply
+    only to keys ABSENT from the baseline, so writing an oversized new file into
+    the baseline exempts it from that moment on. Absorbed by a blind
+    regeneration, the two are indistinguishable.
+
+    The comparison arms only -- no preconditions, no policy. TWO callers run
+    this one implementation (SPOT): ``check_against_baseline``, which is what
+    ``--check`` and the pytest gate compare with, and ``write_baseline``'s gate,
+    which is what stops a regeneration absorbing a raise nobody reviewed. Two
+    implementations of "did a measure rise" would eventually disagree, and the
+    one that disagreed quietly would be the write path.
+    """
+    violations = [
+        *_check_files(current, previous),
+        *_check_functions(current, previous),
+        *_check_tests(current, previous),
+        *_check_totals(current, previous),
+        *_check_ceilings(current, previous),
+    ]
+    return sorted(violations, key=lambda v: (v.measure, v.key))
+
+
 def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """Compare a fresh report against the committed baseline. Pure.
 
@@ -1450,24 +1835,13 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """
     _require_complete_enumeration(current)
     _require_matching_params(current, baseline)
-
-    violations = [
-        *_check_files(current, baseline),
-        *_check_functions(current, baseline),
-        *_check_tests(current, baseline),
-        *_check_totals(current, baseline),
-        *_check_ceilings(current, baseline),
-    ]
-    return sorted(violations, key=lambda v: (v.measure, v.key))
+    return _measure_raises(current, baseline)
 
 
 # ---------------------------------------------------------------------------
 # CLI, in the house shape of scripts/scan_task_toolcall_leaks.py: _build_parser()
 # / _render_table() / main(argv) -> int, with the exit ladder documented in the
 # module docstring above (0 clean, 1 ratchet violations, 2 instrument failure).
-
-#: Where the committed baseline lives, relative to the repo root.
-BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
 
 
 def repo_root() -> Path:
@@ -1576,9 +1950,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         '--write-baseline', metavar='PATH',
-        help='Measure and write a baseline to PATH. Regenerating the committed '
-        'baseline merely to make a test pass silently widens the ratchet for '
-        'every downstream task -- see the file\'s own _README.',
+        help='Measure and write a baseline to PATH. REFUSES (exit 1) to absorb '
+        'a measure that rose unless --authorize-raise names the task doing it, '
+        'so a regeneration can never silently widen the ratchet for every '
+        'downstream task -- see the file\'s own _README.',
     )
     parser.add_argument(
         '--root', default=str(repo_root()),
@@ -1590,12 +1965,102 @@ def _build_parser() -> argparse.ArgumentParser:
         '--baseline', default=str(repo_root() / BASELINE_RELPATH),
         help='Baseline JSON for --check (default: %(default)s).',
     )
+    parser.add_argument(
+        '--authorize-raise', metavar='TASK_ID',
+        help='Permit --write-baseline to absorb the raises in THIS measurement, '
+        'recording them in --ledger against this task id. Requires --reason. '
+        'Authorization is an act, not a standing entry: a recorded raise never '
+        'permits a later one.',
+    )
+    parser.add_argument(
+        '--reason', metavar='TEXT',
+        help='Why this raise is net-additive work rather than a refactor that '
+        'failed. Requires --authorize-raise; recorded verbatim in the ledger.',
+    )
+    parser.add_argument(
+        '--ledger', default=str(repo_root() / LEDGER_RELPATH),
+        help='Authorized-raise ledger appended by --authorize-raise (default: '
+        '%(default)s). Pair it with --write-baseline when writing outside this '
+        'checkout; on its own it would append to THIS checkout\'s ledger.',
+    )
     return parser
+
+
+def _resolve_authorization(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> RaiseAuthorization | None:
+    """Validate the authorization flags against each other, or exit 2 saying why.
+
+    argparse cannot express "these two imply each other, and both require that
+    mode", so it is done here rather than left unchecked. A flag that silently
+    did nothing would read, to the agent who typed it, exactly like an
+    authorization that was granted.
+
+    The value object's own non-blank invariant lands here as the THIRD usage
+    error rather than as a broken instrument: ``--reason ""`` is a flag typed
+    wrong, so it prints like the two above and exits on the same code, before
+    anything is measured.
+    """
+    if (args.authorize_raise is None) != (args.reason is None):
+        parser.error(
+            '--authorize-raise and --reason require each other: a raise with no '
+            'recorded reason is not an authorized raise, it is an unattributed '
+            'one'
+        )
+    if args.authorize_raise is None:
+        return None
+    if not args.write_baseline:
+        parser.error(
+            '--authorize-raise is a modifier of --write-baseline, which is the '
+            'only mode that can absorb a raise. --check reports raises; it '
+            'never records them'
+        )
+    try:
+        return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
+    except MetricsError as exc:
+        parser.error(str(exc))
+
+
+def _write(
+    args: argparse.Namespace, report: dict, authorization: RaiseAuthorization | None
+) -> int:
+    """The --write-baseline arm, reporting what this invocation actually did.
+
+    Without an authorization the ledger is neither read nor written -- an
+    unauthorized raise is refused before it is reached -- so a plain
+    regeneration never depends on that file's health, and --ledger can be passed
+    through unconditionally to keep one call site rather than two arms.
+
+    WHAT IS PRINTED COMES FROM THE WRITE, never from re-reading the ledger, so
+    the operator's log cannot claim a raise the committed file does not carry.
+    """
+    ledger = Path(args.ledger)
+    written = write_baseline(
+        Path(args.write_baseline), report, authorization=authorization, ledger=ledger
+    )
+    print(f'wrote {written.path}')
+    if authorization is None:
+        return 0
+    if written.record is None:
+        # An authorization that recorded nothing must SAY so. Printing only
+        # "wrote ..." would read, to the agent who typed --authorize-raise,
+        # exactly like an authorization that was granted and recorded -- the
+        # very failure _resolve_authorization rejects flag shapes to avoid
+        # (INV-11, no silent fail-soft).
+        print(f'no measure rose; nothing recorded in {ledger}')
+        return 0
+    print(
+        f'recorded {len(written.record["measures"])} authorized raise(s) for '
+        f'task {written.record["task_id"]} in {ledger}'
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. See the module docstring for the exit-code contract."""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    authorization = _resolve_authorization(parser, args)
     root = Path(args.root)
     try:
         report = build_report(root)
@@ -1606,9 +2071,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_render_table(report, root))
             return 0
         if args.write_baseline:
-            target = write_baseline(Path(args.write_baseline), report)
-            print(f'wrote {target}')
-            return 0
+            return _write(args, report, authorization)
         violations = check_against_baseline(report, load_baseline(Path(args.baseline)))
         if not violations:
             return 0
@@ -1619,15 +2082,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         for violation in violations:
             print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
+        return 1
+    except UnauthorizedRaise as exc:
+        # Exit 1, not 2: a refused regeneration is a measure that ROSE, found at
+        # write time instead of at check time. Exit 2 stays reserved for a
+        # broken instrument, and both faces of the gate print the same lines.
         print(
-            'A task that legitimately LOWERS a measure regenerates the baseline '
-            'in the SAME commit. A task may never raise one.',
+            f'{len(exc.violations)} merge-lane ratchet violation(s) would be '
+            f'absorbed by writing {args.write_baseline}:',
             file=sys.stderr,
         )
+        for violation in exc.violations:
+            print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
         return 1
     except MetricsError as exc:
         print(f'merge_lane_metrics: {exc}', file=sys.stderr)
         return 2
+
+
 
 
 if __name__ == '__main__':
