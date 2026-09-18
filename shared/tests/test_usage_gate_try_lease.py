@@ -215,3 +215,136 @@ async def test_before_invoke_never_reverses():
     lease = await gate.before_invoke()
 
     assert lease is not None and lease.name == 'max-b'
+
+
+def test_try_lease_skips_an_account_named_in_exclude():
+    """*exclude* is a CALLER-SIDE BOUND, not a cap rule (task 5488 review).
+
+    A synchronous caller that rotates through the pool must be able to
+    terminate. It cannot rely on "each failed attempt marks one account
+    capped": the gate's ``detect_cap_hit`` returns True for a NEAR-CAP
+    banner too, and ``_handle_near_cap_warning`` is annotation-only — it
+    sets ``acct.near_cap`` and takes NO phase transition. So the admissible
+    set need not shrink at all, and a rotation inferring its bound from the
+    gate's handlers can spin forever on one account.
+
+    Saying "not this one again" is the caller's own business, so it is a
+    parameter of the selection rather than a new phase.
+    """
+    gate = make_gate(['acct-1', 'acct-2', 'acct-3'])
+
+    lease = gate.try_lease(exclude={'acct-1'})
+
+    assert lease is not None
+    assert lease.name == 'acct-2'
+    assert not gate._accounts[0].capped, (
+        'exclusion must not cap the account it skips — it is the caller\'s '
+        'bound on ITS OWN loop, and the gate keeps owning admissibility'
+    )
+
+
+@pytest.mark.timeout(15)
+def test_try_lease_returns_none_immediately_when_every_name_is_excluded():
+    """The termination property itself, and the reason it is worth a timeout.
+
+    This is the state a bounded rotation reaches on its last pass: every
+    account tried, none admissible to THIS caller, yet the gate may still
+    consider all of them perfectly healthy. Returning ``None`` is what lets
+    the trickle reach task 4736's exit-0 DEFERRED branch by the same line
+    that already handles a genuinely all-capped pool. A regression that
+    waited here instead would hang the 03:00 unit — which is a hang, not a
+    wrong value, so only a timeout catches it.
+    """
+    gate = make_gate(['acct-1', 'acct-2', 'acct-3'])
+
+    assert gate.try_lease(exclude={'acct-1', 'acct-2', 'acct-3'}) is None
+    for acct in gate._accounts:
+        assert not acct.capped, (
+            'exhausting the CALLER\'s bound must leave the gate\'s own view '
+            'of the roster untouched'
+        )
+
+
+def test_try_lease_exclude_composes_with_reverse():
+    """Two orthogonal knobs on one selection: *reverse* picks the direction
+    of the walk, *exclude* removes names from it. Neither is an admission
+    rule, so they compose without interacting."""
+    gate = make_gate(_POOL)
+
+    lease = gate.try_lease(reverse=True, exclude={'max-h', 'max-g'})
+
+    assert lease is not None
+    assert lease.name == 'max-f'
+
+
+def test_try_lease_default_walk_is_unchanged_by_the_exclude_knob():
+    """Opt-in, and byte-identical when not opted into — both the omitted and
+    the explicit ``None`` spelling, because the call site passes a variable."""
+    gate = make_gate(_POOL)
+
+    assert gate.try_lease().name == 'max-b'
+    assert gate.try_lease(exclude=None).name == 'max-b'
+    assert gate.try_lease(exclude=set()).name == 'max-b'
+
+
+async def test_before_invoke_never_excludes():
+    """The non-regression complement: ``before_invoke`` passes no *exclude*,
+    so every existing async caller keeps selecting exactly what it did."""
+    gate = make_gate(_POOL)
+
+    lease = await gate.before_invoke()
+
+    assert lease is not None and lease.name == 'max-b'
+
+
+def test_try_lease_exclude_of_an_absent_name_is_a_no_op():
+    """A caller's tried-set can name an account the roster no longer has (a
+    reload, a token that stopped resolving). Harmless: the exclusion is a
+    membership test, not a lookup that must succeed."""
+    gate = make_gate(['acct-1', 'acct-2'])
+
+    lease = gate.try_lease(exclude={'max-z', 'acct-404'})
+
+    assert lease is not None and lease.name == 'acct-1'
+
+
+def test_try_lease_still_admits_a_near_cap_account():
+    """THE load-bearing case, and the one that decides what *exclude* MEANS.
+
+    ``near_cap`` is deliberately non-blocking: ``_handle_near_cap_warning``
+    annotates the account and takes no transition, so a near-cap account
+    still serves turns. That stays true here — *exclude* adds a caller's
+    bound and changes NO admissibility rule, so the near-cap account is
+    selected exactly as before unless the caller itself names it.
+
+    This is also why the bound is necessary. A near-cap banner makes
+    ``detect_cap_hit`` return True while leaving the account admissible, so
+    a rotation that re-asked the gate without excluding what it just tried
+    would be handed the same account again, forever.
+    """
+    gate = make_gate(['acct-1', 'acct-2'])
+    gate._accounts[0].near_cap = True
+
+    assert gate.try_lease().name == 'acct-1'
+    assert gate.try_lease(exclude={'acct-1'}).name == 'acct-2'
+
+
+def test_try_lease_does_not_claim_the_probe_slot_of_an_excluded_account():
+    """The exclusion is checked BEFORE the PROBE_IN_FLIGHT claim.
+
+    Selecting a PROBING account is mutating: it claims the account's single
+    probe slot. If the exclusion were tested after that claim, a caller
+    bounding its own loop would burn one probe slot per excluded account —
+    silently making the pool less available the harder the caller tried.
+    """
+    gate = make_gate(['acct-1', 'acct-2'])
+    gate._accounts[0].probing = True
+
+    lease = gate.try_lease(exclude={'acct-1'})
+
+    assert lease is not None and lease.name == 'acct-2'
+    assert not gate._accounts[0].probe_in_flight, (
+        'an excluded PROBING account must keep its probe slot — the skip '
+        'happens before the claim, not after it'
+    )
+    assert gate._accounts[0].probing, 'and it stays PROBING, untransitioned'
