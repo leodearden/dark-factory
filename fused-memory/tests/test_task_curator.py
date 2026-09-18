@@ -369,6 +369,8 @@ class TestPoolWithheld:
         rendered = census.render()
         assert rendered is not None
         lowered = rendered.lower()
+        # The ONE place the guidance's wording is pinned — every other test
+        # asks `_carries_guidance`, which reads it from render() itself.
         # Absence in a truncated pool is not proof of absence...
         assert 'not proof' in lowered
         # ...so prefer create over a speculative combine.
@@ -552,6 +554,20 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
         )
         for tid, status in pairs
     ]
+
+
+def _carries_guidance(text: str) -> bool:
+    """Does *text* carry the pool-truncation decision-safety guidance?
+
+    Read from the guidance's ONE source — ``PoolWithheld.render`` itself —
+    so a test that only cares WHETHER a prompt carries it does not pin a
+    second copy of the prose. The wording is pinned in exactly one place,
+    ``TestPoolWithheld.test_render_carries_the_decision_safety_guidance``;
+    a reword touches that test and nothing else.
+    """
+    rendered = PoolWithheld(by_source={'module': 1}, caps={'module': 15}).render()
+    assert rendered is not None
+    return rendered.split('\n', 1)[1] in text
 
 
 class TestParseDecision:
@@ -3014,9 +3030,6 @@ class TestPromptCarriesPoolTruncation:
             caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
         )
 
-    def _guidance_present(self, rendered: str) -> bool:
-        return 'not proof' in rendered.lower()
-
     def test_single_prompt_carries_the_fact_and_the_guidance(self):
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         pool = _pool_with_ids(('10', 'pending'))
@@ -3024,7 +3037,7 @@ class TestPromptCarriesPoolTruncation:
             CandidateTask(title='T'), pool, withheld=self._census(),
         )
         assert 'pool_truncated:' in rendered
-        assert self._guidance_present(rendered)
+        assert _carries_guidance(rendered)
 
     def test_batch_section_carries_the_fact_and_the_guidance(self):
         curator = TaskCurator(config=_make_config(), taskmaster=None)
@@ -3033,7 +3046,7 @@ class TestPromptCarriesPoolTruncation:
             CandidateTask(title='T'), pool, 0, withheld=self._census(),
         )
         assert 'pool_truncated:' in rendered
-        assert self._guidance_present(rendered)
+        assert _carries_guidance(rendered)
 
     def test_fact_follows_the_pool_block(self):
         curator = TaskCurator(config=_make_config(), taskmaster=None)
@@ -4011,7 +4024,7 @@ class TestWithheldReachesTheLlmPrompt:
             curator, CandidateTask(title='T'), corpus,
         )
         assert 'pool_truncated:' in prompt
-        assert 'not proof' in prompt.lower()
+        assert _carries_guidance(prompt)
 
     @pytest.mark.asyncio
     async def test_single_path_stays_quiet_for_an_untruncated_corpus(self):

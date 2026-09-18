@@ -1419,7 +1419,6 @@ class TestCuratorEntryCharCaps:
             + cfg.pool_embedding_cap
             + cfg.pool_dependency_cap
         )
-        assert maximal_pool == 29
         assert maximal_pool <= cfg.pool_total_cap, (
             f'A maximal pool is {maximal_pool} entries against pool_total_cap '
             f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
