@@ -21,6 +21,7 @@ TDD pair 1: the Enumeration value (GREEN on impl step-10).
 TDD pair 2: excess / slack / tighten + the no-add-key property (GREEN on impl step-12).
 TDD pair 3: the two comparability refusals, uniform across all three (GREEN on impl step-14).
 TDD pair 4: dump / load round trip + the committed-file shape (GREEN on impl step-16).
+TDD pair 5: load()'s refusals, every one naming the path (GREEN on impl step-18).
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ import shared.ratchet
 from shared.ratchet import (
     BASELINE_README,
     SCHEMA_VERSION,
+    BaselineUnusable,
     Enumeration,
     IncompleteEnumeration,
     ParamsMismatch,
@@ -666,3 +668,205 @@ class TestDumpIsAtomic:
         path = tmp_path / 'nested' / 'deeper' / 'baseline.json'
         dump(REPRESENTATIVE, path)
         assert load(path) == REPRESENTATIVE
+
+
+class TestLoadRefuses:
+    """Absent, unreadable, malformed and wrong-schema all mean one thing.
+
+    Every case raises :class:`BaselineUnusable`, every message names the path,
+    and the exception carries the path as a structured attribute — at this
+    boundary the path is what an operator needs, which is why these refusals
+    are not the bare ValueError ``Enumeration.__post_init__`` raises.
+
+    ONE ENUMERATION SHAPE FAULT HAS NO CASE HERE, and the omission is measured
+    rather than forgotten: a counts entry keyed by a non-str cannot cross this
+    boundary at all, because JSON object keys are strings by the format's
+    definition and ``json.loads`` therefore hands ``load`` str keys whatever the
+    file said.  ``Enumeration.__post_init__`` remains that check's only home,
+    where it catches the in-process construction that can actually produce it.
+    What IS worth pinning at the file boundary is the other half of the same
+    stance — that a key which merely LOOKS like something else is still an
+    opaque token — which
+    :meth:`TestLoadDoesNotPoliceWhatAHumanAdded.test_a_numeric_looking_key_is_still_an_opaque_token`
+    does.
+    """
+
+    @staticmethod
+    def _refuses(path):
+        with pytest.raises(BaselineUnusable) as excinfo:
+            load(path)
+        error = excinfo.value
+        assert str(path) in str(error)
+        assert str(error.path) == str(path)
+        return str(error)
+
+    @staticmethod
+    def _written(tmp_path, payload):
+        path = tmp_path / 'baseline.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        return path
+
+    def test_a_missing_baseline_is_never_an_empty_baseline_pass(self, tmp_path):
+        """INV-11, in this test's own words: absent is not clean.
+
+        An empty baseline compares clean against EVERYTHING, so a load that
+        answered "no file, have an empty one" would turn a deleted or
+        never-seeded baseline into a permanently green gate — the silent
+        fail-soft the invariant is named for.
+
+        Boundary scenario 11's "baseline absent" path is the scanner's to
+        detect by an existence check BEFORE calling load, so it can say
+        something better than "unusable".  That is a nicer message, not a
+        weaker contract: load itself refuses, and this asserts it.
+        """
+        self._refuses(tmp_path / 'never-written.json')
+
+    def test_a_directory(self, tmp_path):
+        (tmp_path / 'baseline.json').mkdir()
+        self._refuses(tmp_path / 'baseline.json')
+
+    def test_bytes_that_are_not_utf8(self, tmp_path):
+        path = tmp_path / 'baseline.json'
+        path.write_bytes(b'\xff\xfe not utf-8 at all')
+        self._refuses(path)
+
+    def test_text_that_is_not_json(self, tmp_path):
+        path = tmp_path / 'baseline.json'
+        path.write_text('{ this is not json', encoding='utf-8')
+        self._refuses(path)
+
+    @pytest.mark.parametrize('payload', [[], 'a string', 17, None])
+    def test_a_top_level_that_is_not_an_object(self, tmp_path, payload):
+        self._refuses(self._written(tmp_path, payload))
+
+    @pytest.mark.parametrize('version', [None, 'one', 1.0, 999])
+    def test_a_schema_version_this_build_does_not_read(self, tmp_path, version):
+        """Naming BOTH the found and the expected version.
+
+        The ``fused-memory/scripts/census_memory_metadata.py::
+        load_coverage_history`` precedent: refusing to misread it as one.
+        """
+        payload = {'schema_version': version, 'params': {}, 'complete': True, 'counts': {}}
+        if version is None:
+            del payload['schema_version']
+        message = self._refuses(self._written(tmp_path, payload))
+        assert str(SCHEMA_VERSION) in message
+        if version is not None:
+            assert repr(version) in message
+
+    @pytest.mark.parametrize('params', [None, [], 'x', 17])
+    def test_params_absent_or_not_an_object(self, tmp_path, params):
+        payload = {'schema_version': SCHEMA_VERSION, 'params': params, 'complete': True, 'counts': {}}
+        if params is None:
+            del payload['params']
+        self._refuses(self._written(tmp_path, payload))
+
+    @pytest.mark.parametrize(
+        'counts',
+        [
+            None,  # absent
+            [],  # not an object
+            {'a': 'two'},  # non-int
+            {'a': 0},  # zero
+            {'a': -1},  # negative
+        ],
+    )
+    def test_every_counts_shape_fault_surfaces_as_baseline_unusable(self, tmp_path, counts):
+        """Not the bare ValueError __post_init__ raises.
+
+        At this boundary the operator is holding a file, so the refusal has to
+        name the file.  A ValueError describing a count in the abstract leaves
+        them hunting for which of several baselines produced it.
+        """
+        payload = {'schema_version': SCHEMA_VERSION, 'params': {}, 'complete': True, 'counts': counts}
+        if counts is None:
+            del payload['counts']
+        self._refuses(self._written(tmp_path, payload))
+
+    @pytest.mark.parametrize('complete', [None, 'true', 1, []])
+    def test_complete_absent_or_not_a_bool(self, tmp_path, complete):
+        payload = {'schema_version': SCHEMA_VERSION, 'params': {}, 'complete': complete, 'counts': {}}
+        if complete is None:
+            del payload['complete']
+        self._refuses(self._written(tmp_path, payload))
+
+    @pytest.mark.parametrize('unreadable', ['x.py', [17], {'a': 1}])
+    def test_unreadable_present_but_not_a_list_of_str(self, tmp_path, unreadable):
+        self._refuses(
+            self._written(
+                tmp_path,
+                {
+                    'schema_version': SCHEMA_VERSION,
+                    'params': {},
+                    'complete': False,
+                    'counts': {},
+                    'unreadable': unreadable,
+                },
+            )
+        )
+
+    def test_the_completeness_contradiction_survives_the_file_boundary(self, tmp_path):
+        """complete=true with a non-empty unreadable is refused off disk too.
+
+        The in-process constructor refuses it; if the file boundary did not,
+        the contradiction would simply be laundered through a write.
+        """
+        self._refuses(
+            self._written(
+                tmp_path,
+                {
+                    'schema_version': SCHEMA_VERSION,
+                    'params': {},
+                    'complete': True,
+                    'counts': {},
+                    'unreadable': ['pkg/a.py'],
+                },
+            )
+        )
+
+    def test_is_a_ratchet_error(self):
+        assert issubclass(BaselineUnusable, RatchetError)
+
+
+class TestLoadDoesNotPoliceWhatAHumanAdded:
+    """A hand-added key still loads, and that is not a hole."""
+
+    def test_an_added_key_loads(self, tmp_path):
+        """The kernel does not police the file's CONTENT, only its SHAPE.
+
+        There is no need to: an added key cannot widen anything, because the
+        only baseline-producing function is :func:`tighten` and its result is a
+        subset of the baseline by construction.  A key someone added by hand
+        survives exactly until the next tighten, and buys them nothing in the
+        meantime beyond permitting an entry the gate would otherwise name.
+        Refusing it here would be a second, weaker enforcement point for a
+        property the arithmetic already guarantees.
+        """
+        path = tmp_path / 'baseline.json'
+        dump(REPRESENTATIVE, path)
+        tampered = json.loads(path.read_text(encoding='utf-8'))
+        tampered['counts']['deadbeef0000'] = 7
+        path.write_text(json.dumps(tampered), encoding='utf-8')
+
+        reloaded = load(path)
+        assert reloaded.counts['deadbeef0000'] == 7
+
+        scan = Enumeration(counts=dict(REPRESENTATIVE.counts), params=dict(REPRESENTATIVE.params))
+        assert 'deadbeef0000' not in tighten(scan, reloaded)
+
+    def test_a_numeric_looking_key_is_still_an_opaque_token(self, tmp_path):
+        """The kernel never INTERPRETS a key, so a digit string is just a key.
+
+        The counterpart to the note in :class:`TestLoadRefuses`: a non-str
+        counts key cannot survive JSON, so what a file boundary can actually
+        get wrong is reading a str key as the thing it resembles.  A baseline
+        keyed by content digests will sooner or later hold one that is all
+        digits, and it must round-trip as the same key rather than as an int.
+        """
+        path = tmp_path / 'baseline.json'
+        numeric = Enumeration(counts={'1234567890ab': 3}, params=dict(PARAMS))
+        dump(numeric, path)
+
+        reloaded = load(path)
+        assert reloaded == numeric
+        assert list(reloaded.counts) == ['1234567890ab']
