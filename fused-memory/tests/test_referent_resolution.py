@@ -1843,7 +1843,12 @@ class TestKnownProjectIdsNarrowing:
     def test_conflicts_are_still_computed_against_the_scan_when_declared(self):
         """``.conflicts`` is DEFINED as declared-versus-scan, and the scan it is
         computed against is the narrowed one — so a junk-qualified mention is
-        no longer evidence of a conflict, while an in-registry one still is."""
+        no longer evidence of a conflict, while an in-registry one still is.
+
+        The result holds the contradicted DECLARED referents, not the scanned
+        ones (``_conflicting_referents``), so both arms assert on 'Task 3127'
+        and the registry moves it between present and absent.
+        """
         genuine = resolve_referents(
             declared=[{'kind': 'task', 'id': 3127}],
             metadata={},
@@ -1851,7 +1856,7 @@ class TestKnownProjectIdsNarrowing:
             group_id=GROUP,
             known_project_ids=self.REGISTRY,
         )
-        assert genuine.conflicts == (Referent(kind='task', project_id='reify', number='132'),)
+        assert genuine.conflicts == (Referent(kind='task', number='3127'),)
         junk = resolve_referents(
             declared=[{'kind': 'task', 'id': 3127}],
             metadata={},
