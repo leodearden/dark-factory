@@ -200,7 +200,10 @@ def test_try_lease_default_order_is_unchanged_by_the_new_knob():
     account preference, which this task has no business touching."""
     gate = make_gate(_POOL)
 
-    assert gate.try_lease().name == 'max-b'
+    lease = gate.try_lease()
+
+    assert lease is not None
+    assert lease.name == 'max-b'
 
 
 @pytest.mark.asyncio
