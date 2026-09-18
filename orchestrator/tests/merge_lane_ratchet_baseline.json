@@ -1060,7 +1060,7 @@
     "orchestrator/tests/test_verdict_servers_integration_gate.py": {"patch_targets": [], "private_reads": 32},
     "orchestrator/tests/test_verify_cancel.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_verify_categories.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_verify_env_transient.py": {"patch_targets": [], "private_reads": 35},
+    "orchestrator/tests/test_verify_env_transient.py": {"patch_targets": [], "private_reads": 31},
     "orchestrator/tests/test_verify_main_tip_sweep.py": {"patch_targets": [], "private_reads": 40},
     "orchestrator/tests/test_verify_phase_rebase.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_verify_plan_integration.py": {"patch_targets": ["verify_failure_is_preexisting_on_main"], "private_reads": 1},
