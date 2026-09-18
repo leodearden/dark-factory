@@ -2231,6 +2231,23 @@ class MemoryService:
         # Forward to the storm escalator, which is where project_id →
         # project_root resolution actually happens.
         self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
+        # The PERMISSIVE arm is logged too, not only the populated one. An
+        # empty registry is a real window rather than a hypothetical: this
+        # service is constructed before `build_known_projects_map` runs (see
+        # `__init__`), and while it lasts every producer referent scan stays
+        # permissive — junk qualifiers like 'localhost:6379' keep minting
+        # referents — with nothing else in the log to say so. The remedy is the
+        # same one the three existing `_known_projects`-miss messages already
+        # name, so this reads as one idiom with them.
+        logger.info(
+            'Known-project registry wired: %s. Remedy if unintended: '
+            'MemoryService.set_known_projects(build_known_projects_map(...)) '
+            'at server startup.',
+            {
+                'known_project_count': len(self._known_projects),
+                'referent_narrowing': 'active' if self._known_projects else 'permissive',
+            },
+        )
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
