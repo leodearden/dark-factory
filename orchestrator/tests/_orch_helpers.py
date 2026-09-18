@@ -200,6 +200,22 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
+#
+# THAT NEVER-NARROW RULE WAS APPLIED HERE AND NOT TO ITS NEIGHBOUR, which is
+# recorded rather than left to be noticed later.  HEAVY_BARRIER_TEST_TIMEOUT
+# (test_merge_queue_concurrent_verify.py) stayed at 300 while this moved to 540,
+# so it now sits BELOW the ini default it used to equal: under a bare
+# local/agent run the heaviest merge-barrier classes become the one heavy family
+# whose module marks TIGHTEN below the ambient budget -- exactly the inversion
+# the rule above exists to prevent, on the tests most exposed to the CPU
+# starvation the 540 raise answers.  A LATENT GAP, not a regression: verify
+# passes `--timeout=300` on its CLI either way (see VERIFY_CLI_PER_TEST_TIMEOUT
+# below), so on the merge gate those tests see 300 whatever this file says.
+# Unfixed here because that constant lives outside the file scope of the task
+# that moved this one, and because the fix is a genuine choice rather than a
+# mechanical one -- either exempt a DERIVED merge-wait bound from the rule
+# explicitly, or raise it to `max(5 * MERGE_RESULT_TIMEOUT + 75,
+# PYPROJECT_DEFAULT_TIMEOUT)`.  Filed as follow-up.
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 
 # task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`

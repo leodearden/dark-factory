@@ -243,13 +243,17 @@ class TestTimeoutConstants:
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= _ABSOLUTE_FLOOR_SECONDS, (
             f'WHOLE_TREE_SCAN_TEST_TIMEOUT ({WHOLE_TREE_SCAN_TEST_TIMEOUT}) has '
             f'fallen below the absolute floor ({_ABSOLUTE_FLOOR_SECONDS}s). It '
-            f'is derived as 5 * PYPROJECT_DEFAULT_TIMEOUT '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}), so the likeliest cause is that the '
-            "pyproject's per-test default was TIGHTENED and dragged this "
-            'ceiling down with it. The family ceiling must stay anchored to the '
-            f'measured cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at '
-            'loadavg 120-176, with worker deaths at loadavg 250-423), not to '
-            'the setting it exists to clear -- pin it explicitly rather than '
+            'is a LITERAL, derived from nothing: the `5 * '
+            'PYPROJECT_DEFAULT_TIMEOUT` derivation was DROPPED on 2026-09-12 '
+            "(this test's docstring says why), so do not read the two as "
+            'tracking each other. What binds the constant is never-narrow '
+            'against TWO independent bounds -- this floor, and the ini default '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, asserted separately below) -- so '
+            'the likeliest cause of this failure is the constant being lowered '
+            'by hand. The family ceiling must stay anchored to the measured '
+            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at loadavg '
+            '120-176, with worker deaths at loadavg 250-423), not to whichever '
+            'setting it happens to clear -- pin it explicitly rather than '
             'lowering this floor.'
         )
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
