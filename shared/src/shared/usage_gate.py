@@ -57,6 +57,8 @@ from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_stric
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
@@ -1006,7 +1008,11 @@ class UsageGate:
         )
 
     def try_lease(
-        self, *, scope: str | None = None, reverse: bool = False,
+        self,
+        *,
+        scope: str | None = None,
+        reverse: bool = False,
+        exclude: Collection[str] | None = None,
     ) -> AccountLease | None:
         """Select an admissible account and return its lease, or ``None`` —
         SYNCHRONOUSLY, and WITHOUT ever blocking.
@@ -1055,10 +1061,38 @@ class UsageGate:
         caller keeps the order it has always had. The knob lives HERE, in the
         gate, rather than in a caller-side rotation that would have to
         re-implement selection to express it.
+
+        *exclude* skips accounts by NAME. It is a CALLER-SIDE BOUND — a
+        synchronous caller rotating through the pool saying "not this one
+        again" — and it is emphatically NOT a cap rule, NOT a phase
+        transition, and NOT an admissibility change: nothing about the
+        excluded account is written, and the gate keeps deciding on its own
+        who can serve a turn. ``near_cap`` in particular stays non-blocking
+        here, exactly as ``_handle_near_cap_warning`` intends: a near-cap
+        account is still selected unless the caller itself names it.
+
+        That distinction is what makes *exclude* necessary rather than
+        merely convenient. ``detect_cap_hit`` returns True for a near-cap
+        banner while taking NO transition, so a rotation that re-asked for
+        an account after each refusal could be handed the same one forever
+        — its termination would depend on the gate's handler semantics. With
+        a growing exclusion set the bound is structural: the walk never
+        returns an excluded name, so the set grows by one per pass and the
+        selection runs out after at most one pass per account. Like
+        *reverse*, it is opt-in and ``before_invoke`` never passes it, so the
+        blocking policy and the orchestrator's ordering are unchanged.
         """
         roster = reversed(self._accounts) if reverse else self._accounts
         for acct in roster:
             if acct.capped or acct.probe_in_flight or acct.auth_failed:
+                continue
+            if exclude and acct.name in exclude:
+                # Checked BEFORE the PROBE_IN_FLIGHT claim below: selecting a
+                # PROBING account is mutating, so testing the exclusion after
+                # it would burn one probe slot per excluded account — making
+                # the pool less available the harder a caller bounded itself.
+                # Guarded on a truthy `exclude` so the None/empty path stays
+                # byte-identical for every existing caller.
                 continue
             if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
                 # Scope-capped for this model (S2): skip for this scope
