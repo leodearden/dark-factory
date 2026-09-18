@@ -72,6 +72,7 @@ from shared.safe_io import atomic_write_text
 
 __all__ = [
     'BASELINE_README',
+    'BaselineUnusable',
     'Enumeration',
     'IncompleteEnumeration',
     'ParamsMismatch',
@@ -177,6 +178,45 @@ class IncompleteEnumeration(RatchetError):
             f'{len(unreadable)} entr(y/ies) — {list(unreadable)}. A scan that skipped '
             'entries measures LOWER than the truth, so comparing it would read as a clean '
             'tree, or worse as an improvement worth writing into the baseline (INV-11).'
+        )
+
+
+class BaselineUnusable(RatchetError):
+    """The baseline at this path cannot be compared against.
+
+    THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE.  Absent,
+    unreadable, malformed and wrong-schema all mean one identical thing to a
+    caller — *you cannot compare against this, and no comparison you could run
+    would mean anything* — so splitting the family by cause would hand every
+    consumer four ``except`` clauses that all do the same thing.  The cause is
+    still there for whoever is fixing the file; it is in the message and on
+    :attr:`cause`, where it informs without having to be dispatched on.
+
+    Attributes:
+        path: The baseline this refusal is about, named FIRST in the message.
+            An operator holding a red gate is usually holding several
+            baselines, and the one thing they cannot derive from the rest of
+            the message is which file to open.
+        reason: What was wrong with it, in one clause.
+        cause: The underlying exception when the refusal came from one
+            (``OSError``, a decode failure, or the shape ``ValueError``
+            :class:`Enumeration` raises), else ``None``.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str | os.PathLike[str],
+        reason: str,
+        cause: Exception | None = None,
+    ) -> None:
+        self.path = path
+        self.reason = reason
+        self.cause = cause
+        super().__init__(
+            f'refusing to compare against the baseline at {path}: {reason}. A baseline this '
+            'kernel cannot read IS the finding — returning an empty one instead would compare '
+            'clean against everything and report a breach as a clean tree (INV-11).'
         )
 
 
@@ -433,17 +473,108 @@ def dump(enumeration: Enumeration, path: str | os.PathLike[str]) -> None:
     atomic_write_text(path, '{\n' + ',\n'.join(blocks) + '\n}\n', mkdir=True)
 
 
+def _found(raw: Mapping[str, object], name: str) -> str:
+    """Render *name*'s value for a refusal message, or the word ``absent``.
+
+    A field that is missing and a field that is present and wrong are different
+    mistakes with different fixes, and a message that renders the first as
+    ``None`` sends the reader looking for a null they never wrote.
+    """
+    return repr(raw[name]) if name in raw else 'absent'
+
+
+def _require_baseline_shape(raw: object, path: str | os.PathLike[str]) -> None:
+    """Refuse anything that is not shaped like a baseline, naming the field.
+
+    Explicit and ordered, ahead of :class:`Enumeration`, so the refusal names
+    the one field that is wrong rather than whatever the constructor happened
+    to trip over first.
+
+    SHAPE, NEVER CONTENT.  A key a human added by hand loads without complaint,
+    and that is not a hole: :func:`tighten` is the only baseline-producing
+    function and its result is a subset of the baseline, so an added key cannot
+    widen anything and survives exactly until the next tighten.  Policing it
+    here would be a second, weaker enforcement point for a property the
+    arithmetic already guarantees.
+    """
+    if not isinstance(raw, dict):
+        raise BaselineUnusable(
+            path=path,
+            reason=f'its top level is a {type(raw).__name__}, not a JSON object',
+        )
+
+    version = raw.get('schema_version')
+    if type(version) is not int or version != SCHEMA_VERSION:
+        declared = _found(raw, 'schema_version')
+        raise BaselineUnusable(
+            path=path,
+            reason=(
+                f'its schema_version is {declared} and this build reads only schema_version '
+                f'{SCHEMA_VERSION}'
+            ),
+        )
+
+    for name in ('params', 'counts'):
+        if not isinstance(raw.get(name), dict):
+            raise BaselineUnusable(
+                path=path,
+                reason=f'its {name} block is {_found(raw, name)}, not a JSON object',
+            )
+
+    if not isinstance(raw.get('complete'), bool):
+        raise BaselineUnusable(
+            path=path,
+            reason=(
+                f'its complete flag is {_found(raw, "complete")}, not a JSON boolean — an '
+                'enumeration that does not say how honest it is cannot be compared'
+            ),
+        )
+
+    unreadable = raw.get('unreadable', [])
+    if not isinstance(unreadable, list) or not all(isinstance(name, str) for name in unreadable):
+        raise BaselineUnusable(
+            path=path,
+            reason=f'its unreadable list is {_found(raw, "unreadable")}, not a list of strings',
+        )
+
+
 def load(path: str | os.PathLike[str]) -> Enumeration:
-    """Read the baseline at *path*.
+    """Read the baseline at *path*, or refuse to hand back anything at all.
+
+    THE POLARITY, stated here rather than pointed at, because it is the
+    opposite of the one a whole-tree sweep guard takes.  A sweep that cannot
+    read one file out of thousands may reasonably carry on and name it in
+    ``unreadable``.  This instrument is asked to compare against ONE fixed,
+    named artifact, so a baseline it cannot read IS the finding, and there is
+    no degraded answer available to return instead: an empty baseline compares
+    clean against EVERYTHING, so a soft return would report a breach as a clean
+    tree (INV-11 ``no-silent-fail-soft``).  Absent, undecodable, unparseable,
+    misshapen and wrong-schema therefore all converge on one refusal.
 
     Any inbound ``_README`` is DROPPED rather than carried: :func:`dump` always
     re-emits the constant, which is what stops an edited one surviving a round
     trip and softening the rule in the file that publishes it.
+
+    Raises:
+        BaselineUnusable: Always, for every one of those ways of failing to get
+            an Enumeration out of this path.  The cause travels on the message
+            and on ``.cause`` rather than in the exception type, because the
+            caller does the same thing in every case.
     """
-    raw = json.loads(Path(path).read_text(encoding='utf-8'))
-    return Enumeration(
-        counts=raw['counts'],
-        params=raw['params'],
-        complete=raw['complete'],
-        unreadable=tuple(raw.get('unreadable', ())),
-    )
+    location = Path(path)
+    try:
+        raw = json.loads(location.read_text(encoding='utf-8'))
+        _require_baseline_shape(raw, location)
+        return Enumeration(
+            counts=raw['counts'],
+            params=raw['params'],
+            complete=raw['complete'],
+            unreadable=tuple(raw.get('unreadable', ())),
+        )
+    # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses,
+    # as is the value fault Enumeration.__post_init__ raises; BaselineUnusable is
+    # not, so a refusal raised above travels out of here unwrapped.
+    except (OSError, ValueError) as exc:
+        raise BaselineUnusable(
+            path=location, reason=f'{type(exc).__name__}: {exc}', cause=exc
+        ) from exc
