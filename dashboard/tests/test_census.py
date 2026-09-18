@@ -224,6 +224,18 @@ def test_build_census_accepts_an_immutable_mapping():
 # ---------------------------------------------------------------------------
 
 
+def wire_section(wire, key) -> dict[str, int]:
+    """The *key* section of a census wire dict, narrowed for indexing.
+
+    ``to_wire()`` is honestly typed ``dict[str, object]`` — its values are
+    heterogeneous — so a test that reaches into a section narrows it here
+    rather than the module weakening its own annotation.
+    """
+    section = wire[key]
+    assert isinstance(section, dict)
+    return section
+
+
 def test_to_wire_emits_exactly_the_four_contract_keys():
     """The wire shape is closed: counts, total, views, sub_views."""
     wire = build_census(NINE_MEMBER_MAP).to_wire()
@@ -233,16 +245,18 @@ def test_to_wire_emits_exactly_the_four_contract_keys():
 def test_to_wire_keys_counts_by_the_plain_status_strings():
     """`'in-progress'`/`'infra-hold'` as written, not enum objects."""
     wire = build_census(NINE_MEMBER_MAP).to_wire()
-    assert set(wire['counts']) == {member.value for member in TaskStatus}
-    assert all(type(key) is str for key in wire['counts'])
+    counts = wire_section(wire, 'counts')
+    assert set(counts) == {member.value for member in TaskStatus}
+    assert all(type(key) is str for key in counts)
 
 
 def test_to_wire_keys_views_by_the_plain_view_strings():
     """The view keys cross the wire as the strings the SPA reads."""
     wire = build_census(NINE_MEMBER_MAP).to_wire()
-    assert set(wire['views']) == {'in_flight', 'backlog', 'terminal'}
-    assert set(wire['sub_views']) == {'running'}
-    assert all(type(key) is str for key in wire['views'])
+    views = wire_section(wire, 'views')
+    assert set(views) == {'in_flight', 'backlog', 'terminal'}
+    assert set(wire_section(wire, 'sub_views')) == {'running'}
+    assert all(type(key) is str for key in views)
 
 
 def test_to_wire_is_json_serialisable_without_a_custom_encoder():
@@ -254,11 +268,12 @@ def test_to_wire_is_json_serialisable_without_a_custom_encoder():
 def test_to_wire_parts_sum_to_the_whole():
     """The PRD's boundary sketch #4, asserted on the wire the SPA actually reads."""
     wire = build_census(NINE_MEMBER_MAP).to_wire()
-    assert sum(wire['counts'].values()) == wire['total'] == sum(wire['views'].values())
+    counts_total = sum(wire_section(wire, 'counts').values())
+    assert counts_total == wire['total'] == sum(wire_section(wire, 'views').values())
 
 
 def test_to_wire_never_puts_running_in_the_partition():
     """`running` is a sub-view; a fourth `views` entry would break the sum above."""
     wire = build_census(NINE_MEMBER_MAP).to_wire()
-    assert 'running' not in wire['views']
-    assert wire['sub_views']['running'] == 1
+    assert 'running' not in wire_section(wire, 'views')
+    assert wire_section(wire, 'sub_views')['running'] == 1

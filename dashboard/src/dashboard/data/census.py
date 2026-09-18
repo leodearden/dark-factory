@@ -129,6 +129,19 @@ class TaskCensus:
     views: Mapping[TaskView, int]
     sub_views: Mapping[TaskView, int]
 
+    def to_wire(self) -> dict[str, object]:
+        """Render the four contract keys with plain-string keys throughout.
+
+        This is the one place the census wire shape is known, so a consumer
+        needs neither the Python enums nor a custom JSON encoder to read it.
+        """
+        return {
+            'counts': {member.value: count for member, count in self.counts.items()},
+            'total': self.total,
+            'views': {view.value: count for view, count in self.views.items()},
+            'sub_views': {view.value: count for view, count in self.sub_views.items()},
+        }
+
 
 def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
     """Tally *status_map* into a :class:`TaskCensus`.
