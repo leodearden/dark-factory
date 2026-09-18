@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from shared.async_sqlite_base import AsyncSqliteBase
 
+from dashboard.api.window import _parse_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
@@ -134,25 +135,12 @@ _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
 logger = logging.getLogger(__name__)
 
-_WINDOW_DAYS: dict[str, int] = {
-    '24h': 1,
-    '7d': 7,
-    '30d': 30,
-    'all': 3650,
-}
-
 _BURNDOWN_WINDOWS: dict[str, int] = {
     '24h': 1,
     '7d': 7,
     '30d': 30,
     '90d': 90,
 }
-
-
-def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
-    """Parse the ``?window=`` query parameter and return the corresponding days int."""
-    window = query_params.get('window', f'{default}d')
-    return _WINDOW_DAYS.get(window, default)
 
 
 # ---------------------------------------------------------------------------
