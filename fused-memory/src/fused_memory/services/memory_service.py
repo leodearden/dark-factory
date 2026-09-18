@@ -3433,15 +3433,23 @@ class MemoryService:
             group_id: The project graph this episode was written to.
             referents: The referent set leaf epsilon decoded off the queue
                 payload — what this write DECLARED itself to be about.
-            content: The episode body, threaded from ``payload['content']``, so
-                this pass can RE-DERIVE the producer's ambiguity set (see the
-                AMBIGUITY paragraph above). Defaults to ``''`` — no content, no
+            content: The episode body, threaded from ``payload['content']``.
+                Read ONLY on the ``ambiguous is None`` legacy path, to re-derive
+                the pre-change producer's ambiguity set; a row that carries the
+                wire key never scans it. Defaults to ``''`` — no content, no
                 ambiguity — which is the pre-threading behaviour exactly.
             referent_source: The ``ReferentSource`` leaf epsilon decoded
                 alongside *referents*, one of :data:`REFERENT_SOURCES`. Read only
                 by :func:`_candidate_pool`, to decide whether the
                 whole-declared-set fallback is licensed. Defaults to
                 ``'derived'``, the source on which that rule is unchanged.
+            ambiguous: The PRODUCER's ambiguity set, read off the wire. ``()``
+                means the producer found nothing ambiguous and is BELIEVED;
+                ``None`` means the row carried no such key and is answered with
+                the permissive re-derivation from *content*. Defaults to
+                ``None``, so a caller predating task 5262 keeps re-deriving.
+                See the AMBIGUITY paragraphs above for why the two are not
+                interchangeable.
 
         Returns:
             A :class:`ReferentStats` recording what was walked and every finding.
