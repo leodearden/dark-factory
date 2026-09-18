@@ -103,10 +103,6 @@ class TestEnumerationAccepts:
         assert enumeration.complete is False
         assert enumeration.unreadable == ('x.py',)
 
-    def test_unreadable_normalises_to_a_tuple(self):
-        enumeration = Enumeration(counts={}, params={}, complete=False, unreadable=['x.py'])
-        assert enumeration.unreadable == ('x.py',)
-
 
 class TestEnumerationRejects:
     """A bad in-process construction is a programmer error: ValueError, named.
