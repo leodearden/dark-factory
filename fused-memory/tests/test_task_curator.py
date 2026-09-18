@@ -377,6 +377,25 @@ class TestPoolWithheld:
         assert 'create' in lowered
         assert 'combine' in lowered
 
+    def test_lower_bound_streams_are_named_in_the_fact(self):
+        """A count the retrieval window ceilinged must not read as exact."""
+        census = PoolWithheld(
+            by_source={'module': 7, 'embedding': 20},
+            caps={'module': 15, 'embedding': 10},
+            lower_bounds=('embedding',),
+        )
+        rendered = census.render()
+        assert rendered is not None
+        assert self._payload(rendered)['lower_bounds'] == ['embedding']
+        assert 'at least' in rendered.lower()
+
+    def test_an_exact_census_names_no_lower_bounds(self):
+        census = PoolWithheld(by_source={'module': 7}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        assert 'lower_bounds' not in self._payload(rendered)
+        assert 'at least' not in rendered.lower()
+
     def test_is_frozen(self):
         census = PoolWithheld(by_source={'module': 1})
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -2249,9 +2268,56 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
 
         assert sizes['embedding'] == cap
         # The cap broke out of the neighbour loop; the neighbours it never
-        # visited are exactly what the pool lost.
+        # visited are exactly what the pool lost. 20 here is the RETRIEVAL
+        # WINDOW's ceiling (overfetch = cap + 20), not a corpus count — see
+        # test_embedding_count_is_a_floor_when_the_window_filled.
         assert withheld.by_source['embedding'] == 20
         assert withheld.by_source['module'] == 0
+
+    @pytest.mark.asyncio
+    async def test_embedding_count_is_a_floor_when_the_window_filled(self):
+        """The embedding arm is bounded by the retrieval window, not the corpus.
+
+        ``overfetch = pool_embedding_cap + 20`` bounds how many neighbours are
+        ever fetched, so its unvisited tail is at most 20 however many
+        near-duplicates the corpus actually holds. Unlike ``module`` and
+        ``dependency`` — both corpus-exhaustive — this count is a FLOOR when
+        the window filled, and the prompt has to say so: it is the one stream
+        ordered by actual similarity, so its withheld entries are the likeliest
+        duplicates of all.
+        """
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 20)  # exactly overfetch
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert withheld.by_source['embedding'] == 20
+        assert withheld.lower_bounds == ('embedding',)
+
+    @pytest.mark.asyncio
+    async def test_embedding_count_is_exact_when_the_window_had_room(self):
+        """qdrant returned fewer neighbours than asked for, so nothing is hidden."""
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        neighbor_ids = self._neighbor_ids(cap + 3)  # well under overfetch
+        neighbor_tasks = [self._module_task(tid) for tid in neighbor_ids]
+        for t in neighbor_tasks:
+            t['files_to_modify'] = []
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(neighbor_tasks))
+
+        _pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T'), neighbor_ids=neighbor_ids,
+        )
+
+        assert withheld.by_source['embedding'] == 3
+        assert withheld.lower_bounds == ()
 
     @pytest.mark.asyncio
     async def test_dependency_cap_excess_is_counted(self):

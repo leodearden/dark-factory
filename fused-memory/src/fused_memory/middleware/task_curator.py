@@ -379,6 +379,16 @@ class PoolWithheld:
     configured limits that produced those counts, so a reader can tell a pool
     one entry over its cap from one that lost forty.
 
+    The ``module`` and ``dependency`` counts are corpus-exhaustive — both
+    streams scan every task. The ``embedding`` count is NOT: it is taken over
+    a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
+    at most 20 neighbours can ever be reported however many near-duplicates
+    the corpus holds. A stream whose count is ceilinged that way is named in
+    ``lower_bounds`` and :meth:`render` says so, because the alternative is
+    the LLM reading a ceiling as an exact count on the one stream ordered by
+    actual similarity — the stream whose withheld entries are the likeliest
+    duplicates of all.
+
     Every count is deliberately per-STREAM and not only at ``total_cap``:
     under stock config the stream caps are the binding constraints and
     ``total_cap`` never fires at all (see the pool-cap block in
@@ -391,6 +401,7 @@ class PoolWithheld:
 
     by_source: Mapping[str, int] = field(default_factory=dict)
     caps: Mapping[str, int] = field(default_factory=dict)
+    lower_bounds: tuple[str, ...] = ()
 
     @property
     def total(self) -> int:
@@ -401,18 +412,26 @@ class PoolWithheld:
         """Render the prompt block, or ``None`` when nothing was withheld."""
         if self.total == 0:
             return None
-        fact = json.dumps(
-            {'withheld': dict(self.by_source), 'caps': dict(self.caps)},
-            sort_keys=True,
-        )
-        return (
-            f'pool_truncated: {fact}\n'
+        payload: dict[str, object] = {
+            'withheld': dict(self.by_source), 'caps': dict(self.caps),
+        }
+        if self.lower_bounds:
+            payload['lower_bounds'] = list(self.lower_bounds)
+        block = (
+            f'pool_truncated: {json.dumps(payload, sort_keys=True)}\n'
             '  The pool above is INCOMPLETE — the counts above are tasks that '
             'matched this candidate but did not fit. Absence of a duplicate in '
             'a truncated pool is not proof that no duplicate exists, so prefer '
             '"create" over a speculative "combine" or "drop" when the pool '
             'offers no clearly-overlapping task.'
         )
+        if self.lower_bounds:
+            block += (
+                '\n  The streams named in "lower_bounds" withheld AT LEAST '
+                'that many: the retrieval window they were counted over was '
+                'itself full, so the true number is that count or higher.'
+            )
+        return block
 
 
 @dataclass
@@ -2519,6 +2538,7 @@ class TaskCurator:
         # Stream 3: embedding neighbors
         embedding_matches: list[_PoolEntry] = []
         embedding_unvisited_ids: list[str] = []
+        embedding_window_full = False
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
@@ -2563,6 +2583,14 @@ class TaskCurator:
                         str((p.payload or {}).get('task_id', ''))
                         for p in points[i + 1:]
                     ]
+                    # And a hard ceiling in the other direction, unlike the
+                    # corpus-exhaustive module/dependency streams: this tail
+                    # can hold at most `overfetch - cap` ids because that is
+                    # all qdrant was asked for. A full window means neighbours
+                    # past it were never fetched, so the count is a FLOOR and
+                    # is reported as one rather than as a count of everything
+                    # excluded.
+                    embedding_window_full = len(points) >= overfetch
                     break
         except Exception as exc:
             logger.debug('task_curator: embedding neighbors failed: %s', exc)
@@ -2635,6 +2663,7 @@ class TaskCurator:
                 'dependency': dependency_cap,
                 'total_cap': self._config.curator.pool_total_cap,
             },
+            lower_bounds=('embedding',) if embedding_window_full else (),
         )
         return pool, pool_sizes, withheld
 
