@@ -537,6 +537,7 @@ class TestAddMemoryStampsReferents:
         assert payload['referents'] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -555,6 +556,7 @@ class TestAddMemoryStampsReferents:
         assert payload['referents'] == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -568,7 +570,7 @@ class TestAddMemoryStampsReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_mem0_only_write_never_enqueues_at_all(self, service):
@@ -639,6 +641,7 @@ class TestAddMemoryStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -659,11 +662,12 @@ class TestAddMemoryStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
     async def test_the_empty_declaration_is_distinct_from_none(self, service):
-        """`{'source': 'declared', 'refs': []}` vs `{'source': 'none', ...}` IS
+        """`{'source': 'declared', 'refs': [], 'ambiguous': []}` vs `{'source': 'none', ...}` IS
         the "considered referents and none applied" vs "never looked" signal
         leaf iota counts. Collapsing [] onto None anywhere on this path would
         erase it silently."""
@@ -675,7 +679,7 @@ class TestAddMemoryStampsDeclaredReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': []}
+        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -704,6 +708,7 @@ class TestAddMemoryStampsDeclaredReferents:
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
+                'ambiguous': [],
             }, f'{extra!r}: {payload["referents"]!r}'
 
         service.durable_queue.enqueue.reset_mock()
@@ -714,7 +719,7 @@ class TestAddMemoryStampsDeclaredReferents:
             **kwargs,
         )
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_declared_digits_are_verbatim(self, service):
@@ -835,6 +840,7 @@ class TestADeclarationIsScopedToTheGraphitiLeg:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
 
@@ -854,6 +860,7 @@ class TestAddEpisodeStampsReferents:
         assert payload['referents'] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -863,7 +870,7 @@ class TestAddEpisodeStampsReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_never_reaches_the_metadata_source(self, service):
@@ -957,6 +964,7 @@ class TestAddEpisodeStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -971,7 +979,7 @@ class TestAddEpisodeStampsDeclaredReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': []}
+        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -995,6 +1003,7 @@ class TestAddEpisodeStampsDeclaredReferents:
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
+                'ambiguous': [],
             }, f'{content!r}: {payload["referents"]!r}'
 
     @pytest.mark.asyncio
@@ -1404,12 +1413,14 @@ class TestReplayFromStoreStampsReferents:
         assert blobs[0] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
         assert blobs[1] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '2500'}],
+            'ambiguous': [],
         }
-        assert blobs[2] == {'source': 'none', 'refs': []}
+        assert blobs[2] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_the_metadata_bridge_is_live_on_this_producer(self, service):
@@ -1426,6 +1437,7 @@ class TestReplayFromStoreStampsReferents:
         assert blob == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1723,6 +1735,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1767,6 +1780,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1793,6 +1807,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1823,6 +1838,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio

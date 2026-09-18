@@ -537,16 +537,17 @@ def _candidate_pool(
     to ``.ambiguous``; treated as undeclared; recorded, not guessed"). γ routes a
     number claimed by BOTH a bare own-project mention and a foreign-qualified
     reference to ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents``, on
-    purpose. ε then drops ``.ambiguous`` from the wire, so a consumer reading only
-    the decoded set sees an ambiguous endpoint as a plain non-member —
-    indistinguishable from a genuine conflation (``_encode_referents``:
-    "AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA").
-    ζ therefore RE-DERIVES the producer's ambiguity set from ``content`` and
-    suppresses the pool for any endpoint in it: an ambiguous reference must be
-    RECORDED and LEFT ALONE, never handed to eta as destructive repair surgery.
-    Tested FIRST, ahead of even the corroboration guard, because it is the
-    strongest "do not touch this" signal available and must hold whatever the
-    fact happens to cite.
+    purpose — so the decoded referent set ALONE cannot distinguish an ambiguous
+    endpoint from a genuine conflation: both are simply non-members. That is why
+    the ambiguity set is a separate PARAMETER here rather than something this
+    function could infer. The pool is suppressed for any endpoint in it: an
+    ambiguous reference must be RECORDED and LEFT ALONE, never handed to eta as
+    destructive repair surgery. Tested FIRST, ahead of even the corroboration
+    guard, because it is the strongest "do not touch this" signal available and
+    must hold whatever the fact happens to cite. WHERE the set comes from is ζ's
+    concern, documented at :meth:`MemoryService._verify_episode_referents`; this
+    function only needs it to be the PRODUCER's set, already through
+    :func:`~fused_memory.utils.referent_resolution.local_referent`.
 
     VETO 2 — A ``source='metadata'`` FALLBACK. ``resolve_referents`` ranks ambient
     ``metadata['task_id']`` ABOVE the content-derived scan, and its own docstring
@@ -597,9 +598,10 @@ def _candidate_pool(
             ambiguous. The subtraction of the endpoint from the pool stays in
             :func:`_candidate_targets`, so this function remains "which referents
             is there evidence for", not "which targets survive".
-        ambiguous: The referents the EPISODE CONTENT was ambiguous about, as
-            re-derived by :meth:`MemoryService._verify_episode_referents` from
-            ``scan_content(content, group_id=...).ambiguous``. Already through
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about — the
+            PRODUCER's set, recovered by
+            :meth:`MemoryService._verify_episode_referents`; see there for how.
+            Already through
             :func:`~fused_memory.utils.referent_resolution.local_referent`, so it
             compares equal to *endpoint* on a self-qualified spelling.
         source: The ``ReferentSource`` :func:`_decode_referents` read off the

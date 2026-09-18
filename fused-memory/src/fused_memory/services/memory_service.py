@@ -1184,7 +1184,8 @@ def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
     payloads::
 
         {'source': <one of REFERENT_SOURCES>,
-         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
+         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...],
+         'ambiguous': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
 
     Deliberately NO ``payload_version``, no unknown-operation guard and no
     migration (PRD "Queue compatibility is free here").  An OLD consumer
@@ -1201,49 +1202,79 @@ def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
     itself: the queue persists payloads as JSON TEXT in SQLite, so a
     non-serializable value here would surface only in production.
 
-    AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA.
-    ``ReferentResolution.ambiguous`` (and ``.conflicts``) are dropped here; only
-    ``.source`` and ``.referents`` ride the wire.  That matters because gamma
-    excludes ambiguous referents from ``.referents`` on purpose ("recorded, not
-    guessed"), so a consumer that reads ONLY ``refs`` sees an ambiguous endpoint
-    as a plain non-member of the set — indistinguishable from a genuine
-    conflation.  Leaf zeta must therefore NOT treat "endpoint not in the decoded
-    set" as sufficient grounds for leaf eta to repoint the edge, or an ambiguous
-    reference gets destructively repaired instead of recorded and left alone
-    (PRD boundary-test table: "Ambiguous scan | ref routed to ``.ambiguous``;
-    treated as undeclared; recorded, not guessed").
+    AMBIGUITY RIDES THE WIRE (task 5262).  ``.ambiguous`` is a THIRD key, and
+    the reason is a consumer that cannot otherwise exist safely: gamma excludes
+    ambiguous referents from ``.referents`` on purpose ("recorded, not
+    guessed"), so a consumer reading ONLY ``refs`` sees an ambiguous endpoint as
+    a plain non-member of the set — indistinguishable from a genuine conflation.
+    Acting on that reading means leaf eta destructively repoints an edge the PRD
+    says to leave alone (boundary-test table: "Ambiguous scan | ref routed to
+    ``.ambiguous``; treated as undeclared; recorded, not guessed").  Carrying
+    the producer's own answer is what lets zeta tell the two apart.
 
-    Zeta re-derives it rather than reading it off the wire.  ``.ambiguous`` is
+    WHY THE SET AND NOT THE INPUTS.  ``.ambiguous`` was previously recoverable
+    at the far end, because it is
     ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
-    precedence path — a pure function of ``(content, group_id)``, independent of
-    ``declared``/``metadata`` (referent_resolution.py: "`.ambiguous` is the
-    scan's verbatim answer on every path").  ``_execute_graphiti_write`` holds
-    both ``payload['content']`` and ``payload['group_id']``, so zeta can recover
-    the producer's exact ambiguity set from data already on the payload.
+    precedence path (referent_resolution.py: "`.ambiguous` is the scan's
+    verbatim answer on every path") and ``_execute_graphiti_write`` holds both
+    inputs.  That re-derivation was a SECOND SCAN SITE — the INV-5 lockstep
+    duplication canonical_labels exists to prevent — and it is only sound while
+    the two scans are parameterized identically.  They are not: the producer now
+    scans with the project registry (task 5262 workstream B) and runs at
+    ENQUEUE, while the consumer runs at DEQUEUE on the far side of a durable
+    SQLite queue, so a restart with a changed registry between the two
+    desynchronizes them silently.  Threading the RESULT rather than the INPUTS
+    makes the two sets incapable of disagreeing at all.
 
-    That re-derivation is a SECOND SCAN SITE, which gamma's own comment flags as
-    the INV-5 lockstep duplication canonical_labels exists to prevent — so
-    carrying ``'ambiguous'`` as a third key is the better long-term shape and is
-    filed as follow-up work.  It is not done here because this leaf's frozen
-    contract is the two-key blob and widening it changes this function's return
-    arity and the wire shape every test in
-    tests/test_referent_queue_threading.py pins.  Extending it later is
-    additive and needs no migration, exactly as adding ``'referents'`` did.
+    ``.conflicts`` REMAINS DROPPED, and that is a decision, not an omission.  A
+    conflict is a property of what the CALLER DECLARED versus what the prose
+    says; ``resolve_referents`` reports it to that caller at resolution time and
+    nothing downstream of the queue has a use for it.  Zeta asks a different
+    question — "did this edge land on something the write was about" — and a
+    conflict does not answer it.
+
+    STILL ADDITIVE: no ``payload_version``, no unknown-operation guard, no
+    migration, exactly as adding ``'referents'`` did.  An old consumer draining
+    a new row ignores one more unknown key; a new consumer draining an old row
+    finds ``'ambiguous'`` absent, which :func:`_decode_referents` reports as
+    ``None`` — "the producer did not tell us" — and answers with a permissive
+    re-derivation that reproduces that producer exactly.
     """
+    def _scalars(referents: ReferentSet) -> list[dict[str, str]]:
+        # ONE rendering for both lists: `_decode_referents` validates them
+        # through one helper for the same reason, and two copies of the field
+        # set here would let the two keys drift into different shapes the day
+        # `Referent` grows a field.
+        return [
+            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
+            for r in referents
+        ]
+
     return {
         'source': resolution.source,
-        'refs': [
-            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
-            for r in resolution.referents
-        ],
+        'refs': _scalars(resolution.referents),
+        'ambiguous': _scalars(resolution.ambiguous),
     }
 
 
-def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
+def _decode_referents(
+    payload: dict[str, Any],
+) -> tuple[ReferentSet, str, ReferentSet | None]:
     """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
 
-    Returns ``(referents, source)``.  An ABSENT key decodes to ``((), 'none')``
-    — an old-format queue row executes byte-identically to today.
+    Returns ``(referents, source, ambiguous)``.  An ABSENT key decodes to
+    ``((), 'none', None)`` — an old-format queue row executes byte-identically
+    to today.
+
+    ``ambiguous`` IS ``None``-OR-A-SET, AND THE DISTINCTION IS LOAD-BEARING.
+    ``None`` means "the producer did not tell us": the blob predates the third
+    key, so it was written by a producer that scanned PERMISSIVELY, and the
+    consumer may reproduce it by re-deriving permissively.  ``()`` means "the
+    producer told us: nothing was ambiguous", which the consumer must BELIEVE —
+    re-deriving there would scan with whatever registry happens to be live at
+    dequeue and could manufacture an ambiguity the producer never saw.
+    Collapsing the two into a truthiness test silently reopens exactly the
+    producer/consumer drift threading the key closes.
 
     POPS the key, matching how ``_execute_graphiti_write`` already treats
     ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
@@ -1259,35 +1290,42 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
     ``project_id`` are type-checked here before it runs; see the inline comment
     in the decode loop for the three distinct ways an unchecked field escapes.
 
-    DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
-    ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
-    SINGLE malformed entry — degrades the WHOLE blob to ``((), 'none')``, never
-    a partial set.  A partial set is worse than no set for the consumer this
+    DEGRADATION IS ALL-OR-NOTHING, ACROSS BOTH LISTS.  Any unreadable element —
+    a non-dict blob, a ``source`` outside :data:`REFERENT_SOURCES`, a non-list
+    ``refs`` or ``ambiguous``, or a SINGLE malformed entry in EITHER — degrades
+    the WHOLE blob to ``((), 'none', None)``, never a partial set and never a
+    good ``refs`` beside a dropped ``ambiguous``.  A partial set is worse than no set for the consumer this
     exists to serve: leaf zeta's set-membership check reads "endpoint not in
     the referent set" as a conflation and leaf eta repairs it by repointing the
     edge, so a referent silently dropped by a lenient decoder would manufacture
     a false conflation and drive destructive edge surgery onto the wrong node.
     Referents are therefore accumulated into a local list and only frozen into
     a tuple on FULL success, so a partial set cannot escape by construction.
+    Both lists run through ONE decode helper, so they cannot drift into two
+    validation policies — and that helper reports failure with a SENTINEL
+    rather than an empty list, because ``[]`` is a legitimate decode of both
+    keys.
 
     DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
     executor: raising would route the item to ``_handle_failure`` and
     eventually dead-letter it, LOSING the memory over a telemetry field.
     Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
     that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
-    not a silent fallthrough.  The ABSENT key is the one case that does NOT
-    warn: it is the load-bearing back-compat path (every row written before
-    task 3670), not an anomaly, and warning on it would drown the log during a
-    drain of a pre-feature queue.  It is still COUNTED, in the same bucket.
+    not a silent fallthrough.  TWO cases do NOT warn, for one reason: they are
+    load-bearing back-compat paths, not anomalies, and warning on them would
+    drown the log during a drain of a pre-feature queue.  An ABSENT
+    ``'referents'`` key is every row written before task 3670; a blob with no
+    ``'ambiguous'`` key is every row written before task 5262, and its refs are
+    READABLE and used.  The first is still COUNTED, in the same bucket.
 
     Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
     ``_execute_graphiti_write``, so this file has one idiom, not two.
     """
     blob = payload.pop('referents', None)
     if blob is None:
-        return (), 'none'
+        return (), 'none', None
 
-    def _degrade(reason: str) -> tuple[ReferentSet, str]:
+    def _warn(reason: str) -> None:
         # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
         # queue row and this warning fires on EVERY retry attempt of that item,
         # so an oversized corrupt value would otherwise dump its full repr into
@@ -1299,57 +1337,104 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
             'having no referents. Blob: %s',
             reason, _safe_repr(blob),
         )
-        return (), 'none'
+
+    def _degrade(reason: str) -> tuple[ReferentSet, str, None]:
+        _warn(reason)
+        return (), 'none', None
 
     if not isinstance(blob, dict):
         return _degrade(f'expected a dict, got {type(blob).__name__}')
     source = blob.get('source')
     if source not in REFERENT_SOURCES:
         return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
-    refs = blob.get('refs')
-    if not isinstance(refs, list):
-        return _degrade(f"'refs' must be a list, got {type(refs).__name__}")
 
-    decoded: list[Referent] = []
-    for entry in refs:
-        if not isinstance(entry, dict):
-            return _degrade(f'entry {_safe_repr(entry)} is not a dict')
-        # `Referent.__post_init__` validates `kind` against the kind registry
-        # but NOT `number`/`project_id` — those two fields accept any object at
-        # all, so the constructor alone does NOT harden this boundary. Each
-        # unchecked type is a distinct downstream failure:
-        #   - a non-str `number` (e.g. 3127) mints a Referent that compares
-        #     UNEQUAL to its string twin, so leaf zeta's set-membership check
-        #     would read a legitimate endpoint as a conflation and leaf eta
-        #     would repoint the edge destructively — the same false-conflation
-        #     failure the all-or-nothing rule above exists to prevent, arriving
-        #     through a mistyped field instead of a dropped one;
-        #   - a None `number`/`project_id` mints a referent whose `node_name`
-        #     is the literal string 'Task None';
-        #   - an UNHASHABLE `number` (a list) mints a Referent that raises
-        #     TypeError the moment a consumer puts it in a set — a raise inside
-        #     the queue executor, i.e. exactly the dead-letter-and-lose-the-
-        #     memory outcome degrade-rather-than-raise exists to prevent.
-        # `_encode_referents` only ever emits strings, so this is reachable
-        # today only from a corrupt or hand-edited SQLite row — but this
-        # function is the wire-hardening boundary, so it hardens the fields
-        # that matter rather than assuming its own encoder wrote the row.
-        number = entry.get('number')
-        project_id = entry.get('project_id', '')
-        if not isinstance(number, str) or not isinstance(project_id, str):
-            return _degrade(
-                f'entry {_safe_repr(entry)} has a non-string number/project_id'
-            )
-        try:
-            decoded.append(Referent(
-                kind=entry.get('kind', 'task'),
-                project_id=project_id,
-                number=number,
-            ))
-        except (KeyError, TypeError, ValueError) as e:
-            return _degrade(f'entry {_safe_repr(entry)} is not a valid Referent: {e}')
+    def _decode_list(key: str, raw: Any) -> list[Referent] | None:
+        """Decode one wire list of referent dicts; ``None`` if it is unreadable.
 
-    return tuple(decoded), source
+        ONE policy for both keys. A second copy for 'ambiguous' would be two
+        validation rules that must agree in lockstep, and the half they would
+        disagree about is precisely the half that decides whether an ambiguous
+        endpoint reads as a conflation.
+
+        FAILURE IS ``None``, NOT ``[]``: an empty list is a legitimate decode of
+        either key ("no referents" / "nothing was ambiguous"), so it cannot
+        double as the error report. The absent-key question is settled by the
+        caller BEFORE it gets here, so ``None`` carries exactly one meaning
+        inside this helper.
+        """
+        if not isinstance(raw, list):
+            _warn(f'{key!r} must be a list, got {type(raw).__name__}')
+            return None
+
+        decoded: list[Referent] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                _warn(f'{key!r} entry {_safe_repr(entry)} is not a dict')
+                return None
+            # `Referent.__post_init__` validates `kind` against the kind
+            # registry but NOT `number`/`project_id` — those two fields accept
+            # any object at all, so the constructor alone does NOT harden this
+            # boundary. Each unchecked type is a distinct downstream failure:
+            #   - a non-str `number` (e.g. 3127) mints a Referent that compares
+            #     UNEQUAL to its string twin, so leaf zeta's set-membership
+            #     check would read a legitimate endpoint as a conflation and
+            #     leaf eta would repoint the edge destructively — the same
+            #     false-conflation failure the all-or-nothing rule above exists
+            #     to prevent, arriving through a mistyped field instead of a
+            #     dropped one;
+            #   - a None `number`/`project_id` mints a referent whose
+            #     `node_name` is the literal string 'Task None';
+            #   - an UNHASHABLE `number` (a list) mints a Referent that raises
+            #     TypeError the moment a consumer puts it in a set — a raise
+            #     inside the queue executor, i.e. exactly the dead-letter-and-
+            #     lose-the-memory outcome degrade-rather-than-raise exists to
+            #     prevent.
+            # `_encode_referents` only ever emits strings, so this is reachable
+            # today only from a corrupt or hand-edited SQLite row — but this
+            # function is the wire-hardening boundary, so it hardens the fields
+            # that matter rather than assuming its own encoder wrote the row.
+            number = entry.get('number')
+            project_id = entry.get('project_id', '')
+            if not isinstance(number, str) or not isinstance(project_id, str):
+                _warn(
+                    f'{key!r} entry {_safe_repr(entry)} has a non-string '
+                    'number/project_id'
+                )
+                return None
+            try:
+                decoded.append(Referent(
+                    kind=entry.get('kind', 'task'),
+                    project_id=project_id,
+                    number=number,
+                ))
+            except (KeyError, TypeError, ValueError) as e:
+                _warn(
+                    f'{key!r} entry {_safe_repr(entry)} is not a valid '
+                    f'Referent: {e}'
+                )
+                return None
+        return decoded
+
+    refs = _decode_list('refs', blob.get('refs'))
+    if refs is None:
+        return (), 'none', None
+
+    # ABSENT is not the same as EMPTY. No 'ambiguous' key means the row predates
+    # task 5262, so the producer never told us — `None`, and the consumer may
+    # re-derive permissively. An explicit `[]` means it told us nothing was
+    # ambiguous, which the consumer must believe.
+    raw_ambiguous = blob.get('ambiguous')
+    if raw_ambiguous is None:
+        return tuple(refs), source, None
+    ambiguous = _decode_list('ambiguous', raw_ambiguous)
+    if ambiguous is None:
+        # ALL-OR-NOTHING SPANS BOTH LISTS: the readable `refs` above go down
+        # with it. A good set beside a dropped ambiguity set is the precise
+        # half-decode that would let zeta read an ambiguous endpoint as a
+        # conflation and eta repoint the edge — worse than no blob at all.
+        return (), 'none', None
+
+    return tuple(refs), source, tuple(ambiguous)
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
@@ -3268,34 +3353,32 @@ class MemoryService:
         than one means it is not, and the finding is recorded with
         ``resolvable=False`` and a reason rather than dropped or guessed at.
 
-        AMBIGUITY IS RE-DERIVED HERE, NOT READ OFF THE WIRE, and that is by
-        epsilon's explicit instruction (``_encode_referents``: "AMBIGUITY IS
-        DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA"). Gamma routes
-        a number claimed by BOTH a bare own-project mention and a
+        AMBIGUITY IS A SEPARATE INPUT, NOT SOMETHING THE DECODED SET IMPLIES.
+        Gamma routes a number claimed by BOTH a bare own-project mention and a
         foreign-qualified reference in the same content to
         ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents`` — "recorded,
-        not guessed" — and epsilon's two-key blob carries only ``.source`` and
-        ``.refs``. A consumer reading the decoded set alone therefore cannot tell
-        an AMBIGUOUS endpoint from a genuine conflation: both are simply
-        non-members. Since ``.ambiguous`` is
-        ``scan_content(content, group_id=group_id).ambiguous`` verbatim on every
-        precedence path — a pure function of ``(content, group_id)``, independent
-        of source — this pass recovers the producer's exact set from
-        ``payload['content']``, which ``_execute_graphiti_write`` already holds.
-        An endpoint in that set is still DETECTED and RECORDED (it really is
-        outside the declared set), but never made ``resolvable``: the PRD's
-        boundary row is "treated as undeclared; recorded, not guessed". The
-        veto itself lives in :func:`_candidate_pool` beside its two siblings, so
-        all three read at ONE site (INV-5).
+        not guessed". A consumer reading the decoded set alone therefore cannot
+        tell an AMBIGUOUS endpoint from a genuine conflation: both are simply
+        non-members. An endpoint in the ambiguity set is still DETECTED and
+        RECORDED (it really is outside the declared set), but never made
+        ``resolvable``: the PRD's boundary row is "treated as undeclared;
+        recorded, not guessed". The veto itself lives in
+        :func:`_candidate_pool` beside its two siblings, so all three read at
+        ONE site (INV-5).
 
-        The re-derivation is a SECOND SCAN SITE, which gamma's own comment flags
-        as the kind of lockstep duplication canonical_labels exists to prevent.
-        Carrying ``'ambiguous'`` as a third wire key is the better long-term
-        shape and is epsilon's filed follow-up; it is not done here because it
-        would widen a frozen contract every test in
-        tests/test_referent_queue_threading.py pins. Scanned ONCE per episode,
-        after the edgeless early-out, so the clean path pays for it only when
-        there is something to check.
+        THE SET IS RE-DERIVED HERE FROM ``content``, which is sound because
+        ``.ambiguous`` is ``scan_content(content, group_id=group_id).ambiguous``
+        verbatim on every precedence path — a pure function of
+        ``(content, group_id)``, independent of source — and
+        ``_execute_graphiti_write`` holds both. It is nonetheless a SECOND SCAN
+        SITE, the lockstep duplication gamma's own comment flags
+        canonical_labels as existing to prevent, and it is only sound while both
+        scans are parameterized identically. Task 5262 puts ``.ambiguous`` on
+        the wire (``_encode_referents``' third key) so this pass can take the
+        producer's answer instead; until the preference rule lands here, this
+        re-derivation remains the only path. Scanned ONCE per episode, after the
+        edgeless early-out, so the clean path pays for it only when there is
+        something to check.
 
         An EMPTY *referents* makes the whole pass a no-op, honouring the contract
         ``resolve_referents`` publishes in its own docstring ("an EMPTY
@@ -5355,7 +5438,13 @@ class MemoryService:
         # between the write and its verification. Nothing the BACKEND sees
         # changes, which is what keeps an old-format row byte-identical.
         referents: ReferentSet
-        referents, referent_source = _decode_referents(payload)
+        # `ambiguous` is the producer's own ambiguity set, threaded since task
+        # 5262 so the verification pass inside the lock below can tell an
+        # AMBIGUOUS endpoint from a genuine conflation without re-scanning the
+        # body. `None` (rather than `()`) means the row predates the third wire
+        # key, i.e. the producer did not tell us — see `_decode_referents`.
+        ambiguous: ReferentSet | None
+        referents, referent_source, ambiguous = _decode_referents(payload)
         # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
         # degraded paths are counted rather than silently falling through. See
         # `_referent_source_counts` in __init__ for why this is unconditional
