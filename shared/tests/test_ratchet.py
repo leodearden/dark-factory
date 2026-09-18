@@ -19,6 +19,7 @@ conventions are matched here, its code is not reached for.
 
 TDD pair 1: the Enumeration value (GREEN on impl step-10).
 TDD pair 2: excess / slack / tighten + the no-add-key property (GREEN on impl step-12).
+TDD pair 3: the two comparability refusals, uniform across all three (GREEN on impl step-14).
 """
 from __future__ import annotations
 
@@ -30,7 +31,15 @@ from pathlib import Path
 import pytest
 
 import shared.ratchet
-from shared.ratchet import Enumeration, excess, slack, tighten
+from shared.ratchet import (
+    Enumeration,
+    IncompleteEnumeration,
+    ParamsMismatch,
+    RatchetError,
+    excess,
+    slack,
+    tighten,
+)
 
 # Same src-root expression as shared/tests/conftest.py and
 # test_pure_stdlib_leaves.py — read the LOCAL tree, never an installed copy.
@@ -350,3 +359,123 @@ class TestNoFunctionCanAddAKeyToABaseline:
         construction rather than only once the last function lands.
         """
         assert set(shared.ratchet.__all__) <= self.EXPECTED_SURFACE
+
+
+#: Every kernel operation, so a refusal is asserted UNIFORMLY. A future fourth
+#: operation added without its precondition has to be added here too, and the
+#: parametrization is what makes that visible.
+OPERATIONS = [excess, slack, tighten]
+
+
+class TestParamsMismatchRefusal:
+    """Different parameters mean the two sides are not measurements of one thing.
+
+    From ``scripts/merge_lane_metrics.py::_require_matching_params``: comparing
+    across a parameter change reports a wall of downstream violations instead
+    of the one named cause, and the one named cause is the parameter change.
+    """
+
+    @pytest.mark.parametrize('operation', OPERATIONS)
+    @pytest.mark.parametrize(
+        ('current_params', 'baseline_params'),
+        [
+            ({'key_version': 2}, {'key_version': 1}),  # a changed value
+            ({'key_version': 1, 'extra': 'x'}, {'key_version': 1}),  # an added key
+            ({'key_version': 1}, {'key_version': 1, 'extra': 'x'}),  # a removed key
+            ({'kinds': ('noqa', 'nosec')}, {'kinds': ('nosec', 'noqa')}),  # tuple order
+        ],
+    )
+    def test_every_operation_refuses(self, operation, current_params, baseline_params):
+        current = Enumeration(counts={'a': 1}, params=current_params)
+        baseline = Enumeration(counts={'a': 1}, params=baseline_params)
+        with pytest.raises(ParamsMismatch):
+            operation(current, baseline)
+
+    def test_names_the_differing_keys_and_both_sides(self):
+        current = Enumeration(counts={}, params={'key_version': 2})
+        baseline = Enumeration(counts={}, params={'key_version': 1})
+        with pytest.raises(ParamsMismatch) as excinfo:
+            excess(current, baseline)
+        error = excinfo.value
+        assert error.differing == ('key_version',)
+        assert dict(error.current_params) == {'key_version': 2}
+        assert dict(error.baseline_params) == {'key_version': 1}
+        assert 'key_version' in str(error)
+        assert '1' in str(error) and '2' in str(error)
+
+
+class TestIncompleteEnumerationRefusal:
+    """A partial scan measures LOW, so comparing it reads as a clean tree."""
+
+    @staticmethod
+    def _partial(counts):
+        return Enumeration(
+            counts=counts, params=PARAMS, complete=False, unreadable=('pkg/unreadable.py',)
+        )
+
+    @staticmethod
+    def _whole(counts):
+        return Enumeration(counts=counts, params=PARAMS)
+
+    @pytest.mark.parametrize('operation', OPERATIONS)
+    @pytest.mark.parametrize('incomplete_side', ['current', 'baseline', 'both'])
+    def test_every_operation_refuses_whichever_side_is_partial(
+        self, operation, incomplete_side
+    ):
+        current = self._partial({'a': 1}) if incomplete_side in ('current', 'both') else self._whole({'a': 1})
+        baseline = self._partial({'a': 1}) if incomplete_side in ('baseline', 'both') else self._whole({'a': 1})
+        with pytest.raises(IncompleteEnumeration):
+            operation(current, baseline)
+
+    def test_names_the_side_and_lists_what_it_skipped(self):
+        with pytest.raises(IncompleteEnumeration) as excinfo:
+            excess(self._partial({'a': 1}), self._whole({'a': 1}))
+        error = excinfo.value
+        assert error.side == 'current'
+        assert error.unreadable == ('pkg/unreadable.py',)
+        assert 'pkg/unreadable.py' in str(error)
+
+    def test_the_gate_is_identity_not_truthiness(self):
+        """An ABSENT completeness flag must refuse, not be read as "probably fine".
+
+        INV-11's shape is ``complete is True``, and
+        ``scripts/merge_lane_metrics.py::_require_complete_enumeration`` spells
+        it that way for exactly this reason: under truthiness a value that is
+        merely non-falsy — or a flag a future loader forgot to populate —
+        compares green.  Identity refuses anything that is not literally True.
+        """
+        with pytest.raises(IncompleteEnumeration):
+            excess(self._partial({}), self._whole({}))
+
+
+class TestPreconditionsRunBeforeAnyComparison:
+    """Ordering is deterministic and the same for all three operations."""
+
+    @pytest.mark.parametrize('operation', OPERATIONS)
+    def test_incompleteness_is_reported_before_a_params_mismatch(self, operation):
+        """Both faults present; the named winner is asserted, not left to chance.
+
+        The discipline of ``scripts/merge_lane_metrics.py::
+        check_against_baseline`` and its
+        ``test_preconditions_are_checked_before_any_comparison``: the
+        preconditions run ahead of every comparison, in a fixed order, so the
+        red a caller sees is reproducible rather than dependent on which check
+        happened to be written first.
+        """
+        current = Enumeration(
+            counts={'a': 1},
+            params={'key_version': 2},
+            complete=False,
+            unreadable=('pkg/unreadable.py',),
+        )
+        baseline = Enumeration(counts={'a': 1}, params={'key_version': 1})
+        with pytest.raises(IncompleteEnumeration):
+            operation(current, baseline)
+
+
+class TestTheRefusalFamilyIsOneExceptClause:
+    """gamma1 maps every refusal to exit 2 with a single ``except``."""
+
+    @pytest.mark.parametrize('error', [ParamsMismatch, IncompleteEnumeration])
+    def test_is_a_ratchet_error(self, error):
+        assert issubclass(error, RatchetError)
