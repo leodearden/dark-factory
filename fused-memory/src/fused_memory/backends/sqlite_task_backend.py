@@ -2265,6 +2265,7 @@ class SqliteTaskBackend:
         audit_fields: dict,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
 
@@ -2290,6 +2291,19 @@ class SqliteTaskBackend:
         metadata merge (both-or-neither), and is mapped to an explicit
         ``{'success': False, 'error': 'status_write_not_persisted', ...}``
         error dict instead of a false success.
+
+        Stamps ``metadata.pending_since`` on a ``pending`` landing (task 3816,
+        PRD §C1) via :func:`stamp_pending_since`, on the SAME rules
+        :meth:`set_task_status` applies — this is the writer every reopen
+        takes (``audit_fields`` non-empty), so it carries D3's only reset:
+        ``cancelled -> pending`` overwrites the anchor, any other origin
+        leaves a present one alone. The anchor is applied to the POST-audit
+        blob (see the composition comment at the merge below).
+
+        ``pending_since_now`` supplies the stamp's clock; ``None`` (the
+        default) means "compute ``_now()`` here". See
+        :meth:`set_task_status` for why the interceptor's CSV branch passes
+        one value for a whole batch.
 
         Deliberately NOT declared on :class:`TaskBackendProtocol` — mirrors
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
@@ -2323,6 +2337,22 @@ class SqliteTaskBackend:
                     mode='merge',
                     project_root=project_root, tag=tag, task_id=tid,
                 )
+                # Wait anchor (task 3816, PRD §C1), composed audit-merge
+                # FIRST and anchor SECOND: the anchor is applied to the
+                # post-audit blob, so neither write can clobber the other,
+                # and a caller that ever passed `pending_since` inside
+                # `audit_fields` cannot bypass the transition table. This
+                # writer already emits the metadata column, so a stamp
+                # substitutes the value rather than widening the UPDATE.
+                stamped = stamp_pending_since(
+                    new_metadata,
+                    old_status=old_status,
+                    new_status=status,
+                    now=pending_since_now or _now(),
+                    project_root=project_root, tag=tag, task_id=tid,
+                )
+                if stamped is not None:
+                    new_metadata = stamped
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, _now()]
