@@ -9252,7 +9252,7 @@ async def _setup_interrupted_dead_predecessor_run(
     # Stamp completed_at = the interrupt instant (the freshness clock).
     await journal.complete_run(run_id, 'interrupted')
     if completed_at is not None:
-        async with journal._txn() as db:
+        async with journal._access.write() as db:
             await db.execute(
                 'UPDATE runs SET completed_at = ? WHERE id = ?',
                 (completed_at.isoformat(), run_id),
