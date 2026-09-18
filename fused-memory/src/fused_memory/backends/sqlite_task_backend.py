@@ -73,7 +73,12 @@ logger = logging.getLogger(__name__)
 #       residual non-cancelled duplicates at connection-open and SKIPS the
 #       index build (leaving user_version at 3) when any remain, so the next
 #       open lands it once residuals are cleaned up. See ``_migrate_v3_to_v4``.
-_SCHEMA_VERSION = 4
+#   v5: one-shot ``metadata.pending_since`` back-fill for the legacy pending
+#       population (task 3816, PRD
+#       plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1). No
+#       column or index change — a pure metadata back-fill. See
+#       ``_migrate_v4_to_v5``.
+_SCHEMA_VERSION = 5
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -321,6 +326,10 @@ async def _migrate(
       ``candidate_key`` (fm-task-dedup W8 task A1).
     * v3 → v4: see :func:`_migrate_v3_to_v4` — self-gating partial UNIQUE
       index over ``candidate_key`` (fm-task-dedup W8 task A2).
+    * v4 → v5: see :func:`_migrate_v4_to_v5` — one-shot
+      ``metadata.pending_since`` back-fill (task 3816). Gated on a RE-READ of
+      ``PRAGMA user_version``, not on the local ``version``, because the
+      preceding step is self-gating (see the dispatch below).
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``_SCHEMA_SQL`` already created every column runs all steps as no-op
@@ -411,6 +420,21 @@ async def _migrate(
             project_root=project_root,
             residual_dup_escalation_cb=residual_dup_escalation_cb,
         )
+        # RE-READ, deliberately (task 3816 design decision 7). Unlike every
+        # step above, `_migrate_v3_to_v4` is SELF-GATING: it stamps
+        # `user_version = 4` only on the clean-build path and leaves the DB
+        # at 3 on a flagged residual, a race, or an unexpected failure, so
+        # the next open retries. Gating the step below on the local
+        # `version` (or on the prior call having "succeeded") would run
+        # v4->v5 against a DB still at v3 and stamp 5 -- permanently
+        # skipping the candidate_key index build and turning a deliberately
+        # self-healing degraded state into an unrecoverable one. The pragma
+        # is ground truth and costs one cheap query at connection-open.
+        row = await (await conn.execute('PRAGMA user_version')).fetchone()
+        version = row[0] if row else version
+
+    if version >= 4 and version < 5:
+        await _migrate_v4_to_v5(conn)
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -895,6 +919,78 @@ async def _candidate_key_index_present(conn: aiosqlite.Connection) -> bool:
     """
     index_rows = await (await conn.execute('PRAGMA index_list(tasks)')).fetchall()
     return any(row[1] == 'ux_tasks_candidate_key' for row in index_rows)
+
+
+async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
+    """v4 -> v5 (task 3816, PRD §C1 back-fill): seed ``metadata.pending_since``.
+
+    One shot, at migration: every task currently ``pending`` with no
+    parseable anchor gets ``pending_since = updated_at`` and
+    ``pending_since_backfilled = True``. Logs the count of rows touched.
+
+    Seeding from ``updated_at`` gives the true filing time for a
+    never-touched task and a younger-than-truth anchor for a previously
+    requeued one (PRD D4). The mis-aging direction is deliberately
+    conservative: the back-fill can UNDER-age a task but never over-age one,
+    so it cannot manufacture a queue jump, and the under-aged tail is exactly
+    what the watchdog (§C4) covers. Every back-filled row carries the marker
+    key so that distortion is countable and auditable rather than invisible.
+
+    Structured after :func:`_migrate_v2_to_v3` — bulk SELECT, accumulate, one
+    ``executemany``, one counted log line, stamp, commit — for the reason
+    that step already documents: on a large legacy tasks table N sequential
+    round-trips would delay the first read after connection-open. Unlike it,
+    this step performs NO ``ALTER``; it is a pure metadata back-fill.
+
+    Never raises on row data. A corrupt or non-dict blob is skipped and
+    counted, because a connection-open migration that raised on one bad row
+    would make the whole store unopenable — and the skipped row simply reads
+    as anchorless, which C1's reader contract already handles (absent =>
+    age 0, fail-safe).
+    """
+    cursor = await conn.execute(
+        "SELECT tag, id, metadata, updated_at FROM tasks WHERE status = 'pending'",
+    )
+    updates: list[tuple[str, str, int]] = []
+    skipped_corrupt = 0
+    for row in await cursor.fetchall():
+        metadata_raw = row['metadata']
+        if metadata_raw:
+            try:
+                parsed = json.loads(metadata_raw)
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, dict):
+                skipped_corrupt += 1
+                continue
+        else:
+            parsed = {}
+        existing = parsed.get('pending_since')
+        if isinstance(existing, str) and existing.strip() != '':
+            continue
+        merged = {
+            **parsed,
+            'pending_since': row['updated_at'],
+            'pending_since_backfilled': True,
+        }
+        updates.append((json.dumps(merged), row['tag'], row['id']))
+    if updates:
+        await conn.executemany(
+            'UPDATE tasks SET metadata = ? WHERE tag = ? AND id = ?',
+            updates,
+        )
+
+    logger.info(
+        'sqlite_task_backend: schema v4->v5 migration -- metadata.pending_since '
+        'backfilled from updated_at for anchorless pending rows; '
+        'rows_backfilled=%d skipped_corrupt_metadata=%d (task 3816; every '
+        'backfilled row is marked pending_since_backfilled so the deliberate '
+        'under-aging stays countable)',
+        len(updates), skipped_corrupt,
+    )
+
+    await conn.execute('PRAGMA user_version = 5')
+    await conn.commit()
 
 
 def _warn_malformed_metadata_once(
