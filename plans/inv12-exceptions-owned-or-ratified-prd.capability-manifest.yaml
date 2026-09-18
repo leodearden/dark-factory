@@ -1,0 +1,190 @@
+# Machine-readable twin of inv12-exceptions-owned-or-ratified-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py::CapabilityManifestDoc).
+# task_id stays null until commit_planning stamps it. Every grep pattern below
+# was checked ABSENT from main 890be05658 on 2026-09-18, so no producer reads as
+# delivered before it lands.
+prd: plans/inv12-exceptions-owned-or-ratified-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    title: "INV-12 exceptions-owned-or-ratified in the pinned invariant sites"
+    capabilities:
+      - name: "inv12-heading-defines-the-slug"
+        binding: "capability→producer (wired) — family derived from design-invariants.md headings by scripts/tests/test_design_invariants_consistency.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^## INV-12 `exceptions-owned-or-ratified`"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "inv12-fixtures-present"
+        binding: "capability→producer — INV-12-PRD / INV-12-CODE fixture sections"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "INV-12-CODE"
+          paths: ["docs/legibility/design-invariants-fixtures.md"]
+          expect: present
+  - label: "β"
+    title: "shared.governed_exceptions vocabulary + shared.ratchet multiset kernel"
+    capabilities:
+      - name: "governed-exceptions-declaration-fn"
+        binding: "capability→producer — shared is a workspace dep of every declaring package"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def governed_exceptions\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "inline-marker-parser"
+        binding: "capability→producer — one parser returning Disposition values"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def parse_disposition_marker\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "multiset-kernel-cannot-add-keys"
+        binding: "rejection-mechanism — built and bound by β's own tests"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of an add-key path is a property of the API surface, judged by β's tests"
+  - label: "γ1"
+    title: "Inline suppression scanner, consumer model and multiset ratchet CLI"
+    capabilities:
+      - name: "inline-ratchet-cli"
+        binding: "producer:β upstream; marker grammar verified against ruff and pyright with positive controls 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tighten"
+          paths: ["scripts/inline_suppressions.py"]
+          expect: present
+      - name: "scan-budget"
+        binding: "floor: 10 s > 4.3 s (11.9 s full tokenize pass x 697/1918 prefiltered files)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a wall-clock bound is measured in γ1's signal, not grep-able"
+      - name: "unowned-marker-rejection"
+        binding: "rejection-check — scenario 1 observed to fire on fixtures by γ1's tests"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by γ1's fixture scenarios"
+  - label: "γ2"
+    title: "Exception register: static discovery, closed-world Policy check, report"
+    capabilities:
+      - name: "register-cli"
+        binding: "producer:β, producer:γ1 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "governed_exceptions"
+          paths: ["scripts/exception_register.py"]
+          expect: present
+      - name: "ratification-table-exists"
+        binding: "capability→producer — γ2 creates the empty table δ adds rows to"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "id"
+          paths: ["docs/legibility/exception-ratifications.yaml"]
+          expect: present
+  - label: "δ"
+    title: "INV-12 day-one rulings (operator decision)"
+    capabilities:
+      - name: "day-one-rulings-on-main"
+        binding: "pure gate closes on resume; this check holds ζb via the scheduler's delivered-check cache"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^- id: inv12-"
+          paths: ["docs/legibility/exception-ratifications.yaml"]
+          expect: present
+  - label: "ε1"
+    title: "Declare the governed lists of orchestrator/ and scripts/"
+    capabilities:
+      - name: "orchestrator-and-scripts-declarations"
+        binding: "producer:β upstream; containers and live owners verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "governed_exceptions\\("
+          paths: ["orchestrator/tests/", "scripts/tests/"]
+          expect: present
+  - label: "ε2"
+    title: "Declare the governed lists of shared/, fused-memory/ and dashboard/"
+    capabilities:
+      - name: "shared-fused-memory-dashboard-declarations"
+        binding: "producer:β upstream; containers and live owners verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "governed_exceptions\\("
+          paths: ["shared/tests/", "fused-memory/tests/", "dashboard/tests/"]
+          expect: present
+  - label: "λ"
+    title: "Tell implementer and reviewer roles the INV-12 forms and blockers"
+    capabilities:
+      - name: "role-prompts-carry-the-forms"
+        binding: "capability→producer — orchestrator/src/orchestrator/agents/roles.py is the only channel to dispatched agents"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "debt: task"
+          paths: ["orchestrator/src/orchestrator/agents/roles.py"]
+          expect: present
+  - label: "κ1"
+    title: "Seed the inline-suppression baseline on main (operator action)"
+    capabilities:
+      - name: "baseline-committed"
+        binding: "pure gate closes on resume; this check holds ζb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"params\""
+          paths: ["scripts/inline_suppression_baseline.json"]
+          expect: present
+  - label: "ζb"
+    title: "Apply the day-one rulings to declarations, class table and baseline"
+    capabilities:
+      - name: "no-disposition-cites-the-docket"
+        binding: "producer:δ, ε1, ε2, κ1, γ2 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the pattern embeds δ's task id, unknown until commit_planning; judged from --report"
+  - label: "η"
+    title: "Owner-liveness sweep, timer pair and installer"
+    capabilities:
+      - name: "sweep-with-own-key-idempotence"
+        binding: "producer:β, γ1, γ2 upstream; store resolver, status vocabulary, filing client, ticket persistence verified 2026-09-18"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "x_inv12_finding"
+          paths: ["scripts/exception_owner_sweep.py"]
+          expect: present
+  - label: "κ2"
+    title: "Activate the owner-liveness sweep timer (operator action)"
+    capabilities:
+      - name: "timer-enabled-on-host"
+        binding: "host state, not tree state"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "systemd user-unit state is outside the tree; θ's real-report signal proves it"
+  - label: "θ"
+    title: "INV-12 integration gate: real-tree report, planted red, live dry-run, runbook"
+    capabilities:
+      - name: "operations-runbook-section"
+        binding: "DAG-direction — every capability the signal needs is upstream (α, ζb, κ2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exception_register"
+          paths: ["OPERATIONS.md"]
+          expect: present
