@@ -196,3 +196,45 @@ def test_validate_rejects_a_known_state_with_no_as_of(state):
         validate_datum(datum, SERVED_AT)
     assert excinfo.value.invariant is DatumInvariant.UNKNOWN_TRIAD
     assert repr(None) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Invariant 2 — state != 'fresh' implies a non-empty reason. A number that is
+# anything but freshly measured owes the reader an explanation.
+# ---------------------------------------------------------------------------
+
+NON_FRESH_STATES = [DatumState.STALE, DatumState.LOWER_BOUND, DatumState.UNKNOWN]
+
+
+def datum_in_state(state, reason):
+    """A Datum in *state* carrying *reason*, conforming to the unknown triad."""
+    known = state is not DatumState.UNKNOWN
+    return Datum(
+        value=5 if known else None,
+        as_of=AS_OF if known else None,
+        state=state,
+        reason=reason,
+        freshness_bound_seconds=60,
+    )
+
+
+@pytest.mark.parametrize('state', NON_FRESH_STATES)
+@pytest.mark.parametrize('reason', [None, '', '   ', '\t\n'])
+def test_validate_rejects_a_non_fresh_datum_without_a_reason(state, reason):
+    """An empty or whitespace-only reason explains nothing, so it is not a reason."""
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(datum_in_state(state, reason), SERVED_AT)
+    assert excinfo.value.invariant is DatumInvariant.REASON_REQUIRED
+    assert repr(state.value) in str(excinfo.value)
+    assert repr(reason) in str(excinfo.value)
+
+
+@pytest.mark.parametrize('state', NON_FRESH_STATES)
+def test_validate_accepts_a_non_fresh_datum_with_a_reason(state):
+    """A real explanation satisfies the invariant in every non-fresh state."""
+    validate_datum(datum_in_state(state, 'fused-memory unreachable'), SERVED_AT)
+
+
+def test_validate_accepts_a_fresh_datum_without_a_reason():
+    """A freshly measured value needs no excuse."""
+    validate_datum(datum_in_state(DatumState.FRESH, None), SERVED_AT)
