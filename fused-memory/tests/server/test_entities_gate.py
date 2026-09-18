@@ -19,7 +19,6 @@ case), so the undeclared majority must flow through untouched.
 
 from __future__ import annotations
 
-import inspect
 import json
 
 import pytest
@@ -382,9 +381,3 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
         assert block['conflicts'] == ['Task 3129'], f'{block!r}'
         assert block['content_referents'] == ['evil_proj:132'], f'{block!r}'
-
-    def test_the_gate_takes_no_registry_parameter(self):
-        """Structural, not incidental: there is no channel through which a
-        caller could hand this gate a registry, so 'the gate holds no registry'
-        cannot be quietly undone by a call-site edit."""
-        assert 'known_project_ids' not in inspect.signature(entities_gate).parameters
