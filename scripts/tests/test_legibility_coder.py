@@ -1743,7 +1743,7 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
 
         accounts = ()
 
-        def try_lease(self, *, scope=None, reverse=False):
+        def try_lease(self, *, scope=None, reverse=False, exclude=None):
             return None
 
         def release_probe_slot(self, oauth_token):

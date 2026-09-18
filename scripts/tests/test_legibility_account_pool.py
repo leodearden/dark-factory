@@ -46,6 +46,11 @@ class FakeAccount:
         self.name = name
         self.token = token
         self.capped = capped
+        # Annotation-only, exactly as on the real AccountState: a near-cap
+        # account is NOT capped and keeps serving turns. The two flags are
+        # separate here because the whole near-cap defect below lives in the
+        # gap between them.
+        self.near_cap = False
         self.generation = 0
 
 
@@ -53,10 +58,20 @@ class FakeGate:
     """Exactly the six members ``account_pool`` calls, and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
-    ``reverse`` knob; ``detect_cap_hit`` reproduces the STRICT detector's
-    contract (marks the account capped and returns True only when it
-    verdicts a cap) with a scripted verdict, so a test can drive the
-    false-verdict branch that must NOT rotate.
+    ``reverse`` / ``exclude`` knobs; ``detect_cap_hit`` reproduces the STRICT
+    detector's contract with a scripted verdict, so a test can drive every
+    branch the caller must handle:
+
+    * ``cap_verdict=True``  — a CAP HIT: returns True AND marks the account
+      capped, the ``_handle_cap_detected`` route.
+    * ``cap_verdict=False`` — no cap: returns False, and the caller must NOT
+      rotate.
+    * ``cap_verdict='near'`` — a NEAR-CAP warning: returns True and takes NO
+      phase transition at all, because ``_handle_near_cap_warning`` is
+      annotation-only by design. This is the mode the suite was missing, and
+      the gap it left is the whole reason rotation cannot infer its bound
+      from the gate's handlers: a True verdict does not imply a shrinking
+      admissible set.
     """
 
     def __init__(self, accounts, *, cap_verdict=True):
@@ -69,11 +84,20 @@ class FakeGate:
         self.costs = []
 
     # -- selection ---------------------------------------------------------
-    def try_lease(self, *, scope=None, reverse=False):
-        self.lease_calls.append({'scope': scope, 'reverse': reverse})
+    def try_lease(self, *, scope=None, reverse=False, exclude=None):
+        # SNAPSHOT the exclusion, never the caller's own set: the caller
+        # passes a set it goes on mutating, so recording the object itself
+        # would make every entry alias the final value and an assertion
+        # about GROWTH would read as an assertion about nothing.
+        self.lease_calls.append({
+            'scope': scope, 'reverse': reverse,
+            'exclude': None if exclude is None else set(exclude),
+        })
         roster = reversed(self.accounts) if reverse else self.accounts
         for acct in roster:
             if acct.capped:
+                continue
+            if exclude and acct.name in exclude:
                 continue
             return AccountLease(
                 name=acct.name, token=acct.token, generation=acct.generation,
@@ -91,7 +115,10 @@ class FakeGate:
             return False
         for acct in self.accounts:
             if acct.token == oauth_token:
-                acct.capped = True
+                if self.cap_verdict == 'near':
+                    acct.near_cap = True   # annotation only — NOT capped
+                else:
+                    acct.capped = True
         return True
 
     @property
@@ -466,6 +493,179 @@ def test_a_pool_that_resolved_NO_accounts_says_so_instead():
 
 
 # ---------------------------------------------------------------------------
+# task 5488 / step-29: THE NEAR-CAP ROUTE — a True cap verdict that caps
+# NOTHING, and the non-terminating rotation it used to cause.
+#
+# The suite above never caught this because its FakeGate always capped the
+# account whenever its verdict was True. The REAL gate does not: a near-cap
+# banner reaches `_handle_near_cap_warning`, which sets `acct.near_cap = True`
+# and returns True while taking NO phase transition at all. The account is
+# still perfectly admissible, so a rotation that merely re-asked the gate was
+# handed the SAME account again — forever, at 03:00, with nothing to observe
+# but a unit that never finished.
+#
+# So termination cannot be inferred from the gate's handler semantics. It has
+# to be structural on the caller's side: a growing set of already-tried names,
+# passed as `exclude=` to the gate's one selection implementation.
+# ---------------------------------------------------------------------------
+
+_NEAR_BANNER = "Approaching your Claude usage limit for this week."
+
+
+def _near_cap_pool(*specs):
+    """A pool whose gate verdicts every banner as a NEAR-cap: True, but no
+    account is ever capped by it."""
+    gate = _pool(*specs)
+    gate.cap_verdict = 'near'
+    return gate
+
+
+class _NeverTwice(_RecordingInvoke):
+    """An ``_invoke_cli`` stub that fails LOUDLY the moment one account's
+    token is handed to it a second time.
+
+    Deliberately an immediate guard rather than an assertion after the fact.
+    The defect being pinned is an infinite loop, and an infinite loop is not
+    a wrong value: left to run, it reaches no assertion at all — it grows the
+    recorded-call lists until the host runs out of memory, taking the rest of
+    the suite with it. Catching the repeat where it happens turns that into
+    one line naming the account that was served twice. The
+    ``@pytest.mark.timeout`` on these tests stays as the backstop for a
+    regression that spins WITHOUT repeating a token.
+    """
+
+    def __call__(self, prompt, model, *, oauth_token=None, **kwargs):
+        already = [c['oauth_token'] for c in self.calls]
+        assert oauth_token not in already, (
+            f"account token {oauth_token!r} was handed to the CLI twice for "
+            f"one digest — the rotation is not bounded by what it has "
+            f"already tried, so it never terminates (calls so far: {already})"
+        )
+        return super().__call__(prompt, model, oauth_token=oauth_token, **kwargs)
+
+
+@pytest.mark.timeout(15)
+def test_a_near_cap_verdict_everywhere_still_terminates():
+    """THE termination property, over a pool where NOTHING ever gets capped.
+
+    Every account banners, every verdict is True, and not one account
+    transitions — which is precisely the real gate's near-cap behaviour. The
+    digest must still give up after exactly one try per account and raise
+    CoderCapExhausted, so the night reaches task 4736's exit-0 DEFERRED path
+    instead of hanging the 03:00 unit until the weekly reset.
+    """
+    gate = _near_cap_pool(('max-b', False), ('max-c', False), ('max-d', False))
+    invoke = _NeverTwice(raises={
+        f'tok-{name}': _cap_exhausted(marker='approaching', stdout=_NEAR_BANNER)
+        for name in ('max-b', 'max-c', 'max-d')
+    })
+
+    with pytest.raises(coder_mod.CoderCapExhausted):
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert len(invoke.calls) == gate.account_count == 3, (
+        f'exactly one try per account, then stop; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert not any(a.capped for a in gate.accounts), (
+        'the premise this test exists for: a near-cap verdict caps NOTHING, '
+        'so the admissible set never shrank and the bound cannot have come '
+        'from the gate'
+    )
+    assert all(a.near_cap for a in gate.accounts), (
+        'the gate did record the signal — it simply is not a cap'
+    )
+
+
+@pytest.mark.timeout(15)
+def test_a_near_cap_account_rotates_and_the_digest_completes_next_door():
+    """Bounding the loop must not COST the rotation, which is the trap in the
+    obvious fix.
+
+    "Raise as soon as the gate hands back an account already tried" also
+    terminates — and would abandon this digest with a live account sitting
+    right there, because the gate has no reason to stop offering a near-cap
+    account. Only EXCLUDING the tried names keeps the walk moving on to the
+    healthy one.
+    """
+    gate = _near_cap_pool(('max-b', False), ('max-c', False))
+    invoke = _NeverTwice(
+        # reverse=True leases max-c first; it near-caps, max-b then answers.
+        raises={'tok-max-c': _cap_exhausted(marker='approaching',
+                                            stdout=_NEAR_BANNER)},
+        replies={'tok-max-b': '{"matches": [], "candidates": []}'},
+    )
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-max-c', 'tok-max-b']
+    assert [c['prompt'] for c in invoke.calls] == ['the digest prompt'] * 2
+    assert out == '{"matches": [], "candidates": []}', (
+        f'the healthy account\'s real reply, verbatim — nothing fabricated; '
+        f'got {out!r}'
+    )
+    assert gate.account_named('max-c').capped is False, (
+        'a near-cap warning must not cap the account: the gate takes no '
+        'phase transition, and neither may the caller'
+    )
+    assert gate.account_named('max-c').near_cap is True
+
+
+@pytest.mark.timeout(15)
+def test_the_growing_exclusion_is_what_bounds_the_rotation():
+    """Not just THAT it terminates — WHY. Each pass asks the gate for a lease
+    excluding everything already tried, so the admissible set shrinks by
+    construction on the CALLER's side no matter what the gate's handlers do
+    with the verdict."""
+    gate = _near_cap_pool(('max-b', False), ('max-c', False), ('max-d', False))
+    invoke = _NeverTwice(raises={
+        f'tok-{name}': _cap_exhausted(marker='approaching', stdout=_NEAR_BANNER)
+        for name in ('max-b', 'max-c', 'max-d')
+    })
+
+    with pytest.raises(coder_mod.CoderCapExhausted):
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    # An omitted exclusion and an empty one mean the same thing to the gate,
+    # so normalise rather than over-pin which spelling the first pass uses.
+    excludes = [set(c['exclude'] or ()) for c in gate.lease_calls]
+    assert excludes == [
+        set(), {'max-d'}, {'max-d', 'max-c'}, {'max-d', 'max-c', 'max-b'},
+    ], f'the exclusion must grow by the account just tried; got {excludes}'
+    assert all(
+        previous < nxt
+        for previous, nxt in zip(excludes, excludes[1:], strict=False)
+    ), f'strictly growing, every pass; got {excludes}'
+
+
+@pytest.mark.timeout(15)
+def test_the_genuine_cap_route_is_unchanged_by_the_bound():
+    """The bound is ADDITIVE to real-cap rotation, not a replacement for it.
+
+    A true CAP HIT still caps the account through the gate — that is what
+    makes the rest of the night skip it, and what makes nightly's "all
+    accounts capped" summary true. The exclusion rides alongside as the
+    caller's own bookkeeping; neither mechanism is load-bearing for the
+    other.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))  # cap_verdict=True
+    invoke = _NeverTwice(raises={
+        'tok-max-c': _cap_exhausted(stdout='Claude usage limit reached.'),
+    }, replies={'tok-max-b': 'the reply'})
+
+    out = mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert out == 'the reply'
+    assert gate.account_named('max-c').capped is True, (
+        'a genuine cap hit must still mark the account capped'
+    )
+    assert set(gate.lease_calls[1]['exclude'] or ()) == {'max-c'}, (
+        'and the caller still excludes what it tried, so the two agree '
+        'instead of one depending on the other'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-15: build_pool() — a REAL UsageGate from nothing but an accounts file.
 #
 # The trickle's original excuse for riding ~/.claude was that the
@@ -661,7 +861,11 @@ def test_subprocess_env_carries_a_pool_token_and_strips_the_api_key(monkeypatch)
         "the rest of the parent env rides along -- census.py needs PATH, HOME "
         "and the unit's own vars, so this is an OVERLAY, not a replacement"
     )
-    assert gate.lease_calls == [{"scope": None, "reverse": True}]
+    assert gate.lease_calls == [
+        # No exclusion: the census takes ONE account and never rotates, so it
+        # has no loop of its own to bound.
+        {"scope": None, "reverse": True, "exclude": None},
+    ]
 
 
 def test_subprocess_env_skips_a_capped_account():
