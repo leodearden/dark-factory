@@ -207,6 +207,86 @@ async def test_add_task_status_defaults_to_pending(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_add_task_pending_insert_stamps_pending_since(backend, project_root):
+    """A default (pending) insert carries the wait anchor (task 3816, PRD §C1).
+
+    Asserts ``pending_since == updatedAt`` EXACTLY, not within a tolerance
+    window: add_task hoists one ``_now()`` and binds it to both (design
+    decision 5), so a freshly inserted pending row satisfies the same identity
+    the one-shot back-fill establishes for the legacy population — the two
+    populations are indistinguishable in shape as well as in format. A
+    tolerance window is how a real two-clocks drift defect hides.
+    """
+    dto = await backend.add_task(project_root=project_root, title='Default task')
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == 'pending'
+    anchor = one['metadata']['pending_since']
+    assert re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', anchor), (
+        f'pending_since must use the updated_at format; got {anchor!r}'
+    )
+    assert anchor == one['updatedAt']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ('deferred', 'blocked', 'infra-hold'))
+async def test_add_task_non_pending_insert_writes_no_anchor(
+    backend, project_root, status,
+):
+    """Only a PENDING landing stamps — a parked task accrues no wait.
+
+    ``status='deferred'`` is the planning_mode shape: a batch filed under
+    ``planning_mode=True`` must accrue nothing until ``commit_planning``
+    flips it to pending, or the batch would arrive pre-aged.
+    """
+    dto = await backend.add_task(
+        project_root=project_root, title=f'{status} task', status=status,
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == status
+    assert 'pending_since' not in (one['metadata'] or {})
+
+
+@pytest.mark.asyncio
+async def test_add_task_stamp_preserves_caller_supplied_metadata(backend, project_root):
+    """The anchor is merged into the caller's blob, never substituted for it."""
+    dto = await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'files': ['a.py'], 'source': 'agent-followup'}),
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['metadata']['files'] == ['a.py']
+    assert one['metadata']['source'] == 'agent-followup'
+    assert 'pending_since' in one['metadata']
+
+
+@pytest.mark.asyncio
+async def test_add_task_stamped_anchor_emits_no_schema_warning(
+    backend, project_root, caplog,
+):
+    """The stamp must not manufacture an unknown_key census line.
+
+    This is what pins the Tier-A blessing of ``pending_since`` to the write
+    path: ``_validate_metadata_on_write`` parses in warn-mode
+    unconditionally and emits one ``task_metadata.schema_warning`` line per
+    warning, so an unblessed key would produce one on EVERY task write in the
+    factory. Sibling canary:
+    ``test_add_task_valid_metadata_emits_no_schema_warning``.
+    """
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        dto = await backend.add_task(project_root=project_root, title='t')
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert census_msgs == [], (
+        f'Expected no census line for the stamped anchor; got: {census_msgs}'
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert 'pending_since' in one['metadata']
+
+
+@pytest.mark.asyncio
 async def test_add_task_increments_id(backend, project_root):
     await backend.add_task(project_root=project_root, title='one')
     await backend.add_task(project_root=project_root, title='two')
