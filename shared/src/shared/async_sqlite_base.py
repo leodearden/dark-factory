@@ -238,11 +238,21 @@ class AtomicConnection:
         too, or aiosqlite's implicit transaction stays open holding the writer
         lock against every other coroutine on the connection.
 
-        Residual, deliberately not fixed here: a unit that reads and then
-        writes still has a window in which a commit from a DIFFERENT connection
-        to the same file can raise ``SQLITE_BUSY_SNAPSHOT`` between those two
-        statements.  Closing it needs ``BEGIN IMMEDIATE`` or a bounded retry;
-        the lock addresses the in-process, cross-coroutine collision only.
+        Residual, and stated as a known BOUND rather than left to look like an
+        oversight: a unit that SELECTs before it writes opens a read snapshot
+        ahead of its first write, so a commit from a DIFFERENT connection to the
+        same file landing between the two statements can still raise
+        ``SQLITE_BUSY_SNAPSHOT``.  Four units have that shape today —
+        ``EventBuffer.claim_deferred_writes``, ``EventBuffer.release_stale_claims``,
+        ``ReconLedgerStore.gc``'s TTL flip, and ``ReconLedgerStore.mark_addressed``.
+
+        The lock removes the in-process, cross-COROUTINE collision, which is the
+        failure this primitive owns and the one the incidents were.  Closing the
+        remaining cross-CONNECTION window would need ``BEGIN IMMEDIATE`` — which
+        the RCA measured still raising, and excludes by name — or a bounded
+        retry, which is separate work.  Do not read the four units above as
+        sites awaiting conversion: batching their read inside the unit is
+        deliberate, because each must see its own uncommitted write.
         """
         async with self._held('write()'):
             try:
