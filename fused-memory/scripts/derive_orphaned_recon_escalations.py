@@ -16,10 +16,12 @@ accumulates continuously.  Measured pending
 ``reconciliation_stale_gate_backlog`` count — 108 on 2026-08-30, 117 at
 planning, **124 on 2026-09-02**.  Always re-derive; never drain a stale list.
 
-The classification rule has exactly ONE owner, shared with the in-cycle
-Stage-1 sweep: ``fused_memory.reconciliation.orphaned_recon_escalation_sweep``.
-A second copy could drift and make the flag and the reap disagree about which
-records are safe to close.
+The derivation has exactly ONE owner, shared with the in-cycle Stage-1 sweep:
+``orphaned_recon_escalation_sweep.classify_pending_escalations``.  Not just
+the leaf predicates — the whole classification PASS, counts and canary
+warnings included, so this script adds only the ``queue.resolve`` step.  A
+second copy of that loop could drift and make the flag and the reap disagree
+about which records are safe to close.
 
 Closing here does not contradict A7b.  That invariant bans the HARNESS from
 resolving its own queue; an operator-run one-shot over the same queue is
@@ -43,6 +45,24 @@ Usage
       --queue-dir /path/to/data/reconciliation/escalations \\
       --project-root /home/leo/src/reify --apply
 
+Exit codes
+----------
+==  ============================================================================
+0   Clean scan.  Every reapable record was classified against a census that
+    was read successfully.  ``reaped: 0`` here genuinely means "nothing to do".
+1   REFUSED: ``--queue-dir`` does not exist.  Nothing was scanned, nothing was
+    created; the refusal is printed on stderr.
+3   DEGRADED: at least one project's census could not be read
+    (``errors > 0``), so its records were classified as nothing at all.  Re-run
+    once the store is readable — the reap set is re-derived every run.
+4   REGISTRY GAP: at least one record could not be scoped to a known project
+    (``unresolvable > 0``).  Pass ``--project-root`` for it, or verify those
+    records by hand.  Never a reap: the subject was never checked.
+==  ============================================================================
+
+``errors`` outranks ``unresolvable`` when both are non-zero.  2 is deliberately
+unused — argparse exits with it on a usage error.
+
 WARNING — ``--apply`` MUTATES THE LIVE QUEUE.  It resolves real pending
 escalation records at ``<project_root>/data/reconciliation/escalations``, which
 is production operational state.  Running it is the OPERATOR's or the port-8103
@@ -56,8 +76,10 @@ the RELATIVE ``./data/reconciliation/escalations``, so a run from anywhere but
 the project root -- a task worktree in particular, and
 ``skills/recon-escalation-watcher/SKILL.md`` documents the invocation without
 pinning a cwd -- would otherwise have ``EscalationQueue.__init__`` mkdir an
-empty queue and report ``"scanned": 0, "reaped": 0``, a false all-clear that
-``main()`` below would hand back as exit 0.
+empty queue and report ``"scanned": 0, "reaped": 0``, a false all-clear.  The
+exit codes below cannot catch that one: a manufactured empty queue produces no
+``errors`` and no ``unresolvable`` records, so it exits 0 exactly like a
+genuinely clean scan.  The preflight is what tells the two apart.
 
 See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
 for the mechanism, the probe-vs-existence argument, the prior art and the
@@ -100,13 +122,12 @@ from escalation.queue import EscalationQueue
 
 from fused_memory.models.scope import build_known_projects_map
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
-    _project_status_census,
-    classify_orphan,
-    escalation_project_id,
-    select_reapable_escalations,
-    sole_subject_status,
+    classify_pending_escalations,
 )
-from fused_memory.utils.target_store_preflight import assert_queue_dir_exists
+from fused_memory.utils.target_store_preflight import (
+    TargetStoreMissing,
+    assert_queue_dir_exists,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,24 +143,39 @@ RESOLUTION_CLASS: str = 'moot-terminal-subject'
 
 DEFAULT_QUEUE_DIR: str = './data/reconciliation/escalations'
 
+# Exit codes.  A DEGRADED run must be distinguishable from a clean one without
+# reading the JSON: the queue can be scanned, nothing reaped, and the reason
+# buried in a count key an operator has to notice by eye.  ``errors`` outranks
+# ``unresolvable`` because it means a task store could not be READ at all,
+# whereas an unresolvable record is a known registry gap with a known fix
+# (--project-root).  2 is skipped: argparse exits with it on a usage error, so
+# reusing it would make a bad flag indistinguishable from a degraded scan.
+EXIT_OK: int = 0
+EXIT_QUEUE_DIR_MISSING: int = 1
+EXIT_CENSUS_ERRORS: int = 3
+EXIT_UNRESOLVABLE: int = 4
+
 PROJECT_ROOT: str = str(Path(__file__).resolve().parents[2])
 
 
-def _resolution_note(esc, classification, project_id, subject_status) -> str:
+def _resolution_note(orphan) -> str:
     """Free-text rationale stamped on the closed record.
 
     Names the evidence so a later auditor can re-derive the decision from the
-    record alone rather than trusting this script's assertion.
+    record alone rather than trusting this script's assertion.  Takes the
+    whole ``OrphanedRecord`` so the note can never be built from a project or
+    a status other than the one the classifier actually observed.
     """
-    if classification == 'terminal':
+    esc = orphan.escalation
+    if orphan.classification == 'terminal':
         observed = (
-            f'subject task {esc.task_id} is {subject_status} (terminal) in '
-            f"{project_id}'s task store"
+            f'subject task {esc.task_id} is {orphan.subject_status} (terminal) '
+            f"in {orphan.project_id}'s task store"
         )
     else:
         observed = (
-            f'subject task {esc.task_id} has no row in {project_id}\'s task '
-            'store (checked across every tag)'
+            f'subject task {esc.task_id} has no row in '
+            f"{orphan.project_id}'s task store (checked across every tag)"
         )
     return (
         f'orphaned-recon-escalation reaper: {observed}. This '
@@ -213,90 +249,33 @@ async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -
     queue = EscalationQueue(Path(queue_dir))
     # Queue ROOT only: an archived record is already closed and is correctly
     # invisible here, which is what makes a repeat --apply a clean no-op.
-    reapable = select_reapable_escalations(queue.get_pending())
+    orphans, counts = await classify_pending_escalations(
+        queue.get_pending(), taskmaster, project_roots, log=logger,
+    )
 
     report: dict = {
         'dry_run': not apply,
         'queue_dir': str(queue_dir),
-        'scanned': len(reapable),
-        'terminal': 0,
-        'missing': 0,
-        'live': 0,
-        'ambiguous': 0,
-        'unresolvable': 0,
-        'errors': 0,
+        **counts,
         'reaped': 0,
-        'reapable_ids': [],
+        'reapable_ids': [orphan.escalation.id for orphan in orphans],
     }
+    if not apply:
+        return report
 
-    censuses: dict[str, dict[str, set[str]] | None] = {}
-
-    for esc in reapable:
-        project_id = escalation_project_id(esc)
-        if project_id is None or project_id not in project_roots:
-            report['unresolvable'] += 1
-            continue
-
-        if project_id not in censuses:
-            censuses[project_id] = await _project_status_census(
-                taskmaster, project_roots[project_id], log=logger,
-            )
-        census = censuses[project_id]
-        if census is None:
-            report['errors'] += 1
-            continue
-
-        classification = classify_orphan(esc, census)
-        if classification == 'live':
-            report['live'] += 1
-            continue
-        if classification == 'ambiguous':
-            # The subject id lives in several tags with differing statuses, so
-            # the record (which carries no tag) cannot name its own subject.
-            # Never reapable: closing it could close a still-blocked task's
-            # record on another task's evidence.
-            report['ambiguous'] += 1
-            continue
-
-        report[classification] += 1
-        report['reapable_ids'].append(esc.id)
-
-        if not apply:
-            continue
-
-        note = _resolution_note(
-            esc, classification, project_id, sole_subject_status(esc, census),
-        )
+    for orphan in orphans:
         result = queue.resolve(
-            esc.id, note,
+            orphan.escalation.id, _resolution_note(orphan),
             resolved_by=resolved_by,
             resolution_class=RESOLUTION_CLASS,
         )
         if result is None:
             logger.warning(
                 'Escalation %s not found during resolve (state drift between '
-                'get_pending and apply); skipping', esc.id,
+                'get_pending and apply); skipping', orphan.escalation.id,
             )
             continue
         report['reaped'] += 1
-
-    if report['ambiguous']:
-        logger.warning(
-            '%d of %d reapable record(s) name a subject id present in more than '
-            'one tag with differing statuses and were NOT classified — ids are '
-            'per-tag, and a record carries no tag, so the subject cannot be '
-            'identified; check by hand which tag each subject lives in before '
-            'touching those records',
-            report['ambiguous'], report['scanned'],
-        )
-
-    if report['unresolvable']:
-        logger.warning(
-            '%d of %d reapable record(s) could not be scoped to a known project '
-            'and were NOT classified — pass --project-root for the missing '
-            'project(s), or verify those records by hand before touching them',
-            report['unresolvable'], report['scanned'],
-        )
 
     return report
 
@@ -340,16 +319,31 @@ def main() -> int:
     args = parser.parse_args()
 
     project_roots = build_known_projects_map(PROJECT_ROOT, args.project_root)
-    report = asyncio.run(
-        run(
-            args.queue_dir,
-            project_roots,
-            apply=args.apply,
-            resolved_by=args.resolved_by,
-        ),
-    )
+    try:
+        report = asyncio.run(
+            run(
+                args.queue_dir,
+                project_roots,
+                apply=args.apply,
+                resolved_by=args.resolved_by,
+            ),
+        )
+    except TargetStoreMissing as exc:
+        # The refusal is an OPERATOR-facing message about a mis-targeted
+        # --queue-dir (or a cwd the relative default does not fit), not a bug:
+        # one line on stderr says more than a traceback, and the exit code is
+        # what a caller actually branches on.
+        print(f'error: {exc}', file=sys.stderr)
+        return EXIT_QUEUE_DIR_MISSING
+
     print(json.dumps(report, indent=2, default=str))
-    return 0
+    # The report is printed either way — a degraded run is still the operator's
+    # best evidence — but the code says which of the three outcomes it was.
+    if report['errors']:
+        return EXIT_CENSUS_ERRORS
+    if report['unresolvable']:
+        return EXIT_UNRESOLVABLE
+    return EXIT_OK
 
 
 if __name__ == '__main__':

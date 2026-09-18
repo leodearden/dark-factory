@@ -628,6 +628,15 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   python fused-memory/scripts/derive_orphaned_recon_escalations.py            # dry run (default)
   python fused-memory/scripts/derive_orphaned_recon_escalations.py --apply    # closes them
   ```
+  **Read the exit code, not just the JSON.** `0` is a clean scan — `reaped: 0`
+  then genuinely means nothing to do. `1` is the refusal above (wrong
+  `--queue-dir`/cwd; the reason is one line on stderr). `3` means at least one
+  project's task store could not be READ, so its records were classified as
+  nothing at all — re-run once the store is readable, since the set is
+  re-derived every run. `4` means a record could not be scoped to a known
+  project (the registry gap below). A `3` or a `4` is a partial scan wearing a
+  clean-looking report: do **not** treat that run's `reaped` count as the
+  whole story.
   Detection is recon-side only; **you are the sole closer** — no
   reconciliation stage ever calls `queue.resolve()` on this queue (the A7b
   invariant above `_RECON_DEDUP_CONFIG` in

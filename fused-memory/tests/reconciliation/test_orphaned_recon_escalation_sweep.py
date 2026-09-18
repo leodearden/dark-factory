@@ -51,7 +51,9 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     build_orphaned_escalation_flag,
     classify_orphan,
     escalation_project_id,
+    normalize_status_census,
     select_reapable_escalations,
+    sole_subject_status,
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
@@ -316,13 +318,14 @@ class TestClassifyOrphan:
         for tid in ('650', '5943', '101'):
             assert classify_orphan(make_escalation(task_id=tid), {}) == 'missing'
 
-    def test_id_lookup_is_str_coerced_on_both_sides(self):
-        """An int-typed id on either side must match its str spelling.
+    def test_the_subject_id_is_str_coerced_for_the_lookup(self):
+        """An int-typed id on the RECORD must match its str spelling.
 
         Census maps come back ``{id_str: status_str}`` but task ids arrive as
         ints in some code paths; an un-coerced lookup would silently classify
         a ``done`` subject as ``missing``.  Both reap, but the EVIDENCE handed
-        to the closer would be false.
+        to the closer would be false.  (The CENSUS side is coerced once where
+        it is built — see ``TestCensusNormalisation``.)
         """
         esc = make_escalation(task_id='650')
         assert classify_orphan(esc, {'650': 'done'}) == 'terminal'
@@ -330,7 +333,67 @@ class TestClassifyOrphan:
         int_keyed = make_escalation(task_id='650')
         int_keyed.task_id = 650  # type: ignore[assignment]
         assert classify_orphan(int_keyed, {'650': 'done'}) == 'terminal'
-        assert classify_orphan(esc, {650: 'done'}) == 'terminal'  # type: ignore[dict-item]
+
+
+class TestCensusNormalisation:
+    """The census is str-keyed ONCE where it is built, never once per record.
+
+    ``_observed_statuses`` runs per RECORD against a census that is the whole
+    task store — 124+ pending records against 4958 (dark_factory) / 7150
+    (reify) tasks, both growing continuously — so re-keying it inside the
+    lookup cost ~1M dict insertions per sweep, re-paid every Stage-1 cycle and
+    again in the operator script, to serve one membership test.
+
+    Moving the coercion to the build makes an UN-normalised census a wiring
+    mistake, and it must fail LOUDLY: every subject reads as absent against
+    one, which classifies as ``'missing'`` and drives a REAP on no evidence —
+    the one direction this module must never fail in.
+    """
+
+    def test_a_non_str_keyed_census_raises_instead_of_reaping(self):
+        esc = make_escalation(task_id='650')
+
+        with pytest.raises(TypeError) as exc_info:
+            classify_orphan(esc, {650: 'done'})  # type: ignore[dict-item]
+
+        assert 'normalize_status_census' in str(exc_info.value), (
+            'the refusal must name the remedy, not just the rejection'
+        )
+
+    def test_sole_subject_status_refuses_the_same_shape(self):
+        """Both census readers inherit the guard — it lives in one place."""
+        esc = make_escalation(task_id='650')
+
+        with pytest.raises(TypeError):
+            sole_subject_status(esc, {650: 'done'})  # type: ignore[dict-item]
+
+    def test_normalising_restores_the_classification_for_either_value_shape(self):
+        """The remedy the refusal names actually works."""
+        esc = make_escalation(task_id='650')
+
+        assert classify_orphan(esc, normalize_status_census({650: 'done'})) == 'terminal'
+        assert classify_orphan(esc, normalize_status_census({650: {'blocked'}})) == 'live'
+        assert sole_subject_status(esc, normalize_status_census({650: 'done'})) == 'done'
+
+    def test_normalisation_is_idempotent(self):
+        """A canonical census survives unchanged, so double-normalising is safe."""
+        canonical = normalize_status_census({650: 'done', '651': 'blocked'})
+
+        assert canonical == {'650': {'done'}, '651': {'blocked'}}
+        assert normalize_status_census(canonical) == canonical
+
+    def test_normalisation_keeps_a_cross_tag_collision_ambiguous(self):
+        """Folding must UNION per id, never last-key-wins — the reap turns on it."""
+        esc = make_escalation(task_id='650')
+
+        census = normalize_status_census({'650': {'done', 'blocked'}})
+
+        assert census == {'650': {'done', 'blocked'}}
+        assert classify_orphan(esc, census) == 'ambiguous'
+
+    def test_an_empty_census_is_accepted_not_refused(self):
+        """The key probe is a canary on the wiring, not a non-empty requirement."""
+        assert classify_orphan(make_escalation(task_id='650'), {}) == 'missing'
 
 
 class TestClassifyOrphanAmbiguity:

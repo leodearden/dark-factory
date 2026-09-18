@@ -27,7 +27,10 @@ from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
-from fused_memory.reconciliation.orphaned_recon_escalation_sweep import classify_orphan
+from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
+    classify_orphan,
+    sweep_orphaned_recon_escalations,
+)
 from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = (
@@ -152,6 +155,14 @@ def taskmaster():
             },
         },
     })
+
+
+def _resolution_note_of(queue: EscalationQueue, esc_id: str) -> str:
+    """The note stamped on a closed record, asserting there IS one to read."""
+    closed = queue.get(esc_id)
+    assert closed is not None, f'{esc_id} is unreadable after --apply'
+    assert closed.resolution is not None, f'{esc_id} was closed with no note at all'
+    return closed.resolution
 
 
 def _hash_dir(queue_dir: Path) -> dict[str, str]:
@@ -353,6 +364,81 @@ class TestDeriveOrphanedReconEscalations:
             )
 
     @pytest.mark.asyncio
+    async def test_apply_stamps_the_observed_evidence_on_each_closed_record(
+        self, seeded_queue, taskmaster,
+    ):
+        """The note must let a later auditor re-derive the decision from the record.
+
+        It is the ONLY evidence that survives on a closed record — the census
+        it was read from is gone — so a swapped branch, or a terminal note
+        stamped with no status at all, would ship a record whose stated
+        rationale does not match why it was actually closed.
+        """
+        _, queue_dir, records = seeded_queue
+
+        await _mod.run(
+            queue_dir=queue_dir, project_roots=PROJECT_ROOTS,
+            apply=True, taskmaster=taskmaster,
+        )
+        reread = EscalationQueue(queue_dir)
+
+        # Terminal branch: names the subject, its project, and the status
+        # actually OBSERVED for it -- 650 is done, 653 is cancelled.
+        for key, task_id, status in (
+            ('done', '650', 'done'), ('hor_done', '653', 'cancelled'),
+        ):
+            note = _resolution_note_of(reread, records[key].id)
+            assert task_id in note and status in note and 'dark_factory' in note, (
+                f'{key}: terminal note must name the subject, its project and '
+                f'its observed status; got {note!r}'
+            )
+            assert 'no row' not in note, f'{key}: terminal note took the missing branch'
+
+        # Missing branch: asserts the ABSENCE, and scopes it to the census
+        # that was actually read -- every tag of one project's store.
+        note = _resolution_note_of(reread, records['norow'].id)
+        assert '652' in note and 'no row' in note and 'every tag' in note, (
+            f'missing note must state the cross-tag absence; got {note!r}'
+        )
+        assert 'None' not in note, (
+            'the missing branch has no observed status to name and must not '
+            'interpolate one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_script_and_the_in_cycle_sweep_agree_record_for_record(
+        self, seeded_queue, taskmaster,
+    ):
+        """ONE derivation, two channels: the counts and the selected set must match.
+
+        Stage 1 flags and this script closes, so a drift between them hands
+        the sole closer a set the in-cycle finding never named.  Sharing only
+        the leaf predicates did not prevent that — the composition that
+        produces the counts is what has to be shared.
+        """
+        _, queue_dir, _ = seeded_queue
+
+        report = await _mod.run(
+            queue_dir=queue_dir, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+        )
+        stats = await sweep_orphaned_recon_escalations(
+            EscalationQueue(queue_dir), taskmaster, PROJECT_ROOTS,
+        )
+
+        for key in (
+            'scanned', 'terminal', 'missing', 'live', 'ambiguous',
+            'unresolvable', 'errors',
+        ):
+            assert report[key] == stats[key], (
+                f'{key}: {report[key]} via the script, {stats[key]} in-cycle'
+            )
+        assert len(stats['flags']) == len(report['reapable_ids'])
+        for esc_id in report['reapable_ids']:
+            assert sum(esc_id in f['description'] for f in stats['flags']) == 1, (
+                f'{esc_id} is reapable by the script but named by no in-cycle flag'
+            )
+
+    @pytest.mark.asyncio
     async def test_apply_is_idempotent(self, seeded_queue, taskmaster):
         """A second ``--apply`` reaps nothing — the re-derivation excludes closed records.
 
@@ -466,11 +552,15 @@ class TestMissingQueueDirRefusal:
         assert report['scanned'] == 0
         assert report['reaped'] == 0
 
-    def test_main_does_not_return_zero_for_a_missing_queue_dir(self, tmp_path):
-        """``main()`` returns 0 UNCONDITIONALLY, with no error accounting.
+    def test_main_reports_the_refusal_as_a_nonzero_exit_not_a_traceback(
+        self, tmp_path, capsys,
+    ):
+        """A refusal routed through the normal report path would exit 0.
 
-        A refusal routed through the normal report path would therefore exit 0,
-        reproducing the very defect the guard exists to fix.  It must raise.
+        That is the very defect the guard exists to fix, so ``main()`` must
+        surface it in the one channel a caller branches on -- the exit code --
+        while the operator-facing message stays one line on stderr rather than
+        a traceback about a mis-typed path.
         """
         import sys as _sys  # noqa: PLC0415
 
@@ -480,9 +570,76 @@ class TestMissingQueueDirRefusal:
             _sys.argv = [
                 'derive_orphaned_recon_escalations.py', '--queue-dir', str(missing),
             ]
-            with pytest.raises(TargetStoreMissing):
-                _mod.main()
+            code = _mod.main()
         finally:
             _sys.argv = old_argv
 
+        assert code == _mod.EXIT_QUEUE_DIR_MISSING
+        assert code != 0
+        captured = capsys.readouterr()
+        assert str(missing) in captured.err
+        assert 'Traceback' not in captured.err
+        assert captured.out == '', 'a refusal must not print a report to stdout'
         assert not missing.exists()
+
+
+class TestMainExitCodes:
+    """A DEGRADED run must be distinguishable from a clean one without reading the JSON.
+
+    ``--apply`` on a contended store reaps nothing and reports it in a count
+    key an operator has to notice by eye; the same is true of the documented
+    registry-gap signal.  The report is still printed in every case -- it is
+    the operator's best evidence -- but the exit code says which outcome it
+    was.
+    """
+
+    @staticmethod
+    def _run_main(monkeypatch, report: dict) -> tuple[int, str]:
+        """Drive ``main()`` over a canned report, returning ``(code, stdout)``."""
+        import sys as _sys  # noqa: PLC0415
+
+        async def _fake_run(*_args, **_kwargs):
+            return report
+
+        monkeypatch.setattr(_mod, 'run', _fake_run)
+        monkeypatch.setattr(
+            _sys, 'argv', ['derive_orphaned_recon_escalations.py'],
+        )
+        return _mod.main()
+
+    @pytest.mark.parametrize(
+        ('errors', 'unresolvable', 'expected_attr'),
+        [
+            (0, 0, 'EXIT_OK'),
+            (1, 0, 'EXIT_CENSUS_ERRORS'),
+            (0, 1, 'EXIT_UNRESOLVABLE'),
+            (1, 1, 'EXIT_CENSUS_ERRORS'),
+        ],
+    )
+    def test_the_exit_code_names_the_outcome(
+        self, monkeypatch, capsys, errors, unresolvable, expected_attr,
+    ):
+        """An unreadable census outranks a registry gap when both are present."""
+        report = {
+            'dry_run': True, 'queue_dir': '/tmp/q', 'scanned': 3, 'terminal': 0,
+            'missing': 0, 'live': 0, 'ambiguous': 0, 'unresolvable': unresolvable,
+            'errors': errors, 'reaped': 0, 'reapable_ids': [],
+        }
+
+        code = self._run_main(monkeypatch, report)
+
+        assert code == getattr(_mod, expected_attr)
+        assert json.loads(capsys.readouterr().out) == report, (
+            'the report is printed whatever the outcome'
+        )
+
+    def test_every_exit_code_is_distinct_and_avoids_the_argparse_usage_code(self):
+        """2 is argparse's usage-error code; reusing it would conflate the two."""
+        codes = [
+            _mod.EXIT_OK, _mod.EXIT_QUEUE_DIR_MISSING,
+            _mod.EXIT_CENSUS_ERRORS, _mod.EXIT_UNRESOLVABLE,
+        ]
+
+        assert len(set(codes)) == len(codes)
+        assert _mod.EXIT_OK == 0
+        assert 2 not in codes

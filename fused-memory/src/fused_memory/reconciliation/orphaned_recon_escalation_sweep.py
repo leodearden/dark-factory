@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -205,27 +206,55 @@ def select_reapable_escalations(escalations):
 def _observed_statuses(esc, statuses):
     """Every status *statuses* records for *esc*'s subject, or ``None`` if absent.
 
-    A census value is either a bare status string (the legacy flat shape) or a
-    collection of statuses — one per tag that carries this id (see
-    ``_project_status_census``).  ``isinstance(value, str)`` is tested FIRST
-    because a ``str`` is itself iterable: read as a collection, ``'done'``
-    would explode into ``{'d', 'o', 'n', 'e'}`` and render every flat census
-    ambiguous, silently reducing recall to zero.
+    *statuses* must be a CANONICAL census — ``str`` keys — as built by
+    ``_project_status_census`` (whose ``_merge_tag_census`` writes ``str(tid)``
+    for every id) or by ``normalize_status_census`` for a map from anywhere
+    else.  Coercing the keys HERE instead would re-key the whole task store
+    once per RECORD: the live fleet reads 124+ pending records against 4958
+    (dark_factory) / 7150 (reify) tasks and both sides grow continuously, so a
+    defensive ``{str(k): v for k, v in statuses.items()}`` costs ~1M dict
+    insertions per sweep — paid again every Stage-1 cycle and again in the
+    operator script — to serve one membership test.
 
-    The id lookup is ``str``-coerced on BOTH sides: censuses come back
-    ``{id_str: status}`` but task ids arrive as ints on some paths, and an
-    un-coerced lookup would report a ``done`` subject as ``missing`` — the
-    reap decision would coincide, but the EVIDENCE handed to the closer would
-    be false, which is exactly the failure the sibling sweeps' "not proof"
-    discipline exists to prevent.
+    A non-``str`` key is therefore rejected LOUDLY rather than tolerated:
+    against an un-normalised census every subject reads as absent, which
+    ``classify_orphan`` renders ``'missing'`` and the sole closer acts on as a
+    REAP — the one direction this module must never fail in.  ONE key is
+    probed, not every key: a mixed-key mapping is pathological, so this is a
+    canary for the wiring mistake, not a validator.
+
+    A census VALUE is either a bare status string (the legacy flat shape) or a
+    collection of statuses — one per tag that carries this id (see
+    ``_project_status_census``).  That tolerance stays here because it is O(1)
+    per record and guards the worse misread: ``isinstance(value, str)`` is
+    tested FIRST because a ``str`` is itself iterable, so read as a collection
+    ``'done'`` would explode into ``{'d', 'o', 'n', 'e'}`` and render every
+    flat census ambiguous, silently reducing recall to zero.
+
+    The SUBJECT id is still ``str``-coerced: task ids arrive as ints on some
+    paths, and an un-coerced lookup would report a ``done`` subject as
+    ``missing`` — the reap decision would coincide, but the EVIDENCE handed to
+    the closer would be false, which is exactly the failure the sibling
+    sweeps' "not proof" discipline exists to prevent.
+
+    Raises:
+        TypeError: when *statuses* is not ``str``-keyed.
 
     Pure: no I/O, no side effects.
     """
+    probe = next(iter(statuses), None)
+    if probe is not None and not isinstance(probe, str):
+        raise TypeError(
+            'orphaned_recon_escalation_sweep: the status census must be '
+            f'str-keyed, got a {type(probe).__name__} key ({probe!r}) — pass '
+            'it through normalize_status_census first; every subject reads as '
+            "absent against an un-normalised census, which classifies as "
+            "'missing' and drives a REAP on no evidence",
+        )
     tid = str(getattr(esc, 'task_id', None))
-    by_str = {str(k): v for k, v in statuses.items()}
-    if tid not in by_str:
+    if tid not in statuses:
         return None
-    value = by_str[tid]
+    value = statuses[tid]
     return {value} if isinstance(value, str) else set(value)
 
 
@@ -275,8 +304,14 @@ def classify_orphan(esc, statuses):
 
     Only ``'terminal'`` and ``'missing'`` are flaggable.
 
-    *statuses* must be a successfully-read census.  An errored or partial read
-    must never reach here: it would render as ``missing`` for every record.
+    *statuses* must be a CANONICAL census — ``str`` keys, values either a
+    status string or a collection of them.  ``_project_status_census`` returns
+    that shape; anything else goes through ``normalize_status_census`` first,
+    and a non-``str``-keyed map raises rather than classifying every subject
+    ``'missing'`` (see ``_observed_statuses``).
+
+    *statuses* must also be a successfully-read census.  An errored or partial
+    read must never reach here: it would render as ``missing`` for every record.
     That guarantee does NOT rest on the backend raising —
     ``backends/sqlite_task_backend.py::get_statuses_fresh`` never does, it
     "fails open to ``{}`` on any error" — so ``_project_status_census``
@@ -329,6 +364,36 @@ def build_orphaned_escalation_flag(
     suppression instead of re-emitting unmarked every cycle.  Keying on the
     escalation id instead would make every re-file of the same subject look
     like a brand-new finding.
+
+    RESIDUAL, UNFIXED HERE: that key is NOT project-qualified, and the subject
+    frequently belongs to a project OTHER than the one running Stage 1 (live
+    subjects span seven projects — dark_factory 56, reify 48, autopilot_video
+    7, ...).  ``flag_dedup.dedup_flags`` keys the ledger row on
+    ``(project_id=the RUNNING project, task_id, flag_type)``, and task ids are
+    per-project counters that all start near 1, so two orphan records with the
+    same numeric subject id in DIFFERENT projects share one row: their
+    recurrence counts conflate, and a cross-project fix-task suppression
+    decision computed for one can suppress the other's flag.  Nothing in the
+    marker payload distinguishes them either — ``dedup_flags`` persists only
+    ``task_id``/``flag_type``/``run_id`` (task 4712 retired the ``cited_tasks``
+    payload write), so the conflation is not even auditable after the fact.
+
+    Two fixes were considered and BOTH rejected as worse than the residual.
+    (a) Adding ``cited_tasks=[{'project_id': subject, 'task_id': tid}]``: it
+    buys no auditability for the reason just given, and it is actively harmful
+    — ``_resolve_live_cross_project_fix_task`` is FOREIGN-ONLY and
+    ``_cited_fix_task_live`` counts a ``done`` task as live, so citing a
+    ``done`` subject in another project would make a carried-forward orphan
+    flag suppress ITSELF for up to ``_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES``
+    (8) cycles, silencing the largest class of true findings.  (b) A composite
+    ``'dark_factory:650'`` ``task_id``: ``_is_valid_marker_task_id`` rejects
+    it, which would make the flag bypass dedup entirely and re-emit unmarked
+    every cycle — the exact failure the placement-above-``dedup_flags``
+    comment in ``stages/memory_consolidator.py`` exists to avoid.  A real fix
+    means teaching ``flag_dedup`` a project-qualified marker shape, which is
+    that module's change to make, not this one's.  Until then the flag's
+    DESCRIPTION always names the subject's project, so a closer reading the
+    finding is never misled even when the recurrence row is shared.
 
     Args:
         esc: The pending ``Escalation`` being reported.
@@ -416,20 +481,48 @@ def _merge_tag_census(census, per_tag):
     ``dict.update`` would silently resolve that collision — and an escalation
     record carries no tag, so there is nothing to resolve it WITH.
     ``classify_orphan`` reports a multi-status id as ``'ambiguous'`` instead.
+
+    THE SINGLE PLACE ids are ``str``-coerced, which is what lets the per-record
+    lookup in ``_observed_statuses`` be a plain O(1) ``in`` test.  A value that
+    is itself a collection is folded element-wise so this same rule can
+    normalise an already-canonical census (``normalize_status_census``);
+    ``isinstance(value, str)`` is tested FIRST for the reason
+    ``_observed_statuses`` gives — a ``str`` is iterable, and reading one as a
+    collection turns ``'done'`` into four bogus statuses.
     """
-    for tid, status in per_tag.items():
-        census.setdefault(str(tid), set()).add(status)
+    for tid, value in per_tag.items():
+        observed = {value} if isinstance(value, str) else set(value)
+        census.setdefault(str(tid), set()).update(observed)
+
+
+def normalize_status_census(statuses):
+    """Return *statuses* in the canonical ``{str(id): {status, ...}}`` shape.
+
+    The boundary converter for a census that did NOT come from
+    ``_project_status_census`` — a legacy flat ``{id: status}`` map, or one
+    keyed by int.  ``classify_orphan``/``sole_subject_status`` require the
+    canonical shape and reject anything else loudly, because normalising ONCE
+    per census is what keeps their per-record lookup O(1) rather than
+    re-keying the whole task store for every record (see
+    ``_observed_statuses`` for the measured cost).
+
+    Idempotent: a census already in the canonical shape survives unchanged.
+
+    Pure: no I/O, no side effects; *statuses* is never mutated.
+    """
+    census: dict[str, set[str]] = {}
+    _merge_tag_census(census, statuses)
+    return census
 
 
 async def _project_status_census(taskmaster, project_root, *, log = logger):
     """Return a CROSS-TAG-COMPLETE ``{id: {status, ...}}`` census for *project_root*.
 
-    Underscore-prefixed but deliberately SHARED with
-    ``fused-memory/scripts/derive_orphaned_recon_escalations.py``: the
-    cross-tag rule below is the same soundness requirement in both call sites,
-    and a second copy could drift so that the in-cycle flag and the operator
-    reap disagree about which records are safe to close. The name stays
-    private because it is not part of the module's Stage-1-facing surface.
+    Private, and reached by both channels through the ONE caller that composes
+    it, ``classify_pending_escalations``: the cross-tag rule below is the same
+    soundness requirement for the in-cycle flag and for the operator reap, and
+    a second copy could drift so that the two disagree about which records are
+    safe to close.
 
     ``taskmaster.get_statuses_fresh`` defaults to a SINGLE tag when none is
     given — stated in
@@ -545,6 +638,174 @@ async def _project_status_census(taskmaster, project_root, *, log = logger):
     return census
 
 
+class OrphanedRecord(NamedTuple):
+    """One pending record the classification pass found reapable, with its evidence.
+
+    Carries everything BOTH consumers need to describe the finding — the
+    Stage-1 flag builder and the operator script's resolution note — so
+    neither re-derives the project or re-reads the census, and so the two
+    cannot describe the same record differently.
+    """
+
+    escalation: Any
+    classification: str
+    project_id: str
+    subject_status: str | None
+
+
+#: The counts every classification pass reports.  Always all present, so a
+#: consumer never needs a ``.get(..., 0)`` fallback and can tell the degraded
+#: signature (``errors > 0``) from the clean-but-empty one directly.
+_CLASSIFICATION_COUNT_KEYS: tuple[str, ...] = (
+    'scanned', 'terminal', 'missing', 'live', 'ambiguous', 'unresolvable', 'errors',
+)
+
+
+def _zeroed_counts() -> dict[str, int]:
+    """A fresh all-zero count dict in the shape every caller returns."""
+    return dict.fromkeys(_CLASSIFICATION_COUNT_KEYS, 0)
+
+
+async def classify_pending_escalations(
+    escalations,
+    taskmaster,
+    known_projects,
+    *,
+    log = logger,
+):
+    """Classify every reapable member of *escalations* against its OWN project.
+
+    THE SINGLE OWNER OF THE WHOLE DERIVATION, composition included — not just
+    of the leaf predicates.  Both channels call exactly this coroutine: the
+    in-cycle Stage-1 sweep (``sweep_orphaned_recon_escalations``, which then
+    only builds flags) and the operator reap
+    (``fused-memory/scripts/derive_orphaned_recon_escalations.py``, which then
+    only adds the ``queue.resolve`` step).  Sharing only the leaf predicates
+    was not enough: the two copies of this loop had already drifted in how
+    they counted and what their warnings named, which is precisely how the
+    in-cycle flag and the operator reap come to disagree about which records
+    are safe to close.
+
+    Flow per record: ``escalation_project_id`` -> known-projects check -> one
+    cross-tag-complete census per resolvable project, cached -> and
+    ``classify_orphan`` against that project's census.
+
+    Args:
+        escalations: Whatever ``EscalationQueue.get_pending()`` returned;
+            ``select_reapable_escalations`` narrows it here, so a caller never
+            has to remember to.
+        taskmaster: A ``TaskBackendProtocol`` providing ``list_tags`` and
+            ``get_statuses_fresh``.
+        known_projects: ``{project_id: project_root}``.  A record naming a
+            project absent from this map is ``unresolvable``, never an orphan.
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        ``(orphans, counts)``.  *orphans* holds one :class:`OrphanedRecord`
+        per FLAGGABLE record (``'terminal'``/``'missing'``), in input order;
+        every other record is counted and dropped.  *counts* is
+        :data:`_CLASSIFICATION_COUNT_KEYS`, all always present.
+
+    Fail-SAFE in ONE direction: a census-read failure is tallied into
+    ``errors`` and classifies NOTHING for that project — never ``terminal`` or
+    ``missing``.  A false ``terminal`` tells the sole closer to resolve a
+    record whose subject is still ``blocked``, re-arming the filing rule and
+    reproducing the measured re-file churn (``esc-650-1`` -> ``esc-650-2`` in
+    ~4h); a missed detection is simply re-checked next cycle.
+
+    The loop is sequential rather than an ``asyncio.gather`` so per-record
+    error attribution stays exact, mirroring
+    ``curator_gate_resolution_sweep.py::sweep_resolved_curator_gates``.
+    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate.
+    """
+    counts = _zeroed_counts()
+    orphans: list[OrphanedRecord] = []
+
+    # Census cache keyed by project_id.  A project whose census read failed is
+    # cached as None so a second record for the same project neither retries
+    # the failing backend nor is silently classified against a partial map.
+    censuses: dict[str, dict[str, set[str]] | None] = {}
+    unresolved_project_ids: set[str] = set()
+    ambiguous_subject_ids: set[str] = set()
+
+    for esc in select_reapable_escalations(escalations):
+        counts['scanned'] += 1
+
+        project_id = escalation_project_id(esc)
+        if project_id is None or project_id not in known_projects:
+            # Never an orphan: the subject's own store was never consulted.
+            # Folding this into `missing` would reap records on no evidence.
+            counts['unresolvable'] += 1
+            unresolved_project_ids.add(
+                project_id if project_id is not None else '<unparseable>',
+            )
+            continue
+
+        if project_id not in censuses:
+            censuses[project_id] = await _project_status_census(
+                taskmaster, known_projects[project_id], log=log,
+            )
+        census = censuses[project_id]
+        if census is None:
+            counts['errors'] += 1
+            continue
+
+        classification = classify_orphan(esc, census)
+        if classification == 'live':
+            counts['live'] += 1
+            continue
+        if classification == 'ambiguous':
+            # The id exists in several tags with differing statuses, so the
+            # subject cannot be identified from a record that carries no tag.
+            # Counted and surfaced below, never flagged.
+            counts['ambiguous'] += 1
+            ambiguous_subject_ids.add(str(getattr(esc, 'task_id', None)))
+            continue
+
+        counts[classification] += 1
+        orphans.append(OrphanedRecord(
+            escalation=esc,
+            classification=classification,
+            project_id=project_id,
+            subject_status=sole_subject_status(esc, census),
+        ))
+
+    if counts['ambiguous']:
+        # Sibling of the registry-gap canary below.  An ambiguous record is
+        # invisible to the reaper for a reason no operator can see from the
+        # counts alone, and the bucket grows the moment a project starts using
+        # a second tag — so the colliding subject ids are named here rather
+        # than letting recall shrink silently.
+        log.warning(
+            'orphaned_recon_escalation_sweep: %d of %d reapable record(s) name a '
+            'subject id that exists in MORE THAN ONE tag with differing statuses '
+            '(subject task ids: %s) — ids are per-tag (PRIMARY KEY (tag, id)) and '
+            'a record carries no tag, so the subject cannot be identified; these '
+            'were NOT classified and must be resolved by hand',
+            counts['ambiguous'], counts['scanned'],
+            ', '.join(sorted(ambiguous_subject_ids)),
+        )
+
+    if counts['scanned'] and counts['unresolvable']:
+        # Registry-gap canary, mirroring sweep_resolved_curator_gates' zero-
+        # recall canary.  An unresolvable record is silently invisible to the
+        # reaper — its subject is never checked — so a growing bucket is
+        # shrinking recall, not a clean result.  The deployed
+        # DASHBOARD_KNOWN_PROJECT_ROOTS covers all seven projects present in
+        # the live queue and 0 of 124 records fail the detail parse, so a
+        # non-empty bucket is a real signal worth grepping for.
+        log.warning(
+            'orphaned_recon_escalation_sweep: %d of %d reapable record(s) could '
+            'not be scoped to a known project and were NOT classified '
+            '(project_ids: %s) — a known_projects registry gap or a detail-block '
+            'format drift silently shrinks this sweep\'s recall',
+            counts['unresolvable'], counts['scanned'],
+            ', '.join(sorted(unresolved_project_ids)),
+        )
+
+    return orphans, counts
+
+
 async def sweep_orphaned_recon_escalations(
     escalation_queue,
     taskmaster,
@@ -562,10 +823,9 @@ async def sweep_orphaned_recon_escalations(
     an operator can also re-derive and close the same set on demand with
     ``fused-memory/scripts/derive_orphaned_recon_escalations.py --apply``.
 
-    Flow: ``get_pending()`` -> ``select_reapable_escalations`` -> group by
-    ``escalation_project_id`` -> one cross-tag-complete census per resolvable
-    project -> ``classify_orphan`` per record -> a flag for ``'terminal'`` and
-    ``'missing'`` only.
+    This is the FLAG-BUILDING half only: ``classify_pending_escalations`` owns
+    the derivation itself and the operator script consumes the very same pass,
+    so the two channels cannot disagree about which records are safe to close.
 
     Args:
         escalation_queue: An ``EscalationQueue`` over the RECON queue dir.
@@ -580,39 +840,17 @@ async def sweep_orphaned_recon_escalations(
 
     Returns:
         dict with ``flags`` (Stage-1 flag dicts to append to
-        ``report.items_flagged``) and int counts ``scanned`` (reapable records
-        considered), ``terminal``, ``missing``, ``live``, ``ambiguous``,
-        ``unresolvable``, ``errors``.  Every key is always present, so a
-        caller never needs a ``.get(..., 0)`` fallback and can read the
-        degraded-cycle signature (``errors > 0``) apart from the
-        clean-but-empty one directly.
+        ``report.items_flagged``) and the always-present int counts
+        :data:`_CLASSIFICATION_COUNT_KEYS`, so a caller never needs a
+        ``.get(..., 0)`` fallback and can read the degraded-cycle signature
+        (``errors > 0``) apart from the clean-but-empty one directly.
 
-    Best-effort, and fail-SAFE in ONE direction: a queue-read or census-read
-    failure is caught, logged, tallied into ``errors``, and NEVER classified
-    as ``terminal`` or ``missing``.  The asymmetry matters more here than in
-    the sibling sweeps: a false ``terminal`` tells the sole closer to resolve
-    a record whose subject is still ``blocked``, re-arming the filing rule and
-    producing the measured re-file churn the watcher playbook documents
-    (``esc-650-1`` -> ``esc-650-2`` in ~4h), whereas a missed detection is
-    simply re-checked next cycle.
+    Best-effort: a queue-read failure is caught, logged, tallied into
+    ``errors`` and classifies nothing this cycle; the census-read half of that
+    guarantee lives in ``classify_pending_escalations``.
     ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` are
     re-raised unchanged.
-
-    The per-record loop is sequential rather than an ``asyncio.gather`` so
-    per-record error attribution stays exact, mirroring
-    ``curator_gate_resolution_sweep.py::sweep_resolved_curator_gates``.
     """
-    stats = {
-        'flags': [],
-        'scanned': 0,
-        'terminal': 0,
-        'missing': 0,
-        'live': 0,
-        'ambiguous': 0,
-        'unresolvable': 0,
-        'errors': 0,
-    }
-
     try:
         pending = escalation_queue.get_pending()
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -622,95 +860,23 @@ async def sweep_orphaned_recon_escalations(
             'orphaned_recon_escalation_sweep: get_pending failed — '
             'no records classified this cycle',
         )
-        stats['errors'] += 1
-        return stats
+        counts = _zeroed_counts()
+        counts['errors'] += 1
+        return {'flags': [], **counts}
 
-    reapable = select_reapable_escalations(pending)
-    if not reapable:
-        return stats
+    orphans, counts = await classify_pending_escalations(
+        pending, taskmaster, known_projects, log=log,
+    )
 
-    # Census cache keyed by project_id.  A project whose census read failed is
-    # cached as None so a second record for the same project neither retries
-    # the failing backend nor is silently classified against a partial map.
-    censuses: dict[str, dict[str, set[str]] | None] = {}
-    unresolved_project_ids: set[str] = set()
-    ambiguous_subject_ids: set[str] = set()
-
-    for esc in reapable:
-        stats['scanned'] += 1
-
-        project_id = escalation_project_id(esc)
-        if project_id is None or project_id not in known_projects:
-            # Never an orphan: the subject's own store was never consulted.
-            # Folding this into `missing` would reap records on no evidence.
-            stats['unresolvable'] += 1
-            unresolved_project_ids.add(
-                project_id if project_id is not None else '<unparseable>',
-            )
-            continue
-
-        if project_id not in censuses:
-            censuses[project_id] = await _project_status_census(
-                taskmaster, known_projects[project_id], log=log,
-            )
-        census = censuses[project_id]
-        if census is None:
-            stats['errors'] += 1
-            continue
-
-        classification = classify_orphan(esc, census)
-        if classification == 'live':
-            stats['live'] += 1
-            continue
-        if classification == 'ambiguous':
-            # The id exists in several tags with differing statuses, so the
-            # subject cannot be identified from a record that carries no tag.
-            # Counted and surfaced below, never flagged.
-            stats['ambiguous'] += 1
-            ambiguous_subject_ids.add(str(esc.task_id))
-            continue
-
-        stats[classification] += 1
-        stats['flags'].append(
+    return {
+        'flags': [
             build_orphaned_escalation_flag(
-                esc,
-                classification,
-                subject_project_id=project_id,
-                subject_status=sole_subject_status(esc, census),
-            ),
-        )
-
-    if stats['ambiguous']:
-        # Sibling of the registry-gap canary below.  An ambiguous record is
-        # invisible to the reaper for a reason no operator can see from the
-        # stats alone, and the bucket grows the moment a project starts using
-        # a second tag — so the colliding subject ids are named here rather
-        # than letting recall shrink silently.
-        log.warning(
-            'orphaned_recon_escalation_sweep: %d of %d reapable record(s) name a '
-            'subject id that exists in MORE THAN ONE tag with differing statuses '
-            '(subject task ids: %s) — ids are per-tag (PRIMARY KEY (tag, id)) and '
-            'a record carries no tag, so the subject cannot be identified; these '
-            'were NOT classified and must be resolved by hand',
-            stats['ambiguous'], stats['scanned'],
-            ', '.join(sorted(ambiguous_subject_ids)),
-        )
-
-    if stats['scanned'] and stats['unresolvable']:
-        # Registry-gap canary, mirroring sweep_resolved_curator_gates' zero-
-        # recall canary.  An unresolvable record is silently invisible to the
-        # reaper — its subject is never checked — so a growing bucket is
-        # shrinking recall, not a clean result.  The deployed
-        # DASHBOARD_KNOWN_PROJECT_ROOTS covers all seven projects present in
-        # the live queue and 0 of 124 records fail the detail parse, so a
-        # non-empty bucket is a real signal worth grepping for.
-        log.warning(
-            'orphaned_recon_escalation_sweep: %d of %d reapable record(s) could '
-            'not be scoped to a known project and were NOT classified '
-            '(project_ids: %s) — a known_projects registry gap or a detail-block '
-            'format drift silently shrinks this sweep\'s recall',
-            stats['unresolvable'], stats['scanned'],
-            ', '.join(sorted(unresolved_project_ids)),
-        )
-
-    return stats
+                orphan.escalation,
+                orphan.classification,
+                subject_project_id=orphan.project_id,
+                subject_status=orphan.subject_status,
+            )
+            for orphan in orphans
+        ],
+        **counts,
+    }
