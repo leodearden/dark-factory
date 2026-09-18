@@ -239,6 +239,20 @@ class TestXdistWorkers:
     is not.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_ambient_worker_count(self, monkeypatch):
+        """Every test in this class starts from a KNOWN ambient environment.
+
+        `auto_num_workers` reports what the command's subprocess will actually
+        see, which INCLUDES an ambient `PYTEST_XDIST_AUTO_NUM_WORKERS` — and
+        this repo pins that key to '16' in top-level `verify_env`, so these
+        tests run with it exported whenever the fleet verifies this branch.
+        Deleting it here is what makes a null assertion below a statement about
+        the code rather than about the runner; the tests that care about the
+        ambient value set it themselves.
+        """
+        monkeypatch.delenv('PYTEST_XDIST_AUTO_NUM_WORKERS', raising=False)
+
     def test_the_exact_key_set(self):
         from orchestrator.verify import _xdist_workers  # noqa: PLC0415
 
@@ -385,6 +399,65 @@ class TestXdistWorkers:
 
         assert _xdist_workers(LIVE_TEST_COMMAND, {})['auto_num_workers'] is None
         assert _xdist_workers(LIVE_TEST_COMMAND, None)['auto_num_workers'] is None
+
+    def test_an_ambient_value_is_recorded_not_nulled(self, monkeypatch):
+        """*verify_env* is the config OVERLAY, not the env the command runs in.
+
+        `_target_subprocess_env` builds the child env from `os.environ` (minus
+        the venv/`ORCH_` scrub) and applies the overlay LAST, so an ambient
+        `PYTEST_XDIST_AUTO_NUM_WORKERS` IS in effect for the command — and
+        `dark-factory-orchestrator.yaml` names exactly that at unit level.
+        Reading the overlay alone stamped `null`: "not set" about a variable
+        that was set, in the record whose purpose is saying what the run saw.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        monkeypatch.setenv('PYTEST_XDIST_AUTO_NUM_WORKERS', '8')
+
+        assert _xdist_workers(LIVE_TEST_COMMAND, {})['auto_num_workers'] == '8'
+        assert _xdist_workers(LIVE_TEST_COMMAND, None)['auto_num_workers'] == '8'
+
+    def test_the_overlay_wins_over_an_ambient_value(self, monkeypatch):
+        """The overlay is applied LAST by the builder, so config beats ambient."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        monkeypatch.setenv('PYTEST_XDIST_AUTO_NUM_WORKERS', '8')
+        record = _xdist_workers(
+            LIVE_TEST_COMMAND, {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'},
+        )
+
+        assert record['auto_num_workers'] == '6'
+
+    @pytest.mark.parametrize(
+        ('ambient', 'overlay'),
+        [(None, None), ('8', None), (None, '6'), ('8', '6')],
+        ids=['neither', 'ambient-only', 'overlay-only', 'both'],
+    )
+    def test_the_recorded_value_is_the_one_the_spawn_will_use(
+        self, monkeypatch, ambient, overlay,
+    ):
+        """INV-10: the stamp and the spawn read ONE env resolution.
+
+        Asserted against `_target_subprocess_env` itself — the builder
+        `_run_cmd` hands to the subprocess — rather than against a re-spelled
+        `overlay-then-ambient` expression here, because a second spelling of the
+        precedence is exactly what would drift silently. Every cell of the
+        2x2 is covered so agreement cannot come from both sides being null.
+        """
+        from orchestrator.verify import (  # noqa: PLC0415
+            _target_subprocess_env,
+            _xdist_workers,
+        )
+
+        if ambient is not None:
+            monkeypatch.setenv('PYTEST_XDIST_AUTO_NUM_WORKERS', ambient)
+        verify_env = {'PYTEST_XDIST_AUTO_NUM_WORKERS': overlay} if overlay else {}
+
+        assert _xdist_workers(LIVE_TEST_COMMAND, verify_env)['auto_num_workers'] == (
+            _target_subprocess_env(dict(verify_env)).get(
+                'PYTEST_XDIST_AUTO_NUM_WORKERS',
+            )
+        )
 
     def test_the_two_facts_are_independent(self):
         """Neither field is derived from the other — that is the whole point.
@@ -644,6 +717,30 @@ class TestTheStampIsTakenOnTheRealPath:
     existed to remove it.
     """
 
+    @pytest.fixture(autouse=True)
+    def _deterministic_worker_count_sources(self, monkeypatch):
+        """Pin BOTH sources of `PYTEST_XDIST_AUTO_NUM_WORKERS` to absent.
+
+        The stamped value is what `_target_subprocess_env` would hand the
+        spawn, and that has two inputs — neither of which this test supplies,
+        and both of which the ambient environment does:
+
+        - the CONFIG overlay. `OrchestratorConfig(project_root=tmp_path)` looks
+          like "the defaults", but pydantic-settings reads an ambient
+          `ORCH_CONFIG_PATH`, and this repo's own config pins the key to '16'.
+          Measured: without this delenv the stamp reads '16' here. That is the
+          same leak `_target_subprocess_env` scrubs for CHILD processes (task
+          2957) reaching an in-process construction instead.
+        - `os.environ`. Measured '8' on this host, exported at unit level by
+          `dark-factory-orchestrator.yaml`.
+
+        Deleting both is what lets `test_the_xdist_facts_ride_along` assert a
+        literal None instead of re-deriving the expected value from the same
+        resolution it is checking.
+        """
+        monkeypatch.delenv('PYTEST_XDIST_AUTO_NUM_WORKERS', raising=False)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
     @staticmethod
     def _stamped(summary):
         return [c for c in summary['commands'] if c['cmd'] is not None]
@@ -707,12 +804,10 @@ class TestTheStampIsTakenOnTheRealPath:
             segment's flag as the whole command's -> None.
           - lint is `uv run ruff check src/`, not pytest at all -> None.
 
-        Only `n_flag` is asserted by VALUE. `auto_num_workers` is read from
-        `verify_env`, which inherits `PYTEST_XDIST_AUTO_NUM_WORKERS` from the
-        ambient environment — it is '8' on this host and absent on one that
-        does not export it — so pinning it here would assert a property of the
-        runner rather than of the code. `TestXdistWorkers` covers it against a
-        supplied env instead, which is where that value IS knowable.
+        `auto_num_workers` is asserted too, and deterministically — but only
+        because `_deterministic_worker_count_sources` above pins BOTH of its
+        sources absent. `TestXdistWorkers` covers the non-null cells against a
+        supplied overlay and a set ambient key.
         """
         _result, summary = await _run_and_read_summary(
             tmp_path, segmented=segmented, reader=_rising_reader(),
@@ -727,6 +822,10 @@ class TestTheStampIsTakenOnTheRealPath:
             assert xdist['n_flag'] == n_flag_by_label[entry['label']], (
                 f"{entry['label']}: the flag on disk is not the one the "
                 f"rendered command carried"
+            )
+            assert xdist['auto_num_workers'] is None, (
+                f"{entry['label']}: nothing set PYTEST_XDIST_AUTO_NUM_WORKERS "
+                f"for this spawn, so the stamp must say so"
             )
 
     @pytest.mark.asyncio

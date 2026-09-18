@@ -9028,10 +9028,24 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
       recovery's strip and refusal screen, and matching it keeps ONE answer in
       the module: widening only the telemetry would leave the stamp claiming a
       flag the strip would not shed.
-    - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` from the
-      EFFECTIVE verify env, or ``None``. Reported independently of ``n_flag``:
-      a reader that wants the effective count joins them itself, and can see
-      when it cannot.
+    - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
+      own subprocess will see it, or ``None`` when nothing sets it. Resolved by
+      asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
+      with — and NOT by reading *verify_env*, which is only the config OVERLAY
+      (``config.verify_env`` + the module's + ``DF_VERIFY_ROLE``). The child env
+      is ``os.environ`` minus the venv/``ORCH_`` scrub with that overlay applied
+      LAST, so an AMBIENT value is in effect for the command; reading the
+      overlay alone recorded ``null`` for it — "not set" about a variable that
+      was set, in the record whose whole purpose is saying what the run
+      experienced. This repo pins the key in top-level ``verify_env``, so the
+      live path agreed by luck; ``dark-factory-orchestrator.yaml`` sets it
+      ambiently at unit level too, and a targeted project that does not pin it
+      recorded a false null. Asking the builder also keeps the precedence and
+      the scrub unrestated here, so the stamp cannot drift from what the spawn
+      does.
+
+      Reported independently of ``n_flag``: a reader that wants the effective
+      count joins them itself, and can see when it cannot.
 
     ``None`` for every non-pytest tool and for a raw-retained chain — the same
     no-op guards ``apply_pytest_numprocesses`` documents, for the same reason:
@@ -9044,7 +9058,9 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     n_flag: str | None = None
     auto_num_workers: str | None = None
     try:
-        auto_num_workers = (verify_env or {}).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
+        auto_num_workers = _target_subprocess_env(
+            dict(verify_env) if verify_env else None,
+        ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
             flags = parsed.base_flags
