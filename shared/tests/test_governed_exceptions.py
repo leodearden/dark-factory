@@ -20,11 +20,13 @@ expression: the structural guards below read the module source from the LOCAL
 TDD pair 1: the Disposition vocabulary (GREEN on impl step-2).
 TDD pair 2: the inline marker parser + INLINE_MARKER_FORMS (GREEN on impl step-4).
 TDD pair 3: GovernedList + the accepting half of governed_exceptions (GREEN on impl step-6).
+TDD pair 4: every rejection of governed_exceptions, incl. scenario 12 (GREEN on impl step-8).
 """
 from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -34,10 +36,12 @@ from shared.governed_exceptions import (
     INLINE_MARKER_FORMS,
     Debt,
     Disposition,
+    MalformedDeclaration,
     MalformedDisposition,
     Policy,
     TaskRef,
     TicketRef,
+    UndisposedException,
     governed_exceptions,
     parse_disposition_marker,
 )
@@ -575,3 +579,173 @@ class TestDeclarationForms:
         assert isinstance(DECLARATION_FORMS, tuple)
         assert DECLARATION_FORMS
         assert all(isinstance(form, str) for form in DECLARATION_FORMS)
+
+
+class TestUndisposedException:
+    """The INV-12 violation itself: an entry nobody owns and no ruling covers."""
+
+    @staticmethod
+    def _raised(**kwargs):
+        with pytest.raises(UndisposedException) as excinfo:
+            governed_exceptions(LIST_ID, RULE, **kwargs)
+        return excinfo.value
+
+    def test_names_only_the_undisposed_key(self):
+        error = self._raised(keys=['a', 'b'], dispositions={'a': Policy('inv12-x')})
+        assert error.keys == ('b',)
+        assert "'b'" in str(error)
+
+    def test_names_every_undisposed_key(self):
+        error = self._raised(keys=['a', 'b'])
+        assert error.keys == ('a', 'b')
+
+    def test_message_names_the_list_and_publishes_every_declaration_form(self):
+        message = str(self._raised(keys=['a', 'b']))
+        assert LIST_ID in message
+        for form in DECLARATION_FORMS:
+            assert form in message
+
+    def test_carries_structured_attributes(self):
+        error = self._raised(
+            keys=['a', 'b', 'c'], default=Debt(TaskRef(5149)), default_covers=2
+        )
+        assert error.list_id == LIST_ID
+        assert error.keys == ('a', 'b', 'c')
+        assert error.covered == 3
+        assert error.default_covers == 2
+
+    def test_scenario_12_a_defaulted_list_gains_a_key(self):
+        """BOUNDARY SCENARIO 12, and it falls out of the general count rule.
+
+        A list declared ``default_covers=2`` now has three keys and no
+        overrides.  Nothing about the two original entries changed; the third
+        is simply undisposed, which is exactly what D4 makes ``default_covers``
+        a COUNT for — a new entry needs an explicit override or a visible
+        increment beside the disposition it is borrowing.  There is no
+        special-case branch for this in the implementation, and there must not
+        be one: it is the same "covered > declared" arm as a list with no
+        default at all.
+        """
+        message = str(
+            self._raised(keys=['a', 'b', 'c'], default=Debt(TaskRef(5149)), default_covers=2)
+        )
+        assert "'c'" in message  # the added key
+        assert 'default_covers=2' in message  # the declared count
+        assert '3' in message  # the actual count
+        assert 'override' in message and 'increment' in message  # what to do about it
+
+    def test_is_raised_when_the_declaring_module_is_collected(self, tmp_path):
+        """The shape the PRD specifies, observed rather than assumed.
+
+        D4 puts the declaration at module scope in a package's test tree, so
+        the violation surfaces when pytest COLLECTS that module.  Calling the
+        function directly would leave that unverified, so this writes a real
+        module and imports it.
+        """
+        module_path = tmp_path / 'declares_a_governed_list.py'
+        module_path.write_text(
+            'from shared.governed_exceptions import Debt, TaskRef, governed_exceptions\n'
+            '\n'
+            'governed_exceptions(\n'
+            "    'pkg.tests.example',\n"
+            "    'every entry is owned or ratified',\n"
+            "    ['a', 'b', 'c'],\n"
+            '    default=Debt(TaskRef(5149)),\n'
+            '    default_covers=2,\n'
+            ')\n',
+            encoding='utf-8',
+        )
+        spec = importlib.util.spec_from_file_location('declares_a_governed_list', module_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with pytest.raises(UndisposedException) as excinfo:
+            spec.loader.exec_module(module)
+        assert excinfo.value.list_id == 'pkg.tests.example'
+
+    def test_is_not_a_value_error(self):
+        """A broad ``except ValueError`` must never swallow an INV-12 breach.
+
+        The three faults map to different exit codes — 1 for this violation, 2
+        for a broken instrument — so they share no base class and none
+        subclasses a builtin that consumers already catch.
+        """
+        assert not issubclass(UndisposedException, ValueError)
+        assert not issubclass(UndisposedException, MalformedDeclaration)
+        assert not issubclass(MalformedDeclaration, UndisposedException)
+
+
+class TestMalformedDeclaration:
+    """Instrument failures: the declaration itself is broken, so nothing is judged."""
+
+    @staticmethod
+    def _message(list_id=LIST_ID, rule=RULE, keys=(), **kwargs):
+        with pytest.raises(MalformedDeclaration) as excinfo:
+            governed_exceptions(list_id, rule, keys, **kwargs)
+        return str(excinfo.value)
+
+    def test_a_duplicate_key(self):
+        message = self._message(keys=['a', 'b', 'a'], dispositions={'a': Policy('x'), 'b': Policy('y')})
+        assert "'a'" in message
+
+    def test_an_override_for_a_key_that_is_not_declared(self):
+        message = self._message(keys=['a'], dispositions={'a': Policy('x'), 'stray': Policy('y')})
+        assert "'stray'" in message
+
+    def test_a_default_without_a_count(self):
+        message = self._message(keys=['a'], default=Policy('x'))
+        assert 'default_covers' in message
+
+    def test_a_count_without_a_default(self):
+        message = self._message(keys=['a'], default_covers=1)
+        assert 'default_covers' in message
+
+    def test_a_count_that_over_claims(self):
+        """A stale literal, not a violation: nothing is left undisposed.
+
+        ``default_covers`` larger than the number of keys without an override
+        means the list SHRANK and the literal was not decremented.  Every
+        remaining entry still has a disposition, so this is exit 2 (fix the
+        instrument), not exit 1 (fix the invariant).
+        """
+        message = self._message(keys=['a', 'b'], default=Policy('x'), default_covers=5)
+        assert 'default_covers=5' in message
+        assert '2' in message
+
+    @pytest.mark.parametrize('bad_list_id', ['nodots', '', '.leading', 'trailing.', 'a..b', 17])
+    def test_a_list_id_that_is_not_dotted_and_unique(self, bad_list_id):
+        message = self._message(list_id=bad_list_id, keys=['a'], dispositions={'a': Policy('x')})
+        assert repr(bad_list_id) in message
+
+    @pytest.mark.parametrize('bad_rule', ['', '   ', None])
+    def test_a_blank_rule(self, bad_rule):
+        """The rule is what an operator judges a NEW entry against, so it is required."""
+        message = self._message(rule=bad_rule, keys=['a'], dispositions={'a': Policy('x')})
+        assert repr(bad_rule) in message
+
+    @pytest.mark.parametrize('bad', ['task 5149', TaskRef(5149), 5149, None])
+    def test_an_override_value_that_is_not_a_disposition(self, bad):
+        if bad is None:
+            pytest.skip('None is how "no override" is spelled; it never appears as a value')
+        message = self._message(keys=['a'], dispositions={'a': bad})
+        assert repr(bad) in message
+
+    @pytest.mark.parametrize('bad', ['task 5149', TaskRef(5149), 5149])
+    def test_a_default_that_is_not_a_disposition(self, bad):
+        message = self._message(keys=['a'], default=bad, default_covers=1)
+        assert repr(bad) in message
+
+
+class TestCheckOrdering:
+    """Preconditions before judgements — the local fault is what gets reported."""
+
+    def test_a_duplicate_key_is_reported_before_an_undisposed_one(self):
+        """Both faults are present; the STRUCTURAL one is named.
+
+        A duplicate key makes every count downstream of it meaningless, so
+        reporting the undisposed keys first would hand back a wall of noise
+        whose one real cause is a line the reader can see.  This is the
+        ordering discipline ``scripts/merge_lane_metrics.py::
+        check_against_baseline`` applies for the same reason.
+        """
+        with pytest.raises(MalformedDeclaration):
+            governed_exceptions(LIST_ID, RULE, ['a', 'a', 'b'])
