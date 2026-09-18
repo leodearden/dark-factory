@@ -439,8 +439,8 @@ def test_merge_queue_uses_24h_recent_window(client):
     the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
     mock_build = AsyncMock(return_value={})
     with (
-        patch('dashboard.app.build_per_project_merge_queue', new=mock_build),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value=None)),
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
     assert resp.status_code == 200
@@ -1189,11 +1189,11 @@ def test_merge_queue_live_path_uses_live_entries(client):
         },
     }
     with (
-        patch('dashboard.app.build_per_project_merge_queue',
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
               new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
 
@@ -1226,11 +1226,11 @@ def test_merge_queue_fallback_path_when_unreachable(client):
     """
     # fetch_live_merge_queues returns {} (no live data) → resolve_active falls back
     with (
-        patch('dashboard.app.build_per_project_merge_queue',
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
               new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value={})),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
 
