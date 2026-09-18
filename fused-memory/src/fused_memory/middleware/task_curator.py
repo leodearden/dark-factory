@@ -360,6 +360,59 @@ class PreparedCandidate:
     prompt_tokens: int
 
 
+@dataclass(frozen=True)
+class PoolWithheld:
+    """Per-cap census of the pool entries a cap kept out of the prompt.
+
+    The consumer is the CURATOR LLM, and the prompt is the only surface it
+    reads — so the pool's incompleteness travels in :meth:`render`, not in a
+    log line nobody at the decision point sees (INV-11
+    ``no-silent-fail-soft``). Without it the LLM cannot distinguish "no
+    duplicate exists" from "the duplicate was cut at a cap", and answers
+    ``create`` or ``combine`` as if the pool were complete.
+
+    ``by_source`` counts the eligible entries each cap excluded, keyed by the
+    stream that lost them (``module`` / ``embedding`` / ``dependency``) plus
+    ``total_cap`` for the final :func:`_trim_pool` pass. ``caps`` carries the
+    configured limits that produced those counts, so a reader can tell a pool
+    one entry over its cap from one that lost forty.
+
+    Every count is deliberately per-STREAM and not only at ``total_cap``:
+    under stock config the stream caps are the binding constraints and
+    ``total_cap`` never fires at all (see the pool-cap block in
+    ``config/schema.py::CuratorConfig``), so a census keyed on the final trim
+    alone would be permanently silent.
+
+    An empty census renders nothing: a pool that fit says nothing about
+    fitting, exactly as a complete result surface carries no delta.
+    """
+
+    by_source: Mapping[str, int] = field(default_factory=dict)
+    caps: Mapping[str, int] = field(default_factory=dict)
+
+    @property
+    def total(self) -> int:
+        """How many eligible entries the caps kept out of the pool, in total."""
+        return sum(self.by_source.values())
+
+    def render(self) -> str | None:
+        """Render the prompt block, or ``None`` when nothing was withheld."""
+        if self.total == 0:
+            return None
+        fact = json.dumps(
+            {'withheld': dict(self.by_source), 'caps': dict(self.caps)},
+            sort_keys=True,
+        )
+        return (
+            f'pool_truncated: {fact}\n'
+            '  The pool above is INCOMPLETE — the counts above are tasks that '
+            'matched this candidate but did not fit. Absence of a duplicate in '
+            'a truncated pool is not proof that no duplicate exists, so prefer '
+            '"create" over a speculative "combine" or "drop" when the pool '
+            'offers no clearly-overlapping task.'
+        )
+
+
 @dataclass
 class _PoolEntry:
     """One task as seen by the curator — extracted from raw taskmaster data."""
