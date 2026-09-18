@@ -15,7 +15,10 @@ import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+from fused_memory.reconciliation.backlog_policy import (
+    _POLICY_ONLY_KEYS,
+    BacklogPolicy,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
@@ -1472,3 +1475,196 @@ class TestFoldIsolation:
         # The foreign record is not merely un-folded — it is untouched.
         assert foreign_path.read_text(encoding='utf-8') == before
         assert pending[foreign_id].get('dedupe_count', 0) == 0
+
+
+class TestPolicyKeyCoupling:
+    """``_POLICY_ONLY_KEYS`` must describe what the write path actually stamps.
+
+    The constant is consumed by the close path and the write path, and nothing
+    about the language couples the two: before ``_policy_keys`` the write path
+    repeated the four names in a literal, so adding a fifth key would have
+    restored it on close while never stamping it on write — leaving a key that
+    exists only on archived records. These pin both halves of the coupling.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_policy_only_key_lands_on_a_freshly_filed_record(
+        self, event_buffer, tmp_path,
+    ):
+        """The end-to-end half: whatever the constant names is on disk."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        policy = BacklogPolicy(
+            event_buffer, _StubQueue(), lambda _: True, hard_limit=10,
+        )
+        verdict = await policy.check('proj', project_root=str(project_root))
+        assert verdict.escalation_path is not None
+
+        record = json.loads(
+            Path(verdict.escalation_path).read_text(encoding='utf-8'),
+        )
+        assert set(_POLICY_ONLY_KEYS) <= set(record), sorted(record)
+
+
+class TestDegradedFilingPaths:
+    """What the policy REPORTS when a record is filed but cannot be stamped.
+
+    Filing is two phases — ``submit_or_dedupe`` then the policy-key merge — so
+    a record can exist on disk while carrying none of the keys that make it
+    attributable. ``queue.submit`` persists ``Escalation.to_json()`` and
+    ``attach_dedupe_child`` re-hydrates through ``Escalation.from_json``, so
+    BOTH phases strip them and only the merge puts them back.
+
+    A record in that state cannot be auto-closed: ``on_judge_unhalt`` skips
+    every candidate whose ``project_id`` does not match. So the verdict must
+    report NO path — ``harness._notify_judge_halt`` claims its per-process halt
+    sentinel only on a non-None ``escalation_path``, and claiming it on an
+    unattributable record retires the retry that would have rescued it.
+    """
+
+    @staticmethod
+    def _policy(event_buffer, clock) -> BacklogPolicy:
+        return BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=lambda: clock['now'],
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_record_that_cannot_be_located_reports_no_path(
+        self, event_buffer, tmp_path, monkeypatch, caplog,
+    ):
+        """Phase 1 succeeded, phase 2 could not find the record at all."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        monkeypatch.setattr(
+            BacklogPolicy, '_locate_persisted', staticmethod(lambda _dir, _id: None),
+        )
+
+        policy = self._policy(event_buffer, {'now': 1_000_000.0})
+        with caplog.at_level(logging.WARNING):
+            verdict = await policy.check('proj', project_root=str(project_root))
+
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is None
+        assert 'could not read it back' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_first_write_whose_merge_fails_reports_no_path(
+        self, event_buffer, tmp_path, monkeypatch, caplog,
+    ):
+        """Located, but the read-modify-write raised — the state a bare
+        ``Path | None`` return could not distinguish from success."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        # A record whose JSON is unparseable: located fine, merged never.
+        corrupt = tmp_path / 'corrupt.json'
+        corrupt.write_text('{ truncated', encoding='utf-8')
+        monkeypatch.setattr(
+            BacklogPolicy, '_locate_persisted', staticmethod(lambda _dir, _id: corrupt),
+        )
+
+        policy = self._policy(event_buffer, {'now': 1_000_000.0})
+        with caplog.at_level(logging.WARNING):
+            verdict = await policy.check('proj', project_root=str(project_root))
+
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is None
+        assert 'could not stamp' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_fold_whose_merge_fails_also_reports_no_path(
+        self, event_buffer, tmp_path, monkeypatch, caplog,
+    ):
+        """The fold branch degrades the SAME way, because it breaks the same way.
+
+        Measured on this branch: ``attach_dedupe_child`` re-hydrates through
+        ``Escalation.from_json``, so a fold strips the four policy keys its
+        parent's own first merge put there. A fold whose merge then fails
+        leaves exactly the unattributable record a failed first write leaves —
+        so reporting the parent's path here would claim the halt sentinel on a
+        record nothing can ever close.
+        """
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._policy(event_buffer, clock)
+
+        first = await policy.check('proj', project_root=str(project_root))
+        assert first.escalation_path is not None
+
+        # Fail only _merge_onto_persisted's write: it is the one writer here
+        # using Path.write_text on a '<id>.json.tmp' sibling, while the queue
+        # writes through tempfile.mkstemp + os.fdopen.
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *args, **kwargs):
+            if self.name.endswith('.json.tmp'):
+                raise OSError('no space left on device')
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'write_text', failing_write_text)
+
+        # A changed condition, so the merge has something to write.
+        await _seed_buffered(event_buffer, 'proj', n=18)
+        clock['now'] += 901.0
+        with caplog.at_level(logging.WARNING):
+            second = await policy.check('proj', project_root=str(project_root))
+
+        assert second.outcome == 'escalated'
+        assert second.escalation_path is None
+        assert 'could not stamp' in caplog.text
+
+        # The fold itself DID happen — this is a report contract, not a rollback.
+        parent = json.loads(
+            Path(first.escalation_path).read_text(encoding='utf-8'),
+        )
+        assert parent['dedupe_count'] == 1
+        # And the record really is unattributable, which is why no path is named.
+        assert 'project_id' not in parent
+
+    @pytest.mark.asyncio
+    async def test_a_closed_halt_is_never_a_fold_parent_for_the_next_one(
+        self, event_buffer, tmp_path,
+    ):
+        """Close-then-recur must mint a fresh record, not fold into the closed one.
+
+        ``find_dedupe_parent`` scans only PENDING records and
+        ``attach_dedupe_child`` refuses archived parents, so a halt that
+        recurs after being auto-closed opens a new record at ``dedupe_count``
+        0. Without this the unbounded dedupe window would read as "fold
+        forever", and a recurrence after an all-clear would be silently
+        appended to a resolved record nobody is watching.
+        """
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._policy(event_buffer, clock)
+        policy.register_project_root('proj', str(project_root))
+
+        first = await policy.on_judge_halt('proj', reason='first halt')
+        assert first.escalation_path is not None
+        first_id = Path(first.escalation_path).stem
+
+        assert await policy.on_judge_unhalt('proj') == [first_id]
+
+        clock['now'] += 901.0
+        second = await policy.on_judge_halt('proj', reason='it came back')
+        assert second.escalation_path is not None
+        second_id = Path(second.escalation_path).stem
+        assert second_id != first_id
+
+        esc_dir = project_root / 'data' / 'escalations'
+        pending = TestFoldIsolation._pending(esc_dir)
+        assert list(pending) == [second_id], sorted(pending)
+        # A NEW incident, counted from zero — not a child of the closed one.
+        assert pending[second_id]['dedupe_count'] == 0
+        assert pending[second_id]['project_id'] == 'proj'
+        assert _persisted_record(esc_dir, first_id)['status'] == 'resolved'
