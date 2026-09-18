@@ -823,16 +823,44 @@ class BacklogPolicy:
         record_id = result['id']
         folded = result.get('status') == 'dedup_skipped'
 
-        # Required on BOTH branches, not only the submit: queue.submit persists
-        # Escalation.to_json() (== asdict, dataclass fields only) and
-        # attach_dedupe_child re-hydrates through Escalation.from_json before
-        # rewriting, so each INDEPENDENTLY drops the four non-dataclass keys the
-        # 48h-reify forensic query depends on.
+        # ONE dict literal, built from this call's own parameters, used by both
+        # branches — a second formula for "what the record should say" is
+        # exactly how the fold path and the first-write path drift apart.
+        #
+        # The four policy keys are required on BOTH branches, not only the
+        # submit: queue.submit persists Escalation.to_json() (== asdict,
+        # dataclass fields only) and attach_dedupe_child re-hydrates through
+        # Escalation.from_json before rewriting, so each INDEPENDENTLY drops
+        # the four non-dataclass keys the 48h-reify forensic query depends on.
+        #
+        # ``summary``/``detail`` ride along because the REFRESH IS DELIBERATE.
+        # attach_dedupe_child does not rewrite them, so a parent folded for
+        # days would state its first window's count for a condition that has
+        # since grown — and a compact drain keeps `summary` while dropping
+        # `detail` (`_COMPACT_ESCALATION_FIELDS`, escalation/server.py), so
+        # that stale line is precisely what a steward triages from. The
+        # gate-backlog precedent (gate_backlog_fingerprint_key's ACCEPTED COST
+        # paragraph) declined the same refresh, for reasons that do not
+        # transfer: it would have mutated live records it did not author, from
+        # inside a key-RESOLUTION helper. This policy owns the record,
+        # re-derives summary/detail from first principles on every tick, and is
+        # already rewriting the parent under escalation_id_lock to restore the
+        # policy keys — so the refresh costs zero extra I/O and adds no new
+        # write site. On a first submit every value already matches and
+        # _merge_onto_persisted skips the write entirely.
+        #
+        # Deliberately absent: `timestamp` (the first-seen anchor, which is
+        # what makes "how long has this been going on" answerable), `severity`
+        # (owned by attach_dedupe_child's max_severity promotion), `updated_at`
+        # (stamped by attach_dedupe_child) and dedupe_count/dedupe_children
+        # (the queue's to write).
         path = self._merge_onto_persisted(esc_dir, record_id, {
             'project_id': project_id,
             'error_type': error_type,
             'backlog': backlog,
             'threshold': threshold,
+            'summary': summary,
+            'detail': detail,
         })
         if path is None:
             # An 'accepted_unpersisted' response, or a record gone from both the
