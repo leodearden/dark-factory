@@ -98,7 +98,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: EventBuffer(db_path=tmp / 'eb.db'),  # noqa: ARG005
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._access.connection,
         id='EventBuffer',
     ),
     pytest.param(
