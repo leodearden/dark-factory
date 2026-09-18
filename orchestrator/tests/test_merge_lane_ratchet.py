@@ -23,8 +23,11 @@ orchestrator/tests/merge_lane_ratchet_baseline.json``). A raise is a different
 matter but not a forbidden one: it must be AUTHORIZED, never silent. Adding
 ``--authorize-raise <task-id> --reason <text>`` to that same command records the
 per-measure delta in ``merge_lane_ratchet_authorized_raises.json``; without
-those flags ``--write-baseline`` refuses to absorb a raise at all, so
-regenerating the baseline cannot make this test pass by widening the ratchet.
+those flags ``--write-baseline`` refuses to absorb a raise over an EXISTING
+baseline, so regenerating cannot make this test pass by widening the ratchet.
+Deleting the baseline first would -- there is then nothing to compare against --
+but that is a wholesale reset of every frozen measure, read in the diff by the
+reviewer rather than by any gate, and it is not a path past this one.
 ``metrics.RAISE_REMEDY`` is the one copy of that rule, and every failure message
 here composes it.
 

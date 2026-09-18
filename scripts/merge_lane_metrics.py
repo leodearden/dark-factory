@@ -1090,8 +1090,13 @@ RAISE_REMEDY = (
     f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
     'task and the reason, so the raise lands as a diff a reviewer reads rather '
     'than as a number nobody saw move. Without those flags --write-baseline '
-    'REFUSES to absorb a raise at all, so the ratchet stays fail-closed: a '
-    'blind regeneration cannot widen it.'
+    'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
+    'place cannot widen the ratchet. What no gate can see is a baseline deleted '
+    'first, or written elsewhere and copied over: with nothing to compare '
+    'against, every frozen measure resets and every ceiling is re-grandfathered, '
+    'unrefused and unrecorded. That is not a way past this gate -- it is a '
+    'wholesale reset of the file, visible to nobody but the reviewer reading '
+    'the diff. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
@@ -1276,6 +1281,15 @@ def write_baseline(
     the cluster still raises the derived totals, so it still needs an
     authorization -- which is honest, the totals really did rise.
 
+    THE OTHER ARM OF THAT PRECONDITION, complexipy version drift, reaches this
+    gate the same way and is easy to misread. A new version re-reads every
+    cognitive number at once -- the same merge_queue.py measures 2031 at 3.0.0,
+    2092 at 5.0.0 and 2133 at 6.x/7.x -- so a post-drift regeneration arrives as
+    a wall of raises and needs one authorization. It is recorded as a raise
+    because that is what the numbers did; the ledger reason is what tells a
+    reviewer the INSTRUMENT moved rather than the code, which is why
+    ``_require_matching_params`` asks for the version in it.
+
     With an *authorization*, the raises are recorded in the append-only ledger
     at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
     ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
@@ -1291,10 +1305,21 @@ def write_baseline(
     ``BaselineWrite`` says which of the two happened, so a caller reports the
     outcome from the write itself rather than re-reading the ledger to guess.
 
-    A MISSING destination is a first write with nothing to compare against. A
-    MALFORMED one propagates ``load_baseline``'s ``MetricsError`` rather than
-    being overwritten: a previous baseline you cannot read is one whose raises
-    you cannot see.
+    A MISSING destination is a first write with nothing to compare against, and
+    that is the gate's exact limit -- ``RAISE_REMEDY`` says so too, because the
+    agent reading it is the one most likely to go looking for the hole. Deleting
+    the committed baseline, or writing to a scratch path and copying it over,
+    resets every frozen measure and re-grandfathers every ceiling, unrefused and
+    unrecorded. Closing that would mean comparing against the copy in git HEAD:
+    a git dependency in an instrument that has none, plus a special case for the
+    commit that introduces the baseline, bought against a move that already
+    lands as a wholesale diff a reviewer cannot miss. The boundary is drawn
+    rather than overclaimed -- the write gate stops a raise being ABSORBED,
+    review stops a RESET.
+
+    A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
+    rather than being overwritten: a previous baseline you cannot read is one
+    whose raises you cannot see.
     """
     text = render_baseline(report)
     target = Path(path)
@@ -1635,7 +1660,13 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
             '2031 at 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x -- so a silent '
             'drift rewrites every number at once and leaves the ratchet '
             'comparing two incomparable measurements. Pin the dev group '
-            f'({COMPLEXIPY_REQUIRED}) or regenerate the baseline deliberately.'
+            f'({COMPLEXIPY_REQUIRED}), or regenerate the baseline deliberately '
+            '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
+            'cannot tell the difference: every number the new version reads '
+            'higher is a raise it will refuse. Pass --authorize-raise with a '
+            f'--reason naming the version change, so the {LEDGER_RELPATH} entry '
+            'reads as a change of instrument rather than as a task that grew '
+            'the cluster.'
         )
 
     recorded = list(_params(baseline, 'baseline').get('cluster_paths', ()))
