@@ -37,6 +37,7 @@ from dashboard.data.merge_queue import (
 )
 from dashboard.data.metrics import get_merge_active_series
 from dashboard.data.redux_api import _project_label
+from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 router = APIRouter()
 
