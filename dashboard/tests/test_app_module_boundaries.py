@@ -45,6 +45,12 @@ _APP_PY = _SRC / 'dashboard' / 'app.py'
 # New module dotted path -> the top-level names it must define.
 MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
     'dashboard.api.window': ('_WINDOW_DAYS', '_parse_window'),
+    'dashboard.project_dbs': (
+        '_project_scoped_dbs',
+        '_project_scoped_dbs_labeled',
+        '_cost_dbs',
+        '_burndown_dbs',
+    ),
 }
 
 # URL path -> (module dotted path, handler name) for every extracted route.
@@ -53,6 +59,7 @@ MOVED_ROUTES: dict[str, tuple[str, str]] = {}
 # Repo-relative path of every file this extraction created.
 NEW_MODULES: tuple[str, ...] = (
     'dashboard/src/dashboard/api/window.py',
+    'dashboard/src/dashboard/project_dbs.py',
 )
 
 _REACH_BACK = 'dashboard.app'
