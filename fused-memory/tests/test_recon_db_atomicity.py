@@ -19,6 +19,8 @@ next reader does not re-derive them:
     journal: checkpoint vs. write        20/20 SQLITE_LOCKED         ->  0/20
     EventBuffer: peek vs. heartbeat      ~70% of iterations (28/40)  ->  0/20
     EventBuffer: checkpoint vs. push     20/20 SQLITE_LOCKED         ->  0/20
+    ledger: checkpoint vs. upsert        20/20 SQLITE_LOCKED         ->  0/20
+    ledger: cancel vs. concurrent write  survivor's row LOST, 3/3   ->  survives
 
 The checkpoint arms are the direct reproduction of the production log line
 ``checkpoint recon_journal failed: database table is locked``.  Note the direction:
@@ -26,19 +28,30 @@ it is the CHECKPOINT that raises when another coroutine has a statement in fligh
 the same connection, not the write.  Same defect, same fix; the arms assert neither
 side raises.
 
-NOT HERE, deliberately, so a later reader does not mistake the gap for an oversight:
-the connection-wide-rollback regression (one coroutine's failing unit rolls back the
-CONNECTION, discarding another coroutine's in-flight write, whose own commit then
-succeeds silently).  Reproducing it needs a suspension point INSIDE a write unit and
-no public store method has one; the nearest store-level shape lost 0 of 20 writes
-when measured on this base, so an assertion here would be green for reasons nobody
-checked.  It is pinned at the primitive instead, in
-``shared/tests/test_async_sqlite_base.py``.
+TWO GAPS, both deliberate, recorded so a later reader does not mistake either for an
+oversight:
+
+1. There is no ReconLedgerStore COLLISION arm.  One was attempted and measured at
+   0/20 on this base — a multi-hop ``list_suppressions`` read pinned, a foreign
+   commit on the journal's connection, then ``upsert``, at 8,000 rows.  No
+   reproducing shape was found for this store, and an arm that passes on the
+   unfixed code asserts nothing.  The ledger is migrated anyway: it is the third
+   connection to the same file, its checkpoint arm below DOES fail 20/20 today, and
+   its old transaction wrapper carried the same connection-wide rollback.
+
+2. The FAILING-unit half of the connection-wide-rollback regression (one coroutine's
+   failing unit rolls back the CONNECTION, discarding another coroutine's in-flight
+   write, whose own commit then succeeds silently) is pinned at the primitive, in
+   ``shared/tests/test_async_sqlite_base.py``, not here.  It needs a suspension
+   point INSIDE a write unit and no public store method has one; the nearest
+   store-level shape lost 0 of 20 writes when measured.  The CANCELLATION half of
+   the same defect a store method CAN trigger, and is pinned below at the ledger.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -54,6 +67,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 PROJECT_ID = 'atomicity'
 
@@ -399,3 +413,89 @@ async def test_checkpoint_on_an_uninitialized_event_buffer_is_a_non_event():
     failure on every tick of a Taskmaster-disabled deployment.
     """
     assert await EventBuffer().checkpoint() == (-1, -1, -1)
+
+
+@pytest_asyncio.fixture
+async def ledger(journal):
+    """A ReconLedgerStore on the journal's own ``reconciliation.db`` file.
+
+    The third of production's three connections to that one file.
+    """
+    store = ReconLedgerStore(journal.data_dir / 'reconciliation.db')
+    await store.initialize()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+def _ledger_record(task_id: str) -> ReconLedgerRecord:
+    return ReconLedgerRecord(
+        project_id=PROJECT_ID,
+        record_kind='marker',
+        task_id=task_id,
+        payload_json='{}',
+        state='open',
+        created_at='2026-09-17T00:00:00+00:00',
+    )
+
+
+@pytest.mark.asyncio
+async def test_ledger_checkpoint_and_upsert_do_not_lock_each_other_out(ledger):
+    """Arm F: the checkpoint arm at the third shared connection."""
+    for i in range(CHECKPOINT_ITERATIONS):
+        written, checkpointed = await asyncio.wait_for(
+            asyncio.gather(
+                ledger.upsert(_ledger_record(f'marker-{i}')),
+                ledger.checkpoint(),
+                return_exceptions=True,
+            ),
+            timeout=CHECKPOINT_TIMEOUT_SECONDS,
+        )
+        assert not isinstance(written, BaseException), (
+            f'iteration {i}: the upsert raised alongside a concurrent checkpoint: {written!r}'
+        )
+        assert not isinstance(checkpointed, BaseException), (
+            f'iteration {i}: the checkpoint raised alongside a concurrent upsert: '
+            f'{checkpointed!r}'
+        )
+
+    busy, log, pages = await ledger.checkpoint()
+    assert all(isinstance(value, int) for value in (busy, log, pages)), (
+        f'checkpoint() must keep unpacking as (busy, log, checkpointed): {(busy, log, pages)!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_write_does_not_discard_a_concurrent_one(ledger):
+    """Arm G: cancelling one unit must not roll back another's in-flight write.
+
+    Rollback is a property of the CONNECTION, not of a transaction, so a
+    cancelled unit that rolls back the shared connection takes any other
+    coroutine's uncommitted statements with it — and that coroutine's own commit
+    then succeeds, reporting a write that no longer exists.  Silent data loss
+    with no error anywhere, which is why it is asserted on the surviving row
+    rather than on an exception.
+
+    Both writes are queued before the cancellation lands, so the victim's
+    rollback (if it takes one) happens while the survivor's INSERT is still
+    uncommitted.
+    """
+    survivor = asyncio.create_task(ledger.upsert(_ledger_record('survivor')))
+    victim = asyncio.create_task(
+        ledger.upsert_many([_ledger_record(f'victim-{i}') for i in range(200)])
+    )
+    await asyncio.sleep(0)
+    victim.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await victim
+    await survivor
+
+    assert await ledger.get_by_identity(PROJECT_ID, 'marker', task_id='survivor') is not None, (
+        "the surviving write is gone: the cancelled unit's rollback discarded it, and "
+        'its own commit then reported success'
+    )
+    assert await ledger.get_by_identity(PROJECT_ID, 'marker', task_id='victim-0') is None, (
+        'the cancelled unit left rows behind: its rollback was partial'
+    )
