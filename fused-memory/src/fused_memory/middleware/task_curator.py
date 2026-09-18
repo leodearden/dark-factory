@@ -2507,7 +2507,9 @@ class TaskCurator:
             seen_ids.add(entry.task_id)
 
         # Final cap — trim weakest entries first (embedding, then module, then dep).
-        pool = _trim_pool(pool, self._config.curator.pool_total_cap)
+        pool, total_cap_dropped = _trim_pool(
+            pool, self._config.curator.pool_total_cap,
+        )
 
         pool_sizes = {
             'anchor': sum(1 for e in pool if e.source == 'anchor'),
@@ -3098,13 +3100,22 @@ def _module_sort_key(entry: _PoolEntry) -> tuple[int, int, str]:
     return (status_rank, priority_rank, entry.task_id)
 
 
-def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
+def _trim_pool(
+    pool: list[_PoolEntry], total_cap: int,
+) -> tuple[list[_PoolEntry], int]:
     """Trim a pool that exceeds the total cap, dropping the weakest first.
 
     Weak = dependency > embedding > module > anchor, preserving anchor always.
+
+    Returns ``(kept, dropped_n)``. ``dropped_n`` is how many entries the cap
+    removed, and it feeds the :class:`PoolWithheld` census so the prompt can
+    say that the pool the LLM is reading is incomplete. Reporting the
+    shortfall alongside the result, rather than logging it, is INV-11
+    ``no-silent-fail-soft``: the consumer that makes the combine-vs-create
+    call is the LLM, and the prompt is the only surface it reads.
     """
     if len(pool) <= total_cap:
-        return pool
+        return pool, 0
     weakest_order = ['dependency', 'embedding', 'module', 'anchor']
     result = list(pool)
     for source in weakest_order:
@@ -3120,7 +3131,8 @@ def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
             if len(result) <= total_cap:
                 break
             result.pop(i)
-    return result[:total_cap]
+    kept = result[:total_cap]
+    return kept, len(pool) - len(kept)
 
 
 def _parse_decision_dict(
