@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.window import _parse_window
 from dashboard.config import DashboardConfig
@@ -80,12 +81,10 @@ from dashboard.data.metrics import (
     get_memory_24h_ago,
     get_memory_sparks,
     get_merge_active_series,
-    get_orchestrators_running_series,
     get_queue_pending_series,
     get_recon_sparks,
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
-from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
@@ -544,6 +543,7 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 # module owns its own router and declares its own literal path, so a path
 # and the handler serving it stay in one file.
 app.include_router(api_tasks_routes.router)
+app.include_router(api_orchestrators_routes.router)
 
 
 # ---------------------------------------------------------------------------
@@ -1082,27 +1082,6 @@ async def _performance_resources(
 # ---------------------------------------------------------------------------
 # JSON API: /api/v2/dashboard/*
 # ---------------------------------------------------------------------------
-
-
-@app.get('/api/v2/dashboard/orchestrators')
-async def api_orchestrators(request: Request) -> JSONResponse:
-    """ORCHESTRATORS + PROJECTS for the redux dashboard."""
-    config: DashboardConfig = request.app.state.config
-    pool: DbPool = request.app.state.db
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    metrics_db = await pool.get(config.metrics_db)
-    orchestrators, running_spark = await asyncio.gather(
-        discover_orchestrators(http_client, config),
-        get_orchestrators_running_series(metrics_db, days=1),
-    )
-    known_roots = [config.project_root, *config.known_project_roots]
-    return JSONResponse(
-        redux_api.shape_orchestrators(
-            orchestrators,
-            known_project_roots=known_roots,
-            running_spark=running_spark,
-        )
-    )
 
 
 # Per-HTTP-request budget for /memory's three MCP legs (task 3871), matching
