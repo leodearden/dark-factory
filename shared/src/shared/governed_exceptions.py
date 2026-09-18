@@ -52,16 +52,21 @@ pins.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 __all__ = [
+    'DECLARATION_FORMS',
     'Debt',
     'Disposition',
+    'GovernedList',
     'INLINE_MARKER_FORMS',
     'MalformedDisposition',
     'Policy',
     'TaskRef',
     'TicketRef',
+    'governed_exceptions',
     'parse_disposition_marker',
 ]
 
@@ -330,3 +335,114 @@ def parse_disposition_marker(comment: str) -> Disposition | None:
     if policy is not None:
         return Policy(policy.group(1))
     raise MalformedDisposition(rejected, value=comment)
+
+
+DECLARATION_FORMS: tuple[str, ...] = (
+    'Debt(TaskRef(<task id>))',
+    "Debt(TicketRef('tkt_<ticket id>'))",
+    "Policy('<ratification row id>')",
+)
+"""The accepted declaration-side forms, published once for every consumer.
+
+The twin of :data:`INLINE_MARKER_FORMS` for entries disposed in a declaration
+rather than in a comment.  Rendered by :class:`UndisposedException`'s message
+(so the agent reading a red gate is told how to fix it), by the register's
+rejection output, and by the implementer-facing prompt block.  Nobody retypes
+the grammar; ``shared/tests/test_governed_exceptions.py`` asserts the
+exception's message really carries every form."""
+
+
+@dataclass(frozen=True)
+class GovernedList:
+    """One governed exception list, with a disposition reachable for every key.
+
+    A value, not a registry: it is what a declaration in a package's test tree
+    evaluates to, and the report renders.  Constructed through
+    :func:`governed_exceptions`, which is where every check lives — this type
+    normalises and resolves, and refuses nothing.
+
+    Attributes:
+        list_id: The dotted, globally unique id of the list.
+        rule: One sentence saying what the list's entries are allowed to be —
+            the thing an operator judges a new entry against.
+        keys: The declared entries, in declaration order.
+        default: A disposition borrowed by every key without an override, or
+            ``None``.
+        default_covers: The literal COUNT of keys the default covers, or
+            ``None``.  D4 makes it a count rather than a list on purpose: a new
+            entry then needs either an explicit override or a visible increment
+            beside the disposition it is borrowing.
+        overrides: Per-key dispositions, read-only.  Each restates its entry's
+            key, so drift between the two is loud by construction (D5).
+    """
+
+    list_id: str
+    rule: str
+    keys: tuple[str, ...]
+    default: Disposition | None
+    default_covers: int | None
+    overrides: Mapping[str, Disposition]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'keys', tuple(self.keys))
+        object.__setattr__(self, 'overrides', MappingProxyType(dict(self.overrides)))
+
+    def disposition_for(self, key: str) -> Disposition | None:
+        """Resolve *key*'s disposition: its override, else the list's default.
+
+        THE SINGLE HOME of the override-else-default rule.  Every consumer that
+        needs to know why an entry is legal — the report, the sweep that
+        follows dead owners, the register's closed-world Policy check — asks
+        here rather than reimplementing the two-line fallback, because a second
+        copy that forgot the override would silently attribute an entry to the
+        wrong owner.
+
+        Raises:
+            KeyError: *key* is not declared in this list.  Deliberately not a
+                quiet ``None``: returning the default for an entry nobody
+                declared would let a report print a disposition for something
+                that does not exist.
+        """
+        if key not in self.keys:
+            raise KeyError(
+                f'GovernedList {self.list_id!r} does not declare the key {key!r}.'
+            )
+        return self.overrides.get(key, self.default)
+
+
+def governed_exceptions(
+    list_id: str,
+    rule: str,
+    keys: Iterable[str],
+    *,
+    default: Disposition | None = None,
+    default_covers: int | None = None,
+    dispositions: Mapping[str, Disposition] = MappingProxyType({}),
+) -> GovernedList:
+    """Declare a governed exception list and check every entry is disposed.
+
+    Called at import time from a test module in the owning package's test tree
+    (D4), so a mis-edited disposition fails that package's suite and nothing
+    else: no production module and no stdlib-only script gains an import or an
+    import-time raise from INV-12.
+
+    D5's DIVISION OF KNOWLEDGE, which is why this function exists at all.  The
+    static register reads ``list_id``, ``rule``, ``default``, ``default_covers``
+    and the overrides straight out of the source, because all five are
+    literals.  Only this runtime call also sees the KEY SET — the container's
+    actual contents, which no AST can enumerate — so this is the one place keys
+    and dispositions are reconciled, and the only place that can notice a list
+    has quietly grown an entry.
+
+    ``dispositions`` defaults to an empty ``MappingProxyType`` rather than
+    ``{}``: ruff's B006 forbids a mutable default, and the immutable proxy is
+    the shape the field stores anyway.
+    """
+    return GovernedList(
+        list_id=list_id,
+        rule=rule,
+        keys=tuple(keys),
+        default=default,
+        default_covers=default_covers,
+        overrides=dispositions,
+    )

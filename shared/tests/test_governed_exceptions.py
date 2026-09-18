@@ -498,7 +498,7 @@ class TestGovernedListIsImmutable:
         mapping would let one package's declaration silently re-disposition
         another's.
         """
-        mutable = {'a': Policy('inv12-x')}
+        mutable: dict[str, Disposition] = {'a': Policy('inv12-x')}
         declaration = governed_exceptions(LIST_ID, RULE, ['a'], dispositions=mutable)
         mutable['a'] = Debt(TaskRef(5149))
         assert declaration.overrides['a'] == Policy('inv12-x')
