@@ -411,9 +411,16 @@ async def test_add_task_warn_mode_emits_schema_warning_and_proceeds(
     )
 
     # The write proceeded: the task exists and its metadata is preserved raw
-    # (original bytes — no repair, no schema_version stamp).
+    # (original bytes — no repair, no schema_version stamp). The pending-wait
+    # anchor is the one key add_task itself adds (task 3816); it is asserted
+    # here rather than scoped out so the whole blob stays pinned, and its
+    # value is spelled as the insert's own updated_at because a fresh pending
+    # insert binds one clock read to both.
     task = await backend.get_task(dto['id'], project_root=project_root)
-    assert task['metadata'] == {'task_kind': 'deterministic'}
+    assert task['metadata'] == {
+        'task_kind': 'deterministic',
+        'pending_since': task['updatedAt'],
+    }
 
 
 @pytest.mark.asyncio
@@ -1682,6 +1689,11 @@ async def test_update_task_preserves_sibling_keys_during_memory_hints_append(bac
             'audit': {'created_by': 'x'},
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
@@ -1693,6 +1705,7 @@ async def test_update_task_preserves_sibling_keys_during_memory_hints_append(bac
         'spawned_from': 'task-100',
         'audit': {'created_by': 'x'},
         'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        'pending_since': anchor,
     }
 
 
@@ -1823,6 +1836,11 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
             'memory_hints': [{'entity': 'E1', 'query': 'q1'}],
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); the legacy
+    # memory_hints normalisation must not disturb it.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
@@ -1834,6 +1852,7 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
         'spawned_from': 'task-100',
         'audit': {'created_by': 'x'},
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
     }
 
 
@@ -2705,7 +2724,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
+    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -2723,7 +2742,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 4."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 5."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -2750,13 +2769,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 4
+    assert user_version == 5
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -2782,7 +2801,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 4, f'Fresh DB should have user_version=4; got {user_version}'
+    assert user_version == 5, f'Fresh DB should have user_version=5; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -2880,7 +2899,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 4, f'Expected user_version=4 after v1->v4 migration; got {user_version}'
+    assert user_version == 5, f'Expected user_version=5 after v1->v5 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -3147,8 +3166,9 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert by_id[3] == compute_candidate_key('Refactor the thing', [])
     # The v2->v3 backfill's own audit is clean (3/3 unique), and the v3->v4
     # residual audit over the same rows is trivially clean too, so the chain
-    # reaches v4 (index built) rather than stopping at v3.
-    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
+    # runs on past v4 (index built) to the v4->v5 pending_since back-fill
+    # rather than stopping at v3.
+    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -3613,9 +3633,11 @@ async def _open_raw_v3_conn(db_path: Path) -> aiosqlite.Connection:
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
 ):
-    """A fresh DB chains through v0->v4: the v3->v4 step's residual-duplicate
+    """A fresh DB chains through v0->v5: the v3->v4 step's residual-duplicate
     audit is trivially clean on an empty table, so it builds the partial
-    UNIQUE index over (tag, candidate_key) and stamps user_version=4.
+    UNIQUE index over (tag, candidate_key) and stamps user_version=4 — after
+    which the chain continues to the v4->v5 back-fill, so the version
+    observed at the end is the top of the chain, not that step's own stamp.
     """
     import sqlite3
 
@@ -3646,9 +3668,10 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     assert 'candidate_key IS NOT NULL' in index_sql, index_sql
     assert "status != 'cancelled'" in index_sql, index_sql
     assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
-    # (d) user_version advances to 4 on a clean build.
-    assert user_version == 4, (
-        f'Expected user_version=4 after clean v3->v4 migration; got {user_version}'
+    # (d) the version advances past 4 on a clean build -- the v3->v4 step
+    # stamps 4 and the chain then runs the v4->v5 back-fill to the top.
+    assert user_version == 5, (
+        f'Expected user_version=5 after clean v3->v4 migration + chain; got {user_version}'
     )
 
 
@@ -3889,13 +3912,14 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert cancelled_metadata['files'] == ['a.py', 'b.py'], cancelled_metadata
 
     # (d) no residual remains after healing, so the partial UNIQUE index IS
-    # built and user_version advances to 4 in this SAME connection-open —
-    # no restart required.
+    # built and the version advances past 4 in this SAME connection-open —
+    # no restart required. It lands at the top of the chain (5) because the
+    # v3->v4 step stamped 4, which is what lets the v4->v5 step run.
     assert 'ux_tasks_candidate_key' in indexes, (
         f'Expected the index to be built once the residual is self-healed; got {indexes}'
     )
-    assert user_version == 4, (
-        f'Expected user_version=4 after a fully self-healed residual; got {user_version}'
+    assert user_version == 5, (
+        f'Expected user_version=5 after a fully self-healed residual; got {user_version}'
     )
 
     # (e) nothing ambiguous here — the escalation callback must NOT fire.
@@ -7210,6 +7234,11 @@ async def test_update_task_warn_mode_emits_schema_warning_and_proceeds(
         metadata=json.dumps({'foo': 'bar'}),
     )
     tid = dto['id']
+    # The seed insert also stamped the pending-wait anchor (task 3816), which
+    # the update must carry through untouched.
+    anchor = (await backend.get_task(tid, project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     # The seed add_task above emits its own census line for the "foo" unknown
     # key (unrelated to what this test verifies) — caplog.records accumulates
     # for the whole test regardless of the at_level() scope below, so drop it
@@ -7240,10 +7269,15 @@ async def test_update_task_warn_mode_emits_schema_warning_and_proceeds(
         f'Expected the invariant error text in census line; got: {combined!r}'
     )
 
-    # The write proceeded: the merged metadata (including the "foo" sibling)
-    # is stored raw/unchanged — no repair, no schema_version stamp.
+    # The write proceeded: the merged metadata (including the "foo" sibling
+    # and the insert's pending-wait anchor, task 3816) is stored raw/unchanged
+    # — no repair, no schema_version stamp.
     task = await backend.get_task(tid, project_root=project_root)
-    assert task['metadata'] == {'foo': 'bar', 'task_kind': 'deterministic'}
+    assert task['metadata'] == {
+        'foo': 'bar',
+        'task_kind': 'deterministic',
+        'pending_since': anchor,
+    }
 
 
 @pytest.mark.asyncio
@@ -7289,6 +7323,11 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
             project_root=project_root, title='t', metadata=seed_metadata,
         )
         tid = dto['id']
+        # The seed insert stamped the pending-wait anchor (task 3816); an
+        # unchanged row therefore still carries it after the rollback.
+        anchor = (await backend.get_task(tid, project_root=project_root))['metadata'][
+            'pending_since'
+        ]
 
         with pytest.raises(ValidationError):
             await backend.update_task(
@@ -7297,7 +7336,7 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
             )
 
         task = await backend.get_task(tid, project_root=project_root)
-        assert task['metadata'] == {'foo': 'bar'}, (
+        assert task['metadata'] == {'foo': 'bar', 'pending_since': anchor}, (
             f'Expected the rolled-back txn to leave metadata unchanged; got: {task["metadata"]}'
         )
     finally:
@@ -7480,6 +7519,11 @@ async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
             project_root=project_root, title='t',
             metadata=json.dumps({'foo': 'bar'}),
         )
+        # The seed insert stamped the pending-wait anchor (task 3816); an
+        # unchanged row therefore still carries it after the rejection.
+        anchor = (await backend.get_task(dto['id'], project_root=project_root))[
+            'metadata'
+        ]['pending_since']
 
         with pytest.raises(ValidationError):
             await backend.update_task(
@@ -7492,7 +7536,7 @@ async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
             )
 
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == {'foo': 'bar'}, (
+        assert task['metadata'] == {'foo': 'bar', 'pending_since': anchor}, (
             f'Expected the rejected txn to leave metadata unchanged; got: {task["metadata"]}'
         )
     finally:
