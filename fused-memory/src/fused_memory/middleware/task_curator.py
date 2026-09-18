@@ -2975,6 +2975,27 @@ class TaskCurator:
 # ----------------------------------------------------------------------
 
 
+def clip_for_prompt(text: str, cap: int) -> str:
+    """Clip *text* to *cap* characters, marking how much was elided.
+
+    The single owner of truncate-and-mark for the curator prompt. Both sides
+    of that prompt route through it — the POOL side (:meth:`_PoolEntry.render`)
+    and the CANDIDATE side (:meth:`TaskCurator._build_user_prompt` and
+    :meth:`TaskCurator._build_batch_section`) — so the two cannot drift apart
+    (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
+    appended a bare ``…`` while the candidate side clipped silently, so the
+    reading LLM could not tell a short description from a truncated one.
+
+    The elided COUNT is part of the marker because the size of the loss is
+    what decides whether it mattered: "2 characters trimmed" and "1827
+    characters of concrete file references gone" are not the same event, and
+    1827 was the measured mean elision at the pre-2026-09-18 cap.
+    """
+    if len(text) <= cap:
+        return text
+    return f'{text[:cap]}…[+{len(text) - cap} chars elided]'
+
+
 def _task_files(task: dict) -> list[str]:
     """Extract files_to_modify from a raw taskmaster task dict.
 
