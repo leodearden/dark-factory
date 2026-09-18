@@ -87,6 +87,7 @@ class TestReferentWireCodec:
                 Referent(number='3127'),
                 Referent(number='2500', project_id='reify'),
             ),
+            ambiguous=(Referent(number='6379', project_id='reify'),),
         ))
 
         assert blob == {
@@ -94,6 +95,9 @@ class TestReferentWireCodec:
             'refs': [
                 {'kind': 'task', 'project_id': '', 'number': '3127'},
                 {'kind': 'task', 'project_id': 'reify', 'number': '2500'},
+            ],
+            'ambiguous': [
+                {'kind': 'task', 'project_id': 'reify', 'number': '6379'},
             ],
         }
 
@@ -112,25 +116,33 @@ class TestReferentWireCodec:
         from fused_memory.services.memory_service import _encode_referents
 
         assert _encode_referents(ReferentResolution(source='none')) == {
-            'source': 'none', 'refs': [],
+            'source': 'none', 'refs': [], 'ambiguous': [],
         }
 
-    def test_ambiguity_is_deliberately_not_threaded(self):
-        """`.ambiguous` and `.conflicts` are DROPPED on the wire — a decision,
-        not an oversight, so it gets a named test rather than only a docstring.
+    def test_ambiguity_is_threaded(self):
+        """`.ambiguous` RIDES the wire; `.conflicts` still does not.
 
-        Gamma excludes ambiguous referents from `.referents` on purpose
-        ("recorded, not guessed"), so a consumer reading only `refs` sees an
-        ambiguous endpoint as a plain non-member — indistinguishable from a
-        genuine conflation. Leaf zeta must NOT treat non-membership alone as
-        grounds for leaf eta to repoint the edge; it re-derives ambiguity from
-        `payload['content']`/`payload['group_id']`, which reproduce the
-        producer's set exactly because `.ambiguous` is `scan_content(...)`
-        verbatim on every precedence path.
+        This is task 3670's `test_ambiguity_is_deliberately_not_threaded`,
+        rewritten rather than repaired — it was written to go red exactly here,
+        routing this author through `_encode_referents`' docstring instead of
+        past it.
 
-        When the follow-up that carries `'ambiguous'` as a third key lands, this
-        test is the thing that fails — which is the point: it routes that author
-        through `_encode_referents`' docstring instead of past it.
+        WHY IT CHANGED. Gamma excludes ambiguous referents from `.referents` on
+        purpose ("recorded, not guessed"), so a consumer reading only `refs`
+        sees an ambiguous endpoint as a plain non-member — indistinguishable
+        from a genuine conflation, which leaf eta would repair by destructively
+        repointing the edge. Zeta used to recover the set by RE-DERIVING it from
+        `payload['content']`/`payload['group_id']`; that is a second scan site,
+        the INV-5 lockstep duplication canonical_labels exists to prevent, and
+        it desynchronizes the moment the producer scans with a project registry
+        the consumer no longer has. Threading the producer's actual set makes
+        the two INCAPABLE of disagreeing.
+
+        `.conflicts` STAYS DROPPED, and that is not an oversight either: a
+        conflict is a property of what the CALLER DECLARED versus what the prose
+        says — it is reported to the caller at resolution time and has no
+        consumer downstream of the queue. Zeta asks "did this edge land on
+        something the write was about"; a conflict answers a different question.
         """
         from fused_memory.services.memory_service import _encode_referents
 
@@ -141,8 +153,12 @@ class TestReferentWireCodec:
             conflicts=(Referent(number='42'),),
         ))
 
-        assert set(blob) == {'source', 'refs'}
+        assert set(blob) == {'source', 'refs', 'ambiguous'}
         assert blob['refs'] == [{'kind': 'task', 'project_id': '', 'number': '3127'}]
+        assert blob['ambiguous'] == [
+            {'kind': 'task', 'project_id': '', 'number': '9'},
+        ]
+        assert 'conflicts' not in blob
 
     def test_decode_rebuilds_the_exact_referent_tuple(self):
         from fused_memory.services.memory_service import (
@@ -156,12 +172,17 @@ class TestReferentWireCodec:
                 Referent(number='3127'),
                 Referent(number='2500', project_id='reify'),
             ),
+            ambiguous=(
+                Referent(number='6379'),
+                Referent(number='4242', project_id='reify'),
+            ),
         )
         payload = {'referents': _encode_referents(resolution)}
 
         assert _decode_referents(payload) == (
             (Referent(number='3127'), Referent(number='2500', project_id='reify')),
             'derived',
+            (Referent(number='6379'), Referent(number='4242', project_id='reify')),
         )
 
     def test_digits_survive_verbatim(self):
@@ -177,10 +198,11 @@ class TestReferentWireCodec:
         ))
         assert blob['refs'][0]['number'] == '0132'
 
-        referents, source = _decode_referents({'referents': blob})
+        referents, source, ambiguous = _decode_referents({'referents': blob})
         assert referents == (Referent(number='0132'),)
         assert referents[0].number == '0132'
         assert source == 'declared'
+        assert ambiguous == ()
 
     def test_decode_pops_the_key(self):
         """Matches how `_execute_graphiti_write` already treats
@@ -272,6 +294,51 @@ _UNREADABLE_PAYLOADS = [
         ]}},
         id='partially-malformed-set',
     ),
+    # The `'ambiguous'` key is decoded through the SAME validation as `refs`,
+    # so every shape above has a twin here. All-or-nothing spans BOTH lists:
+    # a good `refs` beside an unreadable `ambiguous` is the half-decoded blob
+    # `_decode_referents`' docstring argues is worse than no blob at all —
+    # zeta would then read a genuinely ambiguous endpoint as a conflation and
+    # eta would repoint the edge, which is precisely what threading the key
+    # exists to prevent.
+    pytest.param(
+        {'referents': {
+            'source': 'derived', 'refs': [], 'ambiguous': 'not-a-list',
+        }},
+        id='ambiguous-not-a-list',
+    ),
+    pytest.param(
+        {'referents': {
+            'source': 'derived', 'refs': [], 'ambiguous': ['6379'],
+        }},
+        id='ambiguous-entry-not-a-dict',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'task', 'number': 6379},
+        ]}},
+        id='ambiguous-int-number',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'task', 'number': '6379', 'project_id': 7},
+        ]}},
+        id='ambiguous-int-project-id',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'unregistered_kind', 'number': '6379'},
+        ]}},
+        id='ambiguous-unregistered-kind',
+    ),
+    pytest.param(
+        {'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
+        }},
+        id='good-refs-beside-a-malformed-ambiguous',
+    ),
 ]
 
 
@@ -297,7 +364,7 @@ class TestReferentWireCodecDegradation:
     def test_unreadable_blob_degrades_to_the_empty_set(self, payload):
         from fused_memory.services.memory_service import _decode_referents
 
-        assert _decode_referents(dict(payload)) == ((), 'none')
+        assert _decode_referents(dict(payload)) == ((), 'none', None)
 
     @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
     def test_key_is_popped_in_every_case(self, payload):
@@ -337,12 +404,80 @@ class TestReferentWireCodecDegradation:
 
         assert not caplog.records
 
+    def test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None(self):
+        """A row written before `'ambiguous'` was threaded: `refs` decode
+        normally, and the third value is `None` — NOT `()`.
+
+        `None` is the load-bearing sentinel and the two are NOT
+        interchangeable. `None` means "the producer did not tell us", which is
+        the only state in which a consumer may re-derive the set; `()` means
+        "the producer told us: nothing was ambiguous", which it must believe.
+        Collapsing the distinction to a truthiness test would make an honest
+        empty answer trigger a spurious re-scan — reopening the producer /
+        consumer drift that threading the key closes, and doing it silently.
+        """
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source, ambiguous = _decode_referents({'referents': {
+            'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
+        }})
+
+        assert referents == (Referent(number='3127'),)
+        assert source == 'derived'
+        assert ambiguous is None
+
+    def test_a_legacy_two_key_blob_does_not_warn(self, caplog):
+        """The same argument as the absent key one register down: a two-key
+        blob is every row enqueued before this change, not an anomaly. It is
+        READABLE — its refs are used — so warning would be both wrong and
+        loud."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            _decode_referents({'referents': {
+                'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
+            }})
+
+        assert not caplog.records
+
+    def test_an_explicitly_empty_ambiguous_is_not_None(self):
+        """The other side of the sentinel: a post-change producer that found
+        nothing ambiguous sends `[]`, and that must decode to `()`."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        _, _, ambiguous = _decode_referents({'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [],
+        }})
+
+        assert ambiguous == ()
+        assert ambiguous is not None
+
+    def test_a_malformed_ambiguous_takes_the_good_refs_down_with_it(self):
+        """Named separately from the parametrized sweep for the same reason
+        `test_the_one_salvageable_referent_does_not_escape` is: all-or-nothing
+        spans BOTH lists, and a readable `refs` beside an unreadable
+        `ambiguous` is the exact half-decode that would let zeta read an
+        ambiguous endpoint as a conflation."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source, ambiguous = _decode_referents({'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
+        }})
+
+        assert referents == ()
+        assert source == 'none'
+        assert ambiguous is None
+
     def test_the_one_salvageable_referent_does_not_escape(self):
         """Named separately from the parametrized sweep because it is the whole
         reason the decode is all-or-nothing."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, source = _decode_referents({'referents': {
+        referents, source, ambiguous = _decode_referents({'referents': {
             'source': 'derived',
             'refs': [
                 {'kind': 'task', 'number': '3127'},
@@ -352,6 +487,7 @@ class TestReferentWireCodecDegradation:
 
         assert referents == ()
         assert source == 'none'
+        assert ambiguous is None
         assert Referent(number='3127') not in referents
 
     @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
@@ -363,7 +499,7 @@ class TestReferentWireCodecDegradation:
         degrade-rather-than-raise design exists to prevent."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, _ = _decode_referents(dict(payload))
+        referents, _, _ = _decode_referents(dict(payload))
 
         assert set(referents) == set()
 
@@ -373,12 +509,13 @@ class TestReferentWireCodecDegradation:
         would produce is indistinguishable from a correctly-encoded row."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, source = _decode_referents({'referents': {
+        referents, source, ambiguous = _decode_referents({'referents': {
             'source': 'derived', 'refs': [{'kind': 'task', 'number': 3127}],
         }})
 
         assert referents == ()
         assert source == 'none'
+        assert ambiguous is None
 
 
 class TestAddMemoryStampsReferents:
