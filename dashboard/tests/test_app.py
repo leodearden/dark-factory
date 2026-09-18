@@ -604,8 +604,8 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     })
 
     with (
-        patch('dashboard.app.aggregate_burndown_projects', new=mock_projects),
-        patch('dashboard.app.aggregate_burndown_series', new=mock_series),
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
     ):
         resp = client.get('/api/v2/dashboard/burndown?window=30d')
 
