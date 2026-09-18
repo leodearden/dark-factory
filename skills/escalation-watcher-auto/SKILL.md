@@ -66,7 +66,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
-- Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the pinning escalation: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
+- Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the escalations the record already names as open on the held task: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
 
 ## Shallow-by-default → Deepen-on-signal RCA
 
@@ -785,7 +785,7 @@ Add to digest: `PROMOTED (L2 <id>): infra_issue — <task_id or N/A> — <summar
 
 The orchestrator files ONE blocking L1 when the same recovery veto has held a task for `threshold` consecutive sweeps over a minimum elapsed span (`orchestrator/src/orchestrator/recovery_emission.py::emit_recovery_veto_streak_escalation`). These are **monitor signals**, not work: the record's `task_id` is a SYNTHETIC sentinel (`__recovery_veto_streak__<real_task_id>`) precisely so that observing a hold cannot itself deepen it.
 
-Every record in this class looks alike at the mechanism level, so the generic `"risk:<module-or-area-slug>"` key below folds **unrelated** streaks into one perpetually-growing L2 that eventually self-truncates. Key the promote on the ORIGINATING PIN instead — the escalation actually holding the task — so streaks held by different incidents land in different L2s.
+Every record in this class looks alike at the mechanism level, so the generic `"risk:<module-or-area-slug>"` key below folds **unrelated** streaks into one perpetually-growing L2 that eventually self-truncates. Key the promote on the ORIGINATING INCIDENT instead — identified by the escalations the sweep found open on the held task, which the record already names — so streaks belonging to different incidents land in different L2s.
 
 **Class discriminator.** Match a pending L1 where **both** hold:
 - `task_id` starts with `__recovery_veto_streak__` (`RECOVERY_VETO_STREAK_SENTINEL_PREFIX`)
@@ -793,7 +793,7 @@ Every record in this class looks alike at the mechanism level, so the generic `"
 
 Both come from the emitter. The category half is what keeps an **unrelated** record filed on the same sentinel id out of this class — the sentinel prefix alone does not discriminate it.
 
-**Extraction.** From `esc["detail"]`, take the single line beginning `Pinning escalations: `. Each comma-separated entry reads `<esc_id> (<age> old)` or `<esc_id> (age unknown)`; take the id and discard the parenthetical. So
+**Extraction.** From `esc["detail"]`, take the single line beginning `Pinning escalations: `. Each comma-separated entry reads `<listed_esc_id> (<age> old)` or `<listed_esc_id> (age unknown)`; take the id and discard the parenthetical. So
 
 ```
 Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)
@@ -801,27 +801,34 @@ Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-999
 
 yields `esc-1000-2`, `esc-5000-3`, `esc-9999-1`. The emitter already renders these **sorted and deduplicated** across its buckets (`_flatten_ids` returns `sorted(set(...))`), so read them in the order given — do not re-sort, re-order, or drop any. That format is pinned by `orchestrator/tests/test_recovery_emission.py::TestEmitRecoveryVetoStreakEscalation::test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated`, so you may rely on it rather than re-deriving the order.
 
+**That line is not filtered to pins — read this before you word the options.** Despite its label it lists EVERY escalation the pin sweep found open on the task. The emitter flattens all three buckets of `orchestrator/src/orchestrator/recovery_emission.py::pin_buckets`, which the production caller hands it whole: `queue_handoff` (a live supervised handoff — PINS), `dead_l0` (vetoes a done-flip but does NOT pin recovery) and `non_pinning` (an `info`-severity record — never pins, at any level). Those three readings are defined at `escalation/src/escalation/pins.py::PinReport`. No bucket label survives into the text, so from this line alone you **cannot** tell a live hold from an incidental info record. Two consequences to carry, neither fixable from this prompt and both cheaper than the single over-folded bucket this rule replaces:
+
+- Word the options so they do not PROMISE that resolving a listed id releases the task. Say what is true — resolving it releases the task *if* it is what holds it — and leave the human the check you cannot make.
+- The key is over the whole listed set, so two streaks held by the same real pin but differing in one incidental record will NOT fold together. That is residual fragmentation, accepted knowingly.
+
 The same `detail` names the REAL task id (`Task: <id>`), plus `Veto site:`, `Consecutive IDENTICAL vetoes:` and `Elapsed since the streak began:` — quote those as evidence rather than re-deriving them.
 
-Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>"`. When multiply pinned, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different pin-sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
+Root_cause: `"recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>"`. When the line names several, join ALL the ids with `+` in the order read, e.g. `"recovery-veto-streak-noise-from-pending-l2-pin:esc-1000-2+esc-5000-3"`. **Never truncate the list** — two different id sets sharing a truncated key would fold together and reintroduce the exact over-fold this rule exists to prevent.
 
-**When nothing pins.** If the `Pinning escalations:` line is absent, reads `(none recorded)`, or yields no id once the age parentheticals are stripped, there is no pin to key on. This is a reachable branch, not a malformed record — the alarm is generic over veto shapes, and `unmapped_shape` for one holds a task with nothing pinning it. Fall back to the **bare stem** `"recovery-veto-streak-noise-from-pending-l2-pin"`. You may suffix the veto `site` read from `detail` (`"recovery-veto-streak-noise-from-pending-l2-pin:site-<site>"`) to keep unrelated sites apart; pick one form and apply it consistently across a rotation, or the two spellings will not fold together.
+**When the line names nothing.** If the `Pinning escalations:` line is absent, reads `(none recorded)`, or yields no id once the age parentheticals are stripped, there is nothing to key on. This is a reachable branch, not a malformed record — the alarm is generic over veto shapes, and `unmapped_shape` is one that holds a task with nothing open on it. Use the **bare stem** `"recovery-veto-streak-noise-from-pending-l2-pin"`, with no suffix of any kind. One spelling, normatively: a site-suffixed variant offered alongside it would give a single rotation two keys for the same fallback, and the two would not fold.
 
-**Never** interpolate the literal `(none recorded)`, or any empty or punctuation-only fragment, into the key. `"...-pending-l2-pin:(none"` is stable and wrong: it would quietly become a NEW over-fold bucket, the same defect wearing a different name. A punctuation-ONLY key cannot be filed at all — `promote_to_l2` rejects a `root_cause` that canonicalises to the empty string (the `canonical_root_cause` guard in `escalation/src/escalation/server.py`), so that one fails the call loudly rather than degrading quietly. The bare stem is deliberately the SAME key these streaks already fold under, so unpinned streaks keep clustering exactly as they do today: this rule changes behaviour only where there IS a pin to split on.
+**Never** interpolate the literal `(none recorded)`, or any empty or punctuation-only fragment, into the key. Run the extraction above on that line unguarded and it mints `"...-pending-l2-pin:(none recorded)"` — stable, wrong, and a NEW over-fold bucket, the same defect wearing a different name. Do not expect the server to catch it for you: that key canonicalises to non-empty, so `promote_to_l2` accepts it. The `canonical_root_cause` guard in `escalation/src/escalation/server.py` rejects only a `root_cause` canonicalising to the EMPTY string — a purely punctuation key — so it is a backstop for that case alone. Here the check is yours.
+
+**The stem is new; nothing folds under it yet.** Unpinned streaks land today under the generic `"risk:<module-or-area-slug>"` key, which is unrelated to this stem under `canonical_root_cause`. So the first rotation after this rule lands may find an already-pending `risk:*` L2 covering them: fold into or supersede that L2 rather than minting a second decision point for the same incident.
 
 ```python
 mcp__escalation__promote_to_l2(
   task_id=<the sentinel task_id, verbatim — e.g. "__recovery_veto_streak__3535">,
   agent_role="escalation-watcher-auto",
-  member_ids=[<the sentinel veto-streak L1 esc ids being clustered — NOT the pinning ids>, ...],
-  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<pinning_esc_id>[+<pinning_esc_id>...]",
+  member_ids=[<the sentinel veto-streak L1 esc ids being clustered — NOT the listed ids>, ...],
+  root_cause="recovery-veto-streak-noise-from-pending-l2-pin:<listed_esc_id>[+<listed_esc_id>...]",
   evidence=(
     "Task <real_task_id> held by the same veto at <site> for <n> consecutive "
-    "sweeps over <span> (reason <reason>); pinned by <pinning_esc_ids with their ages>."
+    "sweeps over <span> (reason <reason>); open on it: <listed_esc_ids with their ages>."
   ),
   options=[
-    "A: resolve or dismiss <pinning_esc_id> if it is stale — that releases task <real_task_id>",
-    "B: drive <pinning_esc_id> to completion; it is a live hold, not noise",
+    "A: resolve or dismiss <listed_esc_id> if it is stale — that releases task <real_task_id> if it is what holds it",
+    "B: drive <listed_esc_id> to completion; check first whether it is a live hold or an incidental info record",
     "C: retune or silence the detector via the green-tier recovery_emission knobs",
     "D: something else",
   ],
@@ -831,11 +838,11 @@ mcp__escalation__promote_to_l2(
 )
 ```
 
-**The pinning escalations must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
+**The escalations read off that line must never appear in `member_ids`** — they are the SUBJECT of this L2, not members of it: an L2 resolution cascades to every member L1 (`escalation/src/escalation/server.py::promote_to_l2`), so clustering a live pin would let one L2 close silently dismiss the very hold the L1 was filed to report, exactly the loss recorded under [Declared pins: a close can be REFUSED](#declared-pins-a-close-can-be-refused-declared_pin_refused).
 
-The options must name the **pinning escalation**, because resolving it is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did.
+The options must NAME those escalations, because acting on one of them is the concrete actionable; "investigate the streak" is not, and hands the human back the same re-derivation this extraction already did. Naming them is not the same as vouching for them — per the caveat above, some may not pin at all, so let the option say so rather than assert a release the line cannot support.
 
-**Why key on the pin.** Streaks genuinely held by the SAME incident still fold together (same pin id → same key), which is the clustering you want; only truly unrelated pins separate. The accepted cost is more, smaller L2s — that is triage volume, not blocked work, because the sentinel `task_id` is synthetic and pins nothing real, so an open L2 in this class never holds a task.
+**Why key on the listed escalations.** Streaks whose records list the SAME ids fold together, which is the clustering you want; unrelated ones separate. Identical ids rather than identical incident, note — the caveat above is the gap between the two, and it errs toward splitting. The accepted cost either way is more, smaller L2s: that is triage volume, not blocked work, because the sentinel `task_id` is synthetic and pins nothing real, so an open L2 in this class never holds a task.
 
 Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <summary>`
 

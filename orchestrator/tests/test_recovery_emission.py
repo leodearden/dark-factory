@@ -682,13 +682,21 @@ class TestEmitRecoveryVetoStreakEscalation:
         that key exists to split.  This test is what makes such a reformat
         visible to whoever makes it.
 
-        Two properties the rule leans on, and therefore must not drift.  (1) The
-        ids arrive SORTED and DEDUPED across buckets — ``_flatten_ids`` returns
-        ``sorted(set(...))`` — so the minted key is stable whatever order the
-        caller passed them in, and the rule can say "read them in the order
-        given" rather than asking a rotation to sort.  (2) Each id carries a
-        trailing parenthetical age, so extraction must strip a trailing
+        Three properties the rule leans on, and therefore must not drift.  (1)
+        The ids arrive SORTED and DEDUPED across buckets — ``_flatten_ids``
+        returns ``sorted(set(...))`` — so the minted key is stable whatever
+        order the caller passed them in, and the rule can say "read them in the
+        order given" rather than asking a rotation to sort.  (2) Each id carries
+        a trailing parenthetical age, so extraction must strip a trailing
         ``  (...)`` per entry rather than taking a comma-split token whole.
+        (3) The line is the UNION of all three ``pin_buckets`` buckets, NOT the
+        pinning ones — the production caller passes the buckets whole
+        (``orchestrator/src/orchestrator/harness.py``), and neither ``dead_l0``
+        (does not pin recovery) nor ``non_pinning`` (info-severity, never pins)
+        is filtered out or labelled.  The line's own label is therefore wider
+        than it reads, which is why every bucket is populated below; SKILL.md
+        states the consequence the rotation must carry, that an option may not
+        promise resolving a listed id releases the task.
 
         Characterization guard, GREEN on arrival: the emitter is already correct.
         Its job is to lock a currently-unpinned contract, not to drive a
@@ -699,11 +707,12 @@ class TestEmitRecoveryVetoStreakEscalation:
         queue = EscalationQueue(tmp_path)
         assert _file_streak(**_streak_kwargs(
             queue,
-            # Deliberately unsorted, with esc-1000-2 in TWO buckets.
+            # Deliberately unsorted, with esc-1000-2 in TWO buckets.  Every
+            # bucket is populated, including the two that do not pin.
             escalation_ids={
                 'queue_handoff': ['esc-9999-1', 'esc-1000-2'],
                 'dead_l0': ['esc-5000-3', 'esc-1000-2'],
-                'non_pinning': [],
+                'non_pinning': ['esc-2000-4'],
             },
             ages_secs={'esc-9999-1': 7200.0},
         )) is True
@@ -713,14 +722,19 @@ class TestEmitRecoveryVetoStreakEscalation:
         assert len(lines) == 1, f'the rule reads ONE whole line, got {lines}'
         assert lines[0] == (
             'Pinning escalations: esc-1000-2 (age unknown), '
-            'esc-5000-3 (age unknown), esc-9999-1 (2.0 h old)'
+            'esc-2000-4 (age unknown), esc-5000-3 (age unknown), '
+            'esc-9999-1 (2.0 h old)'
         )
 
         # Exactly the extraction the SKILL.md rule documents, run for real.
         ids = [e.split(' (')[0] for e in lines[0].split(': ', 1)[1].split(', ')]
-        assert ids == ['esc-1000-2', 'esc-5000-3', 'esc-9999-1'], (
+        assert ids == ['esc-1000-2', 'esc-2000-4', 'esc-5000-3', 'esc-9999-1'], (
             'ids must reach the rule sorted and deduped across buckets, so the '
             'key it mints does not depend on bucket iteration order'
+        )
+        assert 'esc-2000-4' in ids, (
+            'a non_pinning id reaches the line unlabelled — the rule keys on '
+            'the union, and SKILL.md must keep saying so'
         )
 
     def test_the_pinning_escalations_line_names_no_id_when_nothing_pins(self, tmp_path):
@@ -732,13 +746,18 @@ class TestEmitRecoveryVetoStreakEscalation:
         the task is held with NOTHING pinning it and ``escalation_ids`` is
         genuinely empty.
 
-        It matters because it is the input on which a naive extraction of the
-        ``Pinning escalations:`` line mints
-        ``recovery-veto-streak-noise-from-pending-l2-pin:(none`` — a key that is
-        stable and wrong, and would quietly become a NEW over-fold bucket, the
-        same defect wearing a different name.  The fallback that forbids this
-        (drop to the bare stem, never interpolate the sentinel text) is
-        documented under "Recovery veto-streak sentinel L1s" in
+        It matters because it is the input on which the documented extraction,
+        run unguarded, mints
+        ``recovery-veto-streak-noise-from-pending-l2-pin:(none recorded)`` — the
+        whole sentinel arrives as one token, since it carries neither a comma
+        nor an inner `` (`` to split on.  That key is stable and wrong, and
+        would quietly become a NEW over-fold bucket, the same defect wearing a
+        different name.  Nothing downstream stops it: it canonicalises to
+        non-empty, so ``promote_to_l2`` accepts it — the ``canonical_root_cause``
+        guard rejects only a root_cause canonicalising to the EMPTY string, so
+        it is no backstop for this case.  The fallback that forbids this (drop
+        to the bare stem, never interpolate the sentinel text) is documented
+        under "Recovery veto-streak sentinel L1s" in
         ``skills/escalation-watcher-auto/SKILL.md``; this test is what keeps the
         rendered text that fallback keys on from being dropped or reshaped.
 
