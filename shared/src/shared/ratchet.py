@@ -233,6 +233,62 @@ def _normalised_param(key: str, value: object) -> object:
     )
 
 
+def _require_comparable(current: Enumeration, baseline: Enumeration) -> None:
+    """Refuse two enumerations that are not two measurements of the same thing.
+
+    THE ONE MECHANISM, with three call sites.  It is the first statement of
+    :func:`excess`, :func:`slack` and :func:`tighten` rather than a public
+    ``assert_comparable()`` the caller is trusted to run, and that is the whole
+    reason the kernel's signatures take Enumerations instead of the bare
+    Counters the Contract's prose names.  A forgettable precondition is exactly
+    the single missed check INV-11 forbids: a caller who skipped it would
+    compare a partial scan against the baseline and read green, which is the
+    one failure mode this instrument exists to make impossible.  Making the
+    guard structural costs one wrapper type and removes the failure mode
+    entirely.
+
+    The two checks run in a FIXED order, so the red a caller sees is
+    reproducible when both faults are present.  Completeness is first because
+    it is the fault that says the measurement never really happened; a params
+    mismatch between two enumerations, at least one of which is a partial scan,
+    is not the more useful thing to report.
+
+    ``complete is True`` is an IDENTITY test, not truthiness: an absent or
+    unpopulated flag must refuse rather than read as "probably fine", which is
+    the spelling ``scripts/merge_lane_metrics.py::_require_complete_enumeration``
+    uses for the same reason.
+    """
+    incomplete = tuple(
+        side
+        for side, enumeration in (('current', current), ('baseline', baseline))
+        if enumeration.complete is not True
+    )
+    if incomplete:
+        raise IncompleteEnumeration(
+            side=' and '.join(incomplete),
+            unreadable=tuple(
+                entry
+                for enumeration in (current, baseline)
+                if enumeration.complete is not True
+                for entry in enumeration.unreadable
+            ),
+        )
+
+    differing = tuple(
+        sorted(
+            key
+            for key in set(current.params) | set(baseline.params)
+            if current.params.get(key) != baseline.params.get(key)
+        )
+    )
+    if differing:
+        raise ParamsMismatch(
+            current_params=current.params,
+            baseline_params=baseline.params,
+            differing=differing,
+        )
+
+
 def excess(current: Enumeration, baseline: Enumeration) -> Counter[str]:
     """What *current* has beyond *baseline* — the VIOLATION REPORT.
 
@@ -243,7 +299,12 @@ def excess(current: Enumeration, baseline: Enumeration) -> Counter[str]:
     Its keys may include keys the baseline never had.  That is not a leak in
     the no-add-key property — it IS the finding, and the caller renders it as
     one.  Nothing in this module ever writes a report back to a baseline.
+
+    Raises:
+        RatchetError: The two enumerations are not comparable — see
+            :func:`_require_comparable`.
     """
+    _require_comparable(current, baseline)
     return Counter(current.counts) - Counter(baseline.counts)
 
 
@@ -254,7 +315,12 @@ def slack(current: Enumeration, baseline: Enumeration) -> Counter[str]:
     an identical line in where one was removed, so the headroom is a standing
     invitation nobody meant to leave open.  The mirror of :func:`excess`, and
     saturating for the same reason.
+
+    Raises:
+        RatchetError: The two enumerations are not comparable — see
+            :func:`_require_comparable`.
     """
+    _require_comparable(current, baseline)
     return Counter(baseline.counts) - Counter(current.counts)
 
 
@@ -269,5 +335,12 @@ def tighten(current: Enumeration, baseline: Enumeration) -> Counter[str]:
 
     Idempotent by the same property: tightening against an already-tightened
     baseline changes nothing.
+
+    Raises:
+        RatchetError: The two enumerations are not comparable — see
+            :func:`_require_comparable`.  A baseline tightened against a
+            PARTIAL scan would delete every key the scan failed to reach, which
+            is the widening that refusal exists to prevent.
     """
+    _require_comparable(current, baseline)
     return Counter(current.counts) & Counter(baseline.counts)
