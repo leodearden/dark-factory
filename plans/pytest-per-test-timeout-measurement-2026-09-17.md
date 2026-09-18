@@ -152,6 +152,44 @@ in `fused-memory/tests/` they carry no marker at all (verified: that file
 contains zero `pytest.mark.timeout` occurrences), so they sit squarely on the ini
 default. That is what makes them governing rather than excludable.
 
+### Why the scan-family carve-out was not applied to these two
+
+This is the sharpest objection to the value below, so it is answered here rather
+than left for a reader to find. `orchestrator/tests/test_whole_tree_scan_timeout_guard.py`'s
+module docstring carves the family out of exactly this arithmetic: widening the
+global `timeout` is "NOT ... the remedy for THIS hazard ... doing it for that
+reason would blunt the hang-catching ceiling for the other ~16000 tests to buy
+headroom only ~13 modules need." Two members of that same family are what drive
+the 540 derived below. The tension is real and is not dissolved by observing
+that the global raise answers a different hazard.
+
+It is nonetheless derived from the tree AS MEASURED, for three reasons.
+
+**The ini default's job is defined over the tests that do not opt out.** What the
+default must be is a question about the repository as it stands, not about a
+repository in which an edit that was never made had been made. A number derived
+from a hypothetically-marked tree would be justified by nothing a later reader
+could reproduce from the code.
+
+**Marking them is not this task's to do.** `pytestmark = pytest.mark.timeout(...)`
+in `fused-memory/tests/test_check_bare_magicmock_config.py` is an edit to a test
+module, outside the scope that governs this work ("every module
+`pyproject.toml`"). This task could not both mark them and derive from the
+marked tree in one commit, and deriving from a tree it had not actually produced
+would be worse than deriving from the one in front of it.
+
+**What changes if they are marked is arithmetic, not another measurement.** With
+those two excluded, the worst unmarked figure in the corpus becomes 45.48s
+(`orchestrator/tests/test_hard_v2_fixture_pool.py`, root-bound) — which is NOT a
+tree scan: it performs no `glob`/`rglob` at all, so the next-worst figure is a
+genuinely different kind of test rather than the same family one rung down.
+45.48 x 8 = 363.84, rounded up to a whole minute and floored at 300, gives
+**420** rather than 540. That is the better end state — ~16000 tests under a
+tighter hang-catching ceiling, and the ~13+2 modules that need the headroom
+carrying it explicitly — and reaching it needs only the marker edit plus a
+re-derivation, no re-measurement. Filed as a follow-up, which owns both halves;
+until it lands the value stands at 540 and the corpus above is what justifies it.
+
 ### What was excluded, and why
 
 Every test named in the `worst marked` column above carries
@@ -245,7 +283,17 @@ to surface faster.
    rather than discovered later; the yaml knob is outside this task's scope ("every
    module pyproject.toml") and is filed as a follow-up.
 
-3. **Root-bound mode was measured over the repo-root-owned test directories in
+3. **The two governing tests are an unmarked branch of the whole-tree-scan
+   family.** Marking them the way `orchestrator/tests/` marks its own members
+   would re-derive this value as 420 rather than 540, putting ~16000 tests under
+   a tighter hang-catching ceiling. The full argument for why this task derived
+   from the tree as measured instead is above, under "Why the scan-family
+   carve-out was not applied to these two", and is not restated here. Filed as a
+   follow-up owning both halves: the marker edit in
+   `fused-memory/tests/test_check_bare_magicmock_config.py`, and the
+   re-derivation that follows from it.
+
+4. **Root-bound mode was measured over the repo-root-owned test directories in
    full, and over the member trees only by targeted re-measurement of the worst
    unmarked tests the per-member sweep found.** A full serial root-bound run of
    every member tree was not attempted: `orchestrator` alone took 44 minutes at

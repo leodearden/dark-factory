@@ -213,6 +213,14 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   both directions rather than raising a floor under it, so an `N` below the
   value silently TIGHTENS the run — `orchestrator/tests/_orch_helpers.py`'s
   constant block is the single home of that reasoning.
+  One caveat with teeth, because it decides what the MERGE GATE enforces: every
+  verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
+  the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
+  — an unmarked test taking 310 seconds passes locally and reds the gate, and
+  the two tests the measurement above derived its value from still run at the
+  4.9x headroom that measurement calls insufficient. Aligning that yaml knob is
+  outside the scope that set these configs and is filed as residue 2 of
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
 <!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
      Mirrors the `ruff check` leg of `lint_command` in
