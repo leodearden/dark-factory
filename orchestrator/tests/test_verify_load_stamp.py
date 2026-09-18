@@ -260,6 +260,79 @@ class TestXdistWorkers:
 
         assert _xdist_workers('uv run pytest tests/ -n auto', {})['n_flag'] == 'auto'
 
+    @pytest.mark.parametrize(
+        'flag',
+        ['-n 8', '--numprocesses 8', '-n=8', '--numprocesses=8'],
+        ids=['short', 'long', 'short-attached', 'long-attached'],
+    )
+    def test_every_worker_count_spelling_is_read(self, flag):
+        """The SPELLINGS are tested, not one literal.
+
+        A stamp that bound ``-n`` alone reported ``n_flag: null`` for a module
+        config written with the long spelling — which the census reads as "no
+        flag on argv, so addopts decided the count". That is a wrong fact,
+        silently, in the corpus this deliverable exists to make trustworthy; no
+        live config uses the long spelling today, so it was latent rather than
+        active. Both attached forms are here because argparse accepts both.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers(f'uv run pytest tests/ {flag}', {})['n_flag'] == '8'
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'uv run pytest tests/ --dist loadgroup',
+            'uv run pytest tests/ --dist=loadgroup',
+            'uv run pytest tests/ --maxprocesses 4',
+        ],
+        ids=['dist', 'dist-attached', 'maxprocesses'],
+    )
+    def test_a_mode_or_a_cap_is_not_a_worker_count(self, cmd):
+        """The narrowing that makes ``_XDIST_N_FLAGS`` its own set, behaviourally.
+
+        ``verify_cmd._XDIST_WORKER_FLAGS`` is the family a serial recovery must
+        SHED, so it also carries ``--dist`` (a distribution MODE) and
+        ``--maxprocesses`` (a CAP). Reusing it here would report ``'loadgroup'``
+        as a worker count — the fabricated datum this stamp exists to remove.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers(cmd, {})['n_flag'] is None
+
+    def test_a_count_after_a_mode_is_still_found(self):
+        """The walk does not stop at the first value flag it declines."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        record = _xdist_workers(
+            'uv run pytest tests/ --dist loadgroup --numprocesses 8', {},
+        )
+
+        assert record['n_flag'] == '8'
+
+    def test_an_empty_attached_value_names_no_count(self):
+        """``--numprocesses=`` is a pytest usage error, not a count of ``''``."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers('uv run pytest tests/ --numprocesses=', {})['n_flag'] is None
+
+    def test_the_count_spellings_are_a_narrowing_of_the_shed_family(self):
+        """Both containments, so the narrowing stays deliberate.
+
+        ``_XDIST_N_FLAGS`` is a subset of the flags a serial recovery sheds (it
+        may not name one that module does not recognise) and of the flags whose
+        value is the adjacent token (the walk's pair-binding is what reads it).
+        Either containment breaking is drift, and would break silently.
+        """
+        from orchestrator.verify import _XDIST_N_FLAGS  # noqa: PLC0415
+        from orchestrator.verify_cmd import (  # noqa: PLC0415
+            _PYTEST_VALUE_FLAGS,
+            _XDIST_WORKER_FLAGS,
+        )
+
+        assert _XDIST_N_FLAGS <= _XDIST_WORKER_FLAGS
+        assert _XDIST_N_FLAGS <= _PYTEST_VALUE_FLAGS
+
     def test_the_live_command_carries_no_flag_and_says_so(self):
         """The dominant case: addopts decides, and verify cannot see addopts."""
         from orchestrator.verify import _xdist_workers  # noqa: PLC0415

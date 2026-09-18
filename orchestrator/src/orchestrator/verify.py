@@ -8976,6 +8976,20 @@ def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
     }
 
 
+# The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
+#
+# DELIBERATELY NARROWER than ``verify_cmd._XDIST_WORKER_FLAGS``, and not a
+# drifting copy of it: that set is the family a serial recovery must SHED, so it
+# also carries ``--dist`` (a distribution MODE) and ``--maxprocesses`` (a CAP).
+# Neither is a worker count, and reporting either one's value as ``n_flag``
+# would put a fabricated count in the corpus this stamp exists to make
+# trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
+# the pair-binding walk below needs no special case for them;
+# test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
+# stated choice rather than becoming drift the day either set moves.
+_XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
+
+
 def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     """The xdist worker facts for *cmd*, as two independently-nullable fields.
 
@@ -8991,13 +9005,29 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
     So two orthogonal facts, separately sourced:
 
-    - ``n_flag`` — the token after ``-n`` in the command AS PARSED, or ``None``
-      when the command carries none. Read off the STRUCTURED ``base_flags``,
-      never by regex over the string: a regex would find the ``-n`` inside a
+    - ``n_flag`` — the worker count the command NAMES, AS PARSED, or ``None``
+      when it names none. Read off the STRUCTURED ``base_flags``, never by
+      regex over the string: a regex would find the ``-n`` inside a
       cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
       this command's flag. ``_PYTEST_VALUE_FLAGS`` is read rather than
       re-derived so the flag/value pairing has one home, which is also what
       keeps a ``-k '-n'`` from being mistaken for a worker count.
+
+      SPELLINGS, tested rather than assumed equal to one literal: both ``-n 8``
+      and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
+      the attached one-token form (``--numprocesses=8``, ``-n=8`` — argparse
+      accepts both). A set that bound ``-n`` alone would report ``n_flag: null``
+      for a module config using the long spelling, which the census reads as
+      "no flag on argv, so addopts decided the count" — a wrong fact, silently,
+      in the corpus this deliverable exists to make trustworthy. No live config
+      uses the long spelling today, so that was latent rather than active.
+
+      The CONCATENATED short form (``-n8``) is deliberately reported as absent.
+      That is the grammar boundary ``verify_cmd._is_xdist_worker_flag`` — the
+      one home for "is this token a worker flag" — already draws for the serial
+      recovery's strip and refusal screen, and matching it keeps ONE answer in
+      the module: widening only the telemetry would leave the stamp claiming a
+      flag the strip would not shed.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` from the
       EFFECTIVE verify env, or ``None``. Reported independently of ``n_flag``:
       a reader that wants the effective count joins them itself, and can see
@@ -9020,10 +9050,22 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
             flags = parsed.base_flags
             i = 0
             while i < len(flags):
-                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
-                    if flags[i] == '-n':
+                # One partition covers both spellings of "this flag's value":
+                # attached (`--numprocesses=8` -> sep is '=') or the adjacent
+                # token (`-n 8`), which `_PYTEST_VALUE_FLAGS` has already bound
+                # next to its flag. An attached form with an EMPTY value
+                # (`--numprocesses=`) names no count — pytest rejects that
+                # command outright — so it falls through and reports absent
+                # rather than recording `''` as a worker count.
+                head, sep, attached = flags[i].partition('=')
+                if head in _XDIST_N_FLAGS:
+                    if sep and attached:
+                        n_flag = attached
+                        break
+                    if not sep and i + 1 < len(flags):
                         n_flag = flags[i + 1]
                         break
+                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
                     i += 2
                 else:
                     i += 1
