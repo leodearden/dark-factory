@@ -2092,12 +2092,12 @@ class TestBuildCorpus:
 # ----------------------------------------------------------------------
 
 
-class TestBuildCorpusWithheldCensus:
-    """`_build_corpus` reports what each cap kept OUT of the pool.
+class _CorpusHarness:
+    """Stubs for driving `_build_corpus` end to end against fake streams.
 
-    The census must count at every cap, not only at the final `_trim_pool`
-    pass: under stock config a maximal pool is 29 entries against a total cap
-    of 30, so a census keyed on the final trim alone never fires.
+    Shared by every `_build_corpus` census test so the four streams are
+    wired one way only — a second copy would be free to drift from the
+    stream ordering the census depends on.
     """
 
     MODULE_FILE = 'src/parser.py'
@@ -2190,6 +2190,15 @@ class TestBuildCorpusWithheldCensus:
             return await curator._build_corpus(
                 candidate, project_id='p', project_root='/x',
             )
+
+
+class TestBuildCorpusWithheldCensus(_CorpusHarness):
+    """`_build_corpus` reports what each cap kept OUT of the pool.
+
+    The census must count at every cap, not only at the final `_trim_pool`
+    pass: under stock config a maximal pool is 29 entries against a total cap
+    of 30, so a census keyed on the final trim alone never fires.
+    """
 
     @pytest.mark.asyncio
     async def test_module_cap_excess_is_counted(self):
@@ -2357,6 +2366,107 @@ class TestBuildCorpusWithheldCensus:
             'embedding': 0,
             'dependency': 0,
         }
+
+
+class TestWithheldCountsOnlyAbsentEntries(_CorpusHarness):
+    """`by_source` counts entries a cap kept OUT, never one that is present.
+
+    The census exists to tell the LLM the pool it is reading is incomplete.
+    An entry one stream skipped and another admitted is IN the pool, so
+    counting it makes the prompt assert a truncation that did not happen —
+    and `render()` then tells the LLM to prefer `create` over a `combine`
+    the complete pool actually supports. Counting has to happen against the
+    ids the streams finally admitted, not at the moment each cap fires.
+    """
+
+    def _pooled_ids(self, pool) -> set[str]:
+        return {e.task_id for e in pool}
+
+    async def _module_overflow_ids(self, config, tasks) -> list[str]:
+        """The module ids this config's cap actually leaves out of the pool.
+
+        Derived from a real run rather than from `_module_sort_key`'s
+        tiebreak, so the test states the contract instead of restating the
+        production sort.
+        """
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, _withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+        pooled = self._pooled_ids(pool)
+        return [t['id'] for t in tasks if t['id'] not in pooled]
+
+    @pytest.mark.asyncio
+    async def test_module_overflow_readmitted_by_embedding_is_not_withheld(self):
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        overflow = await self._module_overflow_ids(config, tasks)
+        assert len(overflow) == 5
+
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=overflow,
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(tid in pooled for tid in overflow), (
+            'the embedding stream re-admitted every module overflow entry'
+        )
+        assert withheld.by_source['module'] == 0
+        assert withheld.total == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_unvisited_neighbors_already_pooled_are_not_withheld(self):
+        config = _make_config()
+        cap = config.curator.pool_embedding_cap
+        modules = [self._module_task(str(200 + i)) for i in range(10)]
+        assert len(modules) <= config.curator.pool_module_cap
+        fresh_ids = self._neighbor_ids(cap)
+        fresh = []
+        for tid in fresh_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            fresh.append(t)
+        curator = TaskCurator(
+            config=config, taskmaster=self._taskmaster([*modules, *fresh]),
+        )
+
+        # The fresh neighbours fill the cap; the already-pooled module ids are
+        # the tail the break never visits.
+        pool, _sizes, withheld = await self._corpus(
+            curator,
+            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=[*fresh_ids, *[t['id'] for t in modules]],
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(t['id'] in pooled for t in modules), (
+            'the module stream pooled every one of the unvisited tail ids'
+        )
+        assert withheld.by_source['embedding'] == 0
+        assert withheld.render() is None
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_absent_module_entry_is_still_withheld(self):
+        """The fix must stop the census lying, not silence it."""
+        config = _make_config()
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
+        overflow = await self._module_overflow_ids(config, tasks)
+
+        curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
+        pool, _sizes, withheld = await self._corpus(
+            curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+        )
+
+        pooled = self._pooled_ids(pool)
+        assert all(tid not in pooled for tid in overflow)
+        assert withheld.by_source['module'] == len(overflow)
+        assert withheld.render() is not None
 
 
 # ----------------------------------------------------------------------
