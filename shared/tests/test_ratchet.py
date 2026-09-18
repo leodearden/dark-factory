@@ -22,6 +22,7 @@ TDD pair 2: excess / slack / tighten + the no-add-key property (GREEN on impl st
 TDD pair 3: the two comparability refusals, uniform across all three (GREEN on impl step-14).
 TDD pair 4: dump / load round trip + the committed-file shape (GREEN on impl step-16).
 TDD pair 5: load()'s refusals, every one naming the path (GREEN on impl step-18).
+TDD pair 6: a params key that is ABSENT vs. one that is present and null (GREEN on impl step-20).
 """
 from __future__ import annotations
 
@@ -396,6 +397,15 @@ class TestParamsMismatchRefusal:
             ({'key_version': 1, 'extra': 'x'}, {'key_version': 1}),  # an added key
             ({'key_version': 1}, {'key_version': 1, 'extra': 'x'}),  # a removed key
             ({'kinds': ('noqa', 'nosec')}, {'kinds': ('nosec', 'noqa')}),  # tuple order
+            # A null-valued key gained and lost.  These two rows exist because
+            # ``.get``-based difference detection conflates ABSENT with NULL,
+            # and the params block is the one mapping in this module where
+            # None is a legal VALUE rather than a sentinel for missing: every
+            # other row above differs on a str or an int, so a bare
+            # ``.get(key) != .get(key)`` catches them all while letting a
+            # params block that gained or lost a null compare as MATCHING.
+            ({'strict': None}, {}),  # the current side gained a null-valued key
+            ({}, {'strict': None}),  # the current side lost one
         ],
     )
     def test_every_operation_refuses(self, operation, current_params, baseline_params):
@@ -415,6 +425,42 @@ class TestParamsMismatchRefusal:
         assert dict(error.baseline_params) == {'key_version': 1}
         assert 'key_version' in str(error)
         assert '1' in str(error) and '2' in str(error)
+
+    @pytest.mark.parametrize('operation', OPERATIONS)
+    def test_a_null_valued_key_on_both_sides_is_not_a_difference(self, operation):
+        """The over-correction guard for the absent-vs-null distinction.
+
+        A sentinel fix that made every None-valued key differ from ITSELF
+        would refuse every comparison of a params block containing a null, and
+        nothing else in this suite would notice: no other case here puts a
+        None in params on both sides.  None is a legal params value, so a key
+        holding one on both sides is two sides agreeing.
+        """
+        params = {'strict': None, 'key_version': 1}
+        current = Enumeration(counts={'a': 2}, params=dict(params))
+        baseline = Enumeration(counts={'a': 1}, params=dict(params))
+        assert operation(current, baseline) == {
+            excess: Counter({'a': 1}),
+            slack: Counter(),
+            tighten: Counter({'a': 1}),
+        }[operation]
+
+    def test_names_an_absent_side_as_absent_and_never_as_none(self):
+        """``None`` and ``absent`` are different mistakes with different fixes.
+
+        Rendering the absent side as ``None`` sends the operator hunting for a
+        null they never wrote — the mistake this module already solved at the
+        file boundary with ``_found``.  The present side's ``None`` must still
+        render as ``None``, because that null IS what they wrote.
+        """
+        current = Enumeration(counts={}, params={'strict': None})
+        baseline = Enumeration(counts={}, params={})
+        with pytest.raises(ParamsMismatch) as excinfo:
+            excess(current, baseline)
+        error = excinfo.value
+        assert error.differing == ('strict',)
+        assert 'strict: baseline=absent current=None' in str(error)
+        assert 'baseline=None' not in str(error)
 
 
 class TestIncompleteEnumerationRefusal:
