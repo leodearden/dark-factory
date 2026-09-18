@@ -3279,6 +3279,7 @@ class MemoryService:
     async def _verify_episode_referents(
         self, result: Any, *, group_id: str, referents: ReferentSet,
         content: str = '', referent_source: str = 'derived',
+        ambiguous: ReferentSet | None = None,
     ) -> ReferentStats:
         """Verify each edge hangs off a node this write is actually ABOUT.
 
@@ -3366,18 +3367,24 @@ class MemoryService:
         :func:`_candidate_pool` beside its two siblings, so all three read at
         ONE site (INV-5).
 
-        THE SET IS RE-DERIVED HERE FROM ``content``, which is sound because
-        ``.ambiguous`` is ``scan_content(content, group_id=group_id).ambiguous``
-        verbatim on every precedence path — a pure function of
-        ``(content, group_id)``, independent of source — and
-        ``_execute_graphiti_write`` holds both. It is nonetheless a SECOND SCAN
-        SITE, the lockstep duplication gamma's own comment flags
-        canonical_labels as existing to prevent, and it is only sound while both
-        scans are parameterized identically. Task 5262 puts ``.ambiguous`` on
-        the wire (``_encode_referents``' third key) so this pass can take the
-        producer's answer instead; until the preference rule lands here, this
-        re-derivation remains the only path. Scanned ONCE per episode, after the
-        edgeless early-out, so the clean path pays for it only when there is
+        THE SET IS READ OFF THE WIRE, NOT RE-DERIVED (task 5262).
+        ``_encode_referents`` carries ``.ambiguous`` as a third key, so the
+        *ambiguous* argument IS the producer's own answer and this pass simply
+        believes it. That removes a SECOND SCAN SITE — the lockstep duplication
+        gamma's own comment flags canonical_labels as existing to prevent — and
+        it removes a real drift window, not a theoretical one: the producer
+        scans at ENQUEUE and now narrows with the project registry, this pass
+        runs at DEQUEUE across a durable queue, and a restart that changed the
+        registry between them would leave a re-derivation disagreeing with the
+        producer about which endpoints were contested.
+
+        ``None`` — the row carried no such key, so it was enqueued before task
+        5262 — is the ONLY case that re-derives, and it re-derives PERMISSIVELY
+        (no ``known_project_ids``), because that is what reproduces the
+        pre-change producer exactly. ``()`` is NOT ``None``: it means the
+        producer found nothing ambiguous, which is believed rather than
+        re-checked. The fallback scan is ONE per episode, after the edgeless
+        early-out, so even a legacy row pays for it only when there is
         something to check.
 
         An EMPTY *referents* makes the whole pass a no-op, honouring the contract
@@ -3424,21 +3431,50 @@ class MemoryService:
         if not edges:
             return stats
 
-        # The producer's ambiguity set, re-derived from the episode body — see
-        # the AMBIGUITY paragraph above for why it is re-derived rather than read
-        # off the wire. THROUGH `local_referent`, for the same reason the
-        # endpoint parse below is: `scan_content` preserves the qualifier it
-        # read, so a self-qualified ambiguous mention ('dark_factory:2500') would
-        # otherwise compare unequal to the locally-classified endpoint referent
-        # and the veto would silently miss.
+        # THE PRODUCER'S AMBIGUITY SET, PREFERRED OFF THE WIRE (task 5262).
+        # `.ambiguous` is `_encode_referents`' third key, so the set that
+        # decided what γ excluded from `.referents` arrives here verbatim
+        # instead of being reconstructed. That removes the SECOND SCAN SITE
+        # γ's own comment flags as the INV-5 lockstep duplication
+        # canonical_labels exists to prevent.
         #
-        # PERMISSIVE mode (no `known_project_ids`), matching gamma's own choice —
-        # the producer scanned in that mode too, and this must recover the
-        # producer's set, not a differently-parameterized one.
-        ambiguous = frozenset(
-            local_referent(ref, group_id=group_id)
-            for ref in scan_content(content, group_id=group_id).ambiguous
-        ) if content else frozenset()
+        # IT IS ALSO THE RESOLUTION OF THE QUEUE-CROSSING DRIFT. The producer
+        # scans at ENQUEUE, this pass runs at DEQUEUE on the far side of a
+        # durable SQLite queue, and the producer now narrows its scan with the
+        # project registry. A restart that changes `DASHBOARD_KNOWN_PROJECT_ROOTS`
+        # between the two would silently desynchronize any re-derivation —
+        # VETO 1 would then fail to fire where the producer said it should, and
+        # an AMBIGUOUS endpoint would reach eta as a destructive repair
+        # instruction. Threading the RESULT makes the two sets incapable of
+        # disagreeing at all, which is strictly stronger than narrowing both in
+        # lockstep.
+        #
+        # `None` IS NOT `()`, and collapsing them into a truthiness test
+        # reopens exactly that drift. `None` means the row carried no
+        # 'ambiguous' key — i.e. it was enqueued by pre-task-5262 code, whose
+        # producer scanned PERMISSIVELY — so only a PERMISSIVE re-derivation
+        # (no `known_project_ids`) reproduces that producer byte-for-byte. `()`
+        # means the producer told us nothing was ambiguous, which must be
+        # BELIEVED: re-deriving there would scan with whatever registry happens
+        # to be live now and could manufacture an ambiguity the producer never
+        # saw.
+        #
+        # BOTH ARMS GO THROUGH `local_referent`, for the same reason the
+        # endpoint parse below does: `scan_content` preserves the qualifier it
+        # read, so a self-qualified ambiguous mention ('dark_factory:2500')
+        # would otherwise compare unequal to the locally-classified endpoint
+        # referent and the veto would silently miss. The wire carries that
+        # spelling verbatim, so the normalization is needed on the wire arm too
+        # and not merely inherited from the old one.
+        if ambiguous is not None:
+            ambiguous_referents = frozenset(
+                local_referent(ref, group_id=group_id) for ref in ambiguous
+            )
+        else:
+            ambiguous_referents = frozenset(
+                local_referent(ref, group_id=group_id)
+                for ref in scan_content(content, group_id=group_id).ambiguous
+            ) if content else frozenset()
 
         # The episode's own node names, which is all the detection needs — see
         # the parse_node_name invariance note above. Same defensive
@@ -3713,7 +3749,7 @@ class MemoryService:
                     cited=cited,
                     endpoint=endpoint_referent,
                     other_endpoint=other_referent,
-                    ambiguous=ambiguous,
+                    ambiguous=ambiguous_referents,
                     source=referent_source,
                 )
                 resolvable = len(candidates) == 1
@@ -3746,12 +3782,12 @@ class MemoryService:
                         pool=_candidate_pool(
                             referents=referent_set, cited=cited,
                             endpoint=endpoint_referent,
-                            ambiguous=ambiguous, source=referent_source,
+                            ambiguous=ambiguous_referents, source=referent_source,
                         ),
                         cited=cited,
                         endpoint=endpoint_referent,
                         other_endpoint=other_referent,
-                        ambiguous=ambiguous,
+                        ambiguous=ambiguous_referents,
                         source=referent_source,
                     ),
                 ))
@@ -5054,6 +5090,7 @@ class MemoryService:
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str, referents: ReferentSet = (),
         content: str = '', referent_source: str = 'derived',
+        ambiguous: ReferentSet | None = None,
     ) -> ReconcileStats:
         """Fold the eight post-write identity/verification/repair sweeps into one call.
 
@@ -5137,6 +5174,11 @@ class MemoryService:
                 forwarded to the verification sub-pass. Defaults to empty, which
                 makes that pass a no-op — so every caller predating task 3671 is
                 unchanged.
+            ambiguous: The PRODUCER's ambiguity set, read off the wire and
+                forwarded verbatim to the verification sub-pass. ``None`` means
+                the row carried no such key, which that pass answers with a
+                permissive re-derivation; see it for why the distinction from
+                ``()`` is load-bearing.
 
         Returns:
             A ReconcileStats aggregating every sub-pass's count, the
@@ -5205,6 +5247,7 @@ class MemoryService:
             self._verify_episode_referents(
                 result, group_id=group_id, referents=referents,
                 content=content, referent_source=referent_source,
+                ambiguous=ambiguous,
             ),
             ReferentStats(),
         )
@@ -5519,14 +5562,19 @@ class MemoryService:
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=payload['group_id'], referents=referents,
-                # BOTH halves of what zeta needs beyond the decoded set:
-                # `content` so it can re-derive the producer's ambiguity set
-                # (epsilon drops `.ambiguous` from the wire on purpose), and
-                # `referent_source` so an ambient `metadata['task_id']`
-                # declaration is never mistaken for evidence about which node an
-                # edge belongs on. The FULL content, not the 200-char journal
-                # excerpt above -- a truncated body would silently lose the
+                # THREE things zeta needs beyond the decoded set.
+                # `ambiguous` is the producer's own ambiguity set, threaded off
+                # the wire since task 5262, which is what lets zeta tell an
+                # AMBIGUOUS endpoint from a genuine conflation without
+                # re-deriving it. `None` means the row predates that key.
+                # `content` is now only the LEGACY fallback's input, for exactly
+                # that case -- still the FULL content, not the 200-char journal
+                # excerpt above, since a truncated body would silently lose the
                 # second half of an ambiguity pair.
+                # `referent_source` is so an ambient `metadata['task_id']`
+                # declaration is never mistaken for evidence about which node an
+                # edge belongs on.
+                ambiguous=ambiguous,
                 content=payload['content'],
                 referent_source=referent_source,
             )

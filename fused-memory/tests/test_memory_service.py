@@ -5174,7 +5174,7 @@ class TestReconcileEpisodeIdentity:
 
         service._verify_episode_referents.assert_awaited_once_with(
             mock_result, group_id='test', referents=(Referent(number='3127'),),
-            content='', referent_source='derived',
+            content='', referent_source='derived', ambiguous=None,
         )
 
     @pytest.mark.asyncio
@@ -5192,7 +5192,7 @@ class TestReconcileEpisodeIdentity:
 
         service._verify_episode_referents.assert_awaited_once_with(
             mock_result, group_id='test', referents=(),
-            content='', referent_source='derived',
+            content='', referent_source='derived', ambiguous=None,
         )
 
     @pytest.mark.asyncio
@@ -5937,7 +5937,8 @@ class TestWriteTimeIdentityGate:
             return mock_result
 
         async def fake_reconcile(result, *, group_id, referents=(),
-                                 content='', referent_source='derived'):
+                                 content='', referent_source='derived',
+                                 ambiguous=None):
             observed_locked['reconcile'] = lock.locked()
             observed_same_lock['reconcile'] = (
                 service.graphiti._identity_lock_for(group_id) is lock
@@ -5967,9 +5968,12 @@ class TestWriteTimeIdentityGate:
         assert lock.locked() is False, 'lock must be released after _execute_graphiti_write returns'
         service._reconcile_episode_identity.assert_awaited_once_with(
             mock_result, group_id='test', referents=(),
-            # zeta re-derives the producer's ambiguity set from the FULL body and
-            # reads the source to decide whether the declared-set fallback is
-            # licensed; both ride this same locked call.
+            # zeta reads the producer's ambiguity set off the wire (`None` here:
+            # this payload carries no 'referents' blob at all, the legacy shape),
+            # falls back to the FULL body for such a row, and reads the source to
+            # decide whether the declared-set fallback is licensed; all three ride
+            # this same locked call.
+            ambiguous=None,
             content='test content', referent_source='none',
         )
 
@@ -6006,7 +6010,8 @@ class TestWriteTimeIdentityGate:
             return MockAddEpisodeResult()
 
         async def fake_reconcile(result, *, group_id, referents=(),
-                                 content='', referent_source='derived'):
+                                 content='', referent_source='derived',
+                                 ambiguous=None):
             await _bump()
             return ReconcileStats()
 
