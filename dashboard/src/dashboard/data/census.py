@@ -88,6 +88,28 @@ TONES: MappingProxyType[TaskStatus, str] = MappingProxyType(
 )
 
 
+class CensusVocabularyError(ValueError):
+    """A status map carried a value outside ``TaskStatus``.
+
+    Raised rather than absorbed, deliberately. Dropping the row would
+    under-report ``total`` silently — the class of uniform lie this module
+    exists to remove — and a tenth bucket would break the nine-key contract
+    every consumer is being written against, falsifying ``total ==
+    sum(counts.values())`` either way.
+
+    Being pure, :func:`build_census` cannot degrade gracefully itself, and it
+    does not need to: the access layer above wraps the call, catches this, and
+    serves the census as an ``unknown``/``stale``
+    :class:`~dashboard.data.datum.Datum` carrying this message verbatim as its
+    ``reason``. That is what makes the failure visible instead of fatal.
+
+    The store's vocabulary is already closed by
+    ``fused_memory/server/tools.py::_VALID_TASK_STATUSES``, which imports from
+    the same ``shared`` module, so an unknown value here means the vocabulary
+    drifted and must be loud.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TaskCensus:
     """How many tasks sit in each status, and in each named view of them.
@@ -124,10 +146,29 @@ def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
 
     Returns:
         A census whose ``counts`` carry all nine members, seeded at zero.
+
+    Raises:
+        CensusVocabularyError: If any value falls outside ``TaskStatus``.
+            Every offender is collected and reported in one raise, so a
+            vocabulary drift is not found one rerun at a time.
     """
     counts = dict.fromkeys(TaskStatus, 0)
-    for status in status_map.values():
-        counts[TaskStatus(status)] += 1
+    offenders: list[tuple[Any, str]] = []
+    for task_id, status in status_map.items():
+        try:
+            member = TaskStatus(status)
+        except ValueError:
+            offenders.append((task_id, status))
+        else:
+            counts[member] += 1
+
+    if offenders:
+        listed = ', '.join(f'id={task_id!r} status={status!r}' for task_id, status in offenders)
+        legal = ', '.join(repr(member.value) for member in TaskStatus)
+        raise CensusVocabularyError(
+            f'status map carried {len(offenders)} value(s) outside TaskStatus: '
+            f'{listed}. Legal members are: {legal}'
+        )
 
     def tally(members: frozenset[TaskStatus]) -> int:
         return sum(counts[member] for member in members)
