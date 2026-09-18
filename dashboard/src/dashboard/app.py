@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from dashboard.api import memory as api_memory_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.window import _parse_window
@@ -78,10 +79,7 @@ from dashboard.data.merge_queue import (
 from dashboard.data.metrics import (
     fan_out_list_tickets,
     get_curator_sparks,
-    get_memory_24h_ago,
-    get_memory_sparks,
     get_merge_active_series,
-    get_queue_pending_series,
     get_recon_sparks,
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
@@ -543,6 +541,7 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 # module owns its own router and declares its own literal path, so a path
 # and the handler serving it stay in one file.
 app.include_router(api_tasks_routes.router)
+app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 
 
@@ -1082,53 +1081,6 @@ async def _performance_resources(
 # ---------------------------------------------------------------------------
 # JSON API: /api/v2/dashboard/*
 # ---------------------------------------------------------------------------
-
-
-# Per-HTTP-request budget for /memory's three MCP legs (task 3871), matching
-# the metrics samplers' 5.0s. Without it each leg silently ran to
-# mcp_tool_call's 10s default — including pool acquisition — while its
-# sibling legs honoured a real budget.
-#
-# Deliberately NOT also wrapped in asyncio.wait_for, unlike the curator leg
-# below: this gather has no return_exceptions=True, so a TimeoutError raised
-# by a wrapper would escape as a 500 rather than degrading one leg. The three
-# callees swallow their own per-URL failures and return offline dicts, so
-# adding a whole-operation bound here means first giving each leg its own
-# exception containment — a shape change beyond this task.
-_MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
-
-
-@app.get('/api/v2/dashboard/memory')
-async def api_memory(request: Request) -> JSONResponse:
-    """MEMORY_STATUS, including queue counts and per-project totals."""
-    http_client = request.app.state.http_client
-    config: DashboardConfig = request.app.state.config
-    pool: DbPool = request.app.state.db
-    metrics_db = await pool.get(config.metrics_db)
-    status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
-        memory_data.get_memory_status(
-            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
-        ),
-        memory_data.get_queue_stats(
-            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
-        ),
-        get_memory_sparks(metrics_db, days=1),
-        get_queue_pending_series(metrics_db, days=1),
-        get_memory_24h_ago(metrics_db),
-        memory_data.get_wal_status(
-            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
-        ),
-    )
-    return JSONResponse(
-        redux_api.shape_memory(
-            status,
-            queue,
-            sparks=sparks,
-            queue_spark=queue_spark,
-            delta_24h=delta_24h,
-            wal=wal,
-        )
-    )
 
 
 @app.get('/api/v2/dashboard/memory-graphs')
