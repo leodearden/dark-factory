@@ -1025,6 +1025,35 @@ and no `landed` ref flipped back. That matters because dark-factory reads
 recovery downgrades to a revert-and-redispatch, and
 `git_ops.py::_abort_lane_acquisition` declines to preserve the branch.
 
+**What the widening costs, stated asymmetrically — because it is asymmetric.**
+It buys the 81 refs above; what it risks is a tip that cites task N without
+being task N's work (the shape pinned as `test_warm_lane_degenerate_ref.sh`'s
+K6). Both consumers act on `degenerate`, never on `landed`, so the cost of a
+false `landed` is whatever the `degenerate` action would have been — and that
+is **not** the same at the two sites:
+
+| Site | Acts on `degenerate` by | Cost of a false `landed` |
+|---|---|---|
+| `git_ops.py::_abort_lane_acquisition` | `_delete_branch_if_on_main` | a retained, stale branch |
+| `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done | **a phantom-done task** — precisely what that guard's own comment ("a degenerate branch carries ZERO task work, so MARK_DONE would phantom-complete a task that never actually landed anything") gives as its reason to exist |
+
+At the harness site the only degeneracy-specific backstop is the independent
+`_branch_is_degenerate(branch, metadata)` disjunct, and it is **fail-open**:
+`orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
+40-hex sha. The `validate_landing_evidence` call below it does not bound this
+error either — it checks that the candidate commit's effect survives at main
+HEAD, and a foreign on-main tip passes that check by construction.
+
+The port is still net-positive, on the measurement rather than on a symmetry
+argument: a false `degenerate` costs re-dispatched landed work or a deleted
+branch across every ref of the commonest shape there is (81 of 427), where a
+false `landed` needs a foreign tip that names this task in a conventional-commit
+subject. Do not restate the tradeoff as "`landed` is the conservative verdict at
+both call sites" — an earlier draft of this delta's sibling prose did, and this
+task's amendment pass corrected it here, in `tests/warm-lane/README.md` Delta 7
+and in the K6 comment.
+
 **Vendored, not inlined.** The grammar could have been inlined into its one
 dark-factory consumer. It was not, for the reason stated at the top of
 "Documented deltas": inlining would manufacture a fresh content divergence in
@@ -1040,6 +1069,45 @@ consumer**, exactly as `lib_portable.sh`'s `allocate_free_port` and
 `portable_timeout` already do; and **no separate lib test is ported**, as for
 `lib_live_refs.sh` and `lib_portable.sh`, whose coverage arrives transitively
 through the scripts that source them.
+
+Those two facts compose into a third that is easy to miss, so state it
+plainly: transitive coverage reaches only what the consumer calls. The
+degenerate-ref suite exercises `task_citation_message_cites` (every
+classification) and `task_citation_regex_escape` (the `--branch-prefix`
+metacharacter block); `task_citation_peer_ids` — roughly a third of the file,
+including its per-digit-suffix candidate enumeration and its SIGPIPE/`pipefail`
+feeding idiom — is **unexercised here**, because nothing here calls it.
+`test_warm_lane_bash_suite.py::test_every_invocable_script_has_ported_coverage`
+names the split in its docstring rather than claiming whole-file coverage.
+
+**What the vendored lib still says about reify, and why it was left saying it.**
+`lib_task_citation.sh` is byte-identical to reify, header included, so it
+carries three references that resolve only there: line 16's rule *"DO NOT
+re-inline any ERE in a consumer … and `tests/infra/test_lib_task_citation.sh`
+fails if one reappears"*, and lines 74 and 111 citing that same file's Blocks G
+and F as the pins for the `pipefail` feeding idiom and the arbiter/harvest
+set-equality contract. **In dark-factory that test does not exist and the rule
+is documented but unenforced.** A review pass proposed annotating or trimming
+line 16 in the file itself; that was declined, and the reasons are worth
+keeping because the same fork will recur for the next vendored lib:
+
+- The precedent is already set one file over — `lib_portable.sh` carries a
+  dangling `tests/infra/test_run_gui_scripts.sh` reference and was vendored
+  verbatim regardless.
+- Every other delta in this list rides a file that had to change anyway, so it
+  costs the diff nothing. A note here would be the **only** hunk in an
+  otherwise byte-clean 171-line file, converting a free drift check into a
+  non-zero one — for a file reify was still editing the day before this port.
+- The one place a re-inline could actually happen is a **consumer**, and
+  dark-factory's only consumer already says so in its own header: *"That lib is
+  the SINGLE copy; dark-factory ports no separate lib test … so re-inlining
+  either ERE here would reintroduce the drift the lib exists to prevent with
+  nothing to catch it."* The misleading claim is contradicted at the point of
+  use, which is the point that matters.
+
+Manufacturing the missing enforcement with a grep-for-the-ERE test was
+considered and rejected in the same pass: it would pin a spelling rather than
+the property, and κ is the leaf that settles cross-repo enforcement.
 
 **The three divergences from reify's post-7244 file**, filed as one delta
 because they share a file, a task and a cause — Delta 7's own rule for not
@@ -1069,6 +1137,23 @@ splitting, whose same-task limb these satisfy and Delta 8's did not:
    dark-factory, and its `# shellcheck source=` names reify's path. Leaving
    them would be a dangling cross-repo reference of the same kind this task was
    filed to remove.
+
+   The re-pointed directive reads
+   `# shellcheck source=orchestrator/scripts/warm-lane/lib_task_citation.sh`
+   — **repo-root-relative, deliberately**, and it is the only `source=` in
+   *this* directory that is. A review pass read that as a break from the five
+   siblings' `scripts/<lib>.sh` spelling; measurement says otherwise on both
+   halves. Those five are un-re-pointed reify text: `scripts/lib_portable.sh`,
+   `scripts/lib_live_refs.sh` and `scripts/lib_lane_state.sh` **do not exist at
+   this repo's root** (`ls` them — every one is a `No such file` here), so they
+   name nothing. Every path dark-factory has actually re-pointed is
+   repo-root-relative instead — five in the sibling test directory naming
+   `orchestrator/tests/warm-lane/lib_warm_lane_paths.sh` and two naming
+   `orchestrator/scripts/warm-lane/lib_lane_state.sh`. This directive follows
+   *that* convention, not the one it is drifting away from. Note also that
+   nothing validates any of them: shellcheck is not installed on the reference
+   host and is invoked by no hook, script or CI job in this repo, so a `source=`
+   here is a reader's hint and a provenance record, never a checked one.
 
 The pre-existing references to `docs/design/warm-lane-degenerate-ref-seam.md`
 (absent here) are **untouched** — they predate this task and sit in the

@@ -233,13 +233,31 @@ things about it are not, and both are prose:
    `docs/design/warm-lane-degenerate-ref-seam.md` §4b for why dark-factory's
    consumer tolerates a foreign tip reading `landed`. That doc is reify-side and
    has no dark-factory counterpart, so the REASON travels instead of the
-   pointer: `landed` is the conservative verdict at both dark-factory call
-   sites — `harness.py`'s MARK_DONE recovery declines to downgrade,
-   `git_ops.py::_abort_lane_acquisition` declines to delete — so a false
-   `landed` costs a stale ref where a false `degenerate` re-dispatches landed
-   work or deletes its branch. That asymmetry is the whole reason the 81-of-427
-   misclassification mattered, and K6 pins the direction of the tradeoff as a
-   KNOWN CONSEQUENCE rather than a goal.
+   pointer. What travels is the MEASUREMENT (81 of 427 live-pool refs flipped
+   `degenerate` → `landed`, none the reverse), **not** a claim that a false
+   `landed` is cheap at both dark-factory call sites — it is not, and an
+   earlier draft of this item and of the K6 comment asserted that it was
+   (corrected by this task's amendment pass). The two sites are asymmetric,
+   and both act on `degenerate` rather than on `landed`:
+
+   | Site | Acts on `degenerate` by | Cost of a false `landed` |
+   |---|---|---|
+   | `git_ops.py::_abort_lane_acquisition` | `_delete_branch_if_on_main` | a retained, stale branch |
+   | `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done | **a phantom-done task** — the exact failure that guard's own comment ("a degenerate branch carries ZERO task work") cites as its reason to exist |
+
+   The harness site's only degeneracy-specific backstop is the independent
+   `_branch_is_degenerate(branch, metadata)` disjunct, which is **fail-open**:
+   `orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+   returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
+   40-hex sha. So the backstop is not unconditional, and K6's fixture — a
+   foreign on-main tip whose subject cites task 51 — is precisely the shape
+   that would phantom-complete task 51 there.
+
+   The tradeoff still favours the widening: a false `degenerate` costs
+   re-dispatched landed work or a deleted branch on EVERY ref of that shape,
+   and the measured corpus had 81 of them against zero contrived K6-shaped
+   flips. K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a
+   goal.
 
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 

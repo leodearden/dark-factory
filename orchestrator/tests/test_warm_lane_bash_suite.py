@@ -333,8 +333,16 @@ def test_every_invocable_script_has_ported_coverage() -> None:
       invocation;
     * ``lib_lane_state.sh`` by the same audit suite's Block L and by
       ``test_lane_state_lib.py``, which pins it directly;
-    * ``lib_task_citation.sh`` by ``test_warm_lane_degenerate_ref.sh``, whose
-      every classification runs through it (task 5566).
+    * ``lib_task_citation.sh`` — TWO of its three exports, by
+      ``test_warm_lane_degenerate_ref.sh``: every classification runs through
+      ``task_citation_message_cites``, and the ``--branch-prefix``
+      metacharacter block through ``task_citation_regex_escape``.  Its third,
+      ``task_citation_peer_ids``, has no dark-factory caller (the sole one is
+      reify's ``task-branch-contamination-sweep.sh``, which is not among the
+      relocated scripts) and therefore travels UNEXERCISED — the standing gap
+      ``lib_portable.sh``'s ``allocate_free_port`` and ``portable_timeout``
+      already carry, recorded in
+      ``orchestrator/scripts/warm-lane/README.md`` Delta 11 (task 5566).
     """
     invocable = {
         p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')

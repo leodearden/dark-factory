@@ -453,12 +453,23 @@ assert "R1: stdout is 'landed <tip sha>' (prefix matched literally, not as ERE q
 # K6 — task/51 tip is ANOTHER task's `fix(4812): rebase onto task/51` commit
 #      -> exit 4, "landed <sha>". Pinned as a known consequence, not a goal:
 #      the verdict is "the tip cites N", and that subject does. dark-factory
-#      tolerates the direction of that error because `landed` is the
-#      conservative verdict at both its call sites — `harness.py`'s MARK_DONE
-#      recovery declines to downgrade, and
-#      `git_ops.py::_abort_lane_acquisition` declines to delete — so a false
-#      `landed` costs a stale ref where a false `degenerate` re-dispatches
-#      landed work or deletes its branch.
+#      accepts that direction of error on the MEASUREMENT (81 of 427
+#      live-pool refs flipped degenerate -> landed, none the reverse), NOT
+#      because a false `landed` is cheap at both its call sites. It is not:
+#        * `git_ops.py::_abort_lane_acquisition` deletes only on
+#          `degenerate`, so a false `landed` costs a retained, stale branch;
+#        * `harness.py`'s MARK_DONE_WITH_PROVENANCE downgrade also fires only
+#          on `degenerate`, so a false `landed` lets MARK_DONE proceed — a
+#          PHANTOM-DONE task, the exact failure that guard was written to
+#          prevent. Its one degeneracy-specific backstop is the independent
+#          `_branch_is_degenerate(branch, metadata)` disjunct, and that is
+#          fail-open: `landing_evidence.py::branch_is_degenerate` returns
+#          False whenever `metadata['branch_base_sha']` is absent or is not
+#          a 40-hex sha. THIS FIXTURE is that shape — a foreign on-main tip
+#          citing task 51 would phantom-complete task 51 at that site.
+#      A false `degenerate` is still the worse error (it re-dispatches landed
+#      work, or deletes its branch, on EVERY such ref rather than on a
+#      contrived one), which is what makes the widening net-positive.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- amendment: conventional-commit citation-form coverage ---"
