@@ -26,6 +26,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -95,7 +96,12 @@ def load_script(*, real_host_defaults: bool = False):
     spec = importlib.util.spec_from_file_location('load_threshold_calibration', SCRIPT)
     assert spec is not None, f'Could not build spec from {SCRIPT}'
     assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
+    # `Any` rather than the inferred ModuleType: pyright knows no attribute a
+    # by-path-loaded module defines, so it admits every `module.<name>` READ
+    # below through ModuleType.__getattr__ but rejects the two assignments. This
+    # checks them the way the reads are already checked. Not `setattr`: bugbear
+    # B010 is selected for this directory by the root [tool.ruff].
+    module: Any = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore[union-attr]
     if not real_host_defaults:
         module.DEFAULT_PEER_CONFIG = _ABSENT_PEER_CONFIG
