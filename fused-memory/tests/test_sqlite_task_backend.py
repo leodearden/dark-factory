@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
+    _REPLACE_ONLY_FIELDS,
     SqliteTaskBackend,
     _classify_residual_group,
     _emit_schema_warning,
@@ -25,10 +26,12 @@ from fused_memory.backends.sqlite_task_backend import (
     _migrate_v3_to_v4,
     _parse_qualified_dep,
     _parse_task_id,
+    _reject_append_on_replace_only_fields,
     _resolve_metadata_mode,
     _StatusWriteNotPersisted,
 )
 from fused_memory.backends.task_backend_errors import (
+    AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
     StatusWriteAuthorityError,
     TaskmasterError,
@@ -5925,6 +5928,128 @@ def test_resolve_metadata_mode_append_false_no_metadata_ok():
     assert _resolve_metadata_mode(None, False, metadata_present=False) == 'replace'
 
 
+# ── _reject_append_on_replace_only_fields (task 4039) ──────────────────────
+#
+# The pure-function twin of _resolve_metadata_mode's guards, for the three
+# text columns that can only ever REPLACE. See the guard's docstring for the
+# defect (append=True silently overwrote description instead of appending).
+
+
+def test_replace_only_fields_pinned():
+    """The covered field set is pinned so adding a fourth replace-only column
+    is a DELIBERATE act, not an accident. ``dependencies`` is also
+    replace-only and is deliberately NOT covered (design decision 3): a
+    dependency list is short, structurally visible in ``get_task`` and cheap
+    to re-derive, unlike the multi-KB authored prose the recorded repros
+    destroyed."""
+    assert _REPLACE_ONLY_FIELDS == ('title', 'description', 'priority'), (
+        f'unexpected replace-only field set: {_REPLACE_ONLY_FIELDS!r}'
+    )
+
+
+@pytest.mark.parametrize(
+    'field, value',
+    [
+        ('description', 'x'),
+        ('title', 'x'),
+        ('priority', 'high'),
+    ],
+)
+def test_reject_append_on_replace_only_fields_raises_per_field(field, value):
+    """append=True with any single replace-only field raises, and the message
+    names that field so the caller knows which one to fix."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, **{field: value})
+    assert field in str(exc.value), (
+        f'message must name the offending field {field!r}; got: {exc.value!s}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_names_all_offenders_in_order():
+    """A call carrying several offenders raises ONCE and names them all, in
+    _REPLACE_ONLY_FIELDS order — deterministic, not set-iteration order."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, description='d', title='t')
+    assert exc.value.fields == ('title', 'description'), (
+        f'offending fields must be in _REPLACE_ONLY_FIELDS order; '
+        f'got {exc.value.fields!r}'
+    )
+    msg = str(exc.value)
+    assert 'title' in msg and 'description' in msg, (
+        f'message must name BOTH offending fields; got: {msg!r}'
+    )
+    assert msg.index('title') < msg.index('description'), (
+        f'message must list offenders in _REPLACE_ONLY_FIELDS order; got: {msg!r}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_typed_error_contract():
+    """The raised error keeps the TaskmasterError/TASKMASTER_TOOL_ERROR shape so
+    every existing ``except TaskmasterError`` site and ``err.code ==
+    'TASKMASTER_TOOL_ERROR'`` branch keeps working unchanged; the subclass
+    exists for isinstance discrimination and a specific wire ``error_type``.
+    Also carries the offending field names and the task id for callers that
+    want to branch structurally rather than on prose."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, description='x', task_id='7')
+    assert isinstance(exc.value, TaskmasterError), (
+        f'must subclass TaskmasterError; mro={type(exc.value).__mro__}'
+    )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    assert exc.value.fields == ('description',), (
+        f'Expected fields == (description,); got {exc.value.fields!r}'
+    )
+    assert exc.value.task_id == '7', (
+        f'Expected task_id == "7"; got {exc.value.task_id!r}'
+    )
+
+
+@pytest.mark.parametrize(
+    'append, kwargs',
+    [
+        # append=True but none of the three replace-only fields — a
+        # details-only or metadata-only write, which is exactly what append
+        # is FOR. Inert.
+        (True,  {}),
+        (True,  {'title': None, 'description': None, 'priority': None}),
+        # append is not the sanctioned True: replace-only fields are honored
+        # as plain overwrites, exactly as before this guard existed.
+        (False, {'description': 'x'}),
+        (None,  {'description': 'x'}),
+        (None,  {'title': 't', 'description': 'd', 'priority': 'high'}),
+        (False, {'title': 't', 'description': 'd', 'priority': 'high'}),
+    ],
+)
+def test_reject_append_on_replace_only_fields_inert_cases(append, kwargs):
+    """The guard is inert for every combination that is not the trap — it must
+    not broaden into a general validator."""
+    assert _reject_append_on_replace_only_fields(append, **kwargs) is None, (
+        f'guard must be inert for append={append!r}, {kwargs!r}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_keys_on_identity_not_truthiness():
+    """``append`` is checked with ``is True``, not truthiness — the same
+    identity check _resolve_metadata_mode's merge+append carve-out uses. A
+    truthy non-bool (e.g. ``1``) is not the sanctioned flag value and does not
+    trip the guard, keeping the two sibling guards on this method consistent
+    about what counts as append=True.
+
+    This pins a cell that is KNOWINGLY left to the details/prompt path (which
+    does key on truthiness), not an oversight, and it is only reachable from
+    an in-process caller that bypasses the wire annotation — the reasoning and
+    the coercion measurement live with the guard itself,
+    sqlite_task_backend.py::_reject_append_on_replace_only_fields."""
+    assert _reject_append_on_replace_only_fields(
+        1,  # pyright: ignore[reportArgumentType] - off-type BY DESIGN, see docstring
+        description='x',
+    ) is None, (
+        'guard must key on `append is True`, not truthiness'
+    )
+
+
 # ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
 
 
@@ -6105,6 +6230,291 @@ async def test_update_task_bare_append_false_rejected_preserves_blob(backend, pr
     assert meta.get('_causation_id') == 'keep', f'original blob wiped: {meta}'
     assert meta.get('extra') == 'keep2', f'original blob wiped: {meta}'
     assert 'files' not in meta, f'rejected write must not land: {meta}'
+
+
+# ── update_task append-on-replace-only-fields, end-to-end (task 4039) ──────
+#
+# The headline defect: update_task(description=…, append=True) silently
+# OVERWROTE the description instead of appending. Tests 1-5 pin the
+# rejection; the fence below them pins everything the guard must NOT touch.
+
+_ORIGINAL_DESCRIPTION = (
+    'ORIGINAL defect report. ' * 40
+    + 'This is the multi-KB authored prose the four recorded live repros '
+    'destroyed — it exists nowhere else and cannot be re-derived.'
+)
+
+
+@pytest.mark.asyncio
+async def test_update_task_description_append_true_rejected_preserves_description(
+    backend, project_root,
+):
+    """The headline task-4039 repro: an append=True description write is
+    REJECTED and the stored description is left byte-identical. The raise
+    fires before the DB txn, so the original is never touched and the
+    rejected addendum never lands."""
+    await backend.add_task(
+        project_root=project_root, title='t', description=_ORIGINAL_DESCRIPTION,
+    )
+    addendum = '\n\n--- PRD ADOPTION ---\nthis was meant to be appended'
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, description=addendum, append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    assert 'description' in str(exc.value), (
+        f'message must name the offending field; got: {exc.value!s}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'original description must survive verbatim; got: '
+        f'{task["description"]!r}'
+    )
+    assert 'PRD ADOPTION' not in task['description'], (
+        f'rejected write must not land: {task["description"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'ORIGINAL TITLE', 'x-new'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_title_and_priority_append_true_rejected(
+    backend, project_root, field, original, incoming,
+):
+    """title and priority share description's unconditional-overwrite
+    treatment, so they are covered in the same pass — rejected, and the
+    seeded original survives."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        priority=original if field == 'priority' else 'medium',
+    )
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, append=True, **{field: incoming},
+        )
+    assert field in str(exc.value), (
+        f'message must name {field!r}; got: {exc.value!s}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == original, (
+        f'{field} must be unchanged after the rejection; got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_names_all_offending_fields(
+    backend, project_root,
+):
+    """One call carrying several offenders raises ONCE and reports them all,
+    so the caller fixes every field in a single round-trip."""
+    await backend.add_task(
+        project_root=project_root, title='ORIGINAL TITLE',
+        description=_ORIGINAL_DESCRIPTION,
+    )
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            description='addendum', title='new title', append=True,
+        )
+    assert exc.value.fields == ('title', 'description'), (
+        f'Expected offenders in _REPLACE_ONLY_FIELDS order; '
+        f'got {exc.value.fields!r}'
+    )
+    msg = str(exc.value)
+    assert 'title' in msg and 'description' in msg, (
+        f'message must name both offenders; got: {msg!r}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['title'] == 'ORIGINAL TITLE', f'title clobbered: {task["title"]!r}'
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'description clobbered: {task["description"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """The guard runs BEFORE the task SELECT, so the rejection beats
+    'No tasks found' — mirroring the status write-authority floor and its
+    test_update_task_status_rejection_precedes_existence_check. This is what
+    makes the guard a pure pre-connection floor rather than a row-aware
+    check."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '99999', project_root=project_root, description='x', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found' not in str(exc.value), (
+        f'append rejection must precede the existence check; got: {exc.value!s}'
+    )
+    assert not isinstance(exc.value, TaskNotFoundError), (
+        f'Expected AppendUnsupportedFieldError, not a not-found error: '
+        f'{type(exc.value).__name__}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_precedes_metadata_mode_resolution(
+    backend, project_root,
+):
+    """A call tripping BOTH this guard and _resolve_metadata_mode's
+    merge+append carve-out raises AppendUnsupportedFieldError — the
+    content-loss guard wins. Either ordering is correct (nothing is written
+    both ways), so it is chosen on which message helps more: the
+    description-wipe is the failure mode that was SILENT and destroyed
+    content four times, while the metadata contradiction already raises
+    today. Pinned so it cannot drift."""
+    await backend.add_task(
+        project_root=project_root, title='t', description=_ORIGINAL_DESCRIPTION,
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'keep2'}),
+    )
+    with pytest.raises(AppendUnsupportedFieldError):
+        await backend.update_task(
+            '1', project_root=project_root, description='x',
+            metadata=json.dumps({'k': 'v'}), metadata_mode='merge', append=True,
+        )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('_causation_id') == 'keep', f'metadata disturbed: {meta}'
+    assert meta.get('extra') == 'keep2', f'metadata disturbed: {meta}'
+    assert 'k' not in meta, f'rejected write must not land: {meta}'
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'description clobbered: {task["description"]!r}'
+    )
+
+
+# ── Non-regression fence for the task-4039 guard ───────────────────────────
+#
+# These pass on pre-guard code too — deliberately green-on-arrival. They
+# exist so the wiring step fails loudly if the guard is over-broadened past
+# `append is True` + the three replace-only columns.
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_append_true_still_concatenates(
+    backend, project_root,
+):
+    """A plain details append=True write (no metadata_mode) still
+    concatenates. append's ACTUAL job must be untouched by the guard; the
+    suite otherwise covers this only via the metadata_mode='merge' variant."""
+    await backend.add_task(project_root=project_root, title='t', details='D0')
+    await backend.update_task(
+        '1', project_root=project_root, details='D1', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['details'] == 'D0\n\nD1', (
+        f'details append=True must concatenate; got {task["details"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_append_true_still_concatenates(
+    backend, project_root,
+):
+    """Same for the legacy prompt= path, which feeds details when no explicit
+    details is passed."""
+    await backend.add_task(project_root=project_root, title='t', details='D0')
+    await backend.update_task(
+        '1', project_root=project_root, prompt='D1', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['details'] == 'D0\n\nD1', (
+        f'prompt append=True must concatenate; got {task["details"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'old title', 'new title'),
+        ('description', 'old description', 'new description'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_replace_only_fields_unaffected_when_append_omitted(
+    backend, project_root, field, original, incoming,
+):
+    """With append omitted the three columns still overwrite, exactly as
+    before — the guard closes the trap without changing any call shape that
+    works today."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        description=original if field == 'description' else None,
+        priority=original if field == 'priority' else 'medium',
+    )
+    await backend.update_task(
+        '1', project_root=project_root, **{field: incoming},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == incoming, (
+        f'{field} must still overwrite when append is omitted; '
+        f'got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'old title', 'new title'),
+        ('description', 'old description', 'new description'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_replace_only_fields_unaffected_under_append_false(
+    backend, project_root, field, original, incoming,
+):
+    """An explicit append=False overwrites without raising — the guard is
+    scoped to `append is True` only, so append=False stays the way a caller
+    confirms a deliberate replace."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        description=original if field == 'description' else None,
+        priority=original if field == 'priority' else 'medium',
+    )
+    await backend.update_task(
+        '1', project_root=project_root, append=False, **{field: incoming},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == incoming, (
+        f'{field} must still overwrite under append=False; got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_only_append_true_still_additive(
+    backend, project_root,
+):
+    """A metadata-only append=True write still resolves to the additive union
+    — _resolve_metadata_mode's legacy shim must be untouched by the new
+    guard."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'items': [1], '_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'items': [2]}), append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['items'] == [1, 2], (
+        f'metadata-only append=True must additive-union: {task["metadata"]}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'sibling key lost: {task["metadata"]}'
+    )
 
 
 @pytest.mark.asyncio
