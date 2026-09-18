@@ -398,7 +398,13 @@ class UndisposedException(Exception):
 
     Attributes:
         list_id: The declaring list.
-        keys: The undisposed keys, sorted.
+        keys: The keys with NO OVERRIDE, sorted — which is not the same set in
+            both cases.  With no default they are exactly the undisposed keys.
+            With a default they are the keys BORROWING it, and which of those
+            are undisposed is not recorded anywhere: D4 makes ``default_covers``
+            a count rather than a list, so the declaration never said which
+            entries the count was for.  The message says so rather than
+            asserting the stronger thing this attribute cannot support.
         covered: How many keys actually have no override.
         default_covers: How many the declaration says the default covers, or
             ``None`` when there is no default.
@@ -416,11 +422,28 @@ class UndisposedException(Exception):
         self.keys = keys
         self.covered = covered
         self.default_covers = default_covers
+        if default_covers is None:
+            detail = (
+                f'declares no default, so every entry needs its own override — {covered} '
+                f'key(s) have none and are undisposed: {list(keys)}. Add an override for each'
+            )
+        else:
+            # NO KEY LIST HERE, deliberately.  The declaration records a COUNT (D4),
+            # so nothing in it says WHICH of the borrowers are the new ones — and
+            # printing all of them under the word "undisposed" names 61 keys when 2
+            # are the finding, which is the same wall of noise the check ordering
+            # above exists to avoid handing back, and a false statement besides.
+            # The borrowers are on :attr:`keys` for a report that wants them.
+            detail = (
+                f'has {covered} key(s) borrowing the default, but declares '
+                f'default_covers={default_covers} — so {covered - default_covers} '
+                'entr(y/ies) are undisposed, and the declaration does not record WHICH. '
+                'Add an override for each new entry, or increment default_covers beside '
+                'the disposition they borrow'
+            )
         super().__init__(
-            f'governed_exceptions: {list_id} declares default_covers={default_covers}, but '
-            f'{covered} key(s) have no override — these are undisposed: {list(keys)}. Add an '
-            'override for each, or increment default_covers beside the disposition they '
-            'borrow. Accepted forms:\n  ' + '\n  '.join(DECLARATION_FORMS)
+            f'governed_exceptions: {list_id} {detail}. Accepted forms:\n  '
+            + '\n  '.join(DECLARATION_FORMS)
         )
 
 
@@ -569,6 +592,22 @@ def governed_exceptions(
         )
 
     declared_keys = tuple(keys)
+    # BEFORE the duplicate check, and before every set operation below it, because
+    # all of them sort: a key set of mixed types makes `sorted` raise a bare
+    # TypeError, which escapes both MalformedDeclaration (exit 2) and
+    # UndisposedException (exit 1) and so escapes the two-code split this module
+    # is built around.  A governed list keyed by task ids or line numbers is a
+    # natural thing for a declaration author to reach for, so this is a
+    # declaration-site fault, not a type-checker-only one.
+    for key in declared_keys:
+        if not isinstance(key, str):
+            raise MalformedDeclaration(
+                f'governed_exceptions: {list_id} declares the key {key!r}, which is a '
+                f'{type(key).__name__} and not a str. A key is restated verbatim by the '
+                'override that disposes it and rendered into the report, so it needs one '
+                'stable spelling.',
+                value=key,
+            )
     duplicates = sorted(key for key, count in Counter(declared_keys).items() if count > 1)
     if duplicates:
         raise MalformedDeclaration(

@@ -647,14 +647,41 @@ class TestUndisposedException:
         special-case branch for this in the implementation, and there must not
         be one: it is the same "covered > declared" arm as a list with no
         default at all.
+
+        WHICH key is the new one is NOT asserted, because the declaration never
+        said: ``default_covers`` is a count, so all three keys borrow the default
+        and nothing distinguishes the third.  The added key is among the
+        borrowers on ``.keys``, and that is the whole of what is knowable here.
         """
-        message = str(
-            self._raised(keys=['a', 'b', 'c'], default=Debt(TaskRef(5149)), default_covers=2)
+        error = self._raised(
+            keys=['a', 'b', 'c'], default=Debt(TaskRef(5149)), default_covers=2
         )
-        assert "'c'" in message  # the added key
-        assert 'default_covers=2' in message  # the declared count
-        assert '3' in message  # the actual count
+        message = str(error)
+        assert 'c' in error.keys  # the added key is among the borrowers
+        assert 'default_covers=2' in message  # the declared count, as the author wrote it
+        assert '3' in message  # how many actually borrow
+        assert '1 entr' in message  # how many of them are undisposed
         assert 'override' in message and 'increment' in message  # what to do about it
+
+    def test_a_defaulted_list_does_not_call_every_borrower_undisposed(self):
+        """The size at which the misstatement stops being invisible.
+
+        A 61-key list whose default covers 59 has TWO undisposed entries.  Naming
+        all 61 under the word "undisposed" would be false, and would hand an agent
+        reading the red gate a wall of noise whose real cause is two lines — the
+        failure mode the check ordering elsewhere in this module exists to avoid.
+        The count is knowable and is stated; WHICH entries is not, and saying so
+        is the honest report.  Pinned at 61 rather than at 3 because at 3 the
+        difference between the true and the false message is invisible.
+        """
+        keys = _keys(61)
+        error = self._raised(keys=keys, default=Debt(TaskRef(5149)), default_covers=59)
+        message = str(error)
+        assert error.keys == tuple(sorted(keys))  # every borrower, for a report
+        assert not any(key in message for key in keys)  # but not in the prose
+        assert '2 entr' in message  # the number that IS knowable
+        assert 'does not record WHICH' in message  # and the honest statement
+        assert len(message) < len(str(DECLARATION_FORMS)) + 400  # no 992-char wall
 
     def test_is_raised_when_the_declaring_module_is_collected(self, tmp_path):
         """The shape the PRD specifies, observed rather than assumed.
@@ -704,6 +731,19 @@ class TestMalformedDeclaration:
         with pytest.raises(MalformedDeclaration) as excinfo:
             governed_exceptions(list_id, rule, keys, **kwargs)
         return str(excinfo.value)
+
+    @pytest.mark.parametrize('bad_keys', [[1, 2], [1, 'a'], [None], [('a', 'b')]])
+    def test_a_declared_key_that_is_not_a_str(self, bad_keys):
+        """A non-str key escapes BOTH exit codes if it is not caught here.
+
+        Every check below the key set sorts it, so a mixed-type key list raised a
+        bare ``TypeError`` out of ``sorted`` — not MalformedDeclaration (exit 2)
+        and not UndisposedException (exit 1), which is the whole two-code split
+        this module is built around.  A list keyed by task ids or line numbers is
+        a natural thing for a declaration author to pass.
+        """
+        message = self._message(keys=bad_keys)
+        assert repr(bad_keys[0]) in message
 
     def test_a_duplicate_key(self):
         message = self._message(keys=['a', 'b', 'a'], dispositions={'a': Policy('x'), 'b': Policy('y')})
