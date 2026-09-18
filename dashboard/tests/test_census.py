@@ -12,11 +12,19 @@ therefore the claim a future reader is most likely to doubt.
 from __future__ import annotations
 
 import enum
+from types import MappingProxyType
 
 import pytest
 from shared.task_statuses import TERMINAL, TaskStatus
 
-from dashboard.data.census import SUB_VIEWS, TONES, VIEWS, TaskView, build_census
+from dashboard.data.census import (
+    SUB_VIEWS,
+    TONES,
+    VIEWS,
+    CensusVocabularyError,
+    TaskView,
+    build_census,
+)
 
 
 def test_task_view_is_a_str_enum():
@@ -159,3 +167,51 @@ def test_build_census_keeps_an_absent_member_at_zero():
     assert census.counts[TaskStatus.PENDING] == 1
     assert census.total == 1
     assert_views_sum_to_total(census)
+
+
+# ---------------------------------------------------------------------------
+# The vocabulary boundary. An off-vocabulary status means the vocabulary
+# drifted, so build_census refuses loudly rather than dropping the row (which
+# would under-report `total`) or opening a tenth bucket (which would break the
+# nine-key contract every consumer is written against).
+# ---------------------------------------------------------------------------
+
+
+def test_build_census_rejects_an_off_vocabulary_status():
+    """The message names the offending value AND the id that carried it."""
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census({7: TaskStatus.IN_PROGRESS.value, 9: 'archived'})
+    message = str(excinfo.value)
+    assert repr('archived') in message
+    assert repr(9) in message
+
+
+def test_build_census_vocabulary_error_names_the_legal_members():
+    """An operator sees what WAS legal without going to read the enum."""
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census({1: 'archived'})
+    message = str(excinfo.value)
+    assert all(repr(member.value) in message for member in TaskStatus)
+
+
+def test_build_census_reports_every_offender_at_once():
+    """One raise carries all offenders, so a fix is not found one rerun at a time."""
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census({1: 'archived', 2: 'retired', 3: TaskStatus.DONE.value})
+    message = str(excinfo.value)
+    assert repr('archived') in message
+    assert repr('retired') in message
+
+
+def test_build_census_does_not_mutate_the_mapping_it_was_handed():
+    """Purity: the caller's map is an input, never scratch space."""
+    status_map = dict(NINE_MEMBER_MAP)
+    before = dict(status_map)
+    build_census(status_map)
+    assert status_map == before
+
+
+def test_build_census_accepts_an_immutable_mapping():
+    """A MappingProxyType input is read, never written, so it is accepted."""
+    census = build_census(MappingProxyType(dict(NINE_MEMBER_MAP)))
+    assert census.total == 9
