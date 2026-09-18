@@ -936,7 +936,7 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
 
     with (
         patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks),
-        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+        caplog.at_level(logging.WARNING, logger='dashboard.api.escalations'),
     ):
         result = await asyncio.wait_for(
             _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
@@ -962,7 +962,7 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
 
     warnings = [
         r.getMessage() for r in caplog.records
-        if r.levelno >= logging.WARNING and r.name == 'dashboard.app'
+        if r.levelno >= logging.WARNING and r.name == 'dashboard.api.escalations'
     ]
     assert any('whole-operation budget' in m for m in warnings), (
         f'no timeout WARNING was logged (records: {warnings}) — the returned '
