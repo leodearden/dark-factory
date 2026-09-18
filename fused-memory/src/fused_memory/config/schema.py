@@ -2072,6 +2072,22 @@ class CuratorConfig(BaseModel):
     max_turns: int = Field(default=8, ge=3)
 
     # Corpus caps — see design notes in shared/docs (the four-stream pool).
+    #
+    # pool_total_cap is UNREACHABLE at these stock values, and that is worth
+    # knowing before tuning any of them: a maximal pool is anchor(<=1) + 15 +
+    # 10 + 3 = 29 <= 30, so ``_trim_pool``'s ``len(pool) <= total_cap``
+    # short-circuits on every call. The binding constraints are the three
+    # STREAM caps, which is where a genuinely overlapping task is actually
+    # lost — the module stream especially, since it is ordered by status and
+    # priority rather than relevance (see the lock_depth note below).
+    # ``test_config_schema.py::TestCuratorEntryCharCaps`` pins this
+    # arithmetic so an edit that re-strands or un-strands the final trim is
+    # caught here rather than as a silent census.
+    #
+    # These four are deliberately NOT re-tuned by task 5364. Nothing measured
+    # how often they bind; the ``pool_truncated`` census that task installs
+    # (``task_curator.py::PoolWithheld``) IS that instrument, and tuning waits
+    # on what it reports rather than repeating the 2026-04 guess.
     pool_module_cap: int = Field(default=15)
     pool_embedding_cap: int = Field(default=10)
     pool_dependency_cap: int = Field(default=3)
@@ -2100,9 +2116,37 @@ class CuratorConfig(BaseModel):
     # if a decision was already rendered within this window.
     idempotency_ttl_seconds: float = Field(default=600.0)
 
-    # Entry payload limits (applied per pool entry; whole entries trimmed, not
-    # truncated — see design notes on preserving concrete code references).
-    entry_description_chars: int = Field(default=500)
+    # Entry payload limits, applied per pool entry AND to the candidate block
+    # (both sides route through ``task_curator.py::clip_for_prompt``, which
+    # marks what it elided).
+    #
+    # Derived from the live task corpus, measured 2026-09-18 (n=5574 rows;
+    # 1015 pending == the combine-eligible pool side):
+    #   description  mean 2076  p50 1813  p75 2788  p90 3906  p95 4939
+    #   details      mean  950  p50    0  p75  732  p90 2827
+    # At the previous caps (description 500, details 1500) the two were
+    # INVERTED relative to that data: 87.6% of all tasks and 96.1% of pending
+    # ones exceeded the description cap, with a mean 1827-char elision among
+    # those clipped, while only 18.6% exceeded the details cap. For 96% of
+    # combine-eligible pool entries the curator saw roughly the first quarter
+    # of the description — and, before clip_for_prompt, could not tell.
+    #
+    # 2000 is the smallest round cap above p50, so the median task now renders
+    # in full; measured clipping rate 87.6% -> 44.7% (pending 96.1% -> 69.5%).
+    # 1500 was considered and rejected: it still clips the median (58.5% all /
+    # 77.3% pending). description keeps the LARGER cap because it is the
+    # near-always-populated and roughly twice-longer field — parity would
+    # merely soften the inversion rather than end it.
+    #
+    # Cost is computed, not assumed: per-entry rendered worst case 2320 ->
+    # 3820 chars (~580 -> ~955 tok), a full 29-entry pool ~16.8K -> ~27.7K
+    # prompt tokens. Against the measured $0.30574 for a full pool
+    # (esc-task-curator-191) that scales to ~$0.50 under the flat $2.00
+    # single_call_budget_cap_usd — 4x headroom. batch_token_threshold stays at
+    # 50K deliberately: it is what holds a multi-candidate batch under that
+    # same flat per-call ceiling, so easing batch fan-in is the soft threshold
+    # working as designed, not a regression to patch.
+    entry_description_chars: int = Field(default=2000)
     entry_details_chars: int = Field(default=1500)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
