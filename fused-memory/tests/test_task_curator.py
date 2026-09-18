@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -40,6 +41,7 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
+    PoolWithheld,
     TaskCurator,
     _parse_batch_decisions,
     _parse_decision,
@@ -304,6 +306,79 @@ class TestTrimPool:
         kept, dropped_n = _trim_pool(pool, 30)
         assert len(kept) + dropped_n == len(pool)
         assert dropped_n == 11
+
+
+class TestPoolWithheld:
+    """The census that tells the LLM its pool is incomplete.
+
+    Absence of a duplicate in a TRUNCATED pool is not evidence that no
+    duplicate exists, so the prompt has to say when the pool was cut — and
+    say nothing when it was not.
+    """
+
+    def test_empty_census_is_quiet(self):
+        assert PoolWithheld().total == 0
+        assert PoolWithheld().render() is None
+
+    def test_all_zero_counts_are_also_quiet(self):
+        census = PoolWithheld(
+            by_source={'module': 0, 'embedding': 0, 'dependency': 0, 'total_cap': 0},
+            caps={'module': 15},
+        )
+        assert census.total == 0
+        assert census.render() is None
+
+    def test_total_sums_every_source(self):
+        census = PoolWithheld(
+            by_source={'module': 4, 'embedding': 2, 'dependency': 1, 'total_cap': 3},
+        )
+        assert census.total == 10
+
+    def _payload(self, rendered: str) -> dict:
+        """Parse the JSON fact out of the rendered block (no substring matching)."""
+        line = next(
+            line for line in rendered.splitlines() if line.strip().startswith('pool_truncated:')
+        )
+        return json.loads(line.split('pool_truncated:', 1)[1])
+
+    def test_render_emits_a_parseable_pool_truncated_fact(self):
+        census = PoolWithheld(
+            by_source={'module': 7, 'embedding': 3, 'dependency': 0, 'total_cap': 0},
+            caps={
+                'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30,
+            },
+        )
+        rendered = census.render()
+        assert rendered is not None
+        payload = self._payload(rendered)
+        assert payload['withheld'] == {
+            'module': 7, 'embedding': 3, 'dependency': 0, 'total_cap': 0,
+        }
+        assert payload['caps'] == {
+            'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30,
+        }
+
+    def test_render_emits_exactly_one_fact_line(self):
+        census = PoolWithheld(by_source={'module': 1}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        assert rendered.count('pool_truncated:') == 1
+
+    def test_render_carries_the_decision_safety_guidance(self):
+        census = PoolWithheld(by_source={'module': 7}, caps={'module': 15})
+        rendered = census.render()
+        assert rendered is not None
+        lowered = rendered.lower()
+        # Absence in a truncated pool is not proof of absence...
+        assert 'not proof' in lowered
+        # ...so prefer create over a speculative combine.
+        assert 'create' in lowered
+        assert 'combine' in lowered
+
+    def test_is_frozen(self):
+        census = PoolWithheld(by_source={'module': 1})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            census.by_source = {'module': 2}  # type: ignore[misc]
 
 
 class TestCandidateHash:
