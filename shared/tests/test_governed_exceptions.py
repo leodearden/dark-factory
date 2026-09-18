@@ -116,6 +116,7 @@ class TestTicketRef:
             'TKT_ABC',  # the prefix is literal and lower-case
             'tkt_ABCI',  # I, L, O and U are excluded from the alphabet
             'tkt_ABC-DEF',  # punctuation is not in the alphabet
+            'tkt_ABC\n',  # a trailing newline is not part of a ticket id
             5601,  # not a str
         ],
     )
@@ -138,7 +139,20 @@ class TestPolicy:
 
     @pytest.mark.parametrize(
         'bad',
-        ['', 'Not-Kebab', 'has_underscore', 'trailing-', '-leading', 'double--dash', 17],
+        [
+            '',
+            'Not-Kebab',
+            'has_underscore',
+            'trailing-',
+            '-leading',
+            'double--dash',
+            # A TRAILING NEWLINE, which an anchored `match` would have accepted:
+            # Python's `$` matches immediately before one.  The id would then
+            # silently fail to match the ratification row it names, and D3's
+            # closed-world check would report a row that plainly exists as absent.
+            'inv12-x\n',
+            17,
+        ],
     )
     def test_rejects_a_bad_shape_naming_the_value(self, bad):
         with pytest.raises(MalformedDisposition) as excinfo:
@@ -719,7 +733,21 @@ class TestMalformedDeclaration:
         assert 'default_covers=5' in message
         assert '2' in message
 
-    @pytest.mark.parametrize('bad_list_id', ['nodots', '', '.leading', 'trailing.', 'a..b', 17])
+    @pytest.mark.parametrize(
+        'bad_list_id',
+        [
+            'nodots',
+            '',
+            '.leading',
+            'trailing.',
+            'a..b',
+            # A trailing newline: well formed to the eye, and two list ids that
+            # differ only by one would be indistinguishable in every report, which
+            # is exactly the global uniqueness the dotted form exists to give.
+            'a.b\n',
+            17,
+        ],
+    )
     def test_a_list_id_that_is_not_dotted_and_unique(self, bad_list_id):
         message = self._message(list_id=bad_list_id, keys=['a'], dispositions={'a': Policy('x')})
         assert repr(bad_list_id) in message

@@ -74,7 +74,19 @@ __all__ = [
 ]
 
 # A dotted, globally unique list id: non-empty segments joined by single dots.
-_LIST_ID_RE = re.compile(r'^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$')
+#
+# THE THREE ID VALIDATORS ARE APPLIED WITH `fullmatch`, NEVER `match` against an
+# anchored pattern.  Python's `$` also matches immediately before a TRAILING
+# NEWLINE, so an anchored `match` accepts 'inv12-x\n' and 'tkt_ABC\n' — ids
+# carrying an invisible character, which then silently fail to match the
+# ratification row or the ticket they name, and which defeat the global
+# uniqueness the dotted list_id exists to give.  The patterns are therefore left
+# unanchored and the whole-value requirement lives at the call site, the
+# spelling `shared/src/shared/memory_eval_metrics.py::_STAMP_PATTERN` uses for
+# the same reason.  The MARKER patterns further down are a separate case: they
+# end `\s*$` deliberately, because trailing whitespace around a source comment
+# is not part of the operand.
+_LIST_ID_RE = re.compile(r'[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+')
 
 # THE OPERAND PATTERNS, each written once and consumed twice — by the
 # dataclass that validates a hand-written value, and by the marker form that
@@ -103,8 +115,9 @@ _TICKET_ID_PATTERN = r'tkt_[0-9ABCDEFGHJKMNPQRSTVWXYZ]+'
 # doubled hyphen.
 _POLICY_ID_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
 
-_TICKET_ID_RE = re.compile(f'^{_TICKET_ID_PATTERN}$')
-_POLICY_ID_RE = re.compile(f'^{_POLICY_ID_PATTERN}$')
+# Unanchored on purpose, and applied with `fullmatch`; see _LIST_ID_RE above.
+_TICKET_ID_RE = re.compile(_TICKET_ID_PATTERN)
+_POLICY_ID_RE = re.compile(_POLICY_ID_PATTERN)
 
 # The keyword probe.  Case-sensitive on purpose: the grammar D6 publishes is
 # lower-case, so `# DEBT: task 5601` is not a marker at all and must return
@@ -212,7 +225,7 @@ class TicketRef:
                 f'TicketRef: id={self.id!r} must be a str, not {type(self.id).__name__}.',
                 value=self.id,
             )
-        if not _TICKET_ID_RE.match(self.id):
+        if not _TICKET_ID_RE.fullmatch(self.id):
             raise MalformedDisposition(
                 f'TicketRef: id={self.id!r} is not a ticket id — expected the literal '
                 "prefix 'tkt_' followed by one or more Crockford base32 characters "
@@ -242,7 +255,7 @@ class Policy:
                 f'not {type(self.ratified).__name__}.',
                 value=self.ratified,
             )
-        if not _POLICY_ID_RE.match(self.ratified):
+        if not _POLICY_ID_RE.fullmatch(self.ratified):
             raise MalformedDisposition(
                 f'Policy: ratified={self.ratified!r} is not a ratification row id — '
                 'expected kebab-case (lower-case alphanumeric segments joined by single '
@@ -526,7 +539,7 @@ def governed_exceptions(
             back a wall of noise whose one real cause is a line the reader can
             see.
     """
-    if not isinstance(list_id, str) or not _LIST_ID_RE.match(list_id):
+    if not isinstance(list_id, str) or not _LIST_ID_RE.fullmatch(list_id):
         raise MalformedDeclaration(
             f'governed_exceptions: list_id={list_id!r} must be a dotted, globally unique '
             "id such as 'orchestrator.tests.timeout_marker_grandfathered' — non-empty "
