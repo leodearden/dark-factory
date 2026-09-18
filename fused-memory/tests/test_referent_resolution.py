@@ -1706,3 +1706,163 @@ class TestStructuralInputsAreRejectedLoudly:
             declared=None, metadata={}, content='Fixed Task 3127.', group_id=''
         )
         assert resolution.source in REFERENT_SOURCES
+
+
+class TestKnownProjectIdsNarrowing:
+    """The optional project registry, wired from ``MemoryService._known_projects``.
+
+    This is the wiring the module's own docstring used to DEFER — "threading a
+    live project registry is a wiring concern belonging to the leaf that owns
+    the wiring" — which no leaf's decomposed scope ever actually contained.
+    The parameter forwards verbatim to the ONE ``scan_content`` call, so
+    ``.referents``, ``.conflicts`` and ``.ambiguous`` all narrow together and
+    no second scan site can drift from it.
+    """
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    def test_a_junk_qualified_foreign_referent_is_narrowed_out(self):
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors evil_proj:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.referents == ()
+        assert resolution.source == 'none'
+
+    def test_a_genuine_in_registry_foreign_referent_is_preserved(self):
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.referents == (Referent(kind='task', project_id='reify', number='132'),)
+        assert resolution.source == 'derived'
+
+    def test_the_subtractive_invariant_holds_end_to_end(self):
+        """The A3(ii) guarantee, observed at the boundary a caller uses rather
+        than at ``scan_content``'s: a body whose only task mention is contested
+        by a junk qualifier still resolves EMPTY under a live registry, exactly
+        as it does permissively. A registry that MINTED a referent here would
+        hand the downstream verifier a set to act on where today it no-ops."""
+        content = 'Restarted redis at localhost:6379 while finishing task 6379.'
+        narrowed = resolve_referents(
+            declared=None,
+            metadata={},
+            content=content,
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        permissive = resolve_referents(
+            declared=None, metadata={}, content=content, group_id=GROUP
+        )
+        assert narrowed.referents == ()
+        assert narrowed.source == 'none'
+        assert permissive.referents == ()
+        assert permissive.source == 'none'
+
+    def test_ambiguous_reflects_the_same_narrowed_scan(self):
+        """``.ambiguous`` is the value that now rides the wire, so it must come
+        from the SAME narrowed scan as ``.referents`` — one scan, one answer.
+        The junk qualifier is gone from it while the bare number it contested
+        remains."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='Restarted redis at localhost:6379 while finishing task 6379.',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.ambiguous == (Referent(kind='task', number='6379'),)
+
+    def test_a_mapping_of_project_id_to_root_is_accepted_directly(self):
+        """The caller's registry IS a ``{project_id: project_root}`` dict —
+        the shape ``MemoryService._known_projects`` actually holds — not a set
+        the caller has to remember to convert."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors reify:132 and evil_proj:9',
+            group_id=GROUP,
+            known_project_ids={'dark_factory': '/src/dark-factory', 'reify': '/src/reify'},
+        )
+        assert resolution.referents == (Referent(kind='task', project_id='reify', number='132'),)
+
+    @pytest.mark.parametrize(
+        'registry_kwargs',
+        [{}, {'known_project_ids': None}, {'known_project_ids': {}}],
+        ids=['omitted', 'none', 'empty'],
+    )
+    @pytest.mark.parametrize(
+        ('declared', 'metadata', 'content', 'expected_source'),
+        [
+            ([{'kind': 'task', 'id': 3127}], {}, 'mirrors evil_proj:132', 'declared'),
+            (None, {'task_id': 3127}, 'mirrors evil_proj:132', 'metadata'),
+            (None, {}, 'mirrors evil_proj:132', 'derived'),
+            (None, {}, 'no reference at all', 'none'),
+        ],
+        ids=['declared', 'metadata', 'derived', 'none'],
+    )
+    def test_the_permissive_fallback_is_kept_on_every_precedence_path(
+        self, registry_kwargs, declared, metadata, content, expected_source
+    ):
+        """Omitted, None and ``{}`` are byte-identical to HEAD. The
+        empty-registry permissiveness belongs to ``_canonical_allowlist`` and
+        needs no second emptiness check here."""
+        baseline = resolve_referents(
+            declared=declared, metadata=metadata, content=content, group_id=GROUP
+        )
+        resolution = resolve_referents(
+            declared=declared,
+            metadata=metadata,
+            content=content,
+            group_id=GROUP,
+            **registry_kwargs,
+        )
+        assert resolution == baseline
+        assert resolution.source == expected_source
+
+    def test_precedence_is_undisturbed_by_a_live_registry(self):
+        """``declared`` still outranks ``metadata['task_id']``, which still
+        outranks the scan — narrowing changes what the SCAN sees, never which
+        source wins."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={'task_id': 2500},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.source == 'declared'
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+
+    def test_conflicts_are_still_computed_against_the_scan_when_declared(self):
+        """``.conflicts`` is DEFINED as declared-versus-scan, and the scan it is
+        computed against is the narrowed one — so a junk-qualified mention is
+        no longer evidence of a conflict, while an in-registry one still is."""
+        genuine = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert genuine.conflicts == (Referent(kind='task', project_id='reify', number='132'),)
+        junk = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={},
+            content='mirrors evil_proj:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert junk.conflicts == ()
+
+    def test_the_parameter_is_keyword_only(self):
+        """``resolve_referents`` is ``*``-only today; a fifth parameter must not
+        become the one a caller can pass positionally."""
+        with pytest.raises(TypeError):
+            resolve_referents(None, {}, 'mirrors reify:132', GROUP, self.REGISTRY)  # type: ignore[misc]
