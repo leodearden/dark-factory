@@ -2610,7 +2610,17 @@ class SqliteTaskBackend:
         current_version = version_row[0] if version_row is not None else 0
         if current_version >= 4:
             self._candidate_key_index_cache[project_root] = True
-            return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+            # `current_version`, not a literal 4 (task 3816): this gate means
+            # "at or past v4", so once v5 exists a literal would report a
+            # fabricated version for a store that is genuinely further along,
+            # and a caller inspecting this dict to decide whether the store
+            # still needs migrating would be handed a stale answer. Report
+            # what was measured; a future v6 then needs no edit here.
+            return {
+                'index_built': True,
+                'already_at_v4': True,
+                'user_version': current_version,
+            }
 
         async with self._write_lock(project_root):
             conn = await self._get_connection(project_root)
@@ -2621,7 +2631,12 @@ class SqliteTaskBackend:
             current_version = version_row[0] if version_row is not None else current_version
             if current_version >= 4:
                 self._candidate_key_index_cache[project_root] = True
-                return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+                # Measured, not a literal — see the pre-lock return above.
+                return {
+                    'index_built': True,
+                    'already_at_v4': True,
+                    'user_version': current_version,
+                }
 
             result = await _migrate_v3_to_v4(
                 conn,
