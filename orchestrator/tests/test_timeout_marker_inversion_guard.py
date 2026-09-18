@@ -149,7 +149,7 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: definition out of the tree and fails if the two disagree.  This map is a
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 300.0,
+    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 540.0,
     'HEAVY_BARRIER_TEST_TIMEOUT': 300.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
@@ -624,8 +624,12 @@ class TestVerifyCliBudgetConstant:
 
         THIS EXACT COLLAPSE HAPPENED ONCE (2026-09-12, commit 64e24b547f), back
         when the lower edge mirrored the ini default and that default was
-        raised 60 -> 300 fleet-wide.  See DELIBERATE_TIGHT_BOUND_CEILING's
-        comment in _orch_helpers.py for why the edge is now a literal.
+        raised 60 -> 300 fleet-wide.  That default has since moved AGAIN, to 540
+        (2026-09-17, task 5442, this time derived from measurement rather than
+        picked) -- so had the edge stayed a mirror it would now sit ABOVE the
+        upper one and invert the band rather than merely emptying it.  See
+        DELIBERATE_TIGHT_BOUND_CEILING's comment in _orch_helpers.py for why the
+        edge is a literal.
         """
         assert DELIBERATE_TIGHT_BOUND_CEILING < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
@@ -1437,7 +1441,7 @@ def test_extractor_resolves_a_sanctioned_constant_name() -> None:
         def test_warm_lane() -> None:
             pass
         """
-    ) == {'test_bare': 300.0, 'test_dotted': 300.0, 'test_warm_lane': 960.0}
+    ) == {'test_bare': 540.0, 'test_dotted': 540.0, 'test_warm_lane': 960.0}
 
 
 def test_extractor_yields_none_for_an_unresolvable_expression() -> None:

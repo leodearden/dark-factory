@@ -102,8 +102,10 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 300, raised from 60 on 2026-09-12 -- see that setting's comment,
-# and shared/pyproject.toml for the canonical rationale).  It was a bare
+# (currently 540, raised from 60 on 2026-09-12 and from 300 on 2026-09-17 --
+# see that setting's comment, shared/pyproject.toml for the canonical
+# rationale, and plans/pytest-per-test-timeout-measurement-2026-09-17.md for
+# the measurement the current value is derived from).  It was a bare
 # literal in
 # test_merge_queue_concurrent_verify.py, whose own comment admitted the
 # defect -- "it is still a literal and CAN drift if that setting changes
@@ -112,7 +114,7 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
 # pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
 # add a second copy -- import this one.
-PYPROJECT_DEFAULT_TIMEOUT = 300
+PYPROJECT_DEFAULT_TIMEOUT = 540
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
@@ -176,6 +178,21 @@ PYPROJECT_DEFAULT_TIMEOUT = 300
 # justify.  test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
 # already encoded exactly that independence and is unchanged.
 #
+# 300 -> 540 on 2026-09-17 (task 5442), and NOT because this family was
+# re-measured: the never-narrow rule below forces it, since the ini default it
+# must not fall below moved to 540.  Two things follow and are recorded rather
+# than left to be rediscovered.  (a) The raise incidentally CLEARS this
+# family's own freshly measured requirement -- that task measured a marked
+# member of it (test_merge_lane_ratchet.py) at 51.87s setup under load,
+# 51.87 x 8 = 414.96, which 540 covers and the former 300 did not.  (b) The
+# ANCHOR is nonetheless stale: `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` dates
+# from task 4215 and this family has since been measured at 1.7x that, so the
+# arithmetic that justifies _ABSOLUTE_FLOOR_SECONDS now rests on an
+# out-of-date figure even though its conclusion is no longer binding.
+# Re-anchoring it is deliberately NOT done here -- it would change a constant
+# whose whole point is independence from the ini default, on a task that
+# measured the ini default -- and is filed as follow-up.
+#
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT, which happens to
 # equal 300 but is merge-wait arithmetic (`5 * MERGE_RESULT_TIMEOUT + 75`); an
 # AST sweep performs zero merge waits, so borrowing it would let a future
@@ -183,7 +200,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 300
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 
 # task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
 # token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
@@ -204,6 +221,16 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
 # ONLY when the marker yielded None.  So `@pytest.mark.timeout(N)` is a TWO-WAY
 # override: whatever budget is in force it REPLACES, raising it wherever the
 # ambient budget is smaller and LOWERING it under verify's `--timeout=300`.
+#
+# THE CLI BUDGET AND THE INI DEFAULT NO LONGER COINCIDE.  Both were 300 until
+# 2026-09-17, when task 5442's measurement raised the ini default to 540 and
+# deliberately left the verify `--timeout=300` alone (that knob lives in yaml,
+# outside a task scoped to "every module pyproject.toml").  So verify now runs
+# TIGHTER than a bare local `pytest`, and this constant -- which names the
+# VERIFY budget, never the ini default -- is the edge that matters for a
+# merge-gating run.  That is exactly why it is a literal rather than derived
+# from PYPROJECT_DEFAULT_TIMEOUT: a mirror would have followed the ini default
+# up to 540 and silently widened the band past what verify actually passes.
 #
 # THE INVERSION BAND.  A marker at N falls in one of three regimes:
 #   * N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough that it reads as a
@@ -249,6 +276,9 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 # a mirror would have followed it: (300, 300) is EMPTY, so every sweep built on
 # this band would pass VACUOUSLY -- green because nothing can offend -- while
 # the 61 in-band markers it was built to ratchet stayed untouched in the tree.
+# Task 5442 then moved the ini default again, to 540, which is a second reason
+# the same mirror would have been wrong: it would now put the lower edge ABOVE
+# the upper one and make the band not merely empty but inverted.
 #
 # The raise did not remove the hazard, only one framing of it.  A marker at 120
 # still REPLACES verify's 300, still `os._exit()`s the xdist worker when a
@@ -258,9 +288,10 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 # looks like a loosening. The edge therefore stays at the value the design
 # always used -- pinned by test_timeout_marker_inversion_guard.py::
 # test_the_band_edges_are_exactly_where_the_design_puts_them -- and stops
-# borrowing a number that can move underneath it. The ini default is expected
-# to move again: 64e24b547f records 300 as INTERIM and judgement-picked, with a
-# follow-up task owning the measured value.
+# borrowing a number that can move underneath it. The ini default DID move
+# again -- 300 -> 540 on 2026-09-17, task 5442, which is the measured value the
+# follow-up this comment anticipated was owed -- and this edge did not move
+# with it, which is the whole point of it having stopped being a mirror.
 DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 

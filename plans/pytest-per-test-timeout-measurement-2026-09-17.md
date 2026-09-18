@@ -220,16 +220,19 @@ to surface faster.
 
 ## Residue, recorded rather than left silent
 
-1. **The whole-tree-scan family's own ceiling is now under-derived by its own
-   rule.** `WHOLE_TREE_SCAN_TEST_TIMEOUT` is anchored to
-   `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` (task 4215, loadavg 120-176). This
-   sweep measured a MARKED member of that family at **51.87s** setup
-   (`orchestrator/tests/test_merge_lane_ratchet.py`) and another at 45.36s call.
-   Under the same 8x rule that family would now derive 420, not 300. This task
-   raises the constant only as far as the never-narrow rule requires (it must not
-   fall below the ini default) and deliberately does NOT re-anchor
-   `_MEASURED_UNDER_LOAD_WORST_CASE` or `_ABSOLUTE_FLOOR_SECONDS`, which are
-   independent of the ini default by design. Filed as a follow-up.
+1. **The whole-tree-scan family's measurement anchor is stale, though its value
+   is no longer binding.** `_ABSOLUTE_FLOOR_SECONDS = 300` is justified by
+   `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` (task 4215, loadavg 120-176) times
+   the same 8x factor. This sweep measured a MARKED member of that family at
+   **51.87s** setup (`orchestrator/tests/test_merge_lane_ratchet.py`) and another
+   at 45.36s call — 1.7x the figure the floor rests on, which would derive 420
+   rather than 300. The family ceiling itself is NOT left short: the never-narrow
+   rule forbids `WHOLE_TREE_SCAN_TEST_TIMEOUT` sitting below the ini default, so
+   it moves to 540 and clears 414.96 comfortably. What remains stale is the
+   ANCHOR under the floor, and re-anchoring it is deliberately not done here —
+   `_ABSOLUTE_FLOOR_SECONDS` exists precisely to be independent of the ini
+   default, so a task that measured the ini default is the wrong place to move
+   it. Filed as a follow-up.
 
 2. **The CLI `--timeout=300` on every verify `test_command` is now TIGHTER than
    the ini default.** A CLI `--timeout` overrides the ini, and `--timeout=300`
