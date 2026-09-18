@@ -764,7 +764,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         async def boom(*a, **k):
             raise RuntimeError('llm down')
@@ -791,7 +791,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='auth error', structured_output=None,
@@ -818,7 +818,7 @@ class TestCurateFallbacks:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='auth error', structured_output=None,
@@ -848,7 +848,7 @@ class TestCurateFallbacks:
         curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='StructuredOutput denied',
@@ -886,7 +886,7 @@ class TestCurateFallbacks:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         failing_result = AgentResult(
             success=False, output='err', structured_output=None,
@@ -1040,7 +1040,7 @@ class TestCurateFallbacks:
         }
 
         async def corpus_with_known_sizes(*a, **k):
-            return [], known_pool_sizes
+            return [], known_pool_sizes, PoolWithheld()
 
         # CuratorFailureError with subtype and cost_usd set.
         budget_error = CuratorFailureError(
@@ -1249,7 +1249,7 @@ class TestCuratorCapHandling:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1276,7 +1276,7 @@ class TestCuratorCapHandling:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1320,7 +1320,7 @@ class TestZeroOutputTimeoutAcceptance:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1372,7 +1372,7 @@ class TestZeroOutputTimeoutAcceptance:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         mock_llm = AsyncMock(side_effect=[zot_result, healthy_result])
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
@@ -1412,7 +1412,7 @@ class TestZeroOutputBreakerCurate:
 
     async def _curate(self, curator, title: str) -> CuratorDecision:
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             return await curator.curate(
@@ -1441,7 +1441,7 @@ class TestZeroOutputBreakerCurate:
 
         # 3rd call with breaker open — LLM must NOT be invoked.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1512,7 +1512,7 @@ class TestZeroOutputBreakerCurate:
 
         # Probe (half-open): should be allowed through and succeed.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1532,7 +1532,7 @@ class TestZeroOutputBreakerCurate:
             await curator.curate(CandidateTask(title='E'), project_id='p', project_root='/x')
 
         async def empty_corpus2(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus2), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -1620,7 +1620,7 @@ class TestZeroOutputBreakerBatchReset:
         mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
@@ -1778,7 +1778,7 @@ class TestCurateHappyPath:
         curator = TaskCurator(config=config, taskmaster=None)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         llm_result = AgentResult(
             success=True,
@@ -1808,6 +1808,7 @@ class TestCurateHappyPath:
             return (
                 _pool_with_ids(('99', 'done')),
                 {'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0},
+                PoolWithheld(),
             )
 
         llm_result = AgentResult(
@@ -1837,6 +1838,7 @@ class TestCurateHappyPath:
             return (
                 _pool_with_ids(('50', 'pending')),
                 {'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0},
+                PoolWithheld(),
             )
 
         llm_result = AgentResult(
@@ -1962,7 +1964,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='Follow-up', spawned_from='100'),
                 project_id='p', project_root='/x',
             )
@@ -2000,7 +2002,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='New bug', files_to_modify=['src/parser.py']),
                 project_id='p', project_root='/x',
             )
@@ -2031,7 +2033,7 @@ class TestBuildCorpus:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='T', files_to_modify=['src/parser.py']),
                 project_id='p', project_root='/x',
             )
@@ -2074,7 +2076,7 @@ class TestBuildCorpus:
         with patch.object(curator, '_ensure_collection', return_value='task_curator_p'), \
              patch.object(curator, '_get_embedder', return_value=mock_embedder), \
              patch.object(curator, '_get_qdrant', return_value=mock_client):
-            pool, sizes = await curator._build_corpus(
+            pool, sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='Near-identical re-file'),
                 project_id='p', project_root='/x',
             )
@@ -3645,7 +3647,7 @@ class TestPrepareCandidate:
         )
         # Empty corpus keeps the section deterministic.
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             prepared = await curator.prepare_candidate(candidate, 'p', '/x')
         assert isinstance(prepared, PreparedCandidate)
@@ -3709,7 +3711,7 @@ class TestCurateBatchHappyPath:
 
         async def fake_corpus(candidate, project_id, project_root):
             nonlocal call_idx
-            result = (pools[call_idx], sizes[call_idx])
+            result = (pools[call_idx], sizes[call_idx], PoolWithheld())
             call_idx += 1
             return result
 
@@ -3771,7 +3773,7 @@ class TestCurateBatchPreDedupCachePollution:
         payload_hash = c1.payload_hash()
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         # The LLM only sees the unique candidate (the first one); emit a 'create'.
         batch_result = AgentResult(
@@ -3822,7 +3824,7 @@ class TestCurateBatchWholeBatchFailure:
         ]
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch.object(
@@ -3865,7 +3867,7 @@ class TestCurateBatchAllAccountsCapped:
         c2 = CandidateTask(title='Cap Two')
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch.object(
@@ -3985,7 +3987,7 @@ class TestCurateBatchBatchTargetIndexRemap:
         # unique_indices[2] = 3.
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         batch_result = AgentResult(
             success=True,
@@ -4094,7 +4096,7 @@ class TestCurateBatchCacheCheck:
         d_new = CuratorDecision(action='create', justification='new-from-llm')
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         single_calls: list = []
 
@@ -4307,7 +4309,7 @@ class TestCuratorCapWaitSanityBound:
         )
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -4801,7 +4803,7 @@ class TestCuratorBlocklistShortCircuit:
             return None
 
         async def fake_corpus(*a, **k):
-            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}, PoolWithheld()
 
         create_result = AgentResult(
             success=True,
@@ -4906,7 +4908,7 @@ def _make_create_mocks():
         return None
 
     async def fake_corpus(*a, **k):
-        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}, PoolWithheld()
 
     create_result = AgentResult(
         success=True,
@@ -5402,7 +5404,7 @@ class TestZeroOutputBreakerBatchPath:
         mock_llm = AsyncMock(return_value=zot)
 
         async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
@@ -7970,7 +7972,7 @@ class TestPerProjectLockDepth:
             raise RuntimeError('no qdrant')
 
         with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
-            pool, _sizes = await curator._build_corpus(
+            pool, _sizes, _withheld = await curator._build_corpus(
                 CandidateTask(title='New bug', files_to_modify=files),
                 project_id='p', project_root=project_root,
             )

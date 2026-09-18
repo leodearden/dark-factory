@@ -1532,7 +1532,7 @@ class TaskCurator:
             )
 
         try:
-            pool, pool_sizes = await self._build_corpus(
+            pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
             )
         except Exception as exc:
@@ -1654,7 +1654,7 @@ class TaskCurator:
         degrade to an empty pool — same behaviour as inside ``curate_batch``.
         """
         try:
-            pool, pool_sizes = await self._build_corpus(
+            pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
             )
         except Exception as exc:
@@ -2414,8 +2414,16 @@ class TaskCurator:
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
-    ) -> tuple[list[_PoolEntry], dict[str, int]]:
-        """Assemble the four-stream pool for the LLM prompt."""
+    ) -> tuple[list[_PoolEntry], dict[str, int], PoolWithheld]:
+        """Assemble the four-stream pool for the LLM prompt.
+
+        Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
+        :class:`PoolWithheld` census of everything the caps kept out, counted
+        at EVERY cap rather than only at the final :func:`_trim_pool` — under
+        stock config that final trim never fires (see the pool-cap block in
+        ``config/schema.py::CuratorConfig``), so the stream caps are where the
+        genuinely-overlapping task is actually lost.
+        """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
         # own depth (3..12 across the fleet). The scheduler snapshot already
@@ -2486,12 +2494,18 @@ class TaskCurator:
                 module_matches.append(entry)
 
         module_matches.sort(key=_module_sort_key)
-        for entry in module_matches[: self._config.curator.pool_module_cap]:
+        module_cap = self._config.curator.pool_module_cap
+        # The sort key is status+priority, NOT relevance, so the entries this
+        # cap discards are not the least-similar ones — a genuinely
+        # overlapping task can sit just past it.
+        module_withheld = max(0, len(module_matches) - module_cap)
+        for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
         # Stream 3: embedding neighbors
         embedding_matches: list[_PoolEntry] = []
+        embedding_withheld = 0
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
@@ -2508,7 +2522,8 @@ class TaskCurator:
                 limit=overfetch,
                 with_payload=True,
             )
-            for point in results.points:
+            points = list(results.points)
+            for i, point in enumerate(points):
                 payload = point.payload or {}
                 tid = str(payload.get('task_id', ''))
                 if not tid or tid in seen_ids:
@@ -2523,6 +2538,12 @@ class TaskCurator:
                     continue
                 embedding_matches.append(entry)
                 if len(embedding_matches) >= self._config.curator.pool_embedding_cap:
+                    # The neighbours the cap left unvisited. An UPPER bound on
+                    # what the pool lost — some would have been filtered as
+                    # already-seen or unresolvable — but these are ordered by
+                    # embedding distance, so the closest of them are the most
+                    # likely duplicates in the whole corpus.
+                    embedding_withheld = len(points) - i - 1
                     break
         except Exception as exc:
             logger.debug('task_curator: embedding neighbors failed: %s', exc)
@@ -2555,7 +2576,9 @@ class TaskCurator:
                 if entry is not None:
                     dep_matches.append(entry)
 
-        for entry in dep_matches[: self._config.curator.pool_dependency_cap]:
+        dependency_cap = self._config.curator.pool_dependency_cap
+        dependency_withheld = max(0, len(dep_matches) - dependency_cap)
+        for entry in dep_matches[:dependency_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
@@ -2570,7 +2593,21 @@ class TaskCurator:
             'embedding': sum(1 for e in pool if e.source == 'embedding'),
             'dependency': sum(1 for e in pool if e.source == 'dependency'),
         }
-        return pool, pool_sizes
+        withheld = PoolWithheld(
+            by_source={
+                'module': module_withheld,
+                'embedding': embedding_withheld,
+                'dependency': dependency_withheld,
+                'total_cap': total_cap_dropped,
+            },
+            caps={
+                'module': module_cap,
+                'embedding': self._config.curator.pool_embedding_cap,
+                'dependency': dependency_cap,
+                'total_cap': self._config.curator.pool_total_cap,
+            },
+        )
+        return pool, pool_sizes, withheld
 
     async def _fetch_entry_for_neighbor(
         self,
