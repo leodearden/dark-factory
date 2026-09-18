@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_helpers import MockNode, poll_until
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -1129,12 +1129,12 @@ class TestAddEpisodeStampsDeclaredReferents:
         assert json.loads(json.dumps(payload['referents'])) == payload['referents']
 
 
-def _encoded(source, *referents):
+def _encoded(source, *referents, ambiguous=()):
     from fused_memory.services.memory_service import _encode_referents
 
-    return _encode_referents(
-        ReferentResolution(source=source, referents=tuple(referents)),
-    )
+    return _encode_referents(ReferentResolution(
+        source=source, referents=tuple(referents), ambiguous=tuple(ambiguous),
+    ))
 
 
 #: The exact kwargs `_execute_graphiti_write` hands the backend today, for
@@ -1593,6 +1593,57 @@ class TestReferentsSurviveTheRealQueue:
         assert stats['counts'].get('completed') == 1
 
     @pytest.mark.asyncio
+    async def test_a_flagged_ambiguity_still_vetoes_the_repair_after_the_round_trip(
+        self, real_queue, service,
+    ):
+        """The whole chain in ONE assertion: producer -> JSON -> SQLite ->
+        decode -> executor -> the real reconcile -> zeta's VETO 1.
+
+        Everything else in this file pins one hop, and every OTHER executor-seam
+        assertion uses `()` or `None` — the values that make the veto a no-op.
+        So a defect at ANY hop that lost the set (a dropped key, a fresh empty
+        local, a kwarg not forwarded) would leave those green while re-opening
+        the exact failure the wire key closes: with the set gone, `Task 6379` is
+        simply a non-member of the declared set, `_candidate_pool` falls back to
+        that set, and the finding arrives at eta RESOLVABLE — a repair
+        instruction to repoint the edge onto `Task 3127`.
+
+        `unresolvable` is the observable because the counter increments exactly
+        when `not finding.resolvable`. `set-membership` is asserted beside it so
+        a chain that produced NO finding at all (a silently failed sub-pass)
+        cannot pass by leaving both at zero.
+        """
+        from test_referent_verification import _edge, _episode
+
+        service.graphiti.add_episode = AsyncMock(return_value=_episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-end', target='n-mirror')],
+            nodes=[MockNode(name='Task 6379', uuid='n-end'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        ))
+
+        await real_queue.enqueue(
+            group_id='dark_factory',
+            operation='add_episode',
+            payload=_graphiti_payload(
+                group_id='dark_factory',
+                referents=_encoded(
+                    'derived', Referent(number='3127'),
+                    ambiguous=(Referent(number='6379'),),
+                ),
+            ),
+        )
+
+        await poll_until(
+            lambda: service.referent_finding_counts()['set-membership'] == 1,
+            message='the chain produced no set-membership finding at all',
+        )
+        assert service.referent_finding_counts()['unresolvable'] == 1, (
+            'the finding came out RESOLVABLE, so the producer ambiguity set was '
+            'lost somewhere between enqueue and zeta'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_callback_still_sees_the_key_the_executor_popped(
         self, real_queue, service,
     ):
@@ -1662,6 +1713,35 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         )
 
         assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
+
+    @pytest.mark.asyncio
+    async def test_a_populated_ambiguity_set_reaches_it_intact(self, service):
+        """The one value that makes zeta's VETO 1 actually FIRE.
+
+        Every other assertion at this seam is `()` or `None` — the two values
+        that make the veto a no-op — so a plumbing defect substituting a fresh
+        empty local for the decoded set would leave all of them green. The unit
+        halves are covered on either side (`_decode_referents` returns the set;
+        `test_referent_verification.py::TestTheWireAmbiguitySetIsPreferred`
+        drives the verifier with a populated one); this is the hop between them,
+        and dropping it hands eta an AMBIGUOUS endpoint as a destructive repair
+        instruction — the failure threading the key exists to close.
+        """
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded(
+                'derived', Referent(number='3127'),
+                ambiguous=(Referent(number='6379'),),
+            )),
+        )
+
+        kwargs = service._reconcile_episode_identity.call_args[1]
+        assert kwargs['ambiguous'] == (Referent(number='6379'),)
+        # Asserted together: the two lists are decoded by one helper, so a
+        # defect that crossed them would otherwise read as a pass here.
+        assert kwargs['referents'] == (Referent(number='3127'),)
 
     @pytest.mark.asyncio
     async def test_the_backend_kwargs_are_still_untouched(self, service):
