@@ -18,6 +18,7 @@ expression: the structural guards below read the module source from the LOCAL
 ``shared/src`` tree rather than an installed copy.
 
 TDD pair 1: the Disposition vocabulary (GREEN on impl step-2).
+TDD pair 2: the inline marker parser + INLINE_MARKER_FORMS (GREEN on impl step-4).
 """
 from __future__ import annotations
 
@@ -28,12 +29,14 @@ from pathlib import Path
 import pytest
 
 from shared.governed_exceptions import (
+    INLINE_MARKER_FORMS,
     Debt,
     Disposition,
     MalformedDisposition,
     Policy,
     TaskRef,
     TicketRef,
+    parse_disposition_marker,
 )
 
 # Same src-root expression as shared/tests/conftest.py and
@@ -214,3 +217,176 @@ class TestModuleStructure:
         consumer must never be able to swallow one of them.
         """
         assert not issubclass(MalformedDisposition, ValueError)
+
+
+class TestParseDispositionMarkerAccepts:
+    """D6's grammar, parsed out of the whole COMMENT token as tokenize yields it."""
+
+    @pytest.mark.parametrize(
+        ('comment', 'expected'),
+        [
+            # The three examples printed verbatim in PRD D6.
+            ('# type: ignore[attr-defined]  # debt: task 5601', Debt(TaskRef(5601))),
+            (f'# noqa: E402  # debt: ticket {TICKET_ID}', Debt(TicketRef(TICKET_ID))),
+            (
+                '# pyright: ignore[reportArgumentType]  # ratified: inv12-day-one-test-doubles',
+                Policy('inv12-day-one-test-doubles'),
+            ),
+        ],
+    )
+    def test_the_prd_examples_parse_to_their_values(self, comment, expected):
+        assert parse_disposition_marker(comment) == expected
+
+    def test_a_marker_with_no_suppression_before_it_still_parses(self):
+        """PINNED DELIBERATELY: ``x = 1  # debt: task 5601`` is not this function's violation.
+
+        D6 names two distinct violations — a marker that does not parse, and a
+        marker sitting on a line with no suppression.  Only the first is a
+        property of the disposition grammar.  Detecting the second needs the
+        scanner's kind table (``type: ignore``, ``noqa``, ``pyright: ignore``,
+        ``pragma: no cover``, ``nosec``) and D8's consumer model, and putting a
+        copy of that table here would give it two homes.  So this parses, and
+        the scanner is what reports it.
+        """
+        assert parse_disposition_marker('# debt: task 5601') == Debt(TaskRef(5601))
+
+    @pytest.mark.parametrize(
+        'comment',
+        [
+            '# debt: task 5601',
+            '  # debt: task 5601',
+            '# debt: task 5601  ',
+            '\t# debt: task 5601\t',
+        ],
+    )
+    def test_is_unaffected_by_whitespace_around_the_token(self, comment):
+        """A tokenize COMMENT token carries whatever spacing the author wrote."""
+        original = comment
+        assert parse_disposition_marker(comment) == Debt(TaskRef(5601))
+        assert comment == original
+
+
+class TestParseDispositionMarkerReturnsNone:
+    """Absent marker is None, never a raise — the two-outcome contract's first half."""
+
+    @pytest.mark.parametrize(
+        'comment',
+        [
+            '# type: ignore[attr-defined]',
+            '# noqa: E402',
+            '',
+            '# a plain comment',
+            '# see task 5601',
+            '# ratification pending',  # 'ratified' does not appear as a keyword
+        ],
+    )
+    def test_no_keyword_means_no_marker(self, comment):
+        assert parse_disposition_marker(comment) is None
+
+    def test_an_uppercase_keyword_is_not_a_keyword(self):
+        """PINNED CHOICE: ``# DEBT: task 5601`` returns None, it does not raise.
+
+        The grammar D6 publishes is lower-case, and the keyword probe is
+        case-sensitive, so an upper-case spelling is simply not a marker.
+        Raising instead would make every comment that happens to start with
+        the word DEBT an instrument failure.  The cost of this choice is that a
+        shouted marker is silently not a disposition — which the scanner still
+        catches, because the suppression it sits beside remains undisposed.
+        """
+        assert parse_disposition_marker('# DEBT: task 5601') is None
+
+
+class TestParseDispositionMarkerRejects:
+    """Marker present and unparseable is a raise — the contract's second half."""
+
+    @pytest.mark.parametrize(
+        'comment',
+        [
+            '# debt: soon',  # D6's own named case: an owner that is not a ref
+            '# debt:',
+            '# debt: task',
+            '# debt: task abc',
+            '# debt: task 0',
+            '# debt: task 007',  # a decimal numeral carries no leading zeros
+            '# debt: ticket 5601',
+            '# debt: ticket tkt_lowercase',
+            '# ratified:',
+            '# ratified: Not_Kebab',
+            '# debt: task 5601 and more',  # trailing text after the disposition
+            '# type: ignore  # debt: task 5601 (see also 5602)',
+        ],
+    )
+    def test_names_the_comment_and_publishes_every_accepted_form(self, comment):
+        with pytest.raises(MalformedDisposition) as excinfo:
+            parse_disposition_marker(comment)
+        message = str(excinfo.value)
+        assert repr(comment) in message
+        for form in INLINE_MARKER_FORMS:
+            assert form in message
+
+    def test_two_dispositions_in_one_comment_is_a_violation(self):
+        """"One disposition covers every suppression in that comment" means exactly one.
+
+        Two markers cannot be reconciled without inventing a precedence rule
+        nobody has ruled on, so the parser refuses rather than silently
+        honouring the first.
+        """
+        comment = '# debt: task 5601  # ratified: inv12-day-one-test-doubles'
+        with pytest.raises(MalformedDisposition) as excinfo:
+            parse_disposition_marker(comment)
+        assert repr(comment) in str(excinfo.value)
+
+
+class TestInlineMarkerFormsAreTheOneGrammar:
+    """The published forms and the implemented grammar cannot drift apart."""
+
+    #: Placeholder -> a concrete legal value.  Keyed by the placeholder text as
+    #: it appears in INLINE_MARKER_FORMS, so a form that grows a NEW placeholder
+    #: fails ``test_every_placeholder_has_a_substitution`` below rather than
+    #: silently skipping the round trip.
+    SUBSTITUTIONS = {
+        '<task id>': '5601',
+        'tkt_<ticket id>': TICKET_ID,
+        '<ratification row id>': 'inv12-day-one-test-doubles',
+    }
+
+    #: Which Disposition type each keyword must produce.
+    KEYWORD_TYPES = {'debt:': Debt, 'ratified:': Policy}
+
+    @staticmethod
+    def _fill(form):
+        for placeholder, value in TestInlineMarkerFormsAreTheOneGrammar.SUBSTITUTIONS.items():
+            form = form.replace(placeholder, value)
+        return form
+
+    def test_is_a_non_empty_tuple_of_str(self):
+        assert isinstance(INLINE_MARKER_FORMS, tuple)
+        assert INLINE_MARKER_FORMS
+        assert all(isinstance(form, str) for form in INLINE_MARKER_FORMS)
+
+    @pytest.mark.parametrize('form', INLINE_MARKER_FORMS)
+    def test_every_placeholder_has_a_substitution(self, form):
+        filled = self._fill(form)
+        assert '<' not in filled and '>' not in filled, (
+            f'INLINE_MARKER_FORMS entry {form!r} carries a placeholder this test cannot '
+            'fill. Add it to SUBSTITUTIONS so the round-trip below actually exercises '
+            'the new form.'
+        )
+
+    @pytest.mark.parametrize('form', INLINE_MARKER_FORMS)
+    def test_every_published_form_actually_parses(self, form):
+        """THE ANTI-DRIFT GUARANTEE, made behavioural rather than a wording pin.
+
+        What must not be retyped is the GRAMMAR.  Presentation legitimately
+        differs between an exception message, a CLI rejection line and the
+        implementer-facing prompt block, so the SPOT is a tuple of forms each
+        consumer renders itself — and the way that tuple is kept honest is
+        this: every form it publishes is filled in and fed to the parser, and
+        the value that comes back must be the type the form's keyword promises.
+        A form nobody implemented, or an implementation nobody published, turns
+        this red.
+        """
+        filled = self._fill(form)
+        keywords = [kw for kw in self.KEYWORD_TYPES if kw in form]
+        assert len(keywords) == 1, f'{form!r} must carry exactly one keyword, found {keywords}'
+        assert type(parse_disposition_marker(filled)) is self.KEYWORD_TYPES[keywords[0]]
