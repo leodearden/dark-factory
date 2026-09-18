@@ -438,11 +438,17 @@ def _leg(label: str = 'test', cmd: str | None = _FULL_SUITE, **overrides):
     return entry
 
 
+def _module_yaml(root: Path, prefix: str = 'orchestrator') -> Path:
+    """The `<root>/<prefix>/orchestrator.yaml` the selector reads its command from."""
+    path = root / prefix / 'orchestrator.yaml'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'test_command: "{_FULL_SUITE}"\n', encoding='utf-8')
+    return path
+
+
 def _corpus_with(tmp_path, *commands, prefix='orchestrator', lane='3353', **top):
     """A one-record synthetic root, plus the module yaml the selector reads."""
-    module_yaml = tmp_path / prefix / 'orchestrator.yaml'
-    module_yaml.parent.mkdir(parents=True, exist_ok=True)
-    module_yaml.write_text(f'test_command: "{_FULL_SUITE}"\n', encoding='utf-8')
+    _module_yaml(tmp_path, prefix)
 
     path = _worktree_record(tmp_path, lane, f'attempt-1.{prefix}.summary.json')
     path.write_text(json.dumps(_summary(*commands, **top)), encoding='utf-8')
@@ -1341,6 +1347,134 @@ class TestHostMovementIsReported:
         )
         assert 'HOST MOVEMENT DURING THE RUN' in text
         assert 'rose 1' in text
+
+
+class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
+    """The only seam in this deliverable that crosses a module boundary.
+
+    Everything else on both sides hand-builds the `load` dict — `_load_record`
+    here, `TestCheckRunLoad` and `TestLoadReachesTheSummaryPayload._load` in
+    `orchestrator/tests/test_verify_load_stamp.py` — so neither suite can see a
+    RENAME. Renesting a key in `verify._load_sample`, or in the
+    `{'start','end','xdist'}` composition at its single call site, would leave
+    all of them green while the census silently booked every run under
+    `unstamped` — the bucket whose whole purpose is to never be confused with a
+    reading. That is the same whitelist-drift failure `segments` actually
+    suffered, at the one place no single-module test can reach.
+
+    So this drives the REAL `run_verification` into a corpus-shaped tmp root and
+    reads the summary.json it WRITES with the REAL census.
+    """
+
+    _START_CPU = 1.0
+    _END_CPU = 75.0
+    _END_CPU60 = 40.0
+
+    def _legs_from_a_real_verify(self, tmp_path, monkeypatch):
+        import asyncio  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
+        from shared.psi import PsiSample  # noqa: PLC0415
+        from verify_budget_census import (  # noqa: PLC0415
+            load_records,
+            select_full_suite_legs,
+        )
+
+        from orchestrator import verify  # noqa: PLC0415
+
+        # `OrchestratorConfig(project_root=...)` reads an ambient
+        # ORCH_CONFIG_PATH, so without this the "default" config is whichever
+        # project the runner happens to point at — the same leak
+        # `_target_subprocess_env` scrubs for child processes (task 2957).
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
+        def sample(cpu, cpu60):
+            return PsiSample(
+                cpu_some10=cpu, cpu_some60=cpu60, mem_some10=0.0, mem_full10=0.0,
+                io_some10=0.0, read_ok=True, runqueue_ratio=0.25,
+                runqueue_read_ok=True,
+            )
+
+        # Exactly two readings, start then end. A third call exhausts the
+        # iterator, which `_load_sample`'s never-raise wrapper turns into an
+        # all-null record — and the assertions below then fail loudly rather
+        # than passing on a fabricated reading.
+        readings = iter((
+            sample(self._START_CPU, 0.5),
+            sample(self._END_CPU, self._END_CPU60),
+        ))
+        real_load_sample = verify._load_sample
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            return 0, 'ok', False
+
+        # The worktree IS the corpus path: `<root>/.worktrees/<lane>/` is where
+        # `load_records` looks, and `run_verification` persists into
+        # `<worktree>/.task/verify/` on its own.
+        worktree = tmp_path / '.worktrees' / '3353'
+        (worktree / '.task').mkdir(parents=True, exist_ok=True)
+        _module_yaml(tmp_path)
+
+        with patch.object(verify, '_run_cmd', side_effect=fake_run_cmd), \
+             patch.object(
+                 verify, '_load_sample',
+                 side_effect=lambda: real_load_sample(read=lambda: next(readings)),
+             ):
+            asyncio.run(
+                verify.run_verification(
+                    worktree,
+                    OrchestratorConfig(
+                        project_root=tmp_path, verify_admission_enabled=False,
+                    ),
+                    ModuleConfig(prefix='orchestrator', test_command=_FULL_SUITE),
+                    attempt_id=1,
+                    task_id='3353',
+                    max_retries=0,
+                ),
+            )
+
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+        )
+        assert len(selection.legs) == 1, (
+            f'the real producer wrote nothing the census selects: '
+            f'{selection.rejected_entries} / {selection.rejected_records}'
+        )
+        return selection.legs
+
+    def test_the_census_reads_a_pressure_out_of_a_real_record(
+        self, tmp_path, monkeypatch,
+    ):
+        """`band_pressure` indexes the producer's own keys, not a literal."""
+        from verify_budget_census import band_pressure  # noqa: PLC0415
+
+        legs = self._legs_from_a_real_verify(tmp_path, monkeypatch)
+
+        assert band_pressure(legs[0].load) == self._END_CPU
+
+    def test_a_real_record_bands_instead_of_landing_in_unstamped(
+        self, tmp_path, monkeypatch,
+    ):
+        """The failure this guard exists for: a renamed key books every run as
+        "load not knowable" while every single-module test stays green."""
+        from verify_budget_census import by_load_band  # noqa: PLC0415
+
+        bands = by_load_band(self._legs_from_a_real_verify(tmp_path, monkeypatch))
+
+        assert bands['unstamped']['durations']['n'] == 0
+        assert bands[_heavy_band_name()]['durations']['n'] == 1
+
+    def test_the_movement_section_reads_both_instants_of_a_real_record(
+        self, tmp_path, monkeypatch,
+    ):
+        from verify_budget_census import load_movement  # noqa: PLC0415
+
+        movement = load_movement(self._legs_from_a_real_verify(tmp_path, monkeypatch))
+
+        assert movement['rose'] == 1
+        assert movement['not_knowable'] == 0
+        assert movement['end_cpu_some60']['max'] == self._END_CPU60
 
 
 class TestColdSeparabilityIsReportedNotInferred:
