@@ -524,8 +524,133 @@ No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD 
 **α — `shared.toolcall_markup`: detector, deterministic repairer, committed fixture corpus.** *(intermediate — unlocks β, δ, ε, ζ, θ)*
 Modules: `shared/src/shared/toolcall_markup.py`, `shared/tests/`, `shared/tests/fixtures/toolcall_markup_corpus.jsonl`.
 Implements C1. Extracts the real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
-*Two numbers, both correct — do not reconcile them by editing one.* **334 / 308 / 26** is the **2026-08-05 survey**, measured over that window's transcripts (§2.3, §2.6, §5 D2, §6, and the G6 note below all quote it). **504 records, 443 repaired / 61 unrepairable** is the **committed corpus** at `shared/tests/fixtures/toolcall_markup_corpus.jsonl` as extraction actually landed it — re-derived from that file 2026-08-15 (task 4022). Where this document states a present-tense fact about the committed file (§4 C1 determinism, §10 B13, §11 open question 3) it uses the 504 figures; where it reports what the survey found, it keeps 334.
+*Two numbers, both correct — do not reconcile them by editing one.* **334 / 308 / 26** is the **2026-08-05 survey**, measured over that window's transcripts (§2.3, §2.6, §5 D2, §6, and the G6 note below all quote it). **504 records, 444 repaired / 60 unrepairable** is the **committed corpus** at `shared/tests/fixtures/toolcall_markup_corpus.jsonl` as extraction actually landed it — re-derived from that file 2026-08-15 (task 4022), and 443/61 until task **4502** moved exactly one record repaired-ward on 2026-08-28 (addendum below). Where this document states a present-tense fact about the committed file (§4 C1 determinism, §10 B13, §11 open question 3) it uses the 504 figures; where it reports what the survey found, it keeps 334.
 *Unlocks:* β (the middleware imports `detect`/`repair`), δ, ε.
+
+> **Addendum 2026-08-28 (task 4502) — two rulings on α's envelope-literal blind spots.**
+>
+> **FINDING 1 — the name-echoing closer enumeration gap (esc-4457-1, routed here by task 4457): EXPLICIT NON-GOAL.**
+> `ENVELOPE_LITERALS` stays exactly six members — the `description`, `parameter`,
+> `details` and `content` closers, the canonical opener prefix, and the invoke
+> closer, all canonical-dialect or generic-name. **No name-echoing literal is
+> added.** Two reasons, both structural rather than preferential. §7 already puts
+> re-litigating the write-time/read-time calibration split out of scope and freezes
+> both derived tuples' value AND order — the read-time tuple is zipped `strict=True`
+> against Qdrant filter clauses in `fused-memory/tests/test_mem0_client.py`, so its
+> order is load-bearing. And INV-5 forbids a second enumeration: every name-echoing
+> needle is DERIVED by `closer_for()`, which is the one place a closing tag is
+> spelled.
+>
+> The blind spot esc-4457-1 measured on 2026-08-19 at base `450a92ba64` was
+> subsequently **CLOSED IN CODE by task 4696's `detect_for()`**, which widens the
+> scan with `closer_for(param)` plus the caller's `schema_params`, enumerates no new
+> literal, is a strict superset of `detect()`, and is already wired at the C2
+> boundary. So there is nothing left to enumerate.
+>
+> **The one surviving residual is DECLARED, not overlooked:** `mcp_markup_middleware`
+> deliberately does NOT pass `schema_params` at its `detect_for` call site, leaving a
+> **cross-field misclose ungated**. That omission is argued in place at the call site
+> and pinned by a negative-control test (`TestSelfNameCloserIsSeenAtTheBoundary`).
+> Task 4502 does not reopen it — doing so would re-litigate a landed decision rather
+> than close a blind spot. Named here explicitly so it stays greppable instead of
+> being rediscovered a third time.
+>
+> **FINDING 2 — `repair()` returning `None` on leak-quoting reports (agent-followup-3643): REPAIRED, not exempted.**
+> *Mechanism.* Boundary row B5's guard was a bare-substring refusal — any closing tag
+> anywhere in a recovered item's value. Its own stated rule is narrower ("the value is
+> itself doubly corrupted, so its boundary is a guess"), and 4502 restored the
+> implementation to that rule as an **alternative-boundary test**: an inner closer
+> blocks recovery iff **(i)** it names the item itself, **either dialect's** closer
+> for it — the name-echoing closer **and** the canonical `parameter`, the latter
+> regardless of which dialect the item's *opener* used — or `invoke`; or **(ii)**
+> reading it as this item's terminator also yields a valid parse of the remainder.
+> Otherwise it is quoted prose and recovery proceeds. No allowlist, no record-shape
+> detector, no per-tool carve-out — a narrowing toward the documented contract, not a
+> new exception.
+>
+> *Amended (esc-4502-3), and the amendment is load-bearing.* Condition (i) first
+> shipped as "the item's **opener-dialect** closer (`parameter`)", implemented as
+> `inner_name in (name, closer_name)`. Those two entries coincide only in the
+> canonical dialect: for an **echo**-dialect item `closer_name` IS the item's own
+> name, so the tuple collapsed to one entry and `parameter` fell out of the block set.
+> Measured consequence — a value opening echo-dialect for `agent_id` and closing with
+> the canonical `parameter` closer recovered `agent_id` as `'claude-interactive'` plus
+> that closer plus a whole trailing next-tool-call paragraph, reported as
+> `outcome=repaired` and, under FORWARD_REPAIR, written straight into the tool's
+> arguments. The mirror pairing (canonical opener / echo closer) was refused
+> throughout; the gap existed precisely because one pairing was pinned by a negative
+> control and its mirror was not. `parameter` is therefore listed **categorically**,
+> because `_parse_body` treats it as a *universal* terminator — a property of the
+> parser, not of the opener — and the dialects demonstrably blend. Negative control
+> (d) in `TestQuotedReportIsRepairable` pins the mirror; unlike controls (a)–(c) it is
+> not a both-ways control, and fails without this amendment.
+>
+> *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
+> `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and
+> it is non-negotiable: the C2 middleware forwards it as the repaired argument.
+>
+> *The invariant that was narrowed, and what replaced it.* A RECOVERED value is
+> verbatim caller text under D5 and may legitimately quote a literal — a faithful
+> report of a markup leak quotes the leak. `TestNoStillPoisonedValueEverEscapes`
+> therefore reads "no value trips `detect` **unaccounted for**" rather than "no value
+> trips `detect`": anything still tripping must be a recovered parameter, never the
+> absorbing one, and must be named in a new `quoted_markup_params` field published on
+> the `markup_detected` fact (a tenth key) and on **both** policy payloads. Per INV-2
+> and the repo's loud-over-silent-degradation norm the quoting is made countable
+> rather than silent, and a caller retrying an offered `repaired_call` can see why it
+> still carries a literal and reach for the existing `allow_mcp_markup` override.
+>
+> *Blast radius, measured.* The 504-record committed corpus moves **443/61 → 444/60**.
+> **Exactly one record changed**: `toolu_01XbCz5NFCA6pCvmseyqFgvy`
+> (`mcp__escalation__escalate_info` / `detail`), which is the same underlying leaked
+> call as the two `esc-3514` specimens — so the entire known population of this shape
+> is one call and its two filings. All 444 accepted `clean_value`s still carry no
+> qualifying closer (re-verified, not retyped).
+>
+> *The non-obvious part, recorded so it is not re-derived the hard way.* A **naive
+> narrowing — the ambiguity probe alone, or qualifying inner closers only on schema
+> membership — also flips corpus record 25** (`mcp__plan-tools__add_design_decision` /
+> `decision`). That value opens canonically for `rationale`, closes with the
+> name-echoing `rationale` closer, and is followed by an invoke closer plus the head
+> of a whole NEXT invoke block. The probe does not catch it, because the residue does
+> not itself parse as pseudo-parameters — so the naive rule would accept it and
+> **silently swallow the next tool call's fragment into the recovered `rationale`**,
+> the no-silent-partial-repair failure this module exists to prevent and strictly
+> worse than the `None` it returns today. **Condition (i) is what prevents it**, and
+> it is safe to state categorically because an item's own closing tag inside its own
+> value is a cross-dialect mis-close by definition, never prose about itself.
+>
+> **Follow-on 2026-09-04 (task 4502, same task, later iteration) — the COUNTABILITY
+> half silently no-opped, and every test was green.** The narrowing above shipped
+> correct: the characters land. `quoted_markup_params` did not. It was computed from
+> the **post-coercion** recovered map, while the parameter the carve-out exists for —
+> `escalate_info.evidence`, declared `list[dict[str, Any]] | None` — is decoded to a
+> `list` by `_coerce_recovered` and skipped by the census's `str`-only scan. Measured
+> against the real escalation server with the one record above:
+> `recovered_params=['evidence','suggested_action']` and `quoted_markup_params=[]` —
+> **empty for the entire measured population**. Fixed by taking the census ONCE from
+> the **verbatim** (pre-coercion) map, which is the caller's own text under D5, and
+> threading it to all three publication sites; the same replay now reports
+> `quoted_markup_params=['evidence']`.
+>
+> *Why nothing failed, which is the reusable part.* Every unit pin exercised only
+> **string-typed** parameters, where the pre- and post-coercion values are the same
+> object; and the corpus replay's synthetic tools declare **every** parameter
+> `str | None`, so no test in the suite ever reached `_coerce_recovered`'s decode
+> branch. The anti-vacuity guard (`test_the_carve_out_is_REACHED_by_this_corpus`)
+> passed throughout. **A schema-directed mechanism needs at least one pin driven
+> through a REAL declared type**, and the real-server replay is where it belongs —
+> here, `escalation/tests/test_markup_middleware_registration.py`'s
+> `TestTheQuotedMarkupCensusAgainstTheREALSchema`. That pin ended up at BOTH
+> levels rather than only there, and saying so is the accurate version of this
+> paragraph: `shared/tests/test_mcp_markup_middleware.py`'s
+> `TestQuotedMarkupIsSurfacedForANonStringParameter` drives the same shape through
+> the `escalate_info_typed` toy, which carries that declared type verbatim —
+> measured, moving the census below the coercion fails five tests there. The
+> real-server class stays load-bearing for a different reason than "nowhere else
+> can host it": the toy is a hand-kept **copy**, so the real-server class is the
+> one that fails when the original drifts away from the copy. The FINDING 2 ruling
+> above is unchanged.
 *Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
 *G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
 
@@ -653,7 +778,7 @@ No waivers required.
 | B10 | Storm escape fires | 3 repairs within the window on one project | Storm escalation filed once, naming outcome `repaired` |
 | B11 | Sweep atomicity | δ interrupted between temp-write and replace | Target file unchanged and still parses; no partial JSON |
 | B12 | Lazy write-back under concurrency | ε repairs a live plan while a task reads it | Reader observes either the old or the repaired file, never a partial one |
-| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 443 repaired / 61 unrepairable) |
+| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 444 repaired / 60 unrepairable) |
 | B14 | REQUIRED absorbed parameter is recoverable | `add_memory.content` absorbs the REQUIRED `project_id`, which is then absent from the call; both tiers | `on_call_tool` runs before pydantic validation, so the repair is reached: `REJECT_WITH_REPAIR` bounces with `repaired_call.project_id` and `error_type=mcp_markup_detected` (NOT a missing-required-field error) and nothing is written; `FORWARD_REPAIR` executes the tool bound to a required argument that was never on the wire |
 | B15 | The ordering's one precondition | the same call with `strict_input_validation=True` | Middleware never runs; caller gets `Input validation error`; NO `markup_detected` fact and NO storm count — every required-parameter leak is silently unrepairable. Registration (γ) must not enable it |
 
@@ -664,5 +789,6 @@ No waivers required.
 1. **Middleware ordering.** If a server later adds a second middleware, does the markup guard run first? **Suggested resolution:** register it first and assert its position in a test. Decide during γ.
    *Partly settled (task 4022, empirically, fastmcp 3.2.2).* The FRAMEWORK-ordering half is no longer open: `on_call_tool` runs strictly BEFORE pydantic argument validation, so a REQUIRED absorbed parameter is recoverable — boundary rows B14/B15, with the one precondition that `strict_input_validation` stays off. This item's actual question — ordering relative to a SECOND middleware, if one is ever added — is untouched by that and remains for γ.
 2. **`add_system_record` / `update_memory` policy tier.** Both are fused-memory writes, so they inherit `REJECT_WITH_REPAIR`; `add_system_record` is recon-stage-only and may not retry. **Suggested resolution:** start with the server default, revisit if the storm counter shows rejections there. Decide during γ.
-3. **Fixture corpus size in-repo.** 504 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 61 unrepairable cases verbatim. Decide during α.
+3. **Fixture corpus size in-repo.** 504 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 60 unrepairable cases verbatim. Decide during α.
+   *Settled (task 4022 landed the corpus; re-confirmed at task 4502).* The committed file is 494,420 bytes with the truncation rule applied — large but not a problem, and re-scoring it in place through the extractor's own `load_corpus`/`write_corpus` yields a one-line diff. **Closed.**
 4. **Retention of the archived transcripts.** The corpus is extracted from `agent-transcripts/`, which is retention-bounded. **Suggested resolution:** the committed corpus is the durable artifact; no dependency on the archive after α.

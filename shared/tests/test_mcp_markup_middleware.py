@@ -1986,11 +1986,18 @@ class TestB9RecoveredNameCollidesWithASuppliedArgument:
 # ---------------------------------------------------------------------------
 
 
-#: The eight keys PRD section 6 contracts for ``markup_detected``, plus the key
-#: naming the fact itself. Asserted as an EXACT set, which catches drift in both
-#: directions: a missing key sends a consumer back to log-scraping, and an extra
-#: value-bearing key would turn the fact stream into a second copy of the
-#: caller's payload.
+#: The eight keys PRD section 6 contracts for ``markup_detected``, the key
+#: naming the fact itself, and — as of task **4502** — ``quoted_markup_params``.
+#: Asserted as an EXACT set, which catches drift in both directions: a missing
+#: key sends a consumer back to log-scraping, and an extra value-bearing key
+#: would turn the fact stream into a second copy of the caller's payload.
+#:
+#: The 4502 addition is NAMES ONLY, so it does not breach that second guard: it
+#: is the subset of ``recovered_params`` whose delivered value still trips
+#: ``detect``, which exists because narrowing boundary row B5 made such a value
+#: possible and INV-2 requires it be countable rather than silent. Extending
+#: this set is deliberate — the exactness is the point, so a key may only
+#: appear here alongside the reason it is not payload.
 FACT_KEYS = {
     'fact',
     'tool',
@@ -1999,6 +2006,7 @@ FACT_KEYS = {
     'misclose',
     'outcome',
     'recovered_params',
+    'quoted_markup_params',
     'agent_id',
     'project',
 }
@@ -3928,6 +3936,318 @@ class TestOnePatternPerEvent:
             'where': 'plan_tools',
         }
         assert payload['recovered_params'] == ['where']
+
+
+class TestQuotedMarkupIsSurfacedNotSilent:
+    """Task **4502**: a recovery whose RECOVERED value still trips ``detect``.
+
+    Boundary row B5 was narrowed so that a faithful REPORT of a markup leak is
+    repaired rather than refused. That necessarily delivers a recovered value
+    still carrying a literal — the report quotes the pattern that tripped the
+    tripwire, and a recovered value is verbatim caller text under invariant D5.
+    Delivering it is the correct outcome: refusing drops exactly the characters
+    the PRD exists to stop dropping.
+
+    But it must be COUNTABLE. Per INV-2 and the repo's loud-over-silent-
+    degradation norm, the guard publishes ``quoted_markup_params`` — the SORTED
+    names of the recovered parameters whose delivered value still trips
+    ``detect`` — on the ``markup_detected`` fact and on BOTH policy payloads. A
+    caller mechanically retrying an offered ``repaired_call`` can then see WHY
+    it still carries a literal, and reach for the existing
+    ``allow_mcp_markup`` override, instead of looping against its own rejection.
+
+    NAMES ONLY, like ``recovered_params``: no fact or payload ever becomes a
+    second copy of the caller's data.
+    """
+
+    #: ``detail`` mis-closes with its own tag, a clean ``project_root`` pair
+    #: follows, and ``suggested_action`` is a final unterminated opener whose
+    #: value QUOTES the content closer — the shape of a leak report. Two
+    #: recovered siblings, exactly ONE of them quoting, so the new field cannot
+    #: pass by accidentally echoing ``recovered_params``.
+    CLEAN = 'The write-time tripwire fired on a value that had absorbed its siblings.'
+    ACTION = (
+        'Narrow the guard; the report quotes matched_pattern='
+        + _closer('content')
+        + ' verbatim, which is caller text, not a leak.'
+    )
+    DETAIL = (
+        CLEAN
+        + _closer('detail') + '\n'
+        + _canonical_opener('project_root') + '/home/leo/src/dark-factory'
+        + '\x3c/parameter>' + '\n'
+        + _canonical_opener('suggested_action') + ACTION
+    )
+
+    ARGS = {'summary': 'A markup leak was reported', 'detail': DETAIL}
+
+    async def _forwarded(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('escalate_info', dict(self.ARGS))
+        return h, result
+
+    async def test_the_call_is_FORWARDED_not_refused(self):
+        """(a) The whole point of the narrowing: those characters land.
+
+        Before task 4502 this shape returned ``None`` from ``repair`` and
+        routed to the unrepairable path, so the recommendation and the evidence
+        were dropped on the floor while the guard reported success at refusing.
+        """
+        h, _ = await self._forwarded()
+
+        assert [f['outcome'] for f in h.facts] == ['repaired']
+        assert h.facts[0]['recovered_params'] == ['project_root', 'suggested_action']
+        assert h.recorder.args == {
+            'tool': 'escalate_info',
+            'summary': 'A markup leak was reported',
+            'detail': self.CLEAN,
+            'suggested_action': self.ACTION,
+            'project_root': '/home/leo/src/dark-factory',
+        }
+
+    async def test_the_fact_names_the_quoting_parameter(self):
+        """(b) The new tenth key on the ``markup_detected`` fact.
+
+        ``project_root`` is recovered too and is clean, so this cannot pass by
+        echoing ``recovered_params``.
+        """
+        h, _ = await self._forwarded()
+
+        assert h.facts[0]['quoted_markup_params'] == ['suggested_action']
+
+    async def test_the_forward_meta_names_the_quoting_parameter(self):
+        """(c) Same list on the ToolResult meta a forwarded caller reads."""
+        _, result = await self._forwarded()
+
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == [
+            'suggested_action'
+        ]
+
+    async def test_the_reject_payload_names_the_quoting_parameter(self):
+        """(d) Same list on the refusal payload, which is the load-bearing one.
+
+        Under ``REJECT_WITH_REPAIR`` the caller is handed a ``repaired_call``
+        to resubmit verbatim — and that call still carries a literal, so a
+        caller retrying it mechanically would be rejected again. Naming the
+        parameter is what turns an infinite retry loop into an adjudicable
+        report.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('escalate_info', dict(self.ARGS))
+        payload = _reject_payload(excinfo)
+
+        assert payload['quoted_markup_params'] == ['suggested_action']
+        # The claim is TRUE of the offered call, not merely asserted about it.
+        assert detect(payload['repaired_call']['suggested_action']) is not None
+        assert detect(payload['repaired_call']['project_root']) is None
+
+    async def test_an_ordinary_repair_reports_the_field_PRESENT_AND_EMPTY(self):
+        """(e) THE NEGATIVE CONTROL, and the shape convention.
+
+        Present-and-empty rather than absent, matching this file's existing
+        convention that ``misclose`` is present-and-null on the unrepairable
+        path: a consumer must never have to tell "nothing quoted" apart from
+        "that emitter forgot the key".
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'submit_task',
+            {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+        )
+
+        assert h.facts[0]['recovered_params'] == ['priority']
+        assert h.facts[0]['quoted_markup_params'] == []
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == []
+
+    async def test_an_unrepairable_value_reports_it_present_and_empty_too(self):
+        """(e), continued — the path with no ``Repair`` at all.
+
+        There is nothing recovered to inspect, so the answer is the empty list
+        for the same present-and-empty reason, not an omitted key.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert h.facts[0]['outcome'] == 'unrepairable'
+        assert h.facts[0]['quoted_markup_params'] == []
+
+
+class TestQuotedMarkupIsSurfacedForANonStringParameter:
+    """Task **4502**: the census against a NON-string declared type.
+
+    The class above pins ``quoted_markup_params`` for ``str``-typed recoveries
+    only, and every other pin in this file does the same. That leaves the shape
+    the carve-out was actually written about untested: the real
+    ``escalate_info`` declares ``evidence: list[dict[str, Any]] | None``, which
+    :func:`_accepted_types` documents as "the parameter this whole mechanism
+    exists for", and a leak REPORT puts the quoted literal in exactly that
+    parameter. So this class drives :func:`escalate_info_typed`, the toy that
+    carries the real server's signature verbatim.
+
+    Two roads make a quoting parameter invisible to a census read off the
+    DELIVERED map, and both are exercised below:
+
+    (a) DECODED. ``_coerce_recovered`` types the verbatim slice into a ``list``,
+        so a ``str``-only scan of the delivered map skips it — while the prose
+        inside those dicts still carries the literal the report is about.
+
+    (b) DROPPED. The slice does not decode, so under ``FORWARD_REPAIR`` it is
+        removed from the forwarded map and preserved in the residue channel.
+        A census read off the delivered map cannot see it either, which makes
+        the same parameter named under ``REJECT_WITH_REPAIR`` and unnamed under
+        ``FORWARD_REPAIR`` — the answer depending on policy rather than on the
+        caller's text.
+
+    ``quoted_markup_params`` is a census of the CALLER'S VERBATIM TEXT (D5),
+    which is why neither road may hide a name. It therefore OVERLAPS
+    ``unrecovered_params`` rather than partitioning against it: the two keys
+    answer different questions — "this text quoted a literal" and "this value
+    did not land" — and a value can honestly be both.
+    """
+
+    #: The clean, ``str``-typed sibling. Present so the census cannot pass by
+    #: echoing ``recovered_params``: exactly one of the two recoveries quotes.
+    CLEAN = 'The write-time tripwire fired on a value that had absorbed its siblings.'
+    ACTION = 'Attach these observations to the root-cause task; nothing to do here.'
+
+    #: (a) Loadable JSON that decodes to the declared ``list`` AND quotes a
+    #: content closer in its prose — the verbatim shape of the committed corpus
+    #: record ``toolu_01XbCz5NFCA6pCvmseyqFgvy``.
+    DECODED = json.dumps([
+        {
+            'observation': (
+                'add_memory rejected: field=content, matched_pattern='
+                + _closer('content')
+                + ', agent_id=claude-task-4502-implementer'
+            ),
+            'measured_at': 'HEAD=6f5c0adeab',
+            'ref': 'add_memory call #1',
+        }
+    ])
+
+    #: (b) NOT loadable JSON, so ``_coerce_recovered`` reports it untypable and
+    #: ``FORWARD_REPAIR`` drops it — and it quotes a content closer too.
+    DROPPED = (
+        'The tripwire reported field=content matched_pattern='
+        + _closer('content')
+        + ' three times; the entries were never serialized as JSON.'
+    )
+
+    REQUIRED = {
+        'task_id': '4502',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'A markup leak was reported',
+    }
+
+    @classmethod
+    def _args(cls, evidence: str) -> dict[str, Any]:
+        """``detail`` mis-closes with its own tag and absorbs both siblings."""
+        return {
+            **cls.REQUIRED,
+            'detail': (
+                cls.CLEAN
+                + _closer('detail') + '\n'
+                + _canonical_opener('suggested_action') + cls.ACTION
+                + '\x3c/parameter>' + '\n'
+                + _canonical_opener('evidence') + evidence
+            ),
+        }
+
+    async def _forwarded(self, evidence: str):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('escalate_info_typed', self._args(evidence))
+        return h, result
+
+    # -- (a) the decoded case ---------------------------------------------
+
+    async def test_a_DECODED_recovery_is_still_counted(self):
+        """The fact names ``evidence`` even though it lands as a ``list``.
+
+        Measured before the fix: ``recovered_params=['evidence',
+        'suggested_action']`` with ``quoted_markup_params=[]`` — the census
+        empty for the sole shape it exists to count.
+        """
+        h, _ = await self._forwarded(self.DECODED)
+
+        assert h.facts[0]['recovered_params'] == ['evidence', 'suggested_action']
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+
+    async def test_the_forward_meta_counts_it_too(self):
+        _, result = await self._forwarded(self.DECODED)
+
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == ['evidence']
+
+    async def test_the_declared_type_delivery_is_UNCHANGED_by_the_census(self):
+        """Counting it must not stop coercing it.
+
+        A guard that simply left the verbatim ``str`` in place would satisfy a
+        ``str``-only census and then die inside pydantic with ``Input should be
+        a valid list`` — the exact failure ``_coerce_recovered`` exists to
+        prevent. The census must be right WHILE the delivery stays right.
+        """
+        h, _ = await self._forwarded(self.DECODED)
+        delivered = h.recorder.args['evidence']
+
+        assert isinstance(delivered, list) and delivered
+        assert all(isinstance(entry, dict) for entry in delivered)
+        assert h.recorder.args['detail'] == self.CLEAN
+
+    async def test_the_reject_payload_counts_it_as_well(self):
+        """The load-bearing path: this ``repaired_call`` is offered for retry."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('escalate_info_typed', self._args(self.DECODED))
+        payload = _reject_payload(excinfo)
+
+        assert payload['quoted_markup_params'] == ['evidence']
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+
+    # -- (b) the dropped case ---------------------------------------------
+
+    async def test_a_DROPPED_recovery_is_still_counted(self):
+        """Naming it must not depend on whether the value happened to land.
+
+        Measured before the fix on this exact input: the verbatim census is
+        ``['evidence']``, the ``FORWARD_REPAIR`` census ``[]`` and the
+        ``REJECT_WITH_REPAIR`` census ``['evidence']`` — the same caller text,
+        named or not by policy alone.
+        """
+        h, result = await self._forwarded(self.DROPPED)
+        warning = meta_of(result)['markup_repair']
+
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+        assert warning['quoted_markup_params'] == ['evidence']
+
+    async def test_it_is_named_by_BOTH_keys_at_once(self):
+        """The deliberate overlap, and the reason it is not a contradiction.
+
+        ``unrecovered_params`` says the value did not land; the census says the
+        caller's text quoted a literal. Both are true of this one parameter,
+        and a reader who expects them to partition would conclude one of the
+        two emitters is wrong.
+        """
+        h, result = await self._forwarded(self.DROPPED)
+        warning = meta_of(result)['markup_repair']
+
+        assert warning['unrecovered_params'] == ['evidence']
+        assert warning['quoted_markup_params'] == ['evidence']
+        # It really was dropped: the delivered call carries no evidence at all.
+        assert h.recorder.args['evidence'] is None
+        # And the census is NOT a copy of recovered_params, which the drop
+        # legitimately shrank.
+        assert h.facts[0]['recovered_params'] == ['suggested_action']
 
 
 def test_this_module_spells_no_raw_envelope_literal():
