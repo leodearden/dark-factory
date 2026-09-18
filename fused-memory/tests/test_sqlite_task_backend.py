@@ -3320,6 +3320,259 @@ def _make_v3_db_with_dup_groups(
     conn.close()
 
 
+def _make_v4_db_for_backfill(
+    db_path: Path,
+    rows: list[tuple[int, str, str, str | None, str]],
+) -> None:
+    """Create a tasks.db seeded directly at schema v4 for the v4->v5 back-fill.
+
+    Mirrors ``_make_v3_db_with_dup_groups`` (same raw-sqlite3 CREATE TABLE
+    with the full v4 column set, same ``dependencies``/``id_counters``
+    tables) but seeds straight at ``user_version = 4`` WITH the partial
+    UNIQUE index a real v4 DB carries, so these tests drive the v4->v5 step
+    in isolation without re-exercising v1->v2->v3->v4.
+
+    ``rows`` entries are ``(id, title, status, metadata_raw, updated_at)``.
+    ``metadata_raw`` is stored VERBATIM — including deliberately unparseable
+    text, which is how the corrupt-row arm is seeded.
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag             TEXT NOT NULL DEFAULT 'master',
+            id              INTEGER NOT NULL,
+            title           TEXT NOT NULL,
+            description     TEXT,
+            details         TEXT,
+            test_strategy   TEXT,
+            status          TEXT NOT NULL,
+            priority        TEXT,
+            metadata        TEXT,
+            updated_at      TEXT NOT NULL,
+            claimant_run_id TEXT,
+            heartbeat_at    TEXT,
+            candidate_key   TEXT,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_candidate_key
+            ON tasks (tag, candidate_key)
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled';
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    max_id = 0
+    for task_id, title, status, metadata_raw, updated_at in rows:
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at, "
+            "candidate_key) VALUES ('master', ?, ?, ?, ?, ?, ?)",
+            (task_id, title, status, metadata_raw, updated_at,
+             compute_candidate_key(title, [])),
+        )
+        max_id = max(max_id, task_id)
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', ?)", (max_id,))
+    conn.execute('PRAGMA user_version = 4')
+    conn.commit()
+    conn.close()
+
+
+# (id, title, status, metadata_raw, updated_at) — the v4->v5 back-fill corpus.
+# Two anchorless pending rows with DISTINCT updated_at values (so a back-fill
+# that stamped one shared clock instead of each row's own updated_at would be
+# caught), one already-anchored pending row whose anchor differs from its
+# updated_at, one row in each non-pending status, and one corrupt pending row.
+_BACKFILL_ROWS: list[tuple[int, str, str, str | None, str]] = [
+    (1, 'anchorless one', 'pending', None, '2026-01-01T00:00:00.000Z'),
+    (2, 'anchorless two', 'pending', '{"source": "keep me"}',
+     '2026-02-02T00:00:00.000Z'),
+    (3, 'already anchored', 'pending',
+     '{"pending_since": "2025-12-25T00:00:00.000Z"}', '2026-03-03T00:00:00.000Z'),
+    (4, 'running', 'in-progress', None, '2026-04-04T00:00:00.000Z'),
+    (5, 'held', 'blocked', '{"source": "x"}', '2026-05-05T00:00:00.000Z'),
+    (6, 'finished', 'done', None, '2026-06-06T00:00:00.000Z'),
+    (7, 'discarded', 'cancelled', None, '2026-07-07T00:00:00.000Z'),
+    (8, 'corrupt', 'pending', 'NOT_JSON_BACKFILL', '2026-08-08T00:00:00.000Z'),
+]
+_BACKFILL_UPDATED_AT = {row[0]: row[4] for row in _BACKFILL_ROWS}
+
+
+def _read_backfill_state(db_path: Path) -> tuple[dict[int, str | None], int]:
+    """Return ``({id: metadata_raw}, user_version)`` via a fresh connection."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        metadata = {
+            row[0]: row[1]
+            for row in conn.execute('SELECT id, metadata FROM tasks ORDER BY id')
+        }
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+    return metadata, user_version
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog):
+    """The one-shot back-fill (task 3816, PRD §C1 back-fill + D4).
+
+    Every task currently ``pending`` with no anchor gets
+    ``pending_since = updated_at`` and ``pending_since_backfilled = true``.
+    Seeding from ``updated_at`` gives the true filing time for a never-touched
+    task and a younger-than-truth anchor for a previously-requeued one: the
+    mis-aging direction is conservative — it can UNDER-age a task but never
+    over-age one, so it cannot manufacture a queue jump. The marker key makes
+    that distortion countable rather than invisible.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v4_db_for_backfill(db_path, _BACKFILL_ROWS)
+    before, _ = _read_backfill_state(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate) -- must not raise.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    after, user_version = _read_backfill_state(db_path)
+
+    # (a) exactly the two anchorless pending rows are anchored from their OWN
+    # updated_at and marked as back-filled.
+    for task_id in (1, 2):
+        parsed = json.loads(after[task_id])
+        assert parsed['pending_since'] == _BACKFILL_UPDATED_AT[task_id]
+        assert parsed['pending_since_backfilled'] is True
+    assert json.loads(after[2])['source'] == 'keep me', 'siblings must survive'
+
+    # (b) the already-anchored pending row keeps its own value and gains no marker.
+    assert after[3] == before[3]
+
+    # (c) NO non-pending row is touched -- the back-fill must not manufacture
+    # anchors for rows that are not waiting.
+    for task_id in (4, 5, 6, 7):
+        assert after[task_id] == before[task_id], f'row {task_id} must be untouched'
+
+    # (d) the corrupt row is skipped and its bytes are unchanged.
+    assert after[8] == 'NOT_JSON_BACKFILL'
+
+    # (e) the chain lands at the new top.
+    assert user_version == 5, f'Expected user_version=5; got {user_version}'
+
+    # (f) exactly one line, reporting the COUNT -- the migration reporting N is
+    # part of the user-observable signal (PRD boundary row 3).
+    lines = [
+        r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()
+    ]
+    assert len(lines) == 1, f'Expected exactly one v4->v5 log line; got {lines}'
+    assert 'rows_backfilled=2' in lines[0], (
+        f'the count of rows touched must be reported; got {lines[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_backfill_is_a_no_op_on_reopen(tmp_path, caplog):
+    """A second open touches nothing and logs nothing -- the gate holds."""
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v4_db_for_backfill(db_path, _BACKFILL_ROWS)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+    after_first, _ = _read_backfill_state(db_path)
+
+    b2 = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await b2.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            await b2.get_tasks(project_root=project_root)
+    finally:
+        await b2.close()
+
+    after_second, user_version = _read_backfill_state(db_path)
+    assert after_second == after_first, 'a second open must touch no row'
+    assert [r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()] == []
+    assert user_version == 5
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_does_not_run_when_v3_to_v4_self_gated(tmp_path, caplog):
+    """THE CRITICAL GUARD (task 3816, design decision 7).
+
+    ``_migrate``'s v3->v4 call does NOT reassign its local ``version`` (it was
+    the last step), and ``_migrate_v3_to_v4`` is SELF-GATING: it stamps
+    ``user_version = 4`` only on the clean-build path and deliberately leaves
+    the version at 3 on a flagged residual, a race, or an unexpected failure,
+    returning ``index_built: False`` so the NEXT open retries.
+
+    So a naive ``if version < 5:`` appended after it would run against a DB
+    still at v3 and stamp 5 — permanently skipping the candidate_key partial
+    UNIQUE index build and converting a deliberately self-healing degraded
+    state into an unrecoverable one, with ``add_task``'s index-independent
+    dedup guard left as the only backstop forever. The v4->v5 step must
+    therefore gate on a RE-READ of ``PRAGMA user_version``.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    # A title-divergent (stale stored key) group flags as residual, so the
+    # v3->v4 step skips the index build and leaves user_version at 3.
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'first title', 'pending', ['a.py'], 'stale-shared-key'),
+            (2, 'second title', 'pending', ['b.py'], 'stale-shared-key'),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+    finally:
+        conn.close()
+
+    assert user_version == 3, (
+        'the v4->v5 step must not stamp 5 over a self-gated v3 DB; got '
+        f'{user_version} -- the candidate_key index build would be skipped forever'
+    )
+    assert not any('candidate_key' in idx for idx in indexes)
+
+
 class _FailingExecuteConn:
     """Delegating proxy over an aiosqlite.Connection that raises from
     `execute()` when `should_fail(sql, self)` returns True.
