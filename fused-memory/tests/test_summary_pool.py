@@ -409,7 +409,7 @@ class TestWriteCycleSummaryLedgerWrite:
 
         assert result is True
 
-        db = ledger_store._db
+        db = ledger_store._access.connection
         cursor = await db.execute(
             "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary' "
             'AND run_id = ?',

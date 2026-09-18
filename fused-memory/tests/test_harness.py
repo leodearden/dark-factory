@@ -2330,7 +2330,7 @@ class TestStage2CycleSummaryHarnessBackstop:
 
     @staticmethod
     async def _count_cycle_summary_rows(ledger_store, run_id: str) -> int:
-        cursor = await ledger_store._require_db().execute(
+        cursor = await ledger_store._access.connection.execute(
             """
             SELECT COUNT(*) FROM recon_ledger
             WHERE project_id = ? AND record_kind = 'cycle_summary'
