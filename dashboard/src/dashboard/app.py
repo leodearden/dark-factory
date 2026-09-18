@@ -130,6 +130,7 @@ from dashboard.data.write_journal import (
     get_operations_breakdown,
 )
 from dashboard.http_pool import reaper_loop
+from dashboard.project_dbs import _burndown_dbs, _cost_dbs, _project_scoped_dbs_labeled
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
@@ -1259,44 +1260,6 @@ async def healthz(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-async def _project_scoped_dbs(
-    config: DashboardConfig,
-    pool: DbPool,
-    rel_path: Path,
-) -> list[aiosqlite.Connection | None]:
-    """Return DB connections for a project-scoped file across all known roots."""
-    seen: set[Path] = {config.project_root}
-    paths: list[Path] = [config.project_root / rel_path]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            paths.append(root / rel_path)
-    return [await pool.get(p) for p in paths]
-
-
-async def _project_scoped_dbs_labeled(
-    config: DashboardConfig,
-    pool: DbPool,
-    rel_path: Path,
-) -> list[tuple[str, aiosqlite.Connection | None]]:
-    """Return labeled (str(root), connection|None) pairs across all known project roots."""
-    seen: set[Path] = {config.project_root}
-    roots: list[Path] = [config.project_root]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            roots.append(root)
-    return [(str(root), await pool.get(root / rel_path)) for root in roots]
-
-
-async def _cost_dbs(
-    config: DashboardConfig,
-    pool: DbPool,
-) -> list[aiosqlite.Connection | None]:
-    """Connections for all known project runs.db files (costs and performance)."""
-    return await _project_scoped_dbs(config, pool, Path('data/orchestrator/runs.db'))
-
-
 async def _performance_resources(
     config: DashboardConfig,
     pool: DbPool,
@@ -1312,14 +1275,6 @@ async def _performance_resources(
             esc_dirs.append(root / 'data' / 'escalations')
     dbs = [await pool.get(p) for p in run_paths]
     return dbs, esc_dirs
-
-
-async def _burndown_dbs(
-    config: DashboardConfig,
-    pool: DbPool,
-) -> list[aiosqlite.Connection | None]:
-    """Connections for all known project burndown.db files."""
-    return await _project_scoped_dbs(config, pool, Path('data/burndown/burndown.db'))
 
 
 # ---------------------------------------------------------------------------
@@ -2486,11 +2441,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
 __all__: Sequence[str] = (
     'app',
     'lifespan',
-    '_project_scoped_dbs',
-    '_project_scoped_dbs_labeled',
-    '_cost_dbs',
     '_performance_resources',
-    '_burndown_dbs',
     '_task_cards_cache_clear',
     '_mcp_probe_state_clear',
     '_load_task_cards',

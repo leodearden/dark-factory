@@ -1218,9 +1218,9 @@ class TestProjectScopedDbsLabeled:
         """Returns (str(root), connection|None) pairs, main project first."""
         from pathlib import Path
 
-        from dashboard.project_dbs import _project_scoped_dbs_labeled
         from dashboard.config import DashboardConfig
         from dashboard.data.db import DbPool
+        from dashboard.project_dbs import _project_scoped_dbs_labeled
 
         root_a = tmp_path / 'A'
         root_b = tmp_path / 'B'
@@ -1255,9 +1255,9 @@ class TestProjectScopedDbsLabeled:
         """When known_project_roots contains the same path as project_root, only one entry."""
         from pathlib import Path
 
-        from dashboard.project_dbs import _project_scoped_dbs_labeled
         from dashboard.config import DashboardConfig
         from dashboard.data.db import DbPool
+        from dashboard.project_dbs import _project_scoped_dbs_labeled
 
         root_a = tmp_path / 'A'
         root_a.mkdir()
@@ -1280,9 +1280,9 @@ class TestProjectScopedDbsLabeled:
         """Returns None connection when the DB file does not exist."""
         from pathlib import Path
 
-        from dashboard.project_dbs import _project_scoped_dbs_labeled
         from dashboard.config import DashboardConfig
         from dashboard.data.db import DbPool
+        from dashboard.project_dbs import _project_scoped_dbs_labeled
 
         root_a = tmp_path / 'A'
         root_a.mkdir()
