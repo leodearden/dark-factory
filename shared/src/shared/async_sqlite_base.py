@@ -4,6 +4,7 @@ Provides:
 - apply_wal_pragmas(conn, busy_timeout_ms): standalone utility to configure WAL + busy_timeout
 - apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
 - connect_daemon(database, **kwargs): open a connection with worker thread marked daemon
+- AtomicConnection: per-connection lock making every access an atomic unit
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -12,8 +13,9 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
-from typing import NamedTuple, Self
+from typing import Any, NamedTuple, Self
 
 import aiosqlite
 
@@ -22,6 +24,7 @@ __all__ = [
     'apply_full_durability_pragmas',
     'connect_daemon',
     'CheckpointResult',
+    'AtomicConnection',
     'AsyncSqliteBase',
 ]
 
@@ -125,6 +128,159 @@ async def connect_daemon(database: str | Path, **kwargs) -> aiosqlite.Connection
     with contextlib.suppress(AttributeError, RuntimeError):
         conn_awaitable._thread.daemon = True
     return await conn_awaitable
+
+
+class AtomicConnection:
+    """Serializes every access on ONE aiosqlite connection into an atomic unit.
+
+    A single aiosqlite connection is shared by every coroutine in a process,
+    and aiosqlite funnels its statements through one worker thread.  That makes
+    the statements ordered but NOT grouped: another coroutine's statement can
+    be queued between any two of yours.  Two failures follow, both observed in
+    production against ``data/reconciliation/reconciliation.db`` and diagnosed
+    in ``plans/recon-sqlite-database-locked-rca-2026-09-16.md``.
+
+    **Pinned read snapshot.**  ``async with conn.execute(sql) as cur: await
+    cur.fetchall()`` is several queued hops, and SQLite pins the read snapshot
+    from the execute hop until the statement completes.  A write queued into
+    that gap fails immediately with ``SQLITE_BUSY_SNAPSHOT`` once a DIFFERENT
+    connection to the same file has committed.  Raising ``busy_timeout`` cannot
+    help, because the busy handler is never invoked while a transaction is
+    already open.  :meth:`read_all` closes the gap by doing execute and fetch
+    in ONE hop; the lock keeps a write from being queued mid-unit.
+
+    **Connection-wide rollback.**  ``rollback()`` is a property of the
+    CONNECTION, not of a unit, so a failing unit used to discard another
+    coroutine's in-flight write — whose own commit then succeeded silently,
+    losing the write with no error anywhere.  Holding the lock across the
+    rollback puts that back inside one unit's blast radius.
+
+    Wraps an already-open connection rather than owning connect, pragmas and
+    schema: those differ per store in load-bearing ways (an in-memory store
+    cannot enable WAL, migration ordering is store-specific) and folding them
+    in would cost one flag per store.
+    """
+
+    def __init__(self, connection: aiosqlite.Connection) -> None:
+        self._connection = connection
+        self._lock = asyncio.Lock()
+        self._holder: asyncio.Task | None = None
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """The wrapped connection, for LIFECYCLE and TEST SUPPORT only.
+
+        No store method may issue statements through it outside ``initialize()``
+        and ``close()``.  Routing every other access through :meth:`read_all`,
+        :meth:`read_one` and :meth:`write` is what makes atomicity structural
+        rather than a convention each new call site has to remember.
+        """
+        return self._connection
+
+    @contextlib.asynccontextmanager
+    async def _held(self, what: str) -> AsyncIterator[None]:
+        """Hold the connection lock for one access, refusing to nest."""
+        if asyncio.current_task() is self._holder:
+            raise RuntimeError(
+                f'AtomicConnection.{what} called from inside this task\'s own open '
+                f'write() unit — nesting two accesses on one connection would '
+                f'deadlock the per-connection lock. Pass the unit\'s connection to '
+                f'a private helper instead of calling back through the primitive.'
+            )
+        async with self._lock:
+            self._holder = asyncio.current_task()
+            try:
+                yield
+            finally:
+                self._holder = None
+
+    async def read_all(
+        self, sql: str, params: Iterable[Any] = ()
+    ) -> list[aiosqlite.Row]:
+        """Run ``sql`` and materialise every row, in ONE queued worker-thread hop.
+
+        ``execute_fetchall`` is a single queued call, so no other coroutine's
+        statement can be queued between the execute and the fetch — which is
+        the whole read-side fix.  Never spell this as ``execute`` + ``fetch*``.
+
+        Rows honour the wrapped connection's ``row_factory``, so ``row['col']``
+        works when it is set to :class:`aiosqlite.Row`.
+        """
+        async with self._held('read_all()'):
+            return list(await self._connection.execute_fetchall(sql, params))
+
+    async def read_one(
+        self, sql: str, params: Iterable[Any] = ()
+    ) -> aiosqlite.Row | None:
+        """Return the first row of ``sql``, or None when it matches nothing.
+
+        The caller MUST bound the query — a primary key, a ``LIMIT`` or an
+        aggregate — because :meth:`read_all` materialises the full result set
+        before this discards all but the first row.
+
+        Delegates rather than nests: the lock is taken by :meth:`read_all`
+        after this method returns control to it, so the re-entrancy guard sees
+        one access, not two.
+        """
+        rows = await self.read_all(sql, params)
+        return rows[0] if rows else None
+
+    @contextlib.asynccontextmanager
+    async def write(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Hold the connection for one write unit: commit on clean exit, else roll back.
+
+        Yields the connection so the unit's statements — including reads it
+        needs to batch, such as a ``DELETE ... RETURNING`` drain — run directly
+        on it.  Routing those back through :meth:`read_all` would nest and is
+        refused.
+
+        ``BaseException`` is caught deliberately: cancellation must roll back
+        too, or aiosqlite's implicit transaction stays open holding the writer
+        lock against every other coroutine on the connection.
+
+        Residual, deliberately not fixed here: a unit that reads and then
+        writes still has a window in which a commit from a DIFFERENT connection
+        to the same file can raise ``SQLITE_BUSY_SNAPSHOT`` between those two
+        statements.  Closing it needs ``BEGIN IMMEDIATE`` or a bounded retry;
+        the lock addresses the in-process, cross-coroutine collision only.
+        """
+        async with self._held('write()'):
+            try:
+                yield self._connection
+                await self._connection.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await self._connection.rollback()
+                raise
+
+    async def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` as one atomic access.
+
+        Returns ``CheckpointResult(-1, -1, -1)`` when the pragma yields no row,
+        preserving the contract the reconciliation stores' callers already
+        depend on: the checkpoint cycle unpacks the tuple and logs raises
+        separately, so turning a benign empty result into an exception would
+        report a checkpoint failure on every affected tick.
+        """
+        async with self._held('checkpoint()'):
+            rows = list(
+                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            )
+        if not rows:
+            return CheckpointResult(-1, -1, -1)
+        row = rows[0]
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+
+    async def close(self) -> None:
+        """Truncate the WAL best-effort, then close the wrapped connection.
+
+        Taking the lock means a unit already in flight commits first rather
+        than being cut off mid-transaction.
+        """
+        async with self._held('close()'):
+            with contextlib.suppress(Exception):
+                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            await self._connection.close()
 
 
 class AsyncSqliteBase(abc.ABC):
