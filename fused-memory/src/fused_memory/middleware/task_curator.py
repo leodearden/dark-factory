@@ -347,8 +347,9 @@ class CuratorDecision:
 class PreparedCandidate:
     """Per-candidate batch input prepared by :meth:`TaskCurator.prepare_candidate`.
 
-    Carries the candidate, its assembled corpus pool, pool sizes, and the
-    estimated user-prompt token count for this candidate's section of the
+    Carries the candidate, its assembled corpus pool, pool sizes, the
+    :class:`PoolWithheld` census of what the caps kept out of that pool, and
+    the estimated user-prompt token count for this candidate's section of the
     batched prompt.  The token estimate is what the worker uses to decide
     whether adding this candidate to the in-flight batch would exceed the
     soft ``batch_token_threshold``.
@@ -358,6 +359,7 @@ class PreparedCandidate:
     pool: list[_PoolEntry]
     pool_sizes: dict[str, int]
     prompt_tokens: int
+    withheld: PoolWithheld | None = None
 
 
 @dataclass(frozen=True)
@@ -1558,6 +1560,7 @@ class TaskCurator:
         try:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
+                withheld=withheld,
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
@@ -1667,14 +1670,19 @@ class TaskCurator:
             )
             pool = []
             pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            withheld = PoolWithheld()
         # batch_index=0 is fine for the estimate — only a couple of digits of
         # rendered length difference at most across realistic batch sizes.
-        section = self._build_batch_section(candidate, pool, 0)
+        # The census IS included: the estimate has to be taken over the section
+        # actually emitted, or the accumulator under-counts every truncated
+        # candidate.
+        section = self._build_batch_section(candidate, pool, 0, withheld=withheld)
         return PreparedCandidate(
             candidate=candidate,
             pool=pool,
             pool_sizes=pool_sizes,
             prompt_tokens=estimate_tokens(section),
+            withheld=withheld,
         )
 
     async def curate_batch(
@@ -1962,10 +1970,13 @@ class TaskCurator:
             pool_sizes_list = [
                 prepared[unique_indices[k]].pool_sizes for k in llm_k_list
             ]
+            withheld_list = [
+                prepared[unique_indices[k]].withheld for k in llm_k_list
+            ]
             try:
                 llm_raw_decisions = await self._call_llm_batch_with_fallback(
                     to_llm_candidates, pools, pool_sizes_list, start,
-                    project_id, project_root,
+                    project_id, project_root, withheld_list=withheld_list,
                 )
             except AllAccountsCappedException:
                 # Cap exhaustion bubbles up so the caller (worker) can defer
@@ -2687,12 +2698,14 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> CuratorDecision:
         # Task 1989: neutral CLI cwd decouples per-call cost from the filing
         # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
-        user_prompt = self._build_user_prompt(candidate, pool)
+        user_prompt = self._build_user_prompt(candidate, pool, withheld=withheld)
 
         # max_budget_usd is now a durable flat $2.00 (task 1980 /
         # esc-task-curator-194): max_budget_usd and single_call_budget_cap_usd
@@ -2768,6 +2781,8 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Invoke one batched LLM call for N candidates and parse the result.
 
@@ -2781,7 +2796,9 @@ class TaskCurator:
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
         n = len(candidates)
-        user_prompt = self._build_batch_user_prompt(candidates, pools)
+        user_prompt = self._build_batch_user_prompt(
+            candidates, pools, withheld_list=withheld_list,
+        )
 
         # Scale by (n-1): the single-call budget (timeout_seconds /
         # max_turns / max_budget_usd) already covers the first item's
@@ -2886,6 +2903,8 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Try one batched LLM call; on :exc:`CuratorFailureError` bisect and retry each half.
 
@@ -2917,10 +2936,11 @@ class TaskCurator:
                 await self.curate(candidates[0], project_id, project_root),
             ]
 
+        censuses: list[PoolWithheld | None] = list(withheld_list or [None] * n)
         try:
             return await self._call_llm_batch(
                 candidates, pools, pool_sizes_list, start,
-                project_id, project_root,
+                project_id, project_root, withheld_list=censuses,
             )
         except AllAccountsCappedException:
             raise
@@ -2940,10 +2960,12 @@ class TaskCurator:
                 self._call_llm_batch_with_fallback(
                     candidates[:mid], pools[:mid], pool_sizes_list[:mid],
                     start, project_id, project_root,
+                    withheld_list=censuses[:mid],
                 ),
                 self._call_llm_batch_with_fallback(
                     candidates[mid:], pools[mid:], pool_sizes_list[mid:],
                     start, project_id, project_root,
+                    withheld_list=censuses[mid:],
                 ),
             )
             # Right-half decisions came back in [0, n-mid)-local space; shift
@@ -3059,7 +3081,7 @@ class TaskCurator:
         candidates: list[CandidateTask],
         pools: list[list[_PoolEntry]],
         *,
-        withheld_list: list[PoolWithheld] | None = None,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> str:
         """Build a batched user prompt containing one labelled section per candidate.
 

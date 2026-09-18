@@ -3589,7 +3589,7 @@ class TestCallLlmBatchWithFallback:
             },
         )
 
-        async def fake_call_llm_batch(cs, ps, pss, st, pid, pr):
+        async def fake_call_llm_batch(cs, ps, pss, st, pid, pr, **kwargs):
             n = len(cs)
             call_log.append(n)
             if n == len(candidates):
@@ -3671,7 +3671,7 @@ class TestCallLlmBatchWithFallback:
         # Right half emits: T2 = create, T3 = drop with batch_target_index=0
         # (right-local 0 == T2).  After shift by mid=2, batch_target_index=2
         # in input-local space (which IS T2's input-local index).
-        async def fake(cs, ps, pss, st, pid, pr):
+        async def fake(cs, ps, pss, st, pid, pr, **kwargs):
             n = len(cs)
             if n == 4:
                 raise CuratorFailureError('top fail', subtype='error_empty_output')
@@ -5179,7 +5179,7 @@ class TestCuratorBatchBlocklistShortCircuit:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -6700,7 +6700,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -6767,7 +6767,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -6828,7 +6828,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return [
                 CuratorDecision(action="create", justification=f"genuinely new {i}",
@@ -7020,7 +7020,7 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             return [
                 CuratorDecision(action="create", justification="new-1",
                                 pool_sizes=empty_sizes, latency_ms=0),
@@ -7456,7 +7456,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. Its output schema has no 'route_deterministic'
             # action, so anything reaching it can only ever come back 'create'.
@@ -7533,7 +7533,7 @@ class TestCuratorBatchRouteDeterministic:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
@@ -7582,7 +7582,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. If c0 reaches it, it can only come back
             # 'create' — its output schema has no 'route_deterministic'.
