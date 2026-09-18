@@ -12,6 +12,7 @@ therefore the claim a future reader is most likely to doubt.
 from __future__ import annotations
 
 import enum
+import json
 from types import MappingProxyType
 
 import pytest
@@ -215,3 +216,49 @@ def test_build_census_accepts_an_immutable_mapping():
     """A MappingProxyType input is read, never written, so it is accepted."""
     census = build_census(MappingProxyType(dict(NINE_MEMBER_MAP)))
     assert census.total == 9
+
+
+# ---------------------------------------------------------------------------
+# The census wire shape. Plain strings throughout, so a consumer reads the
+# payload without the Python enums and json.dumps needs no custom encoder.
+# ---------------------------------------------------------------------------
+
+
+def test_to_wire_emits_exactly_the_four_contract_keys():
+    """The wire shape is closed: counts, total, views, sub_views."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert set(wire) == {'counts', 'total', 'views', 'sub_views'}
+
+
+def test_to_wire_keys_counts_by_the_plain_status_strings():
+    """`'in-progress'`/`'infra-hold'` as written, not enum objects."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert set(wire['counts']) == {member.value for member in TaskStatus}
+    assert all(type(key) is str for key in wire['counts'])
+
+
+def test_to_wire_keys_views_by_the_plain_view_strings():
+    """The view keys cross the wire as the strings the SPA reads."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert set(wire['views']) == {'in_flight', 'backlog', 'terminal'}
+    assert set(wire['sub_views']) == {'running'}
+    assert all(type(key) is str for key in wire['views'])
+
+
+def test_to_wire_is_json_serialisable_without_a_custom_encoder():
+    """A round-trip through json pins that nothing enum-shaped survives to the wire."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_to_wire_parts_sum_to_the_whole():
+    """The PRD's boundary sketch #4, asserted on the wire the SPA actually reads."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert sum(wire['counts'].values()) == wire['total'] == sum(wire['views'].values())
+
+
+def test_to_wire_never_puts_running_in_the_partition():
+    """`running` is a sub-view; a fourth `views` entry would break the sum above."""
+    wire = build_census(NINE_MEMBER_MAP).to_wire()
+    assert 'running' not in wire['views']
+    assert wire['sub_views']['running'] == 1
