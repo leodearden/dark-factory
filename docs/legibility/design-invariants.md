@@ -394,11 +394,16 @@ already an INV-11 defect, where INV-4 only asks about the hundredth.
 
 **Rule**: For an allow-list that tracks exceptions to a rule intended to be
 uniform, every entry is either `Debt(owner)` — owner a live task or ticket:
-not `done`, `cancelled` or `deferred` — or `Policy(ratified)` — the id of a
-row in `docs/legibility/exception-ratifications.yaml`. No entry may be
-neither. Inline suppressions are in scope, under their own register and
-ratchet. This is true per entry for anything added or touched after the
-seed; N legacy entries are neither, and N may only fall.
+not `done`, `cancelled` or `deferred` — or `Policy(ratified)`, the id of a
+row in the ratification table
+(`docs/legibility/exception-ratifications.yaml`), for an exemption that is a
+deliberate permanent ruling rather than debt. No entry may be neither.
+Inline suppressions are in scope, under their own register and ratchet.
+Entries predating the register's seeding may carry no disposition, but their
+count may only fall, never rise; every entry added or touched after it
+carries one. The ratification table lands with the mechanism (House pattern,
+step γ2) and is not in the tree yet, so `Debt(owner)` is today's only
+available disposition.
 
 **Checkable design question(s)**: Does this feature add or touch an
 allow-list, registry, or inline suppression whose entries silence a
@@ -410,15 +415,23 @@ it is a suppressor: where does each entry's disposition live — a cited live
 task, a cited ticket, or a ratification-table row id — and what notices
 when its owner dies?
 
-**Evidence**: `orchestrator/src/orchestrator/verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES`
-carried an entry that outlived the task that owned it (2733, done
-2026-07-18) with no owner recorded on the entry itself, and the same test
-recurred at task 4545's gate on 2026-09-06 (esc-4545-6); a missing-id check
-would not have caught this — only a **liveness** check would have. A census
-of the repo's named allow-lists found several with a live owner the list
-itself does not name: tasks 5149, 5034, 4354, 4920 and 5215 each own a
-burn-down that nothing connects to the entries it retires, so nothing
-notices when one of those tasks completes and entries remain.
+**Evidence**: `verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES` (since retired, in
+b5bf73106e; the incident predates the retirement) carried an entry that
+outlived the task that owned it (2733, done 2026-07-18) with no owner
+recorded on the entry itself, and the same test recurred at task 4545's gate
+on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
+only a **liveness** check would have. Two registers still in the tree make
+that point checkable today:
+`orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
+(owner task 5149) and
+`orchestrator/tests/test_serial_merge_worker_import_guard.py::ALLOWLIST`
+(owner task 5034) each assert every entry still names a live REFERENT — a
+real in-band site, a file that really imports the fixture — while neither
+records an owner on an entry at all: a dead referent fails, a dead owner
+does not. A census of the repo's named allow-lists found the same gap under
+tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
+the entries it retires, so nothing notices when one of those tasks completes
+and entries remain.
 
 **House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
 disposition vocabulary, the ratification table, the inline-marker grammar,
