@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from shared.task_statuses import TaskStatus
 
+from dashboard.data.census import build_census
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
@@ -298,3 +301,47 @@ def test_validate_accepts_a_non_fresh_datum_older_than_its_bound(state):
     """Being past the bound is what `stale` and `lower_bound` exist to say."""
     as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 100)
     validate_datum(datum_measured_at(as_of, state=state, reason='refresh failed'), SERVED_AT)
+
+
+# ---------------------------------------------------------------------------
+# The nesting seam beta consumes: Datum[TaskCensus]. The envelope delegates to
+# a payload that knows its own wire shape, and passes anything else through.
+# ---------------------------------------------------------------------------
+
+NINE_MEMBER_MAP = {index: member.value for index, member in enumerate(TaskStatus)}
+
+
+def census_datum():
+    """A `fresh` Datum wrapping a census of the nine-member fixture."""
+    return Datum(
+        value=build_census(NINE_MEMBER_MAP),
+        as_of=AS_OF,
+        state=DatumState.FRESH,
+        reason=None,
+        freshness_bound_seconds=60,
+    )
+
+
+def test_to_wire_delegates_to_a_payload_that_knows_its_own_wire_shape():
+    """`value` is the census's OWN wire dict, not the dataclass object."""
+    value = census_datum().to_wire()['value']
+    assert isinstance(value, dict)
+    assert value['views']['in_flight'] == 5
+    assert value['total'] == 9
+
+
+def test_a_wrapped_census_survives_a_json_round_trip():
+    """The whole envelope is serialisable — the seam beta serves over HTTP."""
+    wire = census_datum().to_wire()
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_validate_accepts_an_envelope_wrapping_a_census():
+    """Nesting changes nothing about the invariants; the payload is opaque to them."""
+    validate_datum(census_datum(), SERVED_AT)
+
+
+@pytest.mark.parametrize('payload', [42, [1, 2, 3], {'a': 1}], ids=['int', 'list', 'dict'])
+def test_to_wire_still_passes_a_payload_with_no_wire_shape_through(payload):
+    """The pass-through arm is unchanged: no to_wire means emitted verbatim."""
+    assert fresh_datum(value=payload).to_wire()['value'] == payload
