@@ -372,7 +372,7 @@ class TestEndpointBudgetsReachTheMcpLegs:
     def test_api_memory_hands_each_mcp_leg_the_endpoint_budget(self, client):
         from unittest.mock import AsyncMock, patch
 
-        from dashboard.app import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
+        from dashboard.api.memory import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
 
         status = AsyncMock(return_value={'offline': True, 'error': 'down'})
         queue = AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None})
