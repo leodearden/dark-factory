@@ -189,11 +189,18 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
     return '\n'.join([header] + rows)
 
 
-def _unsafe_pgid_reason(pgid: int, proc_pid: int | None) -> str | None:
+def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     """Return a reason string if *pgid* is unsafe to killpg, else ``None``.
 
     Applied as defence-in-depth: even if a caller (or a PID-reuse race) hands
     us a pgid that targets the user session or ourselves, we refuse.
+
+    Public: consumed cross-package by
+    ``orchestrator.deterministic_runner`` as the third defence layer of the
+    task-845 frozen-pgid contract (task 4333). *proc_pid* defaults to
+    ``None`` so a caller that has no companion pid to compare against (e.g.
+    :func:`reap_process_groups`, reaping foreign pgids by number) can omit
+    it and skip the mismatch check below.
     """
     if pgid <= 1:
         return f'pgid <= 1 ({pgid!r})'
@@ -232,7 +239,7 @@ async def terminate_process_group(
     Behaviour:
     1. If *proc* has already been reaped (``returncode is not None``), return
        immediately.  The group is already gone with the leader.
-    2. Sanity-check *pgid* via :func:`_unsafe_pgid_reason`.  If unsafe, log
+    2. Sanity-check *pgid* via :func:`unsafe_pgid_reason`.  If unsafe, log
        and return without signalling.
     3. ``os.killpg(pgid, SIGTERM)``.  Wait up to *grace_secs* for *proc* to
        exit.
@@ -247,7 +254,7 @@ async def terminate_process_group(
         # Already reaped — the entire group has exited along with the leader.
         return
 
-    reason = _unsafe_pgid_reason(pgid, proc.pid)
+    reason = unsafe_pgid_reason(pgid, proc.pid)
     if reason is not None:
         logger.error(
             'terminate_process_group: refusing to killpg — %s. '
@@ -463,7 +470,7 @@ def reap_process_groups(
     - ``'survived'``     — still alive after SIGKILL + *grace_secs* (rare;
       only same-user-uncooperative or unsignalable groups).
     - ``'refused:<reason>'`` — an unsafe pgid (``pgid <= 1`` / self / parent /
-      own group per :func:`_unsafe_pgid_reason`); never signalled at all.
+      own group per :func:`unsafe_pgid_reason`); never signalled at all.
 
     Generalizes :func:`terminate_process_group`'s escalation from one owned
     proc handle to a set of foreign pgids reaped by number.  All ``killpg``
@@ -475,7 +482,7 @@ def reap_process_groups(
     outcomes: dict[int, str] = {}
     safe: list[int] = []
     for pgid in pgids:
-        reason = _unsafe_pgid_reason(pgid, None)
+        reason = unsafe_pgid_reason(pgid)
         if reason is not None:
             outcomes[pgid] = f'refused:{reason}'
             logger.error(

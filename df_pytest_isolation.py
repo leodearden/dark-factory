@@ -1364,7 +1364,7 @@ def _unsafe_pgid_reason(pgid: int) -> str | None:
     """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
 
     Ported (not imported — see the module docstring's stdlib-only constraint)
-    from ``shared.proc_group._unsafe_pgid_reason``, which is the canonical
+    from ``shared.proc_group.unsafe_pgid_reason``, which is the canonical
     async sibling of this function and the place to look for the full history.
 
     This is not belt-and-braces. That module's docstring records task 845: a
