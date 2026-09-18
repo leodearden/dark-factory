@@ -3840,6 +3840,219 @@ class TestCurateBatchHappyPath:
 
 
 # ----------------------------------------------------------------------
+# The census survives the trip from corpus to LLM prompt
+# ----------------------------------------------------------------------
+
+
+class TestWithheldReachesTheLlmPrompt:
+    """End-to-end: a truncated corpus produces a prompt that says so.
+
+    Counting the withheld entries is worthless if the count stops before the
+    prompt — the LLM is the consumer that makes the combine-vs-create call.
+    """
+
+    POOL_SIZES = {'anchor': 0, 'module': 15, 'embedding': 0, 'dependency': 0}
+
+    def _census(self, module: int = 5) -> PoolWithheld:
+        return PoolWithheld(
+            by_source={
+                'module': module, 'embedding': 0, 'dependency': 0, 'total_cap': 0,
+            },
+            caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
+        )
+
+    def _create_result(self) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'action': 'create', 'justification': 'new'},
+            cost_usd=0.01,
+        )
+
+    def _batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': f'c{i}'}
+                for i in range(n)
+            ]},
+            cost_usd=0.02 * n,
+        )
+
+    async def _curate_capturing_prompt(self, curator, candidate, corpus):
+        mock = AsyncMock(return_value=self._create_result())
+        with patch.object(curator, '_build_corpus', side_effect=corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            decision = await curator.curate(candidate, 'p', '/x')
+        return decision, mock.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_single_path_prompt_carries_the_fact(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), census
+
+        _decision, prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert 'pool_truncated:' in prompt
+        assert 'not proof' in prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_single_path_stays_quiet_for_an_untruncated_corpus(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), PoolWithheld()
+
+        _decision, prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert 'pool_truncated' not in prompt
+
+    @pytest.mark.asyncio
+    async def test_single_path_leaves_pool_sizes_alone(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), census
+
+        decision, _prompt = await self._curate_capturing_prompt(
+            curator, CandidateTask(title='T'), corpus,
+        )
+        assert decision.pool_sizes == self.POOL_SIZES
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_stores_the_census(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+
+        async def corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, census
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(CandidateTask(title='T'), 'p', '/x')
+        assert prepared.withheld == census
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_token_estimate_includes_the_fact(self):
+        """The estimate must match the section actually emitted, or the
+        batch-sizing accumulator under-counts every truncated candidate."""
+        from fused_memory.middleware.task_curator import estimate_tokens
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        census = self._census()
+        candidate = CandidateTask(title='T', description='body')
+
+        async def corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, census
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(candidate, 'p', '/x')
+        section = curator._build_batch_section(candidate, [], 0, withheld=census)
+        assert prepared.prompt_tokens == estimate_tokens(section)
+
+    @pytest.mark.asyncio
+    async def test_corpus_failure_yields_a_quiet_census(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+        assert prepared.withheld is None or prepared.withheld.total == 0
+
+    def _prepared(self, title: str, withheld: PoolWithheld | None) -> Any:
+        from fused_memory.middleware.task_curator import PreparedCandidate
+        return PreparedCandidate(
+            candidate=CandidateTask(title=title, description=f'body of {title}'),
+            pool=_pool_with_ids((f'pool-{title}', 'pending')),
+            pool_sizes=dict(self.POOL_SIZES),
+            prompt_tokens=30,
+            withheld=withheld,
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_path_forwards_each_candidates_own_fact(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', None),
+            self._prepared('Beta', self._census(module=7)),
+        ]
+        mock = AsyncMock(return_value=self._batch_result(2))
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+
+        assert len(decisions) == 2
+        prompt = mock.await_args.kwargs['prompt']
+        # Exactly one fact, in Beta's own section.
+        assert prompt.count('pool_truncated:') == 1
+        assert prompt.index('# Candidate batch_index=1') < prompt.index('pool_truncated:')
+        assert '"module": 7' in prompt
+
+    @pytest.mark.asyncio
+    async def test_batch_path_stays_quiet_when_no_pool_was_truncated(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [self._prepared('Alpha', None), self._prepared('Beta', PoolWithheld())]
+        mock = AsyncMock(return_value=self._batch_result(2))
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            await curator.curate_batch_prepared(prepared, 'p', '/x')
+        assert 'pool_truncated' not in mock.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_batch_path_leaves_pool_sizes_alone(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', self._census()),
+            self._prepared('Beta', self._census(module=7)),
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=self._batch_result(2))):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+        for decision in decisions:
+            assert decision.pool_sizes == self.POOL_SIZES
+
+    @pytest.mark.asyncio
+    async def test_bisect_halves_keep_their_own_census(self):
+        """The bisect splits candidates, pools and sizes — the census must
+        travel with them or the right half silently loses its fact."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        prepared = [
+            self._prepared('Alpha', None),
+            self._prepared('Beta', None),
+            self._prepared('Gamma', self._census(module=9)),
+            self._prepared('Delta', None),
+        ]
+        prompts: list[str] = []
+        calls = 0
+
+        async def flaky(*a, **kwargs):
+            nonlocal calls
+            calls += 1
+            prompts.append(kwargs['prompt'])
+            if calls == 1:
+                raise CuratorFailureError('too big', subtype='error_max_turns')
+            return self._batch_result(2)
+
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=flaky)):
+            decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+
+        assert len(decisions) == 4
+        # The right half (Gamma, Delta) re-ran and still carried Gamma's fact.
+        right_half = [pr for pr in prompts[1:] if 'Gamma' in pr]
+        assert right_half
+        assert all('"module": 9' in pr for pr in right_half)
+
+
+# ----------------------------------------------------------------------
 # curate_batch: pre-batch-dedup must not pollute the payload-hash cache
 # ----------------------------------------------------------------------
 
