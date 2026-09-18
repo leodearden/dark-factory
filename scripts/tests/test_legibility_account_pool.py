@@ -25,6 +25,7 @@ deselected by default (``addopts = -m 'not integration'``).
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -1015,6 +1016,93 @@ def test_build_pool_loads_dotenv_before_building_the_gate(tmp_path, monkeypatch)
     )
 
 
+def test_build_pool_does_not_let_the_dotenv_undo_the_units_api_key_strip(
+    tmp_path, monkeypatch,
+):
+    """The .env that carries the POOL also carries ANTHROPIC_API_KEY.
+
+    `load_dotenv` sets any variable not already present, and "not present"
+    is exactly the state `UnsetEnvironment=ANTHROPIC_API_KEY` leaves the
+    trickle in — so the load above would hand the key straight back and
+    silently defeat the unit's own directive. The strip belongs HERE, at the
+    one point that re-introduces it; `coder.child_env`'s removal cannot
+    cover this, because it only shapes children handed an explicit env.
+    """
+    roster = tmp_path / "roster.yaml"
+    roster.write_text(_ROSTER_YAML)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ANTHROPIC_API_KEY=sk-ant-must-not-come-back\n"
+        "CLAUDE_OAUTH_TOKEN_B=tok-from-dotenv-b\n"
+        "CLAUDE_OAUTH_TOKEN_C=tok-from-dotenv-c\n"
+        "CLAUDE_OAUTH_TOKEN_D=tok-from-dotenv-d\n"
+    )
+    # delenv rather than a bare assertion, and it is what makes the test safe
+    # to run anywhere: monkeypatch restores whatever the ambient value was,
+    # including after build_pool pops it for real.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for letter in ("B", "C", "D"):
+        monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+
+    gate = mod.build_pool(accounts_file=str(roster), env_file=str(env_file))
+
+    assert "ANTHROPIC_API_KEY" not in os.environ, (
+        "the .env load put the API key back into this process — every child "
+        "that INHERITS this environment (the census launcher's env=None "
+        "path) would authenticate as the key's identity while the pool's "
+        "failover still looked like it worked"
+    )
+    assert gate.account_count == 3, (
+        "the strip must remove ONE variable, not disable the dotenv load the "
+        "whole pool depends on"
+    )
+
+
+def test_a_capped_pool_never_hands_the_census_an_api_key(tmp_path, monkeypatch):
+    """The path the gap actually ran down, composed as a night runs it.
+
+    The REAL `build_pool` runs first, exactly as `run_nightly` calls it — it
+    is the .env load inside it that puts the key back — and by census time
+    the pool is capped, which is the state that makes `subprocess_env`
+    return None. nightly's `_default_census_launcher` then spawns census.py
+    with `env=None`, i.e. this process's own environment. So the question is
+    not what the returned env holds, it is what the census PROCESS will see;
+    that is what this asserts. Getting it wrong is invisible rather than
+    loud: `preflight_headroom` would SUCCEED on the key's identity instead
+    of fail-safe deferring, so nothing in the journal would say the account
+    choice had been bypassed.
+
+    The capped pool is the FakeGate for the same reason the rest of this
+    file uses it — "nothing leasable" is a gate state, not a roster one: a
+    roster whose tokens are all absent does not produce it, because
+    `_init_accounts` degrades to the `~/.claude` 'default' account, which
+    still leases.
+    """
+    roster = tmp_path / "roster.yaml"
+    roster.write_text(_ROSTER_YAML)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ANTHROPIC_API_KEY=sk-ant-must-not-reach-the-census\n"
+        "CLAUDE_OAUTH_TOKEN_B=tok-from-dotenv-b\n"
+        "CLAUDE_OAUTH_TOKEN_C=tok-from-dotenv-c\n"
+        "CLAUDE_OAUTH_TOKEN_D=tok-from-dotenv-d\n"
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for letter in ("B", "C", "D"):
+        monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+
+    mod.build_pool(accounts_file=str(roster), env_file=str(env_file))
+    census_env = mod.subprocess_env(_pool(("max-b", True), ("max-h", True)))
+
+    assert census_env is None, "a capped pool leases nothing — the premise"
+    effective = os.environ if census_env is None else census_env
+    assert "ANTHROPIC_API_KEY" not in effective, (
+        "an empty pool must leave the census with NO way to authenticate — "
+        "that is what makes census.preflight_headroom's fail-safe defer fire "
+        "instead of billing an identity the pool never chose"
+    )
+
+
 def test_build_pool_logs_the_resolved_roster_but_never_a_token(
     roster_file, monkeypatch, caplog,
 ):
@@ -1183,8 +1271,6 @@ def test_live_one_shot_completes_when_a_pool_token_is_missing(monkeypatch, tmp_p
     means failover actually happened rather than the run getting lucky on an
     account that was never at risk.
     """
-    import os
-
     token_envs = _roster_token_envs()
     available = [name for name in token_envs if os.environ.get(name)]
     if len(available) < 2:

@@ -38,9 +38,13 @@ EnvironmentFile=/home/leo/src/dark-factory/.env
 # ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN, so one inherited from the
 # `systemd --user` manager's environment would authenticate every invocation
 # as the key's identity while the gate's failover still LOOKED like it worked.
-# Stripped here for this process, and again by coder.child_env for each child
-# it spawns -- one policy, two enforcement points, because neither covers the
-# other's scope.
+# Stripped here for this process (the EnvironmentFile above DOES define the
+# key, and UnsetEnvironment is applied last, so this removes it again), once
+# more in-process by account_pool.build_pool -- whose own load_dotenv of that
+# same .env would otherwise put it straight back, defeating this directive for
+# every child that inherits rather than being handed an env -- and again by
+# coder.child_env for each child spawned with an explicit env. One policy,
+# three enforcement points, because no one of them covers the others' scope.
 UnsetEnvironment=ANTHROPIC_API_KEY
 ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal

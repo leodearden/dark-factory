@@ -110,6 +110,23 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     call is frame-relative and silently switches to the CWD under a
     debugger or an interactive interpreter.
 
+    AND THE LOAD UNDOES THE UNIT'S OWN STRIP, so this repairs it. The
+    project ``.env`` defines ``ANTHROPIC_API_KEY`` and ``load_dotenv`` sets
+    any variable not already present — which is exactly the state
+    ``UnsetEnvironment=ANTHROPIC_API_KEY`` leaves the trickle in, so the
+    call above silently puts back the one variable the unit took away. That
+    matters wherever a child inherits this process's environment rather
+    than a ``coder.child_env`` overlay: ``subprocess_env`` returns None
+    whenever nothing is leasable and ``_default_census_launcher`` then runs
+    with ``env=None``, so the census grandchild and every ``claude`` it
+    spawns would authenticate as the API key's identity instead of
+    deferring — billable spend on an identity the pool never chose, and
+    invisible, since ``census.preflight_headroom`` would SUCCEED rather
+    than fail-safe defer. Popping it here is what makes the unit directive
+    and the Python path enforce the same thing; it is not redundant with
+    ``coder.child_env``'s strip, which only covers children handed an
+    explicit env.
+
     Degrades LOUDLY, never raises, when the pool comes back empty. Copies
     ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
     shape, for a reason specific to this caller: refusing to start would
@@ -119,6 +136,7 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     happen is the quiet version.
     """
     load_dotenv(env_file if env_file is not None else _REPO_ROOT / ".env")
+    os.environ.pop("ANTHROPIC_API_KEY", None)
 
     resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or str(
         default_accounts_file()

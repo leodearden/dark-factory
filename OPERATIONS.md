@@ -1510,7 +1510,13 @@ gate resolves zero accounts — and `UnsetEnvironment=ANTHROPIC_API_KEY`,
 because the CLI prefers an API key over the OAuth token and one inherited from
 the `systemd --user` manager would silently authenticate every invocation as
 that identity. The unit pins **no** account; choosing one is the gate's job,
-per invocation.
+per invocation. That `.env` *also* defines `ANTHROPIC_API_KEY`, so the strip
+has to happen three times over, not once: systemd's `UnsetEnvironment` for the
+unit, `account_pool.build_pool` again in-process (its own `load_dotenv` of that
+same file would otherwise put the key straight back, and a child that inherits
+this environment — the census launcher when the pool has nothing to lease —
+would then bill the key's identity while the failover still looked like it
+worked), and `coder.child_env` for each child handed an explicit env.
 
 **The 2026-09-14 max-h pin is retired.** `legibility-trickle@.service.d/
 10-account-pin.conf` reset `ExecStart` and re-spelled it with one account's
