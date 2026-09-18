@@ -109,13 +109,38 @@ nothing to re-point to. A detach is the whole repair, and the flag shape is
 
     --reason wrong_memory --justification '<why it does not back the finding>'
 
-with no ``--replacement-memory-id``. NOT APPLIED: it needs write access to
-``data/`` in the main checkout, which a task agent does not have (see the
-task-3065 note above for the error that produces). The run is also CROSS-PROJECT
-relative to this repo, which is why it is the script's example and not the MCP
-tool's — the tool passes its own ``caller_project_id`` and would refuse with
-``project_mismatch``. The script passes none; that bypass exists for exactly
-this correction.
+with no ``--replacement-memory-id``. The run is CROSS-PROJECT relative to this
+repo, which is why it is the script's example and not the MCP tool's — the tool
+passes its own ``caller_project_id`` and would refuse with ``project_mismatch``.
+The script passes none; that bypass exists for exactly this correction.
+
+Status of that repair: DONE — APPLIED 2026-09-18 by the task-5552 steward,
+after 5552 merged (``a00b9ad016``). The implementer could not apply it from the
+task worktree for the same reason as task 3065 (no write access to ``data/`` in
+the main checkout), so it was carried by the steward session. Measured against
+the live journal:
+
+  * pre-repair ``runs.stage_reports`` re-read read-only and confirmed
+    byte-identical to the blocked implementer's snapshot —
+    ``sha256 5194b992a59dc7b5f6e644377f2157fd099e0e4bb9b5c7d6caea99b895e56fac``,
+    13710 bytes, no ``citation_repairs`` key.
+  * dry run first (gates green, ``removed_count: 1``), then ``--apply`` ->
+    ``status: repaired``, ``removed_count: 1``.
+  * post-repair blob ``sha256 30904012edcc41e5…``, 14257 bytes. The finding's
+    ``cited_memories`` is now ``[]`` — a detach leaves no citation, because the
+    claim's real evidence was a ``get_task(182)`` read and never a memory. The
+    retired id survives only inside the new ``citation_repairs`` audit entry
+    (``reason: wrong_memory``, ``repaired_by: script:repair_recon_citation``),
+    so a raw substring grep still hits it — check ``cited_memories``, not the
+    raw blob.
+
+Do NOT re-run the invocation; it is retained only as the worked example of the
+``wrong_memory`` flag shape. Rollback artifact (the pre-repair blob) is at
+``/tmp/5552-rollback/pre_stage_reports.json``; note ``/tmp`` is not durable
+across a reboot. The standing-correction memory filed while the tooling gap was
+open (``a593bacf-1c15-4e01-a9d0-e068338e962e``, ``solar_challenge_platform``)
+now describes a repaired finding, so it reads as the incident's history rather
+than as a live caveat.
 """
 
 from __future__ import annotations
