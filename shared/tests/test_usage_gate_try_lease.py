@@ -282,9 +282,14 @@ def test_try_lease_default_walk_is_unchanged_by_the_exclude_knob():
     the explicit ``None`` spelling, because the call site passes a variable."""
     gate = make_gate(_POOL)
 
-    assert gate.try_lease().name == 'max-b'
-    assert gate.try_lease(exclude=None).name == 'max-b'
-    assert gate.try_lease(exclude=set()).name == 'max-b'
+    omitted = gate.try_lease()
+    explicit_none = gate.try_lease(exclude=None)
+    empty = gate.try_lease(exclude=set())
+
+    assert omitted is not None and explicit_none is not None and empty is not None
+    assert omitted.name == 'max-b'
+    assert explicit_none.name == 'max-b'
+    assert empty.name == 'max-b'
 
 
 async def test_before_invoke_never_excludes():
@@ -325,8 +330,12 @@ def test_try_lease_still_admits_a_near_cap_account():
     gate = make_gate(['acct-1', 'acct-2'])
     gate._accounts[0].near_cap = True
 
-    assert gate.try_lease().name == 'acct-1'
-    assert gate.try_lease(exclude={'acct-1'}).name == 'acct-2'
+    admitted = gate.try_lease()
+    excluded = gate.try_lease(exclude={'acct-1'})
+
+    assert admitted is not None and excluded is not None
+    assert admitted.name == 'acct-1'
+    assert excluded.name == 'acct-2'
 
 
 def test_try_lease_does_not_claim_the_probe_slot_of_an_excluded_account():

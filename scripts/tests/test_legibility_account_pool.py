@@ -26,6 +26,7 @@ deselected by default (``addopts = -m 'not integration'``).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import account_pool as mod
 import pytest
@@ -75,7 +76,7 @@ class FakeGate:
       admissible set.
     """
 
-    def __init__(self, accounts, *, cap_verdict=True):
+    def __init__(self, accounts, *, cap_verdict: bool | Literal['near'] = True):
         self.accounts = list(accounts)
         self.cap_verdict = cap_verdict
         self.lease_calls = []
