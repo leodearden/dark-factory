@@ -181,7 +181,14 @@ def test_payload_literals_are_json_objects_carrying_the_documented_keys():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("heading", "expected"), _SLUG_SECTIONS, ids=lambda v: str(v)[:40])
+# IDs are the headings alone, never the frozensets: a set's repr order varies
+# with each process's hash seed, so deriving an id from one makes every xdist
+# worker collect a differently-named test and the run dies in collection.
+@pytest.mark.parametrize(
+    ("heading", "expected"),
+    _SLUG_SECTIONS,
+    ids=[heading for heading, _ in _SLUG_SECTIONS],
+)
 def test_documented_slugs_equal_the_live_vocabulary(heading: str, expected: frozenset[str]):
     body = _section(_read(POLICY), f"## {heading}")
     documented = {m.group(1) for line in body.splitlines() if (m := _SLUG_BULLET.match(line))}
