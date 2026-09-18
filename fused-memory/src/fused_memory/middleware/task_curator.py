@@ -2956,7 +2956,11 @@ class TaskCurator:
             return left + shifted_right
 
     def _build_user_prompt(
-        self, candidate: CandidateTask, pool: list[_PoolEntry],
+        self,
+        candidate: CandidateTask,
+        pool: list[_PoolEntry],
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         desc_cap = self._config.curator.entry_description_chars
         details_cap = self._config.curator.entry_details_chars
@@ -2990,6 +2994,7 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
 
         lines.append(
             'Decide drop / combine / create per the system-prompt rules. '
@@ -3002,6 +3007,8 @@ class TaskCurator:
         candidate: CandidateTask,
         pool: list[_PoolEntry],
         batch_index: int,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         """Build one candidate's section of the batched user prompt.
 
@@ -3043,6 +3050,7 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
         lines.append('')
         return '\n'.join(lines)
 
@@ -3050,15 +3058,27 @@ class TaskCurator:
         self,
         candidates: list[CandidateTask],
         pools: list[list[_PoolEntry]],
+        *,
+        withheld_list: list[PoolWithheld] | None = None,
     ) -> str:
         """Build a batched user prompt containing one labelled section per candidate.
 
         Each section mirrors the single-item :meth:`_build_user_prompt` layout but
         is prefixed ``# Candidate batch_index={i}`` so the model can address
-        decisions by index.  Pools are kept per-candidate (not unioned).
+        decisions by index.  Pools are kept per-candidate (not unioned) — and so
+        is each pool's :class:`PoolWithheld` census, which renders inside its own
+        candidate's section so a truncated pool for one candidate is never read
+        as a qualifier on another's.
+
+        A short or absent *withheld_list* is tolerated: the missing entries
+        simply render nothing, which is what an untruncated pool renders anyway.
         """
+        censuses = withheld_list or []
         sections = [
-            self._build_batch_section(candidate, pool, i)
+            self._build_batch_section(
+                candidate, pool, i,
+                withheld=censuses[i] if i < len(censuses) else None,
+            )
             for i, (candidate, pool) in enumerate(
                 zip(candidates, pools, strict=True),
             )
@@ -3073,6 +3093,21 @@ class TaskCurator:
 # ----------------------------------------------------------------------
 # Pure helpers (module-level — easier to unit-test)
 # ----------------------------------------------------------------------
+
+
+def _append_pool_truncation(
+    lines: list[str], withheld: PoolWithheld | None,
+) -> None:
+    """Append the pool-truncation block to *lines*, if there is one.
+
+    The one place both prompt builders emit the census, so the fact and its
+    guidance cannot end up worded differently on the single and batch paths.
+    Appends nothing when the pool was complete.
+    """
+    rendered = withheld.render() if withheld is not None else None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append('')
 
 
 def clip_for_prompt(text: str, cap: int) -> str:
