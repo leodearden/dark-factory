@@ -33,11 +33,34 @@ if TYPE_CHECKING:
 # The escalation package is a declared workspace dependency, but keep the
 # import guarded exactly as targeted.py / ticket_janitor.py do so a minimal
 # env degrades to a logged no-op rather than failing to import the policy.
+#
+# ONE combined block, deliberately: the names bind or fail together, so a
+# single runtime check remains sufficient. Call sites still name EVERY symbol
+# they use in their guard, because only an identity check on the name itself
+# NARROWS an optionally-imported symbol for the type checker — a guard on
+# ``EscalationQueue`` alone leaves the rest typed ``... | None`` and their call
+# sites fail to type-check (the stage1_stall_detector precedent).
 try:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import (  # type: ignore[import-untyped]
+        EscalationQueue,
+        escalation_id_lock,
+    )
     _HAS_ESCALATION = True
 except ImportError:  # pragma: no cover — exercised only in minimal envs
     EscalationQueue = None  # type: ignore[assignment,misc]
+    Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    content_fingerprint_key = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
+    escalation_id_lock = None  # type: ignore[assignment]
     _HAS_ESCALATION = False
 
 
@@ -62,6 +85,11 @@ _ESC_ID_PREFIXES: dict[str, str] = {
     'judge_halt': 'esc-reconciliation-halt-',
     'wedge': 'esc-reconciliation-wedge-',
 }
+
+# The escalation category every record this policy files carries. Used for BOTH
+# the ``Escalation.category`` and the first component of the dedupe fingerprint,
+# so the fold key and the record's own category can never drift apart.
+_ESCALATION_CATEGORY = 'infra_issue'
 
 # Keys BacklogPolicy stamps onto its escalation records that are NOT
 # ``Escalation`` dataclass fields. ``EscalationQueue.resolve()`` rewrites the
@@ -412,6 +440,62 @@ class BacklogPolicy:
         archived = sorted(esc_dir.glob(f'archive/*/{esc_id}.json'))
         return archived[-1] if archived else None
 
+    def _merge_onto_persisted(
+        self, esc_dir: Path, esc_id: str, updates: Mapping[str, Any],
+    ) -> Path | None:
+        """Merge ``updates`` onto the persisted record for ``esc_id``.
+
+        The single implementation of "put these keys on the record without
+        disturbing anything else", shared by the write/fold path
+        (``_maybe_write_escalation``) and the close path
+        (``_restore_policy_keys``) so the two cannot drift.
+
+        Taken under ``escalation_id_lock`` — the same stable-sidecar lock
+        ``queue.submit``, ``attach_dedupe_child`` and ``resolve`` take — so the
+        merge can never clobber a concurrent fold or close. Keys whose
+        persisted value already matches are skipped, so a merge that would
+        change nothing performs no write at all.
+
+        Returns the path of the record it found, or ``None`` when no record
+        could be located (never persisted, or gone from both the queue root and
+        the archive). A located record whose merge WRITE then failed still
+        returns its path: the escalation is filed and readable, only its
+        forensic decoration is missing, and reporting that as "no record" would
+        strip the caller's ``escalation_path`` for a record that exists.
+        Best-effort by construction — every failure is logged and swallowed.
+        """
+        if escalation_id_lock is None:  # pragma: no cover — minimal envs only
+            logger.warning(
+                'backlog_policy: cannot merge %s onto %s — escalation package '
+                'unavailable',
+                sorted(updates), esc_id,
+            )
+            return None
+        path = self._locate_persisted(esc_dir, esc_id)
+        if path is None:
+            logger.warning(
+                'backlog_policy: could not locate the persisted record %s under '
+                '%s to merge %s — the record will not identify its project',
+                esc_id, esc_dir, sorted(updates),
+            )
+            return None
+        try:
+            with escalation_id_lock(esc_dir, esc_id):
+                record = json.loads(path.read_text(encoding='utf-8'))
+                stripped = {k: v for k, v in updates.items() if record.get(k) != v}
+                if not stripped:
+                    return path
+                record.update(stripped)
+                tmp = path.with_name(f'{path.name}.tmp')
+                tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
+                tmp.replace(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                'backlog_policy: could not merge %s onto record %s: %s',
+                sorted(updates), path, exc,
+            )
+        return path
+
     def _restore_policy_keys(
         self, esc_dir: Path, esc_id: str, original: Mapping[str, Any],
     ) -> None:
@@ -423,36 +507,15 @@ class BacklogPolicy:
         ``_POLICY_ONLY_KEYS``. Re-merging keeps an auto-closed halt
         attributable to its project and its fault kind.
 
-        Best-effort by construction: every failure is logged and swallowed.
-        A record that IS closed but lost its forensic keys must never be
-        misreported as un-closed, so this can never fail the caller.
+        Best-effort by construction: ``_merge_onto_persisted`` logs and
+        swallows every failure. A record that IS closed but lost its forensic
+        keys must never be misreported as un-closed, so this can never fail the
+        caller.
         """
         keys = {k: original[k] for k in _POLICY_ONLY_KEYS if k in original}
         if not keys:
             return
-        path = self._locate_persisted(esc_dir, esc_id)
-        if path is None:
-            logger.warning(
-                'backlog_policy: closed %s but could not locate the persisted '
-                'record under %s to restore %s — the archived record will not '
-                'identify its project',
-                esc_id, esc_dir, sorted(keys),
-            )
-            return
-        try:
-            record = json.loads(path.read_text(encoding='utf-8'))
-            stripped = {k: v for k, v in keys.items() if record.get(k) != v}
-            if not stripped:
-                return
-            record.update(stripped)
-            tmp = path.with_name(f'{path.name}.tmp')
-            tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
-            tmp.replace(path)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(
-                'backlog_policy: could not restore %s on closed record %s: %s',
-                sorted(keys), path, exc,
-            )
+        self._merge_onto_persisted(esc_dir, esc_id, keys)
 
     async def on_watchdog_wedge(self, payload: dict) -> list[BacklogVerdict]:
         """Invoked by :class:`SqliteWatchdog` when the drainer is wedged.
@@ -652,41 +715,147 @@ class BacklogPolicy:
                 return None
             state.last_escalation_ts[kind] = now
 
+        # Every name is listed, not just one: only an identity check on the
+        # name itself narrows an optionally-imported symbol, so a guard on
+        # EscalationQueue alone would leave the other five typed ``... | None``
+        # at the call sites below. No legacy raw-write fallback — a second
+        # write path would keep the sibling-minting defect alive in a branch
+        # nothing exercises, and ``on_judge_unhalt`` already degrades to a
+        # logged no-op for exactly this reason.
+        if (
+            EscalationQueue is None
+            or Escalation is None
+            or DedupeConfig is None
+            or compute_content_fingerprint is None
+            or content_fingerprint_key is None
+            or submit_or_dedupe is None
+        ):  # pragma: no cover — exercised only in minimal envs
+            logger.warning(
+                'backlog_policy: escalation package unavailable — no escalation '
+                'written for %s (kind=%s)',
+                project_id, kind,
+            )
+            return None
+
         esc_dir = Path(project_root) / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.fromtimestamp(self._now(), tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
         prefix = _ESC_ID_PREFIXES.get(kind, _ESC_ID_PREFIXES['backlog'])
         esc_id = f'{prefix}{safe_ts}'
-        path = esc_dir / f'{esc_id}.json'
 
-        record = {
-            'id': esc_id,
-            'task_id': None,
-            'agent_role': 'fused-memory',
-            'severity': 'blocking',
-            'category': 'infra_issue',
-            'summary': summary,
-            'detail': detail,
-            'suggested_action': suggested_action,
-            'timestamp': ts,
-            'status': 'pending',
-            'level': 1,
-            'workflow_state': 'infra',
-            'backlog': backlog,
-            'threshold': threshold,
+        # Fold key = (category, kind, project_id) and NOTHING else. ``kind``
+        # occupies the finding_category slot so a judge halt can never fold into
+        # a backlog parent — task 2920 (a) per-kind independence becomes
+        # structural instead of resting on the separate rate-limit buckets
+        # alone — and ``project_id`` occupies affected_ids so two projects over
+        # limit never collapse into one record.
+        #
+        # Deliberately NOT keyed on the N/threshold count, the wedge payload or
+        # the halt reason: those drift on every tick, and a drifting key never
+        # folds, which IS the defect. The exclusion is structural rather than by
+        # discipline — because affected_ids is non-empty,
+        # compute_content_fingerprint ignores the description argument entirely,
+        # so prose CANNOT enter the key. ``''`` is that documented "no
+        # description in scope" argument.
+        #
+        # The default summary_dedupe_key is unusable here: all three kinds carry
+        # category='infra_issue', and the backlog summary's first three
+        # normalised tokens ('reconciliation', 'backlog', 'exceeded') are the
+        # same for EVERY project, so it would cross-fold projects.
+        fingerprint = compute_content_fingerprint(
+            _ESCALATION_CATEGORY, kind, [project_id], '',
+        )
+        if not fingerprint:
+            # Fail CLOSED. find_dedupe_parent treats a falsy key as "never
+            # fold", so filing anyway would mint a silently unfoldable second
+            # pending record every window — the defect wearing a disguise.
+            # Unreachable via today's sha256-hexdigest callee; this guards a
+            # future change to it.
+            logger.error(
+                'backlog_policy: empty dedupe_fingerprint for %s (kind=%s) — '
+                'refusing to file an unfoldable record',
+                project_id, kind,
+            )
+            return None
+
+        esc = Escalation(
+            id=esc_id,
+            # ``task_id: null`` is the on-disk contract this record family has
+            # carried since it was introduced; the dashboard, the watcher and
+            # the archived corpus all read it that way. Escalation.task_id is
+            # typed ``str``, so preserving null costs this one narrow ignore.
+            # Giving these records a synthetic anchor id instead is defensible,
+            # but it flips every ``if esc.task_id:`` branch for the family —
+            # a separable decision, not one to smuggle into a dedupe fix.
+            task_id=None,  # type: ignore[arg-type]
+            agent_role='fused-memory',
+            severity='blocking',
+            category=_ESCALATION_CATEGORY,
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+            timestamp=ts,
+            level=1,
+            workflow_state='infra',
+            dedupe_fingerprint=fingerprint,
+        )
+        # Constructed only now: EscalationQueue.__init__ mkdirs, and the
+        # rate-limit gate above must keep returning before any directory work.
+        queue = EscalationQueue(esc_dir)
+        config = DedupeConfig(
+            infra_dedupe_enabled=True,
+            # UNBOUNDED window: a backlog that has been over limit for days must
+            # still fold into the parent filed on day one. Any finite window
+            # re-pins dedupe_count at 0 once the condition outlives it, which is
+            # the sibling-minting defect on a longer clock.
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=(_ESCALATION_CATEGORY,),
+            key_fn=content_fingerprint_key,
+        )
+        try:
+            result = submit_or_dedupe(queue, esc, config)
+        except OSError as exc:
+            logger.error(
+                'backlog_policy: failed to file escalation %s: %s', esc_id, exc,
+            )
+            return None
+        # The parent id on a fold, the new id on a submit.
+        record_id = result['id']
+        folded = result.get('status') == 'dedup_skipped'
+
+        # Required on BOTH branches, not only the submit: queue.submit persists
+        # Escalation.to_json() (== asdict, dataclass fields only) and
+        # attach_dedupe_child re-hydrates through Escalation.from_json before
+        # rewriting, so each INDEPENDENTLY drops the four non-dataclass keys the
+        # 48h-reify forensic query depends on.
+        path = self._merge_onto_persisted(esc_dir, record_id, {
             'project_id': project_id,
             'error_type': error_type,
-        }
-        try:
-            path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            'backlog': backlog,
+            'threshold': threshold,
+        })
+        if path is None:
+            # An 'accepted_unpersisted' response, or a record gone from both the
+            # queue root and the archive. Report no path so the caller's retry
+            # path stays honest rather than naming a record nobody can read.
+            logger.warning(
+                'backlog_policy: filed %s for %s (kind=%s) but could not read it '
+                'back — reporting no escalation path',
+                record_id, project_id, kind,
+            )
+            return None
+        if folded:
+            # Loud-over-silent: the recurrence is visible in the log stream, not
+            # only on disk.
+            logger.warning(
+                'backlog_policy: folded %s escalation for %s into pending %s '
+                '(child=%s, backlog=%d, threshold=%d)',
+                kind, project_id, record_id, result.get('child_id'),
+                backlog, threshold,
+            )
+        else:
             logger.warning(
                 'backlog_policy: wrote L1 escalation %s (backlog=%d, threshold=%d)',
                 path, backlog, threshold,
             )
-            return path
-        except OSError as exc:
-            logger.error(
-                'backlog_policy: failed to write escalation %s: %s', path, exc,
-            )
-            return None
+        return path

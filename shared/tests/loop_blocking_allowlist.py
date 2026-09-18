@@ -217,12 +217,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '8f53c74a5d76',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'the judge-halt record on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys (another '
-        'read), and _maybe_write_escalation write_texts the escalation. '
-        'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'its escalation records on the loop thread -- on_judge_unhalt '
+        'read_texts the record and reaches _restore_policy_keys, and '
+        '_maybe_write_escalation reaches _merge_onto_persisted; both '
+        'helpers read_text then write_text the located record under '
+        'escalation_id_lock. Filesystem, the limb task 3778\'s '
+        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
+        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
@@ -230,25 +231,27 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '08a103635fd7',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'the judge-halt record on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys (another '
-        'read), and _maybe_write_escalation write_texts the escalation. '
-        'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'its escalation records on the loop thread -- on_judge_unhalt '
+        'read_texts the record and reaches _restore_policy_keys, and '
+        '_maybe_write_escalation reaches _merge_onto_persisted; both '
+        'helpers read_text then write_text the located record under '
+        'escalation_id_lock. Filesystem, the limb task 3778\'s '
+        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
+        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
-        'ce9dabf347d0',
+        '0d0ced67338b',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
-        'the judge-halt record on the loop thread -- on_judge_unhalt '
-        'read_texts the record and reaches _restore_policy_keys (another '
-        'read), and _maybe_write_escalation write_texts the escalation. '
-        'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'its escalation records on the loop thread -- on_judge_unhalt '
+        'read_texts the record and reaches _restore_policy_keys, and '
+        '_maybe_write_escalation reaches _merge_onto_persisted; both '
+        'helpers read_text then write_text the located record under '
+        'escalation_id_lock. Filesystem, the limb task 3778\'s '
+        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
+        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
 
     # ---- reconciliation/harness.py ----
