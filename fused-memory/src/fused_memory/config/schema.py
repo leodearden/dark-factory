@@ -2145,7 +2145,13 @@ class CuratorConfig(BaseModel):
     # single_call_budget_cap_usd — 4x headroom. batch_token_threshold stays at
     # 50K deliberately: it is what holds a multi-candidate batch under that
     # same flat per-call ceiling, so easing batch fan-in is the soft threshold
-    # working as designed, not a regression to patch.
+    # working as designed, not a regression to patch. Easier fan-in did carry
+    # one real cost — a batch that lands at size 1 takes
+    # ``task_curator.py::TaskCurator.curate_batch_prepared``'s short-circuit,
+    # which used to DISCARD the already-built corpus and reassemble it
+    # (get_tasks over the whole tree + an embedder call + a qdrant query).
+    # That path now hands the prepared bundle to ``curate``, so a smaller
+    # batch no longer costs a rebuild.
     entry_description_chars: int = Field(default=2000)
     entry_details_chars: int = Field(default=1500)
 

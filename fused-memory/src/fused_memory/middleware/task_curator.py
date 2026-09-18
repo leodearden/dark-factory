@@ -353,6 +353,12 @@ class PreparedCandidate:
     batched prompt.  The token estimate is what the worker uses to decide
     whether adding this candidate to the in-flight batch would exceed the
     soft ``batch_token_threshold``.
+
+    ``corpus_error`` is set when assembly FAILED and the pool above is the
+    empty degradation rather than a real (possibly empty) corpus.  The two
+    are indistinguishable from the fields alone, and they call for opposite
+    handling: a real corpus is worth reusing, a failed one is worth
+    rebuilding (see :meth:`TaskCurator.curate`'s ``prepared`` parameter).
     """
 
     candidate: CandidateTask
@@ -360,6 +366,7 @@ class PreparedCandidate:
     pool_sizes: dict[str, int]
     prompt_tokens: int
     withheld: PoolWithheld | None = None
+    corpus_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1473,11 +1480,24 @@ class TaskCurator:
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
+        *,
+        prepared: PreparedCandidate | None = None,
     ) -> CuratorDecision:
         """Render a drop/combine/create decision for a candidate task.
 
         Best-effort: any internal failure returns a ``create`` decision with the
         failure reason in ``justification``. Never raises.
+
+        *prepared* hands over a corpus the caller already assembled, so it is
+        not assembled twice.  :meth:`curate_batch_prepared`'s size-1
+        short-circuit is the caller this exists for: a rebuild there costs a
+        full ``get_tasks`` over the task tree plus an embedder call and a
+        qdrant query for work already done, and size-1 batches get MORE likely
+        as per-candidate sections grow, so the cost would otherwise move with
+        exactly the setting that shrinks the batch.  A bundle whose own
+        assembly failed is deliberately NOT reused — see ``corpus_error``.
+        Everything ahead of corpus assembly (blocklist, premise, exact-match,
+        idempotency cache, deterministic routing, ZOT breaker) still runs.
         """
         start = time.monotonic()
         payload_hash = candidate.payload_hash()
@@ -1552,24 +1572,31 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
 
-        try:
-            pool, pool_sizes, withheld = await self._build_corpus(
-                candidate, project_id, project_root,
-            )
-        except Exception as exc:
-            logger.warning(
-                'task_curator: corpus assembly failed, falling through to create: %s',
-                exc,
-                exc_info=True,
-            )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'corpus-failed: {exc}',
-                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
-            )
-            self._store_cache(payload_hash, decision)
-            return decision
+        if prepared is not None and prepared.corpus_error is None:
+            pool = prepared.pool
+            pool_sizes = prepared.pool_sizes
+            withheld = prepared.withheld or PoolWithheld()
+        else:
+            try:
+                pool, pool_sizes, withheld = await self._build_corpus(
+                    candidate, project_id, project_root,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: corpus assembly failed, falling through to create: %s',
+                    exc,
+                    exc_info=True,
+                )
+                decision = CuratorDecision(
+                    action='create',
+                    justification=f'corpus-failed: {exc}',
+                    pool_sizes={
+                        'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
+                    },
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                )
+                self._store_cache(payload_hash, decision)
+                return decision
 
         # Render the LLM call. A genuine LLM failure raises
         # CuratorFailureError; route it through the escalator if one was
@@ -1675,6 +1702,7 @@ class TaskCurator:
         already exceeded the soft ``batch_token_threshold``.  Corpus failures
         degrade to an empty pool — same behaviour as inside ``curate_batch``.
         """
+        corpus_error: str | None = None
         try:
             pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
@@ -1690,6 +1718,7 @@ class TaskCurator:
             pool = []
             pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
             withheld = PoolWithheld()
+            corpus_error = str(exc)
         # batch_index=0 is fine for the estimate — only a couple of digits of
         # rendered length difference at most across realistic batch sizes.
         # The census IS included: the estimate has to be taken over the section
@@ -1702,6 +1731,7 @@ class TaskCurator:
             pool_sizes=pool_sizes,
             prompt_tokens=estimate_tokens(section),
             withheld=withheld,
+            corpus_error=corpus_error,
         )
 
     async def curate_batch(
@@ -1752,7 +1782,10 @@ class TaskCurator:
             return []
         if len(prepared) == 1:
             return [
-                await self.curate(prepared[0].candidate, project_id, project_root),
+                await self.curate(
+                    prepared[0].candidate, project_id, project_root,
+                    prepared=prepared[0],
+                ),
             ]
 
         candidates = [p.candidate for p in prepared]

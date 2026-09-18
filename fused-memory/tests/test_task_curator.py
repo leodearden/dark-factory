@@ -42,6 +42,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     PoolWithheld,
+    PreparedCandidate,
     TaskCurator,
     _parse_batch_decisions,
     _parse_decision,
@@ -4242,6 +4243,109 @@ class TestWithheldReachesTheLlmPrompt:
         right_half = [pr for pr in prompts[1:] if 'Gamma' in pr]
         assert right_half
         assert all('"module": 9' in pr for pr in right_half)
+
+
+# ----------------------------------------------------------------------
+# A size-1 batch must not rebuild the corpus it was handed
+# ----------------------------------------------------------------------
+
+
+class TestSizeOneBatchReusesThePreparedCorpus:
+    """`curate_batch_prepared` short-circuits N=1 to `curate` — with the bundle.
+
+    Bigger per-candidate sections (the raised `entry_description_chars`) mean
+    the worker's token accumulator admits fewer tickets per batch, so batches
+    land at size 1 MORE often. Rebuilding there re-pays a full `get_tasks`
+    over the task tree, an embedder call and a qdrant query for work already
+    done — the cost moving with exactly the setting that shrinks the batch.
+    """
+
+    POOL_SIZES = {'anchor': 1, 'module': 2, 'embedding': 0, 'dependency': 0}
+
+    def _prepared(self, **overrides: Any) -> PreparedCandidate:
+        kwargs: dict[str, Any] = {
+            'candidate': CandidateTask(title='Alpha', description='body of Alpha'),
+            'pool': _pool_with_ids(('pool-alpha', 'pending')),
+            'pool_sizes': dict(self.POOL_SIZES),
+            'prompt_tokens': 30,
+            'withheld': PoolWithheld(by_source={'module': 6}, caps={'module': 15}),
+        }
+        kwargs.update(overrides)
+        return PreparedCandidate(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_size_one_batch_does_not_rebuild_the_corpus(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        build = AsyncMock()
+        llm = AsyncMock(
+            return_value=_agent_result({'action': 'create', 'justification': 'novel'}),
+        )
+        with patch.object(curator, '_build_corpus', new=build), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
+            decisions = await curator.curate_batch_prepared(
+                [self._prepared()], 'p', '/x',
+            )
+
+        assert build.await_count == 0
+        assert len(decisions) == 1
+        assert decisions[0].pool_sizes == self.POOL_SIZES
+        assert llm.await_args is not None
+        prompt = llm.await_args.kwargs['prompt']
+        # The prepared pool AND its census reached the LLM, not a fresh build.
+        assert 'pool-alpha' in prompt
+        assert '"module": 6' in prompt
+
+    @pytest.mark.asyncio
+    async def test_a_failed_bundle_is_rebuilt_rather_than_reused(self):
+        """A corpus failure degrades the bundle to an empty pool — reusing THAT
+        would trade a loud `corpus-failed` create for an LLM call over nothing,
+        and would drop the retry the rebuild gave the size-1 path."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+        build = AsyncMock(return_value=(
+            _pool_with_ids(('rebuilt-1', 'pending')),
+            dict(self.POOL_SIZES),
+            PoolWithheld(),
+        ))
+        llm = AsyncMock(
+            return_value=_agent_result({'action': 'create', 'justification': 'novel'}),
+        )
+        prepared = self._prepared(
+            pool=[], withheld=PoolWithheld(), corpus_error='qdrant down',
+        )
+        with patch.object(curator, '_build_corpus', new=build), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
+            decisions = await curator.curate_batch_prepared([prepared], 'p', '/x')
+
+        assert build.await_count == 1
+        assert len(decisions) == 1
+        assert llm.await_args is not None
+        assert 'rebuilt-1' in llm.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_prepare_candidate_records_the_corpus_failure(self):
+        """The degradation is on the bundle, not only in a log line."""
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+
+        assert prepared.corpus_error is not None
+        assert 'qdrant down' in prepared.corpus_error
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_prepare_records_no_failure(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        async def corpus(*a, **k):
+            return _pool_with_ids(('10', 'pending')), dict(self.POOL_SIZES), PoolWithheld()
+
+        with patch.object(curator, '_build_corpus', side_effect=corpus):
+            prepared = await curator.prepare_candidate(CandidateTask(title='X'), 'p', '/x')
+
+        assert prepared.corpus_error is None
 
 
 # ----------------------------------------------------------------------
