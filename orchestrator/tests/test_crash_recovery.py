@@ -230,6 +230,11 @@ def _recorded_failures(harness: Harness) -> list:
     return list(harness._eligible_but_failed_resumes)
 
 
+def _survivals(harness: Harness) -> int:
+    """Armed resumes that have SURVIVED this boot — the streak's reset term."""
+    return harness._session_resume_survivals
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -3981,7 +3986,6 @@ class TestSessionResumeStorm:
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=3, storm_window_secs=60,
         )
-        harness._escalation_queue = self._queue()
         self._arm_synthetic_feeder(harness)
 
         reported: list = []
@@ -4033,14 +4037,14 @@ class TestSessionResumeStorm:
         # population an operator needs to read "resume works here" from.
         harness.note_resume_succeeded()
         harness.note_resume_succeeded()
-        assert harness._session_resume_survivals == 2
+        assert _survivals(harness) == 2
 
         # One that actually cuts a run short counts the same way, and the run
         # it retired is gone.
         harness.note_resume_failed(self._report(0))
         assert _streak(harness) == 1
         harness.note_resume_succeeded()
-        assert harness._session_resume_survivals == 3
+        assert _survivals(harness) == 3
         assert _streak(harness) == 0
         assert not _recorded_failures(harness)
 
@@ -4293,7 +4297,7 @@ class TestSessionResumeStorm:
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=3, storm_window_secs=60,
         )
-        harness._escalation_queue = self._queue()
+        queue = harness._escalation_queue = self._queue()
 
         reports = [
             self._report(
@@ -4331,10 +4335,10 @@ class TestSessionResumeStorm:
         for report in reports:
             harness.note_resume_failed(report)
 
-        assert harness._escalation_queue.has_open_l1.called, (
+        assert queue.has_open_l1.called, (
             'the dedup must still be consulted — one open storm L1 at a time'
         )
-        esc = harness._escalation_queue.submit.call_args.args[0]
+        esc = queue.submit.call_args.args[0]
         assert esc.level == 1
         assert 'session-resume' in esc.summary.lower()
         assert 'storm' in esc.summary.lower()
@@ -4387,10 +4391,10 @@ class TestSessionResumeStorm:
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=1, storm_window_secs=60,
         )
-        harness._escalation_queue = self._queue()
+        queue = harness._escalation_queue = self._queue()
         harness.note_resume_failed(self._report(0))
 
-        esc = harness._escalation_queue.submit.call_args.args[0]
+        esc = queue.submit.call_args.args[0]
         operator_text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
         assert not re.search('clock skew|NTP', operator_text, re.IGNORECASE)
 
