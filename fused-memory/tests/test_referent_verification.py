@@ -1660,10 +1660,15 @@ class TestTheAmbiguousScanBoundaryRow:
     """PRD boundary row: "Ambiguous scan | ref routed to ``.ambiguous``;
     treated as undeclared; recorded, not guessed".
 
-    Leaf epsilon drops ``.ambiguous`` from the wire on purpose, so zeta
-    RE-DERIVES it from ``content``; without that, an ambiguous endpoint is
-    indistinguishable from a genuine conflation and gets a destructive repair
-    instruction instead of being recorded and left alone.
+    Without the ambiguity set an ambiguous endpoint is indistinguishable from a
+    genuine conflation and gets a destructive repair instruction instead of
+    being recorded and left alone.
+
+    Every case here passes `content` and NO `ambiguous=`, so they all exercise
+    the LEGACY-ROW path — the permissive re-derivation, which is what a queue
+    row enqueued before task 5262 gets. The preference rule that supersedes it
+    is pinned in `TestTheWireAmbiguitySetIsPreferred` below; these stay as they
+    are because the fallback has to keep behaving byte-identically to HEAD.
     """
 
     @pytest.mark.asyncio
@@ -1756,6 +1761,205 @@ class TestTheAmbiguousScanBoundaryRow:
         assert len(stats.findings) == 1
         assert stats.findings[0].resolvable is True
         assert stats.findings[0].intended_referent == Referent(number='3200')
+
+
+#: Content whose ONLY task mention is 3200 — it contests nothing, so a
+#: re-derivation over it yields an EMPTY ambiguity set. Every wire-value test
+#: below uses it, so a veto that fires can ONLY have come from the wire.
+_UNCONTESTED_CONTENT = 'Task 3200 tracks the rollout.'
+
+#: Content in which 3127 IS contested (a bare own-project mention and a
+#: foreign-qualified reference to the same number), so a re-derivation over it
+#: yields {Task 3127}. Used to prove the fallback still fires and that `()`
+#: suppresses the fallback entirely.
+_CONTESTED_CONTENT = (
+    'Task 3127 was reconciled; see reify:3127 for the mirror. '
+    'Task 3200 tracks it.'
+)
+
+
+class TestTheWireAmbiguitySetIsPreferred:
+    """Task 5262 workstream C: the producer's `.ambiguous` rides the wire, so
+    zeta reads it instead of re-deriving it.
+
+    WHY IT MATTERS RATHER THAN BEING A TIDY-UP. The re-derivation is a SECOND
+    SCAN SITE — the INV-5 lockstep duplication canonical_labels exists to
+    prevent — and it is sound only while both scans are parameterized
+    identically. They stop being so the moment the producer narrows its scan
+    with the project registry (workstream B): the producer scans at ENQUEUE,
+    this pass runs at DEQUEUE on the far side of a durable SQLite queue, and a
+    restart with a changed registry between them desynchronizes the two sets
+    silently. A desynchronized set means `_candidate_pool`'s VETO 1 does not
+    fire where the producer said it should, and an AMBIGUOUS endpoint is handed
+    to eta as a repair instruction — destructive edge surgery onto the wrong
+    node, the precise failure this PRD exists to prevent.
+
+    Threading the RESULT rather than the INPUT makes the two sets incapable of
+    disagreeing, which is strictly stronger than narrowing both in lockstep.
+    """
+
+    @staticmethod
+    def _scan_spy(monkeypatch) -> list[tuple[str, dict]]:
+        """Every (text, kwargs) `_verify_episode_referents` hands `scan_content`.
+
+        Records the KWARGS too, unlike `TestPerEdgeFactScanIsLazy._spy`: the
+        fallback's permissiveness is a property of how it is CALLED, not of
+        what it is called with. Patches the name as imported into
+        `memory_service`, the binding the pass actually calls, and delegates to
+        the real scanner so the findings under test are the production ones.
+        """
+        calls: list[tuple[str, dict]] = []
+        real = memory_service_module.scan_content
+
+        def _recording(text, **kwargs):
+            calls.append((text, dict(kwargs)))
+            return real(text, **kwargs)
+
+        monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
+        return calls
+
+    @staticmethod
+    def _landed_on(number: str):
+        """One edge whose source endpoint is the task node named *number*."""
+        return _episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-end', target='n-mirror')],
+            nodes=[MockNode(name=f'Task {number}', uuid='n-end'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_wire_value_decides_and_the_content_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """ARM 1. The producer says 6379 was ambiguous; the content says
+        nothing of the kind. The wire wins, and no second scan happens.
+
+        A re-derivation over this content yields an EMPTY set, so a fired veto
+        can only have come from the wire — this test cannot pass by accident.
+        """
+        calls = self._scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('6379'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_UNCONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(Referent(number='6379'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.endpoint_referent == Referent(number='6379')
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'AMBIGUOUS' in finding.reason
+        assert stats.unresolvable_findings == 1
+        # THE SECOND SCAN SITE IS GONE when the wire carries the answer. The
+        # per-EDGE fact scan is untouched and may still appear here; what must
+        # not is the episode BODY.
+        assert _UNCONTESTED_CONTENT not in [text for text, _ in calls]
+
+    @pytest.mark.asyncio
+    async def test_a_self_qualified_wire_spelling_is_normalized_on_the_way_in(
+        self, service,
+    ):
+        """The wire set goes through `local_referent` exactly as the re-derived
+        one does, so 'dark_factory:2500' compares equal to the locally-classified
+        endpoint referent instead of sneaking past the veto.
+
+        Not hypothetical: `scan_content` preserves the qualifier it read, so a
+        producer whose content spelled the ambiguous mention self-qualified puts
+        that spelling on the wire verbatim.
+        """
+        stats = await service._verify_episode_referents(
+            self._landed_on('2500'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_UNCONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(Referent(number='2500', project_id='dark_factory'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+    @pytest.mark.asyncio
+    async def test_None_falls_back_to_a_permissive_re_derivation(
+        self, service, monkeypatch,
+    ):
+        """ARM 2. A legacy row (no `'ambiguous'` key) behaves exactly as HEAD.
+
+        `None` means "the producer did not tell us", and a row with no such key
+        was necessarily enqueued by pre-change code — whose producer scanned
+        PERMISSIVELY. Only a permissive re-derivation reproduces that producer,
+        so the fallback must pass no `known_project_ids`.
+        """
+        calls = self._scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=None,
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+        body_scans = [kwargs for text, kwargs in calls if text == _CONTESTED_CONTENT]
+        assert body_scans, 'the fallback did not re-derive from the content'
+        for kwargs in body_scans:
+            assert 'known_project_ids' not in kwargs or (
+                kwargs['known_project_ids'] is None
+            ), f'the legacy fallback must scan PERMISSIVELY; got {kwargs!r}'
+
+    @pytest.mark.asyncio
+    async def test_omitting_the_keyword_is_the_same_as_None(self, service):
+        """The default is the legacy path, so every existing caller — and every
+        test in `TestTheAmbiguousScanBoundaryRow` — keeps its behaviour."""
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+    @pytest.mark.asyncio
+    async def test_an_empty_tuple_is_not_None_and_suppresses_the_fallback(
+        self, service, monkeypatch,
+    ):
+        """ARM 3, and the assertion that stops a later reader "simplifying" the
+        sentinel into a falsy check.
+
+        `()` means "the producer told us: nothing was ambiguous" and must be
+        BELIEVED. Same contested content as the fallback test above, which would
+        veto — but the producer's answer wins, the finding stays resolvable, and
+        the body is never scanned. Under a truthiness test this test is the one
+        that goes red.
+        """
+        calls = self._scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='3200')
+        assert 'AMBIGUOUS' not in finding.reason
+        assert _CONTESTED_CONTENT not in [text for text, _ in calls]
 
 
 def _rows(*uuids) -> list[dict]:
