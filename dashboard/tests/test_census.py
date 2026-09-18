@@ -16,7 +16,7 @@ import enum
 import pytest
 from shared.task_statuses import TERMINAL, TaskStatus
 
-from dashboard.data.census import SUB_VIEWS, TONES, VIEWS, TaskView
+from dashboard.data.census import SUB_VIEWS, TONES, VIEWS, TaskView, build_census
 
 
 def test_task_view_is_a_str_enum():
@@ -79,3 +79,83 @@ def test_vocabulary_constants_reject_mutation(constant):
     """These are imported by beta, the generator and the parity test — SPOT."""
     with pytest.raises(TypeError):
         constant['whatever'] = 'anything'  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# build_census over a nine-member fixture (the PRD's boundary sketch #5 —
+# synthetic, because no live `review`/`infra-hold` rows exist today). Keys are
+# ints and values plain strings, matching what tasks.py::fetch_statuses hands
+# back.
+# ---------------------------------------------------------------------------
+
+NINE_MEMBER_MAP = {index: member.value for index, member in enumerate(TaskStatus)}
+
+
+def assert_views_sum_to_total(census):
+    """The three views partition the statuses, so they must sum to the total."""
+    assert sum(census.views.values()) == census.total
+    assert sum(census.counts.values()) == census.total
+    assert census.sub_views[TaskView.RUNNING] <= census.views[TaskView.IN_FLIGHT]
+
+
+def test_build_census_counts_each_member_of_a_nine_member_map_once():
+    """One id per status: every count is 1 and the total is nine."""
+    census = build_census(NINE_MEMBER_MAP)
+    assert set(census.counts) == set(TaskStatus)
+    assert all(count == 1 for count in census.counts.values())
+    assert census.total == 9 == sum(census.counts.values())
+
+
+def test_build_census_views_over_a_nine_member_map():
+    """Five statuses are in flight, two are backlog, two are terminal."""
+    census = build_census(NINE_MEMBER_MAP)
+    assert dict(census.views) == {
+        TaskView.IN_FLIGHT: 5,
+        TaskView.BACKLOG: 2,
+        TaskView.TERMINAL: 2,
+    }
+    assert dict(census.sub_views) == {TaskView.RUNNING: 1}
+    assert_views_sum_to_total(census)
+
+
+def test_build_census_over_an_unbalanced_map():
+    """Several ids sharing a status tally into that status, and the sums still hold."""
+    status_map = {
+        1: TaskStatus.IN_PROGRESS.value,
+        2: TaskStatus.IN_PROGRESS.value,
+        3: TaskStatus.IN_PROGRESS.value,
+        4: TaskStatus.PENDING.value,
+        5: TaskStatus.DONE.value,
+        6: TaskStatus.DONE.value,
+    }
+    census = build_census(status_map)
+    assert census.counts[TaskStatus.IN_PROGRESS] == 3
+    assert census.counts[TaskStatus.DONE] == 2
+    assert census.counts[TaskStatus.BLOCKED] == 0
+    assert census.total == 6
+    assert dict(census.views) == {
+        TaskView.IN_FLIGHT: 3,
+        TaskView.BACKLOG: 1,
+        TaskView.TERMINAL: 2,
+    }
+    assert_views_sum_to_total(census)
+
+
+def test_build_census_over_an_empty_map_reports_zeroes_not_absences():
+    """All nine keys are present at zero — a missing key would read as a gap."""
+    census = build_census({})
+    assert set(census.counts) == set(TaskStatus)
+    assert all(count == 0 for count in census.counts.values())
+    assert census.total == 0
+    assert all(count == 0 for count in census.views.values())
+    assert all(count == 0 for count in census.sub_views.values())
+    assert_views_sum_to_total(census)
+
+
+def test_build_census_keeps_an_absent_member_at_zero():
+    """A status nobody is in is still a key, so a consumer never sees a KeyError."""
+    census = build_census({1: TaskStatus.PENDING.value})
+    assert census.counts[TaskStatus.INFRA_HOLD] == 0
+    assert census.counts[TaskStatus.PENDING] == 1
+    assert census.total == 1
+    assert_views_sum_to_total(census)
