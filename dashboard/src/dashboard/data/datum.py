@@ -71,3 +71,56 @@ class Datum(Generic[T]):
             'reason': self.reason,
             'freshness_bound_seconds': self.freshness_bound_seconds,
         }
+
+
+class DatumInvariant(enum.StrEnum):
+    """The contract invariant a :class:`DatumContractError` reports.
+
+    Carried as a structured field so a caller recovers WHICH rule broke
+    without parsing the message — the message is free to be reworded.
+    """
+
+    UNKNOWN_TRIAD = 'unknown_triad'
+    REASON_REQUIRED = 'reason_required'
+    FRESHNESS_BOUND = 'freshness_bound'
+
+
+class DatumContractError(ValueError):
+    """A ``Datum`` violates one of the envelope's declared invariants.
+
+    Subclasses ``ValueError`` so an unprepared caller's ``except ValueError``
+    still catches it, while a prepared one reads :attr:`invariant`.
+    """
+
+    def __init__(self, invariant: DatumInvariant, message: str) -> None:
+        super().__init__(message)
+        self.invariant = invariant
+
+
+def validate_datum(datum: Datum, served_at: datetime) -> None:
+    """Raise :class:`DatumContractError` if *datum* breaks a declared invariant.
+
+    Args:
+        datum: The envelope to check.
+        served_at: The instant the payload carrying *datum* is being shaped.
+            Required and injected rather than read from the clock here: the
+            contract's freshness invariant is about the one ``served_at`` the
+            payload actually carries, not about whenever this runs. Unused by
+            the unknown-triad check below.
+
+    Raises:
+        DatumContractError: Naming the invariant and the offending values.
+    """
+    is_unknown = datum.state is DatumState.UNKNOWN
+    if is_unknown != (datum.value is None) or is_unknown != (datum.as_of is None):
+        expectation = (
+            "state is 'unknown', so both value and as_of must be None"
+            if is_unknown
+            else "state is not 'unknown', so neither value nor as_of may be None"
+        )
+        raise DatumContractError(
+            DatumInvariant.UNKNOWN_TRIAD,
+            f'state, value and as_of disagree on whether a measurement exists: '
+            f'state={datum.state.value!r}, value={datum.value!r}, '
+            f'as_of={datum.as_of!r} ({expectation})',
+        )
