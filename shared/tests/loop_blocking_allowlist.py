@@ -221,9 +221,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts the record and reaches _restore_policy_keys, and '
         '_maybe_write_escalation reaches _merge_onto_persisted; both '
         'helpers read_text then write_text the located record under '
-        'escalation_id_lock. Filesystem, the limb task 3778\'s '
-        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
-        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
+        'here because no row can carry it: the dominant blocking work on '
+        'the write path is the escalation.dedupe.submit_or_dedupe call one '
+        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
+        'globs and JSON-parses every pending record in the project queue '
+        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
+        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
+        'The scanner reports only _merge_onto_persisted because those '
+        'primitives live in the escalation package, across a boundary its '
+        'fused-memory/src scope cannot follow -- so a fourth row would be '
+        'a blessing test_no_stale_blessings rejects, and this paragraph is '
+        'the only honest place to state it. Filesystem, the limb task '
+        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
+        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
@@ -235,23 +246,45 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts the record and reaches _restore_policy_keys, and '
         '_maybe_write_escalation reaches _merge_onto_persisted; both '
         'helpers read_text then write_text the located record under '
-        'escalation_id_lock. Filesystem, the limb task 3778\'s '
-        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
-        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
+        'here because no row can carry it: the dominant blocking work on '
+        'the write path is the escalation.dedupe.submit_or_dedupe call one '
+        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
+        'globs and JSON-parses every pending record in the project queue '
+        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
+        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
+        'The scanner reports only _merge_onto_persisted because those '
+        'primitives live in the escalation package, across a boundary its '
+        'fused-memory/src scope cannot follow -- so a fourth row would be '
+        'a blessing test_no_stale_blessings rejects, and this paragraph is '
+        'the only honest place to state it. Filesystem, the limb task '
+        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
+        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy._maybe_write_escalation',
-        'e76198731262',
+        '1939296ee9cb',
         'to_file',
         'ROOT CAUSE (one defect, 3 rows): BacklogPolicy reads and writes '
         'its escalation records on the loop thread -- on_judge_unhalt '
         'read_texts the record and reaches _restore_policy_keys, and '
         '_maybe_write_escalation reaches _merge_onto_persisted; both '
         'helpers read_text then write_text the located record under '
-        'escalation_id_lock. Filesystem, the limb task 3778\'s '
-        'subprocess-only vocabulary omitted. Follow-up filed by task 4484 '
-        'step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
+        'escalation_id_lock. UNDERSTATED BY THESE THREE ROWS, and recorded '
+        'here because no row can carry it: the dominant blocking work on '
+        'the write path is the escalation.dedupe.submit_or_dedupe call one '
+        'line ABOVE the _merge_onto_persisted site -- find_dedupe_parent '
+        'globs and JSON-parses every pending record in the project queue '
+        '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
+        'queue 2026-09-18), then queue.submit writes with a durable fsync. '
+        'The scanner reports only _merge_onto_persisted because those '
+        'primitives live in the escalation package, across a boundary its '
+        'fused-memory/src scope cannot follow -- so a fourth row would be '
+        'a blessing test_no_stale_blessings rejects, and this paragraph is '
+        'the only honest place to state it. Filesystem, the limb task '
+        '3778\'s subprocess-only vocabulary omitted. Follow-up filed by '
+        'task 4484 step-9. Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
 
     # ---- reconciliation/harness.py ----
