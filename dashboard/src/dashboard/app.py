@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import memory as api_memory_routes
+from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.window import _parse_window
@@ -41,7 +42,7 @@ from dashboard.data.cap_history import (
     read_cap_intervals,
     summarize_accounts,
 )
-from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
+from dashboard.data.chart_utils import ChartData
 from dashboard.data.costs import (
     aggregate_account_events,
     aggregate_cost_by_account,
@@ -65,18 +66,9 @@ from dashboard.data.mcp_fanout import (
     reap_detached_refreshes,
 )
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
-from dashboard.data.merge_halt import get_merge_halt_status
-from dashboard.data.merge_queue import (
-    build_per_project_merge_queue,
-    enrich_merges_with_titles,
-    fetch_live_merge_queues,
-    load_task_titles,
-    resolve_active,
-)
 from dashboard.data.metrics import (
     fan_out_list_tickets,
     get_curator_sparks,
-    get_merge_active_series,
     get_recon_sparks,
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
@@ -95,7 +87,6 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
-from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import (
     _FETCH_TASKS_TTL_SECONDS,
@@ -112,7 +103,7 @@ from dashboard.data.write_journal import (
 )
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
-from dashboard.project_dbs import _cost_dbs, _project_scoped_dbs_labeled
+from dashboard.project_dbs import _cost_dbs
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
@@ -530,6 +521,7 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 # module owns its own router and declares its own literal path, so a path
 # and the handler serving it stay in one file.
 app.include_router(api_tasks_routes.router)
+app.include_router(api_merge_queue_routes.router)
 app.include_router(api_burndown_routes.router)
 app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
@@ -1136,62 +1128,6 @@ async def api_recon(request: Request) -> JSONResponse:
             verdict=verdict,
             runs=runs,
             sparks=sparks,
-        )
-    )
-
-
-@app.get('/api/v2/dashboard/merge-queue')
-async def api_merge_queue(request: Request) -> JSONResponse:
-    """MERGE_QUEUE — per-project depth/outcomes/latency/recent/active/speculative."""
-    config: DashboardConfig = request.app.state.config
-    pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
-    hours = days * 24
-    effective_now = datetime.now(UTC)  # clock-exempt: single-capture route
-
-    project_dbs = await _project_scoped_dbs_labeled(
-        config,
-        pool,
-        Path('data/orchestrator/runs.db'),
-    )
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    projects_raw, halt_status, live_map = await asyncio.gather(
-        build_per_project_merge_queue(
-            project_dbs,
-            hours=hours,
-            now=effective_now,
-            recent_window_minutes=1440,
-        ),
-        get_merge_halt_status(http_client, config.escalation_urls),
-        fetch_live_merge_queues(http_client, config.escalation_urls),
-    )
-    pids = list(projects_raw.keys())
-    title_maps = await asyncio.gather(*(load_task_titles(http_client, config, pid) for pid in pids))
-    enriched: dict[str, dict] = {}
-    for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
-        label = _project_label(pid)
-        resolved = resolve_active(label, live_map, data.get('active', []))
-        # ι=1894: extract live metrics from the snapshot and stash for shaping
-        live_metrics = live_map.get(label, {}).get('metrics')
-        enriched[pid] = {
-            **data,
-            'depth_timeseries': trim_leading_zero_buckets(
-                cast(ChartData, data['depth_timeseries'])
-            ),
-            'recent': enrich_merges_with_titles(data['recent'], titles),
-            'active': enrich_merges_with_titles(resolved['entries'], titles),
-            'active_approximate': resolved['approximate'],
-            'live_metrics': live_metrics,
-        }
-    metrics_db = await pool.get(config.metrics_db)
-    active_sparks: dict[str, dict] = {}
-    for pid in pids:
-        active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
-    return JSONResponse(
-        redux_api.shape_merge_queue(
-            enriched,
-            active_sparks=active_sparks,
-            halt_status=halt_status,
         )
     )
 
