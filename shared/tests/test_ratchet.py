@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import json
+import types
 from collections import Counter
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from shared.ratchet import (
     load,
     slack,
     tighten,
+    tighten_into,
 )
 
 # Same src-root expression as shared/tests/conftest.py and
@@ -343,16 +345,27 @@ class TestNoFunctionCanAddAKeyToABaseline:
     """The surface pin the capability manifest's `manual` check defers to.
 
     The PRD's Contract says "no function can add a key to an existing
-    baseline".  That is asserted two ways here, because the property has two
-    halves.  ARITHMETICALLY, :func:`tighten` is the only baseline-producing
-    function and its keys are a subset of the baseline's by construction
-    (``Counter.__and__`` is the pointwise minimum), so the property is
-    structural rather than a check anyone could forget.  BY SURFACE, no other
-    verb exists — and a future ``absorb`` / ``widen`` / ``write_baseline``
-    cannot appear without turning ``test_the_public_surface_is_pinned`` red.
+    baseline".  That is asserted three ways here, because the property has
+    three halves.  ARITHMETICALLY, :func:`tighten` is the only
+    baseline-producing operation and its keys are a subset of the baseline's by
+    construction (``Counter.__and__`` is the pointwise minimum), so the property
+    is structural rather than a check anyone could forget.  ON THE WRITE PATH,
+    the same holds of the bytes :func:`tighten_into` actually commits — the half
+    that decides whether the arithmetic means anything, since a guarantee about
+    a return value guarantees nothing if the convenient way to persist it goes
+    around.  BY SURFACE, no absorb or widen verb exists, and one cannot arrive
+    without turning ``test_the_public_surface_carries_no_unexpected_verb`` red.
+
+    :func:`dump` is the deliberate exception to the surface half rather than a
+    hole in it.  It writes the enumeration it is handed, because seeding a
+    baseline that does not exist and carrying an honestly incomplete one across
+    the file boundary are both legitimate, and neither survives a writer that
+    refuses every key the old file lacked.  That is why the write-path half is
+    asserted of :func:`tighten_into` — the call the module makes shorter — and
+    not of ``dump``.
 
     :func:`excess`'s output legitimately contains keys the baseline never had.
-    That is not a counter-example: excess is a VIOLATION REPORT, never a
+    That is not a counter-example either: excess is a VIOLATION REPORT, never a
     baseline, and a new key in it IS the finding.
     """
 
@@ -374,6 +387,21 @@ class TestNoFunctionCanAddAKeyToABaseline:
         current, baseline = comparable(current_counts, baseline_counts)
         assert set(tighten(current, baseline)) <= set(baseline.counts)
 
+    @pytest.mark.parametrize(('current_counts', 'baseline_counts'), PAIRS)
+    def test_tighten_into_commits_no_key_the_baseline_lacks(
+        self, tmp_path, current_counts, baseline_counts
+    ):
+        """The same property, measured on the committed bytes.
+
+        The arithmetic half above is about a return value.  This is about what
+        reaches disk through the composed verb, which is what a later run
+        actually compares against.
+        """
+        current, baseline = comparable(current_counts, baseline_counts)
+        path = tmp_path / 'baseline.json'
+        tighten_into(current, baseline, path)
+        assert set(load(path).counts) <= set(baseline.counts)
+
     #: The kernel's whole intended public surface. There is no absorb, no
     #: widen, and no write-baseline verb, and there is not meant to be one.
     #: The two constants are part of the surface because a consumer asserting
@@ -393,22 +421,41 @@ class TestNoFunctionCanAddAKeyToABaseline:
             'load',
             'slack',
             'tighten',
+            'tighten_into',
         }
     )
 
     def test_the_public_surface_carries_no_unexpected_verb(self):
         """An explicit expected surface, so a new verb cannot arrive unnoticed.
 
+        Measured against the module's ACTUAL public attributes as well as its
+        ``__all__``, because the two can disagree in the direction that matters:
+        a future ``def absorb(...)`` that nobody added to the manifest is still
+        importable and callable, and a pin that read only the declared list would
+        not see it.  This module's whole point is the verb it does not have, so
+        the pin measures the property rather than the manifest.
+
         Asserted as containment rather than equality on purpose, and it is not
         the weaker pin it looks like.  Containment is exactly the property the
         manifest defers to — a future ``absorb`` / ``widen`` /
-        ``write_baseline`` turns this red the moment it is exported.  The other
+        ``write_baseline`` turns this red the moment it is DEFINED.  The other
         half of equality, that every name above still EXISTS, is pinned by this
         module's own imports: the suite cannot collect without them.  Splitting
         it this way also means the pin holds at every stage of the module's
         construction rather than only once the last function lands.
         """
-        assert set(shared.ratchet.__all__) <= self.EXPECTED_SURFACE
+        defined_here = {
+            name
+            for name, value in vars(shared.ratchet).items()
+            if not name.startswith('_')
+            # An imported module carries no __module__ of its own, so it would
+            # fall through the default below and read as locally defined.
+            and not isinstance(value, types.ModuleType)
+            # A module-level constant has no __module__ either, and that one IS
+            # local: SCHEMA_VERSION and BASELINE_README are part of the surface.
+            and getattr(value, '__module__', 'shared.ratchet') == 'shared.ratchet'
+        }
+        assert defined_here | set(shared.ratchet.__all__) <= self.EXPECTED_SURFACE
 
 
 #: Every kernel operation, so a refusal is asserted UNIFORMLY. A future fourth
@@ -750,6 +797,75 @@ class TestDumpIsAtomic:
         path = tmp_path / 'nested' / 'deeper' / 'baseline.json'
         dump(REPRESENTATIVE, path)
         assert load(path) == REPRESENTATIVE
+
+
+class TestTightenInto:
+    """The composition, so the safe path is the one that is shorter to write.
+
+    ``tighten`` returns a bare Counter, so persisting it by hand means rebuilding
+    an Enumeration and re-supplying params, complete and unreadable — next to
+    ``dump(current, path)``, a shorter call that widens the gate by every key the
+    current scan added.  These pin that the composed verb needs none of that from
+    the caller, and that its refusal happens before the file is touched.
+    """
+
+    def test_returns_what_tighten_returns(self, tmp_path):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        assert tighten_into(current, baseline, tmp_path / 'b.json') == tighten(
+            current, baseline
+        )
+
+    def test_writes_the_pointwise_minimum_under_the_shared_params(self, tmp_path):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        path = tmp_path / 'b.json'
+        tighten_into(current, baseline, path)
+        written = load(path)
+        assert dict(written.counts) == {'a': 1}
+        assert dict(written.params) == dict(baseline.params)
+
+    def test_what_it_writes_is_complete_without_the_caller_saying_so(self, tmp_path):
+        """The claim the hand-rolled path is free to get wrong.
+
+        ``complete=True`` here is not an assumption: tighten has already refused
+        unless both sides are complete.  A caller re-wrapping by hand states it
+        themselves, with nothing checking they were entitled to.
+        """
+        current, baseline = comparable({'a': 3}, {'a': 1})
+        path = tmp_path / 'b.json'
+        tighten_into(current, baseline, path)
+        assert load(path).complete is True
+        assert load(path).unreadable == ()
+
+    def test_is_idempotent_against_what_it_just_wrote(self, tmp_path):
+        current, baseline = comparable({'a': 3, 'b': 1}, {'a': 1, 'c': 5})
+        path = tmp_path / 'b.json'
+        tighten_into(current, baseline, path)
+        assert tighten_into(current, load(path), path) == tighten(current, baseline)
+
+    @pytest.mark.parametrize(
+        'baseline',
+        [
+            Enumeration(counts={'a': 1}, params={'key_version': 2}),  # params differ
+            Enumeration(
+                counts={'a': 1},
+                params={'key_version': 1},
+                complete=False,
+                unreadable=('pkg/a.py',),
+            ),
+        ],
+    )
+    def test_a_refusal_leaves_the_path_untouched(self, tmp_path, baseline):
+        """The precondition runs before the write, not alongside it.
+
+        A baseline written from a pair that could not legally be compared is the
+        widening this kernel exists to refuse — and a half-written one is worse,
+        because every key it lost reads as an improvement worth keeping.
+        """
+        current = Enumeration(counts={'a': 3}, params={'key_version': 1})
+        path = tmp_path / 'b.json'
+        with pytest.raises(RatchetError):
+            tighten_into(current, baseline, path)
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestLoadRefuses:

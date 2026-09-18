@@ -39,11 +39,22 @@ cannot be expressed as one without changing what they report.
   content-addressed and already opaque by design.  Making the kernel generic
   over a key type with a caller-supplied codec would widen a deliberately
   narrow interface for one consumer that does not need it.
-* *It has no absorb, widen, or write-baseline verb, by construction.*
-  :func:`tighten` is the only baseline-producing function and its result is a
-  subset of the baseline's keys because ``Counter.__and__`` is the pointwise
-  minimum.  "No function can add a key to an existing baseline" is therefore a
-  structural property of the arithmetic, not a check someone could forget.
+* *It has no absorb or widen verb, and every baseline it can PRODUCE is a
+  subset of the one it started from.*  :func:`tighten` is the only
+  baseline-producing arithmetic and its result is a subset of the baseline's
+  keys because ``Counter.__and__`` is the pointwise minimum, so "no function
+  can add a key to an existing baseline" holds structurally rather than as a
+  check someone could forget.  :func:`dump` is a write verb and is
+  deliberately NOT policed against the file already at its path: seeding a
+  baseline that does not exist yet is a legitimate first use, and carrying an
+  honestly INCOMPLETE enumeration across the file boundary is what stops a
+  later run loading a partial scan as a complete one — neither is expressible
+  by a writer that refused every key the old file lacked.  What that leaves —
+  regenerating an EXISTING baseline from a fresh scan instead of tightening it
+  — is the one widening move arithmetic cannot refuse, so it is met where it
+  can be: :func:`tighten_into` makes the tightening path the SHORTER one to
+  write, and :data:`BASELINE_README` states the rule in the file a reviewer
+  opens.
 * *It never fails soft.*  A partial enumeration and a mismatched params block
   both REFUSE rather than compare, and an unreadable baseline refuses rather
   than reading as empty.  An empty baseline compares clean against everything,
@@ -84,6 +95,7 @@ __all__ = [
     'load',
     'slack',
     'tighten',
+    'tighten_into',
 ]
 
 # The JSON scalar types a params value may be, or be a tuple of.  Not a
@@ -521,6 +533,14 @@ def dump(enumeration: Enumeration, path: str | os.PathLike[str]) -> None:
 
     The parent directory is created when absent (``mkdir=True``), so seeding a
     baseline at a path that does not exist yet needs no ceremony.
+
+    WHAT IT DOES NOT CHECK: any relationship to the baseline already at *path*.
+    It writes the enumeration it is handed, because seeding a new baseline and
+    carrying an honestly incomplete one across the file boundary are both
+    legitimate and neither survives a writer that refuses unfamiliar keys.
+    Regenerating an EXISTING baseline from a fresh scan is therefore the one
+    call that widens the gate, and :func:`tighten_into` is the shorter way to
+    write the call that does not.
     """
     blocks = [
         f'  "_README": {json.dumps(BASELINE_README)}',
@@ -539,6 +559,40 @@ def dump(enumeration: Enumeration, path: str | os.PathLike[str]) -> None:
         _render_counts(enumeration.counts),
     ]
     atomic_write_text(path, '{\n' + ',\n'.join(blocks) + '\n}\n', mkdir=True)
+
+
+def tighten_into(
+    current: Enumeration, baseline: Enumeration, path: str | os.PathLike[str]
+) -> Counter[str]:
+    """Tighten *baseline* against *current* and write the result to *path*.
+
+    THE SAFE PATH, MADE THE SHORT ONE.  :func:`tighten` returns a bare
+    ``Counter`` (the Contract's signature), so persisting its result means
+    re-wrapping it as an :class:`Enumeration` by hand and re-supplying
+    ``params``, ``complete`` and ``unreadable`` — three chances to commit a
+    baseline that claims more than the scan measured, sitting next to
+    ``dump(current, path)``, a SHORTER line that silently widens the gate by
+    every key the current scan added.  An instrument whose unsafe path is the
+    convenient one leaves the discipline to whoever writes the call, which is
+    the forgettable precondition :func:`_require_comparable` argues must never
+    be left to a caller.  So the composition lives here, and the only thing it
+    can write is the pointwise minimum under the params both sides share.
+
+    ``complete=True`` is not an assumption.  :func:`tighten` has already refused
+    unless BOTH sides are complete, so what is written is honest by the same
+    precondition that made the arithmetic legal — and because that refusal runs
+    first, a pair that cannot legally be compared never reaches the file at all.
+
+    Returns the tightened counter, so a caller can report what left the baseline
+    without reading the file back.
+
+    Raises:
+        RatchetError: The two enumerations are not comparable — see
+            :func:`_require_comparable`.
+    """
+    tightened = tighten(current, baseline)
+    dump(Enumeration(counts=dict(tightened), params=current.params, complete=True), path)
+    return tightened
 
 
 def _require_baseline_shape(raw: object, path: str | os.PathLike[str]) -> None:
