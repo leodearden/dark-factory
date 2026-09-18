@@ -1073,8 +1073,8 @@ async def _run_lifespan_with_a_recording_reaper(
         patch('dashboard.app.httpx.AsyncClient', _recording_async_client),
         patch('dashboard.app.reaper_loop', _recording_reaper_loop),
         patch('dashboard.app.reap_detached_refreshes', _observing_reap_detached),
-        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
         async with lifespan(run.app):
             await _step_until(
@@ -1192,9 +1192,9 @@ class TestWiringTheReaperKeepsTheExitPathGuarantee:
                 'dashboard.app.reap_detached_refreshes',
                 new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
             pytest.raises(RuntimeError, match=self._BOOM),

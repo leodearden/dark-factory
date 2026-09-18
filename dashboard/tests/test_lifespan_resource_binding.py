@@ -45,13 +45,9 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from dashboard.app import (
-    _build_http_limits,
-    _BurndownStore,
-    _metrics_loop,
-    _MetricsStore,
-)
+from dashboard.app import _build_http_limits
 from dashboard.config import DashboardConfig
+from dashboard.loops import _BurndownStore, _metrics_loop, _MetricsStore
 
 
 async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
@@ -93,6 +89,10 @@ def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
         )
 
     with (
+        # Stays on `dashboard.app`: this patches the name as `lifespan`
+        # RESOLVES it, and app.py imports both loops back from
+        # dashboard.loops. Retargeting to `dashboard.loops.*` would
+        # silently no-op and let the real loop run under the test.
         patch('dashboard.app._metrics_loop', new=_recording_metrics_loop),
         patch('dashboard.app._burndown_loop', new=_noop_burndown_loop),
         TestClient(app) as _outer,
@@ -253,6 +253,10 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
         with (
             patch('dashboard.app._build_http_limits', new=_swapping_limits),
             patch.object(_BurndownStore, 'open', _recording_open),
+            # Stays on `dashboard.app`: this patches the name as `lifespan`
+            # RESOLVES it, and app.py imports both loops back from
+            # dashboard.loops. Retargeting to `dashboard.loops.*` would
+            # silently no-op and let the real loop run under the test.
             patch('dashboard.app._burndown_loop', new=_recording_burndown_loop),
             patch('dashboard.app._metrics_loop', new=_noop_metrics_loop),
             TestClient(app),
@@ -364,10 +368,10 @@ async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
     try:
         with (
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(side_effect=_recording_collect),
             ),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
         ):
             task = asyncio.create_task(
                 _metrics_loop(
@@ -464,10 +468,10 @@ async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
     try:
         with (
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(side_effect=_recording_collect),
             ),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
         ):
             task = asyncio.create_task(
                 _metrics_loop(

@@ -330,9 +330,9 @@ class TestLifespanWiresTheLimits:
                 'dashboard.app.DashboardConfig.from_env',
                 return_value=fleet_config,
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
         ):

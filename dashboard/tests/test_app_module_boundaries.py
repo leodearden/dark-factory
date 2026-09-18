@@ -51,6 +51,16 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
         '_cost_dbs',
         '_burndown_dbs',
     ),
+    'dashboard.loops': (
+        '_SAMPLE_INTERVAL_SECONDS',
+        '_DOWNSAMPLE_INTERVAL_SECONDS',
+        '_CHECKPOINT_INTERVAL_SECONDS',
+        '_BurndownStore',
+        '_MetricsStore',
+        '_sleep_to_aligned_tick',
+        '_burndown_loop',
+        '_metrics_loop',
+    ),
 }
 
 # URL path -> (module dotted path, handler name) for every extracted route.
@@ -60,6 +70,7 @@ MOVED_ROUTES: dict[str, tuple[str, str]] = {}
 NEW_MODULES: tuple[str, ...] = (
     'dashboard/src/dashboard/api/window.py',
     'dashboard/src/dashboard/project_dbs.py',
+    'dashboard/src/dashboard/loops.py',
 )
 
 _REACH_BACK = 'dashboard.app'

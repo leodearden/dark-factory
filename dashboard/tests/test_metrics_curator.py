@@ -23,7 +23,6 @@ from _dashboard_helpers import (
     mcp_tool_response,
 )
 
-from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
@@ -31,6 +30,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Shared schemas (minimal for tests)
@@ -757,7 +757,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     expected_conn = None
     loop_opened = False
     try:
-        with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
+        with patch('dashboard.loops.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
             # aligned-sleep loop.  We cancel the task once the event fires.
             task = asyncio.create_task(

@@ -44,8 +44,9 @@ import pytest
 from _dashboard_helpers import apply_isolated_env, drain, wedge_one_bypass
 from fastapi import FastAPI
 
-from dashboard.app import _BurndownStore, lifespan
+from dashboard.app import lifespan
 from dashboard.data.mcp_fanout import TTLCache
+from dashboard.loops import _BurndownStore
 
 
 class TestLifespanReapsDetachedBypassRefreshes:
@@ -89,9 +90,9 @@ class TestLifespanReapsDetachedBypassRefreshes:
             # The background loops' own fan-out is not what this module is
             # about, and un-stubbed it would dial the configured fused-memory
             # endpoint on every run.
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
         ):
@@ -174,9 +175,9 @@ class TestLifespanClosesItsResourcesEvenIfTheReapFails:
                 'dashboard.app.reap_detached_refreshes',
                 new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
             # The fix must not convert a shutdown bug into silence: a reap that
@@ -226,9 +227,9 @@ class TestLifespanClosesTheRestWhenOneCloseFails:
                 autospec=True,
                 side_effect=RuntimeError(self._CLOSE_BOOM),
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
             # Still a real defect, so it still reaches an operator.
