@@ -4,9 +4,12 @@ Bounds the backlog of unprocessed reconciliation events per project. When the
 count of buffered events plus the in-flight queue exceeds a hard limit, the
 policy routes to one of two outcomes:
 
-* **Orchestrator live for project** → write an L1 escalation JSON under
-  ``<project_root>/data/escalations/``. Rate-limited per project so a hot
-  backlog doesn't spam the queue.
+* **Orchestrator live for project** → file an L1 escalation under
+  ``<project_root>/data/escalations/`` through
+  ``escalation.dedupe.submit_or_dedupe``. A tick that finds the condition
+  still live FOLDS into the pending record for the same
+  ``(project_id, kind)`` — bumping its ``dedupe_count`` and refreshing the
+  condition it states — instead of minting a sibling record beside it.
 * **No orchestrator** → return a structured ``ReconciliationBacklogExceeded``
   error that callers convert to MCP responses. Reads stay unaffected.
 
@@ -92,13 +95,20 @@ _ESC_ID_PREFIXES: dict[str, str] = {
 _ESCALATION_CATEGORY = 'infra_issue'
 
 # Keys BacklogPolicy stamps onto its escalation records that are NOT
-# ``Escalation`` dataclass fields. ``EscalationQueue.resolve()`` rewrites the
-# file from ``Escalation.to_json()`` (== ``asdict(Escalation)``), so closing a
-# record DESTROYS them unless they are re-merged afterwards — and with
-# ``project_id``/``error_type`` gone the archived halt is no longer
-# attributable to a project, breaking the exact forensic query that diagnosed
-# the 48h reify incident ('0 of 96 escalation files carried
-# ReconciliationJudgeHalted'). See BacklogPolicy._restore_policy_keys.
+# ``Escalation`` dataclass fields. THREE queue operations destroy them, not
+# one, because each persists a record round-tripped through the dataclass:
+#   * ``EscalationQueue.resolve()`` rewrites from ``Escalation.to_json()``
+#     (== ``asdict(Escalation)``) — the close path;
+#   * ``EscalationQueue.submit()`` persists the same ``to_json()`` — so the
+#     FIRST write drops them too;
+#   * ``attach_dedupe_child()`` re-hydrates via ``Escalation.from_json`` before
+#     rewriting — so does every FOLD.
+# With ``project_id``/``error_type`` gone the record is no longer attributable
+# to a project or a fault kind, breaking the exact forensic query that
+# diagnosed the 48h reify incident ('0 of 96 escalation files carried
+# ReconciliationJudgeHalted'). That is why ``_merge_onto_persisted`` runs on
+# the write and fold paths (``_maybe_write_escalation``) as well as the close
+# path (``_restore_policy_keys``).
 _POLICY_ONLY_KEYS: tuple[str, ...] = ('project_id', 'error_type', 'backlog', 'threshold')
 
 
@@ -696,12 +706,46 @@ class BacklogPolicy:
         detail: str,
         suggested_action: str,
     ) -> Path | None:
-        """Write an escalation JSON unless rate-limited. Returns path on write.
+        """File an escalation unless rate-limited. Returns the record's path.
 
         Rate-limiting is per-(project, ``kind``): a backlog escalation never
         suppresses a judge-halt or wedge escalation within the window, and
         vice-versa (task 2920 (a)). The id prefix is derived from ``kind`` so a
         halt/wedge is never mis-filed as 'backlog'.
+
+        The rate limit now bounds the FOLD cadence, not the mint cadence. Past
+        the window a still-live condition routes through ``submit_or_dedupe``
+        and lands on the pending record rather than beside it, so
+        ``dedupe_count`` reads as "number of ~900s windows this condition has
+        persisted". A process restart re-arming the in-memory stamp can no
+        longer mint a second file either, because the fold identity lives on
+        disk rather than in ``_PolicyState``.
+
+        FOLD KEY = ``(category, kind, project_id)``, via a content fingerprint.
+        The default ``summary_dedupe_key`` is unusable here: all three kinds
+        carry ``category='infra_issue'``, so the category separates nothing,
+        and the backlog summary's first three normalised tokens
+        ('reconciliation', 'backlog', 'exceeded') are identical for EVERY
+        project — keying on them would cross-fold projects into a record that
+        can attribute its condition to neither.
+
+        Returns the PARENT's path on a fold, which is load-bearing:
+        ``harness._notify_judge_halt`` claims its per-process halt sentinel
+        only when ``escalation_path is not None``, so returning None for a
+        halt whose record already exists would re-enter that callback on every
+        ~5s tick forever.
+
+        DEFERRED-TASK INTERACTION, recorded rather than absorbed. A 900s
+        cadence is the ``dedupe_children`` growth case deferred task 4335
+        describes and the parent-freshness gap deferred task 4132 describes.
+        Both are already bounded by task 4885, which landed AFTER they were
+        deferred: ``queue._MAX_DEDUPE_CHILDREN = 200`` with
+        ``_MAX_DEDUPE_CHILDREN_HEAD = 20`` and a ``dedupe_children_truncated``
+        counter, and ``attach_dedupe_child`` stamping ``updated_at``
+        unconditionally. At 900s a parent reaches the 200-child cap in ~50h,
+        after which provenance sheds under the cap while ``dedupe_count`` —
+        the deliberately uncapped recurrence signal — keeps counting. This
+        task neither re-opens nor closes 4335/4132.
         """
         async with self._lock:
             state = self._state.setdefault(project_id, _PolicyState())
