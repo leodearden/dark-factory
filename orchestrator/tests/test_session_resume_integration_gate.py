@@ -38,6 +38,7 @@ import errno
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from collections import namedtuple
@@ -470,6 +471,36 @@ def _storm_queue() -> MagicMock:
     return q
 
 
+def _arm_storm_queue(harness: Harness) -> MagicMock:
+    """Install the stand-in escalation queue on *harness* and return it.
+
+    One of three seams through which this suite touches the harness's storm
+    state — the `_reasons_for` convention test_crash_recovery.py applies to the
+    same fields. Naming each private attribute ONCE keeps a rename to one edit
+    and keeps the coupling a reader has to hold in their head to one line.
+    """
+    queue = _storm_queue()
+    harness._escalation_queue = queue
+    return queue
+
+
+def _filed(harness: Harness) -> list:
+    """Every escalation submitted to the harness's queue so far, in order.
+
+    Reads the stand-in queue ``_arm_storm_queue`` installed, so the declared
+    ``EscalationQueue | None`` type carries neither the armed-ness nor the
+    MagicMock recording attributes — the same suppression this suite already
+    uses for ``harness.event_store.emit.call_args_list``.
+    """
+    submitted = harness._escalation_queue.submit.call_args_list  # type: ignore[attr-defined]
+    return [call.args[0] for call in submitted]
+
+
+def _streak(harness: Harness) -> int:
+    """The current run of genuine session-resume failures."""
+    return harness._session_resume_fallback_streak
+
+
 # ── B1: clean SIGTERM mid-implementer, warm lane ─────────────────────────────
 @pytest.mark.asyncio
 async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
@@ -594,7 +625,7 @@ def _resume_assignment(task_id: str) -> TaskAssignment:
 
 async def _make_resumed_workflow(
     config: OrchestratorConfig, git_ops: GitOps, task_assignment: TaskAssignment,
-    resume_session_id,
+    resume_session_id, resume_outcome_sink=None,
 ) -> tuple[TaskWorkflow, Path]:
     """Build a probe TaskWorkflow with a REAL on-disk TaskArtifacts + config_dir.
 
@@ -612,6 +643,7 @@ async def _make_resumed_workflow(
         briefing=FakeBriefing(),  # type: ignore[arg-type]
         mcp=FakeMcp(),  # type: ignore[arg-type]
         resume_session_id=resume_session_id,
+        resume_outcome_sink=resume_outcome_sink,
     )
     artifacts = TaskArtifacts(cwd)
     artifacts.init(task_assignment.task_id, 'X', 'Y')
@@ -629,6 +661,7 @@ async def _drive_resumed_invoke(
     slug: str = '',
     result_kwargs: dict | None = None,
     drop_config_dir: bool = False,
+    resume_outcome_sink=None,
 ) -> _InvokeCapture:
     """Feed *recovered_session* as ``resume_session_id`` into a REAL
     ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
@@ -643,6 +676,8 @@ async def _drive_resumed_invoke(
     ``result_kwargs`` overrides fields on the ``AgentResult`` the patched
     ``invoke_with_cap_retry`` returns — used to hand back the
     ``resume_fallbacks`` count the CLI-stage instrumentation reads.
+    ``resume_outcome_sink`` wires ε's reporting seam; it defaults to None, so
+    every pre-existing caller drives the un-instrumented path unchanged.
     ``drop_config_dir`` clears ``workflow._config_dir`` after construction,
     driving the arm site's third scoping arm: with no concrete directory there
     is nowhere correct to glob, so the corroboration must NOT veto.
@@ -664,6 +699,7 @@ async def _drive_resumed_invoke(
     assignment = _resume_assignment(task_id)
     workflow, cwd = await _make_resumed_workflow(
         config, git_ops, assignment, recovered_session,
+        resume_outcome_sink=resume_outcome_sink,
     )
     workflow.event_store = event_store
     if seed_transcript:
@@ -1503,7 +1539,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
         harness, task_id, session_id, role='implementer', with_transcript=True,
     )
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     await harness._recover_crashed_tasks()
 
@@ -1525,7 +1561,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reasons'] == ['reseeded']
-    assert harness._escalation_queue.submit.call_count == 0
+    assert _filed(harness) == []
 
 
 # ── B5: stale sidecar beyond the freshness window ────────────────────────────
@@ -1797,7 +1833,7 @@ async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
     counter, so it accumulates identically either way. Reuses ``_storm_queue``.
     """
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-    harness._escalation_queue = _storm_queue()
+    _arm_storm_queue(harness)
 
     # 1st stale dispatch — REAL recovery → adopt → stale fallback.
     _setup_warm_lane_session(harness, 'st0', 'uuid-st0', fresh=False)
@@ -1834,8 +1870,8 @@ async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
 
     # Three fallbacks, a streak that never moved, and NO escalation.
     assert len(_session_resume_emits(harness)) == 3
-    assert harness._session_resume_fallback_streak == 0
-    assert harness._escalation_queue.submit.call_count == 0
+    assert _streak(harness) == 0
+    assert _filed(harness) == []
 
 
 # ── B9: cold worktree, plan present — β widens the cold path too ─────────────
@@ -1976,3 +2012,574 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     assert rewritten.schema_version == 2
     assert rewritten.task_id == str(task_id)
     assert rewritten.session_id == session_id
+
+
+# ── ε (task 3733): eligible-but-FAILED feeds the storm streak ────────────────
+# Deliberately NOT a B-number: B8/B9 are already double-booked between 2775's
+# matrix and δ's rows (see the numbering-trap note above), so a third scheme
+# keyed on the leaf letter cannot collide with either.
+#
+# The seam these rows pin is ``TaskWorkflow._invoke``'s ARM SITE — the single
+# place BOTH resume producers converge (the harness crash-recovery arm and the
+# in-workflow progress-timeout re-arm) and the only place the archive restore
+# actually happens. The harness eligibility predicate runs a whole
+# process-phase earlier and takes ``archive_available`` as a bool precisely so
+# it acquires no filesystem dependency, so it cannot report that a restore
+# failed.
+#
+# Measurement says the same thing from the other side. Measured 2026-09-16:
+# all 10 live ``session_resume_failed`` rows (2026-08-24..09-15) are
+# stage='cli', and not one of their session ids appears among the 8
+# ``session_resume`` rows the harness guard has ever emitted — whose nearest
+# neighbours in time, 2026-08-20 and 2026-09-16, fall outside the failure span
+# entirely. So the dense population is the in-workflow producer's, and a
+# predicate-keyed feeder would have run at ~0.1/day.
+
+
+class _RecordingSink:
+    """Minimal ``ResumeOutcomeSink`` stand-in capturing what ``_invoke`` reports.
+
+    Modelled on ``_RecordingEventStore`` above: the two methods are the whole
+    surface, and a real ``Harness`` would drag its streak, config and
+    escalation queue into rows that are about the REPORTING half of the seam.
+    The composed end-to-end rows bind a real harness instead.
+    """
+
+    def __init__(self) -> None:
+        self.failures: list = []
+        self.successes: int = 0
+
+    def note_resume_failed(self, report) -> None:
+        self.failures.append(report)
+
+    def note_resume_succeeded(self) -> None:
+        self.successes += 1
+
+    def only_failure(self):
+        assert len(self.failures) == 1, (
+            f'expected exactly one reported failure, saw {self.failures}'
+        )
+        return self.failures[0]
+
+
+@pytest.mark.asyncio
+async def test_epsilon_internal_restore_fault_is_reported_with_its_archive(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """arm (a) of the task, end to end: a fault injected INSIDE the restore
+    path is reported to the sink, naming the archive it was reading.
+
+    ENOSPC at ``shutil.copyfile`` is the B1r idiom — past every early return in
+    ``restore_archived_transcript``, so this is the fault class that is the
+    majority of what really happens and that the caller cannot see unaided.
+
+    The report must carry the archive ROOT and the archive PATH, because that
+    is the whole operator-facing point: an L1 that says "a restore failed" and
+    an L1 that says "the restore of /srv/…/<sid>.jsonl out of /srv/… failed
+    with ENOSPC" are different escalations. The path is obtained through
+    ``durable_archive_path`` — the sanctioned sole session-id-keyed locator
+    (PRD §8 contract I-E) — not by globbing a second one.
+    """
+    task_id, session_id = '3733-a', 'uuid-eps-enospc'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink, store = _RecordingSink(), _RecordingEventStore()
+
+    with patch(
+        'shared.transcript_archive.shutil.copyfile',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, event_store=store, resume_outcome_sink=sink,
+        )
+
+    # Still a FRESH dispatch — instrumentation costs no dispatch.
+    assert cap.kwargs['resume_session_id'] is None
+    assert sink.successes == 0
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'fault'
+    assert report.task_id == task_id
+    assert report.session_id == session_id
+    assert report.role == IMPLEMENTER.name
+    assert report.archive_root is not None
+    assert report.archive_path is not None
+    assert session_id in report.archive_path
+    assert 'No space left on device' in (report.detail or '')
+    # The sink and the runs.db row are built from the SAME payload, so the
+    # census an operator queries and the escalation they are paged by cannot
+    # disagree.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['restore'] == report.restore
+    assert failed[0]['data']['stage'] == report.stage
+
+
+@pytest.mark.asyncio
+async def test_epsilon_archive_root_fault_reports_no_path_and_never_raises(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """A fault in the archive-root COMPOSITION leaves both lookups empty — and
+    the best-effort path lookup must neither raise nor invent one.
+
+    ``resolve_archive_root`` is not total (a ``None`` project_root, a
+    non-PathLike root from malformed YAML), and when it raises, ``archive_root``
+    is never bound at all. The report therefore carries ``None`` for both
+    fields, which the L1 renders as "none located" — materially different from
+    an archive that WAS located and held nothing, and the tell for a config
+    regression rather than a disk fault.
+    """
+    task_id, session_id = '3733-b', 'uuid-eps-rootfault'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    with patch(
+        'orchestrator.workflow.resolve_archive_root',
+        side_effect=TypeError("unsupported operand type(s) for /: 'NoneType' and 'str'"),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, resume_outcome_sink=sink,
+        )
+
+    assert cap.kwargs['resume_session_id'] is None
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'fault'
+    assert report.archive_root is None
+    assert report.archive_path is None
+    assert 'unsupported operand type' in (report.detail or '')
+
+
+@pytest.mark.asyncio
+async def test_epsilon_a_genuine_archive_miss_is_reported_as_a_miss(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """An archive that genuinely holds nothing reports ``'miss'``, which the
+    harness carves OUT of the streak.
+
+    This is the archive-COVERAGE signal, and task 3728's handoff note assigns
+    it to a future RATE watch — "a step change in the rate, not a run of them".
+    Putting it on the consecutive-run streak would answer a different question
+    with the wrong instrument, so the classification has to arrive at the
+    harness intact rather than being collapsed into "a restore failed".
+    """
+    task_id, session_id = '3733-c', 'uuid-eps-miss'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        resume_outcome_sink=sink,
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    report = sink.only_failure()
+    assert report.stage == 'pre_flight'
+    assert report.restore == 'miss'
+
+
+@pytest.mark.asyncio
+async def test_epsilon_cli_rejection_of_an_armed_resume_is_reported(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The CLI-stage half: we corroborated, armed ``--resume``, and the CLI
+    rejected the session anyway.
+
+    Genuine by construction — the restore ran a phase earlier and is not what
+    failed here, so the report carries no restore outcome. It must name the
+    session actually LOST, which ``session_id_val`` often is not: ``cli_invoke``
+    regenerates the pre-allocated id on a fresh retry, so the carrier's first
+    dropped id is the resume we adopted.
+    """
+    task_id, session_id = '3733-d', 'uuid-eps-cli'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, resume_outcome_sink=sink,
+        result_kwargs={
+            'resume_fallbacks': 1,
+            'resume_fallback_session_ids': (session_id,),
+        },
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert sink.successes == 0
+    report = sink.only_failure()
+    assert report.stage == 'cli'
+    assert report.restore is None
+    assert report.session_id == session_id
+    assert report.task_id == task_id
+    assert report.role == IMPLEMENTER.name
+
+
+@pytest.mark.asyncio
+async def test_epsilon_a_surviving_resume_is_reported_as_a_success(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """A resume that was adopted AND survived reports exactly one success and
+    no failure — the reset half of the circuit breaker.
+
+    Without this the streak would be a rolling burst count: the escape is meant
+    to fire on a RUN of failures with nothing working in between, so one
+    working resume is proof the systematic cause is not present.
+    """
+    task_id, session_id = '3733-e', 'uuid-eps-ok'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+    sink = _RecordingSink()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, rec.session, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, resume_outcome_sink=sink,
+        result_kwargs={'resume_fallbacks': 0},
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert sink.failures == []
+    assert sink.successes == 1
+
+
+@pytest.mark.asyncio
+async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """With NO sink wired, ``_invoke`` does exactly what it did before ε.
+
+    That is what keeps eval dispatch un-drifted (``evals/runner.py`` passes no
+    sink and stays unedited) and what keeps every pre-existing row in this file
+    — the two B1r fault injections among them — passing unchanged, since
+    ``_drive_resumed_invoke`` wires no sink by default.
+
+    Asserted as a DIFFERENCE, not as a restatement of today's values: the same
+    fault is driven twice, once with a sink and once without, and the iwcr
+    kwargs and the emitted events must match. A row that re-listed the expected
+    kwargs would pass just as happily if both paths drifted together.
+    """
+    task_id, session_id = '3733-f', 'uuid-eps-nosink'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    rec = await _recover(harness, task_id)
+
+    def _stable(cap, repo: Path) -> dict:
+        """The iwcr kwargs with the per-drive values neutralised.
+
+        Each drive builds its OWN tmp repo and mints its OWN fresh session
+        id, so a handful of values differ by construction: the two paths, the
+        config-dir handle (an object with no value equality) and everything
+        derived from the session id, the spawn parent slug included.
+        Neutralised rather than dropped, so every key stays in the comparison
+        and a real drift in any of them still shows up.
+        """
+        out = dict(cap.kwargs)
+        out['cwd'] = Path(out['cwd']).relative_to(repo)
+        out['config_dir'] = Path(out['config_dir'].path).relative_to(repo)
+        out['mcp_config'] = json.loads(
+            json.dumps(out['mcp_config']).replace(str(repo), '<repo>')
+        )
+        spawn = dict(out['spawn_env'])
+        # The spawn parent id is <task_id>-<slug of the session id>; only the
+        # slug is per-drive, so the task-id half stays in the comparison.
+        parent = spawn['CLAUDE_SPAWN_PARENT_ID']
+        spawn['CLAUDE_SPAWN_PARENT_ID'] = f'{parent.rsplit("-", 1)[0]}-<slug>'
+        out['spawn_env'] = spawn
+        out['session_id'] = '<sid>'
+        return out
+
+    stable, emits = [], []
+    for label, sink in (('with', _RecordingSink()), ('without', None)):
+        store = _RecordingEventStore()
+        with patch(
+            'shared.transcript_archive.shutil.copyfile',
+            side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+        ):
+            cap = await _drive_resumed_invoke(
+                tmp_path, dict(rec.session or {}), IMPLEMENTER, caplog,
+                task_id=task_id, seed_archive=True, event_store=store,
+                resume_outcome_sink=sink, slug=f'nosink-{label}',
+            )
+        stable.append(_stable(cap, tmp_path / f'resume-repo-nosink-{label}'))
+        emits.append(store.emits)
+
+    assert stable[0] == stable[1]
+    assert [et for et, _ in emits[0]] == [et for et, _ in emits[1]]
+    # Every event's TYPE and order is compared above; the payloads are
+    # compared for the resume population only, since the routing_decision row
+    # riding alongside carries a wall-clock `decided_at` that differs per drive
+    # by construction and has nothing to do with this seam.
+    assert [
+        kw['data'] for et, kw in emits[0] if et is EventType.session_resume_failed
+    ] == [
+        kw['data'] for et, kw in emits[1] if et is EventType.session_resume_failed
+    ]
+
+
+# ── ε composed: the harness→workflow seam, end to end ───────────────────────
+# The rows above pin what the workflow REPORTS. These bind a REAL Harness as
+# the sink and assert the user-observable signal the task is actually for: a
+# run of genuine restore failures pages an operator exactly once, a boot of
+# purely by-design outcomes never does however long it runs, and one working
+# resume in the middle retires the run.
+
+
+async def _recover_cold_sessions(
+    harness: Harness, specs: list[tuple[str, str]], **setup,
+) -> dict[str, dict]:
+    """Lay down one cold worktree per (task_id, session_id) and recover them all.
+
+    ``lane=False`` because each spec needs its OWN directory: the warm-lane
+    shape always writes ``_lane-0`` (a pool slot, by design), so several lanes
+    in one boot would collide. Recovery runs ONCE over the whole set, which is
+    also the production shape — a boot recovers everything it finds.
+    """
+    for task_id, session_id in specs:
+        _setup_warm_lane_session(
+            harness, task_id, session_id, role='implementer', lane=False, **setup,
+        )
+    await harness._recover_crashed_tasks()
+    return {tid: harness._recovered_sessions[tid] for tid, _ in specs}
+
+
+async def _drive_failing_restore(
+    harness: Harness, tmp_path: Path, caplog, task_id: str, session: dict,
+):
+    """One dispatch whose archive restore faults, reported to *harness*.
+
+    The fault is an UNREADABLE archive — injected at ``shutil.copyfile`` inside
+    ``restore_archived_transcript``, past every early return — which is the
+    task's own stated arm (a) and the fault class that is the majority of what
+    really happens.
+    """
+    with patch(
+        'shared.transcript_archive.shutil.copyfile',
+        side_effect=OSError(errno.EACCES, 'Permission denied'),
+    ):
+        return await _drive_resumed_invoke(
+            tmp_path, session, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, resume_outcome_sink=harness,
+            slug=f'eps-e2e-{task_id}',
+        )
+
+
+def _assert_by_design_emit(
+    emits: list[tuple], seen: int, expected, label: str,
+) -> int:
+    """Assert the guard emitted exactly what this by-design case must produce.
+
+    ``_session_resume_emits`` reads the harness's whole emit history, so *seen*
+    is how many were already there; only the tail is inspected. *expected* is
+    ``None`` for the silent kill switch, the string ``'capped-event'`` for the
+    throttle's own event type, or the sorted reason list carried on a
+    ``session_resume_fallback``. A row that only checked "nothing escalated"
+    would pass just as happily against a guard that never ran.
+    """
+    fresh = emits[seen:]
+    if expected is None:
+        assert fresh == [], f'{label}: the kill switch must stay silent'
+    elif expected == 'capped-event':
+        assert [et for et, _ in fresh] == [EventType.session_resume_capped], label
+    else:
+        assert [et for et, _ in fresh] == [EventType.session_resume_fallback], label
+        assert fresh[0][1]['data']['reasons'] == expected, label
+    return len(emits)
+
+
+@pytest.mark.asyncio
+async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """POSITIVE — at the SHIPPED defaults, a run of unreadable-archive faults
+    files exactly ONE L1 that names the restores that failed.
+
+    This is the task's user-observable signal, composed: REAL recovery adopts
+    the sessions, the REAL ``_run_slot`` guard judges them eligible, the REAL
+    ``_invoke`` arm site attempts and fails the restore, the REAL Harness
+    classifies and counts, and the REAL filer escalates. No step of that chain
+    is a stand-in except the CLI itself.
+
+    THE GUARD IS PART OF THE CHAIN, not scenery. Production evaluates
+    eligibility one process-phase BEFORE the restore, in the dispatch that then
+    performs it, so a row that skips it is not the composition it claims to be:
+    while the guard retired the storm run the moment it judged a session
+    eligible, every failure below was preceded by its own reset and this could
+    never reach the threshold — and this row passed anyway, because it dispatched
+    nothing.
+
+    The detail must name the failures. The escalation this replaces told the
+    operator to run a SQL census and guess which reason drove the run, and
+    before that to check NTP — for a population that provably did not
+    contribute.
+    """
+    harness.config.session_resume = SessionResumeConfig()
+    threshold = harness.config.session_resume.fallback_storm_threshold
+    _arm_storm_queue(harness)
+
+    specs = [(f'eps-{i}', f'uuid-eps-run-{i}') for i in range(threshold)]
+    sessions = await _recover_cold_sessions(harness, specs)
+
+    for task_id, _ in specs:
+        # Eligible (a live transcript corroborates it), then the restore that
+        # fails — production's order, in one interleaved run.
+        capture = await _dispatch_capture(harness, task_id)
+        assert capture.resume_session_id is sessions[task_id]
+        await _drive_failing_restore(
+            harness, tmp_path, caplog, task_id, sessions[task_id],
+        )
+
+    assert _streak(harness) == threshold
+    assert len(_filed(harness)) == 1
+    esc = _filed(harness)[-1]
+    assert esc.level == 1
+    for task_id, session_id in specs:
+        assert task_id in esc.detail
+        assert session_id in esc.detail
+    assert 'Permission denied' in esc.detail
+    assert not re.search(
+        'clock skew|NTP', f'{esc.detail}\n{esc.suggested_action}', re.IGNORECASE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """NEGATIVE — a boot of purely BY-DESIGN outcomes files nothing, however
+    many dispatches it runs.
+
+    Both seams are exercised, because both have their own carve-out and either
+    could leak. At the HARNESS guard: every reason
+    ``_BY_DESIGN_SESSION_RESUME_REASONS`` carves out, ``aged_out`` (task 3730's
+    addition) included — leaving it unclassified would page an operator for a
+    batch of week-old sidecars after a long outage. At the ARM SITE: an archive
+    that genuinely holds nothing ('miss', the coverage signal that belongs on a
+    rate watch) and the restore kill switch ('disabled').
+
+    ``fallback_storm_threshold=1`` makes the very first GENUINE outcome fire,
+    so a zero submit count across the whole boot proves none of these feeds the
+    streak at all — and the streak is asserted INSIDE the loop, so it can never
+    transiently rise either.
+    """
+    base = SessionResumeConfig(fallback_storm_threshold=1)
+    _arm_storm_queue(harness)
+
+    # ── the HARNESS guard: one cold worktree per by-design reason ──
+    day = 86400
+
+    def _drop_transcripts(worktree: Path) -> None:
+        """The config dir SURVIVES but holds no transcript for this session."""
+        for jsonl in worktree.rglob('*.jsonl'):
+            jsonl.unlink()
+
+    def _wipe_config_dir(worktree: Path) -> None:
+        """The stashed config dir is PROVABLY gone — a warm-lane reseed."""
+        for cfg in (worktree / '.task').glob('claude-config-*'):
+            shutil.rmtree(cfg)
+
+    # (reason, session_resume config, setup kwargs, post-recovery mutation,
+    #  the emit the guard must produce). The expected emits are NOT uniform,
+    #  and that is the point: 'capped' has its own event type, 'disabled' is
+    #  silent by design (B6), and 'aged_out' co-occurs with 'stale' because the
+    #  predicate ACCUMULATES rather than returning a first match (task 3728).
+    guard_cases = [
+        ('stale', base, {'age_secs': 2 * day}, None, ['stale']),
+        ('no_transcript', base, {}, _drop_transcripts, ['no_transcript']),
+        ('reseeded', base, {}, _wipe_config_dir, ['reseeded']),
+        ('capped', base.model_copy(update={'max_resumes_per_task': 1}),
+         {'resume_count': 1}, None, 'capped-event'),
+        ('disabled', base.model_copy(update={'enabled': False}), {}, None, None),
+        ('aged_out', base, {'age_secs': 6 * day}, None, ['aged_out', 'stale']),
+    ]
+    seen = 0
+    for reason, config, setup, mutate, expected in guard_cases:
+        harness.config.session_resume = config
+        task_id, session_id = f'bd-{reason}', f'uuid-bd-{reason}'
+        await _recover_cold_sessions(harness, [(task_id, session_id)], **setup)
+        if mutate is not None:
+            mutate(harness.git_ops.worktree_base / task_id)
+        cap = await _dispatch_capture(harness, task_id)
+        # NON-VACUOUS: the guard has to have actually rejected this session for
+        # the reason claimed. Without these the row would pass just as happily
+        # if recovery had adopted nothing at all and the guard never ran.
+        assert cap.resume_session_id is None, reason
+        seen = _assert_by_design_emit(cap.emits, seen, expected, reason)
+        assert _streak(harness) == 0, reason
+        assert _filed(harness) == [], reason
+
+    # ── the ARM SITE: 'miss' (no archive seeded) and 'disabled' (kill switch) ──
+    arm_cases = [
+        ('miss', {}),
+        ('disabled', {'session_resume': SessionResumeConfig(
+            restore_from_archive=False,
+        )}),
+    ]
+    for outcome, overrides in arm_cases:
+        task_id, session_id = f'arm-{outcome}', f'uuid-arm-{outcome}'
+        sessions = await _recover_cold_sessions(harness, [(task_id, session_id)])
+        store = _RecordingEventStore()
+        await _drive_resumed_invoke(
+            tmp_path, sessions[task_id], IMPLEMENTER, caplog, task_id=task_id,
+            resume_outcome_sink=harness, slug=f'eps-bd-{outcome}',
+            config_overrides=overrides, event_store=store,
+        )
+        # NON-VACUOUS again: the arm site has to have PRODUCED this outcome,
+        # not merely failed to report anything.
+        failed = store.of_type(EventType.session_resume_failed)
+        assert [row['data']['restore'] for row in failed] == [outcome]
+        assert _streak(harness) == 0, outcome
+        assert _filed(harness) == [], outcome
+
+
+@pytest.mark.asyncio
+async def test_epsilon_end_to_end_a_surviving_resume_retires_the_run(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """RESET — one working resume in the middle of a run keeps the streak below
+    the threshold, so nothing is filed.
+
+    This is what makes the escape a CIRCUIT BREAKER rather than a rolling burst
+    count: it fires on a run of failures with nothing working in between, so a
+    resume that survives is proof the systematic cause is not present. Without
+    it, a fleet with a steady low failure rate would eventually page an
+    operator for no systematic reason at all.
+    """
+    harness.config.session_resume = SessionResumeConfig()
+    threshold = harness.config.session_resume.fallback_storm_threshold
+    _arm_storm_queue(harness)
+
+    fails = [(f'rst-f{i}', f'uuid-rst-f{i}') for i in range(2 * (threshold - 1))]
+    ok = [('rst-ok', 'uuid-rst-ok')]
+    sessions = await _recover_cold_sessions(harness, fails + ok)
+
+    half = threshold - 1
+    for task_id, _ in fails[:half]:
+        await _drive_failing_restore(
+            harness, tmp_path, caplog, task_id, sessions[task_id],
+        )
+    assert _streak(harness) == half
+
+    # A resume that is corroborated and survives: zero resume_fallbacks.
+    await _drive_resumed_invoke(
+        tmp_path, sessions['rst-ok'], IMPLEMENTER, caplog, task_id='rst-ok',
+        seed_transcript=True, resume_outcome_sink=harness, slug='eps-rst-ok',
+        result_kwargs={'resume_fallbacks': 0},
+    )
+    assert _streak(harness) == 0
+
+    for task_id, _ in fails[half:]:
+        await _drive_failing_restore(
+            harness, tmp_path, caplog, task_id, sessions[task_id],
+        )
+
+    assert _streak(harness) == half
+    assert _filed(harness) == []
