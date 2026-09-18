@@ -13711,3 +13711,102 @@ class TestDeadLetterAlarmWiring:
         assert len(calls) == 1, calls
         assert calls[0][1]['project_id'] == 'proj1'
         assert calls[0][1]['content_preview'] == ''
+
+
+class TestReferentScanNarrowsWithTheProjectRegistry:
+    """The three producer call sites scan with `MemoryService._known_projects`.
+
+    Asserted through BEHAVIOUR rather than introspection: each write path is
+    driven with a body carrying a junk-qualified referent, and the assertion
+    reads the ENCODED wire blob off the enqueued payload. That also pins the
+    thing that actually matters downstream — the NARROWED set is what reaches
+    the durable queue, and therefore what the verifier reads back.
+
+    'evil_proj' is absent from every registry here, so it stands for the
+    measured junk shapes ('localhost:6379', 'INFO:1234') without depending on
+    a port number that also has to survive the ambiguity partition.
+    """
+
+    REGISTRY = {'test': '/src/test-project', 'reify': '/src/reify'}
+    JUNK_BODY = 'mirrors evil_proj:132'
+    GENUINE_BODY = 'mirrors reify:132'
+    REIFY_REF = {'kind': 'task', 'project_id': 'reify', 'number': '132'}
+    EVIL_REF = {'kind': 'task', 'project_id': 'evil_proj', 'number': '132'}
+
+    @staticmethod
+    def _enqueued_refs(service) -> list[dict]:
+        return service.durable_queue.enqueue.call_args[1]['payload']['referents']['refs']
+
+    @staticmethod
+    def _batched_refs(service) -> list[dict]:
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        return batch[0]['payload']['referents']['refs']
+
+    @pytest.mark.asyncio
+    async def test_add_memory_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_add_memory_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_memory(
+            content=self.GENUINE_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == [self.REIFY_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_episode_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_episode(content=self.JUNK_BODY, project_id='test')
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_add_episode_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        await service.add_episode(content=self.JUNK_BODY, project_id='test')
+        assert self._enqueued_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_episode_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_episode(content=self.GENUINE_BODY, project_id='test')
+        assert self._enqueued_refs(service) == [self.REIFY_REF]
+
+    @pytest.mark.asyncio
+    async def test_replay_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.JUNK_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_replay_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.JUNK_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_replay_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.GENUINE_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == [self.REIFY_REF]

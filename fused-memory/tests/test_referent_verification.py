@@ -1778,6 +1778,29 @@ _CONTESTED_CONTENT = (
 )
 
 
+def _scan_spy(monkeypatch) -> list[tuple[str, dict]]:
+    """Every (text, kwargs) `_verify_episode_referents` hands `scan_content`.
+
+    Records the KWARGS too, unlike `TestPerEdgeFactScanIsLazy._spy`, because
+    two separate contracts are properties of how the scanner is CALLED rather
+    than of what it returns: the legacy-row fallback is permissive, and the
+    per-edge fact scan stays permissive even under a populated registry.
+
+    Patches the name as imported into `memory_service`, the binding the pass
+    actually calls, and delegates to the real scanner so the findings under
+    test are the production ones.
+    """
+    calls: list[tuple[str, dict]] = []
+    real = memory_service_module.scan_content
+
+    def _recording(text, **kwargs):
+        calls.append((text, dict(kwargs)))
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
+    return calls
+
+
 class TestTheWireAmbiguitySetIsPreferred:
     """Task 5262 workstream C: the producer's `.ambiguous` rides the wire, so
     zeta reads it instead of re-deriving it.
@@ -1799,26 +1822,6 @@ class TestTheWireAmbiguitySetIsPreferred:
     """
 
     @staticmethod
-    def _scan_spy(monkeypatch) -> list[tuple[str, dict]]:
-        """Every (text, kwargs) `_verify_episode_referents` hands `scan_content`.
-
-        Records the KWARGS too, unlike `TestPerEdgeFactScanIsLazy._spy`: the
-        fallback's permissiveness is a property of how it is CALLED, not of
-        what it is called with. Patches the name as imported into
-        `memory_service`, the binding the pass actually calls, and delegates to
-        the real scanner so the findings under test are the production ones.
-        """
-        calls: list[tuple[str, dict]] = []
-        real = memory_service_module.scan_content
-
-        def _recording(text, **kwargs):
-            calls.append((text, dict(kwargs)))
-            return real(text, **kwargs)
-
-        monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
-        return calls
-
-    @staticmethod
     def _landed_on(number: str):
         """One edge whose source endpoint is the task node named *number*."""
         return _episode(
@@ -1838,7 +1841,7 @@ class TestTheWireAmbiguitySetIsPreferred:
         A re-derivation over this content yields an EMPTY set, so a fired veto
         can only have come from the wire — this test cannot pass by accident.
         """
-        calls = self._scan_spy(monkeypatch)
+        calls = _scan_spy(monkeypatch)
 
         stats = await service._verify_episode_referents(
             self._landed_on('6379'), group_id='dark_factory',
@@ -1895,7 +1898,7 @@ class TestTheWireAmbiguitySetIsPreferred:
         PERMISSIVELY. Only a permissive re-derivation reproduces that producer,
         so the fallback must pass no `known_project_ids`.
         """
-        calls = self._scan_spy(monkeypatch)
+        calls = _scan_spy(monkeypatch)
 
         stats = await service._verify_episode_referents(
             self._landed_on('3127'), group_id='dark_factory',
@@ -1944,7 +1947,7 @@ class TestTheWireAmbiguitySetIsPreferred:
         the body is never scanned. Under a truthiness test this test is the one
         that goes red.
         """
-        calls = self._scan_spy(monkeypatch)
+        calls = _scan_spy(monkeypatch)
 
         stats = await service._verify_episode_referents(
             self._landed_on('3127'), group_id='dark_factory',
@@ -2496,6 +2499,98 @@ class TestPerEdgeFactScanIsLazy:
             Referent(number='3074'), ('Task 3074', 'Task 3075'),
             Referent(number='3075'), True, '')
 
+
+    @pytest.mark.asyncio
+    async def test_the_edge_fact_scan_stays_permissive_under_a_live_registry(
+        self, service, monkeypatch,
+    ):
+        """PERMISSIVE ON PURPOSE, and now a DELIBERATE ASYMMETRY.
+
+        The producer narrows with `self._known_projects` (task 5262 workstream
+        B); this scan must not. It asks a different question — "does this edge's
+        fact NAME the node the edge landed on" — and a fact that genuinely
+        cites an out-of-registry foreign task is evidence about this edge
+        whether or not the factory knows that project. Narrowing it would drop
+        that citation and turn a true negative into a false pairing finding.
+        """
+        calls = _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                         source='n-3128', target='n-3129')],
+            nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                   MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+
+        assert [text for text, _kwargs in calls] == ['Task 3128 supersedes Task 3129']
+        assert all('known_project_ids' not in kwargs for _text, kwargs in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_citation_outside_the_registry_still_counts_as_evidence(
+        self, service, monkeypatch,
+    ):
+        """The behavioural half of the assertion above: the fact cites a task
+        in a project the registry has never heard of, and that citation must
+        still reach the pairing rules. Under a narrowed scan it would vanish
+        and the endpoint would be reported as mis-paired."""
+        _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+        result = _episode(
+            edges=[_edge('e1', fact='mirrors unknown_proj:3129',
+                         source='n-3129', target='n-mirror')],
+            nodes=[MockNode(name='unknown_proj:3129', uuid='n-3129'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+        narrowed_registry = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+        service.set_known_projects({})
+        permissive_registry = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+        assert narrowed_registry.findings == permissive_registry.findings
+
+    @pytest.mark.asyncio
+    async def test_permissiveness_and_deferral_hold_together(
+        self, service, monkeypatch,
+    ):
+        """Both properties of this site at once, so neither can be satisfied by
+        breaking the other: with a POPULATED registry the endpointless edge is
+        still never scanned (deferral) and the two-task-endpoint edge is still
+        scanned exactly once, permissively (asymmetry)."""
+        calls = _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+
+        await service._verify_episode_referents(
+            _episode(
+                edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                             source='n-x', target='n-y')],
+                nodes=[MockNode(name='deploy pipeline', uuid='n-x'),
+                       MockNode(name='merge lane', uuid='n-y')],
+            ),
+            group_id='dark_factory', referents=(Referent(number='3127'),), ambiguous=(),
+        )
+        assert calls == []
+
+        await service._verify_episode_referents(
+            _episode(
+                edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                             source='n-3128', target='n-3129')],
+                nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                       MockNode(name='Task 3129', uuid='n-3129')],
+            ),
+            group_id='dark_factory', referents=(Referent(number='3127'),), ambiguous=(),
+        )
+        assert [text for text, _kwargs in calls] == ['Task 3128 supersedes Task 3129']
+        assert calls[0][1].get('known_project_ids') is None
 
 def _corroborated_membership_episode() -> MockAddEpisodeResult:
     """esc-3671-3's reachable shape, verbatim from `_candidate_pool`'s docstring.

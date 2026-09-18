@@ -19,6 +19,7 @@ case), so the undeclared majority must flow through untouched.
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -348,3 +349,42 @@ class TestConflictingDeclarationsAreRejected:
             content=_CITES_3127,
             group_id=GROUP,
         ) is None
+
+
+class TestTheGateStaysPermissiveWhileTheProducerNarrows:
+    """The gate acquires no project registry (task 5262 workstream B).
+
+    ``MemoryService``'s three ``resolve_referents`` call sites now narrow with
+    ``self._known_projects``, so a junk qualifier stops minting a referent on
+    the write path. This call deliberately does NOT: the gate closes over no
+    server state — the property the module docstring above opens with — so it
+    holds no registry to narrow WITH, and acquiring one would only make it
+    stop catching conflicts it catches today. Rejection is on CONFLICT and
+    never on ABSENCE, so a narrowed scan here can subtract rejections and can
+    never add one.
+
+    A regression fence, not a new behaviour: green before workstream B and
+    required to stay green after it.
+    """
+
+    def test_a_junk_qualified_conflict_is_still_rejected(self):
+        """'evil_proj' is in no registry the factory holds, so a narrowed scan
+        would drop it, empty the content side, and let a contradicted
+        declaration through."""
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}],
+            content='mirrors evil_proj:132',
+            group_id=GROUP,
+            agent_id='claude-interactive',
+        )
+
+        assert isinstance(block, dict), f'the junk-qualified conflict was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['content_referents'] == ['evil_proj:132'], f'{block!r}'
+
+    def test_the_gate_takes_no_registry_parameter(self):
+        """Structural, not incidental: there is no channel through which a
+        caller could hand this gate a registry, so 'the gate holds no registry'
+        cannot be quietly undone by a call-site edit."""
+        assert 'known_project_ids' not in inspect.signature(entities_gate).parameters
