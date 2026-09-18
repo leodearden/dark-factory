@@ -3560,11 +3560,17 @@ class MemoryService:
             # edge twice, which is the property the original eager placement
             # bought and this deferral must not give back.
             #
-            # PERMISSIVE mode (no `known_project_ids`), matching the choice
-            # gamma made and documented in `resolve_referents`. Threading
-            # `self._known_projects` here would fork that decision mid-PRD, and
-            # would DROP a foreign reference the fact genuinely makes — turning
-            # a true negative into a false pairing finding.
+            # PERMISSIVE mode (no `known_project_ids`) ON PURPOSE, and now a
+            # DELIBERATE ASYMMETRY rather than a shared default: the three
+            # producer call sites DO narrow with `self._known_projects`
+            # (task 5262). Threading it here too would DROP a foreign reference
+            # the fact genuinely makes — turning a true negative into a false
+            # pairing finding. Narrowing is right for the producer, which is
+            # deciding what a write is ABOUT and must not mint a referent out
+            # of 'localhost:6379'; it is wrong here, where the question is
+            # whether this edge's fact NAMES the node the edge landed on, and a
+            # citation is evidence whether or not the factory knows that
+            # project.
             #
             # `scan.refs` already excludes `scan.ambiguous`, so nothing further
             # is filtered out here: an ambiguous reference is deliberately
@@ -6004,6 +6010,7 @@ class MemoryService:
             metadata=None,
             content=content,
             group_id=scope.graphiti_group_id,
+            known_project_ids=self._known_projects,
         )
 
         success = True
@@ -6269,6 +6276,7 @@ class MemoryService:
                 metadata=meta,
                 content=content,
                 group_id=scope.graphiti_group_id,
+                known_project_ids=self._known_projects,
             )
             try:
                 assert self.durable_queue is not None
@@ -6809,6 +6817,7 @@ class MemoryService:
             # and never routes to Graphiti.
             resolution = resolve_referents(
                 declared=None, metadata=meta, content=content, group_id=target,
+                known_project_ids=self._known_projects,
             )
             batch.append({
                 'group_id': target,
