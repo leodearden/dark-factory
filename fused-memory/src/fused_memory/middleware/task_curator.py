@@ -32,7 +32,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2508,15 +2508,17 @@ class TaskCurator:
         module_cap = self._config.curator.pool_module_cap
         # The sort key is status+priority, NOT relevance, so the entries this
         # cap discards are not the least-similar ones — a genuinely
-        # overlapping task can sit just past it.
-        module_withheld = max(0, len(module_matches) - module_cap)
+        # overlapping task can sit just past it. Which of them the POOL
+        # actually loses is not known yet: streams 3 and 4 can still admit
+        # one. Hold the ids and count the absent ones once, below.
+        module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
         for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
         # Stream 3: embedding neighbors
         embedding_matches: list[_PoolEntry] = []
-        embedding_withheld = 0
+        embedding_unvisited_ids: list[str] = []
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
@@ -2549,12 +2551,18 @@ class TaskCurator:
                     continue
                 embedding_matches.append(entry)
                 if len(embedding_matches) >= self._config.curator.pool_embedding_cap:
-                    # The neighbours the cap left unvisited. An UPPER bound on
-                    # what the pool lost — some would have been filtered as
-                    # already-seen or unresolvable — but these are ordered by
-                    # embedding distance, so the closest of them are the most
-                    # likely duplicates in the whole corpus.
-                    embedding_withheld = len(points) - i - 1
+                    # The neighbours the cap left unvisited, by id — the count
+                    # is taken below against what the pool finally holds, so a
+                    # neighbour another stream already pooled is not reported
+                    # as lost. It stays an upper bound in one narrower
+                    # respect: an unvisited point might have been unresolvable
+                    # via _fetch_entry_for_neighbor and so never eligible.
+                    # These are ordered by embedding distance, so the closest
+                    # of them are the most likely duplicates in the corpus.
+                    embedding_unvisited_ids = [
+                        str((p.payload or {}).get('task_id', ''))
+                        for p in points[i + 1:]
+                    ]
                     break
         except Exception as exc:
             logger.debug('task_curator: embedding neighbors failed: %s', exc)
@@ -2588,10 +2596,20 @@ class TaskCurator:
                     dep_matches.append(entry)
 
         dependency_cap = self._config.curator.pool_dependency_cap
-        dependency_withheld = max(0, len(dep_matches) - dependency_cap)
+        dep_overflow_ids = [e.task_id for e in dep_matches[dependency_cap:]]
         for entry in dep_matches[:dependency_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
+
+        # Every stream has run, so seen_ids is now the complete admitted set
+        # and a stream's overflow can be resolved into what the pool actually
+        # lacks. Counting against seen_ids rather than the post-trim pool
+        # keeps the stream counts and total_cap DISJOINT by construction: a
+        # stream can only count ids that were never admitted, the trim only
+        # ids that were, so `total` stays a count of distinct absent entries.
+        module_withheld = _count_absent(module_overflow_ids, seen_ids)
+        embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
+        dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
 
         # Final cap — trim weakest entries first (embedding, then module, then dep).
         pool, total_cap_dropped = _trim_pool(
@@ -3115,6 +3133,17 @@ class TaskCurator:
 # ----------------------------------------------------------------------
 # Pure helpers (module-level — easier to unit-test)
 # ----------------------------------------------------------------------
+
+
+def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
+    """How many DISTINCT ids in *task_ids* the pool never admitted.
+
+    The census counts what the prompt is MISSING, so an id a later stream
+    picked up is not withheld however early a cap skipped it. Counting has to
+    run against the finished admitted set for that reason; counting at the
+    moment each cap fires reports entries that end up present.
+    """
+    return len({tid for tid in task_ids if tid and tid not in admitted})
 
 
 def _append_pool_truncation(
