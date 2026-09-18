@@ -265,7 +265,15 @@ class TestTrimPool:
 
     def test_no_trim_when_under_cap(self):
         pool = [self._entry(str(i), 'module') for i in range(5)]
-        assert len(_trim_pool(pool, 10)) == 5
+        kept, dropped_n = _trim_pool(pool, 10)
+        assert len(kept) == 5
+        assert dropped_n == 0
+
+    def test_exactly_at_cap_drops_nothing(self):
+        pool = [self._entry(str(i), 'module') for i in range(10)]
+        kept, dropped_n = _trim_pool(pool, 10)
+        assert kept == pool
+        assert dropped_n == 0
 
     def test_trims_dependency_first(self):
         pool = (
@@ -274,18 +282,28 @@ class TestTrimPool:
             + [self._entry(f'e{i}', 'embedding') for i in range(3)]
             + [self._entry(f'd{i}', 'dependency') for i in range(3)]
         )
-        result = _trim_pool(pool, 7)
-        sources = [e.source for e in result]
+        kept, dropped_n = _trim_pool(pool, 7)
+        sources = [e.source for e in kept]
         # dependency dropped first, so no dependency entries remain
         assert 'dependency' not in sources
-        assert len(result) == 7
+        assert len(kept) == 7
+        assert dropped_n == len(pool) - 7
 
     def test_anchor_preserved(self):
         pool = [self._entry('a', 'anchor')] + [
             self._entry(f'm{i}', 'module') for i in range(20)
         ]
-        result = _trim_pool(pool, 5)
-        assert any(e.source == 'anchor' for e in result)
+        kept, dropped_n = _trim_pool(pool, 5)
+        assert any(e.source == 'anchor' for e in kept)
+        assert len(kept) == 5
+        assert dropped_n == len(pool) - 5
+
+    def test_dropped_count_is_what_the_pool_lost(self):
+        """`dropped_n` is the census input — it must equal the real shortfall."""
+        pool = [self._entry(f'm{i}', 'module') for i in range(41)]
+        kept, dropped_n = _trim_pool(pool, 30)
+        assert len(kept) + dropped_n == len(pool)
+        assert dropped_n == 11
 
 
 class TestCandidateHash:
