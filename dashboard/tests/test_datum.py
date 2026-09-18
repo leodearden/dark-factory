@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -238,3 +238,63 @@ def test_validate_accepts_a_non_fresh_datum_with_a_reason(state):
 def test_validate_accepts_a_fresh_datum_without_a_reason():
     """A freshly measured value needs no excuse."""
     validate_datum(datum_in_state(DatumState.FRESH, None), SERVED_AT)
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 — state == 'fresh' implies served_at - as_of <= the declared
+# bound. Scoped to 'fresh' alone: a stale or lower_bound datum is ALLOWED to
+# be older than its bound, which is precisely what those states announce.
+# ---------------------------------------------------------------------------
+
+BOUND_SECONDS = 60
+
+
+def datum_measured_at(as_of, state=DatumState.FRESH, reason=None):
+    """A Datum in *state* measured at *as_of*, bounded at ``BOUND_SECONDS``."""
+    return Datum(
+        value=5,
+        as_of=as_of,
+        state=state,
+        reason=reason,
+        freshness_bound_seconds=BOUND_SECONDS,
+    )
+
+
+@pytest.mark.parametrize('age_seconds', [0, 1, BOUND_SECONDS - 1])
+def test_validate_accepts_a_fresh_datum_inside_its_bound(age_seconds):
+    """An age strictly inside the declared bound is fresh."""
+    as_of = SERVED_AT - timedelta(seconds=age_seconds)
+    validate_datum(datum_measured_at(as_of), SERVED_AT)
+
+
+def test_validate_accepts_a_fresh_datum_exactly_at_its_bound():
+    """The contract's bound is inclusive; pinned so it cannot silently become '<'."""
+    as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS)
+    validate_datum(datum_measured_at(as_of), SERVED_AT)
+
+
+def test_validate_rejects_a_fresh_datum_one_second_past_its_bound():
+    """One second over the bound is no longer fresh, whatever the producer claimed."""
+    as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS + 1)
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(datum_measured_at(as_of), SERVED_AT)
+    assert excinfo.value.invariant is DatumInvariant.FRESHNESS_BOUND
+    message = str(excinfo.value)
+    assert repr(float(BOUND_SECONDS + 1)) in message
+    assert repr(BOUND_SECONDS) in message
+
+
+def test_validate_rejects_a_fresh_datum_measured_after_it_was_served():
+    """A negative age is a producer/clock defect and is refused, not clamped."""
+    as_of = SERVED_AT + timedelta(seconds=1)
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(datum_measured_at(as_of), SERVED_AT)
+    assert excinfo.value.invariant is DatumInvariant.FRESHNESS_BOUND
+    assert repr(-1.0) in str(excinfo.value)
+
+
+@pytest.mark.parametrize('state', [DatumState.STALE, DatumState.LOWER_BOUND])
+def test_validate_accepts_a_non_fresh_datum_older_than_its_bound(state):
+    """Being past the bound is what `stale` and `lower_bound` exist to say."""
+    as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 100)
+    validate_datum(datum_measured_at(as_of, state=state, reason='refresh failed'), SERVED_AT)
