@@ -337,13 +337,18 @@ class TestNoFunctionCanAddAKeyToABaseline:
 
     #: The kernel's whole intended public surface. There is no absorb, no
     #: widen, and no write-baseline verb, and there is not meant to be one.
+    #: The two constants are part of the surface because a consumer asserting
+    #: against the README or the schema version must cite them rather than
+    #: retype them.
     EXPECTED_SURFACE = frozenset(
         {
+            'BASELINE_README',
             'BaselineUnusable',
             'Enumeration',
             'IncompleteEnumeration',
             'ParamsMismatch',
             'RatchetError',
+            'SCHEMA_VERSION',
             'dump',
             'excess',
             'load',
