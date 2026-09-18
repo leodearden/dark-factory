@@ -650,10 +650,10 @@ _EMPTY_QUEUES = {
 def test_escalations_endpoint_returns_escalations_block(client):
     """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
     with patch(
-        'dashboard.app.build_escalation_queues',
+        'dashboard.api.escalations.build_escalation_queues',
         return_value=_EMPTY_QUEUES,
     ), patch(
-        'dashboard.app.fetch_tasks',
+        'dashboard.api.escalations.fetch_tasks',
         new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/escalations')
@@ -668,7 +668,7 @@ def test_escalations_endpoint_returns_escalations_block(client):
 
 def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
     """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
     _task_cards_cache_clear()
 
     proj_a = tmp_path / 'projA'
@@ -708,10 +708,10 @@ def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp
     }
 
     with patch(
-        'dashboard.app.build_escalation_queues',
+        'dashboard.api.escalations.build_escalation_queues',
         return_value=queues,
     ), patch(
-        'dashboard.app.fetch_tasks',
+        'dashboard.api.escalations.fetch_tasks',
         new=AsyncMock(return_value=[task_dict]),
     ):
         resp = client.get('/api/v2/dashboard/escalations')
@@ -738,7 +738,7 @@ def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp
 
 def test_load_task_cards_caches_within_ttl(client, tmp_path):
     """_load_task_cards: cache hit within TTL + offline result not cached."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     proj_a = tmp_path / 'projA'
     orch_sub = {
@@ -765,8 +765,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
     # Case 1: cache hit — second request should NOT call fetch_tasks again.
     _task_cards_cache_clear()
     mock_ft = AsyncMock(return_value=task_list)
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_ft):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
         client.get('/api/v2/dashboard/escalations')
         client.get('/api/v2/dashboard/escalations')
     assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
@@ -774,8 +774,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
     # Case 2: offline result NOT cached — each request should call fetch_tasks.
     _task_cards_cache_clear()
     mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_offline):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
         r1 = client.get('/api/v2/dashboard/escalations')
         r2 = client.get('/api/v2/dashboard/escalations')
     assert r1.status_code == 200
@@ -785,8 +785,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
 
 def test_load_task_cards_ttl_expiry(client, tmp_path):
     """_load_task_cards: after TTL expires, fetch_tasks is called again."""
-    import dashboard.app as app_module
-    from dashboard.app import _task_cards_cache_clear
+    import dashboard.api.escalations as escalations_module
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     proj_a = tmp_path / 'projA'
     one_orch_queues = {
@@ -802,22 +802,22 @@ def test_load_task_cards_ttl_expiry(client, tmp_path):
                   'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
 
     _task_cards_cache_clear()
-    original_ttl = app_module._TASK_CARDS_TTL_SECONDS
+    original_ttl = escalations_module._TASK_CARDS_TTL_SECONDS
     mock_ft = AsyncMock(return_value=task_list)
     try:
-        with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-             patch('dashboard.app.fetch_tasks', new=mock_ft):
+        with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+             patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
             # First request: cache miss — fetch_tasks called once, result cached.
             client.get('/api/v2/dashboard/escalations')
             assert mock_ft.call_count == 1
 
             # Zero out TTL so the cached entry is immediately treated as expired.
-            app_module._TASK_CARDS_TTL_SECONDS = 0.0
+            escalations_module._TASK_CARDS_TTL_SECONDS = 0.0
 
             # Second request: TTL expired — fetch_tasks called again.
             resp = client.get('/api/v2/dashboard/escalations')
     finally:
-        app_module._TASK_CARDS_TTL_SECONDS = original_ttl
+        escalations_module._TASK_CARDS_TTL_SECONDS = original_ttl
 
     assert resp.status_code == 200
     assert mock_ft.call_count == 2, (
@@ -845,7 +845,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     """
     import asyncio
 
-    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
 
     # Case 1: single-flight collapse
     _task_cards_cache_clear()
@@ -862,7 +862,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
         await release.wait()
         return list(task_list)
 
-    with patch('dashboard.app.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
+    with patch('dashboard.api.escalations.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
         tasks = [
             asyncio.create_task(_load_task_cards(dummy_client, dummy_config, '/proj/X'))
             for _ in range(3)
@@ -878,7 +878,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     # Case 2: offline result NOT cached — each direct call re-fetches.
     _task_cards_cache_clear()
     mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.fetch_tasks', new=mock_offline):
+    with patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
         r1 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
         r2 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
 
@@ -919,8 +919,8 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
     import asyncio
     import logging
 
-    import dashboard.app as _app
-    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+    import dashboard.api.escalations as _esc
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
 
     # A warm entry would be served without ever reaching the hang.
     _task_cards_cache_clear()
@@ -932,10 +932,10 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
         call_count += 1
         await asyncio.Event().wait()  # nothing ever sets it
 
-    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', 0.05)
+    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', 0.05)
 
     with (
-        patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks),
+        patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks),
         caplog.at_level(logging.WARNING, logger='dashboard.app'),
     ):
         result = await asyncio.wait_for(
@@ -989,8 +989,8 @@ async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
     """
     import asyncio
 
-    import dashboard.app as _app
-    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+    import dashboard.api.escalations as _esc
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
 
     _task_cards_cache_clear()
 
@@ -998,10 +998,10 @@ async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
         await asyncio.Event().wait()
 
     budget = 0.5
-    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', budget)
+    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', budget)
     loop = asyncio.get_running_loop()
 
-    with patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks):
+    with patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks):
         started = loop.time()
         results = await asyncio.wait_for(
             asyncio.gather(*[
@@ -1036,7 +1036,7 @@ async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
 
 def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     _task_cards_cache_clear()
 
@@ -1069,8 +1069,8 @@ def test_escalations_endpoint_multi_root_gather(client, tmp_path):
             return [task_b]
         return []
 
-    with patch('dashboard.app.build_escalation_queues', return_value=queues), \
-         patch('dashboard.app.fetch_tasks', side_effect=fetch_side_effect):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=queues), \
+         patch('dashboard.api.escalations.fetch_tasks', side_effect=fetch_side_effect):
         resp = client.get('/api/v2/dashboard/escalations')
 
     assert resp.status_code == 200

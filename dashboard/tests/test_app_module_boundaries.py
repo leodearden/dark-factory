@@ -56,6 +56,14 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
     'dashboard.api.memory': ('_MEMORY_ENDPOINT_TIMEOUT_SECONDS', 'api_memory'),
     'dashboard.api.burndown': ('_BURNDOWN_WINDOWS', 'api_burndown'),
     'dashboard.api.merge_queue': ('api_merge_queue',),
+    'dashboard.api.escalations': (
+        '_TASK_CARDS_TTL_SECONDS',
+        '_TASK_CARDS_BUDGET',
+        '_task_cards_cache',
+        '_task_cards_cache_clear',
+        '_load_task_cards',
+        'api_escalations',
+    ),
     'dashboard.loops': (
         '_SAMPLE_INTERVAL_SECONDS',
         '_DOWNSAMPLE_INTERVAL_SECONDS',
@@ -71,6 +79,7 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
 # URL path -> (module dotted path, handler name) for every extracted route.
 MOVED_ROUTES: dict[str, tuple[str, str]] = {
     '/api/v2/dashboard/merge-queue': ('dashboard.api.merge_queue', 'api_merge_queue'),
+    '/api/v2/dashboard/escalations': ('dashboard.api.escalations', 'api_escalations'),
     '/api/v2/dashboard/burndown': ('dashboard.api.burndown', 'api_burndown'),
     '/api/v2/dashboard/memory': ('dashboard.api.memory', 'api_memory'),
     '/api/v2/dashboard/orchestrators': ('dashboard.api.orchestrators', 'api_orchestrators'),
@@ -80,6 +89,8 @@ MOVED_ROUTES: dict[str, tuple[str, str]] = {
 # Repo-relative path of every file this extraction created.
 NEW_MODULES: tuple[str, ...] = (
     'dashboard/src/dashboard/api/merge_queue.py',
+    'dashboard/src/dashboard/api/escalations.py',
+    'dashboard/src/dashboard/api/__init__.py',
     'dashboard/src/dashboard/api/burndown.py',
     'dashboard/src/dashboard/api/memory.py',
     'dashboard/src/dashboard/api/orchestrators.py',
