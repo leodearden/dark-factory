@@ -1867,6 +1867,19 @@ class Harness:
         self._eligible_but_failed_resumes: deque[ResumeFailure] = deque(
             maxlen=_MAX_RECORDED_RESUME_FAILURES,
         )
+        # The streak's RESET TERM, made observable (task ε/3733, review
+        # amendment): how many armed resumes have SURVIVED since this process
+        # booted, each of which retired any run in progress. Without it the
+        # reset had no trace anywhere — note_resume_succeeded emits no event —
+        # so "a quiet fleet" and "a streak reset a dozen times a day" looked
+        # identical to an operator reading the storm L1 and to
+        # storm_window_bound.py's derivation, which is why that module's
+        # not-inert side can only claim a NECESSARY condition.
+        #
+        # Counts the resets themselves, so unlike the streak it is per-BOOT and
+        # monotonically increasing: _retire_session_resume_run must never clear
+        # it, or the L1 could only ever report zero.
+        self._session_resume_survivals: int = 0
 
         # Rate limiter for _archive_available's fault WARNING (task 3727).
         # The faults that reach that handler are PERSISTENT, not transient —
@@ -7514,6 +7527,40 @@ class Harness:
         except Exception:
             logger.warning('Failed to file pool-storage-absent escalation', exc_info=True)
 
+    def _decay_session_resume_run(self, now: float) -> None:
+        """Retire the run in progress if *now* is a full window past its feed.
+
+        ONE implementation of "when does a run expire" (SPOT), shared by both
+        seams that touch the streak: the ``_run_slot`` eligibility guard and
+        :meth:`note_resume_failed`. Both applied it inline and identically
+        before; two copies of one rule is one copy too many, because the next
+        change to it would be made in one of them.
+
+        The decay is about the PASSAGE OF TIME, not about any particular
+        report, which is why both callers apply it FIRST and unconditionally:
+        "consecutive" means chained within ``storm_window_secs``, so a gap at
+        least that long means the previous run ENDED. Idempotent — it compares
+        against a stamp only a genuine feeder refreshes — so a caller that
+        decays and then reports through :meth:`note_resume_failed` decays
+        twice to the same effect.
+
+        *now* is passed in rather than read here so a caller that also needs
+        the instant for its own bookkeeping uses ONE reading; two calls to
+        ``time.monotonic()`` would let the decay and the increment disagree
+        about when the dispatch happened. MONOTONIC by contract: "stale" is
+        itself produced by clock skew, so a wall-clock decay would be
+        corrupted by the very failure it detects.
+
+        ``storm_window_secs`` is read LIVE, never captured — it is a
+        green-tier reloadable leaf (StormCounter's RELOAD SAFETY contract).
+        """
+        window = self.config.session_resume.storm_window_secs
+        if (
+            self._last_session_resume_fallback_at is not None
+            and (now - self._last_session_resume_fallback_at) >= window
+        ):
+            self._retire_session_resume_run()
+
     def _retire_session_resume_run(self) -> None:
         """End the run of genuine resume failures currently in progress.
 
@@ -7527,6 +7574,11 @@ class Harness:
         Called on both ways a run can end — an intervening success, and the
         rolling window expiring — so "retired" has one meaning and one
         implementation.
+
+        ``_session_resume_survivals`` is deliberately NOT cleared here: it
+        counts retirements across the whole boot rather than describing the
+        run being ended, and clearing it would leave the L1 able to report
+        only zero.
         """
         self._session_resume_fallback_streak = 0
         self._last_session_resume_fallback_at = None
@@ -7541,12 +7593,34 @@ class Harness:
         failures with nothing working in between, so one working resume proves
         the systematic cause is not present and retires the run outright.
 
+        COUNTED, because the reset term was otherwise the one term of the
+        streak with no observable trace at all: this method emits no event, so
+        "a quiet fleet" and "a streak reset to zero a dozen times a day"
+        produced byte-identical evidence in runs.db. Neither an operator
+        reading the storm L1 nor ``storm_window_bound.py``'s derivation could
+        tell them apart, and the derivation's not-inert side is a NECESSARY
+        condition precisely because this population is unmeasurable (see that
+        module's docstring). ``_session_resume_survivals`` counts the resumes
+        that survived this boot, and the log line below names the run a
+        survival cut short.
+
         Total by contract, like ``_on_archival_failure``: this runs on the
         production dispatch path, and instrumentation must never be the thing
         that costs a dispatch (I3).
         """
         try:
+            self._session_resume_survivals += 1
+            interrupted = self._session_resume_fallback_streak
             self._retire_session_resume_run()
+            if interrupted:
+                # Only when a run was actually in progress: a survival on an
+                # idle streak is the ordinary case and says nothing.
+                logger.info(
+                    'Surviving session resume retired a run of %d '
+                    'eligible-but-FAILED resume(s); %d resume(s) have '
+                    'survived this boot',
+                    interrupted, self._session_resume_survivals,
+                )
         except Exception:
             logger.warning(
                 'Failed to retire the session-resume run on a successful '
@@ -7569,28 +7643,27 @@ class Harness:
         ``None`` restore, which is what every cli-stage rejection carries — is
         GENUINE by default, the fail-loud direction.
 
-        The rolling-window decay is applied FIRST and unconditionally, because
-        it is about the passage of time and not about this report: "consecutive"
-        means chained within ``storm_window_secs``, so a gap at least that long
-        means the previous run ENDED. Monotonic, not wall-clock — clock skew is
-        one of the things this seam exists to survive.
+        The rolling-window decay is applied FIRST and unconditionally through
+        :meth:`_decay_session_resume_run`, the shared implementation the
+        ``_run_slot`` eligibility guard also calls — it is about the passage of
+        time and not about this report.
 
-        ``storm_window_secs`` and ``fallback_storm_threshold`` are read LIVE
-        per call, never captured: both are green-tier reloadable leaves, and a
-        captured value would make their RELOADABLE_FIELDS registration
-        reloadable-in-name-only (StormCounter's documented RELOAD SAFETY
-        contract).
+        BOTH SEAMS REPORT HERE. The predicate-side guard in ``_run_slot``
+        builds its own ``ResumeFailure`` and calls this method rather than
+        re-implementing the append/stamp/count/file sequence inline, so the
+        streak protocol has ONE implementation (SPOT) and one totality guard.
+
+        ``fallback_storm_threshold`` is read LIVE per call, never captured (as
+        is ``storm_window_secs`` inside the decay): both are green-tier
+        reloadable leaves, and a captured value would make their
+        RELOADABLE_FIELDS registration reloadable-in-name-only (StormCounter's
+        documented RELOAD SAFETY contract).
 
         Total by contract, for the same reason ``note_resume_succeeded`` is.
         """
         try:
             now = time.monotonic()
-            window = self.config.session_resume.storm_window_secs
-            if (
-                self._last_session_resume_fallback_at is not None
-                and (now - self._last_session_resume_fallback_at) >= window
-            ):
-                self._retire_session_resume_run()
+            self._decay_session_resume_run(now)
 
             if report.restore in _BY_DESIGN_RESTORE_OUTCOMES:
                 return
@@ -7689,6 +7762,15 @@ class Harness:
                     'THE RESUMES THAT FAILED, oldest first ("n/a" = the '
                     'field does not apply at that stage):\n'
                     f'{rendered}\n\n'
+                    'RESET TERM: '
+                    f'{self._session_resume_survivals} armed resume(s) have '
+                    'SURVIVED since this orchestrator booted, each of which '
+                    'retired any run then in progress. A HIGH number means '
+                    'resume normally works and broke in a tight run, so look '
+                    'for what changed recently; a ZERO means nothing has '
+                    'resumed successfully at all since boot, which is a '
+                    'broader fault than the run listed above and should be '
+                    'diagnosed first.\n\n'
                     'EVERY by-design degradation is excluded from this streak '
                     'by construction — harness.py::'
                     '_BY_DESIGN_SESSION_RESUME_REASONS for the pre-dispatch '
@@ -9505,19 +9587,15 @@ class Harness:
                 # the path of tasks that have no recovered session, for no
                 # signal. A by-design outcome still neither feeds NOR resets
                 # the streak — expiry is not a reset, it is the run ending.
-                now = time.monotonic()
-                window = self.config.session_resume.storm_window_secs
-                if (
-                    self._last_session_resume_fallback_at is not None
-                    and (now - self._last_session_resume_fallback_at) >= window
-                ):
-                    # Drops the comparison point and the recorded failures too,
-                    # so the next fallback opens a fresh run instead of chaining
-                    # off an expired stamp, and a retired run's evidence can
-                    # never surface on a later L1 (task ε/3733 — one meaning of
-                    # "retired", one implementation, shared with the arm-seam
-                    # sink's identical decay).
-                    self._retire_session_resume_run()
+                #
+                # _decay_session_resume_run is the SHARED implementation the
+                # arm-seam sink applies too, so "when does a run expire" has
+                # ONE answer and ONE copy of it (SPOT). It drops the
+                # comparison point and the recorded failures as well, so the
+                # next failure opens a fresh run instead of chaining off an
+                # expired stamp, and a retired run's evidence can never
+                # surface on a later L1.
+                self._decay_session_resume_run(time.monotonic())
                 # THE ONE LOOKUP (task 3730). Guarded on `enabled` so the kill
                 # switch keeps its zero-I/O property: with the feature off the
                 # predicate returns {'disabled'} alone without consulting the
@@ -9694,20 +9772,31 @@ class Harness:
                         # reason back on the feeder.
                         genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
                         if genuine:
-                            # The window was already applied above, so this
-                            # branch only EXTENDS the chain: record the
-                            # evidence, refresh the comparison stamp, count. The
-                            # stamp is refreshed ONLY by a genuine feeder — a
-                            # drip of by-design fallbacks must not keep a chain
-                            # alive across an arbitrarily long gap (task 3256).
+                            # REPORTED through the sink, not re-implemented
+                            # here. Appending the evidence, refreshing the
+                            # comparison stamp, counting and filing at the
+                            # threshold is the STREAK PROTOCOL, and it has one
+                            # implementation — note_resume_failed — so a change
+                            # to it cannot land in one seam and silently miss
+                            # the other (SPOT). Routing through the classifier
+                            # also puts this seam under the same totality guard
+                            # the arm seam has: instrumentation must never be
+                            # what costs a dispatch (I3).
                             #
-                            # Recorded as a ResumeFailure so this seam and ε's
-                            # arm seam feed ONE streak read by ONE L1 renderer
-                            # (task 3733): whichever produced the run, the
+                            # GENUINE BY CONSTRUCTION, so the classifier changes
+                            # no verdict here: restore=None is outside
+                            # _BY_DESIGN_RESTORE_OUTCOMES, which is the only
+                            # thing note_resume_failed carves out. The decay it
+                            # re-applies is idempotent against the stamp read
+                            # above, which nothing has moved since.
+                            #
+                            # One ResumeFailure shape for both seams, so this
+                            # one and ε's arm seam feed ONE streak read by ONE
+                            # L1 renderer: whichever produced the run, the
                             # operator gets the same named facts. This branch
                             # stays dead by construction — the record is the
                             # shape it WOULD take, not a live population.
-                            self._eligible_but_failed_resumes.append(
+                            self.note_resume_failed(
                                 ResumeFailure(
                                     task_id=str(assignment.task_id),
                                     # resume_event_data, NOT recovered_session:
@@ -9732,13 +9821,6 @@ class Harness:
                                     ),
                                 )
                             )
-                            self._last_session_resume_fallback_at = now
-                            self._session_resume_fallback_streak += 1
-                            if (
-                                self._session_resume_fallback_streak
-                                >= self.config.session_resume.fallback_storm_threshold
-                            ):
-                                self._file_session_resume_storm_escalation()
             # ──────────────────────────────────────────────────────────────────
 
             # Build steward factory — steward starts when the workflow

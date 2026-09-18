@@ -3960,6 +3960,98 @@ class TestSessionResumeStorm:
             'uuid-rf-2'
         ]
 
+    async def test_both_seams_report_through_one_streak_protocol(
+        self, harness: Harness,
+    ):
+        """The predicate seam REPORTS to the sink; it does not re-implement it.
+
+        "Append the evidence, refresh the comparison stamp, count, file at the
+        threshold" is the streak protocol, and it existed twice — once inline
+        in ``_run_slot``'s genuine-reason branch and once in
+        ``note_resume_failed`` — for ONE streak. Two copies of one rule is one
+        copy too many (SPOT): the inline one is dead by construction today, so
+        the next change to the protocol would have been made in the live copy
+        and silently not in the dead one, and the defect would surface only
+        when a future reason revived it.
+
+        Pinned at the seam rather than by reading the source: the REAL
+        ``_run_slot`` runs, and the report it produces has to arrive through
+        the sink method carrying the predicate seam's own stage.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        reported: list = []
+        real = harness.note_resume_failed
+
+        def _spy(report):
+            reported.append(report)
+            real(report)
+
+        harness.note_resume_failed = _spy  # type: ignore[method-assign]
+        await _drive_session_slot(harness, 'e1', self._fresh_session('uuid-e1'))
+
+        assert len(reported) == 1, (
+            'the eligibility seam must feed the streak THROUGH the sink '
+            'method, not by repeating its body inline'
+        )
+        assert reported[0].stage == 'eligibility'
+        assert reported[0].restore is None
+        assert 'restore_failed' in reported[0].detail
+        # ...and the shared protocol did the rest: one streak, one record.
+        assert _streak(harness) == 1
+        assert [f.session_id for f in _recorded_failures(harness)] == ['uuid-e1']
+
+    async def test_the_reset_term_is_counted_and_reaches_the_operator(
+        self, harness: Harness,
+    ):
+        """A surviving resume is COUNTED, and the count reaches the L1.
+
+        The reset term used to be the one term of the streak with no
+        observable trace anywhere: ``note_resume_succeeded`` emits no event, so
+        a fleet where nothing resumes and a fleet where a run is cut short a
+        dozen times a day produced byte-identical evidence. That matters twice
+        over — an operator reading the L1 cannot tell "resume normally works"
+        from "nothing has resumed at all since boot", and
+        ``storm_window_bound.py``'s derivation cannot include the term at all,
+        which is exactly why its not-inert side claims only a NECESSARY
+        condition.
+
+        PER-BOOT and monotonically increasing: retiring a run must not clear
+        it, or the L1 that reads it could only ever report zero — the run it
+        describes was necessarily just retired by the failures that filed it.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # Survivals with no run in progress still count: they ARE the
+        # population an operator needs to read "resume works here" from.
+        harness.note_resume_succeeded()
+        harness.note_resume_succeeded()
+        assert harness._session_resume_survivals == 2
+
+        # One that actually cuts a run short counts the same way, and the run
+        # it retired is gone.
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+        harness.note_resume_succeeded()
+        assert harness._session_resume_survivals == 3
+        assert _streak(harness) == 0
+        assert not _recorded_failures(harness)
+
+        for i in range(2):
+            harness.note_resume_failed(self._report(10 + i))
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert '3 armed resume(s) have SURVIVED' in esc.detail, (
+            'the operator cannot tell a quiet fleet from a constantly-reset '
+            'streak without the reset term on the L1'
+        )
+
     async def test_a_fresh_boot_carries_no_run(self, harness: Harness):
         """The run is PER-BOOT: a newly constructed Harness starts with no
         streak, no comparison stamp and no recorded failures.
@@ -4217,7 +4309,15 @@ class TestSessionResumeStorm:
                 1, task_id='4102', session_id='uuid-bb', role='architect',
                 stage='pre_flight', restore='fault',
                 archive_root=None, archive_path=None,
-                detail='TypeError: unsupported operand type(s) for /',
+                # The REAL message that fault produces, verbatim — the gate's
+                # sibling row injects exactly this. It contains the substring
+                # 'None', which is why the raw-None check below has to be
+                # positional: a global scan would pass only while this fixture
+                # was trimmed, i.e. by contrivance.
+                detail=(
+                    "TypeError: unsupported operand type(s) for /: "
+                    "'NoneType' and 'str'"
+                ),
             ),
             # A cli-stage rejection: no restore outcome at all (it ran a phase
             # earlier), which is why every one of these is genuine.
@@ -4248,8 +4348,21 @@ class TestSessionResumeStorm:
 
         # Three of the six archive fields above are absent; each says so.
         assert esc.detail.count('none located') == 3
-        assert 'None' not in esc.detail, (
-            'a raw None reached the operator-facing detail'
+
+        # ...and no rendered FIELD VALUE is a bare `None`. Asserted
+        # POSITIONALLY, per field, not as a global substring scan: the detail
+        # legitimately carries restore-failure messages that contain 'None' —
+        # the archive-root fault above is a real TypeError naming 'NoneType' —
+        # so `'None' not in esc.detail` would go red on a realistic payload
+        # while catching nothing a reviewer cares about.
+        for label in ('archive root', 'archive path'):
+            values = re.findall(rf'{label}: (.*)$', esc.detail, re.MULTILINE)
+            assert len(values) == len(reports), f'a {label!r} line went missing'
+            assert 'None' not in values, (
+                f'a raw None reached the operator-facing {label} field'
+            )
+        assert 'restore=None' not in esc.detail, (
+            'a raw None reached the operator-facing restore field'
         )
 
     async def test_storm_l1_never_sends_the_operator_to_ntp(self, harness: Harness):
