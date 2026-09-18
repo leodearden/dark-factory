@@ -57,11 +57,27 @@ from dataclasses import dataclass
 __all__ = [
     'Debt',
     'Disposition',
+    'INLINE_MARKER_FORMS',
     'MalformedDisposition',
     'Policy',
     'TaskRef',
     'TicketRef',
+    'parse_disposition_marker',
 ]
+
+# THE OPERAND PATTERNS, each written once and consumed twice — by the
+# dataclass that validates a hand-written value, and by the marker form that
+# recognises the same operand in a comment.  They are shared as pattern
+# STRINGS rather than duplicated because a second copy of "what a ticket id
+# looks like" would drift from the first, which is the whole reason the
+# vocabulary is one module.
+
+# A decimal task numeral, with no leading zero: `007` is not how anyone writes
+# a task id, and admitting it would let two spellings of task 7 key the same
+# debt.  This one has no dataclass twin — TaskRef takes an int, where the
+# question of leading zeros does not arise — so the LEXICAL rule lives here and
+# the SEMANTIC rule (positive, not a bool) lives in TaskRef.
+_TASK_ID_PATTERN = r'[1-9][0-9]*'
 
 # Crockford base32 — the alphabet fused-memory/src/fused_memory/middleware/
 # ticket_store.py::_new_ticket_id mints from (0-9 and A-Z minus I, L, O, U,
@@ -69,12 +85,50 @@ __all__ = [
 # The body length is deliberately NOT pinned: _new_ticket_id emits 26
 # characters today, and pinning that would turn a future change there into a
 # vocabulary violation at every disposition site in the repo.
-_TICKET_ID_RE = re.compile(r'^tkt_[0-9ABCDEFGHJKMNPQRSTVWXYZ]+$')
+_TICKET_ID_PATTERN = r'tkt_[0-9ABCDEFGHJKMNPQRSTVWXYZ]+'
 
 # Kebab-case, as D3 requires of every ratification row id: lower-case
 # alphanumeric segments joined by single hyphens, with no leading, trailing or
 # doubled hyphen.
-_POLICY_ID_RE = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
+_POLICY_ID_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
+
+_TICKET_ID_RE = re.compile(f'^{_TICKET_ID_PATTERN}$')
+_POLICY_ID_RE = re.compile(f'^{_POLICY_ID_PATTERN}$')
+
+# The keyword probe.  Case-sensitive on purpose: the grammar D6 publishes is
+# lower-case, so `# DEBT: task 5601` is not a marker at all and must return
+# None rather than raise — otherwise every comment beginning with the word
+# DEBT becomes an instrument failure.
+_MARKER_KEYWORD_RE = re.compile(r'#\s*(?:debt|ratified):')
+
+# One anchored form per INLINE_MARKER_FORMS entry, matched against the comment
+# from the keyword onward.  The trailing `$` is what rejects extra prose after
+# a disposition: `# debt: task 5601 (see also 5602)` is a note, not a marker,
+# and honouring its prefix would silently disposition an entry by half a
+# sentence.
+_DEBT_TASK_RE = re.compile(rf'^#\s*debt:\s*task\s+({_TASK_ID_PATTERN})\s*$')
+_DEBT_TICKET_RE = re.compile(rf'^#\s*debt:\s*ticket\s+({_TICKET_ID_PATTERN})\s*$')
+_RATIFIED_RE = re.compile(rf'^#\s*ratified:\s*({_POLICY_ID_PATTERN})\s*$')
+
+INLINE_MARKER_FORMS: tuple[str, ...] = (
+    '# debt: task <task id>',
+    '# debt: ticket tkt_<ticket id>',
+    '# ratified: <ratification row id>',
+)
+"""The accepted inline forms, published once for every consumer to render.
+
+What must not be retyped is the GRAMMAR.  Presentation legitimately differs
+between :class:`MalformedDisposition`'s message (which renders these when a
+marker does not parse), the inline-suppression scanner's per-line rejection
+output, and the implementer-facing prompt block that tells an agent how to
+spell a disposition before the gate does.  A single pre-rendered message block
+would force all three into one layout and invite a second copy; a tuple of
+forms lets each render its own and keeps one home for the grammar itself.
+
+``shared/tests/test_governed_exceptions.py`` fills every form from a
+placeholder table and feeds it to :func:`parse_disposition_marker`, so a form
+published here that nothing implements — or an implemented form nobody
+published — turns that suite red."""
 
 
 class MalformedDisposition(Exception):
@@ -212,3 +266,67 @@ Disposition = Debt | Policy
 """D2's three legal states, as two types: ``Debt(TaskRef | TicketRef)`` and
 ``Policy(row id)``.  A bare ref is not a disposition — it answers "who", not
 "why this entry is legal"."""
+
+
+def parse_disposition_marker(comment: str) -> Disposition | None:
+    """Parse D6's inline grammar out of one whole COMMENT token.
+
+    THE TWO-OUTCOME CONTRACT, and it is the whole interface:
+
+    * ``None`` — the comment carries no disposition marker.  Never a raise:
+      the overwhelming majority of comments in the tree are ordinary prose,
+      and a parser that raised on them would report the tree as one long
+      instrument failure.
+    * a :data:`Disposition` — the marker is present and well formed.
+    * :class:`MalformedDisposition` — the marker is present and does not
+      parse.  Present-but-broken is the case worth being loud about, because
+      the author plainly meant to disposition something and the entry is
+      silently undisposed until someone is told.
+
+    That split — absent is a value, present-and-broken is a raise — is the
+    same one ``shared/src/shared/deploy_state.py::DeployState.from_metadata``
+    draws, for the same reason.
+
+    WHAT THIS FUNCTION DELIBERATELY DOES NOT CHECK: that a suppression
+    actually precedes the marker on the line.  D6 names two violations — "a
+    marker that does not parse, or that sits on a line with no suppression" —
+    and only the first is a property of the disposition grammar.  The second
+    needs the kind table (``type: ignore``, ``noqa``, ``pyright: ignore``,
+    ``pragma: no cover``, ``nosec``) and D8's consumer model, both of which
+    live in the inline-suppression scanner.  So ``x = 1  # debt: task 5601``
+    parses here and is reported there; do not assume it is already covered.
+
+    Every value is built through :class:`TaskRef`, :class:`TicketRef` and
+    :class:`Policy` rather than validated first, so the operand rules have one
+    home — the same home reached by the declarations that construct
+    dispositions by hand with no parser in the path.
+    """
+    keywords = list(_MARKER_KEYWORD_RE.finditer(comment))
+    if not keywords:
+        return None
+
+    # Hoisted so both raise sites publish the same help; the forms are rendered
+    # from INLINE_MARKER_FORMS rather than retyped.
+    rejected = (
+        f'parse_disposition_marker: comment {comment!r} carries a disposition marker '
+        'that does not parse. Accepted forms:\n  ' + '\n  '.join(INLINE_MARKER_FORMS)
+    )
+
+    if len(keywords) > 1:
+        raise MalformedDisposition(
+            f'{rejected}\nFound {len(keywords)} disposition keywords — one disposition '
+            'covers every suppression in a comment, so exactly one is expected.',
+            value=comment,
+        )
+
+    marker = comment[keywords[0].start() :]
+    task = _DEBT_TASK_RE.match(marker)
+    if task is not None:
+        return Debt(TaskRef(int(task.group(1))))
+    ticket = _DEBT_TICKET_RE.match(marker)
+    if ticket is not None:
+        return Debt(TicketRef(ticket.group(1)))
+    policy = _RATIFIED_RE.match(marker)
+    if policy is not None:
+        return Policy(policy.group(1))
+    raise MalformedDisposition(rejected, value=comment)
