@@ -86,7 +86,8 @@ Prior slice fixes (3516, 1564, 1601, 1814, 3517, 3857, 4884) each hardened one
 surface; this PRD is the class fix. Task **4795** (deferred: tasks budget cannot
 cover nine roots) is **not** superseded: its remaining lever after this PRD is field
 projection on `get_tasks` (task 4390, out of scope here); ι records the before/after
-cold-render measurement 4795's acceptance 4 asks for and 4795 depends on ι. Task
+cold-render measurement 4795's acceptance 4 asks for, and 4795 carries a dated note
+pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 **5320** (done 2026-09-17) set the vocabulary-module precedent for recon status.
 
 ## Sketch of approach — the discipline
@@ -249,12 +250,21 @@ cold-render measurement 4795's acceptance 4 asks for and 4795 depends on ι. Tas
     emits `task: dict`) and `merge_queue.py::load_task_titles` each fetch the whole
     tree on request under a 10 s cache. `get_tasks` has no id filter (verified), but
     `get_task` does exist per id. `dashboard/data/task_lookup.py` resolves an id set
-    by reading the snapshot unit's active rows first (live: 31 of 51 escalated tasks
-    are active) and fetching each miss with `get_task` into a per-id cache (terminal
-    rows change rarely; long TTL keyed on status), bounded by the number of misses,
-    never by tree size. An id absent from both is `unknown` with reason, not stale.
-    Freshness is therefore the snapshot's for active ids and per-read for misses —
-    no 10-minute regression. Both consumers read this datum.
+    by reading the snapshot unit's active rows first and fetching each miss with
+    `get_task` into a per-id cache (terminal rows change rarely; long TTL keyed on
+    status). **Measured 2026-09-18** on the live corpus: 149 pending escalation rows
+    carry a task id, 104 distinct ids, 53 active (served from rows), 51 misses; a
+    cold `get_task` costs 0.1–4.4 s (mean 1.85 s, cold MCP sessions dominate). The
+    miss path is therefore **budgeted in the same idiom as today's
+    `app.py::_load_task_cards`** (which is wrapped in `asyncio.wait_for(_TASK_CARDS_BUDGET)`
+    because an unbounded path there once wedged `/escalations` for 19.8 h): a
+    whole-operation deadline per request, a concurrency width (semaphore, suggested
+    4) over the miss set, and a per-request miss cap (suggested 64, newest ids
+    first); ids beyond the cap or the deadline are `unknown` with reason
+    "lookup budget", and the per-id cache makes the second render cheap. An id absent
+    from the store is `unknown` with reason, not stale. Freshness is the snapshot's
+    for active ids and per-read for cached misses — no 10-minute regression. Both
+    consumers read this datum.
 13. **Escalations are one corpus walk** (root + archive via
     `escalation.queue.iter_all_escalation_paths`) with a `location` field, one cache,
     consumed by both `escalations.py` and `escalation_analytics.py`; "pending in live
@@ -493,7 +503,7 @@ by a real dependency edge. α and α2 are independent roots; the rest is a chain
 | γ2 | Orchestrators tab, Overview and app chrome consume the census views | `tabs.jsx` (OrchTab), `tab_overview.jsx`, `app.jsx`, `shell.jsx`, tests | **Leaf** — sketch #1–#3 against fixture payloads under the node harness: the reported "0/1 vs Active 33" shape cannot render; topbar and rail show the same `in_flight` number with `running` disclosed | β, γ1 |
 | γ3 | Tasks tab and PRD boxes consume the census; on-demand terminal fetch wired; client bucketers and `task_status_counts.js` (with its four pins) deleted; 4416 contract landed in the taskgraph-legibility PRD | `tab_tasks.jsx`, `prd_grouping.js`, `task_status_counts.js` (deleted), `orch_filter.js`, `data.js`, `index.html`, `test_index_html.py`, `test_cache_buster_freshness.py`, `tests/js/classic_script_scope.test.mjs`, `test_tab_tasks_status_counts.py` (retire the disjunction pin), `plans/dashboard-taskgraph-legibility-prd.md` | **Leaf** — Tasks header pips are view lookups labelled `running of in-flight`; an offline or degraded project shows `—`; toggling Complete or PRD grouping issues `?terminal=<project>` and the PRD box then shows `≥ n/m` with n from the window; a synthetic nine-status fixture renders nine pips | γ2 |
 | δ1 | Burndown sampler consumes the snapshot unit; gap rows; nullable member columns; `in_progress_rows` column | `data/burndown.py`, `loops.py`, tests | **Intermediate** — unlocks δ2. Against a fixture store: a forced acquisition failure writes a `gap` row with reason and a success writes a value row whose nine members sum to `total` and whose `live + stranded == in_progress_rows`; pre-migration rows read NULL, not 0, for the three new members | β |
-| δ2 | Carry-last aggregate, per-project staleness on the wire, parity/forecast over measured rows only, BurnTab nine zones, `dailyDeltas` deleted | `data/redux_api.py`, `burndown_bands.js`, `tabs.jsx` (BurnTab, OrchTab spark), `shell.jsx`, `test_redux_api.py` (update the ragged test), tests | **Leaf** — sketch #6, #7 on live data: aggregate Backlog equals the per-project sum; "Status mix" legend has nine entries; parity breach count unchanged by a gap row | δ1, γ1 |
+| δ2 | Carry-last aggregate, per-project staleness on the wire, parity/forecast over measured rows only, BurnTab nine zones, `dailyDeltas` deleted | `data/redux_api.py`, `burndown_bands.js`, `tabs.jsx` (BurnTab, OrchTab spark), `shell.jsx`, `test_redux_api.py` (update the ragged test), tests | **Leaf** — sketch #6, #7 against a fixture store with a ragged two-project history: aggregate Backlog equals the per-project sum; "Status mix" legend has nine entries; parity breach count unchanged by a gap row | δ1, γ1 |
 | ε1 | Window echo, per-tab chip validation, labels from payload, recent merges follow the chip | `api/window.py`, `app.jsx`, `tabs.jsx` (Costs/Burn/Merge headers), `data/merge_queue.py`, `test_app.py` (retire the 1440 pin), tests | **Leaf** — sketch #8, #9 first half; no header literal "30d" remains | δ2 |
 | ε2 | Performance wall-clock cutoff + idle state; model-role bound semantics | `data/performance.py`, `data/model_role.py`, `tabs.jsx` (PerfTab), tests | **Leaf** — a project with no completions in the window renders `stale` with last-completion age; hourly sparklines and cards share one cutoff | ε1 |
 | ζ | Merge attempts as one datum; "In queue now" as live datum with sampled history; `task_lookup` datum (snapshot rows + per-id miss path) replaces `load_task_titles` | `data/merge_queue.py`, `data/metrics.py`, `data/task_lookup.py`, `data/tasks.py` (per-id `get_task` wrapper), `data/redux_api.py`, `api/merge_queue.py`, `loops.py`, `tabs.jsx` (MergeTab), tests | **Leaf** — sketch #9 second half; probe failure renders the tile `stale`; against a fixture snapshot with one active and one terminal id, `task_lookup` serves the first from rows and the second via one `get_task` call, and `load_task_titles` is gone | ε2 |
@@ -536,6 +546,11 @@ vs `sub_views` split, TTL arithmetic in decision 20, a 2 s skew threshold, four 
 signals rewritten as fixture-driven, the inert 4795 edge dropped for a note, and the
 age-badge-wins rule.
 
+Third pass: C1–C8 confirmed closed; one new finding D1 — the `task_lookup` miss path
+was 2.5× the stated premise (104 ids / 53 active / 51 misses) and carried no budget
+(decision 12 now budgets it in the `_load_task_cards` idiom with a concurrency width
+and a miss cap); δ2's signal reworded as fixture-driven. META answered yes.
+
 ## Out of scope
 
 - A per-PRD server census (needs a PRD field on the status map — a fused-memory
@@ -556,9 +571,10 @@ age-badge-wins rule.
    Decide in α/β.
 2. **`Datum` implementation type.** Frozen dataclass with `to_wire()` (heuristic 8),
    validated once at shaping. Decide in α.
-3. **Per-id miss cache TTL in `task_lookup`** (terminal rows change rarely; active
-   ids come from the snapshot anyway). Suggested: 10 min for terminal, none for
-   active. Decide in ζ.
+3. **`task_lookup` tuning**: per-id miss cache TTL (suggested 10 min for terminal
+   ids), concurrency width (suggested 4), per-request miss cap (suggested 64) and
+   the whole-operation deadline (suggested: reuse `_TASK_CARDS_BUDGET`). Decide in ζ
+   against the measured 51-miss cold render.
 4. **Stale-age badge format** (`3h` / `3h 12m`). Suggested: coarse humanised age via
    `window.DF_SHELL.timeago`. Decide in γ1.
 5. **Recent-merges cap N.** Suggested 200. Decide in ε1.
