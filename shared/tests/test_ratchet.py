@@ -20,11 +20,13 @@ conventions are matched here, its code is not reached for.
 TDD pair 1: the Enumeration value (GREEN on impl step-10).
 TDD pair 2: excess / slack / tighten + the no-add-key property (GREEN on impl step-12).
 TDD pair 3: the two comparability refusals, uniform across all three (GREEN on impl step-14).
+TDD pair 4: dump / load round trip + the committed-file shape (GREEN on impl step-16).
 """
 from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -32,11 +34,15 @@ import pytest
 
 import shared.ratchet
 from shared.ratchet import (
+    BASELINE_README,
+    SCHEMA_VERSION,
     Enumeration,
     IncompleteEnumeration,
     ParamsMismatch,
     RatchetError,
+    dump,
     excess,
+    load,
     slack,
     tighten,
 )
@@ -479,3 +485,179 @@ class TestTheRefusalFamilyIsOneExceptClause:
     @pytest.mark.parametrize('error', [ParamsMismatch, IncompleteEnumeration])
     def test_is_a_ratchet_error(self, error):
         assert issubclass(error, RatchetError)
+
+
+#: A value exercising everything the file format has to carry: multiplicities
+#: above 1, and a params block mixing an int, a str, a bool and a tuple of str.
+REPRESENTATIVE = Enumeration(
+    counts={'ffee11223344': 3, 'aabb00998877': 1, '00ff11ee22dd': 2},
+    params={'key_version': 1, 'algorithm': 'sha256', 'strict': True, 'kinds': ('noqa', 'nosec')},
+)
+
+
+class TestRoundTrip:
+    """What goes to disk comes back equal — including the honesty flags."""
+
+    def test_a_complete_enumeration_survives(self, tmp_path):
+        path = tmp_path / 'baseline.json'
+        dump(REPRESENTATIVE, path)
+        assert load(path) == REPRESENTATIVE
+
+    def test_an_incomplete_enumeration_survives(self, tmp_path):
+        """Completeness and the NAMED list must cross the file boundary.
+
+        If they did not, a later run would load a partial baseline as a
+        complete one and compare against it — which is the whole failure INV-11
+        names, merely deferred by one process boundary.
+        """
+        partial = Enumeration(
+            counts={'aabb00998877': 1},
+            params={'key_version': 1},
+            complete=False,
+            unreadable=('pkg/a.py', 'pkg/b.py'),
+        )
+        path = tmp_path / 'baseline.json'
+        dump(partial, path)
+        reloaded = load(path)
+        assert reloaded == partial
+        assert reloaded.complete is False
+        assert reloaded.unreadable == ('pkg/a.py', 'pkg/b.py')
+
+    def test_an_empty_enumeration_still_carries_its_params_and_version(self, tmp_path):
+        path = tmp_path / 'baseline.json'
+        dump(Enumeration(counts={}, params={'key_version': 1}), path)
+        parsed = json.loads(path.read_text(encoding='utf-8'))
+        assert parsed['params'] == {'key_version': 1}
+        assert parsed['schema_version'] == SCHEMA_VERSION
+        assert load(path).counts == {}
+
+
+class TestCommittedFileShape:
+    """The bytes a human opens and a merge has to combine."""
+
+    @staticmethod
+    def _dumped(tmp_path, enumeration=REPRESENTATIVE):
+        path = tmp_path / 'baseline.json'
+        dump(enumeration, path)
+        return path.read_text(encoding='utf-8')
+
+    def test_is_json_with_a_trailing_newline(self, tmp_path):
+        text = self._dumped(tmp_path)
+        assert text.endswith('\n')
+        assert json.loads(text)
+
+    def test_every_count_entry_occupies_exactly_one_line(self, tmp_path):
+        """The only property that makes the baseline mergeable.
+
+        The same shape ``orchestrator/tests/test_merge_lane_ratchet.py::
+        test_every_per_path_entry_occupies_exactly_one_line`` pins, for the same
+        reason: concurrent branches editing disjoint keys must land in disjoint
+        hunks.  For THIS file it is sharper still — D7 says the inline
+        baseline's only legal diff is deletions, and a deletion is only legible
+        as one when it is a whole line.
+
+        The value is parsed OUT of the matched line rather than merely found to
+        start there, which is what proves it did not continue onto the next.
+        """
+        text = self._dumped(tmp_path)
+        lines = text.splitlines()
+        for key, value in REPRESENTATIVE.counts.items():
+            prefix = json.dumps(key) + ':'
+            hits = [line for line in lines if line.lstrip().startswith(prefix)]
+            assert len(hits) == 1, f'{key} is not on exactly one line'
+            tail = hits[0].lstrip()[len(prefix) :].strip().rstrip(',')
+            assert json.loads(tail) == value, f'{key} value spans lines'
+
+    def test_count_keys_are_emitted_in_sorted_order(self, tmp_path):
+        text = self._dumped(tmp_path)
+        positions = [text.index(json.dumps(key) + ':') for key in sorted(REPRESENTATIVE.counts)]
+        assert positions == sorted(positions)
+
+    def test_stable_order_is_not_insertion_order(self, tmp_path):
+        """Two dumps of equal Enumerations built from differently-ordered dicts.
+
+        Byte-identical, so re-running the scanner over unchanged input produces
+        no diff at all — the property that lets "the only legal diff is
+        deletions" actually hold in practice.
+        """
+        forwards = Enumeration(counts={'aaa': 1, 'bbb': 2, 'ccc': 3}, params={'v': 1})
+        backwards = Enumeration(counts={'ccc': 3, 'bbb': 2, 'aaa': 1}, params={'v': 1})
+        dump(forwards, tmp_path / 'one.json')
+        dump(backwards, tmp_path / 'two.json')
+        assert (tmp_path / 'one.json').read_bytes() == (tmp_path / 'two.json').read_bytes()
+
+    def test_rendering_is_idempotent(self, tmp_path):
+        """``dump(load(dump(e)))`` reproduces the same bytes.
+
+        Regenerating a baseline from a baseline is a no-op rather than a
+        churned file full of manufactured conflicts.
+        """
+        first = tmp_path / 'first.json'
+        second = tmp_path / 'second.json'
+        dump(REPRESENTATIVE, first)
+        dump(load(first), second)
+        assert first.read_bytes() == second.read_bytes()
+
+    def test_the_first_key_is_the_readme(self, tmp_path):
+        """The rule has to live at the file a human actually opens.
+
+        The baseline is unreviewable by content — its keys are 12-hex digests —
+        so a reviewer's only handle on it is the paragraph at the top saying
+        what a legal change to it looks like.
+        """
+        text = self._dumped(tmp_path)
+        parsed = json.loads(text)
+        assert next(iter(parsed)) == '_README'
+        assert parsed['_README'] == BASELINE_README
+
+    def test_the_readme_states_the_three_things_a_reader_needs(self, tmp_path):
+        readme = json.loads(self._dumped(tmp_path))['_README'].lower()
+        assert 'machine-generated' in readme
+        assert 'deletion' in readme
+        assert 'tighten' in readme
+        assert 'hand-edit' in readme or 'by hand' in readme
+
+    def test_an_inbound_readme_cannot_survive_a_round_trip(self, tmp_path):
+        """load drops it, dump re-emits the constant — so an edited one is erased.
+
+        Without this, someone could soften the rule in the file that publishes
+        it and the next regeneration would preserve their edit.
+        """
+        path = tmp_path / 'baseline.json'
+        dump(REPRESENTATIVE, path)
+        tampered = json.loads(path.read_text(encoding='utf-8'))
+        tampered['_README'] = 'feel free to regenerate this whenever a test is red'
+        path.write_text(json.dumps(tampered), encoding='utf-8')
+        dump(load(path), path)
+        assert json.loads(path.read_text(encoding='utf-8'))['_README'] == BASELINE_README
+
+    def test_carries_the_kernel_schema_version_and_the_scanner_params(self, tmp_path):
+        """Two orthogonal reasons a file is incomparable, so two fields."""
+        parsed = json.loads(self._dumped(tmp_path))
+        assert parsed['schema_version'] == SCHEMA_VERSION
+        assert parsed['params'] == {
+            'key_version': 1,
+            'algorithm': 'sha256',
+            'strict': True,
+            'kinds': ['noqa', 'nosec'],
+        }
+
+
+class TestDumpIsAtomic:
+    """A truncated baseline is a WIDENED ratchet, so the write is all-or-nothing."""
+
+    def test_leaves_no_temp_residue(self, tmp_path):
+        dump(REPRESENTATIVE, tmp_path / 'baseline.json')
+        assert [p.name for p in tmp_path.iterdir()] == ['baseline.json']
+
+    def test_overwriting_leaves_exactly_one_file(self, tmp_path):
+        path = tmp_path / 'baseline.json'
+        dump(REPRESENTATIVE, path)
+        dump(Enumeration(counts={'aaa': 1}, params=dict(REPRESENTATIVE.params)), path)
+        assert [p.name for p in tmp_path.iterdir()] == ['baseline.json']
+        assert dict(load(path).counts) == {'aaa': 1}
+
+    def test_creates_the_parent_directory(self, tmp_path):
+        path = tmp_path / 'nested' / 'deeper' / 'baseline.json'
+        dump(REPRESENTATIVE, path)
+        assert load(path) == REPRESENTATIVE
