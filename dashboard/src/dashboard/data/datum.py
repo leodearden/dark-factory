@@ -105,8 +105,14 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
         served_at: The instant the payload carrying *datum* is being shaped.
             Required and injected rather than read from the clock here: the
             contract's freshness invariant is about the one ``served_at`` the
-            payload actually carries, not about whenever this runs. None of the
-            invariants below reads it today.
+            payload actually carries, not about whenever this runs. Only the
+            freshness invariant reads it.
+
+    A NEGATIVE age — a measurement instant after *served_at*, which means a
+    producer or a clock is wrong — is REFUSED under the freshness invariant
+    rather than clamped to zero. Clamping would let a skewed producer's value
+    render as freshly measured, which is the class of silent lie the envelope
+    exists to remove.
 
     Raises:
         DatumContractError: Naming the invariant and the offending values.
@@ -131,3 +137,14 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
             f'a datum in state {datum.state.value!r} must carry a non-empty reason, '
             f'got reason={datum.reason!r}',
         )
+
+    if datum.state is DatumState.FRESH and datum.as_of is not None:
+        age_seconds = (served_at - datum.as_of).total_seconds()
+        if not 0 <= age_seconds <= datum.freshness_bound_seconds:
+            raise DatumContractError(
+                DatumInvariant.FRESHNESS_BOUND,
+                f'a fresh datum must be no older than the bound its producer '
+                f'declared: age={age_seconds!r}s, '
+                f'freshness_bound_seconds={datum.freshness_bound_seconds!r}, '
+                f'as_of={datum.as_of!r}, served_at={served_at!r}',
+            )
