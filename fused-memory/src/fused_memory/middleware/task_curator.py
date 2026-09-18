@@ -376,13 +376,13 @@ class _PoolEntry:
     combine_eligible: bool
 
     def render(self, desc_cap: int, details_cap: int) -> str:
-        """Render this entry as a human-readable block for the LLM prompt."""
-        desc = self.description[:desc_cap]
-        if len(self.description) > desc_cap:
-            desc += '…'
-        det = self.details[:details_cap]
-        if len(self.details) > details_cap:
-            det += '…'
+        """Render this entry as a human-readable block for the LLM prompt.
+
+        Truncation goes through :func:`clip_for_prompt`, the same helper the
+        CANDIDATE block uses, so the two sides of the prompt cannot drift.
+        """
+        desc = clip_for_prompt(self.description, desc_cap)
+        det = clip_for_prompt(self.details, details_cap)
         files = ', '.join(self.files_to_modify) if self.files_to_modify else '(none)'
         return (
             f'[Task {self.task_id}] status={self.status} priority={self.priority} '
@@ -2877,9 +2877,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
@@ -2926,9 +2930,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
