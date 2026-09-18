@@ -718,7 +718,7 @@ class TestTheStampIsTakenOnTheRealPath:
     """
 
     @pytest.fixture(autouse=True)
-    def _deterministic_worker_count_sources(self, monkeypatch):
+    def _deterministic_worker_count_sources(self, monkeypatch, code_default_config):
         """Pin BOTH sources of `PYTEST_XDIST_AUTO_NUM_WORKERS` to absent.
 
         The stamped value is what `_target_subprocess_env` would hand the
@@ -726,20 +726,23 @@ class TestTheStampIsTakenOnTheRealPath:
         and both of which the ambient environment does:
 
         - the CONFIG overlay. `OrchestratorConfig(project_root=tmp_path)` looks
-          like "the defaults", but pydantic-settings reads an ambient
-          `ORCH_CONFIG_PATH`, and this repo's own config pins the key to '16'.
-          Measured: without this delenv the stamp reads '16' here. That is the
-          same leak `_target_subprocess_env` scrubs for CHILD processes (task
-          2957) reaching an in-process construction instead.
+          like "the defaults", but conftest's autouse `_isolate_orch_config`
+          pins ORCH_CONFIG_PATH at the operational yaml, which pins the key to
+          '16'. Measured: without this fixture the stamp reads '16' here.
+          `code_default_config` is conftest's sanctioned opt-in for reading CODE
+          DEFAULTS and is requested rather than re-spelled: it re-points
+          ORCH_CONFIG_PATH at a guaranteed-absent file, which a bare delenv is
+          NOT equivalent to — deleting it lets `settings_customise_sources` fall
+          back to the RELATIVE `config.yaml`, and this module's test command
+          runs pytest from the `orchestrator/` cwd.
         - `os.environ`. Measured '8' on this host, exported at unit level by
           `dark-factory-orchestrator.yaml`.
 
-        Deleting both is what lets `test_the_xdist_facts_ride_along` assert a
-        literal None instead of re-deriving the expected value from the same
-        resolution it is checking.
+        Pinning both absent is what lets `test_the_xdist_facts_ride_along`
+        assert a literal None instead of re-deriving the expected value from the
+        same resolution it is checking.
         """
         monkeypatch.delenv('PYTEST_XDIST_AUTO_NUM_WORKERS', raising=False)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
 
     @staticmethod
     def _stamped(summary):

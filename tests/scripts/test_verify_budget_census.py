@@ -1387,7 +1387,13 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
         # ORCH_CONFIG_PATH, so without this the "default" config is whichever
         # project the runner happens to point at — the same leak
         # `_target_subprocess_env` scrubs for child processes (task 2957).
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        # Pointed at a guaranteed-ABSENT file rather than deleted, which is the
+        # spelling orchestrator/tests/conftest.py's `code_default_config` uses
+        # (that fixture is not visible from this directory): an absent path makes
+        # the project layer skip itself and leaves `defaults.yaml` loading, while
+        # an unset var falls back to the RELATIVE `config.yaml` and so depends on
+        # the runner's cwd.
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
 
         def sample(cpu, cpu60):
             return PsiSample(
