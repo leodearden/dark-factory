@@ -307,6 +307,19 @@ _UNREADABLE_PAYLOADS = [
         }},
         id='ambiguous-not-a-list',
     ),
+    # JSON `null` is the one non-list shape that could pass for the LEGACY
+    # blob, because a plain `.get('ambiguous')` answers `None` for both. It
+    # must not: this row's `refs` came from a NARROWED producer, so answering
+    # it with the legacy permissive re-derivation would hand zeta an ambiguity
+    # set the producer never computed — quietly, with readable refs attached.
+    pytest.param(
+        {'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': None,
+        }},
+        id='ambiguous-explicit-null',
+    ),
     pytest.param(
         {'referents': {
             'source': 'derived', 'refs': [], 'ambiguous': ['6379'],
@@ -453,6 +466,31 @@ class TestReferentWireCodecDegradation:
 
         assert ambiguous == ()
         assert ambiguous is not None
+
+    def test_an_explicitly_null_ambiguous_is_not_the_legacy_blob(self, caplog):
+        """The third state, named separately because it is the one that LOOKS
+        like the first.
+
+        `test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None` above
+        shows the absent key keeping its refs and answering `None` in silence.
+        A key present as JSON `null` decodes to `None` through a plain
+        `.get(...)` too, so without the `_ABSENT` sentinel it would take that
+        same arm — a corrupt row wearing the back-compat path's clothes,
+        handing the consumer a permissive re-derivation over refs a NARROWED
+        producer wrote, with nothing in the log to say so. It is a malformed
+        field, so it warns and takes the refs down with it like every other.
+        """
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            decoded = _decode_referents({'referents': {
+                'source': 'derived',
+                'refs': [{'kind': 'task', 'number': '3127'}],
+                'ambiguous': None,
+            }})
+
+        assert decoded == ((), 'none', None)
+        assert caplog.records
 
     def test_a_malformed_ambiguous_takes_the_good_refs_down_with_it(self):
         """Named separately from the parametrized sweep for the same reason

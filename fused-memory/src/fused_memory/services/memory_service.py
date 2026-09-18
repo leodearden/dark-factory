@@ -1257,6 +1257,15 @@ def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
     }
 
 
+#: The "no such key" answer for :func:`_decode_referents`' ``'ambiguous'``
+#: lookup. ``None`` cannot serve as that default: a JSON ``null`` decodes to
+#: ``None`` too, so ``blob.get('ambiguous')`` would answer identically for a
+#: legacy row (the key is genuinely absent) and a corrupt one (the key is
+#: present and unreadable) — laundering the second into the first's permissive
+#: re-derivation, silently, on refs a NARROWED producer wrote.
+_ABSENT = object()
+
+
 def _decode_referents(
     payload: dict[str, Any],
 ) -> tuple[ReferentSet, str, ReferentSet | None]:
@@ -1274,7 +1283,10 @@ def _decode_referents(
     re-deriving there would scan with whatever registry happens to be live at
     dequeue and could manufacture an ambiguity the producer never saw.
     Collapsing the two into a truthiness test silently reopens exactly the
-    producer/consumer drift threading the key closes.
+    producer/consumer drift threading the key closes.  A key PRESENT but
+    holding a non-list — JSON ``null`` included — is neither answer: it is a
+    corrupt row, and it degrades like every other unreadable field rather than
+    being read as the absent key (see :data:`_ABSENT`).
 
     POPS the key, matching how ``_execute_graphiti_write`` already treats
     ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
@@ -1419,12 +1431,15 @@ def _decode_referents(
     if refs is None:
         return (), 'none', None
 
-    # ABSENT is not the same as EMPTY. No 'ambiguous' key means the row predates
-    # task 5262, so the producer never told us — `None`, and the consumer may
-    # re-derive permissively. An explicit `[]` means it told us nothing was
-    # ambiguous, which the consumer must believe.
-    raw_ambiguous = blob.get('ambiguous')
-    if raw_ambiguous is None:
+    # ABSENT is not the same as EMPTY, and neither is the same as PRESENT-BUT-
+    # NULL. No 'ambiguous' key means the row predates task 5262, so the producer
+    # never told us — `None`, and the consumer may re-derive permissively. An
+    # explicit `[]` means it told us nothing was ambiguous, which the consumer
+    # must believe. A key present as JSON `null` is a corrupt row and must fall
+    # through to `_decode_list` like any other bad type; only the `_ABSENT`
+    # sentinel keeps it out of the legacy arm above.
+    raw_ambiguous = blob.get('ambiguous', _ABSENT)
+    if raw_ambiguous is _ABSENT:
         return tuple(refs), source, None
     ambiguous = _decode_list('ambiguous', raw_ambiguous)
     if ambiguous is None:
