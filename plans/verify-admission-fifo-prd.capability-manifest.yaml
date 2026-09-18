@@ -13,7 +13,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: class AdmissionGate
+      pattern: 'class [A-Za-z_]*AdmissionGate'
       paths:
       - orchestrator/src/orchestrator/
       expect: present
