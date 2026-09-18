@@ -1930,7 +1930,9 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # ANTI-VACUITY: a gate that refused everything would pass every test
         # above while making the sanctioned workflow impossible.
         target = self._seeded(tmp_path)
-        assert metrics.write_baseline(target, _ratchet_baseline()) == target
+        written = metrics.write_baseline(target, _ratchet_baseline())
+        assert written.path == target
+        assert written.record is None
 
     def test_lowering_a_measure_stays_frictionless(self, tmp_path: Path) -> None:
         # Lowering is the POINT. It must cost nothing extra.
@@ -1938,8 +1940,51 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][_MQ]['lines'] -= 4000
 
-        assert metrics.write_baseline(target, current) == target
+        written = metrics.write_baseline(target, current)
+        assert written.path == target
+        assert written.record is None
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+
+    def test_a_recorded_raise_authorizes_no_later_one(self, tmp_path: Path) -> None:
+        # THE BYPASS THE DESIGN EXISTS TO CLOSE: pre-write a record, then
+        # regenerate. Authorization is the ACT of passing the flags, never a
+        # standing entry, so a landed record -- even one for this very measure
+        # -- licenses nothing. Every other refusal test seeds no ledger at all,
+        # which leaves this branch green whether the gate consults the file or
+        # not.
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'ledger.json'
+        first = copy.deepcopy(_ratchet_baseline())
+        first['files'][_MQ]['lines'] += 103
+        metrics.write_baseline(
+            target, first, authorization=self._AUTHORIZATION, ledger=ledger
+        )
+        recorded = ledger.read_text(encoding='utf-8')
+        assert metrics.load_ledger(ledger)['raises']
+
+        further = copy.deepcopy(first)
+        further['files'][_MQ]['lines'] += 50
+        with pytest.raises(metrics.UnauthorizedRaise):
+            metrics.write_baseline(target, further, ledger=ledger)
+
+        assert ledger.read_text(encoding='utf-8') == recorded
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(first)
+
+    def test_a_plain_regeneration_never_reads_the_ledger(
+        self, tmp_path: Path
+    ) -> None:
+        # The other face of the same property: with nothing to record, the
+        # ledger is not consulted, so a lowering regeneration cannot be blocked
+        # by the health of a file it does not touch. load_ledger fails HARD on
+        # a malformed file, so any read at all would redden this.
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'ledger.json'
+        ledger.write_text('{ not json at all', encoding='utf-8')
+        lowered = copy.deepcopy(_ratchet_baseline())
+        lowered['files'][_MQ]['lines'] -= 4000
+
+        assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
+        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
 
     def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
@@ -2096,9 +2141,10 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         current = self._raised()
 
-        assert metrics.write_baseline(
+        written = metrics.write_baseline(
             target, current, authorization=self._authorization(), ledger=ledger
-        ) == target
+        )
+        assert written.path == target
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
 
     def test_exactly_one_ledger_entry_is_appended_verbatim(
@@ -2107,7 +2153,7 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         authorization = self._authorization()
 
-        metrics.write_baseline(
+        written = metrics.write_baseline(
             target, self._raised(), authorization=authorization, ledger=ledger
         )
 
@@ -2115,6 +2161,10 @@ class TestAuthorizedRaise:
         assert len(entries) == 1
         assert entries[0]['task_id'] == authorization.task_id
         assert entries[0]['reason'] == authorization.reason
+        # What the write HANDS BACK is the entry the file gained, not a
+        # reconstruction of it -- so what the CLI prints cannot drift from what
+        # a reviewer reads in the ledger.
+        assert written.record == entries[0]
 
     def test_the_recorded_measures_are_derived_not_typed(
         self, tmp_path: Path
@@ -2168,24 +2218,35 @@ class TestAuthorizedRaise:
             pytest.param('', 'a real reason', 'task_id', id='empty-task-id'),
         ],
     )
-    def test_an_authorization_with_no_reason_is_not_an_authorization(
-        self, tmp_path: Path, task_id: str, reason: str, field: str
+    def test_an_unattributed_authorization_cannot_be_constructed(
+        self, task_id: str, reason: str, field: str
+    ) -> None:
+        # AT CONSTRUCTION, not at the point the record is rendered. Enforced
+        # further down, the same value would be valid or invalid depending on
+        # whether the report it accompanied happened to raise anything -- a
+        # blank --reason over a lowering run would pass unremarked, and the
+        # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.RaiseAuthorization(task_id=task_id, reason=reason)
+
+        assert field in str(excinfo.value)
+
+    def test_a_rejected_authorization_moves_neither_file(
+        self, tmp_path: Path
     ) -> None:
         target, ledger = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
 
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.MetricsError):
             metrics.write_baseline(
                 target,
                 self._raised(),
-                authorization=metrics.RaiseAuthorization(
-                    task_id=task_id, reason=reason
-                ),
+                authorization=metrics.RaiseAuthorization(task_id='5342', reason='  '),
                 ledger=ledger,
             )
 
-        assert field in str(excinfo.value)
-        # Neither file moved: a rejected authorization is not a partial one.
+        # A rejected authorization is not a partial one: refusing at
+        # construction means the write never starts.
         assert target.read_text(encoding='utf-8') == before
         assert not ledger.exists()
 
@@ -2200,9 +2261,13 @@ class TestAuthorizedRaise:
         lowered = copy.deepcopy(_ratchet_baseline())
         lowered['files'][_MQ]['lines'] -= 4000
 
-        assert metrics.write_baseline(
+        written = metrics.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
-        ) == target
+        )
+        assert written.path == target
+        # The write SAYS it recorded nothing, so the CLI can tell the agent who
+        # typed --authorize-raise rather than leaving silence to read as assent.
+        assert written.record is None
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(lowered)
         assert not ledger.exists()
 
@@ -2914,6 +2979,24 @@ class TestWriteBaselineCli:
             stub_measurement
         )
 
+    def test_a_plain_regeneration_survives_a_corrupt_ledger(
+        self, stub_measurement: dict, tmp_path: Path
+    ) -> None:
+        # --write-baseline now hands --ledger to write_baseline on every call,
+        # so "a plain regeneration never depends on that file's health" has to
+        # be pinned rather than read off a call site that no longer says it.
+        target = tmp_path / 'b.json'
+        ledger = tmp_path / 'ledger.json'
+        ledger.write_text('{ not json at all', encoding='utf-8')
+
+        assert metrics.main([
+            '--write-baseline', str(target), '--ledger', str(ledger)
+        ]) == 0
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(
+            stub_measurement
+        )
+        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
+
 
 class TestAuthorizeRaiseCli:
     """The authorized-raise flags, and the exit ladder the refusal lands on.
@@ -2981,38 +3064,107 @@ class TestAuthorizeRaiseCli:
         assert metrics.main(['--write-baseline', str(target)]) == 2
 
     @pytest.mark.parametrize(
-        'argv',
+        ('argv', 'rule'),
         [
             pytest.param(
                 ['--write-baseline', 'x.json', '--authorize-raise', '5342'],
+                'require each other',
                 id='authorize-without-reason',
             ),
             pytest.param(
                 ['--write-baseline', 'x.json', '--reason', 'because'],
+                'require each other',
                 id='reason-without-authorize',
             ),
             pytest.param(
                 ['--check', '--authorize-raise', '5342', '--reason', 'because'],
+                'modifier of --write-baseline',
                 id='with-check',
             ),
             pytest.param(
                 ['--report', '--authorize-raise', '5342', '--reason', 'because'],
+                'modifier of --write-baseline',
                 id='with-report',
             ),
             pytest.param(
                 ['--json', '--authorize-raise', '5342', '--reason', 'because'],
+                'modifier of --write-baseline',
                 id='with-json',
+            ),
+            pytest.param(
+                [
+                    '--write-baseline', 'x.json',
+                    '--authorize-raise', '5342', '--reason', '   ',
+                ],
+                'missing reason',
+                id='blank-reason',
             ),
         ],
     )
     def test_authorization_is_a_modifier_of_the_write_and_nothing_else(
-        self, argv: list[str]
+        self, argv: list[str], rule: str, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # A flag that silently does nothing is worse than a rejected one: it
         # reads, to the agent who typed it, exactly like an authorization that
         # was granted.
-        with pytest.raises(SystemExit):
+        #
+        # THE RULE THAT FIRED IS ASSERTED, not merely that argparse exited.
+        # Deleting the two flags outright would make argparse exit on
+        # "unrecognized arguments" for every case here, so a bare
+        # pytest.raises(SystemExit) would stay green over a vanished feature.
+        with pytest.raises(SystemExit) as excinfo:
             metrics.main(argv)
+
+        assert excinfo.value.code == 2
+        assert rule in capsys.readouterr().err
+
+    def test_a_blank_reason_is_rejected_before_anything_is_measured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The value object refuses to exist unattributed, and the CLI resolves
+        # the flags before it measures -- so a typo costs a usage error, not a
+        # 71-second measurement whose result is thrown away.
+        def explode(root: Path) -> dict:
+            raise AssertionError('measured despite a blank --reason')
+
+        monkeypatch.setattr(metrics, 'build_report', explode)
+        target = tmp_path / 'b.json'
+
+        with pytest.raises(SystemExit) as excinfo:
+            metrics.main([
+                '--write-baseline', str(target),
+                '--authorize-raise', '5342', '--reason', '   ',
+            ])
+
+        assert excinfo.value.code == 2
+        assert not target.exists()
+
+    def test_an_authorization_that_recorded_nothing_says_so(
+        self, stub_measurement: dict, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # SILENCE IS THE FAILURE. An authorization over a lowering report
+        # records nothing by design, and printing only "wrote ..." would read,
+        # to the agent who typed the flags, exactly like one that was granted
+        # and recorded (INV-11).
+        target = tmp_path / 'b.json'
+        ledger = tmp_path / 'ledger.json'
+        metrics.write_baseline(target, stub_measurement)
+        lowered = copy.deepcopy(stub_measurement)
+        lowered['files'][_MQ]['lines'] -= 10
+        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(lowered))
+
+        assert metrics.main([
+            '--write-baseline', str(target),
+            '--authorize-raise', '5342',
+            '--reason', 'a lowering run that carried the flags',
+            '--ledger', str(ledger),
+        ]) == 0
+
+        out = capsys.readouterr().out
+        assert 'no measure rose' in out
+        assert str(ledger) in out
+        assert not ledger.exists()
 
     def test_ledger_defaults_to_the_committed_path(self) -> None:
         args = metrics._build_parser().parse_args(['--check'])

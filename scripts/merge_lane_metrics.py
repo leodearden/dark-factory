@@ -1229,13 +1229,29 @@ class UnauthorizedRaise(Exception):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class BaselineWrite:
+    """What one write actually did: where the bytes landed, and what it recorded.
+
+    ``record`` is the ledger entry this write appended, or None when it appended
+    none -- which is every unauthorized write, and an authorized one over a
+    report that raised nothing. Returning it is what lets a caller REPORT the
+    outcome instead of re-deriving it: the alternative is reading the ledger
+    before and after and diffing the lengths, which is three reads of one file
+    and misreports the moment anything else appends concurrently.
+    """
+
+    path: Path
+    record: dict | None
+
+
 def write_baseline(
     path: Path,
     report: dict,
     *,
     authorization: RaiseAuthorization | None = None,
     ledger: Path | None = None,
-) -> Path:
+) -> BaselineWrite:
     """Render *report* and write it to *path* atomically, refusing silent raises.
 
     THE TEXT IS RENDERED BEFORE THE DESTINATION IS TOUCHED, so a rendering
@@ -1271,7 +1287,9 @@ def write_baseline(
     render-before-write property above across the pair.
 
     An authorization over a report that raises NOTHING is ignored and appends no
-    record: the ledger holds raises, not intentions.
+    record: the ledger holds raises, not intentions. The returned
+    ``BaselineWrite`` says which of the two happened, so a caller reports the
+    outcome from the write itself rather than re-reading the ledger to guess.
 
     A MISSING destination is a first write with nothing to compare against. A
     MALFORMED one propagates ``load_baseline``'s ``MetricsError`` rather than
@@ -1283,15 +1301,17 @@ def write_baseline(
     raises = (
         _measure_raises(report, load_baseline(target)) if target.exists() else []
     )
+    record = None
     if raises:
         if authorization is None:
             raise UnauthorizedRaise(raises)
+        record = authorization_record(authorization, raises)
         append_authorization(
             Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
-            authorization_record(authorization, raises),
+            record,
         )
     safe_io.atomic_write_text(target, text, mkdir=True)
-    return target
+    return BaselineWrite(path=target, record=record)
 
 
 def load_baseline(path: Path) -> dict:
@@ -1340,6 +1360,17 @@ def load_baseline(path: Path) -> dict:
 # exists to stop rewarding.
 
 
+def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
+    value = getattr(authorization, field)
+    if not isinstance(value, str) or not value.strip():
+        raise MetricsError(
+            f'authorized raise is missing {field}: {value!r}. An authorization '
+            f'with no {field} is not an authorization -- the ledger entry exists '
+            'to tell a reviewer WHO raised a measure and WHY, and an entry that '
+            'answers neither is worse than no entry at all.'
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class RaiseAuthorization:
     """Permission to record ONE set of raises, granted by one invocation.
@@ -1352,10 +1383,20 @@ class RaiseAuthorization:
     widening the ratchet exists to prevent. Per-invocation means the default is
     always refusal, a stale record licenses nothing, and each raise costs one
     deliberate, attributed command.
+
+    BOTH FIELDS ARE CHECKED AT CONSTRUCTION, so an unattributed authorization
+    never exists to be passed anywhere. Enforcing it further down -- where the
+    record is rendered -- would make the same value valid or invalid depending
+    on whether the report it accompanied happened to raise anything, and a blank
+    ``--reason`` over a lowering run would pass unremarked (heuristic 10).
     """
 
     task_id: str
     reason: str
+
+    def __post_init__(self) -> None:
+        _require_non_blank(self, 'task_id')
+        _require_non_blank(self, 'reason')
 
 
 #: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
@@ -1381,31 +1422,21 @@ LEDGER_README = (
 )
 
 
-def _non_blank(authorization: RaiseAuthorization, field: str) -> str:
-    value = getattr(authorization, field)
-    if not isinstance(value, str) or not value.strip():
-        raise MetricsError(
-            f'authorized raise is missing {field}: {value!r}. An authorization '
-            f'with no {field} is not an authorization -- the ledger entry exists '
-            'to tell a reviewer WHO raised a measure and WHY, and an entry that '
-            'answers neither is worse than no entry at all.'
-        )
-    return value
-
-
 def authorization_record(
     authorization: RaiseAuthorization, raises: Sequence[Violation]
 ) -> dict:
     """One ledger entry: who authorized it, why, and exactly what rose.
 
-    ``measures`` is PROJECTED off the Violations the write gate measured, in
-    their already-sorted order, reusing ``Violation``'s field names so the audit
-    record and the failure message describe a raise in one vocabulary. Nothing
-    here is typed by the agent, so the record cannot drift from the diff.
+    A PURE PROJECTION -- it validates nothing, because a ``RaiseAuthorization``
+    that exists is already attributed. ``measures`` is projected off the
+    Violations the write gate measured, in their already-sorted order, reusing
+    ``Violation``'s field names so the audit record and the failure message
+    describe a raise in one vocabulary. Nothing here is typed by the agent, so
+    the record cannot drift from the diff.
     """
     return {
-        'task_id': _non_blank(authorization, 'task_id'),
-        'reason': _non_blank(authorization, 'reason'),
+        'task_id': authorization.task_id,
+        'reason': authorization.reason,
         'measures': [
             {
                 'measure': violation.measure,
@@ -1933,6 +1964,11 @@ def _resolve_authorization(
     mode", so it is done here rather than left unchecked. A flag that silently
     did nothing would read, to the agent who typed it, exactly like an
     authorization that was granted.
+
+    The value object's own non-blank invariant lands here as the THIRD usage
+    error rather than as a broken instrument: ``--reason ""`` is a flag typed
+    wrong, so it prints like the two above and exits on the same code, before
+    anything is measured.
     """
     if (args.authorize_raise is None) != (args.reason is None):
         parser.error(
@@ -1948,35 +1984,44 @@ def _resolve_authorization(
             'only mode that can absorb a raise. --check reports raises; it '
             'never records them'
         )
-    return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
+    try:
+        return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
+    except MetricsError as exc:
+        parser.error(str(exc))
 
 
 def _write(
     args: argparse.Namespace, report: dict, authorization: RaiseAuthorization | None
 ) -> int:
-    """The --write-baseline arm, reporting what an authorized raise recorded.
+    """The --write-baseline arm, reporting what this invocation actually did.
 
-    Without an authorization the ledger is not read at all, so a plain
-    regeneration never depends on that file's health.
+    Without an authorization the ledger is neither read nor written -- an
+    unauthorized raise is refused before it is reached -- so a plain
+    regeneration never depends on that file's health, and --ledger can be passed
+    through unconditionally to keep one call site rather than two arms.
+
+    WHAT IS PRINTED COMES FROM THE WRITE, never from re-reading the ledger, so
+    the operator's log cannot claim a raise the committed file does not carry.
     """
-    if authorization is None:
-        print(f'wrote {write_baseline(Path(args.write_baseline), report)}')
-        return 0
     ledger = Path(args.ledger)
-    # Counted BEFORE the write so what is printed is exactly what THIS
-    # invocation appended. An authorization over a report that raises nothing
-    # records nothing, and the operator's log must never claim a raise the
-    # committed file does not carry.
-    already_recorded = len(load_ledger(ledger)['raises'])
-    target = write_baseline(
+    written = write_baseline(
         Path(args.write_baseline), report, authorization=authorization, ledger=ledger
     )
-    print(f'wrote {target}')
-    for record in load_ledger(ledger)['raises'][already_recorded:]:
-        print(
-            f'recorded {len(record["measures"])} authorized raise(s) for task '
-            f'{record["task_id"]} in {ledger}'
-        )
+    print(f'wrote {written.path}')
+    if authorization is None:
+        return 0
+    if written.record is None:
+        # An authorization that recorded nothing must SAY so. Printing only
+        # "wrote ..." would read, to the agent who typed --authorize-raise,
+        # exactly like an authorization that was granted and recorded -- the
+        # very failure _resolve_authorization rejects flag shapes to avoid
+        # (INV-11, no silent fail-soft).
+        print(f'no measure rose; nothing recorded in {ledger}')
+        return 0
+    print(
+        f'recorded {len(written.record["measures"])} authorized raise(s) for '
+        f'task {written.record["task_id"]} in {ledger}'
+    )
     return 0
 
 
