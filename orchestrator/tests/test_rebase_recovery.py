@@ -481,6 +481,166 @@ def _swept(git_dir: Path):
     )
 
 
+def _fake_proc(root: Path, *, holders: dict[int, Path], unreadable: int = 0,
+               vanished: int = 0) -> Path:
+    """A stand-in ``/proc`` with the three shapes a real one presents.
+
+    Built rather than chmod-ed: ``chmod`` is a no-op for root, so a
+    permission-based fixture asserts nothing wherever CI runs as root (the same
+    vacuity trap that put :func:`_merge_rr_read_fails` in this file).  An ``fd``
+    that is a FILE raises ``NotADirectoryError`` for every uid, modelling "this
+    process's descriptors are not ours to read" deterministically.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'self').mkdir()          # a non-numeric entry, which is skipped
+    for pid, target in holders.items():
+        fd = root / str(pid) / 'fd'
+        fd.mkdir(parents=True)
+        (fd / '0').symlink_to(target)
+    for offset in range(unreadable):
+        pid = root / str(900 + offset)
+        pid.mkdir()
+        (pid / 'fd').write_text('not a directory')
+    for offset in range(vanished):
+        (root / str(800 + offset)).mkdir()   # no fd dir: exited mid-scan
+    return root
+
+
+class TestScanLockHolders:
+    """One ``/proc`` pass, and an honest account of what it could not see.
+
+    The distinction this class exists for: an EMPTY pid list can mean "nothing
+    holds this" or "this run could not tell", and the sweep turns the first
+    into a deletion.  They must not be the same value.
+
+    Where the line falls is a MEASUREMENT, not a preference.  On this host,
+    right now, as the orchestrator's own uid: 1329 pids, 467 fd directories
+    readable, 860 denied (root's and other users' processes), 2 vanished
+    mid-scan.  So treating any unreadable fd directory as blindness would
+    retain every lock on every run and silently delete the stale-lock half of
+    this task, while all its unit cases stayed green.  Blindness is therefore
+    scoped to what it can honestly mean: ``/proc`` itself unavailable.
+    """
+
+    def test_a_holder_is_found_through_the_fd_symlink(self, tmp_path: Path) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={4242: lock})
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.pids_by_path[lock] == (4242,)
+        assert scan.confirmed is True
+
+    def test_processes_whose_descriptors_are_not_ours_do_not_veto(
+        self, tmp_path: Path,
+    ) -> None:
+        """65% of this host's pids are unreadable; vetoing on them removes nothing."""
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={}, unreadable=3)
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.pids_by_path[lock] == ()
+        assert scan.confirmed is True
+
+    def test_a_process_that_exited_mid_scan_does_not_veto(
+        self, tmp_path: Path,
+    ) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+        proc = _fake_proc(tmp_path / 'proc', holders={}, vanished=3)
+
+        scan = rebase_recovery.scan_lock_holders([lock], proc_root=proc)
+
+        assert scan.confirmed is True
+
+    def test_an_unavailable_proc_is_reported_rather_than_raised(
+        self, tmp_path: Path,
+    ) -> None:
+        """The case that MEASURED as raising out of the preflight entirely.
+
+        ``Path('/proc').iterdir()`` on a host with no ``/proc`` mounted raised
+        ``FileNotFoundError`` straight through ``survey_locks`` and out of
+        ``preflight_rebase_recovery``, breaching the totality invariant the
+        module documents and ``TestPreflightIsTotal`` pins.
+        """
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=1)
+
+        scan = rebase_recovery.scan_lock_holders(
+            [lock], proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert scan.confirmed is False
+        assert scan.pids_by_path[lock] == ()
+
+    def test_one_pass_answers_every_candidate_lock(self, tmp_path: Path) -> None:
+        """The scan is per SWEEP, not per lock.
+
+        Each pass readlinks every descriptor of every process, so repeating it
+        per lock multiplies the syscalls by the number of locks — under exactly
+        the contention this module exists to handle, and serialising a
+        merge-lane abort behind it.
+        """
+        git_dir = tmp_path / 'gitdir'
+        locks = [
+            _plant_lock(git_dir, name, age_seconds=5)
+            for name in ('MERGE_RR.lock', 'config.lock', 'index.lock')
+        ]
+        passes: list[list[Path]] = []
+        real = rebase_recovery.scan_lock_holders
+
+        def spy(paths, **kwargs):
+            passes.append(list(paths))
+            return real(paths, **kwargs)
+
+        with patch.object(rebase_recovery, 'scan_lock_holders', side_effect=spy):
+            rebase_recovery.survey_locks(git_dir)
+
+        assert len(passes) == 1, f'{len(passes)} /proc passes for 3 locks'
+        assert sorted(passes[0]) == sorted(locks)
+
+
+class TestBlindnessIsNotEvidenceOfAbsence:
+    """A scan that could not run must retain, and must say why.
+
+    'No holder found' authorises a deletion.  When the finding is really 'no
+    scan happened', that same value deletes a lock something may well be
+    holding — biasing the failure the one direction a module whose contract is
+    never to make things worse cannot afford.
+    """
+
+    def test_an_unscannable_proc_retains_an_old_unheld_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        lock = _plant_lock(tmp_path / 'gitdir', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+
+        swept = rebase_recovery.sweep_stale_locks(
+            git_dir=tmp_path / 'gitdir', now=_NOW, stale_after_seconds=_STALE,
+            proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert swept.removed == ()
+        assert [s.path for s in swept.retained] == [lock]
+        assert swept.retained[0].holders_confirmed is False
+        assert lock.exists(), 'a lock nothing could check must survive the sweep'
+
+    def test_the_reason_reaches_the_result(self, tmp_path: Path) -> None:
+        """A retained lock with no pids still owes the caller an explanation."""
+        result = rebase_recovery.PreflightResult(
+            worktree=tmp_path, dangling=(), unparsable=(), merge_rr_backup=None,
+            locks_removed=(),
+            locks_retained=(
+                rebase_recovery.LockFinding(
+                    path=tmp_path / 'MERGE_RR.lock', age_seconds=99999.0,
+                    holder_pids=(), holders_confirmed=False,
+                ),
+            ),
+        )
+
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert len(result.unrepaired) == 1
+        assert 'MERGE_RR.lock' in result.unrepaired[0]
+
+
 class TestSweepStaleLocks:
     """Removal requires the CONJUNCTION of no holder AND age past threshold.
 

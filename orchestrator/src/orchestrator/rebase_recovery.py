@@ -38,7 +38,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -291,11 +291,17 @@ DEFAULT_LOCK_STALE_AFTER_SECONDS = 3600.0
 
 @dataclass(frozen=True)
 class LockFinding:
-    """One ``*.lock`` and the two facts the removal decision turns on."""
+    """One ``*.lock`` and the facts the removal decision turns on.
+
+    ``holders_confirmed`` is the difference between "nothing holds this" and
+    "this run could not tell".  Both render as an empty ``holder_pids``, and
+    only the first may authorise a deletion.
+    """
 
     path: Path
     age_seconds: float
     holder_pids: tuple[int, ...]
+    holders_confirmed: bool = True
 
 
 @dataclass(frozen=True)
@@ -311,8 +317,30 @@ class LockSweep:
     retained: tuple[LockFinding, ...]
 
 
-def lock_holder_pids(path: Path) -> tuple[int, ...]:
-    """Pids holding *path* open, found by scanning ``/proc/<pid>/fd``.
+#: Where the holder probe looks.  Injectable for the same reason
+#: ``verify_cancel.lane_lock_holder_pids`` takes ``locks_path``: the answer is
+#: read out of a pseudo-filesystem, and a test that cannot substitute one has
+#: to reach into the implementation to say anything about it.
+_PROC_ROOT = Path('/proc')
+
+
+@dataclass(frozen=True)
+class HolderScan:
+    """Which pids hold which of the paths asked about — and whether we know.
+
+    ``confirmed`` is false when the process table could not be enumerated at
+    all, which makes every empty entry mean "unknown" rather than "unheld".
+    The caller must not collapse the two: only one of them may delete a file.
+    """
+
+    pids_by_path: Mapping[Path, tuple[int, ...]]
+    confirmed: bool
+
+
+def scan_lock_holders(
+    paths: Iterable[Path], *, proc_root: Path = _PROC_ROOT,
+) -> HolderScan:
+    """Find the pids holding *paths* open, in ONE pass over the process table.
 
     Deliberately NOT ``git_ops.lane_lock_holder_pids``, which reads
     ``/proc/locks``.  That file lists kernel FLOCK/POSIX locks, whereas git's
@@ -321,14 +349,46 @@ def lock_holder_pids(path: Path) -> tuple[int, ...]:
     every live git lock, and this sweep would delete them.  The two probes
     answer different questions and neither substitutes for the other.
 
-    Per-entry ``OSError`` is tolerated throughout: processes exit mid-scan and
-    other users' fd directories are not ours to read.  Either way the answer
-    for that pid is "cannot confirm it holds this", which is what skipping it
-    records.
+    ONE pass for every candidate, not one per lock: each pass readlinks every
+    descriptor of every process, so per-lock repetition multiplies the syscalls
+    by the number of locks — under precisely the contention this module exists
+    to handle, and serialising a merge-lane abort behind it.
+
+    THREE failures, and they are NOT the same answer:
+
+    * ``proc_root`` cannot be enumerated — no ``/proc`` mounted at all.  The
+      scan saw nothing, so ``confirmed`` is false and every path comes back
+      unknown.  This measured as RAISING out of the preflight before this
+      guard, which breached the module's totality invariant.
+    * A pid's ``fd`` directory is not ours to read.  Tolerated, and it does NOT
+      make the scan unconfirmed.  MEASURED on this host as the orchestrator's
+      own uid: 860 of 1329 pids are unreadable, so vetoing on them would retain
+      every lock on every run — silently deleting the stale-lock half of this
+      task while its unit cases stayed green.
+    * A pid vanishes mid-scan.  Its descriptors are gone because the process
+      is, so it holds nothing; tolerated, and likewise not unconfirmed.
+
+    KNOWN BOUND, stated because it cannot be closed here: under a ``hidepid``
+    ``/proc``, other users' pids are not listed at all rather than denied, so a
+    foreign holder is invisible and no counting of denials would reveal it.
+    The conjunction in :func:`sweep_stale_locks` is the mitigation — a file is
+    removed only if it ALSO has not been touched for an hour.
     """
-    target = str(path.resolve())
-    holders: list[int] = []
-    for entry in Path('/proc').iterdir():
+    wanted = {str(path.resolve()): path for path in paths}
+    holders: dict[Path, set[int]] = {path: set() for path in wanted.values()}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError as exc:
+        logger.warning(
+            'Could not enumerate %s: %s. Lock holders are UNKNOWN for this '
+            'run, so nothing is removed on the strength of finding none.',
+            proc_root, exc,
+        )
+        return HolderScan(
+            pids_by_path={path: () for path in holders}, confirmed=False,
+        )
+
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         try:
@@ -340,14 +400,20 @@ def lock_holder_pids(path: Path) -> tuple[int, ...]:
                 resolved = os.readlink(fd)
             except OSError:
                 continue
-            if resolved == target:
-                holders.append(int(entry.name))
-                break
-    return tuple(holders)
+            path = wanted.get(resolved)
+            if path is not None:
+                holders[path].add(int(entry.name))
+    return HolderScan(
+        pids_by_path={
+            path: tuple(sorted(pids)) for path, pids in holders.items()
+        },
+        confirmed=True,
+    )
 
 
 def survey_locks(
     git_dir: Path, *, now: datetime | None = None,
+    proc_root: Path = _PROC_ROOT,
 ) -> tuple[LockFinding, ...]:
     """Measure every ``*.lock`` directly under *git_dir*, removing nothing.
 
@@ -357,18 +423,24 @@ def survey_locks(
     disagreeing about what they saw.
     """
     moment = now if now is not None else datetime.now(UTC)
-    findings: list[LockFinding] = []
+    aged: list[tuple[Path, float]] = []
     for lock in sorted(git_dir.glob('*.lock')):
         try:
             age = moment.timestamp() - lock.stat().st_mtime
         except OSError:
             continue
-        findings.append(
-            LockFinding(
-                path=lock, age_seconds=age, holder_pids=lock_holder_pids(lock),
-            ),
+        aged.append((lock, age))
+
+    scan = scan_lock_holders([lock for lock, _ in aged], proc_root=proc_root)
+    return tuple(
+        LockFinding(
+            path=lock,
+            age_seconds=age,
+            holder_pids=scan.pids_by_path.get(lock, ()),
+            holders_confirmed=scan.confirmed,
         )
-    return tuple(findings)
+        for lock, age in aged
+    )
 
 
 def sweep_stale_locks(
@@ -376,13 +448,19 @@ def sweep_stale_locks(
     git_dir: Path,
     now: datetime | None = None,
     stale_after_seconds: float = DEFAULT_LOCK_STALE_AFTER_SECONDS,
+    proc_root: Path = _PROC_ROOT,
 ) -> LockSweep:
     """Remove abandoned ``*.lock`` files directly under *git_dir*.
 
-    A lock is removed ONLY when nothing holds it open AND its mtime is older
-    than *stale_after_seconds*.  The conjunction is the whole contract: age
-    alone would delete a lock a live process still depends on, and a holder
-    check alone would clear a lock the instant its writer blinked.
+    A lock is removed ONLY when the holder scan CONFIRMED that nothing holds it
+    open AND its mtime is older than *stale_after_seconds*.  The conjunction is
+    the whole contract: age alone would delete a lock a live process still
+    depends on, and a holder check alone would clear a lock the instant its
+    writer blinked.
+
+    A scan that could not run answers "unknown", never "unheld" — see
+    :func:`scan_lock_holders`.  Unknown retains, and the lock is reported, so
+    the one direction this module must never fail in stays closed.
 
     The mtime of the operation the lock BLOCKS is never consulted — not as a
     tiebreak, not as a hint.  Incident 3517's lock was older than the
@@ -397,8 +475,12 @@ def sweep_stale_locks(
     removed: list[LockFinding] = []
     retained: list[LockFinding] = []
 
-    for finding in survey_locks(git_dir, now=now):
-        if finding.holder_pids or finding.age_seconds <= stale_after_seconds:
+    for finding in survey_locks(git_dir, now=now, proc_root=proc_root):
+        if (
+            finding.holder_pids
+            or not finding.holders_confirmed
+            or finding.age_seconds <= stale_after_seconds
+        ):
             retained.append(finding)
             continue
         lock = finding.path
@@ -410,7 +492,7 @@ def sweep_stale_locks(
         removed.append(finding)
         logger.warning(
             'Removed stale git lock %s — age %.0fs (threshold %.0fs), '
-            'no holder process found in /proc.',
+            'no holder process found in a completed /proc scan.',
             finding.path, finding.age_seconds, stale_after_seconds,
         )
 
@@ -443,16 +525,23 @@ class PreflightResult:
     def unrepaired(self) -> tuple[str, ...]:
         """Findings this run did NOT fix — the reason a caller must not proceed.
 
-        Two arms.  A lock with a live holder is a human's decision: something
-        is using it, and this module will not guess what.  A suspect MERGE_RR
-        with no backup means the damage is still in place — the ``report_only``
-        case, where leaving it is the whole point, and also a quarantine that
-        failed.
+        Three arms.  A lock with a live holder is a human's decision: something
+        is using it, and this module will not guess what.  A lock whose holders
+        could not be determined is the same decision with less evidence, and is
+        named rather than passed over in silence — an unscannable process table
+        is exactly when an operator most needs to be told why a lock survived.
+        A suspect MERGE_RR with no backup means the damage is still in place —
+        the ``report_only`` case, where leaving it is the whole point, and also
+        a quarantine that failed.
         """
         reasons = [
             f'lock {finding.path} held by pids '
             f'{", ".join(str(pid) for pid in finding.holder_pids)}'
-            for finding in self.locks_retained if finding.holder_pids
+            if finding.holder_pids else
+            f'lock {finding.path} left in place — holders unknown, so finding '
+            f'none is not evidence there are none'
+            for finding in self.locks_retained
+            if finding.holder_pids or not finding.holders_confirmed
         ]
         suspect = self.dangling or self.unparsable or self.merge_rr_unreadable
         if self.merge_rr_backup is None and suspect:
@@ -505,6 +594,7 @@ def _lock_json(finding: LockFinding) -> dict:
         'path': str(finding.path),
         'age_seconds': round(finding.age_seconds, 3),
         'holder_pids': list(finding.holder_pids),
+        'holders_confirmed': finding.holders_confirmed,
     }
 
 
