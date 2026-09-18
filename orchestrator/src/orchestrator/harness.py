@@ -6416,8 +6416,15 @@ class Harness:
                 # The chokepoint above cannot cover it: `action` here is
                 # RE_FILE_ESCALATION, not LEAVE, so without this the operator
                 # gets no row at all for a task the sweep decided to hold.
-                # Mirrors the tail arm's emission verbatim so the two cannot
-                # disagree about a log-mode hold.
+                # Mirrors the chokepoint's emission — INCLUDING `tally` —
+                # so the two cannot disagree about a log-mode hold.  The
+                # tally is not optional here: `_release_recovery_veto_streaks`
+                # pops every tracked entry whose task is absent from
+                # `tally.observed_task_ids`, so an emission that charges the
+                # tracker without folding into the tally is un-charged in the
+                # same pass (esc-3541-7) — the streak can never climb, and a
+                # previously-filed streak alarm is auto-resolved every sweep
+                # while the hold recurs.
                 if report_would_duplicate_a_handoff(report):
                     if not emitted_recovery:
                         self._emit_recovery_disposition(
@@ -6427,6 +6434,7 @@ class Harness:
                             shape=recovery_shape_str(report),
                             records=report.open_escalations,
                             store_unavailable=report.escalation_store_unavailable,
+                            tally=tally,
                         )
                     return None
 
@@ -6555,6 +6563,7 @@ class Harness:
                     shape=recovery_shape_str(report),
                     records=report.open_escalations,
                     store_unavailable=report.escalation_store_unavailable,
+                    tally=tally,
                 )
             return None
 

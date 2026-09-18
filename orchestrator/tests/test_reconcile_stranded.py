@@ -4869,10 +4869,11 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
             harness, tmp_path, '8', category='stranded_blocked', level=1,
         )
 
+        tally = RecoverySweepTally()
         with patch(
             'orchestrator.harness.detect_verified_green', AsyncMock(return_value=None),
         ), _spy_dispositions(harness) as spy:
-            result = await _reconcile_stranded(harness, '8', 'blocked')
+            result = await _reconcile_stranded(harness, '8', 'blocked', tally=tally)
 
         assert result is None
         assert _pending_ids(harness, '8') == [
@@ -4885,6 +4886,14 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
         from orchestrator.recovery_emission import LeaveReason
 
         assert spy.call_args.kwargs['reason'] == LeaveReason.escalation_pinned
+        # esc-3541-7: the hold must be CHARGED to the pass's tally, not only
+        # to the tracker.  `_release_recovery_veto_streaks` pops every tracked
+        # task absent from `observed_task_ids`, so a tally-less emission is
+        # un-charged in the same sweep — the streak detector never climbs and
+        # a prior streak alarm flaps.
+        assert spy.call_args.kwargs['tally'] is tally
+        assert '8' in tally.observed_task_ids
+        assert tally.held == 1
 
     async def test_a_dead_filer_l0_still_dedups_and_speaks(
         self, harness: Harness, tmp_path: Path,
