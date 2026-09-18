@@ -228,9 +228,23 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     account. The payoff: nightly's long-standing "all accounts capped"
     summary becomes TRUE for the first time.
 
-    TERMINATION IS STRUCTURAL, not a retry budget: every iteration marks
-    exactly one account capped, so the admissible set strictly shrinks and
-    ``try_lease`` returns None after at most ``account_count`` passes.
+    TERMINATION IS STRUCTURAL, and it is the CALLER's set of already-tried
+    names that makes it so — not the gate's handlers. A True verdict from
+    ``detect_cap_hit`` means only "the gate recorded a cap signal against
+    this account"; a NEAR-cap warning is annotation-only
+    (``_handle_near_cap_warning`` sets ``near_cap`` and takes no phase
+    transition), so the admissible set need not shrink at all and a rotation
+    that merely re-asked would be handed the same account forever. Passing
+    the growing ``tried`` set as ``exclude=`` removes that dependency: the
+    gate never returns an excluded name, so ``tried`` grows by exactly one
+    per pass and ``try_lease`` returns None after at most ``account_count``
+    passes — whatever the handlers did with the verdict.
+
+    The bound is expressed to the gate's ONE selection implementation rather
+    than computed here. Re-classifying the streams the gate is about to
+    classify anyway would put a second copy of cap policy in a caller
+    (heuristic 11) — the rotation-beside-the-gate this module exists not to
+    become.
 
     ONLY THE GATE'S STRICT DETECTOR ROTATES. ``coder``'s loose
     OR-substring matcher keeps its own job — labelling an already-FAILED
@@ -259,13 +273,18 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     """
 
     def invoke_through_pool(prompt: str, model: str) -> str:
+        # Scoped to ONE digest, deliberately: an account that refused this
+        # prompt is not thereby done for the night — a near-cap warning is
+        # not a cap — so the next digest starts from the full roster again.
+        tried: set[str] = set()
         while True:
-            lease = gate.try_lease(reverse=reverse)
+            lease = gate.try_lease(reverse=reverse, exclude=tried)
             if lease is None:
                 raise coder.CoderCapExhausted(
                     f"legibility trickle: {_exhaustion_reason(gate)}",
                     marker=_EXHAUSTED_MARKER,
                 )
+            tried.add(lease.name)
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
@@ -273,13 +292,18 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 return reply
             except coder.CoderCapExhausted as exc:
                 # The loose per-digest gate fired. Ask the STRICT detector
-                # whether this ACCOUNT is out; it marks the account capped and
-                # settles the slot when it agrees.
+                # what the GATE makes of it; on any True verdict it settles
+                # the slot and releases the probe claim. WHICH transition it
+                # took is the gate's business and not knowable from here — a
+                # CapHit caps the account, a NearCap only annotates it — which
+                # is exactly why the retry is bounded by `tried` rather than
+                # by an assumption about what just happened.
                 if not slot.detect_cap_hit(exc.stderr, exc.stdout):
                     raise
                 logger.info(
-                    "account %s is capped — retrying this digest on the next "
-                    "account in the pool", slot.account_name,
+                    "account %s did not complete this digest and the gate "
+                    "recorded a cap signal against it — retrying this digest "
+                    "on the next account in the pool", slot.account_name,
                 )
             finally:
                 gate.release_probe_slot(slot.token)
