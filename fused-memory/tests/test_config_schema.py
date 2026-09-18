@@ -1362,6 +1362,74 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorEntryCharCaps:
+    """The per-entry char caps, pinned with the measurement that set them.
+
+    Measured 2026-09-18 against the live task DB (n=5574; 1015 pending):
+    description p50 1813 / p90 3906, with 87.6% of all tasks (96.1% of
+    pending) over the old 500-char cap and a mean 1827-char elision among
+    those clipped; details p50 0 / p90 2827, with 18.6% over 1500. The two
+    caps were INVERTED relative to that data — the near-always-populated,
+    roughly twice-longer field carried the 3x tighter cap.
+    """
+
+    def test_description_cap_shows_the_median_task_in_full(self):
+        assert CuratorConfig().entry_description_chars == 2000, (
+            'entry_description_chars must be 2000 — the smallest round cap '
+            'above the measured description p50 of 1813, taking the clipping '
+            'rate from 87.6% to 44.7% (96.1% -> 69.5% for pending tasks). At '
+            'the old 500 the curator saw roughly the first quarter of 96% of '
+            'combine-eligible descriptions and could not tell.'
+        )
+
+    def test_details_cap_is_unchanged(self):
+        assert CuratorConfig().entry_details_chars == 1500
+
+    def test_description_cap_is_not_tighter_than_the_details_cap(self):
+        """The relationship the measurement established, not just the values.
+
+        description is populated on essentially every task and runs about
+        twice as long as details (p50 1813 vs 0), so it earns the LARGER
+        budget. Any future edit that re-inverts these two is re-introducing
+        the defect, whatever the absolute numbers become.
+        """
+        cfg = CuratorConfig()
+        assert cfg.entry_description_chars >= cfg.entry_details_chars, (
+            f'entry_description_chars ({cfg.entry_description_chars}) must not '
+            f'be tighter than entry_details_chars ({cfg.entry_details_chars}): '
+            f'description is the near-always-populated and roughly twice-longer '
+            f'field (measured p50 1813 vs 0).'
+        )
+
+    def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
+        """FINDING 1, as an executable invariant rather than a comment.
+
+        A maximal pool is anchor(<=1) + module + embedding + dependency. With
+        stock values that is 29 against a total cap of 30, so ``_trim_pool``
+        short-circuits on every call and the STREAM caps are the binding
+        constraints. This is pinned so a future cap edit that silently
+        re-strands or un-strands the final trim is caught here, at the config
+        layer, rather than being discovered as a permanently-silent
+        ``pool_truncated`` census.
+        """
+        cfg = CuratorConfig()
+        maximal_pool = (
+            1
+            + cfg.pool_module_cap
+            + cfg.pool_embedding_cap
+            + cfg.pool_dependency_cap
+        )
+        assert maximal_pool == 29
+        assert maximal_pool <= cfg.pool_total_cap, (
+            f'A maximal pool is {maximal_pool} entries against pool_total_cap '
+            f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
+            f'reachable and the total_cap arm of the PoolWithheld census stops '
+            f'being dead weight — update the schema comment recording the '
+            f'arithmetic, and re-read whether the stream caps are still the '
+            f'binding constraints.'
+        )
+
+
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
 
