@@ -19,6 +19,7 @@ expression: the structural guards below read the module source from the LOCAL
 
 TDD pair 1: the Disposition vocabulary (GREEN on impl step-2).
 TDD pair 2: the inline marker parser + INLINE_MARKER_FORMS (GREEN on impl step-4).
+TDD pair 3: GovernedList + the accepting half of governed_exceptions (GREEN on impl step-6).
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from shared.governed_exceptions import (
+    DECLARATION_FORMS,
     INLINE_MARKER_FORMS,
     Debt,
     Disposition,
@@ -36,6 +38,7 @@ from shared.governed_exceptions import (
     Policy,
     TaskRef,
     TicketRef,
+    governed_exceptions,
     parse_disposition_marker,
 )
 
@@ -390,3 +393,185 @@ class TestInlineMarkerFormsAreTheOneGrammar:
         keywords = [kw for kw in self.KEYWORD_TYPES if kw in form]
         assert len(keywords) == 1, f'{form!r} must carry exactly one keyword, found {keywords}'
         assert type(parse_disposition_marker(filled)) is self.KEYWORD_TYPES[keywords[0]]
+
+
+# A declaration the register will really see, used throughout the declaration
+# tests so the shapes below are the shapes D4 puts in a package's test tree.
+LIST_ID = 'orchestrator.tests.timeout_marker_grandfathered'
+RULE = 'every grandfathered timeout marker is owned or ratified'
+
+
+def _keys(count, prefix='key'):
+    return [f'{prefix}-{index:03d}' for index in range(count)]
+
+
+class TestGovernedListAccepts:
+    """The declaration shapes D4 and the PRD's scenario 15 actually produce."""
+
+    def test_a_fully_overridden_list(self):
+        declaration = governed_exceptions(
+            LIST_ID,
+            RULE,
+            ['a', 'b'],
+            dispositions={'a': Debt(TaskRef(5149)), 'b': Policy('inv12-x')},
+        )
+        assert declaration.list_id == LIST_ID
+        assert declaration.rule == RULE
+        assert declaration.keys == ('a', 'b')
+        assert dict(declaration.overrides) == {'a': Debt(TaskRef(5149)), 'b': Policy('inv12-x')}
+        assert declaration.default is None
+        assert declaration.default_covers is None
+
+    def test_a_defaulted_list(self):
+        """61 keys, no overrides, one default that covers all of them."""
+        declaration = governed_exceptions(
+            LIST_ID, RULE, _keys(61), default=Debt(TaskRef(5149)), default_covers=61
+        )
+        assert len(declaration.keys) == 61
+        assert declaration.overrides == {}
+
+    def test_a_mixed_list_counts_only_the_keys_without_an_override(self):
+        """default_covers=59, not 61: the two overridden keys are not the default's."""
+        declaration = governed_exceptions(
+            LIST_ID,
+            RULE,
+            _keys(61),
+            default=Debt(TaskRef(5149)),
+            default_covers=59,
+            dispositions={'key-000': Policy('inv12-x'), 'key-001': Debt(TaskRef(5602))},
+        )
+        assert declaration.default_covers == 59
+        assert len(declaration.overrides) == 2
+
+    def test_an_empty_list(self):
+        """A governed list that is currently empty is legal and disposes nothing."""
+        declaration = governed_exceptions(LIST_ID, RULE, [])
+        assert declaration.keys == ()
+        assert declaration.overrides == {}
+
+    def test_a_baseline_unit_is_a_declaration_with_exactly_one_key(self):
+        """The PRD's convention, and it needs no special code path.
+
+        D2 makes each machine-generated baseline ONE governed entry carrying a
+        disposition of its own.  That is spelled as an ordinary declaration
+        whose single key is the baseline's repo-relative path — so nothing in
+        this module knows what a baseline is, and the report counts it like
+        any other entry.
+        """
+        path = 'scripts/inline_suppression_baseline.json'
+        declaration = governed_exceptions(
+            'scripts.inline_suppression_baseline',
+            'the grandfathered inline-suppression baseline, shrink-only',
+            [path],
+            dispositions={path: Policy('inv12-day-one-test-doubles')},
+        )
+        assert declaration.keys == (path,)
+        assert declaration.disposition_for(path) == Policy('inv12-day-one-test-doubles')
+
+    def test_keys_are_a_tuple_in_declaration_order(self):
+        assert governed_exceptions(LIST_ID, RULE, ['z', 'a', 'm']).keys == ('z', 'a', 'm')
+
+    def test_accepts_any_iterable_of_keys(self):
+        """The Contract types ``keys`` as an Iterable, not a list."""
+        assert governed_exceptions(LIST_ID, RULE, (k for k in ('a', 'b'))).keys == ('a', 'b')
+
+
+class TestGovernedListIsImmutable:
+    """A declaration is a value: nothing downstream can edit one."""
+
+    def test_is_frozen(self):
+        declaration = governed_exceptions(LIST_ID, RULE, ['a'])
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            declaration.rule = 'something else'  # type: ignore[misc]
+
+    def test_overrides_is_read_only(self):
+        declaration = governed_exceptions(
+            LIST_ID, RULE, ['a'], dispositions={'a': Policy('inv12-x')}
+        )
+        with pytest.raises(TypeError):
+            declaration.overrides['a'] = Policy('inv12-y')  # type: ignore[index]
+
+    def test_overrides_is_not_the_caller_s_dict(self):
+        """A defensive copy, so a later mutation of the caller's dict cannot reach in.
+
+        Declarations are module-level literals in a test file; a shared mutable
+        mapping would let one package's declaration silently re-disposition
+        another's.
+        """
+        mutable = {'a': Policy('inv12-x')}
+        declaration = governed_exceptions(LIST_ID, RULE, ['a'], dispositions=mutable)
+        mutable['a'] = Debt(TaskRef(5149))
+        assert declaration.overrides['a'] == Policy('inv12-x')
+
+
+class TestDispositionFor:
+    """The single home of the override-else-default resolution rule."""
+
+    def test_returns_the_override_when_one_exists(self):
+        declaration = governed_exceptions(
+            LIST_ID,
+            RULE,
+            ['a', 'b'],
+            default=Debt(TaskRef(5149)),
+            default_covers=1,
+            dispositions={'a': Policy('inv12-x')},
+        )
+        assert declaration.disposition_for('a') == Policy('inv12-x')
+
+    def test_falls_back_to_the_default(self):
+        declaration = governed_exceptions(
+            LIST_ID,
+            RULE,
+            ['a', 'b'],
+            default=Debt(TaskRef(5149)),
+            default_covers=1,
+            dispositions={'a': Policy('inv12-x')},
+        )
+        assert declaration.disposition_for('b') == Debt(TaskRef(5149))
+
+    def test_an_unknown_key_raises_naming_the_list_and_the_key(self):
+        """Not a silent None: a key that is not in the declaration is a caller bug.
+
+        Returning the default for a key nobody declared would let a report
+        print a disposition for an entry that does not exist, which is exactly
+        the shape of the drift D5 makes loud by construction.
+        """
+        declaration = governed_exceptions(LIST_ID, RULE, ['a'], dispositions={'a': Policy('x')})
+        with pytest.raises(KeyError) as excinfo:
+            declaration.disposition_for('nope')
+        assert LIST_ID in str(excinfo.value)
+        assert 'nope' in str(excinfo.value)
+
+
+class TestScenario15RuntimeHalf:
+    """A defaulted list reports "default, default_covers, N overrides" with no key set."""
+
+    def test_a_report_can_render_a_defaulted_list_without_the_keys(self):
+        """The runtime half of PRD scenario 15.
+
+        The static reader sees ``default``, ``default_covers`` and the
+        overrides because they are literals; only this runtime value also
+        knows the key set.  The report prints the former three, so they must
+        read back off the GovernedList exactly as declared — otherwise the
+        report would have to enumerate 61 keys to say one sentence.
+        """
+        declaration = governed_exceptions(
+            LIST_ID,
+            RULE,
+            _keys(61),
+            default=Debt(TaskRef(5149)),
+            default_covers=59,
+            dispositions={'key-000': Policy('inv12-x'), 'key-001': Debt(TaskRef(5602))},
+        )
+        assert declaration.default == Debt(TaskRef(5149))
+        assert declaration.default_covers == 59
+        assert len(declaration.overrides) == 2
+
+
+class TestDeclarationForms:
+    """The declaration-side SPOT, rendered by whoever needs it."""
+
+    def test_is_a_non_empty_tuple_of_str(self):
+        assert isinstance(DECLARATION_FORMS, tuple)
+        assert DECLARATION_FORMS
+        assert all(isinstance(form, str) for form in DECLARATION_FORMS)
