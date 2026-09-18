@@ -1,0 +1,81 @@
+"""Tests for dashboard.data.census — the view vocabulary and the task census.
+
+Pins the contract declared in ``plans/dashboard-one-datum-one-path-prd.md``
+("The task census", decision 3). Every expectation is DERIVED from
+``shared.task_statuses`` rather than restated here — a second hand-written
+copy of the vocabulary is exactly the drift this module exists to remove. The
+sole exceptions are ``REVIEW`` and ``INFRA_HOLD``, named explicitly below
+because their in-flight membership is the PRD's decision-3 amendment and
+therefore the claim a future reader is most likely to doubt.
+"""
+
+from __future__ import annotations
+
+import enum
+
+import pytest
+from shared.task_statuses import TERMINAL, TaskStatus
+
+from dashboard.data.census import SUB_VIEWS, TONES, VIEWS, TaskView
+
+
+def test_task_view_is_a_str_enum():
+    """View members are genuine strings, so they key the wire without conversion."""
+    assert issubclass(TaskView, enum.StrEnum)
+
+
+def test_task_view_vocabulary_is_exactly_the_contract_four():
+    """Three partition views plus one sub-view; a fifth would change the contract."""
+    assert {member.value for member in TaskView} == {
+        'in_flight',
+        'backlog',
+        'terminal',
+        'running',
+    }
+
+
+def test_views_and_sub_views_split_the_view_vocabulary():
+    """Every TaskView is keyed by exactly one of the two constants."""
+    assert set(VIEWS).isdisjoint(SUB_VIEWS)
+    assert set(VIEWS) | set(SUB_VIEWS) == set(TaskView)
+
+
+def test_views_partition_the_task_statuses():
+    """The three views are pairwise disjoint and cover every TaskStatus member."""
+    members = list(VIEWS.values())
+    for index, left in enumerate(members):
+        for right in members[index + 1 :]:
+            assert left.isdisjoint(right)
+    assert set().union(*members) == set(TaskStatus)
+
+
+def test_terminal_view_reuses_the_shared_partition():
+    """`terminal` is bound to shared's TERMINAL by reference, not restated."""
+    assert VIEWS[TaskView.TERMINAL] == TERMINAL
+
+
+def test_running_is_a_strict_subset_of_in_flight():
+    """`running` narrows in_flight; it is a sub-view, never a fourth partition cell."""
+    running = SUB_VIEWS[TaskView.RUNNING]
+    assert running == {TaskStatus.IN_PROGRESS}
+    assert running < VIEWS[TaskView.IN_FLIGHT]
+
+
+def test_review_and_infra_hold_are_in_flight():
+    """The PRD's decision-3 amendment: both are dispatched work, not backlog."""
+    in_flight = VIEWS[TaskView.IN_FLIGHT]
+    assert TaskStatus.REVIEW in in_flight
+    assert TaskStatus.INFRA_HOLD in in_flight
+
+
+def test_tones_cover_every_status_exactly_once():
+    """Every status draws in some tone; a new member with no tone fails here."""
+    assert set(TONES) == set(TaskStatus)
+    assert all(TONES[member] for member in TaskStatus)
+
+
+@pytest.mark.parametrize('constant', [VIEWS, SUB_VIEWS, TONES], ids=['VIEWS', 'SUB_VIEWS', 'TONES'])
+def test_vocabulary_constants_reject_mutation(constant):
+    """These are imported by beta, the generator and the parity test — SPOT."""
+    with pytest.raises(TypeError):
+        constant['whatever'] = 'anything'  # type: ignore[index]
