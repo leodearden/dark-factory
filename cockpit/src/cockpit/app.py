@@ -34,6 +34,14 @@ CockpitApp.action_drop) -- see test_app.py's
 TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
+
+Every decision READ goes through cockpit.registry_reader.scan_decisions --
+registry_reader's folding wrapper over C1's list_decisions, which
+canonicalizes DecisionRecord.project (task 3812) -- at all three of this
+module's read sites: _scan_registry, and the re-reads inside _apply_boost
+and action_drop. That does not weaken the discipline above: scan_decisions
+is itself read-only, so the canonicalized record exists in memory only and
+can never be written back (this module still never calls write_decision).
 """
 
 from __future__ import annotations
@@ -51,7 +59,6 @@ from orchestrator.session_registry import (
     DecisionState,
     SessionRecord,
     Status,
-    list_decisions,
     set_manual_boost,
     update_decision_state,
 )
@@ -90,6 +97,7 @@ from cockpit.registry_reader import (
     SessionScanner,
     SessionScannerProtocol,
     build_snapshot,
+    scan_decisions,
     snapshot_changed,
 )
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
@@ -403,9 +411,16 @@ class CockpitApp(App):
         Touches only self._scanner/self.fleet_root -- no widget access -- so
         this is safe to call off the main/UI thread (see
         _scan_registry_worker, which does exactly that).
+
+        Decisions are read via registry_reader.scan_decisions, the folding
+        wrapper over C1's list_decisions, so DecisionRecord.project arrives
+        already canonicalized -- the same rule the scanner applies to
+        SessionRecord.project (task 3812). Why both row kinds must fold
+        together is argued in registry_reader's module docstring, the one
+        home for that rationale.
         """
         records = self._scanner.scan()
-        decisions = list_decisions(self.fleet_root)
+        decisions = scan_decisions(self.fleet_root)
         return records, decisions
 
     def _apply_scan(
@@ -1042,7 +1057,10 @@ class CockpitApp(App):
         set -- a digit key) is given. A DECISION-backed highlighted row
         persists its new manual_boost via C1's set_manual_boost -- the
         cockpit's own sanctioned decision write -- then re-scans decisions
-        so self._decisions (and its snapshot, so a later poll tick doesn't
+        (registry_reader.scan_decisions, the folding wrapper over C1's
+        list_decisions, so the re-read cannot reintroduce a raw project
+        token the initial scan had already canonicalized -- task 3812) so
+        self._decisions (and its snapshot, so a later poll tick doesn't
         redundantly re-detect this same change as external) reflect the
         persisted value directly; no in-memory overlay is needed once a
         decision's boost is on disk. A SESSION-backed row has no
@@ -1077,7 +1095,7 @@ class CockpitApp(App):
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
             set_manual_boost(item.decision_id, new_boost, root=self.fleet_root)
-            self._decisions = list_decisions(self.fleet_root)
+            self._decisions = scan_decisions(self.fleet_root)
             self._decisions_snapshot = _decisions_snapshot(self._decisions)
         else:
             current_boost = self._boosts.get(key, 0)
@@ -1116,9 +1134,12 @@ class CockpitApp(App):
 
         A DECISION-backed row persists via C1's update_decision_state --
         the cockpit's other sanctioned decision write -- then re-scans
-        decisions so self._decisions (and its snapshot) reflect the
-        persisted state directly; order_queue's own state=='open' filter
-        then excludes it, exactly like _apply_boost's re-scan. A
+        decisions (registry_reader.scan_decisions, the same folding wrapper
+        _apply_boost re-reads through, so a drop cannot refragment a project
+        token either -- task 3812) so self._decisions (and its snapshot)
+        reflect the persisted state directly; order_queue's own
+        state=='open' filter then excludes it, exactly like _apply_boost's
+        re-scan. A
         SESSION-backed row has no cockpit-writable state field at all
         (PRD §2 design decisions), so it is instead added to
         self._dropped, an in-memory overlay order_queue filters out by
@@ -1142,7 +1163,7 @@ class CockpitApp(App):
             return
         if item.kind == 'decision' and item.decision_id is not None:
             update_decision_state(item.decision_id, DecisionState.DROPPED, root=self.fleet_root)
-            self._decisions = list_decisions(self.fleet_root)
+            self._decisions = scan_decisions(self.fleet_root)
             self._decisions_snapshot = _decisions_snapshot(self._decisions)
         else:
             self._record_overlay(key)
