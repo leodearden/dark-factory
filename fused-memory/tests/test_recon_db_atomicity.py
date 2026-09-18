@@ -14,15 +14,17 @@ being split across test_journal.py / test_event_buffer.py / test_recon_ledger.py
 MEASURED BASELINES, taken on this task's base commit (2026-09-17), recorded so the
 next reader does not re-derive them:
 
-    journal collision (arm A)     39/40 SQLITE_BUSY_SNAPSHOT   ->  0/40
-    cutoff control    (arm B)      0/40                        ->  0/40
-    checkpoint + write (arm C)    20/20 SQLITE_LOCKED          ->  0/20
+    journal: reaper read vs. write       39/40 SQLITE_BUSY_SNAPSHOT  ->  0/40
+    journal: same loop, nothing stale     0/40                       ->  0/40
+    journal: checkpoint vs. write        20/20 SQLITE_LOCKED         ->  0/20
+    EventBuffer: peek vs. heartbeat      ~70% of iterations (28/40)  ->  0/20
+    EventBuffer: checkpoint vs. push     20/20 SQLITE_LOCKED         ->  0/20
 
-Arm C is the direct reproduction of the production log line ``checkpoint
-recon_journal failed: database table is locked``.  Note the direction: it is the
-CHECKPOINT that raises when another coroutine has a statement in flight on the same
-connection, not the write.  Same defect, same fix; the arm asserts neither side
-raises.
+The checkpoint arms are the direct reproduction of the production log line
+``checkpoint recon_journal failed: database table is locked``.  Note the direction:
+it is the CHECKPOINT that raises when another coroutine has a statement in flight on
+the same connection, not the write.  Same defect, same fix; the arms assert neither
+side raises.
 
 NOT HERE, deliberately, so a later reader does not mistake the gap for an oversight:
 the connection-wide-rollback regression (one coroutine's failing unit rolls back the
@@ -44,6 +46,13 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    Watermark,
+)
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 
 PROJECT_ID = 'atomicity'
@@ -64,9 +73,29 @@ CHECKPOINT_ITERATIONS = 20
 # of failing in seconds.  The bound turns that into a legible TimeoutError.
 CHECKPOINT_TIMEOUT_SECONDS = 10
 
+# Enough buffered rows that peek_buffered's ORDER BY timestamp scan is still in the
+# worker thread when the write is queued behind it.  Do NOT tune these counts down:
+# below the reproducing size the arm passes for the wrong reason.  verify appends
+# ``-n 8`` to every pytest leg, so this runs 8-way parallel on a loaded machine,
+# which WIDENS the window rather than narrowing it.
+#
+# Two measurements of the pre-fix failure rate at 4,000 rows, both worth keeping
+# because they bracket what a future tuner should expect: planning measured 28/40
+# iterations (~70%, and 39/40 at 8,000 rows); re-measured here while writing the
+# arm, 28 of 80 iterations across four runs (~35%), worst run 4/20 and never a
+# clean one.  The cause of the spread was not established.  What the second
+# measurement does establish is that 4,000 is comfortably above the reproducing
+# size on this tree, which is the property the count has to have.
+BUFFERED_EVENTS = 4_000
+BUFFER_COLLISION_ITERATIONS = 20
+
 _INSERT_RUN = """INSERT INTO runs
     (id, project_id, run_type, trigger_reason, started_at, completed_at, status)
     VALUES (?, ?, ?, ?, ?, ?, ?)"""
+
+_INSERT_EVENT = """INSERT INTO event_buffer
+    (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
 
 
 @pytest_asyncio.fixture
@@ -240,3 +269,133 @@ async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_c
     assert all(isinstance(value, int) for value in (busy, log, pages)), (
         f'checkpoint() must keep unpacking as (busy, log, checkpointed): {(busy, log, pages)!r}'
     )
+
+
+@pytest_asyncio.fixture
+async def event_buffer(journal):
+    """An EventBuffer on the journal's OWN ``reconciliation.db`` file.
+
+    Two stores, two connections, one file — production's exact shape, which is
+    what makes the journal a genuine foreign writer rather than a stand-in.  Both
+    open via ``connect_daemon``, so neither carries the shutdown hazard that
+    ``second_connection`` documents.
+    """
+    buffer = EventBuffer(db_path=journal.data_dir / 'reconciliation.db')
+    await buffer.initialize()
+    try:
+        yield buffer
+    finally:
+        await buffer.close()
+
+
+def _event(index: int) -> ReconciliationEvent:
+    return ReconciliationEvent(
+        id=f'pushed-{index}',
+        type=EventType.memory_added,
+        source=EventSource.agent,
+        project_id=PROJECT_ID,
+        timestamp=datetime.now(UTC),
+    )
+
+
+async def _seed_buffered_events(conn, *, count: int) -> None:
+    """Fill the buffer with ``count`` ``status='buffered'`` rows, in ONE executemany.
+
+    Distinct descending-age timestamps, so ``peek_buffered``'s ``ORDER BY
+    timestamp`` has real work to do rather than reading an already-ordered heap.
+    """
+    now = datetime.now(UTC)
+    rows = [
+        (
+            f'seeded-{i}',
+            PROJECT_ID,
+            'memory_added',
+            'agent',
+            None,
+            (now - timedelta(seconds=count - i)).isoformat(),
+            '{}',
+            'buffered',
+        )
+        for i in range(count)
+    ]
+    async with conn.executemany(_INSERT_EVENT, rows):
+        pass
+    await conn.commit()
+
+
+async def _heartbeat_failures_under_a_pinned_read(buffer, journal) -> list[str]:
+    """Race the buffer's heartbeat against its own peek, with the journal writing.
+
+    The journal is the foreign connection here: its ``update_watermark`` commit —
+    a CHANGING value each iteration, so the WAL really advances — lands while
+    ``peek_buffered`` still holds a read snapshot on the buffer's connection.
+    """
+    failures: list[str] = []
+    for i in range(BUFFER_COLLISION_ITERATIONS):
+        reader = asyncio.create_task(buffer.peek_buffered(PROJECT_ID, 1_000_000))
+        try:
+            await asyncio.sleep(0)
+            await journal.update_watermark(
+                Watermark(project_id=PROJECT_ID, last_full_run_id=f'run-{i}')
+            )
+            try:
+                await buffer.heartbeat(PROJECT_ID)
+            except sqlite3.OperationalError as exc:
+                failures.append(exc.sqlite_errorname)
+        finally:
+            await reader
+    return failures
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
+    journal, event_buffer, second_connection
+):
+    """Arm D: a buffer write must survive a buffer read that is still in flight.
+
+    ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
+    preceding SELECT — the same property that makes ``record_run_session`` the
+    right probe for the journal arm.  Do not substitute another write method
+    without re-checking it.
+    """
+    await _seed_buffered_events(second_connection, count=BUFFERED_EVENTS)
+
+    failures = await _heartbeat_failures_under_a_pinned_read(event_buffer, journal)
+
+    assert not failures, (
+        f'{len(failures)}/{BUFFER_COLLISION_ITERATIONS} heartbeats died while '
+        f'peek_buffered held a read snapshot on the same connection: '
+        f'{sorted(set(failures))}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_buffer_checkpoint_and_push_do_not_lock_each_other_out(event_buffer):
+    """Arm E: the journal's arm C, at the second of the three shared connections."""
+    for i in range(CHECKPOINT_ITERATIONS):
+        pushed, checkpointed = await asyncio.wait_for(
+            asyncio.gather(
+                event_buffer.push(_event(i)),
+                event_buffer.checkpoint(),
+                return_exceptions=True,
+            ),
+            timeout=CHECKPOINT_TIMEOUT_SECONDS,
+        )
+        assert not isinstance(pushed, BaseException), (
+            f'iteration {i}: the push raised alongside a concurrent checkpoint: {pushed!r}'
+        )
+        assert not isinstance(checkpointed, BaseException), (
+            f'iteration {i}: the checkpoint raised alongside a concurrent push: '
+            f'{checkpointed!r}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_on_an_uninitialized_event_buffer_is_a_non_event():
+    """An EventBuffer that was never initialized reports (-1, -1, -1), not a raise.
+
+    server/main.py's checkpoint cycle unpacks the result and logs raises
+    separately, so turning this into an exception would report a checkpoint
+    failure on every tick of a Taskmaster-disabled deployment.
+    """
+    assert await EventBuffer().checkpoint() == (-1, -1, -1)
