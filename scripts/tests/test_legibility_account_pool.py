@@ -8,9 +8,10 @@ pool turns the gate's roster into the ``(prompt, model) -> str`` callable
 the seam already speaks.
 
 THE FAKE GATE IS THE POINT, not a shortcut. ``account_pool`` depends on
-six members of the real 3004-line ``UsageGate`` — ``try_lease``,
+seven members of the real 3004-line ``UsageGate`` — ``try_lease``,
 ``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete``,
-``release_probe_slot`` and ``account_count`` — and stating exactly those here is how the test
+``release_probe_slot``, ``account_count`` and ``active_account_name`` — and
+stating exactly those here is how the test
 says what the interface IS rather than reaching through it into gate
 internals (docs/code-quality.md: tests that reach a module's internals are
 an interface-design smell). The leases it hands out are REAL
@@ -55,7 +56,7 @@ class FakeAccount:
 
 
 class FakeGate:
-    """Exactly the six members ``account_pool`` calls, and nothing else.
+    """Exactly the seven members ``account_pool`` calls, and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
     ``reverse`` / ``exclude`` knobs; ``detect_cap_hit`` reproduces the STRICT
@@ -124,6 +125,22 @@ class FakeGate:
     @property
     def account_count(self):
         return len(self.accounts)
+
+    @property
+    def active_account_name(self):
+        """The gate's own "is anyone still usable" predicate — the first
+        non-capped, non-auth-failed account, or None.
+
+        Part of the consumed interface because the exhaustion reason has to
+        tell "every account is genuinely capped" apart from "every account
+        refused this digest while the gate still considers one live". The
+        gate already publishes that answer; recomputing it by walking a
+        private roster would be the interface smell, not a shortcut.
+        """
+        for acct in self.accounts:
+            if not acct.capped:
+                return acct.name
+        return None
 
     # -- settle surface ----------------------------------------------------
     def confirm_account_ok(self, oauth_token):
@@ -662,6 +679,229 @@ def test_the_genuine_cap_route_is_unchanged_by_the_bound():
     assert set(gate.lease_calls[1]['exclude'] or ()) == {'max-c'}, (
         'and the caller still excludes what it tried, so the two agree '
         'instead of one depending on the other'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5488 / step-31: THE DEFERRAL REASON STAYS HONEST on the near-cap route.
+#
+# Bounding the rotation by the caller's tried set creates a state that could
+# not happen before: a digest exhausts the pool while NO account is capped.
+# The old text — "all N pool accounts capped" — would then be a fresh lie of
+# exactly the class test_main_deferral_summary_stays_honest_about_the_tally
+# exists to prevent, and a costly one: it sends an operator to wait for a
+# weekly reset that will never come, because there is nothing to reset.
+#
+# Three reasons, three different operator responses:
+#   1. no accounts resolved   -> a config fault; the unit is missing token vars
+#   2. all accounts capped    -> expected weather; clears at the weekly reset
+#   3. all accounts refused   -> NOT a cap; something else is failing every try
+#
+# Which of 1/2/3 applies is read off the gate's PUBLIC predicates, never off
+# its private roster.
+# ---------------------------------------------------------------------------
+
+class _OpaqueGate:
+    """A gate that publishes its predicates and NOTHING else — no roster
+    attribute at all, public or private.
+
+    This is the structural half of "decided by ``active_account_name``":
+    a reason computed by walking ``gate._accounts`` would raise
+    AttributeError here instead of answering. Reaching past a published
+    answer to recompute it from another module's internals is the smell
+    this shuts, and an assertion about the resulting TEXT could not have
+    caught it — both spellings produce the same words.
+    """
+
+    def __init__(self, *, account_count, active_account_name):
+        self._count = account_count
+        self._active = active_account_name
+        self.lease_calls = []
+
+    def try_lease(self, *, scope=None, reverse=False, exclude=None):
+        self.lease_calls.append(set(exclude or ()))
+        return None
+
+    def release_probe_slot(self, oauth_token):  # pragma: no cover - never leased
+        raise AssertionError('nothing was ever leased')
+
+    @property
+    def account_count(self):
+        return self._count
+
+    @property
+    def active_account_name(self):
+        return self._active
+
+
+def _reason_from(gate, invoke=None):
+    """The CoderCapExhausted message ``pool_invoke`` produces for *gate*."""
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke or _RecordingInvoke())('prompt', 'haiku')
+    return str(excinfo.value)
+
+
+@pytest.mark.timeout(15)
+def test_an_all_refused_pool_never_claims_a_cap_that_did_not_happen():
+    """Reason 3, and the whole point of adding it.
+
+    Every account near-capped, so every account is still perfectly usable as
+    far as the gate is concerned. Saying "all 2 pool accounts capped" here
+    would be false about the fleet's state AND misdirect the operator to the
+    weekly reset. The honest reason names what happened — every account
+    tried refused this digest — and names an account the gate still
+    considers live, which is the fact that makes "capped" the wrong word.
+    """
+    gate = _near_cap_pool(('max-b', False), ('max-c', False))
+    invoke = _NeverTwice(raises={
+        f'tok-{name}': _cap_exhausted(marker='approaching', stdout=_NEAR_BANNER)
+        for name in ('max-b', 'max-c')
+    })
+
+    message = _reason_from(gate, invoke)
+
+    assert gate.active_account_name is not None, (
+        'the premise: the gate still considers an account usable, because a '
+        'near-cap warning takes no phase transition'
+    )
+    assert 'capped' not in message.lower(), (
+        f'nothing was capped — claiming otherwise sends an operator to wait '
+        f'for a reset that will never come; got {message!r}'
+    )
+    assert gate.active_account_name in message, (
+        f'name the account the gate still considers live: that is the fact '
+        f'that distinguishes this from an exhausted fleet; got {message!r}'
+    )
+    assert '2' in message, f'and how many were tried; got {message!r}'
+    assert 'no pool accounts' not in message.lower(), (
+        f'nor is this the config fault — accounts resolved fine; got {message!r}'
+    )
+
+
+def test_the_all_capped_reason_is_unchanged():
+    """Reason 2, byte-identical. An operator (and
+    test_exhaustion_reason_names_how_many_accounts_were_capped) already
+    reads this wording."""
+    gate = _pool(('max-b', True), ('max-c', True))
+
+    assert 'all 2 pool accounts capped' in _reason_from(gate)
+
+
+def test_the_all_capped_reason_is_decided_by_the_gates_public_predicate():
+    """``active_account_name`` is None iff no non-capped, non-auth-failed
+    account remains — the gate's own answer to the question the honesty
+    check is asking. The opaque gate has no roster to walk, so this passes
+    only if that is genuinely where the answer comes from."""
+    gate = _OpaqueGate(account_count=7, active_account_name=None)
+
+    assert 'all 7 pool accounts capped' in _reason_from(gate)
+
+
+def test_a_live_account_the_gate_would_not_lease_is_not_reported_as_capped():
+    """The same fork, from the other side and with nothing tried at all: the
+    gate declined to lease (every account probe-in-flight, say) while
+    reporting one live. Still not a cap, so still not the capped wording."""
+    gate = _OpaqueGate(account_count=7, active_account_name='max-c')
+
+    message = _reason_from(gate)
+
+    assert 'capped' not in message.lower(), message
+    assert 'max-c' in message, message
+
+
+def test_a_pool_that_resolved_no_accounts_still_wins_over_the_other_two():
+    """Reason 1 dominates: with zero accounts there is nothing to be capped
+    and nothing to be live, and the config fault is the only actionable
+    thing to say."""
+    assert 'no pool accounts' in _reason_from(_pool()).lower()
+
+
+# ---------------------------------------------------------------------------
+# step-31, the end-to-end gate: the near-cap route reaches task 4736's exit-0
+# DEFERRED branch rather than hanging the 03:00 unit.
+#
+# This is the production outcome the whole task exists to guarantee, so it is
+# asserted through the REAL code_digests control flow rather than inferred
+# from the pieces.
+# ---------------------------------------------------------------------------
+
+def _digest_text(session_id):
+    return (
+        "---\n"
+        f'session: "{session_id}"\n'
+        'date: "2026-07-14"\n'
+        'agent_class: "interactive"\n'
+        "---\n\n"
+        f"## User Corrections\n- body marker {session_id}\n"
+    )
+
+
+def _codebook():
+    return {
+        "version": 2,
+        "entries": [
+            {
+                "id": "one-shot-subagent-contract",
+                "title": "Silent no-op one-shot subagent contracts",
+                "cause": "Sub-agents are given contracts their runtime cannot honor.",
+                "severity": "high",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [],
+            },
+        ],
+        "candidates": [],
+    }
+
+
+@pytest.mark.timeout(60)
+def test_a_near_cap_pool_reads_as_a_cap_deferral_end_to_end():
+    """Three digests, two accounts, every invocation near-capping.
+
+    The night must END, and end as a DEFERRAL: `capped` for every digest,
+    status "failure", is_cap_deferral True — the exact RunResult shape
+    nightly's exit-0 branch keys on. Before the caller-side bound this run
+    did not produce a wrong answer, it produced no answer at all: the first
+    digest looped until something killed the unit.
+
+    Six CLI calls, not three: the tried set is scoped to ONE digest, so each
+    digest starts again from the full roster. That is deliberate — a
+    near-cap warning is not a cap, and retiring an account for the night on
+    one would throw away headroom the gate never said was gone.
+    """
+    gate = _near_cap_pool(('max-b', False), ('max-c', False))
+    invoke = _RecordingInvoke(raises={
+        f'tok-{name}': _cap_exhausted(marker='approaching', stdout=_NEAR_BANNER)
+        for name in ('max-b', 'max-c')
+    })
+
+    result = coder_mod.code_digests(
+        [_digest_text(f"batch-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(gate, invoke=invoke),
+    )
+
+    assert result.total == 3
+    assert result.capped == 3, (
+        f'every digest the pool could not code is labelled capped; got '
+        f'{result.capped}'
+    )
+    assert result.records == [], (
+        'the never-fabricate contract holds on this route too: a digest the '
+        'CLI never completed yields NO record'
+    )
+    assert result.status == "failure"
+    assert coder_mod.is_cap_deferral(result) is True, (
+        "this is the input nightly's exit-0 DEFERRED branch keys on — the "
+        "night defers instead of hanging until the weekly reset"
+    )
+    assert len(invoke.calls) == 6, (
+        f'each of the 3 digests tries both accounts afresh — the bound is '
+        f'per digest, not per night; got {len(invoke.calls)}'
+    )
+    assert not any(a.capped for a in gate.accounts), (
+        'and not one account was capped along the way'
     )
 
 
