@@ -247,7 +247,7 @@ class TestStampPendingSinceTransitionTable:
         ('raw_blob', 'task_id'),
         (
             ('{not json at all', 38160),
-            ('', 38161),
+            ('{"unterminated": ', 38161),
             ('[1,2,3]', 38162),
             ('42', 38163),
             ('"str"', 38164),
@@ -285,10 +285,6 @@ class TestStampPendingSinceTransitionTable:
             )
         assert result is None, f'must not rewrite a malformed blob; got {result!r}'
         assert raw_blob == original, 'input bytes must be left exactly as found'
-        if original == '':
-            # Empty/NULL metadata is the ordinary "no metadata yet" shape, not
-            # corruption — it stamps rather than warning.
-            return
         malformed = [r for r in caplog.records if 'malformed metadata' in r.message]
         assert len(malformed) == 1, (
             f'expected exactly one deduped WARNING; got {[r.message for r in malformed]}'

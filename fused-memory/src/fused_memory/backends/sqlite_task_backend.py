@@ -930,6 +930,112 @@ def _warn_malformed_metadata_once(
         )
 
 
+def stamp_pending_since(
+    metadata_raw: str | None,
+    *,
+    old_status: str | None,
+    new_status: str,
+    now: str,
+    project_root: str | None = None,
+    tag: str | None = None,
+    task_id: int | None = None,
+) -> str | None:
+    """Apply the ``metadata.pending_since`` write rules for one status write.
+
+    Task 3816, PRD ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``
+    §C1. ``pending_since`` is the DURABLE wall-clock anchor for how long a
+    task has been waiting to be dispatched: written here, read by the
+    orchestrator scheduler's age term (task beta) and the watchdog idle clock
+    (task delta). An in-memory anchor is re-derived on every restart and the
+    median process era is 2.2h, which is why it lives in the row.
+
+    | Transition                            | Effect on ``pending_since``     |
+    |---------------------------------------|---------------------------------|
+    | ``* -> pending``, key absent          | stamp ``now``                   |
+    | ``cancelled -> pending``              | **overwrite** with ``now`` (D3) |
+    | other ``* -> pending``, key present   | unchanged                       |
+    | ``pending -> *`` (any exit)           | unchanged — never cleared       |
+
+    Returns the NEW metadata JSON string when a stamp is owed, or ``None``
+    meaning "no change" — so a caller appends ``metadata = ?`` to its UPDATE
+    only when one is genuinely owed, and every non-stamping transition (the
+    overwhelming majority) emits SQL byte-identical to a pre-3816 write.
+
+    Invariant: the anchor is monotone NON-DECREASING per task, with
+    ``cancelled -> pending`` as the single exception (Leo's continuity ruling,
+    2026-08-06, PRD D3 — a requeue, an unblock or a ``deferred -> pending``
+    commit must not cost a task the wait it has already accrued because the
+    machine dropped it). A present-but-unusable value (blank, ``None``,
+    non-string) is treated as ABSENT and re-stamped: the reader parses the
+    value, so leaving one in place would pin the task at age 0 forever.
+
+    Fail-safe contract — NEVER raises and NEVER clobbers. A corrupt or
+    non-dict blob skips the stamp, emits one deduped WARNING, and lets the
+    status write proceed: before this key existed a corrupt blob could not
+    block a status write at all (``set_task_status`` never touched the
+    metadata column), and a stamping scheme that raised would mean one
+    corrupt row could no longer be moved out of ``pending`` — a new wedge.
+    The task then reads as anchorless, which C1's reader contract already
+    handles (absent => age 0, fail-safe: it loses age rather than jumping the
+    queue, and increments task beta's INV-4 counter so the event is
+    countable).
+
+    Deliberately does NOT route the merge through :func:`_merge_metadata`
+    (design decision 3): the table has to read the existing ``pending_since``
+    key anyway so the blob is already parsed, and that function falls back to
+    ``incoming`` for valid-JSON-that-is-not-a-dict — i.e. it would REPLACE
+    ``[1,2,3]`` with ``{"pending_since": ...}`` and destroy the bytes an
+    operator needs to repair the row. ``{**old, 'pending_since': now}`` is
+    exactly its ``mode='merge'`` semantics for a single-key patch, so sibling
+    preservation is identical with no double parse and no dead branch.
+
+    ``pending_since_backfilled`` is NOT written here — it is the one-shot
+    v4 -> v5 migration's marker alone, so it keeps identifying the
+    back-filled population (PRD D4).
+
+    This is the ONE shared implementation (INV-5 ``no-lockstep-duplication``):
+    every pending-landing write path — ``add_task``, ``set_task_status``,
+    ``set_status_and_stamp_audit`` — calls it, and none reimplements the
+    table. ``project_root``/``tag``/``task_id`` are optional and only route
+    the fail-safe WARNING through the shared dedup gate, matching
+    :func:`_merge_metadata`'s convention.
+    """
+    if new_status != TaskStatus.PENDING:
+        # Not a pending LANDING: nothing to stamp, and returning None is what
+        # makes "never cleared" structural rather than merely intended.
+        return None
+
+    if not metadata_raw:
+        # NULL/empty metadata column is absence, not corruption.
+        return json.dumps({'pending_since': now})
+
+    # Parse ONCE, defensively — the `_row_to_task` idiom (one json.loads, one
+    # isinstance(dict)), which is also what distinguishes the two malformed
+    # shapes parse_metadata would flag as 'unparseable_json'/'not_an_object'.
+    try:
+        old = json.loads(metadata_raw)
+    except ValueError:
+        old = None
+    if not isinstance(old, dict):
+        resolution = 'skipped pending_since stamp — original bytes preserved'
+        if project_root is not None and tag is not None and task_id is not None:
+            _warn_malformed_metadata_once(
+                project_root, tag, task_id, metadata_raw, resolution=resolution,
+            )
+        else:
+            logger.warning(
+                'sqlite_task_backend: malformed metadata JSON — metadata_raw=%s; %s',
+                repr(metadata_raw)[:80], resolution,
+            )
+        return None
+
+    existing = old.get('pending_since')
+    usable = isinstance(existing, str) and existing.strip() != ''
+    if usable and old_status != TaskStatus.CANCELLED:
+        return None
+    return json.dumps({**old, 'pending_since': now})
+
+
 def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     """Emit the write-boundary census line for one :class:`SchemaWarning`.
 
