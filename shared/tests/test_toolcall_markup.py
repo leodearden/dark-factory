@@ -995,6 +995,13 @@ class TestQuotedReportIsRepairable:
     (a)/(d) on the closer side and (g)/(h) on the opener side. The pin below
     that USED to assert a recovery was inverted in the same task; its docstring
     carries the old reading and why it moved.
+
+    (g)/(h) ARE A PAIR, NOT FULL COVERAGE of the opener side, and the last
+    control in BOUNDS pins where they stop: the rule sits behind
+    ``_parse_body``'s closing-tag prefilter, so a sibling opener with no
+    closing tag anywhere is still swallowed. Declared, owned by task **5639**,
+    and pinned there rather than left as prose — the omission that made (g) and
+    (h) necessary was itself a boundary nobody had written a failing test for.
     """
 
     # escalate_info's eleven parameters, and the five the corrupted call
@@ -1445,6 +1452,60 @@ class TestQuotedReportIsRepairable:
         )
 
         assert self._repair(value) is None
+
+    def test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY(self):
+        """THE OPENER RULE'S OUTER BOUND — where (g) and (h) STOP.
+
+        The rule lives in ``_inner_markup_blocks``, which :func:`_parse_body`
+        consults only after its cheap prefilter finds a closing-tag SEQUENCE in
+        the value. A sibling opener with no closing tag anywhere therefore
+        never reaches the rule at all. This specimen is (g) with exactly one
+        cell removed — the trailing ``xyz`` closer that
+        :func:`_sibling_opener_tail` calls load-bearing — and it gets the
+        OPPOSITE answer.
+
+        THIS PIN ASSERTS A DEFECT, deliberately. ``suggested_action`` is a real
+        parameter disjoint from ``_SUPPLIED``, so what is measured here is the
+        sibling silently NOT recovered and its text written into ``evidence``
+        instead: the same no-silent-partial-repair failure (g) refuses. It is
+        pinned rather than fixed because it predates 4502 instead of regressing
+        at it, and closing it means moving the test up beside the prefilter,
+        which rewrites the sweep's documented unterminated-inner-opener
+        convergence case. TASK **5639** owns that.
+
+        WHEN 5639 LANDS THIS TEST MUST FAIL, which is its whole job: a boundary
+        stated only in PRD prose is one nobody is told about when it moves.
+        Invert it then, the way 5620 inverted the pin above.
+
+        BOTH DIALECTS IN ONE TEST, unlike the (g)/(h) and (a)/(d) pairs, and
+        for a reason that does not weaken the standing "keep the pair together"
+        instruction: the decision here is taken by the PREFILTER, which never
+        looks at a dialect. There is no rule in front of these two that could
+        treat them differently, so there is no asymmetry for a mirror control
+        to catch — which is exactly what stops being true the moment 5639
+        moves the test behind the prefilter.
+        """
+        for dialect, opener in (('canonical', _canonical_opener), ('echo', _opener)):
+            value = (
+                self._CLEAN
+                + _CANONICAL_CLOSER + '\n'
+                + _canonical_opener('evidence')
+                + 'the report quotes ' + opener('suggested_action')
+                + 'refile once the guard is narrowed'
+                + '\n' + INVOKE_CLOSER
+            )
+
+            result = self._repair(value)
+
+            assert result is not None, (
+                f'{dialect}: task 5639 has landed — invert this pin, do not delete it'
+            )
+            assert 'suggested_action' not in result.recovered, (
+                f'{dialect}: the sibling is swallowed, not recovered — that is the bound'
+            )
+            assert opener('suggested_action') in result.recovered['evidence'], (
+                f'{dialect}: the swallowed opener lands verbatim in another argument'
+            )
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
