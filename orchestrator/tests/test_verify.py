@@ -3753,9 +3753,9 @@ class TestPruneArchive:
         assert not older.exists(), 'Oldest .json file should be deleted to satisfy cap'
         assert newer.exists(), 'Newer .json file should remain'
 
-    # (f) gzipped junit reports share the same retention as the logs beside them
+    # (f) junit reports are retained on GREEN runs too, so this budget is the
+    # only thing bounding them.
     def test_old_junit_report_deleted(self, tmp_path: Path):
-        """Old junit .xml.gz reports are pruned by age like *.log and *.json."""
         import os
         import time
         archive_root = tmp_path / 'archive'
@@ -3765,13 +3765,9 @@ class TestPruneArchive:
         old_mtime = time.time() - 31 * 86_400
         os.utime(old_report, (old_mtime, old_mtime))
         self._prune(archive_root, max_age_days=30)
-        assert not old_report.exists(), (
-            'Old junit report must be pruned — junit is retained on GREEN runs '
-            'too, so this budget is the only thing bounding it'
-        )
+        assert not old_report.exists(), 'Old junit report should have been deleted'
 
     def test_junit_report_counted_toward_size_budget(self, tmp_path: Path):
-        """Junit reports count toward the size budget and are evicted oldest-first."""
         import os
         import time
         archive_root = tmp_path / 'archive'
@@ -3792,9 +3788,7 @@ class TestPruneArchive:
 class TestVerifyPlanPersistedBesideTheAttempt:
     """``run_scoped_verification`` leaves the plan's REASONS on disk.
 
-    Why a leg ran full-suite rather than file-scoped lived only in the
-    ``Verify plan:`` log line, so reading it back later depended on syslog
-    retention.  These drive the ARTEFACT, not the writer.
+    Asserted on the written artefact, not on the writer.
     """
 
     _ATTEMPT_ID = 7
@@ -3827,7 +3821,6 @@ class TestVerifyPlanPersistedBesideTheAttempt:
         return worktree / '.task' / 'verify' / f'attempt-{self._ATTEMPT_ID}.plan.json'
 
     async def test_plan_json_records_a_reason_for_every_planned_run(self, tmp_path: Path):
-        """The on-disk plan carries the scope_kind AND the reason for each slot."""
         import json
         worktree = self._worktree(tmp_path)
         await self._run(worktree, None)
@@ -3841,7 +3834,6 @@ class TestVerifyPlanPersistedBesideTheAttempt:
             assert run['scope_kind'], f'a planned run carries no scope_kind: {run}'
 
     async def test_plan_survives_the_worktree_via_the_archive(self, tmp_path: Path):
-        """An archiving caller also gets a durable copy under <archive_root>/<task_id>/."""
         import json
         worktree = self._worktree(tmp_path)
         archive_root = tmp_path / 'data' / 'verify-logs'
@@ -3858,7 +3850,7 @@ class TestVerifyPlanPersistedBesideTheAttempt:
         ), 'the archived plan must be the same record as the worktree copy'
 
     async def test_no_archive_copy_without_an_archiving_caller(self, tmp_path: Path):
-        """archive_root=None (cold-shadow / drift probes) writes nothing durable."""
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
         worktree = self._worktree(tmp_path)
         await self._run(worktree, None)
         assert not (tmp_path / 'data').exists(), (
@@ -3870,17 +3862,14 @@ class TestVerifyPlanPersistedBesideTheAttempt:
 class TestJunitReportRetention:
     """The merge-path junit report is archived on GREEN runs as well as red.
 
-    The report is the only per-test cost record the factory produces and it
-    lives inside a merge worktree that is deleted minutes later; the log
-    archival beside it is gated on ``not passed``, so a retention that copied
-    the same gate would yield a red-only cost corpus.
+    The log archival beside it is gated on ``not passed``; copying that gate
+    would have yielded a red-only cost corpus.
     """
 
     _ATTEMPT_ID = 3
     _TASK_ID = '4242'
 
     def _fake_run_cmd_writing_junit(self, *, rc: int):
-        """Fake _run_cmd writing a report at the injected path and exiting *rc*."""
         xml = (
             '<?xml version="1.0" encoding="utf-8"?>\n'
             f'<testsuites><testsuite name="pytest" errors="0" failures="{int(rc != 0)}"'
@@ -3936,11 +3925,7 @@ class TestJunitReportRetention:
         )
 
     async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):
-        """A non-pytest test command injects no flag, so there is nothing to keep.
-
-        Absence here is the expected outcome, not a degradation — so it must
-        be quiet, and must not leave a husk behind.
-        """
+        """A non-pytest command injects no flag — absence, not degradation."""
         config = OrchestratorConfig(
             project_root=tmp_path, merge_verify_breadth='full',
         )

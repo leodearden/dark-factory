@@ -2017,30 +2017,12 @@ def _archive_junit_report(
 ) -> 'Path | None':
     """Gzip one leg's junit report into the durable archive, GREEN OR RED.
 
-    Target: ``<archive_root>/<task_id>/attempt-{N}[.{safe_prefix}].junit-<utc_ts>.xml.gz``
-    — the filename grammar ``_archive_merge_verify_logs`` already writes, so
-    one prune policy and one naming convention cover every file in the tree.
-
-    Deliberately NOT gated on ``_should_archive_category`` the way
-    ``_archive_attempt_log`` is, nor on ``passed`` the way the merge-path log
-    archival is.  Those gates bound FAILURE triage material; this report is
-    the only per-test COST record the factory produces, and a red-only cost
-    corpus describes a different population from the one being measured.
-
-    COMPRESSED because retaining the greens is what makes the volume bite.
-    Measured: a breadth=full merge-verify writes ~6MB of junit across its
-    modules, and main takes ~12 merges/day — ~78MB/day against the archive's
-    500MB size cap, which evicts OLDEST-FIRST across every suffix.  Storing
-    these raw would therefore have cut the whole archive's effective
-    retention from the 30-day age rule to under a week, silently evicting
-    the failure logs it exists for.  Gzip keeps the policy untouched and the
-    age rule governing, which is the cheaper of the two ways to stay inside
-    it (the other being a bigger disk budget for a study artefact).
-
-    A *junit_path* that does not exist is normal and expected — the report is
-    written only when something actually injected ``--junitxml`` — so that
-    returns ``None`` quietly.  Every other failure warns and returns ``None``:
-    observability may never fail a verify.
+    Ungated on ``passed``: this is a COST record, and a red-only cost corpus
+    describes a different population from the one being measured.  Gzipped
+    because raw greens (~78MB/day, measured 2026-09-19) against the shared
+    500MB oldest-first cap would evict the failure logs.  A missing report is
+    normal — nothing injected ``--junitxml`` — so it returns ``None`` quietly;
+    every other failure warns, because observability may not fail a verify.
     """
     if archive_root is None or task_id is None or not junit_path.is_file():
         return None
@@ -2064,11 +2046,7 @@ def _archive_junit_report(
 
 
 def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
-    """Write *payload* to *path* as indented UTF-8 JSON, or warn and return None.
-
-    Creates the parent directory.  *caller* names the warning's origin, the
-    way the sibling persistence helpers already spell theirs.
-    """
+    """Write *payload* to *path* as indented UTF-8 JSON, or warn and return None."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -2090,30 +2068,12 @@ def _persist_verify_plan(
 ) -> list[Path]:
     """Persist the derived verify plan as an attempt artefact, green or red.
 
-    ``PlannedRun.reason`` is the only record of WHY a leg ran full-suite
-    rather than file-scoped, and it reached nothing more durable than a
-    ``Verify plan:`` log line — so a later census of scope decisions depended
-    on syslog retention.  It now lands as
-    ``<worktree>/.task/verify/attempt-{N}.plan.json`` and, when the caller
-    archives, as ``<archive_root>/<task_id>/attempt-{N}.plan-<utc_ts>.json``.
-
-    The archive copy is written DIRECTLY rather than copied from the worktree,
-    for the reason ``_archive_merge_verify_logs`` gives: merge worktrees have
-    ``.task/`` scrubbed by design, so there is no worktree file to copy and a
-    copy-based path would archive nothing on exactly the lane whose worktree
-    is deleted minutes later.
-
-    ONE plan covers the whole scoped verify, so the filename carries no module
-    prefix — unlike the per-module ``attempt-{N}[.{prefix}].summary.json``
-    siblings :func:`_persist_attempt_logs` writes.
-
-    Call it where the plan is DECIDED, before the legs run: the plan is never
-    amended afterwards, and writing it up front means a leg killed mid-run
-    still leaves its scope decision on disk.
-
-    Returns the paths written (possibly empty).  Best-effort throughout: a
-    plan that cannot be written must never fail an otherwise-passing verify —
-    the rule ``_safe_derive_verify_plan_dict`` already states for deriving it.
+    ``PlannedRun.reason`` — why a leg ran full-suite rather than file-scoped —
+    otherwise reaches only the ``Verify plan:`` log line.  The archive copy is
+    written directly rather than copied, because merge worktrees have
+    ``.task/`` scrubbed and there is no worktree file to copy.  Call it where
+    the plan is DECIDED, before the legs run, so a killed leg still leaves its
+    scope decision behind.
     """
     if plan_dict is None or attempt_id is None:
         return []
@@ -2254,13 +2214,9 @@ def _prune_archive(
     cutoff = now - max_age_days * 86_400
 
     # Single rglob walk — collect all archivable files once, avoiding a second
-    # directory scan for the size-cap pass.  Every suffix this tree is written
-    # with must appear here: *.log from the per-leg logs, *.json because
-    # _archive_merge_verify_logs emits summary.json beside them, and *.gz
-    # because _archive_junit_report stores gzipped junit reports here.  An
-    # uncounted suffix accumulates unbounded — never counted toward the size
-    # budget, never pruned — and the junit reports are retained on GREEN runs
-    # too, so this is the only thing bounding them.
+    # directory scan for the size-cap pass.  Every suffix WRITTEN into this
+    # tree must be listed: an uncounted one is never pruned and never counted
+    # toward the size budget, so it accumulates unbounded.
     _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.gz'))
     all_entries: list[tuple[Path, float, int]] = []
     for path in archive_root.rglob('*'):
@@ -6322,12 +6278,8 @@ async def run_verification(
     failing_test_ids: list[str] | None = None
     if junit_path is not None:
         failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
-        # The report carries this leg's per-test timings — the only per-test
-        # cost record the factory produces — and it lives inside a merge
-        # worktree that is deleted minutes later. Archive it whether the leg
-        # passed or failed: the merge-path LOG archival above is gated on
-        # `not passed`, and a cost corpus that holds only the red runs
-        # describes a different population from the one being measured.
+        # The report dies with the merge worktree; the LOG archival below is
+        # gated on `not passed`, this deliberately is not.
         _archive_junit_report(
             junit_path, archive_root, task_id, attempt_id or 1,
             module_prefix=module_prefix,
