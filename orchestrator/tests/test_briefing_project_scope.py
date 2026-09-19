@@ -1136,6 +1136,84 @@ class TestDegradationIsLoud:
         assert 'Own fact.' in context
         assert 'Foreign fact.' not in context
 
+    async def test_a_partial_failure_survives_having_nothing_left_to_render(
+        self, briefing: BriefingAssembler,
+    ):
+        """The notices must not be thrown away just because no section rendered.
+
+        The case the four tests above all miss: one query fails AND the other
+        recalls nothing, so ``recalled_sections`` is empty and the early
+        return fires. Measured before the fix, that return discarded every
+        notice computed for this dispatch and emitted the byte-identical
+        healthy-empty sentence — reporting a broken query and a degraded
+        store as "the corpus has nothing to say".
+        """
+        from orchestrator.agents.briefing import (
+            MEMORY_DEGRADED_STORES_NOTICE,
+            MEMORY_EMPTY_NOTICE,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._dispatch(
+                failing_slug='briefing-task-semantic',
+                payload={'results': [], 'degraded': True, 'failed_stores': ['graphiti']},
+            )),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.split('{')[0] in context, (
+            'the query that broke must still name itself'
+        )
+        assert 'transport' in context, 'and its reason class must survive'
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.split('{')[0] in context, (
+            'the store outage the server reported must still be named'
+        )
+        assert 'graphiti' in context
+
+        assert context != f'# Context\n\n{MEMORY_EMPTY_NOTICE}', (
+            'this is the measured defect: 234 broken dispatches rendered the '
+            'same bytes as 77 genuinely-empty ones'
+        )
+
+    async def test_a_total_outage_keeps_its_per_section_notices(
+        self, briefing: BriefingAssembler,
+    ):
+        """The family line and the per-section notices coexist.
+
+        A dispatch where every query broke owes the reader both: the family
+        line says "memory is unavailable", the notices say WHICH questions
+        went unanswered. Neither may displace the other, and no ``degraded``
+        reply was ever seen here — the notices come from the failures alone.
+        """
+        from orchestrator.agents.briefing import (
+            MEMORY_DEGRADED_STORES_NOTICE,
+            MEMORY_OUTAGE_NOTICE,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=ConnectionError('memory service unreachable')),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert MEMORY_OUTAGE_NOTICE.split('{')[0] in context
+        assert context.index(MEMORY_OUTAGE_NOTICE.split('{')[0]) < context.index(
+            MEMORY_SECTION_FAILURE_NOTICE.split('{')[0]
+        ), 'the family line leads the block, so the digest markers still match'
+
+        for section in ('Conventions & Gotchas', 'Task Context'):
+            assert MEMORY_SECTION_FAILURE_NOTICE.format(
+                section=section, reason='transport',
+            ) in context, f'{section} went unanswered and must say so'
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.split('{')[0] not in context, (
+            'no store outage was reported on the wire, so none is claimed'
+        )
+
 
 @pytest.mark.asyncio
 class TestOutageStreakEscape:
