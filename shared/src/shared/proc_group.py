@@ -48,7 +48,9 @@ Even with a correctly-captured pgid, ``terminate_process_group`` refuses to
 - ``pgid == os.getpgrp()`` (our own process group — hitting this would kill
   our own orchestrator/tests)
 - ``pgid != proc.pid`` (mismatch — a caller corrupted the capture, or the
-  ``proc`` object was somehow swapped)
+  ``proc`` object was somehow swapped).  The only conditional one:
+  :func:`unsafe_pgid_reason` can run it only when the caller supplies a
+  companion pid, which ``terminate_process_group`` always does.
 
 If any check fires, the helper logs an error and returns without signalling.
 
@@ -200,7 +202,10 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     task-845 frozen-pgid contract (task 4333). *proc_pid* defaults to
     ``None`` so a caller that has no companion pid to compare against (e.g.
     :func:`reap_process_groups`, reaping foreign pgids by number) can omit
-    it and skip the mismatch check below.
+    it.  Any caller that does hold a ``proc`` handle must pass ``proc.pid``:
+    omitting it skips the mismatch check below, the only one of the five
+    that catches a pgid pointing at a *stranger's* group rather than at
+    init or at us.
     """
     if pgid <= 1:
         return f'pgid <= 1 ({pgid!r})'
