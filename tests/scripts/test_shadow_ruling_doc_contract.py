@@ -40,6 +40,7 @@ from escalation.shadow_ruling import (
     REVERSIBLE_ACTIONS,
     SHADOW_RULING_MARKER,
     ShadowRuling,
+    main,
     parse_shadow_ruling,
 )
 
@@ -67,6 +68,14 @@ _SLUG_SECTIONS: tuple[tuple[str, frozenset[str]], ...] = (
 #: Leading-position only, so the surrounding prose in those sections may keep
 #: backticking whatever it likes without joining the vocabulary.
 _SLUG_BULLET = re.compile(r"^- `([a-z0-9_]+)`")
+
+#: The arguments the skill's quoted weekly-count command passes, captured from
+#: after the module spelling to the end of the (possibly `\`-continued) command.
+#: Read off the doc and driven through the live `main()`, so the flag vocabulary
+#: is checked in BOTH directions rather than pinned as a substring.
+_QUOTED_ARGV = re.compile(
+    r"python -m escalation\.shadow_ruling(?P<args>(?:[ \t]|\\\n|[-\w<>/.=:]+)*)"
+)
 
 #: The heading of the skill's shadow-mode section. Its content is read from here
 #: to the next top-level heading.
@@ -262,6 +271,43 @@ def test_the_shadow_section_names_the_policy_document_and_it_exists():
     assert POLICY.is_file()
 
 
+def test_the_shadow_sections_quoted_command_actually_runs(tmp_path: pathlib.Path):
+    """The strongest form of the check below: the doc's OWN argv, driven
+    through the live `main()`.
+
+    `assert "--queue-dir" in section` — what this replaces — was a one-way
+    string pin on prose. It failed if the DOC dropped the flag and stayed green
+    if the CLI RENAMED it, which is the direction that actually costs the
+    operator a runnable command. Running the quoted arguments proves both
+    directions at once: an unknown flag exits 2 out of argparse, and a required
+    flag the doc forgot to quote does too.
+
+    Placeholders (`<project_root>/...`) are substituted with a real empty
+    directory, so this exercises the argument vocabulary and nothing else.
+
+    THE LIMIT, measured rather than assumed: argparse accepts an unambiguous
+    PREFIX of a long option, so renaming `--queue-dir` to `--queue-directory`
+    still parses and still passes here. A rename that is not a prefix of the
+    new spelling — the ordinary case — exits 2 and fails.
+    """
+    section = _section(_read(SKILL), _SHADOW_SECTION)
+    quoted = _QUOTED_ARGV.search(section)
+    assert quoted, (
+        "the shadow section must quote the weekly-count command with its "
+        "arguments, or the measurement half has no operator."
+    )
+
+    argv = [
+        str(tmp_path) if token.startswith("<") else token
+        for token in quoted.group("args").replace("\\\n", " ").split()
+    ]
+    assert argv, "the quoted command passes no arguments; --queue-dir is required"
+    assert main(argv) == 0, (
+        f"the command the shadow section tells the operator to run is not "
+        f"runnable as quoted: {argv}"
+    )
+
+
 def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
     """The module spelling is EXTRACTED from the doc and run against the
     import system, never compared to a literal written here.
@@ -273,8 +319,6 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
     naming a module that does not exist.
     """
     section = _section(_read(SKILL), _SHADOW_SECTION)
-    assert "--queue-dir" in section
-
     quoted = re.findall(r"python -m ([A-Za-z_][\w.]*)", section)
     assert quoted, (
         "the shadow section must quote the weekly-count command, or the "

@@ -68,37 +68,41 @@ _FRESHNESS_NOTE = (
 
 
 class TestSlugVocabularies:
-    """The three slug sets the policy document enumerates and the codec validates."""
+    """The three slug sets the policy document enumerates and the codec
+    validates — held here as TYPES, never as membership.
 
-    def test_first_tranche_classes_are_the_four_shadowed_candidates(self):
-        assert isinstance(FIRST_TRANCHE_CLASSES, frozenset)
-        assert all(isinstance(s, str) for s in FIRST_TRANCHE_CLASSES)
-        assert len(FIRST_TRANCHE_CLASSES) == 4, (
-            f'expected exactly the four first-tranche candidate classes, got '
-            f'{sorted(FIRST_TRANCHE_CLASSES)}'
-        )
+    Membership is owned, in both directions, by
+    `tests/scripts/test_shadow_ruling_doc_contract.py::test_documented_slugs_equal_the_live_vocabulary`,
+    which checks each frozenset against the document that enumerates it. A
+    cardinality assertion beside that one is redundant where it agrees and
+    misleading where it does not: `len(...) == 4` stays green through a RENAME —
+    the drift that actually costs a stamp — and fails on an addition the doc
+    guard would have caught anyway.
+    """
 
-    def test_reversible_actions_are_the_five_ratified_skeleton_actions(self):
-        assert isinstance(REVERSIBLE_ACTIONS, frozenset)
-        assert all(isinstance(s, str) for s in REVERSIBLE_ACTIONS)
-        assert len(REVERSIBLE_ACTIONS) == 5, (
-            f'expected exactly the five reversible actions the ratified skeleton '
-            f'names, got {sorted(REVERSIBLE_ACTIONS)}'
-        )
+    # IDs are spelled out rather than derived from the frozensets: a set's repr
+    # order varies with each process's hash seed, so an id taken from one makes
+    # every xdist worker collect a differently-named test.
+    @pytest.mark.parametrize(
+        'vocabulary',
+        [
+            pytest.param(FIRST_TRANCHE_CLASSES, id='first-tranche-classes'),
+            pytest.param(REVERSIBLE_ACTIONS, id='reversible-actions'),
+            pytest.param(HUMAN_FOREVER_GATES, id='human-forever-gates'),
+        ],
+    )
+    def test_is_a_frozenset_of_slugs(self, vocabulary: frozenset[str]):
+        """Frozen because the codec validates every parsed payload against these
+        on a sweep of the whole archive: a mutable module-level set is one stray
+        `.add` away from widening the policy for the rest of the process."""
+        assert isinstance(vocabulary, frozenset)
+        assert all(isinstance(slug, str) for slug in vocabulary)
 
     def test_the_two_c1_resolution_actions_are_in_the_reversible_list(self):
         """`close_only` and `resume` are the only two that are also C1
         ``resolution_action`` values — the ones the weekly count can compare.
         The other three are task-side and are reported `not_comparable`."""
         assert {'close_only', 'resume'} <= REVERSIBLE_ACTIONS
-
-    def test_human_forever_gates_are_the_seven_gates(self):
-        assert isinstance(HUMAN_FOREVER_GATES, frozenset)
-        assert all(isinstance(s, str) for s in HUMAN_FOREVER_GATES)
-        assert len(HUMAN_FOREVER_GATES) == 7, (
-            f'expected exactly the seven human-forever gates, got '
-            f'{sorted(HUMAN_FOREVER_GATES)}'
-        )
 
     def test_the_vocabularies_do_not_overlap(self):
         """Three orthogonal dimensions — a class, an action and a gate are
@@ -110,13 +114,14 @@ class TestSlugVocabularies:
 
 
 class TestShadowRulingShape:
-    """The payload is exactly the four things the task names, and it is frozen."""
+    """The payload is exactly the four things the task names, and it is frozen.
 
-    def test_fields_are_exactly_the_four_the_task_names(self):
-        names = tuple(f.name for f in dataclasses.fields(ShadowRuling))
-        assert names == ('ruling_class', 'proposed_action', 'evidence', 'confidence'), (
-            f'expected the four fields class/proposed_action/evidence/confidence, got {names}'
-        )
+    The four field NAMES are held behaviourally — by
+    `TestNoteLineRendering::test_the_remainder_is_a_json_object_with_the_four_keys`,
+    off the rendered wire line — rather than by `dataclasses.fields`
+    introspection, which pinned the attribute spellings a caller never sees and
+    reached past the interface to do it.
+    """
 
     def test_is_frozen(self):
         with pytest.raises(dataclasses.FrozenInstanceError):

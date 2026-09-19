@@ -358,19 +358,11 @@ def mechanically_gated(record: Escalation) -> str | None:
     on its own.
 
     ``design_concern`` IS NOT GATED HERE, and that is the deliberate answer to
-    esc-5374-1 rather than an omission: see :data:`_UNGATED_DENIED_CATEGORY` for
-    the two questions this detector and authority.py's denylist separately
-    answer. A ``design_concern`` record is still never auto-closable by the auto
-    watcher — this file changes no authority — but it IS measurable, which the
-    ratified skeleton requires of its own
-    ``design_concern_semantic_collision`` first-tranche class.
-
-    Adoption remains a question about the INTERACTIVE arm rather than the auto
-    arm: per authority.py's own docstring those tables constrain only identified
-    callers in ``ROLE_LEVEL_ALLOWLIST`` — whose sole member is the auto-watcher
-    identity — and a header-less interactive connection is never narrowed by
-    that module. Extending a class to the AUTO watcher would need an
-    authority.py change; adopting one for the interactive session would not.
+    esc-5374-1 rather than an omission. :data:`_UNGATED_DENIED_CATEGORY` owns
+    that argument — the two questions this detector and authority.py's denylist
+    separately answer — and ``docs/escalation-standing-policy.md`` §"Adoption
+    preconditions" owns which arm an adoption would touch. Neither is restated
+    here. This file changes no authority.
     """
     if record.category in GATED_CATEGORIES:
         return (
