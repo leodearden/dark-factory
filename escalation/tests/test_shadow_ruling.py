@@ -296,6 +296,12 @@ def _record(**overrides: object) -> Escalation:
     return Escalation(**fields)  # type: ignore[arg-type]
 
 
+# The one auto-close-denied category the detector deliberately does not gate
+# (esc-5374-1). Named once here so the guards below read as one policy rather
+# than three repetitions of a bare string.
+_DESIGN_CONCERN = 'design_concern'
+
+
 class TestMechanicallyGated:
     """The detectable subset of the human-forever gate list, read off
     ``escalation.authority`` rather than restated here."""
@@ -303,11 +309,24 @@ class TestMechanicallyGated:
     def test_flags_the_milestone_gate_category(self):
         assert mechanically_gated(_record(category='milestone_gate')) == 'milestone_gate'
 
-    @pytest.mark.parametrize('category', sorted(L2_AUTO_CLOSE_DENY_CATEGORIES))
-    def test_flags_every_denied_category(self, category: str):
-        """authority.py's own docstring calls all of these the born-at-L2 human
-        gates, so every member flags — not only the one named `milestone_gate`."""
+    @pytest.mark.parametrize('category', sorted(GATED_CATEGORIES))
+    def test_flags_every_gated_category(self, category: str):
+        """Every gated member flags — not only the one named `milestone_gate`.
+        Parametrized over the detector's OWN set, so a member added to
+        authority.py is covered here the moment it propagates."""
         assert mechanically_gated(_record(category=category)) == 'milestone_gate'
+
+    def test_design_concern_is_denied_auto_close_but_not_gated_here(self):
+        """esc-5374-1. The two tables answer different questions, and this is
+        the single cell where they diverge: `design_concern` is never
+        auto-closable by the auto-watcher, AND it is not a human-forever gate,
+        so it must stay measurable. Gating it put every
+        `design_concern_semantic_collision` stamp — one of the four classes the
+        ratified skeleton instructs the session to shadow — into `gated_stamps`,
+        where it could never reach its own adoption threshold."""
+        assert _DESIGN_CONCERN in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert _DESIGN_CONCERN not in HUMAN_FOREVER_GATES
+        assert mechanically_gated(_record(category=_DESIGN_CONCERN)) is None
 
     @pytest.mark.parametrize('role', sorted(L2_AUTO_CLOSE_DENY_ROLES))
     def test_flags_every_denied_role(self, role: str):
@@ -332,12 +351,22 @@ class TestMechanicallyGated:
 class TestMechanicalGateSpot:
     """The detector must not hold a SECOND copy of the denylists."""
 
-    def test_the_detector_reads_the_imported_category_denylist(self):
-        assert GATED_CATEGORIES is L2_AUTO_CLOSE_DENY_CATEGORIES, (
-            'the detector must consult the imported frozenset itself, so a member '
-            'added in escalation/src/escalation/authority.py propagates here '
-            'instead of drifting'
-        )
+    def test_the_detector_derives_its_categories_from_the_imported_denylist(self):
+        """DERIVED, not re-listed: the detector's set must be the imported
+        frozenset minus its one named exclusion, so a member added in
+        escalation/src/escalation/authority.py propagates here instead of
+        drifting. A hand-written literal fails this even if it happens to agree
+        today."""
+        excluded = {_DESIGN_CONCERN}
+        assert L2_AUTO_CLOSE_DENY_CATEGORIES - excluded == GATED_CATEGORIES
+
+    def test_design_concern_is_the_only_denied_category_not_gated(self):
+        """The local policy is ONE cell wide (esc-5374-1). If a second category
+        ever stops gating, that is a new adjudication and must not arrive
+        silently under cover of this one."""
+        excluded = {_DESIGN_CONCERN}
+        assert excluded == L2_AUTO_CLOSE_DENY_CATEGORIES - GATED_CATEGORIES
+        assert GATED_CATEGORIES < L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_the_detector_reads_the_imported_role_denylist(self):
         assert GATED_ROLES is L2_AUTO_CLOSE_DENY_ROLES, (
@@ -362,8 +391,8 @@ class TestMechanicalGateSpot:
         observed = {
             slug
             for slug in (
-                [mechanically_gated(_record(category=c)) for c in L2_AUTO_CLOSE_DENY_CATEGORIES]
-                + [mechanically_gated(_record(agent_role=r)) for r in L2_AUTO_CLOSE_DENY_ROLES]
+                [mechanically_gated(_record(category=c)) for c in GATED_CATEGORIES]
+                + [mechanically_gated(_record(agent_role=r)) for r in GATED_ROLES]
             )
             if slug is not None
         }
@@ -733,6 +762,25 @@ class TestExclusionsAndWindow:
 
         report = fixture.report(since=at - timedelta(days=1), until=at - _MICROSECOND)
         assert report.for_class(_BRANCH_BEHIND) is None
+
+    def test_a_design_concern_stamp_reaches_a_rate_end_to_end(self, tmp_path: Path):
+        """esc-5374-1, asserted through the REAL queue rather than on the
+        detector alone: the ratified skeleton instructs the session to shadow
+        `design_concern_semantic_collision`, so a stamp on an actual
+        `design_concern` record must produce a measurable rate. While the
+        detector gated the whole auto-close denylist, every such stamp landed in
+        `gated_stamps` and the class could never reach its own threshold."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(
+            _ruling(_SEMANTIC_COLLISION, action='close_only'), observed_action='close_only',
+            category='design_concern', stamped_by='watcher-a', resolved_by='interactive',
+        )
+
+        report = fixture.report()
+        assert report.gated_stamps == 0
+        klass = report.for_class(_SEMANTIC_COLLISION)
+        assert klass is not None and (klass.agreed, klass.diverged) == (1, 0)
+        assert klass.agreement_rate == 1.0
 
     def test_a_gated_stamp_resolved_before_the_window_is_excluded(self, tmp_path: Path):
         """The excluded buckets are WINDOWED, not lifetime totals printed under

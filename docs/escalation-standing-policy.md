@@ -109,6 +109,18 @@ judgements with nothing to match on, so **this list — not the detector — is 
 authority.** A `None` from that function means "no mechanical gate detected",
 never "not gated".
 
+**The detector is not `authority.py`'s denylist, and `design_concern` is the one
+cell where they differ** (esc-5374-1). `L2_AUTO_CLOSE_DENY_CATEGORIES` answers
+*may the auto-watcher auto-close this at L2?* and includes `design_concern`;
+this detector answers *does the gate list above keep this with the human
+forever?* and `design_concern` is not on that list — it is a first-tranche class
+the same ratified text says to shadow. Gating it would make that class
+unmeasurable: every stamp would land in `gated_stamps` and it could never reach
+its own threshold. The detector therefore derives its categories from the
+denylist **minus that one member**, so a new runner-filed category added to
+`authority.py` still gates here for free. Nothing about the auto-watcher's
+authority changes: it still may not auto-close a `design_concern`.
+
 ## Time-boxing a human gate
 
 A human gate that has gone unanswered for N days gets the adjudicator's

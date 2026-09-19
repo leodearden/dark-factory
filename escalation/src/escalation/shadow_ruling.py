@@ -102,12 +102,36 @@ HUMAN_FOREVER_GATES: frozenset[str] = frozenset({
 #: no record-level signal at all.
 DETECTABLE_GATES: frozenset[str] = frozenset({'milestone_gate', 'deterministic_runner_filing'})
 
-#: The categories and roles the detector matches against — THE IMPORTED
-#: ``escalation.authority`` tables, bound under local names, never copies of
-#: their literals. Re-exported so the SPOT property is assertable without
-#: reaching into a private name: a member added to authority.py propagates here
-#: for free, and replacing either binding with a literal fails the guard.
-GATED_CATEGORIES: frozenset[str] = L2_AUTO_CLOSE_DENY_CATEGORIES
+#: The one auto-close-denied category this detector deliberately does NOT gate
+#: on. ``escalation.authority``'s denylist and this detector answer DIFFERENT
+#: QUESTIONS, and ``design_concern`` is the single cell where the two answers
+#: diverge:
+#:
+#: * authority.py asks *may the AUTO-WATCHER IDENTITY auto-close this at L2?* —
+#:   a table its own docstring scopes to the identified callers in
+#:   ``ROLE_LEVEL_ALLOWLIST``, whose sole member is the auto-watcher. Nothing
+#:   here changes that answer: the auto-watcher still may not auto-close a
+#:   ``design_concern``.
+#: * this detector asks *does the ratified skeleton keep this record with the
+#:   human FOREVER, whatever the measurement shows?* The skeleton's gate list is
+#:   "every ``milestone_gate`` and ``orchestrator-deterministic`` record";
+#:   ``design_concern`` is absent from it, absent from
+#:   :data:`HUMAN_FOREVER_GATES`, and named by the same ratified text as one of
+#:   the four first-tranche classes to shadow
+#:   (``design_concern_semantic_collision``).
+#:
+#: Gating it conflated the two questions and made that class unmeasurable —
+#: every stamp landing in the report's ``gated_stamps`` bucket, so the class
+#: could never reach its own "95% or better over at least 10 items" threshold
+#: (esc-5374-1).
+_UNGATED_DENIED_CATEGORY: str = 'design_concern'
+
+#: The categories and roles the detector matches against — DERIVED from the
+#: imported ``escalation.authority`` tables, never copies of their literals, so
+#: a member added to authority.py propagates here for free and replacing either
+#: binding with a literal fails the SPOT guard. The lone subtraction above is
+#: the whole of the local policy, stated once rather than by re-listing members.
+GATED_CATEGORIES: frozenset[str] = L2_AUTO_CLOSE_DENY_CATEGORIES - {_UNGATED_DENIED_CATEGORY}
 GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
 
 #: The reversible actions that are ALSO C1 ``resolution_action`` values, so an
@@ -243,18 +267,20 @@ def mechanically_gated(record: Escalation) -> str | None:
     ``escalation/src/escalation/authority.py`` already relies on: neither benign
     half can mask the other.
 
-    THE ``design_concern`` TENSION, stated rather than hidden. The set this
-    matches is authority.py's auto-close denylist, and ``design_concern`` is a
-    member of it — so every ``design_concern`` shadow stamp lands in the weekly
-    count's ``gated_stamps`` bucket, including one filed under the
-    ``design_concern_semantic_collision`` first-tranche candidate. That is why
-    the candidate is shadow-only. It is ALSO why adoption is a question about
-    the INTERACTIVE arm rather than the auto arm: per authority.py's own
-    docstring these tables constrain only identified callers in
-    ``ROLE_LEVEL_ALLOWLIST`` — whose sole member is the auto-watcher identity —
-    and a header-less interactive connection is never narrowed by that module.
-    Extending a class to the AUTO watcher would need an authority.py change;
-    adopting one for the interactive session would not.
+    ``design_concern`` IS NOT GATED HERE, and that is the deliberate answer to
+    esc-5374-1 rather than an omission: see :data:`_UNGATED_DENIED_CATEGORY` for
+    the two questions this detector and authority.py's denylist separately
+    answer. A ``design_concern`` record is still never auto-closable by the auto
+    watcher — this file changes no authority — but it IS measurable, which the
+    ratified skeleton requires of its own
+    ``design_concern_semantic_collision`` first-tranche class.
+
+    Adoption remains a question about the INTERACTIVE arm rather than the auto
+    arm: per authority.py's own docstring those tables constrain only identified
+    callers in ``ROLE_LEVEL_ALLOWLIST`` — whose sole member is the auto-watcher
+    identity — and a header-less interactive connection is never narrowed by
+    that module. Extending a class to the AUTO watcher would need an
+    authority.py change; adopting one for the interactive session would not.
     """
     if record.category in GATED_CATEGORIES:
         return 'milestone_gate'
