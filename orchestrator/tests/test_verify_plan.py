@@ -23,6 +23,7 @@ from typing import Literal
 
 import pytest
 from _verify_config_corpus import (
+    DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
     MODULE_LINT_COMMANDS,
     ROOT_LINT_COMMAND,
@@ -1126,6 +1127,7 @@ class TestDeriveVerifyPlanMergeBreadth:
 _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
     *((f'{module}-lint', cmd) for module, cmd in MODULE_LINT_COMMANDS.items()),
     ('fm-lint', FM_LINT_COMMAND),
+    ('dashboard-lint', DASHBOARD_LINT_COMMAND),
     ('root-lint', ROOT_LINT_COMMAND),
     ('root-type-check', ROOT_TYPE_CHECK_COMMAND),
     ('root-test', ROOT_TEST_COMMAND),
@@ -1192,6 +1194,28 @@ class TestScoperTrailingClausePreservation:
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
+
+    def test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+        """The second 3-segment chain (task 4485), as a full literal golden.
+
+        Same shape as the fused-memory case above: the ruff clause narrows
+        to the touched file while both sibling checkers survive verbatim,
+        still pointed at the whole ``dashboard/tests`` directory.
+        """
+        files = ['dashboard/tests/test_index_html.py']
+        scoped = _scope_to_keyword(DASHBOARD_LINT_COMMAND, 'ruff check', files)
+        assert scoped == (
+            'uv run --project dashboard ruff check dashboard/tests/test_index_html.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
+            ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+        )
+        assert 'src/ tests/' not in scoped
+        for checker in (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests',
+            '&& python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests',
+        ):
+            assert checker in scoped, f'{checker!r} must survive verbatim'
+            assert checker in DASHBOARD_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
         """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
@@ -1734,6 +1758,7 @@ class TestReprojectStrChainTail:
         'raw',
         [
             FM_LINT_COMMAND,
+            DASHBOARD_LINT_COMMAND,
             *MODULE_LINT_COMMANDS.values(),
             ROOT_LINT_COMMAND,
             ROOT_TYPE_CHECK_COMMAND,
@@ -1742,6 +1767,7 @@ class TestReprojectStrChainTail:
         ],
         ids=[
             'fused-memory-lint',
+            'dashboard-lint',
             *(f'{module}-lint' for module in MODULE_LINT_COMMANDS),
             'root-lint',
             'root-type-check-cd-fan-out',
