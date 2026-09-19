@@ -91,17 +91,14 @@ def _git_ok(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
-def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
-    """Build an isolated repo left mid-rebase with a populated MERGE_RR.
+def _build_conflicting_branches(root: Path, name: str) -> Path:
+    """An isolated repo with ``feature`` and ``main`` in conflict, HEAD on main.
 
-    Creates a deterministic two-branch content conflict on one line of one
-    file, then rebases ``feature`` onto ``main`` so the rebase stops on that
-    conflict.  rerere is enabled, so git writes ``MERGE_RR`` naming the
-    conflict id and a backing ``rr-cache/<id>/`` directory — the substrate the
-    dangling-ref cases manufacture by deleting.
-
-    Returns ``(repo, conflict_id)``.  The conflict id is the LITERAL token from
-    MERGE_RR, carrying any rerere variant suffix verbatim.
+    The substrate both mid-rebase fixtures share: rebasing ``feature`` onto
+    ``main`` stops on a one-line content conflict, and rerere — enabled here —
+    then writes MERGE_RR plus its backing ``rr-cache/<id>/``.  Where that
+    rebase is RUN is what the two fixtures differ on, and it is the only thing
+    they differ on.
     """
     repo = root / name
     repo.mkdir(parents=True)
@@ -135,6 +132,31 @@ def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
     _git_ok(repo, 'checkout', '-q', 'main')
     (repo / 'f.txt').write_text(_MAIN)
     _git_ok(repo, 'commit', '-qam', 'main edit')
+    return repo
+
+
+def _conflict_id_of(git_dir: Path, common_dir: Path) -> str:
+    """The LITERAL first MERGE_RR token, with its backing rr-cache asserted.
+
+    Read from the PER-WORKTREE dir and checked against the COMMON one, which
+    is the same split the module under test makes — in a single checkout the
+    two are one directory, in a linked worktree they are not.
+    """
+    merge_rr = (git_dir / 'MERGE_RR').read_bytes()
+    conflict_id = merge_rr.split(b'\x00')[0].split(b'\t')[0].decode()
+    assert (common_dir / 'rr-cache' / conflict_id).is_dir(), (
+        'fixture expected a backing rr-cache entry'
+    )
+    return conflict_id
+
+
+def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
+    """Build an isolated repo left mid-rebase with a populated MERGE_RR.
+
+    Returns ``(repo, conflict_id)``.  The conflict id is the LITERAL token from
+    MERGE_RR, carrying any rerere variant suffix verbatim.
+    """
+    repo = _build_conflicting_branches(root, name)
 
     _git_ok(repo, 'checkout', '-q', 'feature')
     rebase = _git(repo, 'rebase', 'main')
@@ -142,13 +164,35 @@ def build_mid_rebase_repo(root: Path, name: str = 'repo') -> tuple[Path, str]:
 
     git_dir = repo / '.git'
     assert (git_dir / 'rebase-merge').is_dir(), 'fixture expected mid-rebase state'
+    return repo, _conflict_id_of(git_dir, git_dir)
 
-    merge_rr = (git_dir / 'MERGE_RR').read_bytes()
-    conflict_id = merge_rr.split(b'\x00')[0].split(b'\t')[0].decode()
-    assert (git_dir / 'rr-cache' / conflict_id).is_dir(), (
-        'fixture expected a backing rr-cache entry'
+
+def build_linked_mid_rebase_worktree(root: Path) -> tuple[Path, Path, str]:
+    """A LINKED worktree left mid-rebase — the shape production actually passes.
+
+    All four routed call sites operate on ``.worktrees/*`` or merge worktrees,
+    never on a standalone ``git init`` checkout.  The distinction is not
+    cosmetic: MERGE_RR is PER-WORKTREE while rr-cache is SHARED, so the two
+    directories the module resolves are the same path in a single checkout and
+    different paths here.  Measured on git 2.43.0 for this fixture:
+    ``--git-dir`` is ``<repo>/.git/worktrees/linked``, ``--git-common-dir`` is
+    ``<repo>/.git``, and rr-cache exists only under the latter.
+
+    Returns ``(repo, linked, conflict_id)``.
+    """
+    repo = _build_conflicting_branches(root, 'repo')
+    linked = root / 'linked'
+    _git_ok(repo, 'worktree', 'add', '-q', str(linked), 'feature')
+
+    rebase = _git(linked, 'rebase', 'main')
+    assert rebase.returncode != 0, 'fixture expected a rebase conflict'
+
+    git_dir = repo / '.git' / 'worktrees' / 'linked'
+    assert (git_dir / 'rebase-merge').is_dir(), 'fixture expected mid-rebase state'
+    assert not (git_dir / 'rr-cache').exists(), (
+        'fixture expected rr-cache in the COMMON dir only'
     )
-    return repo, conflict_id
+    return repo, linked, _conflict_id_of(git_dir, repo / '.git')
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1068,80 @@ class TestTheGitProbeIsBounded:
         assert resolved is not None, 'the control must be a resolvable worktree'
         assert spawned, 'the probe must actually spawn'
         assert spawned[0].get('timeout', 0) > 0
+
+
+class TestLinkedWorktreeIsTheProductionShape:
+    """Everything above builds standalone repos; production never passes one.
+
+    All four routed call sites operate on ``.worktrees/*`` or merge worktrees.
+    The per-worktree-vs-common split the module treats as load-bearing is
+    INVISIBLE in a standalone checkout — the two paths are the same directory,
+    so a classifier that resolved rr-cache under the wrong one would still pass
+    every case above.  Here they differ, which is what makes the split
+    falsifiable.
+    """
+
+    def test_resolve_returns_the_two_directories_that_actually_differ(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+
+        resolved = rebase_recovery.resolve_git_dirs(linked)
+
+        assert resolved is not None
+        git_dir, common_dir = resolved
+        assert git_dir.resolve() == (repo / '.git' / 'worktrees' / 'linked').resolve()
+        assert common_dir.resolve() == (repo / '.git').resolve()
+        assert git_dir.resolve() != common_dir.resolve()
+        assert (git_dir / 'MERGE_RR').exists(), 'MERGE_RR is per-worktree'
+        assert (common_dir / 'rr-cache').is_dir(), 'rr-cache is shared'
+
+    def test_a_dangling_ref_is_detected_quarantined_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        """The headline recovery, end to end, on the shape production passes."""
+        repo, linked, conflict_id = build_linked_mid_rebase_worktree(tmp_path)
+        shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        pre_rebase_tip = _git_ok(linked, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert [r.conflict_id for r in result.dangling] == [conflict_id]
+        assert result.verdict == 'repaired'
+        assert result.merge_rr_backup is not None
+        assert result.merge_rr_backup.parent.resolve() == git_dir.resolve(), (
+            'evidence belongs beside the per-worktree MERGE_RR it came from'
+        )
+        assert not (git_dir / 'MERGE_RR').exists()
+
+        abort = _run_argv(linked, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (git_dir / 'rebase-merge').exists()
+        assert _git_ok(linked, 'status', '--porcelain') == ''
+        assert _git_ok(linked, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+        assert result.merge_rr_backup.exists(), 'evidence must outlive the abort'
+
+    def test_an_intact_shared_rr_cache_is_left_alone(self, tmp_path: Path) -> None:
+        """The control, and the one that falsifies resolving rr-cache wrongly.
+
+        rr-cache exists ONLY under the common dir, so a classifier looking for
+        it under the per-worktree dir finds nothing for every record and calls
+        a healthy worktree dangling — quarantining good state on every guarded
+        abort in the fleet.  In a standalone repo that mistake is unobservable.
+        """
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        original = (git_dir / 'MERGE_RR').read_bytes()
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert result.dangling == ()
+        assert result.verdict == 'clean'
+        assert result.merge_rr_backup is None
+        assert (git_dir / 'MERGE_RR').read_bytes() == original
+        assert list(git_dir.glob('MERGE_RR.quarantined-*')) == []
 
 
 # ---------------------------------------------------------------------------
