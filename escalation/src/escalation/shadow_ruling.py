@@ -47,7 +47,7 @@ from types import MappingProxyType
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
-from escalation.queue import iter_all_escalation_paths
+from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,20 @@ class ShadowRuling:
     confidence: float
 
     def __post_init__(self) -> None:
+        # TYPE BEFORE MEMBERSHIP, for the same reason `evidence` and
+        # `confidence` below are type-checked first: the payload is JSON an LLM
+        # session hand-wrote into a `triage_note`, so any of these four values
+        # can arrive as a list, dict or number. `x not in frozenset` raises
+        # TypeError on an unhashable value rather than returning False, and a
+        # TypeError out of this constructor escapes `parse_shadow_ruling`'s
+        # rejection path and kills the whole sweep. Every validation failure in
+        # this class is a ValueError — uniformly, so one catch covers them all.
+        for field, value in (('ruling_class', self.ruling_class),
+                             ('proposed_action', self.proposed_action)):
+            if not isinstance(value, str):
+                raise ValueError(
+                    f'shadow {field} must be a string, got {type(value).__name__} {value!r}'
+                )
         if self.ruling_class not in FIRST_TRANCHE_CLASSES:
             raise ValueError(
                 f'unknown shadow ruling_class {self.ruling_class!r}; '
@@ -263,7 +277,14 @@ def parse_shadow_ruling(triage_note: str) -> ShadowRuling | None:
                 evidence=payload['evidence'],
                 confidence=payload['confidence'],
             )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
+            # ValueError is what ShadowRuling raises for EVERY rejection, and
+            # the type checks in its __post_init__ are what keep that true.
+            # TypeError is the redundant backstop on the "It NEVER raises"
+            # contract above: this parse runs once per record over the whole
+            # live queue, so a single escaping exception costs the entire
+            # measurement, and that price is too high to pay for a validator
+            # invariant enforced only in one place.
             logger.warning('rejected %s payload: %s', SHADOW_RULING_MARKER, exc)
             return None
     return None
@@ -422,6 +443,18 @@ def _resolved_at(record: Escalation) -> datetime | None:
     return _as_aware(parsed)
 
 
+#: The CONTENT faults the sweep treats as "skip this record", passed to
+#: ``escalation/src/escalation/queue.py::read_escalation_for_scan`` rather than
+#: hard-coded there — queue.py and sweep.py deliberately catch different tuples.
+#: ``ValueError`` is a deliberate member and wider than queue.py's own tuple:
+#: ``UnicodeDecodeError`` on a truncated or binary file subclasses it, and this
+#: sweep must survive one, since a single escaping exception anywhere in a
+#: 5000-record queue costs the entire weekly measurement.
+_SWEEP_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, ValueError,
+)
+
+
 def agreement_report(
     escalations_dir: Path | str, *, since: datetime, until: datetime,
 ) -> AgreementReport:
@@ -433,6 +466,18 @@ def agreement_report(
     and a missing directory (yields nothing rather than raising). Records with
     no parsable shadow ruling are skipped — the overwhelming majority carry
     none.
+
+    Each file is read through ``queue.py::read_escalation_for_scan``, the
+    audited helper every unlocked glob-then-read scan in this package uses, NOT
+    an inline ``read_text``. This is a snapshot-then-read over a LIVE tree: the
+    skill points the operator at ``<project_root>/data/escalations``, and a
+    concurrent ``resolve()`` or the ``prune_archive`` pass of another
+    orchestrator's startup sweep can relocate any listed file before this loop
+    reaches it. An inline read raises ``FileNotFoundError`` there and takes the
+    whole measurement down. The helper keeps vanished (DEBUG — routine
+    archival), unreadable (WARNING — a real I/O fault) and unparsable (WARNING)
+    distinguishable, so this stays a skip rather than the blanket
+    ``except OSError`` the no-silent-fail-soft invariant forbids.
 
     THE ORDER OF CHECKS IS PART OF THE CONTRACT: unresolved -> out-of-window ->
     gated -> self_resolved -> non-human resolver -> not_comparable ->
@@ -480,10 +525,11 @@ def agreement_report(
     unresolved_lifetime = 0
 
     for path in iter_all_escalation_paths(Path(escalations_dir)):
-        try:
-            record = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning('skipping unparsable escalation at %s: %s', path, exc)
+        record, _reason = read_escalation_for_scan(
+            path, context='shadow_ruling.agreement_report',
+            parse_errors=_SWEEP_PARSE_ERRORS,
+        )
+        if record is None:
             continue
 
         ruling = parse_shadow_ruling(record.triage_note)

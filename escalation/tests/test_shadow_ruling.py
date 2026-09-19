@@ -227,6 +227,44 @@ class TestParseReturnsNoneForAbsentOrUnusable:
     def test_returns_none(self, note: str):
         assert parse_shadow_ruling(note) is None
 
+    @pytest.mark.parametrize('key', ['class', 'proposed_action', 'evidence', 'confidence'])
+    @pytest.mark.parametrize(
+        'value',
+        [
+            pytest.param(['risk_identified_branch_behind_main'], id='list'),
+            pytest.param({'a': 1}, id='dict'),
+            pytest.param(7, id='number'),
+            pytest.param(None, id='null'),
+        ],
+    )
+    def test_returns_none_for_a_wrong_typed_value(self, key: str, value: object):
+        """The payload is JSON an LLM session hand-wrote into a `triage_note`,
+        so a wrong-typed value is exactly the input this codec exists to
+        tolerate. `x not in frozenset` RAISES TypeError on an unhashable value
+        rather than returning False, so before the type checks a single
+        `"class": [...]` record anywhere in the live queue took the entire
+        weekly sweep down with it."""
+        payload = {
+            'class': sorted(FIRST_TRANCHE_CLASSES)[0], 'proposed_action': 'close_only',
+            'evidence': 'e', 'confidence': 0.5,
+        }
+        payload[key] = value  # type: ignore[assignment]
+        assert parse_shadow_ruling(f'{SHADOW_RULING_MARKER} {json.dumps(payload)}') is None
+
+    @pytest.mark.parametrize('key', ['ruling_class', 'proposed_action'])
+    def test_the_constructor_rejects_an_unhashable_value_as_a_value_error(self, key: str):
+        """The invariant that makes the parser's catch sufficient: EVERY
+        rejection from this class is a ValueError. Asserted on the constructor
+        directly, because a TypeError leaking from here is what reaches the
+        sweep — and the message must name the offending field."""
+        fields = {
+            'ruling_class': sorted(FIRST_TRANCHE_CLASSES)[0],
+            'proposed_action': 'close_only', 'evidence': 'e', 'confidence': 0.5,
+        }
+        fields[key] = ['not', 'a', 'string']  # type: ignore[assignment]
+        with pytest.raises(ValueError, match=key):
+            ShadowRuling(**fields)  # type: ignore[arg-type]
+
     def test_returns_none_for_an_out_of_vocabulary_class(self):
         payload = json.dumps({
             'class': 'invented_class', 'proposed_action': 'close_only',
@@ -929,6 +967,43 @@ class TestSweepRobustness:
         )
         assert report.classes == ()
         assert (report.gated_stamps, report.self_resolved, report.unresolved_lifetime) == (0, 0, 0)
+
+    def test_a_file_that_vanished_between_the_glob_and_the_read_is_skipped(
+        self, tmp_path: Path,
+    ):
+        """This is a snapshot-then-read over a LIVE tree — the skill points the
+        operator at `<project_root>/data/escalations` — so a concurrent
+        `resolve()` or another orchestrator's startup `prune_archive` can
+        relocate a listed file before the loop reaches it. An inline
+        `read_text` raised FileNotFoundError there and returned no report at
+        all; the measurement must survive losing one record."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        queue_dir = fixture.queue.queue_dir
+        # A dangling symlink is globbed like any other esc-*.json and then
+        # fails the read — the same ENOENT a mid-sweep relocation produces.
+        (queue_dir / 'esc-vanished-1.json').symlink_to(queue_dir / 'gone.json')
+
+        report = fixture.report()
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1, (
+            'one unreadable file must cost one record, not the whole sweep'
+        )
+
+    def test_an_unreadable_file_does_not_take_the_sweep_down(self, tmp_path: Path):
+        """The OTHER half of the helper's tri-state: the file IS present and
+        something is genuinely wrong (here: no read permission). That is a
+        WARNING rather than a routine archival, but it is still a skip."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        unreadable = fixture.queue.queue_dir / 'esc-unreadable-1.json'
+        unreadable.write_text('{}')
+        unreadable.chmod(0o000)
+        try:
+            klass = fixture.report().for_class(_BRANCH_BEHIND)
+            assert klass is not None and klass.agreed == 1
+        finally:
+            unreadable.chmod(0o600)
 
     def test_an_empty_queue_dir_yields_an_empty_report(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
