@@ -1530,6 +1530,12 @@ So on an **already-triaged** record you must re-send the previous note's content
 predicate and probe. (Omitting `triage_note` entirely is the safe freshness-bump form — it leaves
 the existing note untouched.)
 
+Re-stamping therefore leaves the note carrying **two** marker lines, which is expected and safe:
+the weekly count reads the **last** one as the record's ruling and treats the earlier lines as
+superseded. Append the new marker below the old one rather than editing the old one in place — and
+if the newest line is malformed the record is counted in `rejected_stamps`, never scored against
+the stale proposal above it.
+
 The marker goes on its **own line** of a note that still satisfies the freshness contract in
 "Reading a triage-ack annotation" above: a named world-facing predicate plus the probe used to check
 it. A shadow stamp is not a substitute for that predicate — and per that same subsection, a
@@ -1571,9 +1577,10 @@ uv run --directory escalation python -m escalation.shadow_ruling \
 
 Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
 `not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
-against; `gated_stamps` and `self_resolved` for stamps excluded from every rate — those two are
-counted over the same window as the rate. A class whose records are mostly `self_resolved` is not a
-class with a small sample — it is not measurable yet.
+against; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
+— those three are counted over the same window as the rate. A class whose records are mostly
+`self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
+`rejected_stamps` means the count could not read that many markers at all.
 
 `unresolved_lifetime` is the exception and says so in its name: a pending record has no
 `resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from

@@ -39,11 +39,13 @@ from escalation.shadow_ruling import (
     HUMAN_FOREVER_GATES,
     REVERSIBLE_ACTIONS,
     SHADOW_RULING_MARKER,
+    NoteStamp,
     ShadowRuling,
     agreement_report,
     main,
     mechanically_gated,
     parse_shadow_ruling,
+    scan_triage_note,
 )
 
 # A well-formed ruling used wherever the test's subject is something OTHER than
@@ -300,6 +302,83 @@ class TestParseReturnsNoneForAbsentOrUnusable:
         assert parse_shadow_ruling(note) is None
 
 
+class TestTheLastMarkerLineIsTheStamp:
+    """`stamp_triage` REPLACES `triage_note` wholesale, so the skill this task
+    writes tells the session to re-send the previous note with the new marker
+    appended on its own line. A re-stamped record therefore carries TWO marker
+    lines, and only the newest one was ruled.
+
+    Scoring the superseded one against the observed outcome is a WRONG sample,
+    which is strictly worse than a lost one: every other way this module loses a
+    sample lands in a bucket a reader can see, and a wrong sample lands in the
+    rate itself.
+    """
+
+    def test_a_restamped_note_yields_the_newest_ruling(self):
+        stale = dataclasses.replace(_A_RULING, proposed_action='close_only')
+        fresh = dataclasses.replace(_A_RULING, proposed_action='resume')
+        note = '\n'.join([_FRESHNESS_NOTE, stale.to_note_line(), fresh.to_note_line()])
+
+        assert parse_shadow_ruling(note) == fresh
+
+    def test_an_unusable_marker_does_not_shadow_a_later_valid_one(self):
+        note = '\n'.join([
+            f'{SHADOW_RULING_MARKER} not json at all',
+            _A_RULING.to_note_line(),
+        ])
+
+        assert parse_shadow_ruling(note) == _A_RULING
+
+    def test_an_unusable_newest_marker_rejects_rather_than_scoring_the_stale_one(self):
+        """The newest stamp is the one that was ruled. If it cannot be read, the
+        record's current proposal is unknown — and the older line is superseded,
+        not a fallback."""
+        note = '\n'.join([
+            _A_RULING.to_note_line(),
+            f'{SHADOW_RULING_MARKER} not json at all',
+        ])
+
+        assert parse_shadow_ruling(note) is None
+        assert scan_triage_note(note).rejected is True
+
+
+class TestScanSeparatesAnAbsentStampFromAnUnreadableOne:
+    """Two ways of answering ``None`` that must not look alike. A record never stamped
+    is the overwhelming majority of the archive and is not a sample at all; a
+    record whose stamp cannot be read is a LOST sample, and the report has to be
+    able to say how many it threw away."""
+
+    def test_no_marker_at_all_is_not_a_rejection(self):
+        assert scan_triage_note(_FRESHNESS_NOTE) == NoteStamp(ruling=None, rejected=False)
+
+    def test_an_empty_note_is_not_a_rejection(self):
+        assert scan_triage_note('') == NoteStamp(ruling=None, rejected=False)
+
+    def test_a_usable_marker_is_not_a_rejection(self):
+        assert scan_triage_note(_A_RULING.to_note_line()) == NoteStamp(
+            ruling=_A_RULING, rejected=False,
+        )
+
+    def test_an_unusable_marker_is_a_rejection(self):
+        assert scan_triage_note(f'{SHADOW_RULING_MARKER} not json at all') == NoteStamp(
+            ruling=None, rejected=True,
+        )
+
+    def test_an_out_of_vocabulary_payload_is_a_rejection_not_an_absence(self):
+        payload = json.dumps({
+            'class': 'invented_class', 'proposed_action': 'close_only',
+            'evidence': 'e', 'confidence': 0.5,
+        })
+
+        assert scan_triage_note(f'{SHADOW_RULING_MARKER} {payload}').rejected is True
+
+    def test_a_rejected_stamp_cannot_also_carry_a_ruling(self):
+        """The invariant that keeps the three states three: ``rejected`` is the
+        answer only when there is no ruling to report."""
+        with pytest.raises(ValueError, match='rejected'):
+            NoteStamp(ruling=_A_RULING, rejected=True)
+
+
 def test_escalation_carries_the_triage_fields_the_codec_rides_in():
     """The stamp has no field of its own: it rides inside ``triage_note``,
     which is why the model needs no migration (design decision 1)."""
@@ -518,11 +597,12 @@ class _Fixture:
         self.queue.submit(record)
         return record
 
-    def stamp(self, record: Escalation, ruling: ShadowRuling, *, by: str) -> None:
-        stamped = self.queue.stamp_triage(
-            record.id, triaged_by=by, triage_note=_stamped_note(ruling),
-        )
+    def stamp_note(self, record: Escalation, note: str, *, by: str = 'watcher-a') -> None:
+        stamped = self.queue.stamp_triage(record.id, triaged_by=by, triage_note=note)
         assert stamped is not None, 'stamp_triage refused a pending record'
+
+    def stamp(self, record: Escalation, ruling: ShadowRuling, *, by: str) -> None:
+        self.stamp_note(record, _stamped_note(ruling), by=by)
 
     def resolve(self, record: Escalation, *, by: str, dismiss: bool = True) -> Escalation:
         resolved = self.queue.resolve(
@@ -959,6 +1039,64 @@ class TestExclusionsAndWindow:
         assert fixture.report().resolver_tiers.get('human') == 1
 
 
+class TestRejectedStamps:
+    """A marker line that is present but unreadable is a LOST SAMPLE, and the
+    report says how many it lost.
+
+    Without this bucket a pasted `comparable=8` cannot be told from one where
+    two further stamps were thrown away — the very confusion the other excluded
+    buckets exist to prevent — unless the reader also happens to hold the stderr
+    stream the WARNING went to.
+    """
+
+    _JUNK = f'{SHADOW_RULING_MARKER} not json at all'
+
+    def test_an_unreadable_stamp_is_counted_not_silently_dropped(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit()
+        fixture.stamp_note(record, f'{_FRESHNESS_NOTE}\n{self._JUNK}')
+        fixture.resolve(record, by='interactive')
+
+        report = fixture.report()
+        assert report.rejected_stamps == 1
+        assert report.classes == (), 'an unreadable stamp names no class to count it under'
+
+    def test_a_record_with_no_marker_at_all_is_not_a_rejection(self, tmp_path: Path):
+        """The overwhelming majority of the archive. If an unstamped record
+        counted here, the bucket would report the archive's size rather than a
+        loss, and the number would mean nothing."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit()
+        fixture.stamp_note(record, _FRESHNESS_NOTE)
+        fixture.resolve(record, by='interactive')
+
+        assert fixture.report().rejected_stamps == 0
+
+    def test_it_is_windowed_like_the_other_two_in_window_buckets(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit()
+        fixture.stamp_note(record, self._JUNK)
+        resolved = fixture.resolve(record, by='interactive')
+        assert resolved.resolved_at is not None
+        at = datetime.fromisoformat(resolved.resolved_at)
+
+        assert fixture.report(since=at, until=at).rejected_stamps == 1, 'both edges inclusive'
+        assert fixture.report(
+            since=at - timedelta(days=2), until=at - _MICROSECOND,
+        ).rejected_stamps == 0, 'a rejection outside the window is not this window\'s loss'
+
+    def test_a_pending_unreadable_stamp_is_backlog_not_a_rejection(self, tmp_path: Path):
+        """The same order a pending GATED stamp follows: nothing has been ruled
+        on the record yet, and an unwindowable record must not enter a windowed
+        number."""
+        fixture = _Fixture(tmp_path)
+        pending = fixture.submit()
+        fixture.stamp_note(pending, self._JUNK)
+
+        report = fixture.report()
+        assert (report.unresolved_lifetime, report.rejected_stamps) == (1, 0)
+
+
 class TestSweepRobustness:
     def test_a_missing_queue_dir_yields_an_empty_report_without_raising(self, tmp_path: Path):
         report = agreement_report(
@@ -966,7 +1104,10 @@ class TestSweepRobustness:
             since=datetime(2000, 1, 1, tzinfo=UTC), until=datetime(2100, 1, 1, tzinfo=UTC),
         )
         assert report.classes == ()
-        assert (report.gated_stamps, report.self_resolved, report.unresolved_lifetime) == (0, 0, 0)
+        assert (
+            report.gated_stamps, report.self_resolved,
+            report.unresolved_lifetime, report.rejected_stamps,
+        ) == (0, 0, 0, 0)
 
     def test_a_file_that_vanished_between_the_glob_and_the_read_is_skipped(
         self, tmp_path: Path,
@@ -1018,7 +1159,10 @@ class TestSweepRobustness:
 
         report = fixture.report()
         assert report.classes == ()
-        assert (report.gated_stamps, report.self_resolved, report.unresolved_lifetime) == (0, 0, 0)
+        assert (
+            report.gated_stamps, report.self_resolved,
+            report.unresolved_lifetime, report.rejected_stamps,
+        ) == (0, 0, 0, 0)
 
     def test_an_unstamped_record_is_skipped_silently(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
@@ -1112,9 +1256,12 @@ class TestCliTable:
             'comparable': '4', 'rate': '75.0%',
         }
 
-    def test_prints_the_three_excluded_buckets(self, tmp_path: Path, capsys):
+    def test_prints_every_excluded_bucket(self, tmp_path: Path, capsys):
         fixture = _Fixture(tmp_path)
         fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        unreadable = fixture.submit()
+        fixture.stamp_note(unreadable, f'{SHADOW_RULING_MARKER} not json at all')
+        fixture.resolve(unreadable, by='interactive')
         fixture.stamped_and_resolved(
             _ruling(), observed_action='close_only', category='milestone_gate',
         )
@@ -1130,6 +1277,7 @@ class TestCliTable:
         assert 'gated_stamps=1' in out
         assert 'self_resolved=1' in out
         assert 'unresolved_lifetime=1' in out
+        assert 'rejected_stamps=1' in out
 
     def test_self_resolved_is_printed_even_when_zero(self, tmp_path: Path, capsys):
         """A reader deciding whether a class cleared "95% over at least 10
@@ -1409,6 +1557,7 @@ class TestCliJson:
         assert payload['gated_stamps'] == 1
         assert payload['self_resolved'] == 1
         assert payload['unresolved_lifetime'] == 0
+        assert payload['rejected_stamps'] == 0
         row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
         assert (row['agreed'], row['diverged'], row['not_comparable']) == (1, 1, 0)
         assert row['comparable'] == 2

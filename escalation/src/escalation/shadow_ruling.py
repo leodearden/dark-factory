@@ -239,55 +239,96 @@ class ShadowRuling:
         return f'{SHADOW_RULING_MARKER} {json.dumps(payload, sort_keys=True)}'
 
 
-def parse_shadow_ruling(triage_note: str) -> ShadowRuling | None:
-    """Return the :class:`ShadowRuling` carried by *triage_note*, or ``None``.
+@dataclass(frozen=True)
+class NoteStamp:
+    """What a ``triage_note`` carries at the marker.
 
-    ``None`` means "no usable shadow ruling here" and is the answer for a note
-    with no marker line, an empty note, a marker line whose payload is not a
-    JSON object, and a payload whose values are outside the policy's
-    vocabularies. It NEVER raises: the weekly count sweeps every escalation in
-    the queue and archive, the overwhelming majority of which carry no stamp,
-    so an exception would turn one malformed note into a failed measurement.
-
-    A marker line that IS present but unusable is logged at WARNING — an
-    unreadable stamp is a lost sample, and losing samples silently is how a
-    class's agreement rate drifts without anybody noticing.
+    THREE states rather than two, because the weekly count has to tell a record
+    that was never stamped — the overwhelming majority of the archive, and not a
+    sample at all — from one that WAS stamped and whose stamp could not be read.
+    The second is a lost sample, and the report has a bucket for it.
     """
-    for line in triage_note.splitlines():
-        if not line.startswith(SHADOW_RULING_MARKER):
-            continue
-        raw = line[len(SHADOW_RULING_MARKER):]
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            logger.warning('unparsable %s payload: %s', SHADOW_RULING_MARKER, exc)
-            return None
-        if not isinstance(payload, dict) or set(payload) != _PAYLOAD_KEYS:
-            logger.warning(
-                '%s payload keys are %r; expected exactly %r',
-                SHADOW_RULING_MARKER,
-                sorted(payload) if isinstance(payload, dict) else type(payload).__name__,
-                sorted(_PAYLOAD_KEYS),
-            )
-            return None
-        try:
-            return ShadowRuling(
-                ruling_class=payload['class'],
-                proposed_action=payload['proposed_action'],
-                evidence=payload['evidence'],
-                confidence=payload['confidence'],
-            )
-        except (TypeError, ValueError) as exc:
-            # ValueError is what ShadowRuling raises for EVERY rejection, and
-            # the type checks in its __post_init__ are what keep that true.
-            # TypeError is the redundant backstop on the "It NEVER raises"
-            # contract above: this parse runs once per record over the whole
-            # live queue, so a single escaping exception costs the entire
-            # measurement, and that price is too high to pay for a validator
-            # invariant enforced only in one place.
-            logger.warning('rejected %s payload: %s', SHADOW_RULING_MARKER, exc)
-            return None
-    return None
+
+    ruling: ShadowRuling | None
+    rejected: bool
+
+    def __post_init__(self) -> None:
+        if self.rejected and self.ruling is not None:
+            raise ValueError('a rejected stamp cannot also carry a ruling')
+
+
+def _decode_marker_line(line: str) -> ShadowRuling | None:
+    """Decode ONE marker line, or ``None`` with a WARNING naming what was wrong."""
+    raw = line[len(SHADOW_RULING_MARKER):]
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning('unparsable %s payload: %s', SHADOW_RULING_MARKER, exc)
+        return None
+    if not isinstance(payload, dict) or set(payload) != _PAYLOAD_KEYS:
+        logger.warning(
+            '%s payload keys are %r; expected exactly %r',
+            SHADOW_RULING_MARKER,
+            sorted(payload) if isinstance(payload, dict) else type(payload).__name__,
+            sorted(_PAYLOAD_KEYS),
+        )
+        return None
+    try:
+        return ShadowRuling(
+            ruling_class=payload['class'],
+            proposed_action=payload['proposed_action'],
+            evidence=payload['evidence'],
+            confidence=payload['confidence'],
+        )
+    except (TypeError, ValueError) as exc:
+        # ValueError is what ShadowRuling raises for EVERY rejection, and the
+        # type checks in its __post_init__ are what keep that true. TypeError is
+        # the redundant backstop on the "It NEVER raises" contract: this decode
+        # runs once per record over the whole live queue, so a single escaping
+        # exception costs the entire measurement, and that price is too high to
+        # pay for a validator invariant enforced only in one place.
+        logger.warning('rejected %s payload: %s', SHADOW_RULING_MARKER, exc)
+        return None
+
+
+def scan_triage_note(triage_note: str) -> NoteStamp:
+    """Read the shadow stamp *triage_note* carries: usable, unusable, or absent.
+
+    THE LAST MARKER LINE IS THE STAMP. ``queue.py::stamp_triage`` REPLACES the
+    note wholesale, so ``skills/escalation-watcher/SKILL.md`` has the session
+    re-send the previous note with the new marker appended on its own line; a
+    re-stamped record therefore carries several marker lines, of which only the
+    newest was ruled. Reading the first scored a SUPERSEDED proposal against the
+    observed outcome — a wrong sample, which is strictly worse than a lost one,
+    because every other way this module loses a sample lands in a bucket a
+    reader can see and a wrong sample lands in the rate itself.
+
+    An earlier line is superseded, not a fallback: when the newest marker cannot
+    be decoded the record's current proposal is simply unknown, so the answer is
+    ``rejected`` rather than the stale ruling above it. An unusable line does
+    not suppress a LATER valid one, which is the same rule read forwards.
+
+    It NEVER raises. The count sweeps every escalation in the queue and archive,
+    so an exception would turn one malformed note into a failed measurement.
+    """
+    markers = [
+        line for line in triage_note.splitlines()
+        if line.startswith(SHADOW_RULING_MARKER)
+    ]
+    if not markers:
+        return NoteStamp(ruling=None, rejected=False)
+    ruling = _decode_marker_line(markers[-1])
+    return NoteStamp(ruling=ruling, rejected=ruling is None)
+
+
+def parse_shadow_ruling(triage_note: str) -> ShadowRuling | None:
+    """The :class:`ShadowRuling` *triage_note* carries, or ``None``.
+
+    The ruling half of :func:`scan_triage_note`, for every caller that does not
+    need to tell an unreadable stamp from an absent one. ``None`` means "no
+    usable shadow ruling here" and never raises, for the reasons stated there.
+    """
+    return scan_triage_note(triage_note).ruling
 
 
 def mechanically_gated(record: Escalation) -> str | None:
@@ -380,20 +421,24 @@ class ClassAgreement:
 class AgreementReport:
     """The weekly count over one window. Every field is a decided number.
 
-    The three non-rate buckets are findings, not noise: each counts a stamp that
+    The four non-rate buckets are findings, not noise: each counts a stamp that
     must not contribute to any class's rate, and each is reported so a reader
-    can tell a small sample from a thrown-away one.
+    can tell a small sample from a thrown-away one. ``rejected_stamps`` is the
+    same discipline applied to the codec itself — a stamp that was filed and
+    could not be read is a sample this measurement lost, and a pasted
+    ``comparable=8`` must not be able to hide two of them.
 
-    TWO OF THE THREE ARE IN-WINDOW AND THE THIRD CANNOT BE, and the field names
-    say which: ``gated_stamps`` and ``self_resolved`` count records RESOLVED
-    inside ``since..until``, exactly like ``agreed``/``diverged``, so they are
-    comparable with the denominator printed beside them. ``unresolved_lifetime``
-    counts stamps still pending — a record with no resolution instant to window
-    on at all — so it is a standing backlog as of the sweep, not a number from
-    this window, and is named for that. Windowing it on ``triaged_at`` instead
-    was rejected: it would put a second time axis under one window header, and
-    the operator-facing contract (``--since``/``--until`` help text) is that the
-    window is read on ``resolved_at``.
+    THREE OF THE FOUR ARE IN-WINDOW AND THE FOURTH CANNOT BE, and the field
+    names say which: ``gated_stamps``, ``self_resolved`` and ``rejected_stamps``
+    count records RESOLVED inside ``since..until``, exactly like
+    ``agreed``/``diverged``, so they are comparable with the denominator printed
+    beside them. ``unresolved_lifetime`` counts stamps still pending — a record
+    with no resolution instant to window on at all — so it is a standing backlog
+    as of the sweep, not a number from this window, and is named for that.
+    Windowing it on ``triaged_at`` instead was rejected: it would put a second
+    time axis under one window header, and the operator-facing contract
+    (``--since``/``--until`` help text) is that the window is read on
+    ``resolved_at``.
     """
 
     since: datetime
@@ -402,6 +447,7 @@ class AgreementReport:
     gated_stamps: int
     self_resolved: int
     unresolved_lifetime: int
+    rejected_stamps: int
     resolver_tiers: Mapping[str, int]
 
     def for_class(self, ruling_class: str) -> ClassAgreement | None:
@@ -479,11 +525,12 @@ def agreement_report(
     distinguishable, so this stays a skip rather than the blanket
     ``except OSError`` the no-silent-fail-soft invariant forbids.
 
-    THE ORDER OF CHECKS IS PART OF THE CONTRACT: unresolved -> out-of-window ->
-    gated -> self_resolved -> non-human resolver -> not_comparable ->
-    agreed/diverged. The first five are all "this record must not contribute to
-    a rate at all"; putting any of them later would let an in-window matching
-    close fall through to ``agreed`` first.
+    THE ORDER OF CHECKS IS PART OF THE CONTRACT: unstamped -> unresolved ->
+    out-of-window -> unreadable -> gated -> self_resolved -> non-human resolver
+    -> not_comparable -> agreed/diverged. Everything up to ``not_comparable`` is
+    "this record must not contribute to a rate at all"; putting any of them
+    later would let an in-window matching close fall through to ``agreed``
+    first.
 
     THE WINDOW COMES BEFORE THE TWO EXCLUDED BUCKETS THAT CAN BE WINDOWED, so
     that every number printed under the window header is a number from that
@@ -495,9 +542,10 @@ def agreement_report(
 
     Pendingness is decided FIRST because a pending record has no ``resolved_at``
     to window on: it would otherwise be dropped by the window filter and vanish
-    from every bucket. That order also decides where a pending GATED stamp
-    lands — ``unresolved_lifetime``, not ``gated_stamps`` — which is the honest
-    reading: nothing has been ruled on it yet.
+    from every bucket. That order also decides where a pending GATED or pending
+    UNREADABLE stamp lands — ``unresolved_lifetime``, not ``gated_stamps`` or
+    ``rejected_stamps`` — which is the honest reading: nothing has been ruled on
+    it yet, and an unwindowable record must not enter a windowed number.
 
     ``self_resolved`` — ``triaged_by is not None and triaged_by ==
     resolved_by`` — is the bucket task 5361 made necessary.
@@ -523,6 +571,7 @@ def agreement_report(
     gated_stamps = 0
     self_resolved = 0
     unresolved_lifetime = 0
+    rejected_stamps = 0
 
     for path in iter_all_escalation_paths(Path(escalations_dir)):
         record, _reason = read_escalation_for_scan(
@@ -532,8 +581,8 @@ def agreement_report(
         if record is None:
             continue
 
-        ruling = parse_shadow_ruling(record.triage_note)
-        if ruling is None:
+        stamp = scan_triage_note(record.triage_note)
+        if stamp.ruling is None and not stamp.rejected:
             continue
 
         if record.status == 'pending':
@@ -542,6 +591,11 @@ def agreement_report(
 
         resolved_at = _resolved_at(record)
         if resolved_at is None or not since <= resolved_at <= until:
+            continue
+
+        ruling = stamp.ruling
+        if ruling is None:
+            rejected_stamps += 1
             continue
 
         if mechanically_gated(record) is not None:
@@ -579,6 +633,7 @@ def agreement_report(
         gated_stamps=gated_stamps,
         self_resolved=self_resolved,
         unresolved_lifetime=unresolved_lifetime,
+        rejected_stamps=rejected_stamps,
         resolver_tiers=MappingProxyType(dict(sorted(tiers.items()))),
     )
 
@@ -610,6 +665,7 @@ def _as_json(report: AgreementReport) -> str:
             'gated_stamps': report.gated_stamps,
             'self_resolved': report.self_resolved,
             'unresolved_lifetime': report.unresolved_lifetime,
+            'rejected_stamps': report.rejected_stamps,
             'resolver_tiers': dict(report.resolver_tiers),
         },
         indent=2,
@@ -621,10 +677,10 @@ def _as_table(report: AgreementReport) -> str:
     """Render the report so an operator can paste it and a reader can decide.
 
     Every number the adoption threshold needs is on the page: the comparable
-    DENOMINATOR beside the rate, and the three excluded buckets — always, even
-    at zero. A class whose stamps were mostly thrown out for self-agreement is
-    not a class with a small sample, and the output must not let the two look
-    alike.
+    DENOMINATOR beside the rate, and every excluded bucket — always, even at
+    zero. A class whose stamps were mostly thrown out for self-agreement, or
+    thrown out unread, is not a class with a small sample, and the output must
+    not let the two look alike.
 
     The excluded buckets sit on their own line under the window header, and the
     one that is NOT from the window says so in its own name
@@ -652,6 +708,7 @@ def _as_table(report: AgreementReport) -> str:
     lines.extend([
         '',
         f'gated_stamps={report.gated_stamps} self_resolved={report.self_resolved} '
+        f'rejected_stamps={report.rejected_stamps} '
         f'unresolved_lifetime={report.unresolved_lifetime}',
         'resolver_tiers: ' + (
             ' '.join(f'{tier}={n}' for tier, n in report.resolver_tiers.items()) or '(none)'

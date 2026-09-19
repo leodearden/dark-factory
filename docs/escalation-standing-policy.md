@@ -207,12 +207,14 @@ lands in exactly one bucket:
   leave `resolution_action` unset. Counted separately and never folded into
   either side: a class whose proposals are mostly task-side is visibly not yet
   measurable rather than falsely green.
-- `gated_stamps`, `self_resolved` — records excluded from every rate, counted
-  over the SAME window as `agreed`/`diverged`, so a small sample and a discarded
-  one cannot look alike.
+- `gated_stamps`, `self_resolved`, `rejected_stamps` — records excluded from
+  every rate, counted over the SAME window as `agreed`/`diverged`, so a small
+  sample and a discarded one cannot look alike. `rejected_stamps` counts a
+  record that carries a marker line the codec could not read: a sample this
+  measurement lost, and one a pasted report must not be able to hide.
 - `unresolved_lifetime` — stamps still pending, including a pending record that
-  would also have been gated. The one number in the report that is not from the
-  window: a pending record has no `resolved_at` to window on, so this is the
+  would also have been gated or whose marker is unreadable. The one number in
+  the report that is not from the window: a pending record has no `resolved_at` to window on, so this is the
   standing backlog as of the sweep, and its name carries that.
 
 The rate is computed over the comparable subset only, and the comparable
