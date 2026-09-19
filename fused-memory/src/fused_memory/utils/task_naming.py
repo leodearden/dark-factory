@@ -102,7 +102,7 @@ def task_node_referent(name: str) -> Referent | None:
     return referent
 
 
-def canonicalize_task_node_name(name):
+def canonicalize_task_node_name(name: str) -> str | None:
     """Return the canonical 'Task N' form of a bare task-node *name*, or None.
 
     The canonical-NAME view of :func:`task_node_referent`, which holds the
