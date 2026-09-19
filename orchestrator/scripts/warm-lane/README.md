@@ -57,11 +57,21 @@ Copied at reify HEAD `638d97d8aba4de09a603494bfb5f239426fa73ef`
 | `thin-warm-lane.sh` | `9be2bfe61a` | 2026-07-23 |
 | `warm-lane-disk-guard.sh` | `9a43111f6c` | 2026-07-19 |
 | `warm-lane-audit.sh` | `77802c19fd` | 2026-07-27 |
-| `warm-lane-degenerate-ref-check.sh` | `fae3eda3cc` | 2026-07-05 |
+| `warm-lane-degenerate-ref-check.sh` | `23e620a9b3` | 2026-09-17 |
 | `provision-warm-lane-fs.sh` | `b37e00eaa6` | 2026-07-11 |
 | `lib_live_refs.sh` | `434fd5a181` | 2026-07-28 |
 | `lib_portable.sh` | `473217c346` | 2026-06-10 |
+| `lib_task_citation.sh` | `d1fea3e2c0` | 2026-09-17 |
 | `lib_lane_state.sh` | — **dark-factory-native** | 2026-07-30 |
+
+**The last two rows are a PARTIAL re-sync, not a new anchor.** The
+`638d97d8aba4de09a603494bfb5f239426fa73ef` HEAD above still governs every
+other row. `warm-lane-degenerate-ref-check.sh` and `lib_task_citation.sh` were
+re-synced by **task 5566** at reify HEAD
+`63ac8d9b4b5faf761bf3fbe79339d56120f31431` (2026-09-17), which is where
+reify's task 7244 landed; nothing else was re-copied at that HEAD, so do not
+read the pair's dates as moving the anchor for the rest of the table. See
+Delta 11.
 
 The copy includes reify task 5572's per-lane live-consumer `/proc` check
 (merged as reify `a4bddeaa51`), which is why `lib_live_refs.sh` travels here.
@@ -77,18 +87,20 @@ Delta 4; its protected-prefix half is consumed by `warm-lane-gc.sh`'s
 `PROTECT_GLOB` default — see Delta 9 (task 3292 closed the drift leaf γ had
 deferred; Delta 6 records what γ did land).
 
-### Why these ten
+### Why these eleven
 
 PRD §2.1 audited each script for project-specific coupling. The token grep
 `cargo|rustc|RUSTFLAGS|OUT_DIR|Cargo|nextest|occt|manifold|reify-gui|tauri`
-across the nine **relocated** files yields exactly two hits, both in
-**comments** (`warm-lane-gc.sh:165`, `lib_live_refs.sh:137`) — no code path
-branches on anything reify-specific. (The tenth, `lib_lane_state.sh`, is
-dark-factory-native and deliberately reify-free; the coupling it carries runs
-the other way, to `orchestrator/src/orchestrator/`.)
+across the ten **relocated** files yields exactly two hits, both in
+**comments** — re-measured by task 5566 after `lib_task_citation.sh` joined
+them, at `warm-lane-gc.sh:231` and `lib_live_refs.sh:137`, and the new lib adds
+none. No code path branches on anything reify-specific. (The eleventh,
+`lib_lane_state.sh`, is dark-factory-native and deliberately reify-free; the
+coupling it carries runs the other way, to
+`orchestrator/src/orchestrator/`.)
 
-Three of the ten source a sibling lib, and none of those libs is among the
-seven scripts the task named — copying only seven would ship three scripts that
+Four of the eleven source a sibling lib, and none of those libs is among the
+seven scripts the task named — copying only seven would ship four scripts that
 cannot execute:
 
 - `warm-lane-gc.sh` and `warm-lane-gc-sweep.sh` `source
@@ -100,10 +112,14 @@ cannot execute:
   copied in shape from `warm-lane-gc.sh`'s; `lib_portable.sh`'s was added by
   task 3370 and is ordered **first**, so a copy carrying neither sibling
   reports it. See Delta 4 and Delta 8.
+- `warm-lane-degenerate-ref-check.sh` `source`s
+  `$SCRIPT_DIR/lib_task_citation.sh` — since task 5566 — behind the same
+  `exit 2` guard shape. That lib is the single copy of the "cites task N"
+  grammar its classification turns on. See Delta 11.
 
 `orchestrator/tests/test_warm_lane_scripts_shipped.py` pins this as executable
 behaviour: every file above is checked for presence, the owner-execute bit and
-`bash -n`, and each of the three sourcing scripts is run with `--help` from
+`bash -n`, and each of the four sourcing scripts is run with `--help` from
 this directory as proof its libs actually travelled along.
 
 ### What deliberately did NOT move
@@ -424,6 +440,12 @@ builtins, so the arithmetic needs nothing on `PATH`):
 | `provision-warm-lane-fs.sh` | `_SCRIPT_DIR`, **and** `_default_mount()`'s `dirname "$REPO_ROOT"`, its `basename "$parent"` and the `dirname "$parent"` in its ascend branch |
 | `warm-lane-audit.sh`, `warm-lane-gc.sh`, `warm-lane-gc-sweep.sh` | `SCRIPT_DIR` |
 | `thin-warm-lane.sh` | `_script_dir` (the `--seed-script` default) |
+
+A **sixth** member joined this class later, under a different task and in a
+file 3279 did not touch, so by this delta's own no-splitting rule it is
+recorded separately: `warm-lane-degenerate-ref-check.sh`'s `SCRIPT_DIR`, added
+with its `lib_task_citation.sh` source by task 5566 — see Delta 11. The
+rationale below is not restated there.
 
 Plus the six **non**-self-directory path derivations found by the later review
 pass, converted in the same task for the reason in "The `[ ... ]` vs assignment
@@ -979,6 +1001,171 @@ the 14-vs-7.0 ordering by the drift gate named above. **Block K5 is the other
 half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS
 the live-reference gate, S-pressure that it DOWNGRADES the record gate, and the
 downgrade is only safe because the gate K5 pins is still standing.
+
+### Delta 11 — `warm-lane-degenerate-ref-check.sh` sources the citation grammar and guards it
+
+**`warm-lane-degenerate-ref-check.sh` is no longer byte-identical to reify.**
+Added by **task 5566**, which also vendored `lib_task_citation.sh` (reify
+`d1fea3e2c0`) verbatim and re-synced the classifier itself to reify
+`23e620a9b3` — the two Provenance rows carrying the partial-re-sync note.
+
+**What prompted the port, and why it is not a cosmetic re-sync.** The script's
+header claimed its citation predicate "mirrors dark-factory
+`orchestrator/git_ops.py`'s citation regex byte-for-byte". That claim was
+**false in both directions**:
+`orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN` has
+**no `#<id>` arm at all**, and its conventional-commit alternative
+(`^(merge|impl|amend|fix|…)(\(\b<id>\b[):]|.*\btask/<id>\b)`) — the form task
+commits in both repos actually use — was **absent from the bash copy**. The
+measured consequence, over reify's live pool on 2026-09-17 (esc-7244-16): **81
+of 427 refs classified `degenerate` were tips whose own `kind(<id>): …` commit
+was already on main**; every one flipped to `landed` under the ported grammar
+and no `landed` ref flipped back. That matters because dark-factory reads
+`degenerate` as "zero task work" and acts on it — `harness.py`'s MARK_DONE
+recovery downgrades to a revert-and-redispatch, and
+`git_ops.py::_abort_lane_acquisition` declines to preserve the branch.
+
+**What the widening costs, stated asymmetrically — because it is asymmetric.**
+It buys the 81 refs above; what it risks is a tip that cites task N without
+being task N's work (the shape pinned as `test_warm_lane_degenerate_ref.sh`'s
+K6). Both consumers act on `degenerate`, never on `landed`, so the cost of a
+false `landed` is whatever the `degenerate` action would have been — and that
+is **not** the same at the two sites:
+
+| Site | Acts on `degenerate` by | Cost of a false `landed` |
+|---|---|---|
+| `git_ops.py::_abort_lane_acquisition` | `_delete_branch_if_on_main` | a retained, stale branch |
+| `harness.py`'s `MARK_DONE_WITH_PROVENANCE` downgrade | revert-and-redispatch instead of marking done | **a phantom-done task** — precisely what that guard's own comment ("a degenerate branch carries ZERO task work, so MARK_DONE would phantom-complete a task that never actually landed anything") gives as its reason to exist |
+
+At the harness site the only degeneracy-specific backstop is the independent
+`_branch_is_degenerate(branch, metadata)` disjunct, and it is **fail-open**:
+`orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
+40-hex sha. The `validate_landing_evidence` call below it does not bound this
+error either — it checks that the candidate commit's effect survives at main
+HEAD, and a foreign on-main tip passes that check by construction.
+
+The port is still net-positive, on the measurement rather than on a symmetry
+argument: a false `degenerate` costs re-dispatched landed work or a deleted
+branch across every ref of the commonest shape there is (81 of 427), where a
+false `landed` needs a foreign tip that names this task in a conventional-commit
+subject. Do not restate the tradeoff as "`landed` is the conservative verdict at
+both call sites" — an earlier draft of this delta's sibling prose did, and this
+task's amendment pass corrected it here, in `tests/warm-lane/README.md` Delta 7
+and in the K6 comment.
+
+**Vendored, not inlined.** The grammar could have been inlined into its one
+dark-factory consumer. It was not, for the reason stated at the top of
+"Documented deltas": inlining would manufacture a fresh content divergence in
+the very file this port exists to bring back into alignment. It would also be
+unsafe across the seam — the PRD's cutover leaves (ζ/η, then κ deleting reify's
+copies of the relocated seven) put reify's runtime on THIS copy, while reify's
+`task-branch-contamination-sweep.sh` is not one of the seven and keeps sourcing
+reify's own `lib_task_citation.sh`. An inlined dark-factory grammar would
+therefore leave the grammar's two consumers holding two copies in two repos,
+which is precisely what the lib was created to prevent.
+`task_citation_peer_ids` therefore travels with **no dark-factory
+consumer**, exactly as `lib_portable.sh`'s `allocate_free_port` and
+`portable_timeout` already do; and **no separate lib test is ported**, as for
+`lib_live_refs.sh` and `lib_portable.sh`, whose coverage arrives transitively
+through the scripts that source them.
+
+Those two facts compose into a third that is easy to miss, so state it
+plainly: transitive coverage reaches only what the consumer calls. The
+degenerate-ref suite exercises `task_citation_message_cites` (every
+classification) and `task_citation_regex_escape` (the `--branch-prefix`
+metacharacter block); `task_citation_peer_ids` — roughly a third of the file,
+including its per-digit-suffix candidate enumeration and its SIGPIPE/`pipefail`
+feeding idiom — is **unexercised here**, because nothing here calls it.
+`test_warm_lane_bash_suite.py::test_every_invocable_script_has_ported_coverage`
+names the split in its docstring rather than claiming whole-file coverage.
+
+**What the vendored lib still says about reify, and why it was left saying it.**
+`lib_task_citation.sh` is byte-identical to reify, header included, so it
+carries three references that resolve only there: line 16's rule *"DO NOT
+re-inline any ERE in a consumer … and `tests/infra/test_lib_task_citation.sh`
+fails if one reappears"*, and lines 74 and 111 citing that same file's Blocks G
+and F as the pins for the `pipefail` feeding idiom and the arbiter/harvest
+set-equality contract. **In dark-factory that test does not exist and the rule
+is documented but unenforced.** A review pass proposed annotating or trimming
+line 16 in the file itself; that was declined, and the reasons are worth
+keeping because the same fork will recur for the next vendored lib:
+
+- The precedent is already set one file over — `lib_portable.sh` carries a
+  dangling `tests/infra/test_run_gui_scripts.sh` reference and was vendored
+  verbatim regardless.
+- Every other delta in this list rides a file that had to change anyway, so it
+  costs the diff nothing. A note here would be the **only** hunk in an
+  otherwise byte-clean 171-line file, converting a free drift check into a
+  non-zero one — for a file reify was still editing the day before this port.
+- The one place a re-inline could actually happen is a **consumer**, and
+  dark-factory's only consumer already says so in its own header: *"That lib is
+  the SINGLE copy; dark-factory ports no separate lib test … so re-inlining
+  either ERE here would reintroduce the drift the lib exists to prevent with
+  nothing to catch it."* The misleading claim is contradicted at the point of
+  use, which is the point that matters.
+
+Manufacturing the missing enforcement with a grep-for-the-ERE test was
+considered and rejected in the same pass: it would pin a spelling rather than
+the property, and κ is the leaf that settles cross-repo enforcement.
+
+**The three divergences from reify's post-7244 file**, filed as one delta
+because they share a file, a task and a cause — Delta 7's own rule for not
+splitting, whose same-task limb these satisfy and Delta 8's did not:
+
+1. **A fail-loud `exit 2` guard on the new `source`.** reify does a bare
+   `source`. Task 3370 (Delta 8) deliberately closed exactly that gap on
+   `warm-lane-audit.sh`, because bash's own bare-`source` failure under
+   `set -e` is **exit 1** — the code this directory's taxonomy assigns to a
+   runtime error — where an absent sibling is *incomplete deployment: nothing
+   about the invocation could have avoided it and no retry fixes it*. Shipping
+   a new bare `source` here would reopen what 3370 closed. The guard reuses
+   `warm-lane-audit.sh`'s message template and exit code verbatim, which is why
+   `test_warm_lane_scripts_shipped.py`'s `FAIL_LOUD_FRAGMENTS` needed a
+   one-line addition rather than a new spelling. The script's **own header
+   exit-code table and `_usage()`'s `Exit codes:` line** were amended to make
+   `2` read usage/WIRING and name the sibling — Delta 8 established that
+   shipping a guard whose exit code the script's own table does not describe
+   reproduces the very defect one layer up.
+2. **A `dirname`-free `SCRIPT_DIR`.** reify's new line is
+   `"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`. This file is the **sixth
+   member of Delta 7's class** (see the pointer there); the full rationale
+   lives in Delta 7 and is not restated here.
+3. **Reify-only prose re-pointed.** reify's text names
+   `tests/infra/test_lib_task_citation.sh` and
+   `task-branch-contamination-sweep.sh`, neither of which exists in
+   dark-factory, and its `# shellcheck source=` names reify's path. Leaving
+   them would be a dangling cross-repo reference of the same kind this task was
+   filed to remove.
+
+   The re-pointed directive reads
+   `# shellcheck source=orchestrator/scripts/warm-lane/lib_task_citation.sh`
+   — **repo-root-relative, deliberately**, and it is the only `source=` in
+   *this* directory that is. A review pass read that as a break from the five
+   siblings' `scripts/<lib>.sh` spelling; measurement says otherwise on both
+   halves. Those five are un-re-pointed reify text: `scripts/lib_portable.sh`,
+   `scripts/lib_live_refs.sh` and `scripts/lib_lane_state.sh` **do not exist at
+   this repo's root** (`ls` them — every one is a `No such file` here), so they
+   name nothing. Every path dark-factory has actually re-pointed is
+   repo-root-relative instead — five in the sibling test directory naming
+   `orchestrator/tests/warm-lane/lib_warm_lane_paths.sh` and two naming
+   `orchestrator/scripts/warm-lane/lib_lane_state.sh`. This directive follows
+   *that* convention, not the one it is drifting away from. Note also that
+   nothing validates any of them: shellcheck is not installed on the reference
+   host and is invoked by no hook, script or CI job in this repo, so a `source=`
+   here is a reader's hint and a provenance record, never a checked one.
+
+The pre-existing references to `docs/design/warm-lane-degenerate-ref-seam.md`
+(absent here) are **untouched** — they predate this task and sit in the
+reify-verbatim body.
+
+**Pinned by** the K1–K6 block in
+`orchestrator/tests/warm-lane/test_warm_lane_degenerate_ref.sh` (assert floor
+70 → 81, re-measured both sides), and by
+`test_warm_lane_scripts_shipped.py::TestDegenerateRefCheckFailsLoudOnAMissingLibTaskCitation`
+plus the script's membership in
+`TestSiblingLibsTravelledWithTheScripts`'s parametrize list — the negative and
+positive halves of the guard.
 
 ## Sibling-seed defaults, and who resolves them
 

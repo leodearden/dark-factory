@@ -141,9 +141,20 @@ SCRIPT_COVERAGE = {
 #: no python3: its whole point is that the pin prevents the render, and it is
 #: NON-VACUOUS by construction — removing the pin from ``run_sweep`` flips Y2/Y3
 #: to ``88 passed, 2 failed`` (task 3655's negative control).
+#:
+#: Dark-factory task 5566 then ported reify's K1–K6 block (esc-7244-16), which
+#: pins the conventional-commit arm of the citation grammar
+#: ``warm-lane-degenerate-ref-check.sh`` now sources from
+#: ``lib_task_citation.sh``, so the degenerate-ref floor moved 70 → 81.
+#: RE-MEASURED both sides: ``Results: 70 passed, 0 failed`` before the port, and
+#: ``Results: 81 passed, 0 failed`` after the script was rewired.  The block
+#: carries no skip guard, so 81 is both floor and measured count on any host
+#: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
+#: by construction: against the pre-port inline predicate the same block reports
+#: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 70,
+    'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
     'test_thin_warm_lane.sh': 45,
     'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5)
@@ -311,12 +322,27 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     removes one whose test is still listed.  PRD leaf κ needs that condition to
     be false before it deletes reify's originals.
 
-    ``lib_live_refs.sh`` and ``lib_portable.sh`` are excluded from the key set by
-    decision, not oversight: both are ``source``-only, neither has a ``--help``
-    or any invocable entry point, and both are covered *transitively* — the
-    gc/gc-sweep ``exit 2``-on-missing-sibling assertions (``test_warm_lane_gc.sh``
-    A9) exercise ``lib_live_refs.sh``, and ``test_warm_lane_audit.sh`` exercises
-    ``lib_portable.sh`` on every audit invocation.
+    The ``lib_`` prefix is excluded from the key set by decision, not oversight:
+    every one of those files is ``source``-only, none has a ``--help`` or any
+    invocable entry point, and each is covered *transitively* by the script that
+    sources it —
+
+    * ``lib_live_refs.sh`` by the gc/gc-sweep ``exit 2``-on-missing-sibling
+      assertions (``test_warm_lane_gc.sh`` A9);
+    * ``lib_portable.sh`` by ``test_warm_lane_audit.sh``, on every audit
+      invocation;
+    * ``lib_lane_state.sh`` by the same audit suite's Block L and by
+      ``test_lane_state_lib.py``, which pins it directly;
+    * ``lib_task_citation.sh`` — TWO of its three exports, by
+      ``test_warm_lane_degenerate_ref.sh``: every classification runs through
+      ``task_citation_message_cites``, and the ``--branch-prefix``
+      metacharacter block through ``task_citation_regex_escape``.  Its third,
+      ``task_citation_peer_ids``, has no dark-factory caller (the sole one is
+      reify's ``task-branch-contamination-sweep.sh``, which is not among the
+      relocated scripts) and therefore travels UNEXERCISED — the standing gap
+      ``lib_portable.sh``'s ``allocate_free_port`` and ``portable_timeout``
+      already carry, recorded in
+      ``orchestrator/scripts/warm-lane/README.md`` Delta 11 (task 5566).
     """
     invocable = {
         p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')
