@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
@@ -767,8 +768,10 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             ),
             'df3082-pair-deadverify': hangs_until(asyncio.Event()),
         })
+        clock = FakeClock()
         worker = make_lane(
             git_ops, queue, verifier=verifier, escalation_queue=fake_eq,
+            clock=clock,
         )
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
@@ -805,6 +808,24 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             worker._run_inflight_verify(item_cl, lease), timeout=15.0,
         )
         assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
+
+        # The dead-verify drive below only TERMINATES because the abandon poll
+        # takes its cadence from the injected clock (task 5485): the fake
+        # charges `mono` the full poll interval per wait, so the no-progress
+        # budget elapses in ten polls costing no real time. Pinned here, off
+        # the cheap control drive above, so reverting that poll to a bare
+        # `asyncio.wait` fails with THIS message rather than as an opaque 15 s
+        # TimeoutError below.
+        assert clock.waits, (
+            'the abandon poll recorded no ClockPort.wait_for_any call — the lane '
+            'is waiting on something other than the clock it measures its '
+            'no-progress budget against'
+        )
+        assert set(clock.waits) == {worker.VERIFY_ABANDON_POLL_SECS}, (
+            f'every ClockPort.wait_for_any must wait exactly '
+            f'VERIFY_ABANDON_POLL_SECS ({worker.VERIFY_ABANDON_POLL_SECS}s): '
+            f'{clock.waits!r}'
+        )
 
         # ── THE DEFECT: dead-verify no-progress abort (:13775/:13776) ────────
         req_dv, item_dv = await _make_merged_item(
