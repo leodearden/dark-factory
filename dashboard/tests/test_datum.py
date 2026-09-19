@@ -1,7 +1,7 @@
 """Tests for dashboard.data.datum — the Datum envelope and its contract invariants.
 
 Pins the envelope declared in ``plans/dashboard-one-datum-one-path-prd.md``
-("The `Datum` envelope"): the five wire keys, the four states, and the three
+("The `Datum` envelope"): the five wire keys, the four states, and the
 machine-checked invariants. Every timestamp here is a fixed tz-aware literal —
 these tests read no clock, exactly as the code under test does not.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from shared.task_statuses import TaskStatus
@@ -301,6 +301,54 @@ def test_validate_accepts_a_non_fresh_datum_older_than_its_bound(state):
     """Being past the bound is what `stale` and `lower_bound` exist to say."""
     as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 100)
     validate_datum(datum_measured_at(as_of, state=state, reason='refresh failed'), SERVED_AT)
+
+
+# ---------------------------------------------------------------------------
+# Invariant 4 — every instant is tz-aware. A naive datetime is a wall-clock
+# reading, not an instant: it makes the freshness subtraction raise a bare
+# TypeError (which sails past the access layer's `except DatumContractError`)
+# and it crosses the wire with no offset, where `new Date(...)` reads it as
+# the BROWSER's local time. Both are the silent lie the envelope removes.
+# ---------------------------------------------------------------------------
+
+NAIVE = datetime(2026, 9, 18, 12, 0, 0)
+BERLIN = timezone(timedelta(hours=2))
+
+
+def test_validate_rejects_a_naive_as_of_as_a_contract_error_not_a_type_error():
+    """`datetime.utcnow()` reaches here as a defect the caller can catch, not a crash."""
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(datum_measured_at(NAIVE), SERVED_AT)
+    assert excinfo.value.invariant is DatumInvariant.TZ_AWARE
+    assert 'as_of' in str(excinfo.value)
+
+
+def test_validate_rejects_a_naive_served_at():
+    """The serving instant is half of the same subtraction, so it is held to the same rule."""
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(fresh_datum(), NAIVE)
+    assert excinfo.value.invariant is DatumInvariant.TZ_AWARE
+    assert 'served_at' in str(excinfo.value)
+
+
+def test_validate_names_every_naive_instant_at_once():
+    """Both halves wrong is one raise, not two runs."""
+    with pytest.raises(DatumContractError) as excinfo:
+        validate_datum(datum_measured_at(NAIVE), NAIVE)
+    message = str(excinfo.value)
+    assert 'as_of' in message
+    assert 'served_at' in message
+
+
+def test_validate_accepts_an_aware_as_of_in_another_offset():
+    """Aware is the rule, not UTC: `parse_timestamp_or_warn` preserves the source offset."""
+    validate_datum(datum_measured_at(SERVED_AT.astimezone(BERLIN)), SERVED_AT)
+
+
+def test_to_wire_renders_an_aware_non_utc_as_of_in_utc():
+    """The PRD spells `as_of` as ISO-8601 UTC; a `+02:00` offset would contradict it."""
+    wire = datum_measured_at(AS_OF.astimezone(BERLIN)).to_wire()
+    assert wire['as_of'] == '2026-09-18T12:00:00+00:00'
 
 
 # ---------------------------------------------------------------------------

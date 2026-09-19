@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
@@ -57,9 +57,10 @@ class Datum(Generic[T]):
 
     Attributes:
         value: The payload, or ``None`` when the state is ``UNKNOWN``.
-        as_of: When the payload was measured, tz-aware; ``None`` when
-            ``UNKNOWN``. Held as a ``datetime`` so arithmetic stays exact —
-            the ISO-8601 text exists only on the wire.
+        as_of: When the payload was measured; ``None`` when ``UNKNOWN``.
+            Held as a ``datetime`` so arithmetic stays exact — the ISO-8601
+            text exists only on the wire. Must be tz-aware, which
+            :func:`validate_datum` enforces rather than assuming.
         state: How fresh the measurement is.
         reason: The producer's verbatim explanation; required for every state
             but ``FRESH``.
@@ -80,6 +81,15 @@ class Datum(Generic[T]):
         A payload satisfying :class:`WireShaped` renders itself; anything else
         passes through unchanged.
 
+        ``as_of`` is normalised to UTC, because the contract spells it as
+        ISO-8601 UTC and ``shared.timestamps.parse_timestamp_or_warn``
+        explicitly preserves a source offset instead of converting it — so a
+        producer can hand us an honest ``+02:00`` instant that must still
+        cross the wire as ``+00:00``. This presumes a datum that passed
+        :func:`validate_datum`: on a NAIVE datetime ``astimezone`` would
+        silently read the SERVER's local zone, which is why tz-awareness is a
+        checked invariant rather than a docstring promise.
+
         Note that ``datum.py`` imports NOTHING from ``census.py`` — the
         dependency runs the other way. The Protocol is what keeps the envelope
         and its payload families orthogonal: a new payload family is added by
@@ -88,7 +98,7 @@ class Datum(Generic[T]):
         """
         return {
             'value': self.value.to_wire() if isinstance(self.value, WireShaped) else self.value,
-            'as_of': None if self.as_of is None else self.as_of.isoformat(),
+            'as_of': None if self.as_of is None else self.as_of.astimezone(UTC).isoformat(),
             'state': self.state.value,
             'reason': self.reason,
             'freshness_bound_seconds': self.freshness_bound_seconds,
@@ -103,6 +113,7 @@ class DatumInvariant(enum.StrEnum):
     """
 
     UNKNOWN_TRIAD = 'unknown_triad'
+    TZ_AWARE = 'tz_aware'
     REASON_REQUIRED = 'reason_required'
     FRESHNESS_BOUND = 'freshness_bound'
 
@@ -130,6 +141,15 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
             payload actually carries, not about whenever this runs. Only the
             freshness invariant reads it.
 
+    Every instant is required to be TZ-AWARE. A naive one is a wall-clock
+    reading rather than an instant: it makes the freshness subtraction below
+    raise a bare ``TypeError``, which sails straight past the access layer's
+    ``except DatumContractError`` and crashes payload shaping instead of
+    degrading it, and it crosses the wire with no offset, where the SPA's
+    ``new Date(...)`` reads it as the BROWSER's local time. Note that
+    ``datetime.utcnow()`` — the usual source of one — is NOT caught by
+    ``test_clock_discipline.py``'s ``.now(...)`` matcher.
+
     A NEGATIVE age — a measurement instant after *served_at*, which means a
     producer or a clock is wrong — is REFUSED under the freshness invariant
     rather than clamped to zero. Clamping would let a skewed producer's value
@@ -151,6 +171,19 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
             f'state, value and as_of disagree on whether a measurement exists: '
             f'state={datum.state.value!r}, value={datum.value!r}, '
             f'as_of={datum.as_of!r} ({expectation})',
+        )
+
+    naive = [
+        (name, moment)
+        for name, moment in (('as_of', datum.as_of), ('served_at', served_at))
+        if moment is not None and moment.utcoffset() is None
+    ]
+    if naive:
+        raise DatumContractError(
+            DatumInvariant.TZ_AWARE,
+            f'every instant on a datum must be tz-aware, so it names one moment '
+            f'rather than a local-clock reading: '
+            f'{", ".join(f"{name}={moment!r}" for name, moment in naive)}',
         )
 
     if datum.state is not DatumState.FRESH and not (datum.reason or '').strip():
