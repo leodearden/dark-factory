@@ -91,6 +91,18 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
 # template is swept in its COMMITTED form rather than only after rendering.
 _UV_PATH_SENTINEL = "__UV_PATH__"
 
+# The one markdown file that OPTS BACK IN to both sweeps, mirroring
+# tests/scripts/test_systemd_restart_backoff.py:61-64.  The `**/*.md` exclusion
+# above is kept for the reason that module states — a doc may legitimately quote
+# the DEFECT, and plans/afk-C1-systemd.md is the live as-built record that must
+# not be edited — but this file is not prose ABOUT a unit, it is the unit new
+# projects are minted from: its own line 16 says the scripts/orchestrator-*
+# .service files are "cp'd verbatim by setup-host.sh" and points at
+# orchestrator-reify.service as the model.  A copy-source still showing the old
+# flags mints this defect into every new project, one unit at a time, with
+# nothing in the sweep able to see it happen.
+_FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
+
 # Run-level flags that take a separate value token, so the walk below consumes
 # the value instead of mistaking it for the command token and stopping early.
 # `--project` is the one every unit here uses; the rest are uv's other
@@ -294,6 +306,45 @@ def discover_uv_run_units() -> list[str]:
     return units
 
 
+def swept_paths() -> list[str]:
+    """Every path both arms below run against: the discovered units plus the opt-in.
+
+    The markdown opt-in is added UNCONDITIONALLY — never as a skip, mirroring
+    test_systemd_restart_backoff.py:61-64 — so the exclusion of the `**/*.md`
+    category costs this file no coverage.  Its guard is therefore strictly
+    stronger than the sweep, not a weaker substitute for it.
+    """
+    return sorted([*discover_uv_run_units(), _FACTORY_INIT_REFERENCE])
+
+
+def test_factory_init_reference_is_swept() -> None:
+    """The opt-in copy-source must exist and still parse as a `uv run` command.
+
+    Without this, a rename of the file or a reformat of its fenced ini block
+    would drop the ONLY copy-source out of both arms silently — the file would
+    simply stop being a path the parametrize produced, and two tests would
+    quietly become fourteen cases instead of fifteen with nothing red.  That is
+    the same silent-shrink hazard the coverage guard above exists for, and it
+    needs its own statement here because this path does not come from discovery.
+    """
+    path = REPO_ROOT / _FACTORY_INIT_REFERENCE
+    assert path.exists(), (
+        f"{_FACTORY_INIT_REFERENCE} does not exist. New projects' supervised "
+        "units are copied from it, so if it moved this guard must follow it "
+        "rather than silently stop checking anything."
+    )
+    flags = uv_run_level_flags(
+        logical_exec_start(path.read_text(encoding="utf-8"), _FACTORY_INIT_REFERENCE)
+    )
+    assert flags is not None, (
+        f"{_FACTORY_INIT_REFERENCE}'s ExecStart no longer parses as a `uv run` "
+        "command, so both arms below would pass it vacuously. Either the fenced "
+        "ini block was reformatted past logical_exec_start, or the command "
+        "changed shape — check it deliberately rather than letting the repo's "
+        "only unit copy-source leave the sweep."
+    )
+
+
 def test_discovery_covers_every_known_uv_run_unit() -> None:
     """Coverage guard: the swept set must be non-empty and exactly the known units.
 
@@ -342,7 +393,7 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
     )
 
 
-@pytest.mark.parametrize("rel_path", discover_uv_run_units(), ids=lambda p: p)
+@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
 def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
     """A unit's `uv run` must carry `--no-sync` among its RUN-LEVEL flags.
 
@@ -368,7 +419,7 @@ def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
     )
 
 
-@pytest.mark.parametrize("rel_path", discover_uv_run_units(), ids=lambda p: p)
+@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
 def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
     """Beside `--no-sync`, a run-level `--frozen`/`--locked` is a no-op — so forbid it.
 
