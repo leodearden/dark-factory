@@ -55,9 +55,19 @@ if pgrep -u "$(id -u)" -f "$PATTERN" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Syncing runtime venv against uv.lock on the .python-version pin (3.13)"
+echo "==> Syncing the WHOLE workspace against uv.lock on the .python-version pin (3.13)"
 cd "$REPO_ROOT"
-"$UV" sync --project orchestrator
+# --all-packages, NEVER a member-scoped --project/--package. Measured on uv
+# 0.11.6: `uv sync --project <member>` is EXACT and uninstalls every package no
+# selected member needs -- it removed a sibling workspace member and its
+# dependency from the shared root .venv. That made the script that exists to
+# REPAIR the shared venv prune it instead. `uv sync --inexact --project <member>`
+# does not prune, but it also cannot install the other members' deps, so it
+# cannot repair the one .venv the seven orchestrators, the dashboard, the load
+# sampler and fused-memory all resolve against. --all-packages is the only form
+# that does the job. Same norm SETUP.md states from the other direction
+# ("Always --all-packages, never a bare uv sync", task 4539).
+"$UV" sync --all-packages
 
 echo "==> Runtime interpreter (expect 3.13.x — fails loudly if a ghost reappears):"
 "$REPO_ROOT/.venv/bin/python" --version
