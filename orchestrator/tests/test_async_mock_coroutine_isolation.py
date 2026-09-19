@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import gc
 import inspect
-from unittest.mock import AsyncMock
+import threading
+from unittest.mock import AsyncMock, AsyncMockMixin
 
 import pytest
-from _orch_helpers import drain_async_mock_coroutines
+from _orch_helpers import drain_async_mock_coroutines, track_async_mock_coroutines
 
 
 def _count_open_mock_coros() -> int:
@@ -153,3 +154,64 @@ def test_autouse_drain_fixture_is_active(request):
         'in conftest.py so it runs after every test and prevents orphaned '
         'AsyncMock coroutines from being GC-promoted into sibling tests.'
     )
+
+
+def test_orphan_created_on_a_background_thread_is_closed():
+    created = []
+    thread = threading.Thread(target=lambda: created.append(AsyncMock()()))
+    thread.start()
+    thread.join()
+
+    assert drain_async_mock_coroutines() >= 1
+    assert inspect.getcoroutinestate(created[0]) == inspect.CORO_CLOSED
+
+
+def test_drain_tolerates_a_thread_calling_mocks_while_it_runs():
+    """Task 5668: a registry that is iterated raised here in 170 of 8,139 drains on CPython 3.13.9.
+
+    The thread's coroutines are born and die while the drain works through the
+    long-lived ones, which is what resizes an iterated container under it.
+    """
+    long_lived = [AsyncMock()() for _ in range(2000)]
+    stop = threading.Event()
+
+    def churn_mock_coroutines():
+        mock = AsyncMock()
+        while not stop.is_set():
+            mock().close()
+
+    thread = threading.Thread(target=churn_mock_coroutines)
+    thread.start()
+    try:
+        for _ in range(200):
+            drain_async_mock_coroutines()
+    finally:
+        stop.set()
+        thread.join()
+
+    assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in long_lived)
+
+
+def test_drain_finds_orphans_without_searching_the_heap(monkeypatch):
+    """Task 5668: a per-test gc.get_objects() search was 88% of a full-suite run's CPU."""
+    coro = AsyncMock()()
+
+    def heap_search_is_forbidden():
+        raise AssertionError('drain_async_mock_coroutines searched the heap')
+
+    monkeypatch.setattr(gc, 'get_objects', heap_search_is_forbidden)
+
+    assert drain_async_mock_coroutines() >= 1
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_tracking_does_not_hide_a_leak_that_refcounting_reclaims():
+    with pytest.warns(RuntimeWarning, match='never awaited'):
+        AsyncMock()()
+
+
+def test_tracking_refuses_an_interpreter_whose_mock_call_path_it_cannot_follow(monkeypatch):
+    monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', lambda self, *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match='_execute_mock_call'):
+        track_async_mock_coroutines()
