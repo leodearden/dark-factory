@@ -153,9 +153,11 @@ _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
 })
 
 #: The reversible actions that are ALSO C1 ``resolution_action`` values, so an
-#: observed outcome can be checked against the proposal. The rest of
+#: observed outcome CAN be checked against the proposal. The rest of
 #: :data:`REVERSIBLE_ACTIONS` is task-side and leaves ``resolution_action``
-#: unset, which is what the report's ``not_comparable`` bucket counts.
+#: unset. Membership here makes a proposal comparable-in-principle only: the
+#: report also needs the observed side to be present, and counts both absences
+#: in the same ``not_comparable`` bucket.
 #:
 #: Must equal ``REVERSIBLE_ACTIONS & set(escalation.server.RESOLVE_ACTIONS)``,
 #: and is pinned in lockstep by a cross-module TEST import rather than derived
@@ -385,11 +387,13 @@ class ClassAgreement:
     """How one shadowed class fared over the report window.
 
     ``agreed`` and ``diverged`` are the COMPARABLE outcomes: the stamped
-    proposal was a C1 action, so the record's observed ``resolution_action``
-    could be checked against it. ``not_comparable`` counts proposals whose
-    action is task-side and leaves no C1 trace — kept as its own number rather
-    than folded into either side, so the denominator the adoption threshold is
-    read off is one a reader can see.
+    proposal was a C1 action AND the record recorded one, so the two could be
+    checked against each other. ``not_comparable`` counts the records where one
+    of those sides is missing — a task-side proposal, which leaves no C1 trace,
+    or an observed ``resolution_action`` of ``None``, which leaves nothing to
+    compare against. Either way it is kept as its own number rather than folded
+    into either side, so the denominator the adoption threshold is read off is
+    one a reader can see, and missing data never reads as disagreement.
     """
 
     ruling_class: str
@@ -610,7 +614,16 @@ def agreement_report(
         if tier != 'human':
             continue
 
-        if ruling.proposed_action not in COMPARABLE_ACTIONS:
+        # COMPARABILITY IS A PROPERTY OF BOTH SIDES, and the observed side can
+        # be missing on a record whose proposal is perfectly comparable:
+        # ``server.py::resolve_issue`` documents a live legacy class (D10) that
+        # resolves without a ``resolution_action``, and the pre-stamp that would
+        # have filled it fires only on the MCP path. Scored against a C1
+        # proposal that becomes a silent ``diverged`` for every such record —
+        # depressing the single number adoption is read off, in the direction
+        # that looks like disagreement rather than like missing data.
+        if (ruling.proposed_action not in COMPARABLE_ACTIONS
+                or record.resolution_action is None):
             not_comparable[ruling.ruling_class] += 1
         elif record.resolution_action == ruling.proposed_action:
             agreed[ruling.ruling_class] += 1

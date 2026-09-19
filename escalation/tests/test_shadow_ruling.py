@@ -752,6 +752,52 @@ class TestAgreementBuckets:
         assert klass is not None and klass.agreed == 1
 
 
+class TestComparabilityIsDecidedFromBothSides:
+    """A C1 proposal against a record that recorded no `resolution_action` has
+    nothing to be checked against.
+
+    `escalation/src/escalation/server.py::resolve_issue` documents this shape as
+    live legacy (D10): a caller that resolves without a `resolution_action`
+    leaves it unset, and the pre-stamp that would have filled it fires only on
+    the MCP path — an in-process `queue.resolve` under a human-tier attribution
+    does not. Scoring that `diverged` silently depresses the single number
+    adoption is read off.
+    """
+
+    def test_an_absent_observed_action_is_not_comparable_never_diverged(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='close_only'), observed_action=None)
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 1)
+        assert klass.agreement_rate is None, 'nothing to compare is not a disagreement'
+
+    def test_it_does_not_depress_a_class_that_is_otherwise_unanimous(self, tmp_path: Path):
+        """The failure this prevents, stated as a number: one legacy record
+        must not turn a 100% class into 50%."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='close_only'), observed_action='close_only')
+        fixture.stamped_and_resolved(_ruling(action='close_only'), observed_action=None)
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert klass.agreement_rate == 1.0
+        assert (klass.comparable, klass.total) == (1, 2), (
+            'the uncomparable record stays visible in the total, out of the denominator'
+        )
+
+    def test_a_present_observed_action_still_compares(self, tmp_path: Path):
+        """The positive half, so the two above read as the absent side being
+        handled rather than the comparison being dead."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(action='resume'), observed_action='close_only')
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 1, 0)
+
+
 class TestSelfResolvedBucket:
     """The bucket task 5361 made necessary.
 

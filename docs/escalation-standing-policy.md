@@ -201,12 +201,15 @@ to produce one: a violation costs the sample either way.
 Each stamped proposal is compared against the record's observed outcome and
 lands in exactly one bucket:
 
-- `agreed` / `diverged` — the proposal was a C1 action, so the observed
-  `resolution_action` could be checked against it.
-- `not_comparable` — the proposal was one of the three task-side actions, which
-  leave `resolution_action` unset. Counted separately and never folded into
-  either side: a class whose proposals are mostly task-side is visibly not yet
-  measurable rather than falsely green.
+- `agreed` / `diverged` — the proposal was a C1 action *and* the record recorded
+  one, so the two could be checked against each other.
+- `not_comparable` — one of those two sides is missing: the proposal was one of
+  the three task-side actions, which leave `resolution_action` unset, or the
+  record itself recorded no `resolution_action` (the legacy shape D10 in
+  `escalation/src/escalation/server.py::resolve_issue` describes). Counted
+  separately and never folded into either side: a class whose proposals are
+  mostly task-side is visibly not yet measurable rather than falsely green, and
+  missing data never reads as disagreement.
 - `gated_stamps`, `self_resolved`, `rejected_stamps` — records excluded from
   every rate, counted over the SAME window as `agreed`/`diverged`, so a small
   sample and a discarded one cannot look alike. `rejected_stamps` counts a
