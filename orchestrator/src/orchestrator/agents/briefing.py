@@ -1874,13 +1874,26 @@ Handle this escalation, then call `resolve_issue` with a summary.
             )
 
         if not recalled_sections:
+            # The per-section notices are owed to the reader whether or not
+            # some OTHER query happened to render: D6 conditions the failure
+            # line on a per-query failure, and `_failed_stores` promises a
+            # partial store outage is reported "even when nothing survived
+            # the cross-project filter". Dropping them here made a broken
+            # dispatch read as a healthy empty corpus — byte-identically.
+            #
+            # The family line stays FIRST: scripts/legibility/digest.py
+            # recognises this block by leading substring, and `outage` keeps
+            # meaning "nothing worked" (the streak predicate above is
+            # untouched), so a partial failure still leads with
+            # MEMORY_EMPTY_NOTICE and a total one with MEMORY_OUTAGE_NOTICE.
             notice = (
                 MEMORY_OUTAGE_NOTICE.format(reasons=', '.join(reasons))
                 if outage else MEMORY_EMPTY_NOTICE
             )
+            body = '\n\n'.join([notice, *notices])
             if drop_note:
-                notice += f'\n\n_Note: {drop_note}._'
-            return f'# Context\n\n{notice}'
+                body += f'\n\n_Note: {drop_note}._'
+            return f'# Context\n\n{body}'
 
         # recalled_sections is non-empty: gate the provenance caveat on that
         # fact alone, NOT on memory_unavailable — a later query failing must
