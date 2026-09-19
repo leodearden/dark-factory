@@ -1235,6 +1235,26 @@ def _params() -> dict[str, object]:
     }
 
 
+class Status(Enum):
+    """Which green a zero exit is — three states that are not interchangeable.
+
+    :attr:`CLEAN` is the only one that means the WHOLE tree was measured against
+    a real baseline and nothing was in excess.  The other two are green with a
+    stated limit, and saying which limit applies is the point: a reader who sees
+    a bare zero over a tree of undisposed markers concludes the scanner is
+    broken, and a reader who sees no label at all concludes the gate is live when
+    it is enforcing nothing.
+
+    Red has no label here, and deliberately so: a run with violations reports
+    how many, because a status word beside a finding would read as a verdict on
+    the tree rather than on the run's reach.
+    """
+
+    CLEAN = 'clean'
+    PARTIAL = 'partial'
+    ADVISORY = 'advisory'
+
+
 @dataclass(frozen=True)
 class Request:
     """One invocation's resolved inputs, shared by every verb.
@@ -1253,6 +1273,28 @@ class Request:
     def scoped(self) -> bool:
         """Whether this run measured only part of the tree."""
         return bool(self.scope)
+
+
+def _status(request: Request) -> Status:
+    """Which green *request*'s zero would be.
+
+    ABSENCE IS DECIDED HERE, BY AN EXPLICIT EXISTENCE CHECK, and never by
+    catching ``shared.ratchet.BaselineUnusable``.  That kernel refusal collapses
+    absent, undecodable, unparseable, misshapen and wrong-schema into one case
+    because they mean one thing to its callers; this consumer is the one place
+    where they do not.  D12 makes absence a legitimate pre-κ1 state, while a
+    baseline that exists and cannot be read is a broken instrument.  Reaching the
+    advisory path by catching the refusal would report a corrupt or truncated
+    baseline as a clean tree, which is the silent fail-soft an empty baseline
+    causes (INV-11).
+
+    ABSENCE OUTRANKS SCOPE.  A scoped run with no baseline is enforcing nothing
+    at all, which is the stronger of the two limits and therefore the one worth
+    the label.
+    """
+    if not request.baseline.exists():
+        return Status.ADVISORY
+    return Status.PARTIAL if request.scoped else Status.CLEAN
 
 
 def _measure(request: Request) -> tuple[Scan, Classification]:
@@ -1344,12 +1386,27 @@ def _excess_violations(
     )
 
 
-def _headline(label: str, violations: tuple[Violation, ...]) -> str:
-    """The report's first word: which green this is, or how big the red is."""
+def _count(total: int, noun: str) -> str:
+    """*total* and *noun*, pluralised by the only rule this report needs."""
+    return f'{total} {noun}' if total == 1 else f'{total} {noun}s'
+
+
+def _figure(total: int | None) -> str:
+    """A ratchet figure, or ``n/a`` when this run's view cannot honestly give one.
+
+    THE DISTINCTION IS NOT COSMETIC.  Zero means *measured, and nothing there*;
+    ``n/a`` means *not measured*, which is what an advisory run's excess and a
+    scoped run's slack both are.  Printing 0 for either would be a number that is
+    wrong in the direction that reassures.
+    """
+    return 'n/a' if total is None else str(total)
+
+
+def _headline(status: Status, violations: tuple[Violation, ...]) -> str:
+    """The report's first words: which green this is, or how big the red is."""
     if not violations:
-        return label
-    plural = '' if len(violations) == 1 else 's'
-    return f'{len(violations)} violation{plural}'
+        return status.value
+    return _count(len(violations), 'violation')
 
 
 def _report_line(
@@ -1357,8 +1414,8 @@ def _report_line(
     classification: Classification,
     *,
     headline: str,
-    excess_total: int,
-    slack_total: int,
+    excess_total: int | None,
+    slack_total: int | None,
 ) -> str:
     """The one-line summary every verb prints to stdout.
 
@@ -1368,9 +1425,10 @@ def _report_line(
     """
     counts = classification.counts
     return (
-        f'{headline}: {len(scan.sites)} suppression sites in {scan.files_tokenized} of '
-        f'{scan.files_enumerated} tracked files; {sum(counts.values())} unowned in '
-        f'{len(counts)} keys; excess {excess_total}, slack {slack_total}'
+        f'{headline}: {_count(len(scan.sites), "suppression site")} in '
+        f'{scan.files_tokenized} of {scan.files_enumerated} tracked files; '
+        f'{sum(counts.values())} unowned in {_count(len(counts), "key")}; '
+        f'excess {_figure(excess_total)}, slack {_figure(slack_total)}'
     )
 
 
@@ -1382,40 +1440,67 @@ def _check(request: Request, kernel: ModuleType) -> int:
     and the ratchet's excess.  Either alone is exit 1.
     """
     scan, classification = _measure(request)
-    baseline = kernel.load(request.baseline)
-    current = _enumeration(classification, kernel)
-    over = dict(kernel.excess(current, baseline))
-    remaining = dict(kernel.slack(current, baseline))
+    status = _status(request)
+    violations = classification.violations
+    excess_total: int | None = None
+    slack_total: int | None = None
 
-    violations = classification.violations + _excess_violations(over, classification)
+    if status is not Status.ADVISORY:
+        baseline = kernel.load(request.baseline)
+        current = _enumeration(classification, kernel)
+        over = dict(kernel.excess(current, baseline))
+        excess_total = sum(over.values())
+        violations += _excess_violations(over, classification)
+        if not request.scoped:
+            slack_total = sum(kernel.slack(current, baseline).values())
+
     print(
         _report_line(
             scan,
             classification,
-            headline=_headline('clean', violations),
-            excess_total=sum(over.values()),
-            slack_total=sum(remaining.values()),
+            headline=_headline(status, violations),
+            excess_total=excess_total,
+            slack_total=slack_total,
         )
     )
+    if status is Status.ADVISORY:
+        print(_ADVISORY_NOTICE.format(baseline=request.baseline))
     for violation in violations:
         print(violation.render(), file=sys.stderr)
     return 1 if violations else 0
 
 
 def _seed(request: Request, kernel: ModuleType) -> int:
-    """Write *request*'s tree as a fresh baseline — κ1's one-time verb."""
+    """Write *request*'s tree as a fresh baseline — κ1's one-time verb.
+
+    The status is :attr:`Status.CLEAN` by construction rather than by
+    measurement: a baseline written from this very scan has no excess over it,
+    and the run is whole-tree because a scoped seed is refused.  Both ratchet
+    figures are ``n/a``, because nothing was compared — printing 0 for an excess
+    that was never computed would be the reassuring-direction error
+    :func:`_figure` exists to refuse.
+    """
     scan, classification = _measure(request)
     kernel.dump(_enumeration(classification, kernel), request.baseline)
     print(
         _report_line(
             scan,
             classification,
-            headline=f'seeded {request.baseline}',
-            excess_total=0,
-            slack_total=0,
+            headline=f'{Status.CLEAN.value} -- seeded {request.baseline}',
+            excess_total=None,
+            slack_total=None,
         )
     )
     return 0
+
+
+#: What a green run with no baseline tells the reader, so the next question —
+#: "then why is this green?" — is answered in the same output.
+_ADVISORY_NOTICE = (
+    'no baseline at {baseline}, so nothing is enforced yet: every suppression here is '
+    'reported and none is a violation. The baseline is seeded once, on main, by the '
+    'operator step κ1; runs are advisory until then'
+)
 
 
 _EPILOG = """exit codes:

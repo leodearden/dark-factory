@@ -1414,7 +1414,7 @@ def test_a_grandfathered_dead_marker_is_green_and_still_counted(
     assert _check(tmp_path, baseline) == 0
 
     report = capsys.readouterr().out
-    assert '1 unowned in 1 keys' in report
+    assert '1 unowned in 1 key' in report
 
 
 def test_a_second_copy_of_a_grandfathered_dead_line_is_in_excess(tmp_path: Path, capsys):
@@ -1436,3 +1436,92 @@ def test_a_second_copy_of_a_grandfathered_dead_line_is_in_excess(tmp_path: Path,
 
     lines = capsys.readouterr().err.strip().splitlines()
     assert [line.split(':')[1] for line in lines] == ['1', '2']
+
+
+def test_with_no_baseline_yet_a_whole_tree_of_undisposed_markers_is_advisory(
+    tmp_path: Path, capsys
+):
+    """BOUNDARY SCENARIO 11 — the pre-κ1 state, which is every tree until the
+    cutover lands.
+
+    D12 makes baseline ABSENCE a legitimate state, so the gate is green and says
+    it is enforcing nothing.  The label has to be its own word rather than a
+    silent ``clean``: a reader who sees ``clean`` over a tree of undisposed
+    markers concludes the scanner is broken, and a reader who sees nothing at all
+    concludes the gate is live when it is not.  The message names the step that
+    seeds the baseline, so the next question is answered in the same line.
+    """
+    baseline = _write_fixture_tree(tmp_path, {'m.py': _grandfathered(5)})
+    capsys.readouterr()
+
+    assert not baseline.exists()
+    assert _check(tmp_path, baseline) == 0
+
+    report = capsys.readouterr().out
+    assert 'advisory' in report
+    assert 'κ1' in report
+
+
+def test_a_scoped_check_over_a_clean_scope_is_partial_and_ignores_the_rest(
+    tmp_path: Path, capsys
+):
+    """The label exists because a scoped green is a WEAKER claim, and the one
+    place that matters is the finding it did not look for.
+
+    Scoped ``--check`` is sound in one direction only, which is why D12 keeps it:
+    dropping sites can lower a key's current count and so only ever UNDER-reports
+    excess — it can never manufacture a violation.  Slack is the mirror and is
+    therefore UNSOUND from a partial view (every unscanned baseline key reads as
+    headroom), so the report declines to put a number on it rather than printing
+    one that is wrong.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'pkg/kept.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    _revise(tmp_path, {'other/fresh.py': 'b = 2  # type: ignore[attr-defined]\n'})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline, 'pkg') == 0
+
+    report = capsys.readouterr()
+    assert 'partial' in report.out
+    assert 'clean' not in report.out
+    assert 'slack n/a' in report.out
+    assert report.err == ''
+
+    assert _check(tmp_path, baseline) == 1
+
+
+@pytest.mark.parametrize('damage', ['truncated', 'not-json', 'wrong-schema'])
+def test_a_baseline_that_exists_but_cannot_be_read_is_never_green(
+    tmp_path: Path, capsys, damage: str
+):
+    """THE ANTI-FAIL-SOFT CASE, and the whole reason absence is detected by an
+    explicit existence check instead of by catching ``BaselineUnusable``.
+
+    ``shared.ratchet.load`` collapses absent, undecodable, unparseable, misshapen
+    and wrong-schema into ONE refusal, because to the kernel's callers they mean
+    one thing.  This consumer is the one place where they do not: absence is a
+    legitimate pre-κ1 state and everything else is a broken instrument.  Reaching
+    the advisory path by catching that refusal would report a corrupt baseline as
+    a clean tree — exactly the silent fail-soft the kernel's own docstring says an
+    empty baseline causes (INV-11).
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    seeded = baseline.read_text(encoding='utf-8')
+    if damage == 'truncated':
+        baseline.write_text(seeded[: len(seeded) // 2], encoding='utf-8')
+    elif damage == 'not-json':
+        baseline.write_text('this is not a baseline\n', encoding='utf-8')
+    else:
+        baseline.write_text(seeded.replace('"schema_version": 1', '"schema_version": 99'))
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 2
+
+    report = capsys.readouterr()
+    assert 'advisory' not in report.out
+    assert 'clean' not in report.out
+    assert str(baseline) in report.err
