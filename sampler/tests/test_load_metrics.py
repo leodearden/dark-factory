@@ -170,23 +170,46 @@ def df_topology(root: Path, *project_ids: str) -> CgroupTree:
 
 
 class TestParsePressureFile:
+    """The re-exported shared parser (see ``TestParserRehomedToShared``).
+
+    These exact-dict pins therefore move whenever ``shared.psi`` grows a key:
+    the four-key shape below is the 60 s window ruling D17 added (task 3353).
+    ``collect_psi``'s own six-key contract is unaffected — it selects the two
+    avg10 keys explicitly — which is what makes the growth additive here.
+    """
+
     def test_both_lines_extracted(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_CPU_TEXT)
-        assert result == {'some_avg10': 2.50, 'full_avg10': 0.30}
+        assert result == {
+            'some_avg10': 2.50,
+            'some_avg60': 1.80,
+            'full_avg10': 0.30,
+            'full_avg60': 0.20,
+        }
 
     def test_missing_full_defaults_to_zero(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_MEM_TEXT)
-        assert result == {'some_avg10': 1.23, 'full_avg10': 0.0}
+        assert result == {
+            'some_avg10': 1.23,
+            'some_avg60': 0.90,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
 
     def test_io_both_lines(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_IO_TEXT)
-        assert result == {'some_avg10': 0.75, 'full_avg10': 0.45}
+        assert result == {
+            'some_avg10': 0.75,
+            'some_avg60': 0.60,
+            'full_avg10': 0.45,
+            'full_avg60': 0.30,
+        }
 
     def test_float_precision(self):
         from sampler.metrics import parse_pressure_file

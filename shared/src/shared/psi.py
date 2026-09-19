@@ -8,7 +8,10 @@ reader were originally written and tested in
 SAME parser instead of each maintaining their own copy that could drift and
 re-derive the "CPU has no ``full`` line on some kernels" asymmetry bug.
 ``sampler.metrics`` re-exports ``parse_pressure_file`` from this module (see
-that module's ``TestParserRehomedToShared`` identity guard).
+that module's ``TestParserRehomedToShared`` identity guard). That re-home was
+verbatim; the parser has since grown ADDITIVELY (the 60 s window, ruling D17),
+which is exactly the growth having one home makes safe — both consumers get it
+at once and neither can drift.
 
 This module is a direct-import submodule — like ``shared.deploy_state`` — and
 is deliberately NOT re-exported from ``shared/__init__.py``:
@@ -52,7 +55,7 @@ __all__ = [
     'read_own_cgroup_pressure',
 ]
 
-_AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
+_AVG_RE = re.compile(r'avg(10|60)=([0-9]+(?:\.[0-9]+)?)')
 
 _PROC_STAT = '/proc/stat'
 _PROC_SELF_CGROUP = '/proc/self/cgroup'
@@ -60,18 +63,28 @@ _CGROUP_ROOT = '/sys/fs/cgroup'
 
 
 def parse_pressure_file(text: str) -> dict[str, float] | None:
-    """Parse a /proc/pressure/<name> text and return {some_avg10, full_avg10}.
+    """Parse a /proc/pressure/<name> text into the two lines x two windows.
 
-    If the ``full`` line is absent (e.g. CPU on some kernels), ``full_avg10``
-    defaults to 0.0.
+    Both averaging windows come off ONE scan, keyed ``<line>_avg<window>``:
+    ``some_avg10``, ``some_avg60``, ``full_avg10``, ``full_avg60``. An absent
+    line or an absent window defaults to 0.0, so ``full_avg10`` is 0.0 when the
+    ``full`` line is absent (e.g. CPU on some kernels).
+
+    The 60 s window is read because ruling D17 (task 3353) stamps host load on
+    every verify summary and wants a window wider than the 10 s one, while
+    forbidding a second PSI reader (INV-5) — so this reader grew rather than a
+    parallel parser appearing in the consumer. The 300 s window the kernel also
+    emits is deliberately NOT extracted: nothing reads it, and an unread key is
+    a shape a consumer can come to depend on by accident.
 
     Returns:
-        A dict with ``some_avg10`` and ``full_avg10`` on success, or ``None``
-        if no some/full avg10 value could be extracted (empty text, garbage
-        content, or truncated read).  A *partial* miss where ``some`` is
-        present but ``full`` is absent still returns a dict — that is a
-        legitimate kernel behaviour, not a fault.  Only a *total* miss (neither
-        key extracted) returns ``None`` so callers can distinguish a
+        A four-key dict on success, or ``None`` if no some/full averaging value
+        this parser reads could be extracted (empty text, garbage content, a
+        truncated read, or a text carrying only windows this parser does not
+        read).  A *partial* miss — ``some`` present but ``full`` absent, or one
+        window present and the other absent — still returns a dict; that is a
+        legitimate kernel behaviour, not a fault.  Only a *total* miss (no key
+        extracted at all) returns ``None`` so callers can distinguish a
         read/parse fault from genuine zero pressure.
 
     Note on asymmetry:
@@ -87,19 +100,26 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
         shift, a separate ``found_some`` guard should be added mirroring the
         ``full`` handling.
     """
-    result: dict[str, float] = {'some_avg10': 0.0, 'full_avg10': 0.0}
+    result: dict[str, float] = {
+        'some_avg10': 0.0,
+        'some_avg60': 0.0,
+        'full_avg10': 0.0,
+        'full_avg60': 0.0,
+    }
     found = False
     for line in text.splitlines():
         line = line.strip()
-        m = _AVG10_RE.search(line)
-        if m is None:
-            continue
-        value = float(m.group(1))
         if line.startswith('some'):
-            result['some_avg10'] = value
-            found = True
+            prefix = 'some'
         elif line.startswith('full'):
-            result['full_avg10'] = value
+            prefix = 'full'
+        else:
+            continue
+        # finditer, not search: one line carries BOTH windows, so a scan that
+        # stops at the first match would silently drop avg60.
+        for match in _AVG_RE.finditer(line):
+            window, value = match.group(1), match.group(2)
+            result[f'{prefix}_avg{window}'] = float(value)
             found = True
     if not found:
         return None
@@ -328,6 +348,14 @@ class PsiSample:
     distinguishable from a healthy one BY VALUE rather than collapsing to a
     flat sentinel. The defaults are the "component absent" reading, so every
     shipped keyword construction stays valid.
+
+    ``cpu_some60`` (ruling D17, task 3353) appends by that same rule: the host
+    CPU ``some avg60``, carried for the verify-summary load stamp, and governed
+    by the HOST component's ``read_ok`` like the four fields beside it. It is
+    deliberately absent from ``_ARMS``: it is telemetry, and adding an arm would
+    silently change ``saturated()`` / ``tripping_metric()``, whose D10 rank is
+    owned by PRD ``plans/load-throttle-harmonisation-prd.md`` and tasks
+    3590/3592.
     """
 
     cpu_some10: float
@@ -340,6 +368,7 @@ class PsiSample:
     own_cpu_some10: float = 0.0
     own_cgroup: str = ''
     own_read_ok: bool = False
+    cpu_some60: float = 0.0
 
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
@@ -398,20 +427,33 @@ class PsiSample:
 
 
 class _HostReading(NamedTuple):
-    """The host-PSI component: the four /proc/pressure/* fields plus its flag."""
+    """The host-PSI component: the five /proc/pressure/* fields plus its flag.
+
+    No field is defaulted, on purpose: both construction sites are in this
+    module, so a default would buy nothing but a silent 0.0 — which reads as a
+    QUIET host — for a field some later edit forgets to pass.
+    """
 
     cpu_some10: float
+    cpu_some60: float
     mem_some10: float
     mem_full10: float
     io_some10: float
     read_ok: bool
 
 
-_HOST_FAIL_OPEN = _HostReading(0.0, 0.0, 0.0, 0.0, False)
+_HOST_FAIL_OPEN = _HostReading(
+    cpu_some10=0.0,
+    cpu_some60=0.0,
+    mem_some10=0.0,
+    mem_full10=0.0,
+    io_some10=0.0,
+    read_ok=False,
+)
 
 
 def _read_host_pressure(read: Callable[[str], str]) -> _HostReading:
-    """Read /proc/pressure/{cpu,memory,io}; degrade the four host fields together.
+    """Read /proc/pressure/{cpu,memory,io}; degrade the host fields together.
 
     Fail-open (DA-D6): if any source is unreadable (``read`` raises ANY
     exception -- e.g. ``OSError``, or a ``UnicodeDecodeError`` from non-UTF-8
@@ -439,6 +481,7 @@ def _read_host_pressure(read: Callable[[str], str]) -> _HostReading:
 
     return _HostReading(
         cpu_some10=cpu['some_avg10'],
+        cpu_some60=cpu['some_avg60'],
         mem_some10=mem['some_avg10'],
         mem_full10=mem['full_avg10'],
         io_some10=io['some_avg10'],
@@ -456,13 +499,14 @@ def read_psi_sample(
 ) -> PsiSample:
     """Read the three PSI components into one PsiSample.
 
-    Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
-    mem_full10, io.some -> io_some10, and adds the runqueue and own-cgroup
-    components (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3).
+    Maps cpu.some -> cpu_some10 (and its 60 s window -> cpu_some60), mem.some
+    -> mem_some10, mem.full -> mem_full10, io.some -> io_some10, and adds the
+    runqueue and own-cgroup components (PRD
+    ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3).
     ``project_id`` selects the slice name the own-cgroup resolver looks for.
 
     The three sources are orthogonal, so they are read INDEPENDENTLY and
-    assembled once: a host-PSI failure zeroes only the four host fields and
+    assembled once: a host-PSI failure zeroes only the host fields and
     sets ``read_ok=False``, while the runqueue and own-cgroup components keep
     whatever they separately obtained. Collapsing a partial degradation to a
     flat all-zero sentinel would discard a reading that actually succeeded,
@@ -488,4 +532,5 @@ def read_psi_sample(
         own_cpu_some10=own.some_avg10,
         own_cgroup=own.cgroup,
         own_read_ok=own.read_ok,
+        cpu_some60=host.cpu_some60,
     )
