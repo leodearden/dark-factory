@@ -2533,3 +2533,405 @@ class TestDryRunTranscriptArchival:
             f'holds .credentials.json and was unconditionally cleaned up before '
             f'the archival hook was inserted ahead of teardown; found: {leftover}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-5: the investigation prompt carries the task's own text
+# ---------------------------------------------------------------------------
+
+_TASK_DOC = {
+    'id': '42',
+    'title': 'Rebase the verify lane',
+    'description': 'The lane drifted from main and verify now fails on import.',
+    'details': 'Repro: run verify against main tip.',
+    'metadata': {
+        'files': ['orchestrator/src/orchestrator/workflow.py'],
+        'model_overrides': {'unblock_auto': {'model': 'opus'}},
+    },
+}
+
+
+class _TaskDocScheduler:
+    """Scheduler fake whose ``get_task`` returns a FULL task document.
+
+    ``_RecordingScheduler`` returns only ``{'metadata': ...}`` — enough for
+    route resolution, which is all the fetch was ever used for.  Set
+    *get_task_error* to model a fused-memory hiccup that RAISES, or
+    *returns_none* to model the real ``scheduler.get_task``, which catches its
+    own exceptions and returns ``None`` on failure or absence.
+
+    *returns_none* is a separate flag rather than ``task_doc=None`` because the
+    ``task_doc if task_doc is not None else _TASK_DOC`` default makes ``None``
+    mean "use the default doc".
+    """
+
+    def __init__(self, task_doc=None, *, get_task_error=None, returns_none=False):
+        self._task_doc = task_doc if task_doc is not None else _TASK_DOC
+        self._get_task_error = get_task_error
+        self._returns_none = returns_none
+        self.update_task = AsyncMock(return_value=True)
+
+    async def get_task(self, task_id):
+        if self._get_task_error is not None:
+            raise self._get_task_error
+        if self._returns_none:
+            return None
+        return dict(self._task_doc)
+
+
+async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+    """Run one investigation and return the prompt handed to the agent."""
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    mock_invoke = AsyncMock(return_value=agent_result)
+    with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+    return mock_invoke.call_args.kwargs['prompt']
+
+
+class TestPromptCarriesTaskContext:
+    """The investigator was asked to judge a block it could not read.
+
+    The prompt carried only the block reason and a clipped detail — never the
+    task's own title, description or details, and never the declared file
+    footprint that SKILL.md's `human-review-required` trigger ("outside the
+    architect's declared file scope") must be judged against.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_task_title_description_and_details(self, tmp_path):
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert 'The lane drifted from main and verify now fails on import.' in prompt, prompt
+        assert 'Repro: run verify against main tip.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_declared_file_footprint(self, tmp_path):
+        """The list the `human-review-required` scope-creep trigger is judged against."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'orchestrator/src/orchestrator/workflow.py' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_still_carries_the_four_original_fields(self, tmp_path):
+        """The fix is additive — it must not regress what the prompt already had."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert '42' in prompt, prompt
+        assert str(tmp_path) in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
+        assert 'All 5 attempts timed out' in prompt, prompt
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):
+        """An oversized task record must not blow the investigation's budget.
+
+        Asserted by length against the module's declared cap, not by exact
+        prose, and the repo's truncation marker must be present so the clip is
+        visible to the reading agent rather than silent — the failure mode the
+        160/120-char block-`detail` clips already exhibit.
+        """
+        import re
+
+        from orchestrator.dry_run_unblock import _TASK_TEXT_FIELD_CHARS
+
+        oversized = 'x' * 20000
+        scheduler = _TaskDocScheduler({**_TASK_DOC, 'description': oversized})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert _TASK_TEXT_FIELD_CHARS < 20000, 'the cap must bound a 20000-char field'
+        assert oversized not in prompt, 'the 20000-char description was not capped'
+        assert '... [' in prompt and 'truncated] ...' in prompt, prompt
+
+        longest_run = max((len(m) for m in re.findall('x+', prompt)), default=0)
+        assert longest_run <= _TASK_TEXT_FIELD_CHARS, (
+            f'rendered description must be capped at {_TASK_TEXT_FIELD_CHARS} '
+            f'chars; found a run of {longest_run}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_task_fetch_is_marked_not_silently_omitted(self, tmp_path):
+        """Loud over silent: the investigator must be able to tell "this task
+        has no description" from "we could not fetch it".
+
+        Matched against the module's own marker constant rather than a guessed
+        substring: `tmp_path` embeds the test's own name and is interpolated
+        into the prompt as `Worktree:`, so a single bare word ('unavailable')
+        passes spuriously against the temp directory.
+        """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        # Still a well-formed prompt — degradation is additive, not destructive.
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-9: the task-fetch fallback is loud, and visible on the entry
+# ---------------------------------------------------------------------------
+
+def _persisted_entry(scheduler):
+    """The proposal entry from the ``append=True`` persist call.
+
+    Filtered rather than read off the last call: route resolution mirrors
+    ``metadata.routing`` through a SECOND ``update_task``, and the trim write
+    is a third — see ``_assert_one_proposal_persist``.
+    """
+    persists = [
+        c for c in scheduler.update_task.call_args_list
+        if c.kwargs.get('append') is True
+    ]
+    assert len(persists) == 1, (
+        f'expected exactly one persist call; got {scheduler.update_task.call_args_list}'
+    )
+    return persists[0].args[1]['dry_run_proposals'][0]
+
+
+async def _run_with_scheduler(tmp_path, scheduler) -> None:
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    with patch('orchestrator.dry_run_unblock.invoke_agent',
+               new=AsyncMock(return_value=agent_result)):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+
+
+class TestTaskFetchFallbackIsLoud:
+    """A failed task fetch used to be swallowed by a bare `except Exception`.
+
+    It silently dropped BOTH the task text and the task's
+    `model_overrides['unblock_auto']` routing pin, with no log at any level
+    and nothing on the persisted entry — so an operator reviewing
+    `metadata.dry_run_proposals[-1]` could not tell a degraded investigation
+    from a healthy one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        message = matching[0].getMessage()
+        assert '42' in message, message
+        assert 'fused-memory down' in message, message
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_non_awaitable_get_task_also_warns_and_stamps(self, tmp_path, caplog):
+        """The MagicMock-scheduler shape used across this suite.
+
+        Its `get_task` is not awaitable, so awaiting it raises TypeError — this
+        shape has been taking the silent fallback path all along.
+        """
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+            for r in caplog.records
+        ), f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_healthy_path_carries_the_flag_as_false(self, tmp_path):
+        """SHAPE PARITY — always present, never absent, matching the convention
+        `_failure_diagnostics` already sets. A consumer must never have to
+        distinguish 'absent key' from 'old entry' from 'healthy'."""
+        scheduler = _TaskDocScheduler()
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert 'task_context_unavailable' in entry, entry
+        assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-12: the DOMINANT degraded path is a falsy result, not a raise
+# ---------------------------------------------------------------------------
+
+class TestFalsyFetchIsAlsoLoud:
+    """`scheduler.get_task` is documented to return ``None`` on failure OR
+    absence, and it catches its own exceptions — so an MCP timeout, a
+    malformed reply and a deleted task all arrive as ``None``, never as a
+    raise.  Keying the loudness on the exception therefore left the dominant
+    degraded path exactly as silent as before: the prompt said
+    `_TASK_UNAVAILABLE_MARKER` while the entry said ``task_context_unavailable:
+    False``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(returns_none=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        assert '42' in matching[0].getMessage(), matching[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(returns_none=True)
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_degraded(self, tmp_path):
+        """THE COHERENCE INVARIANT — the durable form of this bug.
+
+        One investigation produces both surfaces, so they cannot disagree: if
+        the prompt tells the investigator the task record is unavailable, the
+        entry an operator reads must say the same thing.
+        """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler(returns_none=True)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_healthy(self, tmp_path):
+        """The other side of the invariant, so it cannot be satisfied by
+        stamping ``True`` unconditionally."""
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler()
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
+        assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 amendment: the THIRD state — a record that told us nothing
+# ---------------------------------------------------------------------------
+
+class TestContentlessTaskRecordIsAlsoDegraded:
+    """Between "full record" and "fetch failed" sits a record with nothing in it.
+
+    It used to render as the empty string: the prompt carried neither task text
+    nor a marker — just a blank gap the investigator would read as "this task
+    has no description" — while the entry stamped
+    ``task_context_unavailable: False``.  That is the same ambiguity
+    `TestFalsyFetchIsAlsoLoud` exists to eliminate, one level in.
+    """
+
+    _CONTENTLESS = {'id': '42', 'status': 'blocked'}
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_the_record_is_empty(self, tmp_path):
+        """The coherence invariant, extended to the third state."""
+        from orchestrator.dry_run_unblock import (
+            _TASK_EMPTY_MARKER,
+            _TASK_UNAVAILABLE_MARKER,
+        )
+
+        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_EMPTY_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+        # A DISTINCT marker: the fetch succeeded, so telling the investigator
+        # it failed would be a different lie from the one being fixed.
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_empty_record_warns_once_without_claiming_a_failed_fetch(
+        self, tmp_path, caplog,
+    ):
+        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.dry_run_unblock'
+        ]
+        assert len(messages) == 1, messages
+        assert '42' in messages[0], messages[0]
+        assert 'task fetch failed' not in messages[0], messages[0]
+
+    @pytest.mark.asyncio
+    async def test_non_dict_metadata_degrades_rather_than_losing_the_run(self, tmp_path):
+        """`(task.get('metadata') or {}).get('files')` raised AttributeError on a
+        non-dict, escaping to the outer handler and downgrading a WORKING
+        investigation to `investigation_failed`.  Degrading loudly is the whole
+        point of the surrounding change; crashing is the opposite of it."""
+        scheduler = _TaskDocScheduler(task_doc={**_TASK_DOC, 'metadata': 'not-a-dict'})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert entry.get('status') != 'investigation_failed', entry
+        assert entry['task_context_unavailable'] is False, entry

@@ -32,6 +32,7 @@ from shared.task_metadata import (
 from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
+    AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     StatusWriteAuthorityError,
@@ -2642,12 +2643,37 @@ class SqliteTaskBackend:
                     parsed_metadata = None
             if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
                 raise DoneProvenanceWriteAuthorityError(task_id)
-        # Structured fields (title/description/details/priority/dependencies)
-        # land deterministically — any non-None value overrides the current row.
-        # ``prompt`` is kept for backward compatibility: when no explicit
-        # ``details`` is passed it feeds the details path (replace, or append
-        # when ``append=True``). ``metadata`` retains the merge-or-replace
-        # semantics keyed off ``append``.
+        # Third pre-connection floor, and the last one: reject an append=True
+        # write aimed at a REPLACE-ONLY column. Placed here deliberately —
+        # after the two write-authority floors and BEFORE _resolve_metadata_mode
+        # and ensure_connected() — so the rejection precedes existence and
+        # connection errors, and so a call tripping BOTH this guard and
+        # _resolve_metadata_mode's merge+append carve-out surfaces the
+        # content-loss message rather than the metadata one (the description
+        # wipe is the hazard that was silent). See
+        # sqlite_task_backend.py::_reject_append_on_replace_only_fields.
+        _reject_append_on_replace_only_fields(
+            append, title=title, description=description, priority=priority,
+            task_id=task_id,
+        )
+        # How each field resolves against the current row:
+        # - ``title``/``description``/``priority`` are REPLACE-ONLY — a non-None
+        #   value overwrites the current row, and combining any of them with
+        #   ``append=True`` is REJECTED outright by the floor above (task 4039;
+        #   the pair used to be accepted silently and destroy authored prose,
+        #   four recorded live repros).
+        # - ``details`` honors ``append`` (concatenate) and otherwise replaces.
+        #   ``prompt`` is kept for backward compatibility: when no explicit
+        #   ``details`` is passed it feeds the details path with the same
+        #   append-or-replace semantics.
+        # - ``metadata`` keys off ``append``/``metadata_mode`` via
+        #   _resolve_metadata_mode.
+        # - ``dependencies`` is also replace-only but is deliberately NOT
+        #   covered by the task-4039 guard: the list is short, structurally
+        #   visible in ``get_task`` and cheap to re-derive, unlike the multi-KB
+        #   authored prose the repros destroyed. That is a decision, not an
+        #   oversight — widening the guard to a list-valued parameter with
+        #   different merge semantics is a separate call.
         # Validate the metadata_mode VALUE unconditionally — a bad value should
         # always raise immediately, even if no metadata is supplied in this
         # call. But scope the bare-append=False rejection (the task-2180
@@ -3355,6 +3381,94 @@ def _resolve_metadata_mode(
             )
         return 'replace'
     return 'merge'
+
+
+_REPLACE_ONLY_FIELDS: tuple[str, ...] = ('title', 'description', 'priority')
+
+
+def _reject_append_on_replace_only_fields(
+    append: bool | None,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    task_id: str | None = None,
+) -> None:
+    """Reject ``append=True`` combined with a REPLACE-ONLY text column.
+
+    INVARIANT: ``title``, ``description`` and ``priority`` can only ever be
+    REPLACED. ``append`` governs exactly two things — the ``details`` /
+    ``prompt`` concatenation and the metadata merge mode (see
+    ``sqlite_task_backend.py::_resolve_metadata_mode``) — and has never
+    applied to these three columns. Before task 4039 the combination was
+    accepted silently and the incoming value OVERWROTE the column: a caller
+    who wrote ``update_task(description='\\n\\n--- addendum ---',
+    append=True)`` believing they were extending the field instead destroyed
+    the whole original, with no error and no warning. Four live repros are on
+    record; the worst wiped ~17KB of a human-ratified decomposition record.
+
+    Task 4039 took the REJECT arm rather than making ``description``
+    concatenate like ``details``: the append-it arm would silently CHANGE the
+    meaning of an existing call shape (every historical
+    ``description=…, append=True`` caller wrote a replace and got a replace),
+    whereas rejecting changes no successful call's result — no in-repo caller
+    combines the two. This is the same loud-over-silent trade
+    ``_resolve_metadata_mode`` makes for the task-2180 metadata-wipe and the
+    task-3581 nested-metadata clobber; the two guards are twins on the same
+    method and should be read together.
+
+    PURE — a function of the call flags only. It never reads the stored row,
+    so it fires even when the existing column is empty. Making the rejection
+    depend on invisible stored state is precisely the recurrence mechanism
+    task 4039 documents: a caller whose first ``append=True`` description
+    write happens to land on an empty column learns "it worked", then gets
+    bitten later on the multi-KB record. Purity also lets the call sit before
+    ``ensure_connected()`` and the row SELECT, so the rejection precedes any
+    existence or connection error.
+
+    ``dependencies`` is also replace-only and is deliberately NOT covered —
+    the list is short, structurally visible in ``get_task``, and cheap to
+    re-derive, unlike the authored prose the recorded repros destroyed.
+
+    Args:
+        append: The call's ``append`` flag. Checked with ``is True`` (not
+            truthiness), matching ``_resolve_metadata_mode``, whose
+            merge+append carve-out and legacy shim both key on identity.
+            One cell is KNOWINGLY left uncovered by that choice: a truthy
+            NON-bool, which the details/prompt concatenation below does
+            treat as an append (``if (append and existing_details)``) while
+            a co-passed ``description`` would still be overwritten. It is
+            left to the details path deliberately, not overlooked — the wire
+            caller ``server/tools.py::update_task`` declares
+            ``append: bool | None`` and pydantic coerces there (measured:
+            ``1`` and ``'yes'`` arrive as ``True`` and DO trip this guard,
+            ``2`` is rejected outright), so the cell is reachable only from
+            an in-process caller that bypasses the annotation, and keeping
+            the two sibling guards on this method agreeing about what counts
+            as ``append=True`` was preferred to covering it.
+        title / description / priority: The call's replace-only field values;
+            non-``None`` means the write would touch that column.
+        task_id: Recorded on the raised error for structural branching.
+
+    Raises:
+        AppendUnsupportedFieldError: When ``append is True`` and at least one
+            replace-only field is non-``None``. ``.fields`` lists the
+            offenders in ``_REPLACE_ONLY_FIELDS`` order (deterministic, not
+            set-iteration order) and the message names them.
+        KeyError: If ``_REPLACE_ONLY_FIELDS`` ever names a field with no
+            matching keyword parameter. The ``candidates`` lookup below is
+            the single place the constant and the signature must agree, so
+            a half-done widening fails loudly at that one site instead of
+            silently skipping the new field.
+    """
+    if append is not True:
+        return
+    candidates = {'title': title, 'description': description, 'priority': priority}
+    offending = tuple(
+        name for name in _REPLACE_ONLY_FIELDS if candidates[name] is not None
+    )
+    if offending:
+        raise AppendUnsupportedFieldError(offending, task_id)
 
 
 def _merge_values(old: object, new: object) -> object:

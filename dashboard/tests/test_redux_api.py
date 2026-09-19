@@ -106,6 +106,75 @@ def test_shape_orchestrators_propagates_offline_marker():
     [orch] = body['ORCHESTRATORS']
     assert orch.get('offline') is True, f'expected offline=True in ORCHESTRATORS entry, got: {orch}'
     assert orch.get('error') == 'boom', f'expected error=boom in ORCHESTRATORS entry, got: {orch}'
+    assert orch.get('degraded') is False, (
+        'this fetch was attempted and demonstrably failed, so the root is '
+        'proven unreachable; reporting it as merely unmeasured understates a '
+        f'real outage, got: {orch}'
+    )
+
+
+def test_shape_orchestrators_projects_degraded():
+    """A root the budget starved reaches the wire as degraded, NOT as offline.
+
+    The pair matters, not either field alone: a degraded root's state is
+    UNKNOWN, while an offline root is proven down.  Collapsing them here would
+    re-merge on the wire exactly what
+    ``dashboard/src/dashboard/data/orchestrator.py::discover_orchestrators``
+    keeps apart on the entry.
+    """
+    raw = [{
+        'pids': [7777],
+        'prd': '/home/leo/src/dark-factory/prd.md',
+        'label': 'dark-factory/main',
+        'project_root': '/home/leo/src/dark-factory',
+        'running': True,
+        'started': 'Mar18',
+        'last_update': None,
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+        'offline': False,
+        'degraded': True,
+        'error': (
+            'exceeded its 7.0s share of the 20.0s orchestrators budget; its '
+            'task tree is UNKNOWN for this render (not zero)'
+        ),
+    }]
+
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch.get('degraded') is True, f'expected degraded=True in ORCHESTRATORS entry, got: {orch}'
+    assert orch.get('offline') is False, (
+        'the budget expired before this root was measured; nothing proved it '
+        f'unreachable, and saying so sends an operator to a healthy service: {orch}'
+    )
+
+
+def test_shape_orchestrators_degraded_defaults_false_when_absent():
+    """An entry with no ``degraded`` key shapes to False, never a missing key.
+
+    Every wire entry must carry the field: the orchestrators tab reads
+    ``o.degraded`` directly, so a well-formed payload may never hand it
+    ``undefined``.
+    """
+    raw = [{
+        'pids': [2000],
+        'prd': None,
+        'label': 'proj',
+        'project_root': '/home/leo/src/proj',
+        'running': True,
+        'started': 'Mar18',
+        'last_update': None,
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+    }]
+
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch.get('degraded') is False, (
+        f'degraded must be present and False on every entry, got: {orch}'
+    )
 
 
 # ---------------------------------------------------------------------------

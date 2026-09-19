@@ -13,12 +13,15 @@ propagation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import threading
 import time
 import types
 
 import httpx
 import pytest
+from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
 
 from dashboard.data.mcp_fanout import TTLCache, first_success
 
@@ -33,6 +36,27 @@ def _http_status_error(url: str = 'http://x') -> httpx.HTTPStatusError:
     request = httpx.Request('POST', f'{url}/mcp')
     response = httpx.Response(500, request=request)
     return httpx.HTTPStatusError('Server Error', request=request, response=response)
+
+
+def _hanging_call(hang_url: str, attempted: list[str]):
+    """Build a *call* recording every url it is handed, parking on *hang_url*.
+
+    The never-set ``asyncio.Event`` models a server that accepted the request
+    and then went silent — the shape a per-HTTP-request budget cannot bound
+    (see the derivation beside
+    ``mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS``). One definition, shared
+    by the deadline class and the cancellation class below, so the two exits
+    they pin are exercised against the same notion of "hung".
+    """
+    never = asyncio.Event()
+
+    async def call(url):
+        attempted.append(url)
+        if url == hang_url:
+            await never.wait()
+        return 'ok'
+
+    return call
 
 
 @pytest.fixture(autouse=True)
@@ -111,6 +135,296 @@ class TestFirstSuccessPerExceptionFailover:
             "first_success must invalidate the failing url's session"
         )
 
+
+
+# ── (b2) a builtin TimeoutError is a per-URL failure, not a propagating error ─
+
+
+class TestFirstSuccessTimeoutIsAFailure:
+    """A bare builtin ``TimeoutError`` from *call* falls through like any failure.
+
+    ``httpx.TimeoutException`` is NOT a subclass of the builtin
+    ``TimeoutError`` — they share only ``Exception`` — so a ``call`` closure
+    raising the builtin (the type ``asyncio.wait_for`` raises on expiry)
+    escaped first_success's catch tuple entirely and propagated to the caller,
+    skipping the WARNING, the collected error string and the session teardown.
+    ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError`` before it
+    can reach here precisely because of that gap; catching it directly closes
+    it for the call sites that do not.
+    """
+
+    async def test_timeout_error_falls_through_and_invalidates(self, caplog):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://x')
+        assert 'http://x' in _sessions
+
+        async def call(url):
+            if url == 'http://x':
+                raise TimeoutError('slow')
+            return 'ok'
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://x', 'http://y'], call,
+                log_label='test', offline_result=_offline_result,
+            )
+
+        assert result == 'ok', 'a timed-out url must fall through to the next one'
+        assert 'http://x' not in _sessions, (
+            "a builtin TimeoutError must invalidate the failing url's session"
+        )
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING for the timed-out url, got {warnings}'
+        )
+        assert 'http://x' in warnings[0] and 'TimeoutError' in warnings[0], (
+            f'the warning must name the url and the exception type, got {warnings[0]}'
+        )
+        assert 'slow' in warnings[0], (
+            "call's OWN message must survive: call_with_deadline re-renders "
+            'only ITS budget\'s expiry (decided by asyncio.timeout.expired(), '
+            'not by message emptiness), so a caller-raised TimeoutError is '
+            'never overwritten with the generic whole-operation string — '
+            f'got {warnings[0]}'
+        )
+
+    async def test_all_urls_timing_out_returns_the_offline_sentinel(self):
+        urls = ['http://a', 'http://b']
+
+        async def call(url):
+            raise TimeoutError(f'{url} slow')
+
+        result = await first_success(
+            urls, call, log_label='test', offline_result=_offline_result,
+        )
+
+        assert result['offline'] is True
+        assert 'http://a' in result['error']
+        assert 'http://b' in result['error']
+        assert 'TimeoutError' in result['error'], (
+            f'the operator must be told the cause was a timeout, got {result["error"]}'
+        )
+        assert 'http://a slow' in result['error'], (
+            "each url's OWN diagnosis must reach the operator verbatim, not be "
+            'replaced by the whole-operation budget string, got '
+            f'{result["error"]}'
+        )
+
+# ── (b3) a HANGING url is bounded by first_success's own deadline ────
+
+
+class TestFirstSuccessWholeOperationDeadline:
+    """A url that never returns must not park the whole fan-out forever.
+
+    ``mcp_tool_call``'s ``timeout`` is a PER-HTTP-REQUEST budget, so it cannot
+    bound the operation: a cold session performs three posts, and httpx's
+    ``read`` timeout bounds each individual socket read rather than the whole
+    body (see the derivation next to
+    ``mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS``). first_success therefore
+    carries its own default-on whole-operation deadline per url, after which
+    the hung url is logged, invalidated and fallen through like any other
+    failure.
+
+    Every test here wraps the call in an OUTER ``asyncio.wait_for(..., 5)``.
+    That guard is mandatory, not decorative: without it a regression that
+    restores the unbounded await is SIGALRM-killed at the suite's 60s
+    pytest-timeout with no traceback, instead of failing fast and legibly.
+    """
+
+    async def test_hung_url_is_bounded_invalidated_and_fallen_through(self):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        assert 'http://a' in _sessions
+
+        attempted: list[str] = []
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'],
+                _hanging_call('http://a', attempted),
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=0.05,
+            ),
+            timeout=5,
+        )
+
+        assert result == 'ok', 'the hung url must fall through to the next one'
+        assert attempted == ['http://a', 'http://b'], (
+            f'B must still be attempted after A is cut off, got {attempted}'
+        )
+        assert 'http://a' not in _sessions, (
+            "a hung url's wedged session must be invalidated, not left cached"
+        )
+
+    async def test_collected_error_names_the_deadline_that_fired(self):
+        attempted: list[str] = []
+        never = asyncio.Event()
+
+        async def call(url):
+            attempted.append(url)
+            await never.wait()
+            # Unreachable: the Event is never set, so this leg only ever ends
+            # by the deadline firing. Present so the closure's inferred return
+            # type is NoReturn and V solves from offline_result, matching
+            # TestFirstSuccessAllFail's raising `call` above — which is also
+            # why this one test does not use the module-level _hanging_call:
+            # that helper hangs on ONE url and returns 'ok' for the rest, so it
+            # can neither fail EVERY url nor keep V unbound from `str`.
+            raise AssertionError('unreachable')  # pragma: no cover
+
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'], call,
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=0.1,
+            ),
+            timeout=5,
+        )
+
+        assert result['offline'] is True
+        assert 'TimeoutError' in result['error'], (
+            f'the sentinel must name the exception type, got {result["error"]}'
+        )
+        assert '0.1' in result['error'], (
+            'the sentinel must name the budget that fired so an operator can '
+            'tell our whole-operation backstop from an httpx read timeout, '
+            f'got {result["error"]}'
+        )
+
+    async def test_default_deadline_applies_with_no_argument_at_call_time(
+        self, monkeypatch,
+    ):
+        """The default is read INSIDE first_success, not bound at def time.
+
+        Pins the ``TTLCache.ttl_seconds`` idiom: a monkeypatched module
+        constant must take effect immediately, which is the only thing that
+        makes the default path testable without a real 45s wait.
+        """
+        from dashboard.data import mcp_fanout
+        from dashboard.data.memory import _get_session, _sessions
+
+        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+        _get_session('http://a')
+
+        attempted: list[str] = []
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'],
+                _hanging_call('http://a', attempted),
+                log_label='test',
+                offline_result=_offline_result,
+            ),
+            timeout=5,
+        )
+
+        assert result == 'ok'
+        assert attempted == ['http://a', 'http://b']
+        assert 'http://a' not in _sessions
+
+# ── (b4) a CALLER-imposed cancellation must still invalidate ─────────
+
+
+class TestFirstSuccessInvalidatesOnCancellation:
+    """A cancellation mid-``call`` must not leave the wedged session cached.
+
+    ``asyncio.CancelledError`` derives from ``BaseException``, so it bypasses
+    first_success's ``except`` tuple entirely: a caller's enclosing
+    ``asyncio.wait_for`` firing mid-attempt used to unwind first_success with
+    the hung url's ``McpSession`` still in ``memory._sessions``, so the next
+    poll cycle reused it and hung identically. That is the incident shape this
+    class pins — for the call-site class that DOES carry its own deadline.
+
+    The cancellation must still PROPAGATE, never be swallowed into a
+    fall-through: shutdown and ``asyncio.gather`` sibling-cancellation depend
+    on it, which is why each test asserts the next url was never attempted.
+    """
+
+    async def test_caller_wait_for_cancels_and_session_is_invalidated(self, caplog):
+        from dashboard.data import mcp_fanout
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        assert 'http://a' in _sessions
+
+        attempted: list[str] = []
+        # per_url_timeout is deliberately LARGE so the OUTER wait_for is the
+        # one that fires, isolating the cancellation path from the
+        # deadline path exercised by TestFirstSuccessWholeOperationDeadline.
+        with (
+            caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'),
+            pytest.raises(TimeoutError),
+        ):
+            await asyncio.wait_for(
+                first_success(
+                    ['http://a', 'http://b'],
+                    _hanging_call('http://a', attempted),
+                    log_label='test',
+                    offline_result=_offline_result,
+                    per_url_timeout=30.0,
+                ),
+                timeout=0.05,
+            )
+
+        # The handler's other half, and the one a refactor is most likely to
+        # undo: a cancellation must NOT be reported through log_fanout_failure.
+        # Doing so would open a streak for (test, http://a), and the next REAL
+        # failure there would then be its second — demoting that failure's
+        # opening WARNING to DEBUG under the transition-only policy, silently,
+        # for every subsequent poll. Without these two assertions, moving
+        # log_fanout_failure into the CancelledError branch passes the suite.
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ], 'a cancellation is not an endpoint failure and must not be reported'
+        assert mcp_fanout._failure_streaks == {}, (
+            'a cancellation must leave the streak counters untouched, or it '
+            "demotes the next real failure's opening WARNING to DEBUG"
+        )
+
+        assert 'http://a' not in _sessions, (
+            'a cancelled in-flight url must have its wedged session '
+            'invalidated, or every subsequent poll reuses it and hangs'
+        )
+        assert attempted == ['http://a'], (
+            'the cancellation must propagate, not be swallowed into a '
+            f'fall-through to the next url, got {attempted}'
+        )
+
+    async def test_direct_task_cancel_propagates_and_invalidates(self):
+        from dashboard.data import mcp_fanout
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        attempted: list[str] = []
+
+        task = asyncio.create_task(
+            first_success(
+                ['http://a', 'http://b'],
+                _hanging_call('http://a', attempted),
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=30.0,
+            ),
+        )
+        # Yield until the hung leg is actually in flight before cancelling.
+        while not attempted:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert 'http://a' not in _sessions
+        assert attempted == ['http://a']
+        assert mcp_fanout._failure_streaks == {}, (
+            'a task.cancel() is not an endpoint failure either — see the '
+            'streak reasoning in the test above'
+        )
 
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
 
@@ -2388,3 +2702,546 @@ class TestTTLCacheBypassCannotClobberANewerValue:
             'a late-returning locked refresh must not clobber a newer value '
             'a bypass already stored for the same key'
         )
+
+
+class TestTTLCacheDetachedRefreshReaping:
+    """A bypass refresh must be reapable at process shutdown (task 5185).
+
+    ``TTLCache``'s standing policy is abandon-don't-cancel: a bypass whose
+    caller gave up keeps running, may still store a late value, and is
+    deliberately never cancelled (see ``_evict_expired``'s ``dead_bypasses``
+    comment and ``clear()``'s docstring). That is right while the process
+    continues — a late store heals the key for the next caller.
+
+    It stops being right at shutdown, where no next caller exists while the
+    task still pins a connection on the shared httpx client. In THIS suite it
+    is worse than a leak: the caches are module-level and so process-global,
+    while every ``TestClient(app)`` runs its own event loop in its own thread,
+    so a bypass started under one test's app lifespan can still be running
+    when the next test file starts.
+
+    These tests pin the shutdown hook the app's ``lifespan`` will call. They
+    build a genuinely in-flight bypass with ``_dashboard_helpers``'
+    :func:`wedge_one_bypass` — the idiom ``TestTTLCacheBoundedLockAcquisition``
+    established, the module bound monkeypatched down plus a refresh parked on a
+    never-set ``asyncio.Event`` — so no real network and no sleep-based timing
+    is involved. It lives there rather than here because
+    ``test_app_lifespan_reap.py`` wedges the same way against the same
+    bookkeeping, and two copies of a reach into ``TTLCache``'s internals drift.
+    """
+
+    async def test_a_new_cache_is_reachable_from_the_module_registry(self):
+        """Enrolment is automatic, so coverage cannot drift as caches are added.
+
+        There are 8 module-level TTLCache instances across 4 modules today;
+        the reaper finds them because every cache enrols itself, not because
+        anything enumerates them.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        assert any(registered is cache for registered in fanout_mod._live_caches), (
+            'a newly constructed TTLCache must enrol itself in the module-level '
+            'live-cache registry; otherwise reap_detached_refreshes() silently '
+            'misses it and the enrolment is not exhaustive by construction'
+        )
+
+    async def test_reap_cancels_awaits_and_forgets_every_in_flight_bypass(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        bypass, caller = await wedge_one_bypass(cache, 'k')
+        assert not bypass.done(), 'precondition: the bypass is genuinely in flight'
+
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # cancelled(), not "cancel() was called": Task.cancel() only REQUESTS
+        # cancellation, so a reaper that fires and forgets would leave this
+        # False and let the task outlive the shutdown that reaped it.
+        assert bypass.cancelled(), (
+            'reap_detached_refreshes must await each cancellation so it has '
+            'actually landed before shutdown proceeds, not merely request it'
+        )
+        assert reaped == 1, f'the reaper must report what it reaped, got {reaped}'
+        assert cache._live_bypasses == {}, 'the resource roster must be emptied'
+        assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
+
+        await drain(caller)
+
+    async def test_reap_is_a_no_op_when_nothing_is_in_flight(self):
+        """The common case — an app that shuts down cleanly — must be silent."""
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        TTLCache(ttl_seconds=60.0)  # registered, but never used
+
+        assert await fanout_mod.reap_detached_refreshes() == 0
+
+
+class TestTTLCacheReapSurvivesAHostileUnwind:
+    """A reaped refresh that ends by RAISING must not escape the reaper.
+
+    Cancellation is a request; how the coroutine ends in response is not the
+    reaper's to choose. A refresh unwinding through httpx/anyio can finish
+    with ``RuntimeError: Attempted to exit cancel scope in a different task``,
+    and any ``finally`` or ``except CancelledError`` cleanup can raise on its
+    own account. Tolerating ``CancelledError`` alone therefore lets that
+    outcome out of ``cancel_live_bypasses``, up through
+    ``reap_detached_refreshes``, and into ``dashboard.app.lifespan`` — where
+    it arrives ABOVE the store, pool and client closes, so the shutdown hook
+    added to prevent stranded handles would strand them instead.
+
+    Two bypasses under different keys, the hostile one wedged FIRST. A reaper
+    that dies at the first raiser leaves its neighbour cancelled but never
+    awaited, so the guarantee the method's docstring makes — by the time it
+    returns, the task has actually unwound — silently stops holding for
+    everything behind the raiser. One task could not show that half.
+    """
+
+    @staticmethod
+    def _refresh_that_raises_while_unwinding():
+        """Refresh stub that enters, parks, then raises NON-cancellation on cancel.
+
+        Deliberately the same shape as ``never_resolving_refresh`` — enters,
+        signals, never resolves — differing only in how it ends once
+        cancelled. Returns ``(refresh, entered_event)``.
+        """
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+
+        async def _refresh():
+            entered.set()
+            try:
+                await wedged.wait()  # never set
+            except asyncio.CancelledError:
+                raise RuntimeError('cleanup blew up while unwinding') from None
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered
+
+    async def test_a_raising_unwind_neither_escapes_nor_strands_its_neighbour(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        # Hostile first: the roster is built in key-insertion order, so this
+        # is the ordering under which a reaper that stops at the first raiser
+        # abandons a neighbour it has already cancelled.
+        hostile, hostile_caller = await wedge_one_bypass(
+            cache, 'hostile', self._refresh_that_raises_while_unwinding()
+        )
+        polite, polite_caller = await wedge_one_bypass(cache, 'polite')
+        assert not hostile.done() and not polite.done(), (
+            'precondition: both bypasses are genuinely in flight'
+        )
+
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # done(), not cancelled(): a task that raises out of its
+        # except-CancelledError cleanup ENDED BY RAISING, so cancelled() is
+        # False — which is why the sibling class's `assert bypass.cancelled()`
+        # is the wrong shape for this outcome.
+        assert hostile.done(), 'the hostile task must have ended'
+        assert polite.done(), (
+            'the reap must await every task it cancelled, so a neighbour '
+            'queued behind a raiser is not left cancelled-but-never-awaited'
+        )
+        assert reaped == 2, (
+            'a task that ended by raising still ENDED, so it released its '
+            f'connection and is legitimately reaped; got {reaped}'
+        )
+        assert cache._live_bypasses == {}, 'the resource roster must be emptied'
+        assert cache._bypass_tasks == {}, 'the liveness map must be emptied'
+
+        await drain(hostile_caller, polite_caller)
+
+
+class TestTTLCacheReapDoesNotWaitForeverForACleanupThatWontUnwind:
+    """A cancellation that is never honoured must not hang shutdown.
+
+    ``Task.cancel()`` is a REQUEST; how long the coroutine takes to honour it
+    is the coroutine's business, and the thing being reaped here is by
+    hypothesis already wedged. A cleanup that itself awaits — a ``finally``
+    that flushes, a shielded section, an anyio cancel scope exiting in the
+    wrong task — can take arbitrarily long or never finish, and an unbounded
+    reap would then hold ``dashboard.app.lifespan``'s teardown open with no
+    diagnostic at all.
+
+    That would be a regression on the very policy this reap replaced:
+    abandon-don't-cancel could leak a task, but it never DELAYED a shutdown.
+    So past the bound the task is abandoned exactly as that policy would have
+    abandoned it — degrading to the old leak plus a journal line, which is
+    also why the returned count must report what actually ENDED rather than
+    what was asked to.
+    """
+
+    @staticmethod
+    def _refresh_that_refuses_to_unwind():
+        """Refresh stub that enters, parks, then IGNORES its cancellation.
+
+        The same shape as ``never_resolving_refresh`` — enters, signals, never
+        resolves — differing only in that its cleanup awaits something that
+        never completes, so the task is still PENDING after ``cancel()``.
+        Returns ``(refresh, entered_event)``.
+        """
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+
+        async def _refresh():
+            entered.set()
+            try:
+                await wedged.wait()  # never set
+            except asyncio.CancelledError:
+                await asyncio.Event().wait()  # a cleanup that never finishes
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered
+
+    async def test_a_cleanup_that_never_finishes_is_abandoned_not_waited_on(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, '_REAP_UNWIND_TIMEOUT_SECONDS', 0.2)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        stuck, stuck_caller = await wedge_one_bypass(
+            cache, 'stuck', self._refresh_that_refuses_to_unwind()
+        )
+        polite, polite_caller = await wedge_one_bypass(cache, 'polite')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+        # (a) the reap returned at all — unbounded, this test would run until
+        # pytest-timeout killed it rather than failing an assertion.
+        assert not stuck.done(), (
+            'precondition: this refresh genuinely ignores its cancellation, '
+            'so the reap returned while it was still unwinding'
+        )
+        # (b) its neighbour was still reaped, and is what the count reports: a
+        # task still unwinding past the bound is a leak being REPORTED, not
+        # work reclaimed.
+        assert polite.done(), 'a cancellation that is honoured still lands'
+        assert reaped == 1, (
+            f'the count must report what actually ended, not what was asked '
+            f'to end; got {reaped}'
+        )
+        # (c) and the leak is visible, naming the key whose refresh is wedged
+        # — a shutdown that silently abandons work is the failure this reap
+        # was added to fix, merely moved.
+        abandoned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'did not unwind' in r.getMessage()
+        ]
+        assert len(abandoned) == 1, f'expected one abandonment WARNING, got {abandoned}'
+        assert 'stuck' in abandoned[0].getMessage(), (
+            f'the WARNING must name the key that would not unwind; got '
+            f'{abandoned[0].getMessage()}'
+        )
+
+        await drain(stuck, stuck_caller, polite_caller)
+
+class TestTTLCacheReapIsScopedToTheRunningLoop:
+    """The reaper must touch only tasks bound to the loop it is running on.
+
+    A TTLCache is module-level and so process-global, while event loops are
+    not: this suite runs a fresh loop per ``TestClient(app)``, each in its own
+    thread. A bypass task left behind by one of them is therefore still on the
+    roster of a cache the NEXT loop reaps — bound to a loop that is by then
+    closed. That is a reachable state, not a hypothetical.
+
+    ``Task.cancel()`` on such a task cancels its parked future, which
+    schedules that future's callbacks through ``loop.call_soon`` — on a closed
+    loop, ``RuntimeError: Event loop is closed``. That is precisely the escape
+    ``app.py``'s ``lifespan`` docstring records for task 3466, where a
+    stranded handle queued work onto a closed loop and pytest blamed whichever
+    unrelated test happened to be running at that instant.
+
+    Reaping a foreign-loop task is not merely unsafe, it is meaningless: its
+    loop is gone, so nothing this process can do will ever advance it. The
+    honest name for it is unreachable, not reaped.
+    """
+
+    @staticmethod
+    def _seed_bypass_on_a_closed_loop(cache, key):
+        """Register one in-flight bypass on *cache* from a loop that is then closed.
+
+        Runs that loop in its OWN THREAD — the shape ``TestClient(app)``
+        itself has, and the only one available: a loop cannot be driven from
+        inside a running one.
+
+        Goes through ``_start_bypass`` rather than the lock-timeout idiom the
+        sibling class uses, because an ``asyncio.Lock`` binds to the first
+        loop that acquires it: driving the public path here would strand a
+        foreign-loop lock in ``cache._locks`` and make every later assertion a
+        test artefact rather than the state being pinned.
+
+        The returned task is parked inside its refresh, on a future belonging
+        to the now-closed loop — the exact shape whose cancellation raises.
+        """
+        seeded = {}
+
+        def _drive_a_short_lived_loop():
+            async def _seed():
+                refresh, entered = never_resolving_refresh()
+                task = cache._start_bypass(key, refresh, lambda v: True)
+                await asyncio.wait_for(entered.wait(), timeout=5.0)
+                return task
+
+            foreign_loop = asyncio.new_event_loop()
+            try:
+                seeded['task'] = foreign_loop.run_until_complete(_seed())
+            finally:
+                foreign_loop.close()
+
+        thread = threading.Thread(target=_drive_a_short_lived_loop)
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), 'the seeding loop did not finish'
+        task = seeded['task']
+        # This task can never finish — its loop is gone — so asyncio would log
+        # "Task was destroyed but it is pending!" when the test drops it. That
+        # is the state under test, not a defect, so suppress the notice the
+        # same way asyncio's own machinery does.
+        task._log_destroy_pending = False
+        return task
+
+    async def test_a_foreign_loop_task_is_left_alone_without_poisoning_the_sweep(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        foreign = self._seed_bypass_on_a_closed_loop(cache, 'from-a-dead-loop')
+        mine, caller = await wedge_one_bypass(cache, 'on-this-loop')
+        assert foreign.get_loop() is not asyncio.get_running_loop()
+        assert not foreign.done(), 'precondition: the stranded task is still pending'
+
+        # (a) nothing escapes — on a reaper that cancels indiscriminately this
+        # raises RuntimeError: Event loop is closed.
+        reaped = await fanout_mod.reap_detached_refreshes()
+
+        # (b) the foreign task itself is untouched. Its roster entry may go;
+        # the task may not, because nothing this process does can advance it.
+        assert not foreign.cancelled(), (
+            'a task on a closed loop cannot be reaped — cancelling it only '
+            'queues work onto a loop that will never run again'
+        )
+        assert not foreign.done()
+        # (c) its neighbour in the same cache is still reaped.
+        assert mine.cancelled(), (
+            'one stranded foreign-loop entry must not stop the sweep reaping '
+            'the tasks it genuinely can reach'
+        )
+        # (d) the count is what was actually reaped, not what was inspected.
+        assert reaped == 1, f'only the same-loop task was reapable, got {reaped}'
+        # The dead loop's residue must not pin the key against the live cap.
+        assert cache._live_bypasses == {}
+
+        await drain(caller)
+
+
+class TestTTLCacheSparesABypassRunningOnAnotherLiveLoop:
+    """A bypass some OTHER, still-open loop is running must stay tracked.
+
+    The loop-identity filter above decides what the reaper may CANCEL. What it
+    may FORGET is a separate question, and "not my loop" does not answer it: a
+    ``TTLCache`` is process-global, so a foreign-loop entry is either a dead
+    loop's residue or an app that simply shuts down later. Overlapping
+    lifespans are routine here — module-scoped ``TestClient(app)`` fixtures
+    coexist with the function-scoped ``client``, each with its own live loop in
+    its own thread.
+
+    Un-tracking the second kind costs twice. Its tasks still hold connections
+    while that key's ``_MAX_LIVE_BYPASSES_PER_KEY`` accounting resets to zero,
+    so a wedged key can exceed the bound; and they are then on no roster at
+    all, so the loop that owns them finds nothing to reap at its own shutdown
+    — the leak this whole change exists to close, reintroduced by the fix for
+    it.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _a_loop_running_in_another_thread():
+        """Yield a live loop running in its own thread — the ``TestClient`` shape.
+
+        Torn down by unwinding whatever is still pending ON that loop before
+        stopping it, so nothing is destroyed-while-pending and the cache is
+        left as any real shutdown would leave it.
+        """
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            yield loop
+        finally:
+
+            async def _unwind_everything():
+                others = [
+                    t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+                ]
+                for task in others:
+                    task.cancel()
+                await asyncio.gather(*others, return_exceptions=True)
+
+            asyncio.run_coroutine_threadsafe(_unwind_everything(), loop).result(
+                timeout=5.0
+            )
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+            loop.close()
+
+    @staticmethod
+    def _seed_bypass_on(loop, cache, key):
+        """Start one genuinely in-flight bypass for *key* on *loop*.
+
+        Through ``_start_bypass`` rather than the lock-timeout idiom, for the
+        reason the sibling class documents: an ``asyncio.Lock`` binds to the
+        first loop that acquires it, so driving the public path from here would
+        strand a foreign-loop lock in ``cache._locks``.
+        """
+
+        async def _seed():
+            refresh, entered = never_resolving_refresh()
+            task = cache._start_bypass(key, refresh, lambda v: True)
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            return task
+
+        return asyncio.run_coroutine_threadsafe(_seed(), loop).result(timeout=5.0)
+
+    async def test_a_live_foreign_loops_bypass_keeps_both_its_roster_entries(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with self._a_loop_running_in_another_thread() as foreign_loop:
+            # Mine first, theirs second: the wedging idiom needs the module
+            # bound monkeypatched down, and `_evict_expired` drops any
+            # `_bypass_tasks` entry older than that bound — so a foreign entry
+            # seeded FIRST would be aged out by my own `get_or_refresh` call
+            # for reasons that have nothing to do with the reap, and (d) below
+            # would assert against a map already emptied by policy.
+            mine, caller = await wedge_one_bypass(cache, 'my-key')
+            theirs = self._seed_bypass_on(foreign_loop, cache, 'their-key')
+
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+            # (a) this loop's own shutdown still does its own job.
+            assert reaped == 1 and mine.cancelled(), (
+                f'this loop\'s in-flight bypass must still be reaped; got {reaped}'
+            )
+            # (b) the other loop's task is untouched — it is still running.
+            assert not theirs.done(), (
+                'one app shutting down must not end a bypass another, still '
+                'running app is in the middle of'
+            )
+            # (c) and, the point of this class, still TRACKED.
+            assert cache._live_bypasses == {'their-key': [theirs]}, (
+                "a live foreign loop's in-flight bypass must keep its roster "
+                'entry: it still holds a connection, so it must still count '
+                "against that key's bound, and its own loop can only reap it "
+                f'at its own shutdown if it is still tracked; got '
+                f'{cache._live_bypasses}'
+            )
+            assert [entry[1] for entry in cache._bypass_tasks.values()] == [theirs], (
+                'the same holds for the join map: the next caller on that loop '
+                'should still join the refresh it already has in flight'
+            )
+
+            await drain(caller)
+
+class TestReapIsolatesEachCache:
+    """One cache failing to reap must not cost every cache behind it.
+
+    ``reap_detached_refreshes`` fans out over the registry with a bare
+    accumulate, so anything raising out of one cache abandons every cache
+    after it in the traversal AND loses the running count, taking the summary
+    WARNING with it: the sweep would fail silently and PARTIALLY, at the one
+    moment — shutdown — when a cache skipped here leaks its tasks into the
+    next app on a loop that will by then be closed.
+
+    The registry is an open extension point: it admits any ``TTLCache``, and
+    a subclass may override anything. So the exploding cache here is a real
+    subclass enrolling through the real constructor, not a stub reached into
+    the module's internals to plant.
+
+    ``_live_caches`` is a ``WeakSet``, whose iteration order is unspecified,
+    so every assertion below is an invariant over the whole sweep rather than
+    a claim about one traversal. That is not a weakening: without per-cache
+    isolation the escape fails the sweep under EVERY order, and under the
+    orders that put the exploder first it also silently drops the healthy
+    cache's in-flight task.
+    """
+
+    _BOOM = 'this cache cannot be reaped'
+
+    class _ExplodingCache(TTLCache[str]):
+        """A cache whose reap raises — enrolled by ``TTLCache.__init__`` as usual."""
+
+        async def cancel_live_bypasses(self) -> int:
+            raise RuntimeError(TestReapIsolatesEachCache._BOOM)
+
+    async def test_a_failing_cache_neither_aborts_nor_silences_the_sweep(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        # Bound to a local on purpose: the registry is a WeakSet, so an
+        # unreferenced cache drops straight back out of it and the sweep never
+        # meets the exploder at all.
+        exploder = self._ExplodingCache(ttl_seconds=60.0)
+        healthy: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        assert any(cache is exploder for cache in fanout_mod._live_caches), (
+            'precondition: the exploding subclass enrols through the same '
+            'TTLCache.__init__ as any other cache'
+        )
+        bypass, caller = await wedge_one_bypass(healthy, 'k')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            reaped = await fanout_mod.reap_detached_refreshes()
+
+        assert reaped == 1, (
+            'the healthy cache must still be reaped whichever side of the '
+            f'exploding one the traversal reaches it from; got {reaped}'
+        )
+        assert bypass.done(), 'the reachable in-flight task must have ended'
+
+        # Not silent: a shutdown hook that swallows an exception trades one
+        # invisible failure for another.
+        failures = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.exc_info is not None
+        ]
+        assert len(failures) == 1, (
+            f'the sweep must record the cache it could not reap; got {failures}'
+        )
+        assert self._BOOM in caplog.text, (
+            'the recorded failure must identify what went wrong, not merely '
+            f'that something did; got: {caplog.text}'
+        )
+
+        # And the ordinary summary still fires for what WAS reaped.
+        summaries = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'reaped' in r.getMessage()
+        ]
+        assert len(summaries) == 1, (
+            f'the reaped-count WARNING must survive a failing cache; got {summaries}'
+        )
+        assert '1' in summaries[0].getMessage()
+
+        await drain(caller)

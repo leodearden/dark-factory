@@ -30,7 +30,7 @@ def test_serial_reference_fixture_available() -> None:
 
     Asserts the test-local ``_serial_merge_worker.MergeWorker``:
       - is importable by bare module name (flat orchestrator/tests/ convention)
-      - subclasses ``orchestrator.merge_queue._WipHaltMixin``
+      - still carries the shared WIP-halt contract
       - constructs with the historical signature
         ``MergeWorker(git_ops, queue, event_store=None)``
       - exposes the serial-worker surface the ported tests rely on
@@ -38,12 +38,29 @@ def test_serial_reference_fixture_available() -> None:
     """
     from _serial_merge_worker import MergeWorker
 
-    assert issubclass(MergeWorker, mq._WipHaltMixin), (
-        'MergeWorker must still inherit the shared halt-state-machine mixin'
-    )
-
     git_ops = MagicMock()
     worker = MergeWorker(git_ops, asyncio.Queue(), event_store=None)
+
+    # The halt contract, read off the PUBLIC surface the mixin exists to
+    # provide rather than off the mixin class itself: which base supplies
+    # ``halt_for_wip`` / ``set_halt_owner`` / ``is_halt_owner`` / ``unhalt_wip``
+    # / ``is_wip_halted`` / ``halt_owner_esc_id`` is an implementation detail,
+    # and the pinned fact is that a constructed serial worker still answers all
+    # six.
+    for member in (
+        'halt_for_wip', 'set_halt_owner', 'is_halt_owner', 'unhalt_wip',
+        'is_wip_halted', 'halt_owner_esc_id',
+    ):
+        assert hasattr(worker, member), (
+            f'MergeWorker must still carry the shared WIP-halt contract; '
+            f'missing {member!r}'
+        )
+    assert worker.is_wip_halted is False, (
+        'a freshly constructed serial worker starts unhalted'
+    )
+    assert worker.halt_owner_esc_id is None, (
+        'a freshly constructed serial worker owns no halt escalation'
+    )
 
     for attr in ('_dequeue', '_process', '_do_merge', '_urgent', '_queue'):
         assert hasattr(worker, attr), (

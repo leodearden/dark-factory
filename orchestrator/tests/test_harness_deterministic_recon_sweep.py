@@ -1805,6 +1805,10 @@ def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
     archive handling, and a mock would assert none of it.
     """
     h = _make_recon_harness()
+    # The alarm IS the subject here, so its narrow kill switch is pinned ON
+    # rather than inherited from the live project yaml, which an operator may
+    # silence at any time (and did: recovery_emission.streak_escalation_enabled).
+    h.config.recovery_emission.streak_escalation_enabled = True
     h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
     h._escalation_queue = EscalationQueue(tmp_path / 'queue')
     clock = _FakeClock()

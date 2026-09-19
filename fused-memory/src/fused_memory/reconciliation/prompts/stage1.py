@@ -918,4 +918,33 @@ genuinely stranded case that legitimately needs operator attention.
 If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
 for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
+
+## Preserved-Specimen Corroboration
+Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
+sufficient. Some tasks are left `in-progress` with a null claimant and a null heartbeat \
+DELIBERATELY, because that state is itself the evidence something else is waiting on — \
+a preserved validation specimen. Such a task looks identical to a stranded one from the \
+signals alone, and a reset would destroy the very thing it is being kept for.
+
+**Before asserting that a no-claimant / dead-heartbeat `in-progress` task is stranded, \
+corroborate that its state is unintentional.** Two places already hold the answer:
+1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
+2. the task's `investigation_outcome` memories — a prior cycle that adjudicated this \
+   exact question records its verdict there.
+
+If either names the task as a preserved / validation specimen, do NOT recommend a status \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+`actionable=false`, or omit it, and say in the description which citation you read.
+
+**The deterministic gate is enforced in code** by \
+`preservation_specimen_guard.filter_preservation_specimen_flags`, which corroborates the \
+task against both stores and drops such a flag regardless of how it is worded — so a \
+stranded flag for a corroborated specimen will be dropped whatever you call it. It keeps \
+the flag whenever no citation exists or the corroboration could not be read.
+
+This rule exists because of a real incident: dark_factory task 3105 is the sole preserved \
+live validation specimen for gate task 3546, and this re-flag twice became an operator \
+gate task asking for it to be reset — tasks 5080 and 5104, the second born-at-L2 critical. \
+Both were declined by hand. The same false positive has already appeared under three \
+different `flag_type` namings, so renaming it does not make it a new finding.
 """

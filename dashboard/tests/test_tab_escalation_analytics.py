@@ -7,133 +7,25 @@ TestClient-driven route test against the real FastAPI app.
 
 from __future__ import annotations
 
-import html.parser
 import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from _dashboard_helpers import extract_function_body
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware).
-# Copied from test_tab_escalations.py — see that module for the full rationale
-# (brace-depth walk; does not skip braces inside JS string literals).
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included."""
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
-
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+)
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalations.py — scopes token-presence checks to a
+# Imported from `_dashboard_helpers` — scopes token-presence checks to a
 # specific function body rather than searching the entire file (which would
 # give false confidence when a token appears in an unrelated context).
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_tab_escalations.py / test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +55,7 @@ def test_data_js_registers_escalation_analytics_endpoint(data_js_body: str) -> N
         'escalation-analytics must stay unwindowed (no ?window= query param) — the '
         'frontend windows client-side over samples/flow_daily (per the PRD).'
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
     assert seed_block, (
         'data.js does not contain an `ESCALATION_ANALYTICS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -516,8 +408,13 @@ class TestEscalationAnalyticsCacheability:
 # The tests below consume the served-asset fixtures (tab_analytics_jsx_body,
 # app_jsx_body, shell_jsx_body, index_html_body) that now live in conftest.py
 # and `extract_function_body` from _dashboard_helpers (task 3549), plus the
-# load-order helpers still local to this file (_ScriptTagCollector,
-# _find_script_position, _assert_script_loads_before).
+# load-order helpers `find_script_position` and `assert_script_loads_before`,
+# which are ALSO imported from _dashboard_helpers rather than defined here:
+# task 4881 retired the byte-identical copy this module and four others each
+# carried, together with the `ScriptTagCollector` those two parse with (which
+# is why it is not in this module's import list — nothing here calls it
+# directly).  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +518,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
     # (a) tab_escalation_analytics.jsx script tag must exist
-    result = _find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
+    result = find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
     assert result is not None, (
         f'No <script src="{_TAB_ANALYTICS_PREFIX}..."> tag found in index.html — '
         'add it after tab_escalations.jsx and before app.jsx.'
@@ -642,7 +539,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (b) Loads after data.js
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/data.js',
         _TAB_ANALYTICS_PREFIX,
@@ -652,7 +549,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (c) Loads after shell.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/shell.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -662,7 +559,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (d) Loads after tabs.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/tabs.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -672,7 +569,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (e) Loads before app.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_ANALYTICS_PREFIX,
         '/static/redux/app.jsx',

@@ -464,6 +464,81 @@ class TestBD2Completeness:
             "parent's would erase the distinction downstream"
         )
 
+    def test_warm_lane_lock_contention_has_its_own_row_naming_lock_contention(
+        self,
+    ):
+        """WarmLaneLockContention (task 4211) needs its OWN row, and that row
+        must diverge from the parent it inherits on ``reason_prefix``.
+
+        The OWN-KEY assertion is the substance, exactly as for
+        LaneLockSelfOwnedLeak above.  ``_lookup_disposition`` walks the MRO, and
+        the ``WarmLaneRequeue`` BASE row's reason_prefix is LITERALLY
+        ``'warm_lane_disk_pressure (transient infra)'`` — so a subclass with no
+        row of its own resolves through the MRO to that row and keeps rendering
+        a lane-lock refusal as disk pressure, reproducing the very defect this
+        class exists to fix.  BD-2 completeness cannot catch that: MRO
+        resolution already satisfies it (measured — the suite stayed green with
+        the class added and no row).
+
+        The field values are the shared-resource / capacity shape
+        (DISK_PRESSURE / HARD_DOWN / SOFT_PRESSURE), not
+        WarmLaneReseedContaminated's ``counts_against_requeue_cap=True``: a held
+        lane lock is another live consumer's doing, so charging this task's
+        requeue cap for it would punish the wrong party.
+        """
+        from orchestrator.git_ops import WarmLaneLockContention, WarmLaneRequeue
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import (
+            RequeueKind,
+            _disposition_table,
+            _lookup_disposition,
+            classify_failure,
+        )
+
+        disp = _lookup_disposition(WarmLaneLockContention)
+        assert disp is not None, (
+            'WarmLaneLockContention must have a disposition row'
+        )
+        assert WarmLaneLockContention in _disposition_table(), (
+            'the row must be keyed on WarmLaneLockContention ITSELF — resolving '
+            'through the MRO to the WarmLaneRequeue base row would inherit '
+            "reason_prefix='warm_lane_disk_pressure (transient infra)' and keep "
+            'rendering a lane-lock refusal as disk pressure, which is the exact '
+            'defect task 4211 fixes; BD-2 completeness cannot catch this '
+            'because MRO resolution already satisfies it'
+        )
+
+        prefix = disp.reason_prefix
+        assert 'lock_contention' in prefix, prefix
+        assert 'disk_pressure' not in prefix, (
+            f'the operator-facing reason must not say disk pressure: {prefix!r}'
+        )
+
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.escalate_to_human is False, (
+            'transient contention resolves by waiting — it is not a human signal'
+        )
+        assert disp.counts_against_requeue_cap is False, (
+            'a lane lock held by another live consumer is a shared-resource '
+            'condition, not a fault of the requeued task — charging its cap '
+            'would punish the wrong party (cf. task 2988 flipping EXHAUSTED '
+            'True->False)'
+        )
+        assert disp.category is FailureCategory.NONE
+
+        parent = _lookup_disposition(WarmLaneRequeue)
+        assert parent is not None
+        assert disp.reason_prefix != parent.reason_prefix, (
+            'a distinct reason_prefix is what makes lock contention legible in '
+            'a block reason; sharing the base row\'s would re-render it as '
+            'disk pressure downstream'
+        )
+
+        # The end the caller actually goes through.
+        assert classify_failure(
+            WarmLaneLockContention('warm-lane seed refused: lane lock contention')
+        ) is disp
+
     def test_a_brand_new_exception_type_has_no_row_but_still_classifies(self):
         # A synthetic type with no table row proves the completeness check
         # above is meaningful: it FAILS for an unrecognized type rather than
@@ -1066,4 +1141,81 @@ class TestBD1DryRunUnblockConsultsSharedClassifier:
         assert entry['block_class'] == 'merge_verify_red', (
             f'Expected block_class from classify_failure(cap_exc), got: '
             f'{entry["block_class"]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 4930: the two new warm-lane steal/lock-timeout requeue rows
+# ---------------------------------------------------------------------------
+
+
+class TestWarmLaneStealDispositions:
+    """WarmLaneLockTimeout / WarmLaneStealFailed disposition rows (task 4930).
+
+    Both requeue, neither escalates — but they split on the requeue cap: a
+    lock timeout is transient shared-resource contention that clears on its
+    own, whereas a steal failure is driven by chronic pool pressure that does
+    NOT self-clear, so counting it preserves a bounded loud path in place of
+    the per-task BLOCKED+L1 this task removes.
+    """
+
+    def test_lane_lock_timeout_row(self):
+        from orchestrator.git_ops import WarmLaneLockTimeout
+        from orchestrator.workflow_types import (
+            BlockClass,
+            RequeueKind,
+            classify_failure,
+        )
+
+        disp = classify_failure(WarmLaneLockTimeout('x'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.escalate_to_human is False
+        assert disp.counts_against_requeue_cap is False, (
+            'a lost lock race is transient contention on a shared resource — '
+            'the requeued task must not be charged for it (same as its '
+            'WarmLaneDiskPressure neighbour)'
+        )
+        assert disp.reason_prefix == 'warm_lane_lock_timeout (transient infra)'
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+
+    def test_steal_failed_row(self):
+        from orchestrator.git_ops import WarmLaneStealFailed
+        from orchestrator.workflow_types import (
+            BlockClass,
+            RequeueKind,
+            classify_failure,
+        )
+
+        disp = classify_failure(WarmLaneStealFailed('x'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.escalate_to_human is False
+        assert disp.counts_against_requeue_cap is True, (
+            'chronic pool pressure keeps producing hostile lanes and does not '
+            'self-clear — counting it preserves a bounded loud path (the '
+            'requeue-cap escalation) instead of requeueing forever in silence'
+        )
+        assert disp.reason_prefix == 'warm_lane_steal_failed (pool pressure)'
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+
+    def test_both_are_their_own_table_keys(self):
+        """BD-2 completeness: each class must appear as its OWN key.
+
+        Resolving through the MRO to the aliased WarmLaneRequeue base row
+        would give both of them that row's
+        ``warm_lane_disk_pressure (transient infra)`` reason_prefix and
+        ``counts_against_requeue_cap=False`` — silently erasing the
+        steal-failure cap split above and making a steal failure
+        indistinguishable from disk pressure in the journal.
+        """
+        from orchestrator.git_ops import WarmLaneLockTimeout, WarmLaneStealFailed
+        from orchestrator.workflow_types import _disposition_table
+
+        table = _disposition_table()
+        assert WarmLaneLockTimeout in table, (
+            'WarmLaneLockTimeout must have its own row, not inherit the '
+            'WarmLaneRequeue base row through the MRO'
+        )
+        assert WarmLaneStealFailed in table, (
+            'WarmLaneStealFailed must have its own row, not inherit the '
+            'WarmLaneRequeue base row through the MRO'
         )

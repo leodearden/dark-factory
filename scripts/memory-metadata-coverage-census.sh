@@ -39,7 +39,7 @@
 # NO STEP CAN ABORT ANOTHER, AND THE WRAPPER ALWAYS EXITS 0. A recurring
 # `oneshot` that can fail enters systemd `failed` state and STAYS there,
 # silently stopping the whole nightly job (the lesson already written into
-# scripts/reify-closure-staleness-sweep.sh). That matters more here than for
+# scripts/fused-memory-flag-marker-sweep.sh). That matters more here than for
 # most jobs: the census exits 1 BY DESIGN whenever `coverage.complete` is false,
 # which on a live corpus that orchestrators write to during the scroll is a
 # routine outcome, not a fault. Propagating it would wedge the timer on the
@@ -246,7 +246,7 @@ fi
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
 # Always 0 — a recurring systemd oneshot that exits non-zero enters `failed`
 # state and STAYS there, silently ending the append-only trend this job
-# exists to build (see the header, and scripts/reify-closure-staleness-sweep.sh).
+# exists to build (see the header, and scripts/fused-memory-flag-marker-sweep.sh).
 # That is a strictly worse outcome than the one missed nightly row a refusal
 # costs -- the next run's append restores it. The loud-over-silent-
 # degradation norm this invokes is satisfied by LEGIBILITY, not by a wedged

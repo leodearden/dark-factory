@@ -47,6 +47,7 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_merge_queue_store import NINE_PREFIXES
 from test_verify_merge_flake_suppression import (
@@ -145,13 +146,14 @@ async def _drive_merge_boundary(
     """Drive the REAL ``_run_post_merge_verify`` — the single funnel every
     production merge verify flows through.
 
-    Patches, at the ``merge_queue`` lookup sites the boundary resolves at
-    ``LocalRunner`` construction time:
-      * ``run_scoped_verification`` -> a failing VerifyResult naming
-        *failing_node_id* (this also re-patches over the autouse
-        ``_mock_merge_queue_verification`` conftest stub, the standard idiom);
-      * ``_run_unscoped_typechecks`` -> a clean ``PostMergePyrightResult``, so
-        the post-scoped pyright gate never decides the outcome here;
+    The scoped verify and the post-scoped pyright gate both come from the
+    INJECTED verify port (``verifier=``), which is also what makes this
+    independent of the autouse ``_mock_merge_queue_verification`` conftest stub:
+      * ``run_scoped`` -> a failing VerifyResult naming *failing_node_id*;
+      * ``run_unscoped_typechecks`` -> ``FakeVerifier``'s clean
+        ``PostMergePyrightResult``, so the pyright gate never decides the
+        outcome here.
+    One patch remains, and it is not a lane module:
       * ``orchestrator.verify.run_verification`` -> the isolated re-run engine
         ``_merge_gate_isolated_rerun`` calls, passing or failing per
         *isolated_rerun_passes*.
@@ -174,17 +176,7 @@ async def _drive_merge_boundary(
 
     rerun = _passing_result() if isolated_rerun_passes else _failing_rerun_result()
 
-    with (
-        patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=_failing_scoped_result(failing_node_id)),
-        ),
-        patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            new=AsyncMock(return_value=PostMergePyrightResult()),
-        ),
-        patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)),
-    ):
+    with patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)):
         return await _run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={},
@@ -194,7 +186,38 @@ async def _drive_merge_boundary(
             event_store=event_store,
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
+            verifier=_BoundaryVerifier(_failing_scoped_result(failing_node_id)),
         )
+
+
+#: Bound on (c2)'s drive-until-the-storm-fires loop.  Comfortably above the
+#: shipped streak threshold (flake_recorder), which this file deliberately does
+#: not read: the contract under test is "one escalation, then reset".
+_STORM_DRIVE_CAP = 50
+
+
+class _BoundaryVerifier(FakeVerifier):
+    """The lane's verify port, recording the module set it was handed.
+
+    ``run_scoped``'s third argument is the effective set the merge boundary
+    resolved, so a test reads the LOCAL consumer's set here rather than off a
+    ``LocalRunner`` constructor spy.  *result* is what the scoped verify
+    renders — a red naming a specific node id, for the gate scenarios.
+
+    Only the arguments this double actually READS are named; the rest of
+    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
+    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
+    too -- so a port-signature change lands in the port and its one fake, not
+    in every double that wraps them.
+    """
+
+    def __init__(self, result: VerifyResult | None = None) -> None:
+        super().__init__(None if result is None else VerifyScript(result=result))
+        self.module_sets: list[list[ModuleConfig]] = []
+
+    async def run_scoped(self, worktree, config, module_configs, *args, **options):
+        self.module_sets.append(list(module_configs))
+        return await super().run_scoped(worktree, config, module_configs, *args, **options)
 
 
 def _suppression_events(store: _FakeEventStore) -> list[tuple]:
@@ -274,50 +297,71 @@ class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
         """(c1) The suppression bumps the INV-4 streak — the fail-soft path is
         not escape-less."""
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        assert flake_recorder._merge_flake_suppression_streak == 0
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='c1', breadth='full',
             registry=registry, touched=[mc_alpha],
-            escalation_queue=_FakeEscalationQueue(),
+            event_store=store, escalation_queue=queue,
         )
 
         assert outcome is None
-        assert flake_recorder._merge_flake_suppression_streak == 1, (
-            'a confirmed suppression at the merge boundary must advance the '
-            'storm streak by exactly 1'
+        assert len(_suppression_events(store)) == 1, (
+            'a confirmed suppression at the merge boundary is what advances '
+            'the storm streak, and it happened exactly once'
+        )
+        assert queue.submitted == [], (
+            'one suppression is below the threshold — the storm escalation '
+            'fires only when the streak reaches it (c2)'
         )
 
     @pytest.mark.asyncio
     async def test_threshold_suppressions_file_one_l2_storm_escalation_and_reset(
         self, tmp_path: Path,
     ):
-        """(c2) Driving the SAME scenario ``_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD``
-        times files exactly ONE born-at-L2 storm escalation and resets the
-        counter — end-to-end from the merge boundary, not from a direct call to
-        the bump helper.
+        """(c2) Repeating the SAME scenario files exactly ONE born-at-L2 storm
+        escalation and then RESETS the window — end-to-end from the merge
+        boundary, not from a direct call to the bump helper.
+
+        Driven until the storm fires rather than a fixed number of times: the
+        threshold is a ``flake_recorder`` internal, and the contract this test
+        owns is "one escalation, then the window reopens", not what the number
+        is.  ``_STORM_DRIVE_CAP`` bounds the loop so a threshold that never
+        fires is a fast RED instead of a hang.
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        threshold = flake_recorder._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
         queue = _FakeEscalationQueue(open_l2=None)
 
-        for i in range(threshold):
+        drives = 0
+        while not queue.submitted:
+            assert drives < _STORM_DRIVE_CAP, (
+                f'no storm escalation after {drives} consecutive suppressions'
+            )
             outcome = await _drive_merge_boundary(
-                tmp_path, task_id=f'c2-{i}', breadth='full',
+                tmp_path, task_id=f'c2-{drives}', breadth='full',
                 registry=registry, touched=[mc_alpha], escalation_queue=queue,
             )
-            assert outcome is None, f'suppression {i} did not land the merge'
+            assert outcome is None, f'suppression {drives} did not land the merge'
+            drives += 1
 
         assert len(queue.submitted) == 1, (
             f'expected exactly ONE storm escalation at the threshold; '
             f'got {len(queue.submitted)}'
         )
         esc = queue.submitted[0]
-        assert esc.task_id == flake_recorder._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
         assert esc.task_id == 'merge-flake-suppression-storm'
         assert esc.severity == 'critical'
         assert esc.level == 2
-        assert flake_recorder._merge_flake_suppression_streak == 0, (
+
+        # The window RESET: the streak is back at zero, so the very next
+        # suppression files nothing — a counter that kept growing would file a
+        # second escalation here.
+        outcome = await _drive_merge_boundary(
+            tmp_path, task_id='c2-after', breadth='full',
+            registry=registry, touched=[mc_alpha], escalation_queue=queue,
+        )
+        assert outcome is None
+        assert len(queue.submitted) == 1, (
             'the window must reset so the counter cannot grow unbounded'
         )
 
@@ -340,21 +384,30 @@ class TestMergeBoundarySuppressionControls:
     ):
         """(i) At the shipped default the merge verify never widened past the
         task's modules, so the gate has no business reasoning about beta — the
-        merge stays blocked, no fact, streak untouched.
+        merge stays blocked and no suppression fact is emitted.
+
+        ``_suppression_events`` is what carries the streak claim in all four
+        of these controls: the emit and the INV-4 streak bump sit under ONE
+        ``if suppressed:`` branch in
+        ``orchestrator/flake_recorder.py::record_merge_flake_suppression``, so
+        an absent fact means an untouched streak.  The escalation queue cannot
+        carry it — a storm escalation fires only at the streak THRESHOLD, so a
+        regression that bumped by exactly one would still leave ``submitted``
+        empty.
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        store = _FakeEventStore()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='i1', breadth='scoped',
             registry=registry, touched=[mc_alpha], event_store=store,
-            escalation_queue=_FakeEscalationQueue(),
+            escalation_queue=queue,
         )
 
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert flake_recorder._merge_flake_suppression_streak == 0
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (ii) empty registry: safe degrade ------------------------------------
 
@@ -363,18 +416,18 @@ class TestMergeBoundarySuppressionControls:
         """(ii) breadth='full' with an EMPTY registry resolves to the passed set
         — never suppress against a set that was never resolved."""
         mc_alpha, _mc_beta, _registry = self._two_module_registry()
-        store = _FakeEventStore()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='ii1', breadth='full',
             registry={}, touched=[mc_alpha], event_store=store,
-            escalation_queue=_FakeEscalationQueue(),
+            escalation_queue=queue,
         )
 
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert flake_recorder._merge_flake_suppression_streak == 0
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (iii) a red in NO registered module: still fail-closed ---------------
 
@@ -384,19 +437,19 @@ class TestMergeBoundarySuppressionControls:
         module. γ widens the mappable set; it does not make the gate guess.
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        store = _FakeEventStore()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='iii1', breadth='full',
             registry=registry, touched=[mc_alpha],
             failing_node_id=_DELTA_FAILING_ID,
-            event_store=store, escalation_queue=_FakeEscalationQueue(),
+            event_store=store, escalation_queue=queue,
         )
 
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert flake_recorder._merge_flake_suppression_streak == 0
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
     # -- (iv) a GENUINE red in an untouched module: never suppressed ----------
 
@@ -410,19 +463,19 @@ class TestMergeBoundarySuppressionControls:
         through".
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        store = _FakeEventStore()
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='iv1', breadth='full',
             registry=registry, touched=[mc_alpha],
             isolated_rerun_passes=False,
-            event_store=store, escalation_queue=_FakeEscalationQueue(),
+            event_store=store, escalation_queue=queue,
         )
 
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert flake_recorder._merge_flake_suppression_streak == 0
+        assert queue.submitted == [], 'a blocked merge files no escalation at all'
 
 
 # ---------------------------------------------------------------------------
@@ -446,18 +499,17 @@ async def _capture_boundary_consumers(
     """Drive ``_run_post_merge_verify`` and capture what each consumer of the
     module set actually RECEIVED.
 
-    Spies wrap (and delegate to) the real ``build_merge_verify_spec`` and
-    ``LocalRunner`` at their ``merge_queue`` lookup sites — the boundary
-    resolves both names there when it constructs the pool — so the captured
-    values are the genuine arguments, not a re-derivation. ``VerifyRunnerPool.
-    dispatch`` is stubbed to a pass so the run completes without executing
-    anything.
+    The LOCAL set comes off the injected verify port and the WIRE set off a
+    spy that wraps (and delegates to) the real ``build_merge_verify_spec`` at
+    its ``merge_queue`` lookup site — the boundary resolves that name there
+    when it constructs the pool — so both captured values are the genuine
+    arguments, not a re-derivation.
 
     ``global_commands=True`` additionally gives the config LIVE global
     commands, which is what makes INV-1's zero-module ``global_verify_command``
     fallback observable at all (see the empty-set class below).
 
-    Returns ``{'spec_arg', 'spec', 'local_args', 'config', 'merge_wt'}``.
+    Returns ``{'spec_arg', 'spec', 'verified', 'config', 'merge_wt'}``.
     """
     from orchestrator import merge_queue as merge_queue_module
 
@@ -482,10 +534,17 @@ async def _capture_boundary_consumers(
     req = _make_req(task_id, task_wt, config)
     req.module_configs = list(touched)
 
-    captured: dict = {'local_args': [], 'config': config, 'merge_wt': merge_wt}
+    # The LOCAL consumer's module set is read off the verify port: it is
+    # `run_scoped`'s third argument, which is the very list `LocalRunner` was
+    # constructed with (verify_runner.py::LocalRunner.run_merge_verify), so the
+    # observation needs no constructor spy.  The WIRE spec's set has no port —
+    # `build_merge_verify_spec` is a module function — so that one stays spied.
+    verifier = _BoundaryVerifier()
+    captured: dict = {
+        'verified': verifier.module_sets, 'config': config, 'merge_wt': merge_wt,
+    }
 
     real_build = merge_queue_module.build_merge_verify_spec
-    real_local_runner = merge_queue_module.LocalRunner
 
     def _spy_build(cfg, module_configs, task_files):
         captured['spec_arg'] = list(module_configs)
@@ -493,23 +552,13 @@ async def _capture_boundary_consumers(
         captured['spec'] = spec
         return spec
 
-    def _spy_local_runner(*args, **kwargs):
-        captured['local_args'].append(list(args[2]))
-        return real_local_runner(*args, **kwargs)
-
-    with (
-        patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build),
-        patch('orchestrator.merge_queue.LocalRunner', new=_spy_local_runner),
-        patch.object(
-            merge_queue_module.VerifyRunnerPool, 'dispatch',
-            new=AsyncMock(return_value=_passing_result()),
-        ),
-    ):
+    with patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build):
         await _run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=3, max_enospc=1,
             merge_sha=_MERGE_SHA,
+            verifier=verifier,
         )
 
     return captured
@@ -554,8 +603,8 @@ class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
             registry=registry, touched=[mc_a],
         )
 
-        assert captured['local_args'], 'no LocalRunner was constructed'
-        local_set = captured['local_args'][0]
+        assert captured['verified'], 'the verify port was never asked'
+        local_set = captured['verified'][0]
         spec_set = captured['spec_arg']
 
         assert _prefixes(local_set) == ['alpha', 'beta', 'gamma']
@@ -614,7 +663,7 @@ class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
             tmp_path, task_id='w3', breadth='full',
             registry=registry, touched=[mc_a],
         )
-        local_set = captured['local_args'][0]
+        local_set = captured['verified'][0]
 
         remote_scoped = AsyncMock(return_value=_passing_result())
         remote_unscoped = AsyncMock(return_value=PostMergePyrightResult())
@@ -652,7 +701,7 @@ class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
         )
 
         assert _prefixes(captured['spec_arg']) == ['alpha']
-        assert _prefixes(captured['local_args'][0]) == ['alpha']
+        assert _prefixes(captured['verified'][0]) == ['alpha']
 
     @pytest.mark.asyncio
     async def test_full_breadth_empty_registry_spec_carries_the_passed_set(
@@ -668,7 +717,7 @@ class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
         )
 
         assert _prefixes(captured['spec_arg']) == ['alpha']
-        assert _prefixes(captured['local_args'][0]) == ['alpha']
+        assert _prefixes(captured['verified'][0]) == ['alpha']
 
 
 # ---------------------------------------------------------------------------
@@ -721,10 +770,10 @@ class TestMergeBoundaryLeavesTheZeroModuleTaskAlone:
             f"the spec leg must not be widened for a zero-module task; got "
             f"{_prefixes(captured['spec_arg'])!r}"
         )
-        assert captured['local_args'], 'no LocalRunner was constructed'
-        assert captured['local_args'][0] == [], (
+        assert captured['verified'], 'the verify port was never asked'
+        assert captured['verified'][0] == [], (
             f"the local runner must not be widened either; got "
-            f"{_prefixes(captured['local_args'][0])!r}"
+            f"{_prefixes(captured['verified'][0])!r}"
         )
 
     @pytest.mark.asyncio
@@ -769,7 +818,7 @@ class TestMergeBoundaryLeavesTheZeroModuleTaskAlone:
         )
 
         assert _prefixes(captured['spec_arg']) == ['alpha', 'beta', 'gamma']
-        assert _prefixes(captured['local_args'][0]) == ['alpha', 'beta', 'gamma']
+        assert _prefixes(captured['verified'][0]) == ['alpha', 'beta', 'gamma']
         assert captured['spec'].global_verify_command is None
 
 

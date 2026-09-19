@@ -3,7 +3,9 @@
 import json
 import logging
 import os
+import re
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -167,15 +169,98 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
     return out
 
 
+def _reasons_for(
+    harness: Harness,
+    session: object,
+    config_dir: str | None,
+    *,
+    archive_available: bool = False,
+) -> frozenset[str]:
+    """Call the eligibility predicate directly, off the ``_run_slot`` path.
+
+    The ONE place this suite names ``_session_resume_reasons``. The predicate is
+    module-internal, so every case routing through a single seam keeps the
+    coupling to that name at one line rather than one per case — a rename costs
+    an edit here instead of twenty.
+
+    ``archive_available`` defaults to False, the pre-δ answer, so a case that
+    says nothing about the archive reads as one whose outcome does not turn on
+    it; the δ cases below pass it explicitly.
+    """
+    return harness._session_resume_reasons(
+        session, config_dir, archive_available=archive_available
+    )
+
+
+# ── Storm-streak state, read through ONE seam each ───────────────────────────
+# The `_reasons_for` convention above, applied to the streak. Every row that
+# touches this state goes through these, so the suite names each private field
+# ONCE: a rename costs one edit instead of forty, and the coupling a reader has
+# to hold in their head is one line rather than one per assertion. That is also
+# what the merge-lane ratchet's `private_reads` measure is counting.
+
+
+def _streak(harness: Harness) -> int:
+    """The current run of genuine session-resume failures."""
+    return harness._session_resume_fallback_streak
+
+
+def _chain_stamp(harness: Harness) -> float | None:
+    """The chain's monotonic comparison point; None means no run in progress."""
+    return harness._last_session_resume_fallback_at
+
+
+def _set_chain_stamp(harness: Harness, value: float | None) -> None:
+    return setattr(harness, '_last_session_resume_fallback_at', value)
+
+
+def _rewind_chain(harness: Harness, secs: float) -> None:
+    """Advance the clock by *secs* against the chain's own stamp.
+
+    Rewinding the harness's stamp, never monkeypatching ``time.monotonic``: the
+    rewind is deterministic and perturbs no unrelated timer.
+    """
+    stamp = _chain_stamp(harness)
+    assert stamp is not None, 'no chain in progress — nothing to rewind'
+    _set_chain_stamp(harness, stamp - secs)
+
+
+def _recorded_failures(harness: Harness) -> list:
+    """The eligible-but-FAILED resumes backing the current run."""
+    return list(harness._eligible_but_failed_resumes)
+
+
+def _survivals(harness: Harness) -> int:
+    """Armed resumes that have SURVIVED this boot — the streak's reset term."""
+    return harness._session_resume_survivals
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
     session: dict,
     *,
     config_dir: Path | str | None = None,
+    workflow_reports: Callable[[Harness], None] | None = None,
 ):
     """Populate recovered-session state and run ``_run_slot`` with
     ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
+
+    The FULL kwarg set is stashed on the harness as
+    ``_last_build_workflow_kwargs`` for the rows that need a different one (ε's
+    sink wiring). Stashed rather than returned because ~20 existing rows read
+    the return value as a session id, and per-harness rather than per-module
+    because the fixture is function-scoped, so nothing leaks between rows.
+
+    ``workflow_reports`` COMPOSES the guard with the arm seam (task ε/3733).
+    The stand-in workflow calls it, from inside its ``run()``, with the
+    ``resume_outcome_sink`` kwarg ``_run_slot`` actually handed
+    ``build_workflow`` — the object and the moment production's ``_invoke``
+    reports through. That is what puts the REAL eligibility pass and the REAL
+    sink on ONE streak in a single dispatch, in production's own order; the
+    rows that drive either seam alone cannot observe how they interleave, and
+    the reset-on-eligible defect lived exactly in that gap. Left None, nothing
+    reports and every existing row is byte-identical.
     """
     harness._recovered_sessions[task_id] = session
     if config_dir is not None:
@@ -194,7 +279,16 @@ async def _drive_session_slot(
             total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
         )
         MockWorkflow.return_value = mock_wf
+        if workflow_reports is not None:
+            async def _run(*_args, **_kwargs):
+                workflow_reports(
+                    MockWorkflow.call_args.kwargs['resume_outcome_sink']
+                )
+                return MagicMock(value='done')
+
+            mock_wf.run = _run
         await harness._run_slot(assignment, sem)
+        harness._last_build_workflow_kwargs = MockWorkflow.call_args.kwargs  # type: ignore[attr-defined]
         return MockWorkflow.call_args.kwargs['resume_session_id']
 
 
@@ -1929,7 +2023,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-both'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'stale', 'no_transcript'})
 
@@ -1946,7 +2040,7 @@ class TestSessionResumeReasons:
         }
         cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
 
-        reasons = harness._session_resume_reasons(session, str(cfg_dir))
+        reasons = _reasons_for(harness, session, str(cfg_dir))
 
         assert reasons == frozenset()
         assert not reasons  # the eligibility predicate itself
@@ -1963,7 +2057,7 @@ class TestSessionResumeReasons:
         gone = tmp_path / 'gone-three' / 'claude-config-x'
         assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
 
-        reasons = harness._session_resume_reasons(session, str(gone))
+        reasons = _reasons_for(harness, session, str(gone))
 
         assert reasons == frozenset({'stale', 'capped', 'reseeded'})
 
@@ -1986,7 +2080,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-dis'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = _reasons_for(harness, session, str(empty_cfg))
 
         assert reasons == frozenset({'disabled'})
 
@@ -2000,7 +2094,8 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
 
         cfg1 = _make_transcript(tmp_path, 'uuid-bad')
-        r1 = harness._session_resume_reasons(
+        r1 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad', 'role': 'r',
              'started_at': 'not-a-date', 'resume_count': 0},
             str(cfg1),
@@ -2009,7 +2104,8 @@ class TestSessionResumeReasons:
         assert 'no_transcript' not in r1
 
         cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
-        r2 = harness._session_resume_reasons(
+        r2 = _reasons_for(
+            harness,
             {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
             str(cfg2),
         )
@@ -2024,14 +2120,16 @@ class TestSessionResumeReasons:
         harness.config.session_resume = SessionResumeConfig()
         fresh = datetime.now(UTC).isoformat()
 
-        no_dir = harness._session_resume_reasons(
+        no_dir = _reasons_for(
+            harness,
             {'session_id': 'uuid-nocfg', 'role': 'r',
              'started_at': fresh, 'resume_count': 0},
             None,
         )
         assert 'no_transcript' in no_dir
 
-        no_sid = harness._session_resume_reasons(
+        no_sid = _reasons_for(
+            harness,
             {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
             '/some/where',
         )
@@ -2061,7 +2159,8 @@ class TestSessionResumeReasons:
         monkeypatch.setattr(Path, 'stat', fake_stat)
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(
+        reasons = _reasons_for(
+            harness,
             {'session_id': 'uuid-eacces', 'role': 'r',
              'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
             str(blocked),
@@ -2103,7 +2202,10 @@ class TestSessionResumeReasons:
 
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(bad_session, str(tmp_path))
+        reasons = _reasons_for(
+            harness,
+            bad_session, str(tmp_path)
+        )
 
         assert isinstance(reasons, frozenset)
         assert all(isinstance(r, str) for r in reasons)
@@ -2129,9 +2231,276 @@ class TestSessionResumeReasons:
         """
         harness.config.session_resume = SessionResumeConfig(enabled=False)
 
-        reasons = harness._session_resume_reasons(['a'], str(tmp_path))
+        reasons = _reasons_for(
+            harness,
+            ['a'], str(tmp_path)
+        )
 
         assert reasons == frozenset({'disabled'})
+
+    # ── δ (task 3730 / D2): the durable archive as a SECOND source of
+    #    reachability, and freshness demoted to the no-archive case ─────────
+
+    def test_aged_but_archived_and_config_dir_less_is_eligible(
+        self, harness: Harness
+    ):
+        """(a) B8 HEADLINE — the real crash-recovery shape is now ELIGIBLE.
+
+        An aged sidecar, NO live config dir at all, but the session is still
+        in the durable transcript archive: the empty set. Neither 'stale' nor
+        'no_transcript'.
+
+        This is the shape production actually reaches, which is the whole
+        point. ``run()``'s finally executes an unconditional
+        ``cleanup_config_dir`` teardown while ``session_preserved`` keeps the
+        sidecar, so on every crash-recovery path the config dir is GONE and
+        ``_adopt_recovered_session``'s glob hands the guard ``config_dir=None``.
+        Before δ that combination was uncorroborable by construction, which is
+        why ~91% of post-3578 fallbacks (92 of 101, measured 2026-09-04) had a
+        recoverable archive the predicate never consulted.
+
+        Reachability outranks freshness: an archived transcript does not decay
+        with wall-clock, so "how old is it" is the wrong question for a
+        session that is still reachable. The absolute backstop (D3) is what
+        keeps that from meaning "no age limit at all".
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+            'this row must sit BETWEEN the two thresholds, or it is testing '
+            'the backstop instead of the freshness demotion'
+        )
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert reasons == frozenset()
+        assert not reasons  # the eligibility predicate itself
+
+    def test_the_archive_is_the_only_thing_that_changed_the_answer(
+        self, harness: Harness
+    ):
+        """(b) THE CONTROL for (a) — same session, archive_available=False,
+        and the answer is exactly today's {'stale', 'no_transcript'}.
+
+        Run against byte-identical inputs so the archive is demonstrably the
+        only variable. Without this, (a) would be consistent with δ having
+        loosened something else.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+        # Explicit, though False is the helper's default: this row IS the
+        # archive variable held at False, so spelling it makes the contrast
+        # with (a) legible without cross-referencing the helper.
+        reasons = _reasons_for(harness, session, None, archive_available=False)
+
+        assert reasons == frozenset({'stale', 'no_transcript'})
+
+    def test_fresh_and_archived_without_a_live_transcript_is_eligible(
+        self, harness: Harness
+    ):
+        """(c) Reachability ALONE suffices — the age was never the objection.
+
+        A FRESH sidecar with no live transcript is ineligible today purely on
+        corroboration. With an archive it is reachable, so it is eligible;
+        this separates the corroboration change from the freshness change,
+        which (a) exercises together.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-fresh-arch',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert reasons == frozenset()
+
+    def test_a_live_transcript_still_corroborates_on_its_own(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(d) The archive is an ADDITIONAL source of reachability, not a
+        replacement: a live transcript still corroborates with no archive.
+
+        Pins that δ WIDENED the corroboration leg rather than moving it onto
+        the archive — a rewrite that made the archive the only accepted source
+        would leave every warm-lane resume (the population γ shipped for)
+        newly ineligible, and nothing else in this class would notice.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-live-only',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg_dir = _make_transcript(tmp_path, 'uuid-live-only')
+
+        reasons = _reasons_for(
+            harness,
+            session, str(cfg_dir)
+        )
+
+        assert reasons == frozenset()
+
+
+    # ── δ (task 3730 / D3): the absolute backstop — "archive outranks age"
+    #    must not become "no age limit at all" ────────────────────────────
+
+    def _aged(self, cfg: SessionResumeConfig, age_secs: float) -> dict:
+        """A sidecar back-dated *age_secs*, driven off the config knobs."""
+        return {
+            'session_id': 'uuid-aged',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+    def test_aged_out_rejects_even_an_archived_session(self, harness: Harness):
+        """(a) B9 HEADLINE — reachability outranks FRESHNESS, not the BACKSTOP.
+
+        Past absolute_resume_age_secs a session is rejected however reachable
+        it is, and reports 'aged_out'. Without this leg D2 would read as "an
+        archive exempts a session from age entirely", and a sidecar surviving
+        an arbitrarily long outage would resume into a world that had moved on.
+
+        Back-dated off the CONFIG FIELD rather than a literal, so a re-tuned
+        bound re-tunes this row with it.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'aged_out' in reasons
+        assert reasons  # ineligible, whatever else co-occurs
+
+    def test_aged_out_boundary_is_closed_at_the_bound(self, harness: Harness):
+        """(b) `>=`, matching the freshness leg's existing convention.
+
+        AT the bound is rejected; comfortably below it, with an archive, is
+        eligible — which also proves this row is exercising the BACKSTOP and
+        not the freshness window it sits above.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        at_bound = _reasons_for(
+            harness,
+            self._aged(cfg, cfg.absolute_resume_age_secs),
+            None,
+            archive_available=True,
+        )
+        assert 'aged_out' in at_bound
+
+        below = _reasons_for(
+            harness,
+            self._aged(cfg, cfg.absolute_resume_age_secs - 3600),
+            None,
+            archive_available=True,
+        )
+        assert below == frozenset()
+
+    def test_aged_out_co_occurs_rather_than_replacing(self, harness: Harness):
+        """(c) D5 survives the new token: aged out AND capped reports BOTH.
+
+        The predicate accumulates; a new leg that returned early would undo
+        exactly the co-occurrence reporting task 3728 exists to provide.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+        session['resume_count'] = cfg.max_resumes_per_task
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'aged_out' in reasons
+        assert 'capped' in reasons
+
+    @pytest.mark.parametrize(
+        'started_at',
+        ['not-a-date', None, 12345, ['2026-01-01']],
+        ids=['unparseable', 'none', 'int', 'list'],
+    )
+    def test_an_undateable_session_is_never_laundered_by_the_archive(
+        self, harness: Harness, started_at
+    ):
+        """(d) THE FAIL-SAFE CARVE-OUT — an archive cannot redeem an UNDATEABLE
+        sidecar.
+
+        D2's argument for suppressing 'stale' is that an archived transcript
+        does not decay with wall-clock, so age is the wrong question. That
+        applies only to a session whose age we KNOW. With started_at missing,
+        unparseable or the wrong type the age is unknown, so nothing bounds it
+        — and the D3 backstop cannot be evaluated either, because there is no
+        age to compare against. Suppressing 'stale' here would make an
+        undateable sidecar FULLY ELIGIBLE on the strength of an archive: a
+        fail-OPEN regression against the I3 contract.
+
+        The sharpest way to get δ wrong is to write the suppression as a
+        single `if not archive_available` around the whole freshness leg,
+        which passes every other row in this class. This is the row that
+        catches it.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {'session_id': 'uuid-undateable', 'role': 'r',
+                   'resume_count': 0}
+        if started_at is not None:
+            session['started_at'] = started_at
+
+        reasons = _reasons_for(harness, session, None, archive_available=True)
+
+        assert 'stale' in reasons, (
+            'an undateable sidecar must stay ineligible however reachable it '
+            'is: its age cannot be bounded and the absolute backstop cannot '
+            'be evaluated, so nothing is left to stop it resuming'
+        )
+        # ...and the backstop is NOT claimed, because nothing was compared.
+        assert 'aged_out' not in reasons
+
+    def test_no_archive_reports_both_thresholds_separately(self, harness: Harness):
+        """(e) On the no-archive path an aged-out session reports 'stale' AND
+        'aged_out', so a runs.db census can still tell the two apart.
+
+        They answer different operator questions and are actioned differently:
+        'stale' is "old, with no archive to redeem it" (worth asking why the
+        archive is missing — the U2 population), 'aged_out' is "old past the
+        point resuming is safe regardless of reachability" (the backstop
+        working). Collapsing them into one token would destroy the
+        co-occurrence census D5 built the reason SET to enable.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        reasons = _reasons_for(
+            harness,
+            self._aged(cfg, 2 * cfg.absolute_resume_age_secs),
+            None,
+        )
+
+        assert 'stale' in reasons
+        assert 'aged_out' in reasons
 
 
 @pytest.mark.asyncio
@@ -2142,6 +2511,15 @@ class TestSessionResumeGuard:
     session_resume event. The kill switch (enabled=False) degrades silently
     with no event (B6). The guard is fail-safe (I3) — every ineligible path
     is no-worse than today's fresh dispatch.
+
+    Since task 3730 (δ) the guard also HOISTS the durable-archive lookup and
+    feeds it to the predicate as an eligibility input, so two rows here drive
+    the archive-mediated outcomes end to end: an aged, config-dir-less,
+    archive-backed session is now ADOPTED (D2), and the same session past the
+    absolute bound still falls back with 'aged_out' (D3). Every pre-δ row
+    above is unchanged in meaning: none of them seeds an archive, so the
+    hoisted lookup answers False and they exercise exactly the no-archive
+    world they always did.
     """
 
     async def test_eligible_keeps_session_and_emits(self, harness: Harness, tmp_path: Path):
@@ -2506,7 +2884,161 @@ class TestSessionResumeGuard:
         # 'capped' stays visible in the set, so routing the dispatch here
         # rather than to session_resume_capped loses no information.
         assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
+
+    async def test_archive_backed_session_with_no_config_dir_is_adopted(
+        self, harness: Harness
+    ):
+        """δ END TO END (task 3730 / D2), at the GUARD rather than the
+        predicate: the real crash-recovery shape — sidecar PRESERVED, config
+        dir GONE, transcript recoverable only from the durable archive — is
+        adopted, injected as ``resume_session_id``, and emits
+        ``session_resume`` instead of ``session_resume_fallback``.
+
+        THE BAR THIS ROW SETS, and why it is not "any session_resume". The
+        task's Tier-1 signal is a resume attributable to the ARCHIVE-MEDIATED
+        predicate; a live-dir resume proves nothing about D2, because that
+        path was already eligible before δ (see
+        :meth:`test_eligible_keeps_session_and_emits`, unchanged). So this row
+        seeds NO config dir at all and back-dates the sidecar PAST
+        ``freshness_window_secs``: before δ that combination was doubly
+        ineligible (``{'no_transcript', 'stale'}``), and it is the shape
+        production reaches on EVERY crash-recovery path — ``run()``'s finally
+        executes an unconditional ``cleanup_config_dir`` teardown
+        (registered by ``workflow.py::TaskWorkflow._on_terminal_cleanups``,
+        run on every terminal exit) while ``session_preserved`` keeps
+        the sidecar, so ``_adopt_recovered_session``'s glob hands the guard
+        ``config_dir=None``. ~91% of post-3578 fallbacks (92 of 101, measured
+        2026-09-04) had exactly this recoverable archive the predicate never
+        consulted.
+
+        Also pins what adoption does NOT do: a storm run in progress survives
+        it untouched (task ε/3733). Adoption is an ELIGIBILITY verdict reached
+        before the restore, so on this very path — archive-mediated, the one δ
+        opened — the resume it adopts may still fault a phase later. Only a
+        resume that survived retires the run.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+            'this row must sit BETWEEN the two thresholds, or it is measuring '
+            'the backstop rather than the freshness demotion'
+        )
+        session = {
+            'session_id': 'uuid-delta-e2e',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz1', 'uuid-delta-e2e')
+        harness._session_resume_fallback_streak = 2  # a run in progress
+
+        resume_id = await _drive_session_slot(harness, 'dz1', session)  # no config_dir
+
+        assert resume_id is session
+        emits = _session_resume_emits(harness)
+        assert [et for et, _ in emits] == [EventType.session_resume]
+        assert _streak(harness) == 2
+
+    async def test_aged_out_archive_backed_session_still_falls_back(
+        self, harness: Harness
+    ):
+        """The D3 backstop at the guard: the SAME archive-backed, config-dir-less
+        shape adopted above still falls back once it is past
+        ``absolute_resume_age_secs``, and the event carries 'aged_out'.
+
+        Reachability outranks freshness, NOT the backstop — without this row
+        the change above would read as "an archive exempts a session from age
+        entirely". 'aged_out' rather than 'stale' so the two thresholds stay
+        distinguishable in runs.db, and by-design so a batch of week-old
+        sidecars after a long outage cannot page an operator (D4/D5).
+
+        Back-dated off the CONFIG FIELD, never a literal, so a re-derived
+        bound re-tunes this row with it.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-delta-agedout',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.absolute_resume_age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz2', 'uuid-delta-agedout')
+
+        resume_id = await _drive_session_slot(harness, 'dz2', session)  # no config_dir
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # 'stale' is suppressed by the archive; only the backstop fires, and
+        # the corroboration leg is satisfied by the archive too.
+        assert kwargs['data']['reasons'] == ['aged_out']
+        assert kwargs['data']['archive_available'] is True
+        assert _streak(harness) == 0  # by design (D4)
+
+    async def test_restore_kill_switch_withholds_the_archive_from_eligibility(
+        self, harness: Harness
+    ):
+        """THE NARROW KILL SWITCH STILL REVERTS δ (task 3578's
+        ``restore_from_archive``, at δ's guard).
+
+        Same archive-backed, config-dir-less shape adopted two rows above, with
+        restoration disabled — the switch an operator pulls precisely when they
+        suspect a restore regression. It must put that session back on its
+        pre-δ path: an archive nothing will rehydrate does not make a session
+        reachable.
+
+        WHAT GOES WRONG IF ELIGIBILITY IGNORES THE SWITCH. The guard would
+        adopt the session and emit ``session_resume``; the arm site would then
+        skip rehydration (``restore_outcome='disabled'``), fail
+        re-corroboration against the fresh config dir, veto, and dispatch fresh
+        with ``session_resume_failed(stage='pre_flight')``. Every
+        archive-mediated session would move from ``session_resume_fallback`` to
+        ``session_resume`` while none of them actually resumed — so D8's ratio
+        recipe, and the OPERATIONS.md §14 instruction to watch
+        ``session_resume`` rise, would read 100% resumed at 0% resumed. The
+        switch would have made the signal it exists to preserve actively
+        misleading.
+
+        The INSTRUMENT is NOT withheld with it: ``archive_available`` still
+        reports what is on disk, because 'restore switched off' and 'no archive
+        at all' are different operator situations and this field is the only
+        thing in runs.db that tells them apart. That is the same field
+        ``restore_from_archive``'s own description promises not to go blind on.
+        """
+        cfg = SessionResumeConfig(restore_from_archive=False)
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-delta-norestore',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        _make_archive(harness.config.project_root, 'dz3', 'uuid-delta-norestore')
+
+        resume_id = await _drive_session_slot(harness, 'dz3', session)  # no config_dir
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        # EXACTLY the pre-δ answer for this shape (cf.
+        # test_the_archive_is_the_only_thing_that_changed_the_answer).
+        assert kwargs['data']['reasons'] == ['no_transcript', 'stale']
+        assert kwargs['data']['archive_available'] is True
 
 
 @pytest.mark.asyncio
@@ -2517,8 +3049,10 @@ class TestSessionResumeStorm:
 
     The streak is a rolling CHAIN, not a per-boot running total: consecutive
     means chained within storm_window_secs, so a gap at least that long decays
-    it to 0 (an eligible resume also resets it outright, and clears the chain's
-    comparison stamp).
+    it to 0 (a resume that ADOPTED AND SURVIVED also retires the run outright,
+    clearing the chain's comparison stamp and the recorded failures with it —
+    a resume merely judged ELIGIBLE does not, since that predicate runs before
+    the restore and settles nothing about its outcome).
 
     WHAT FEEDS IT is the part task 3728 changed. EVERY by-design outcome is now
     excluded by construction — 'disabled' (silent kill switch), 'capped'
@@ -2527,14 +3061,16 @@ class TestSessionResumeStorm:
     ``_session_resume_reasons``' own docstring described them as the
     anticipated reseed/wipe/clock cases, so the L1 they filed sent operators to
     check NTP for a population the system expects to see. After the carve-out
-    NOTHING the predicate can currently produce feeds the streak — the
-    deliberate, G7-waived window that PRD leaf ε (task 3733) closes by
-    installing the archive-restore-failure feeder.
+    NOTHING the predicate can produce feeds the streak, so the rows driving it
+    through ``_run_slot`` use a SYNTHETIC feeder (:meth:`_arm_synthetic_feeder`),
+    which doubles as the executable statement of the extension contract.
 
-    So the mechanism is RETAINED and exercised here through a SYNTHETIC feeder
-    (:meth:`_arm_synthetic_feeder`) standing in for ε's, which doubles as the
-    executable statement of the extension contract ε consumes. Filing is
-    best-effort — a None queue never raises (I3).
+    THE LIVE FEEDER is ε's (task 3733), and it is a different seam: every armed
+    resume that did not survive, reported from ``TaskWorkflow._invoke`` to
+    :meth:`Harness.note_resume_failed` and classified against
+    ``_BY_DESIGN_RESTORE_OUTCOMES``. The ε rows at the end of this class drive
+    those two methods directly against the same streak, the same decay and the
+    same filer. Filing is best-effort — a None queue never raises (I3).
     """
 
     @staticmethod
@@ -2581,9 +3117,30 @@ class TestSessionResumeStorm:
         ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
         edit anywhere.
 
-        ``restore_failed`` is deliberately the name ε is expected to use.
+        ``restore_failed`` is NOT the name ε ended up using, and the reason is
+        structural rather than a change of mind: ε's feeder is the ARM SEAM,
+        not a predicate reason. ``_session_resume_reasons`` is evaluated in
+        ``_run_slot`` BEFORE the resume injection and takes ``archive_available``
+        as a bool specifically so it acquires no filesystem dependency of its
+        own, while ``restore_archived_transcript`` has exactly ONE call site —
+        inside ``TaskWorkflow._invoke``, a whole process-phase downstream. A
+        predicate that runs before the restore, and is contractually forbidden
+        I/O, cannot report that a restore failed; making it do so would corrupt
+        an ELIGIBILITY predicate into an outcome log.
+
+        So this row is KEPT, and the name with it, as the executable statement
+        of the EXTENSION CONTRACT: a reason absent from
+        ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
+        edit anywhere. ε's own carve-out
+        (``_BY_DESIGN_RESTORE_OUTCOMES``) states the same rule one seam later.
         """
-        def _reasons(session: dict, config_dir: str | None) -> frozenset[str]:
+        def _reasons(
+            session: dict, config_dir: str | None, *, archive_available: bool
+        ) -> frozenset[str]:
+            # Accepts δ's archive_available (task 3730) so the stub tracks the
+            # real signature — a **kwargs sponge would keep passing if the
+            # caller stopped supplying it, which is the one thing the hoist
+            # rows in TestSessionResumeArchiveAvailable exist to catch.
             return reasons
 
         harness._session_resume_reasons = _reasons  # type: ignore[method-assign]
@@ -2636,7 +3193,7 @@ class TestSessionResumeStorm:
             await _drive_session_slot(harness, f'bd{i}', session, config_dir=cfg)
             # Asserted INSIDE the loop: the counter must never transiently
             # rise, not merely end at 0.
-            assert harness._session_resume_fallback_streak == 0
+            assert _streak(harness) == 0
             assert harness._escalation_queue.submit.call_count == 0
 
         emits = _session_resume_emits(harness)
@@ -2677,10 +3234,15 @@ class TestSessionResumeStorm:
         line in ``non_reason_literals`` below, and it forces a human to state
         which kind of string was just added. Fail-open, by contrast, is silent.
 
-        ε (task 3733) is EXPECTED to trip this when it adds ``restore_failed``.
-        The correct resolution is almost certainly to extend the expected
-        vocabulary here, NOT the constant: a restore failure is a genuine
-        feeder, which is the whole point of ε.
+        ε (task 3733) was expected to trip this by adding ``restore_failed``
+        to the predicate, and did not: it keys its feeder on
+        ``TaskWorkflow._invoke``'s arm seam instead, for the structural reason
+        recorded on :meth:`_arm_synthetic_feeder` above. The restore vocabulary
+        gets its own sibling constant and its own fail-closed structural row —
+        ``_BY_DESIGN_RESTORE_OUTCOMES`` and
+        ``test_by_design_restore_constant_classifies_every_producible_outcome``
+        — so this one still covers EXACTLY the predicate, which is what makes
+        its equality assertion meaningful.
         """
         import ast  # noqa: PLC0415 — structural read of one method's source
         import inspect  # noqa: PLC0415
@@ -2731,7 +3293,7 @@ class TestSessionResumeStorm:
 
         producible = strings - non_reason_literals
         assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
-                              'reseeded'}, (
+                              'reseeded', 'aged_out'}, (
             'the string literals in _session_resume_reasons no longer partition '
             'into the declared non-reasons and the known reason vocabulary. If '
             'you added a REASON, classify it in '
@@ -2741,6 +3303,83 @@ class TestSessionResumeStorm:
             f'above. Saw: {sorted(producible)}'
         )
         assert producible == _BY_DESIGN_SESSION_RESUME_REASONS
+
+    async def test_by_design_restore_constant_classifies_every_producible_outcome(self):
+        """``_BY_DESIGN_RESTORE_OUTCOMES`` classifies EXACTLY the restore
+        vocabulary ``TaskWorkflow._invoke``'s arm block can produce (ε/3733).
+
+        The sibling of the row above, one seam downstream. β's constant covers
+        the ELIGIBILITY predicate, evaluated before dispatch on a sidecar; this
+        one covers the archive RESTORE, evaluated inside ``_invoke`` against
+        the filesystem. Because ε keys its feeder on the ARM SEAM rather than
+        on a predicate reason, this — not the reason set — is where an
+        unclassified new value would slip onto the INV-4 storm feeder.
+
+        Fail-CLOSED in the same way, and for the same reason: every string
+        literal anywhere inside a statement that ASSIGNS ``restore_outcome`` is
+        collected, rather than matching one syntax. A fifth outcome introduced
+        as a plain constant, as a ternary arm (which ``'published' if … else
+        'miss'`` already is), as a walrus, or routed through a module-level
+        constant therefore fails HERE instead of becoming a silent feeder.
+
+        The carve-out must also stay a STRICT subset: were it ever to equal the
+        producible set, nothing could feed the streak and INV-4's escape would
+        be inert again — precisely the condition ε exists to end.
+        """
+        import ast  # noqa: PLC0415 — structural read of one method's source
+        import inspect  # noqa: PLC0415
+        import textwrap  # noqa: PLC0415
+
+        import orchestrator.workflow as workflow_mod  # noqa: PLC0415
+        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
+        from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(TaskWorkflow._invoke))
+        ).body[0]
+
+        producible: set[str] = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if value is None or not any(
+                isinstance(t, ast.Name) and t.id == 'restore_outcome' for t in targets
+            ):
+                continue
+            # The WHOLE value subtree, not just a top-level Constant: the
+            # shipped vocabulary already routes two outcomes through a ternary.
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    producible.add(sub.value)
+                elif isinstance(sub, ast.Name):
+                    # ...and a module-global indirection must not hide one.
+                    resolved = getattr(workflow_mod, sub.id, None)
+                    if isinstance(resolved, str):
+                        producible.add(resolved)
+                    elif isinstance(resolved, set | frozenset | tuple | list) and all(
+                        isinstance(item, str) for item in resolved
+                    ):
+                        producible |= set(resolved)
+
+        assert producible == {'disabled', 'miss', 'fault', 'published'}, (
+            'the restore outcomes assigned in TaskWorkflow._invoke no longer '
+            'match the known vocabulary. If you added an OUTCOME, classify it '
+            'in harness.py::_BY_DESIGN_RESTORE_OUTCOMES (or deliberately leave '
+            'it out, making it a genuine storm feeder) and extend this '
+            f'assertion. Saw: {sorted(producible)}'
+        )
+        assert isinstance(_BY_DESIGN_RESTORE_OUTCOMES, frozenset)
+        carved_out = set(_BY_DESIGN_RESTORE_OUTCOMES)
+        assert carved_out == {'disabled', 'miss'}
+        assert carved_out < producible, (
+            'the by-design restore carve-out must be a STRICT subset of the '
+            'producible vocabulary — if it covers everything, no restore '
+            'outcome can feed the streak and the INV-4 escape is inert again'
+        )
 
     async def test_reseeded_fallbacks_never_file_l1(
         self, harness: Harness, tmp_path: Path
@@ -2763,7 +3402,7 @@ class TestSessionResumeStorm:
             )
 
         assert harness._escalation_queue.submit.call_count == 0
-        assert harness._session_resume_fallback_streak == 0
+        assert _streak(harness) == 0
         emits = _session_resume_emits(harness)
         assert len(emits) == 3
         for et, kwargs in emits:
@@ -2806,7 +3445,7 @@ class TestSessionResumeStorm:
         for i in range(3):
             await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
 
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
@@ -2854,7 +3493,7 @@ class TestSessionResumeStorm:
         for i in range(2):
             await _drive_session_slot(harness, f'mx{i}', self._fresh_session(f'uuid-mx{i}'))
 
-        assert harness._session_resume_fallback_streak == 2
+        assert _streak(harness) == 2
         assert harness._escalation_queue.submit.call_count == 1
         # ...and BOTH reasons are on the wire, so the operator sees the
         # by-design co-occurrence rather than inferring it.
@@ -2862,28 +3501,24 @@ class TestSessionResumeStorm:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['restore_failed', 'stale']
 
-    async def test_storm_l1_directs_the_operator_at_the_reason_set(
+    async def test_storm_l1_names_the_failures_rather_than_a_census(
         self, harness: Harness
     ):
         """The filed L1 must send the operator to the EVIDENCE first.
 
         Its detail used to name ``stale`` and ``no_transcript`` as the only
-        surviving causes and send the operator to check NTP FIRST. After D4
-        those are excluded by construction, so that text would be a confident
-        instruction to investigate a population that provably did not
-        contribute — the exact misdirection this task exists to remove, now
-        printed on the escalation itself.
+        surviving causes and send the operator to check NTP FIRST. Task 3728
+        excluded those by construction, and this row then pinned the
+        replacement: a SQL census the operator had to run, and a reason to
+        guess at from its output.
 
-        Stated POSITIVELY rather than as blanket "word X is absent" pins. The
-        earlier form asserted ``'stale' not in text`` and three siblings, which
-        pinned cosmetic phrasing instead of behaviour: they also forbid
-        'staleness', and they would fail a strictly BETTER detail that names
-        the excluded by-design reasons explicitly ("a stale sidecar is excluded
-        by construction and did not contribute") — plausible operator guidance,
-        and closer to what this escalation is for. The real contract is that
-        the L1 is filed at level 1 and its FIRST directive is to read the
-        reason sets off the events rather than to start from a guess, so that
-        is what is asserted; the wording around it stays free to improve.
+        ε (task 3733) removes the guess entirely. The streak now has a live
+        feeder that records WHICH resumes failed, so the escalation can name
+        them — task, session, role, stage, restore outcome, archive path — and
+        the census prose this row used to pin is gone. What survives unchanged
+        is the CONTRACT it was really asserting: the L1 is filed at level 1 and
+        its first directive starts from evidence rather than from a guess. The
+        wording around it stays free to improve.
         """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = self._queue()
@@ -2893,15 +3528,15 @@ class TestSessionResumeStorm:
 
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
-        # The detail hands over the exact query, keyed on the composite field
-        # this task put on the wire — not on the retired first-match scalar.
-        assert "json_extract(data,'$.reasons')" in esc.detail
-        assert "'$.reason'" not in esc.detail
-        # ...and the FIRST thing the operator is told to do is run it. Scoped
-        # to the opening directive, so the rest of suggested_action can say
-        # whatever later turns out to help.
+        # The failure is NAMED — the same renderer the arm-seam feeder uses,
+        # so there is one streak and one L1 (SPOT).
+        assert 'p1' in esc.detail
+        assert 'uuid-p1' in esc.detail
+        assert 'restore_failed' in esc.detail
+        # ...and the operator is no longer handed a census to run and read.
+        assert "json_extract(data,'$.reasons')" not in esc.detail
         first_directive = esc.suggested_action.split('.')[0].lower()
-        assert 'query' in first_directive
+        assert 'query' not in first_directive
 
     async def test_genuine_failures_still_file_l1_across_by_design(
         self, harness: Harness, tmp_path: Path
@@ -2931,9 +3566,24 @@ class TestSessionResumeStorm:
         assert esc.level == 1
         assert 'resume' in esc.summary.lower()
 
-    async def test_streak_is_consecutive_reset_by_eligible(
+    async def test_streak_is_consecutive_reset_by_a_surviving_resume(
         self, harness: Harness, tmp_path: Path
     ):
+        """The streak is CONSECUTIVE, not cumulative — and what breaks a run is
+        a resume that SURVIVED, not one merely judged eligible.
+
+        β wrote this row against the guard's eligibility branch, and it was
+        sound while the predicate was the only feeder: "eligible" and "not a
+        failure" were then ONE proposition, on one input, at one instant. ε
+        moves the feeder a whole process-phase downstream — into the restore
+        ``_invoke`` performs after this predicate has already run — so the two
+        are no longer the same claim, and only the arm seam can report that a
+        resume actually worked.
+
+        Both halves of the original contract survive: the run resumes from 0
+        after a genuine reset (the count is consecutive), and an eligible
+        dispatch interleaved mid-run does NOT break the chain.
+        """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
         harness._escalation_queue = self._queue()
         self._arm_synthetic_feeder(harness)
@@ -2941,22 +3591,29 @@ class TestSessionResumeStorm:
         # 2 genuine fallbacks (streak=2)...
         for i in range(2):
             await _drive_session_slot(harness, f'a{i}', self._fresh_session(f'uuid-a{i}'))
-        # ...then an ELIGIBLE resume resets the streak to 0. The real predicate
-        # has to be back in place for a resume to BE eligible.
+        # ...then a resume that ADOPTED AND SURVIVED retires the run.
+        harness.note_resume_succeeded()
+        assert _streak(harness) == 0
+
+        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
+        for i in range(2):
+            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # An ELIGIBLE dispatch interleaved here leaves the run alone — it is a
+        # pre-dispatch predicate, not a verdict on any restore. The real
+        # predicate has to be back in place for a resume to BE eligible.
         del harness._session_resume_reasons
         cfg = _make_transcript(tmp_path, 'uuid-ok')
         await _drive_session_slot(
             harness, 'ok1', self._fresh_session('uuid-ok'), config_dir=cfg,
         )
-        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
-        self._arm_synthetic_feeder(harness)
-        for i in range(2):
-            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
-        assert harness._escalation_queue.submit.call_count == 0
+        assert _streak(harness) == 2
 
         # A 3rd consecutive genuine fallback AFTER the reset reaches threshold →
         # fires once, proving the streak resumed from 0 (consecutive, not
         # cumulative).
+        self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'b2', self._fresh_session('uuid-b2'))
         assert harness._escalation_queue.submit.call_count == 1
 
@@ -2978,17 +3635,17 @@ class TestSessionResumeStorm:
         # Two genuine fallbacks inside the window → streak=2.
         for i in range(2):
             await _drive_session_slot(harness, f'd{i}', self._fresh_session(f'uuid-d{i}'))
-        assert harness._session_resume_fallback_streak == 2
+        assert _streak(harness) == 2
 
         # ...then the clock jumps past the window before the 3rd arrives.
         # (The assert also pins that a genuine fallback stamped the chain point.)
-        assert harness._last_session_resume_fallback_at is not None
-        harness._last_session_resume_fallback_at -= 120
+        assert _chain_stamp(harness) is not None
+        _rewind_chain(harness, 120)
 
         await _drive_session_slot(harness, 'd2', self._fresh_session('uuid-d2'))
 
         # Decayed to 0, then re-incremented — NOT 3, so no L1.
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_window_retires_the_run_on_a_by_design_dispatch(
@@ -3016,11 +3673,11 @@ class TestSessionResumeStorm:
         self._arm_synthetic_feeder(harness)
         for i in range(2):  # threshold - 1
             await _drive_session_slot(harness, f'rq{i}', self._fresh_session(f'uuid-rq{i}'))
-        assert harness._session_resume_fallback_streak == 2
-        assert harness._last_session_resume_fallback_at is not None
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) is not None
 
         # The clock passes the window with no further genuine failure.
-        harness._last_session_resume_fallback_at -= 120
+        _rewind_chain(harness, 120)
 
         # A perfectly ordinary by-design dispatch (real predicate, corroborated
         # dir, aged sidecar → {'stale'}) is enough to observe the expiry.
@@ -3030,8 +3687,8 @@ class TestSessionResumeStorm:
             harness, 'rq-stale', self._stale_session('uuid-rq-stale'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_by_design_dispatch_inside_the_window_decays_nothing(
@@ -3055,8 +3712,8 @@ class TestSessionResumeStorm:
         self._arm_synthetic_feeder(harness)
         for i in range(2):
             await _drive_session_slot(harness, f'nw{i}', self._fresh_session(f'uuid-nw{i}'))
-        stamp = harness._last_session_resume_fallback_at
-        assert harness._session_resume_fallback_streak == 2
+        stamp = _chain_stamp(harness)
+        assert _streak(harness) == 2
         assert stamp is not None
 
         del harness._session_resume_reasons
@@ -3065,14 +3722,14 @@ class TestSessionResumeStorm:
             harness, 'nw-stale', self._stale_session('uuid-nw-stale'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 2
-        assert harness._last_session_resume_fallback_at == stamp
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) == stamp
 
         # And the run is still live: one more genuine failure reaches the
         # threshold, so the per-dispatch decay did not quietly neuter INV-4.
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'nw2', self._fresh_session('uuid-nw2'))
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
 
     async def test_by_design_fallbacks_do_not_refresh_the_chain_stamp(
@@ -3094,8 +3751,8 @@ class TestSessionResumeStorm:
         # One genuine fallback opens the chain: streak=1, stamp set.
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'cs0', self._fresh_session('uuid-cs0'))
-        assert harness._session_resume_fallback_streak == 1
-        stamp = harness._last_session_resume_fallback_at
+        assert _streak(harness) == 1
+        stamp = _chain_stamp(harness)
         assert stamp is not None
 
         # A drip of REAL by-design reseeds moves NEITHER the counter nor the
@@ -3106,17 +3763,17 @@ class TestSessionResumeStorm:
                 harness, f'csr{i}', self._fresh_session(f'uuid-csr{i}'),
                 config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
             )
-        assert harness._session_resume_fallback_streak == 1
-        assert harness._last_session_resume_fallback_at == stamp
+        assert _streak(harness) == 1
+        assert _chain_stamp(harness) == stamp
 
         # So when the clock passes the window, the NEXT genuine fallback is
         # measured against the first one and decays — reaching 1, not the
         # threshold of 2.
-        harness._last_session_resume_fallback_at = stamp - 120
+        _set_chain_stamp(harness, stamp - 120)
         self._arm_synthetic_feeder(harness)
         await _drive_session_slot(harness, 'cs1', self._fresh_session('uuid-cs1'))
 
-        assert harness._session_resume_fallback_streak == 1
+        assert _streak(harness) == 1
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_streak_survives_within_storm_window(self, harness: Harness):
@@ -3133,34 +3790,20 @@ class TestSessionResumeStorm:
         for i in range(3):
             await _drive_session_slot(harness, f'w{i}', self._fresh_session(f'uuid-w{i}'))
 
-        assert harness._session_resume_fallback_streak == 3
+        assert _streak(harness) == 3
         assert harness._escalation_queue.submit.call_count == 1
         esc = harness._escalation_queue.submit.call_args.args[0]
         assert esc.level == 1
 
-    async def test_eligible_resume_clears_fallback_timestamp(
-        self, harness: Harness, tmp_path: Path
-    ):
-        """An eligible resume clears the chain's comparison point as well as
-        the streak, so the next fallback starts a fresh run rather than
-        chaining off a pre-reset stamp (task 3256).
-        """
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        self._arm_synthetic_feeder(harness)
-        await _drive_session_slot(harness, 'ts0', self._fresh_session('uuid-ts0'))
-        assert harness._session_resume_fallback_streak == 1
-        assert harness._last_session_resume_fallback_at is not None
-
-        del harness._session_resume_reasons  # a resume must be genuinely eligible
-        cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
-        await _drive_session_slot(
-            harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
-        )
-
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
+    # β's `test_eligible_resume_clears_fallback_timestamp` stood here. Its
+    # whole subject was the retirement task ε/3733 deleted, and its real
+    # contract — that a reset clears the chain's comparison point and not only
+    # the streak (task 3256) — moved with the reset to the arm seam, where
+    # `test_success_report_retires_the_run` asserts it verbatim. Re-pointing it
+    # would have produced a duplicate of that row, or of
+    # `test_an_eligible_dispatch_never_retires_a_run_in_progress`, which
+    # asserts the stamp's survival along with the other two pieces of run
+    # state; neither is a second kind of coverage (SPOT).
 
     async def test_no_escalation_queue_never_raises(self, harness: Harness):
         """A bare harness (no escalation queue) must never raise on a fallback
@@ -3173,6 +3816,587 @@ class TestSessionResumeStorm:
         # threshold=1 → the very first genuine fallback trips the filer, which
         # must early-return on the absent queue rather than raising.
         await _drive_session_slot(harness, 'x1', self._fresh_session('uuid-x1'))
+
+    # ── ε (task 3733): the ARM-SEAM feeder ──────────────────────────────────
+    #
+    # β's synthetic feeder above stands in at the ELIGIBILITY predicate. ε's
+    # real one reports from `TaskWorkflow._invoke`'s arm seam instead — the
+    # single place both resume producers converge and the only place the
+    # restore actually happens — so these rows drive `note_resume_failed` /
+    # `note_resume_succeeded` directly against the REAL streak, the REAL decay
+    # and the REAL filer, exactly as the synthetic rows do at the other seam.
+
+    @staticmethod
+    def _report(n: int = 0, **over):
+        """Build one `ResumeFailure`, genuine (restore='fault') by default.
+
+        Imported at CALL time, never at module scope, so a missing name in a
+        RED phase fails only these rows instead of collection (the idiom
+        ``_session_resume_emits`` already uses for EventType members).
+        """
+        from orchestrator.workflow import ResumeFailure  # noqa: PLC0415
+        fields = {
+            'task_id': f'task-{n}',
+            'session_id': f'uuid-rf-{n}',
+            'role': 'implementer',
+            'stage': 'pre_flight',
+            'restore': 'fault',
+            'archive_root': f'/archive/root-{n}',
+            'archive_path': f'/archive/root-{n}/sess-{n}.jsonl.gz',
+            'detail': f'OSError: [Errno 28] No space left on device #{n}',
+        }
+        return ResumeFailure(**(fields | over))
+
+    async def test_sink_files_one_l1_at_threshold_and_dedups(self, harness: Harness):
+        """A RUN of genuine arm-seam failures reaches the threshold and files
+        EXACTLY ONE L1, whatever follows it.
+
+        The run deliberately mixes both stages: two pre_flight restore faults
+        and one cli-stage rejection. A cli-stage report carries no restore
+        outcome at all (the restore happened a phase earlier), so it can never
+        be in the carve-out — every CLI rejection of a resume WE armed is
+        genuine by construction.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        q = self._queue()
+        # The dedup is only observable if the queue answers "open" once one is
+        # filed; _queue()'s stand-in always says False.
+        q.has_open_l1 = MagicMock(side_effect=lambda _s: q.submit.call_count > 0)
+        harness._escalation_queue = q
+
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+        assert q.submit.call_count == 0
+        harness.note_resume_failed(self._report(1))
+        harness.note_resume_failed(self._report(2, stage='cli', restore=None))
+
+        assert _streak(harness) == 3
+        assert q.submit.call_count == 1
+        assert q.submit.call_args.args[0].level == 1
+
+        # A fourth keeps counting but files nothing — one open storm L1 at a time.
+        harness.note_resume_failed(self._report(3))
+        assert _streak(harness) == 4
+        assert q.submit.call_count == 1
+
+    @pytest.mark.parametrize('outcome', ['miss', 'disabled'])
+    async def test_sink_ignores_by_design_restore_outcomes(
+        self, harness: Harness, outcome: str,
+    ):
+        """A by-design restore outcome neither feeds the streak nor records a
+        failure, however many arrive (the D4 carve-out at the arm seam).
+
+        threshold=1 makes the very first GENUINE report fire, so a zero submit
+        count across four reports proves these do not feed it at all. 'miss' is
+        the archive-COVERAGE signal β assigns to a future RATE watch;
+        'disabled' is the restore_from_archive kill switch.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        for i in range(4):
+            harness.note_resume_failed(self._report(i, restore=outcome))
+            # Asserted INSIDE the loop: the counter must never transiently
+            # rise, not merely end at 0.
+            assert _streak(harness) == 0
+            assert _chain_stamp(harness) is None
+            assert not _recorded_failures(harness)
+            assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_success_report_retires_the_run(self, harness: Harness):
+        """A corroborated resume that survived resets the streak AND clears the
+        chain's comparison stamp and the recorded failures.
+
+        Clearing all three together is what keeps the L1's detail truthful: a
+        surviving record from a retired run would name a failure that is no
+        longer part of the run being escalated.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+        assert _chain_stamp(harness) is not None
+        assert len(_recorded_failures(harness)) == 1
+
+        harness.note_resume_succeeded()
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
+        assert not _recorded_failures(harness)
+
+        # ...so the next failure opens a FRESH run and never reaches 2.
+        harness.note_resume_failed(self._report(1))
+        assert _streak(harness) == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_sink_run_decays_after_storm_window(self, harness: Harness):
+        """A gap of >= storm_window_secs between two genuine reports retires
+        the run, so an isolated drip can never accumulate into a false storm.
+
+        The clock is advanced by rewinding the harness's own monotonic stamp,
+        NOT by monkeypatching time.monotonic — deterministic, and it perturbs
+        no unrelated timer (β's idiom, reused).
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        for i in range(2):
+            harness.note_resume_failed(self._report(i))
+        assert _streak(harness) == 2
+        assert _chain_stamp(harness) is not None
+
+        _rewind_chain(harness, 120)
+
+        harness.note_resume_failed(self._report(2))
+
+        # Decayed to 0, then re-incremented — NOT 3, so no L1 — and the
+        # retired run's records went with it.
+        assert _streak(harness) == 1
+        assert harness._escalation_queue.submit.call_count == 0
+        assert [f.session_id for f in _recorded_failures(harness)] == [
+            'uuid-rf-2'
+        ]
+
+    async def test_both_seams_report_through_one_streak_protocol(
+        self, harness: Harness,
+    ):
+        """The predicate seam REPORTS to the sink; it does not re-implement it.
+
+        "Append the evidence, refresh the comparison stamp, count, file at the
+        threshold" is the streak protocol, and it existed twice — once inline
+        in ``_run_slot``'s genuine-reason branch and once in
+        ``note_resume_failed`` — for ONE streak. Two copies of one rule is one
+        copy too many (SPOT): the inline one is dead by construction today, so
+        the next change to the protocol would have been made in the live copy
+        and silently not in the dead one, and the defect would surface only
+        when a future reason revived it.
+
+        Pinned at the seam rather than by reading the source: the REAL
+        ``_run_slot`` runs, and the report it produces has to arrive through
+        the sink method carrying the predicate seam's own stage.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        self._arm_synthetic_feeder(harness)
+
+        reported: list = []
+        real = harness.note_resume_failed
+
+        def _spy(report):
+            reported.append(report)
+            real(report)
+
+        harness.note_resume_failed = _spy  # type: ignore[method-assign]
+        await _drive_session_slot(harness, 'e1', self._fresh_session('uuid-e1'))
+
+        assert len(reported) == 1, (
+            'the eligibility seam must feed the streak THROUGH the sink '
+            'method, not by repeating its body inline'
+        )
+        assert reported[0].stage == 'eligibility'
+        assert reported[0].restore is None
+        assert 'restore_failed' in reported[0].detail
+        # ...and the shared protocol did the rest: one streak, one record.
+        assert _streak(harness) == 1
+        assert [f.session_id for f in _recorded_failures(harness)] == ['uuid-e1']
+
+    async def test_the_reset_term_is_counted_and_reaches_the_operator(
+        self, harness: Harness,
+    ):
+        """A surviving resume is COUNTED, and the count reaches the L1.
+
+        The reset term used to be the one term of the streak with no
+        observable trace anywhere: ``note_resume_succeeded`` emits no event, so
+        a fleet where nothing resumes and a fleet where a run is cut short a
+        dozen times a day produced byte-identical evidence. That matters twice
+        over — an operator reading the L1 cannot tell "resume normally works"
+        from "nothing has resumed at all since boot", and
+        ``storm_window_bound.py``'s derivation cannot include the term at all,
+        which is exactly why its not-inert side claims only a NECESSARY
+        condition.
+
+        PER-BOOT and monotonically increasing: retiring a run must not clear
+        it, or the L1 that reads it could only ever report zero — the run it
+        describes was necessarily just retired by the failures that filed it.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # Survivals with no run in progress still count: they ARE the
+        # population an operator needs to read "resume works here" from.
+        harness.note_resume_succeeded()
+        harness.note_resume_succeeded()
+        assert _survivals(harness) == 2
+
+        # One that actually cuts a run short counts the same way, and the run
+        # it retired is gone.
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+        harness.note_resume_succeeded()
+        assert _survivals(harness) == 3
+        assert _streak(harness) == 0
+        assert not _recorded_failures(harness)
+
+        for i in range(2):
+            harness.note_resume_failed(self._report(10 + i))
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert '3 armed resume(s) have SURVIVED' in esc.detail, (
+            'the operator cannot tell a quiet fleet from a constantly-reset '
+            'streak without the reset term on the L1'
+        )
+
+    async def test_a_fresh_boot_carries_no_run(self, harness: Harness):
+        """The run is PER-BOOT: a newly constructed Harness starts with no
+        streak, no comparison stamp and no recorded failures.
+
+        Asserted structurally as well as by value — the three fields are
+        per-INSTANCE state initialised in ``__init__``, not class attributes a
+        second orchestrator process (or a second Harness in one interpreter)
+        could inherit a half-finished run from.
+        """
+        assert _streak(harness) == 0
+        assert _chain_stamp(harness) is None
+        assert not _recorded_failures(harness)
+
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+
+        for field in ('_session_resume_fallback_streak',
+                      '_last_session_resume_fallback_at',
+                      '_eligible_but_failed_resumes'):
+            assert field in vars(harness), f'{field} must be per-instance state'
+            assert not hasattr(Harness, field), (
+                f'{field} is a class attribute — a run would leak across boots'
+            )
+
+    async def test_sink_is_total(self, harness: Harness):
+        """Instrumentation must never break a dispatch (I3).
+
+        Two independent ways it could: a bare harness with no escalation queue
+        at the moment the threshold trips, and a malformed report. Both are
+        swallowed; neither reaches the caller, which is the production
+        ``_invoke`` path.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        harness._escalation_queue = None
+
+        # threshold=1 → the first genuine report trips the filer, which must
+        # early-return on the absent queue rather than raising.
+        harness.note_resume_failed(self._report(0))
+        assert _streak(harness) == 1
+
+        harness.note_resume_failed(object())  # type: ignore[arg-type]
+        harness.note_resume_succeeded()
+
+    async def test_run_slot_wires_the_harness_as_the_resume_outcome_sink(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The production dispatch path is CONNECTED, not merely connectable.
+
+        ``resume_outcome_sink`` is OPTIONAL on ``build_workflow`` — which is
+        what keeps eval dispatch unedited and un-drifted, and also what makes
+        "nobody ever passed one" a silent, fully-green failure mode: every
+        arm-seam report would be dropped on the floor and INV-4's escape would
+        be inert again while every other row in this class still passed.
+
+        So this pins the wiring itself: ``_run_slot`` passes the Harness
+        ITSELF, the object that owns the streak, the carve-outs and the
+        escalation queue.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        cfg = _make_transcript(tmp_path, 'uuid-sink')
+        await _drive_session_slot(
+            harness, 'sink1', self._fresh_session('uuid-sink'), config_dir=cfg,
+        )
+
+        kwargs = harness._last_build_workflow_kwargs  # type: ignore[attr-defined]
+        assert kwargs['resume_outcome_sink'] is harness
+
+    async def test_an_eligible_dispatch_never_retires_a_run_in_progress(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """ELIGIBILITY IS NOT SURVIVAL: the guard must leave the run alone.
+
+        Eligibility is a PRE-DISPATCH predicate — evaluated one process-phase
+        BEFORE the restore whose failure is this task's headline feeder, in the
+        SAME dispatch (``build_workflow(..., resume_outcome_sink=self)`` sits a
+        few lines below it, and ``TaskWorkflow._invoke``'s restore later
+        still). While the guard retired the run here, an archive-backed session
+        whose restore then faults ran ``eligible → streak:=0 → fault →
+        streak:=1`` forever: serially the streak could never exceed 1 and
+        INV-4's escape could never fire, which is exactly the "green, and
+        measuring nothing" shape this task exists to end.
+
+        All THREE pieces of run state are asserted, not just the streak: they
+        are retired together, so a partial survival would leave a later L1
+        naming failures from a run it is not about. The ``session_resume`` emit
+        is asserted too — the guard keeps doing its own job; only the
+        retirement goes.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=5, storm_window_secs=60,
+        )
+        # No escalation queue is armed: the threshold sits well above the run
+        # this builds, so nothing here can reach the filer. What the row is
+        # about is the run STATE, and a queue would be scenery.
+        for i in range(2):
+            harness.note_resume_failed(self._report(i))
+        run_before = (
+            _streak(harness), _chain_stamp(harness), _recorded_failures(harness),
+        )
+        assert run_before[0] == 2
+        assert run_before[1] is not None
+        assert len(run_before[2]) == 2
+
+        # No synthetic feeder is armed, so the predicate is the REAL one, and a
+        # live transcript makes the session genuinely eligible.
+        cfg = _make_transcript(tmp_path, 'uuid-elig')
+        await _drive_session_slot(
+            harness, 'elig1', self._fresh_session('uuid-elig'), config_dir=cfg,
+        )
+
+        assert [et for et, _ in _session_resume_emits(harness)] == [
+            EventType.session_resume
+        ]
+        assert (
+            _streak(harness), _chain_stamp(harness), _recorded_failures(harness),
+        ) == run_before
+
+    async def test_a_run_of_archive_backed_restore_faults_still_pages(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """THE COMPOSED REGRESSION — the real guard and the real sink, one
+        streak, in production's per-dispatch order.
+
+        Every other row in this class drives ONE of the two seams: the β rows
+        drive the predicate through ``_run_slot``, the ε rows drive
+        ``note_resume_failed`` directly, and the gate's end-to-end rows drive
+        ``_invoke``. None of them can see how the two INTERLEAVE inside a
+        single dispatch, and the reset-on-eligible defect lived precisely in
+        that gap — every one of them stayed green while production measured
+        nothing.
+
+        So this row runs the headline feeder's exact production shape: a
+        session eligible BECAUSE δ/3730's hoisted lookup finds an ARCHIVE (the
+        live config dir survives and simply does not hold the transcript),
+        whose restore then faults and reports back through the very
+        ``resume_outcome_sink`` the guard handed ``build_workflow``. The emits
+        pin that eligibility really was the path taken, so the row cannot pass
+        by quietly falling back instead.
+        """
+        config = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness.config.session_resume = config
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness._escalation_queue = self._queue()
+
+        for i in range(config.fallback_storm_threshold):
+            task_id, session_id = f'af{i}', f'uuid-arch-fault-{i}'
+            _make_archive(harness.config.project_root, task_id, session_id)
+            empty_cfg = tmp_path / f'claude-config-empty-{i}'
+            (empty_cfg / 'projects').mkdir(parents=True)
+            await _drive_session_slot(
+                harness, task_id, self._fresh_session(session_id),
+                config_dir=empty_cfg,
+                workflow_reports=(
+                    lambda sink, n=i: sink.note_resume_failed(self._report(n))
+                ),
+            )
+
+        assert [et for et, _ in _session_resume_emits(harness)] == (
+            [EventType.session_resume] * config.fallback_storm_threshold
+        )
+        assert _streak(harness) == config.fallback_storm_threshold
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_the_shipped_window_admits_the_population_that_exists(
+        self, harness: Harness,
+    ):
+        """At the SHIPPED defaults, a run arriving at the fleet's MEASURED
+        spacing still chains and files the L1 (task ε/3733).
+
+        The other storm rows all pick a small window and drive it, which proves
+        the mechanism but says nothing about whether the SHIPPED number can
+        ever fire. At the pre-ε 3600 s it could not: the smallest interval
+        between two eligible-but-FAILED resumes the fleet has produced is
+        hours, not minutes, so no two of them chained at ANY threshold and
+        INV-4's escape was green and unfireable.
+
+        The spacing is read from ``storm_window_bound.MEASURED_MIN_GAP_SECS``
+        rather than re-typed here, so this row and the derivation cannot drift
+        (SPOT), and the loop count is the shipped threshold — no arithmetic on
+        literals the test controls on both sides. Both halves run the REAL
+        rolling-window decay: the clock is advanced by rewinding the harness's
+        own monotonic stamp, β's idiom.
+        """
+        from orchestrator.storm_window_bound import (  # noqa: PLC0415
+            MEASURED_MIN_GAP_SECS,
+        )
+
+        config = SessionResumeConfig()   # SHIPPED defaults, no overrides
+        harness.config.session_resume = config
+        harness._escalation_queue = self._queue()
+
+        for i in range(config.fallback_storm_threshold):
+            if i:
+                _rewind_chain(harness, MEASURED_MIN_GAP_SECS)
+            harness.note_resume_failed(self._report(i))
+
+        assert _streak(harness) == (
+            config.fallback_storm_threshold
+        )
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # ...and the decay is still LIVE, not merely wide: the same run spaced
+        # a full window apart never chains, so the alarm did not become a
+        # cumulative per-boot counter on the way to being fireable.
+        harness.note_resume_succeeded()
+        harness._escalation_queue = self._queue()
+        for i in range(config.fallback_storm_threshold):
+            if i:
+                _rewind_chain(harness, config.storm_window_secs)
+            harness.note_resume_failed(self._report(100 + i))
+
+        assert _streak(harness) == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_storm_l1_names_every_recorded_failure(self, harness: Harness):
+        """INV-2 structured-facts-at-failure: the L1 names what actually failed.
+
+        Every recorded field of every failure in the run appears VERBATIM, so
+        an operator can go straight to the archive root and the session that
+        broke instead of reconstructing the run from a census. The run here
+        deliberately varies every dimension — two stages, two restore outcomes,
+        three roles, three tasks — because a renderer that collapsed any of
+        them would still pass a single-failure assertion.
+
+        A missing archive_root/archive_path is rendered as an explicit "none
+        located", never as a bare ``None`` and never by dropping the line: the
+        difference between "the archive was checked and held nothing" and "the
+        lookup itself faulted" is exactly what an operator needs, and a
+        silently absent line reads as the former.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        queue = harness._escalation_queue = self._queue()
+
+        reports = [
+            self._report(
+                0, task_id='4101', session_id='uuid-aa', role='implementer',
+                stage='pre_flight', restore='fault',
+                archive_root='/srv/archive-aa',
+                archive_path='/srv/archive-aa/4101/uuid-aa.jsonl.gz',
+                detail='OSError: [Errno 28] No space left on device',
+            ),
+            # Archive-root COMPOSITION faulted, so neither path was ever
+            # located — the best-effort lookup must not masquerade as a miss.
+            self._report(
+                1, task_id='4102', session_id='uuid-bb', role='architect',
+                stage='pre_flight', restore='fault',
+                archive_root=None, archive_path=None,
+                # The REAL message that fault produces, verbatim — the gate's
+                # sibling row injects exactly this. It contains the substring
+                # 'None', which is why the raw-None check below has to be
+                # positional: a global scan would pass only while this fixture
+                # was trimmed, i.e. by contrivance.
+                detail=(
+                    "TypeError: unsupported operand type(s) for /: "
+                    "'NoneType' and 'str'"
+                ),
+            ),
+            # A cli-stage rejection: no restore outcome at all (it ran a phase
+            # earlier), which is why every one of these is genuine.
+            self._report(
+                2, task_id='4103', session_id='uuid-cc', role='reviewer',
+                stage='cli', restore=None,
+                archive_root='/srv/archive-cc', archive_path=None,
+                detail='CLI rejected the armed session after 1 fallback',
+            ),
+        ]
+        for report in reports:
+            harness.note_resume_failed(report)
+
+        assert queue.has_open_l1.called, (
+            'the dedup must still be consulted — one open storm L1 at a time'
+        )
+        esc = queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'session-resume' in esc.summary.lower()
+        assert 'storm' in esc.summary.lower()
+
+        for report in reports:
+            for value in (report.task_id, report.session_id, report.role,
+                          report.stage, report.restore, report.archive_root,
+                          report.archive_path, report.detail):
+                if value is not None:
+                    assert value in esc.detail, f'{value!r} missing from detail'
+
+        # Three of the six archive fields above are absent; each says so.
+        assert esc.detail.count('none located') == 3
+
+        # ...and no rendered FIELD VALUE is a bare `None`. Asserted
+        # POSITIONALLY, per field, not as a global substring scan: the detail
+        # legitimately carries restore-failure messages that contain 'None' —
+        # the archive-root fault above is a real TypeError naming 'NoneType' —
+        # so `'None' not in esc.detail` would go red on a realistic payload
+        # while catching nothing a reviewer cares about.
+        for label in ('archive root', 'archive path'):
+            values = re.findall(rf'{label}: (.*)$', esc.detail, re.MULTILINE)
+            assert len(values) == len(reports), f'a {label!r} line went missing'
+            assert 'None' not in values, (
+                f'a raw None reached the operator-facing {label} field'
+            )
+        assert 'restore=None' not in esc.detail, (
+            'a raw None reached the operator-facing restore field'
+        )
+
+    async def test_storm_l1_never_sends_the_operator_to_ntp(self, harness: Harness):
+        """The misdirection task 3728 removed must not come back (INV-2).
+
+        Pinned where the misdirection would actually reach an operator: in the
+        text of an L1 that was really filed. Neither its detail nor its
+        suggested action may mention clock skew or NTP — the streak's feeder is
+        archive-restore failure, which has nothing to do with either.
+
+        Deliberately NOT pinned by searching harness.py's source for the
+        literal that used to carry it. That assertion matched raw module text,
+        comments included, so it failed in both directions at once: harness.py
+        discusses clock skew on purpose (the monotonic-clock rationale in the
+        rolling-window decay, and in ``note_resume_failed``), so a legitimate
+        comment would have turned the suite red for no defect, while any
+        reworded misdirection — "check NTP sync", "the wall clock may have
+        jumped" — is the regression this row exists to stop and would have
+        stayed green. The task's delivered-check gate is where that literal's
+        absence is enforced, and it runs on every task.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, storm_window_secs=60,
+        )
+        queue = harness._escalation_queue = self._queue()
+        harness.note_resume_failed(self._report(0))
+
+        esc = queue.submit.call_args.args[0]
+        operator_text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
+        assert not re.search('clock skew|NTP', operator_text, re.IGNORECASE)
 
 
 @pytest.mark.asyncio
@@ -3448,23 +4672,47 @@ class TestSessionResumeArchiveAvailable:
     """archive_available on session_resume_fallback (task 3727, PRD §8).
 
     Every fallback emit reports whether that session was actually RECOVERABLE
-    from the durable transcript archive — the measurement task 3619 will move
-    and leaf δ may later gate on. It is instrumentation ONLY (D8 / INV-3
-    instrument-before-acting): it must never change what dispatches, so every
-    assertion here also pins that the reasons, the resume decision and the
-    storm streak are exactly what they would be without the field. (Task 3728
-    later reclassified which reasons FEED that streak; the point these rows
-    make — that the instrument itself moves nothing — is unaffected.)
+    from the durable transcript archive. Task 3727 added it as instrumentation
+    ONLY (D8 / INV-3 instrument-before-acting) — measure the recoverable
+    population before gating on it — and these rows pinned that it moved
+    nothing.
+
+    TASK 3730 (δ) DELIBERATELY ENDS THAT, which is the whole point of the
+    instrument-then-act sequence: the measured signal (~91% of post-3578
+    fallbacks were recoverable, 92 of 101 on 2026-09-04) is now an ELIGIBILITY
+    input, so an archive-backed session that used to fall back is adopted.
+    Four rows below therefore assert the OPPOSITE of what they asserted under
+    3727, each saying so in its own docstring; they are updated rather than
+    deleted because the population each one describes is exactly the
+    population δ moves, and a row that watched it fall back is the right place
+    to record that it no longer does.
+
+    What survives unchanged from 3727: the field is still emitted on the
+    fallback branch ONLY (never on session_resume / session_resume_capped), it
+    is still a real JSON bool, and it is still False-on-fault so a broken
+    lookup cannot break dispatch. What is NEW under δ is that the lookup is
+    hoisted into the guard and happens EXACTLY ONCE per dispatch — the value
+    the predicate consumed and the value the event reports are structurally
+    the same bool — and that the disabled path still pays no filesystem I/O.
     """
 
-    async def test_no_transcript_reports_archive_present(
+    async def test_archive_present_now_resumes_instead_of_falling_back(
         self, harness: Harness, tmp_path: Path
     ):
-        """Archive PRESENT under a foreign lane → archive_available is True.
+        """THE POPULATION 3727 COUNTED AND δ MOVES (task 3730 / D2).
 
-        The recoverable population: the transcript is gone from the live
-        config dir but survives in the durable archive, under an encoded-cwd
-        dir belonging to no lane this test uses.
+        Archive PRESENT under a foreign lane, live transcript gone: under 3727
+        this emitted ``session_resume_fallback`` with ``reasons=['no_transcript']``
+        and ``archive_available: true`` — an ineligible dispatch that the
+        instrument could see was recoverable and was not allowed to act on.
+        The measurement it produced (92 of 101 such fallbacks, 2026-09-04) is
+        what authorised δ, so the row now asserts the conversion: the same
+        inputs are ADOPTED, and no fallback is emitted at all.
+
+        A surviving-but-empty config dir rather than an absent one, so this
+        row is distinct from the guard's crash-recovery-shape row: it pins
+        that reachability is answered by the archive even when the live dir is
+        present and simply does not hold this session's transcript.
         """
         session = {
             'session_id': 'uuid-arch-yes',
@@ -3482,23 +4730,14 @@ class TestSessionResumeArchiveAvailable:
             harness, 'ar1', session, config_dir=empty_cfg
         )
 
-        # D8: the resume decision and the reason are untouched.
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['no_transcript']
-        # `is True`, not truthy: the field must be a real JSON bool for
-        # json_extract(data, '$.archive_available') to be queryable in runs.db.
-        assert kwargs['data']['archive_available'] is True
-        # D8: the instrument still perturbs NOTHING — asserted here because the
-        # streak is the one piece of guard state a filesystem-touching
-        # instrument could plausibly disturb. The expected value is 0 rather
-        # than 1 since task 3728 carved 'no_transcript' (and every other
-        # by-design reason) out of the feeder; α's field is unchanged either
-        # way, which is exactly what this row exists to show.
-        assert harness._session_resume_fallback_streak == 0
+        assert [et for et, _ in emits] == [EventType.session_resume]
+        # The eligible event stays byte-identical (D8's surviving half): the
+        # field rides the fallback branch only, so event_store.py's ratio
+        # recipe keeps its denominator.
+        assert 'archive_available' not in emits[0][1]['data']
+        assert _streak(harness) == 0
 
     async def test_no_transcript_reports_archive_absent(
         self, harness: Harness, tmp_path: Path
@@ -3526,18 +4765,31 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
-        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+        assert _streak(harness) == 0  # by design (3728)
 
     async def test_stale_also_carries_the_field(
         self, harness: Harness, tmp_path: Path
     ):
-        """reason == 'stale' carries it too — it rides the BRANCH, not one reason."""
-        real = SessionResumeConfig()
-        stale_at = datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+        """reason == 'stale' carries it too — it rides the BRANCH, not one reason.
+
+        RETARGETED BY δ (task 3730), deliberately and not incidentally. This
+        row used to drive an AGE-derived 'stale' with the archive present,
+        which is precisely the combination D2 now makes eligible — so keeping
+        it would have asserted the defect δ removes. It drives the OTHER
+        'stale' instead: an UNPARSEABLE ``started_at``, the one the archive
+        never suppresses, because an undateable session cannot be bounded by
+        the absolute backstop either (fail-safe direction: cannot date it,
+        cannot resume it).
+
+        That keeps the row's original claim exactly — the field rides the
+        fallback BRANCH rather than any one reason, so it is present on a
+        'stale' emit and not only on a corroboration failure — while making it
+        a live statement about δ rather than a fossil of pre-δ behaviour.
+        """
         session = {
             'session_id': 'uuid-arch-stale',
             'role': 'implementer',
-            'started_at': stale_at.isoformat(),
+            'started_at': 'not-a-date',  # undateable: 'stale', never suppressed
             'resume_count': 0,
         }
         cfg = _make_transcript(tmp_path, 'uuid-arch-stale')
@@ -3554,17 +4806,25 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['stale']
         assert kwargs['data']['archive_available'] is True
-        assert harness._session_resume_fallback_streak == 0  # by design (3728)
+        assert _streak(harness) == 0  # by design (3728)
 
-    async def test_reseeded_also_carries_the_field(
+    async def test_reseeded_lane_with_an_archive_is_now_adopted(
         self, harness: Harness, tmp_path: Path
     ):
-        """The OTHER fallback emit carries it too (task 3256 split it in two).
+        """A RESEEDED lane whose transcript survives in the archive resumes (δ).
 
-        This is the branch where the field matters MOST: a reseeded lane is
-        precisely the population task 3619 will move, so it has to be
-        measurable from day one. Wiring only one of the two emit sites would
-        half-ship the signal AND bias it.
+        3727 called this "the branch where the field matters MOST: a reseeded
+        lane is precisely the population task 3619 will move". δ is what moves
+        it. Warm-lane acquire always re-seeds from base, wiping
+        ``<lane>/.task/`` and the whole live transcript store with it — but
+        the archival pass copied the transcript OUT of that store before the
+        wipe, so the session is still reachable and the wipe is no longer a
+        reason to dispatch fresh.
+
+        The reseeded/no_transcript discrimination itself is untouched and
+        still pinned by :meth:`test_reseeded_reports_absent_archive`, which
+        drives the same wiped-lane shape with an EMPTY archive: that is where
+        the split still decides the answer.
         """
         session = {
             'session_id': 'uuid-arch-reseed',
@@ -3580,15 +4840,10 @@ class TestSessionResumeArchiveAvailable:
 
         resume_id = await _drive_session_slot(harness, 'ar4', session, config_dir=gone)
 
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['reseeded']
-        assert kwargs['data']['archive_available'] is True
-        # D8: 'reseeded' still does NOT feed the storm streak.
-        assert harness._session_resume_fallback_streak == 0
+        assert [et for et, _ in emits] == [EventType.session_resume]
+        assert _streak(harness) == 0
 
     async def test_reseeded_reports_absent_archive(
         self, harness: Harness, tmp_path: Path
@@ -3735,9 +4990,17 @@ class TestSessionResumeArchiveAvailable:
         looks like a free optimisation and would still leave the whole suite
         green, while silently inverting the contract. Turning archival OFF
         today does not un-archive what was written while it was ON, and those
-        sessions are exactly the recoverable population this instrument exists
-        to count — a config-derived answer would bias the measurement toward
+        sessions are exactly the recoverable population this lookup exists to
+        find — a config-derived answer would bias the measurement toward
         "nothing is recoverable" and mislead an operator triaging the storm L1.
+
+        δ RAISES THE STAKES rather than changing the property (task 3730). The
+        lookup is now an ELIGIBILITY input, so the short-circuit would cost
+        real resumes rather than only a wrong telemetry field: flipping
+        ``transcript_archive.enabled`` off would retroactively make every
+        already-archived session ineligible. The observable therefore moves
+        from ``archive_available is True`` on a fallback to the session being
+        ADOPTED — a strictly louder statement of the same contract.
         """
         session = {
             'session_id': 'uuid-arch-disabled',
@@ -3755,13 +5018,9 @@ class TestSessionResumeArchiveAvailable:
             harness, 'ar11', session, config_dir=empty_cfg
         )
 
-        assert resume_id is None
+        assert resume_id is session
         emits = _session_resume_emits(harness)
-        assert len(emits) == 1
-        et, kwargs = emits[0]
-        assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reasons'] == ['no_transcript']
-        assert kwargs['data']['archive_available'] is True
+        assert [et for et, _ in emits] == [EventType.session_resume]
 
     async def test_null_session_id_reports_false_without_raising(
         self, harness: Harness, tmp_path: Path
@@ -3830,3 +5089,119 @@ class TestSessionResumeArchiveAvailable:
         ]
         for _et, kwargs in emits:
             assert 'archive_available' not in kwargs['data']
+
+    async def test_one_archive_lookup_per_dispatch_feeds_both_consumers(
+        self, harness: Harness
+    ):
+        """δ WIRING (task 3730 / D-hoist): ONE lookup per dispatch, and the
+        value the predicate consumed IS the value the event reports.
+
+        Before δ the fallback emit did its own ``_archive_available`` call,
+        independent of the predicate (which did none at all). Leaving it that
+        way once the predicate gates on the archive would mean TWO lookups of
+        the same fact per dispatch, and — because an archival pass can land
+        between them — a ``session_resume_fallback`` whose
+        ``archive_available`` contradicts the ``reasons`` printed beside it.
+        An operator reading ``archive_available: true`` next to
+        ``reasons: ['no_transcript']`` would be looking at a state δ makes
+        impossible, with no way to tell it was a race.
+
+        So this row counts the calls (exactly one) AND compares the two
+        consumers' views of the same bool. Counting alone is not enough: a
+        single lookup wired to only ONE of the two consumers, with the other
+        left on a hardcoded default, would also count one.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-arch-once',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.absolute_resume_age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        # Aged OUT, so the dispatch still reaches the fallback emit and the
+        # event is observable at all — an adopted session emits no field.
+        _make_archive(harness.config.project_root, 'ar12', 'uuid-arch-once')
+
+        lookups: list[tuple] = []
+        real_lookup = harness._archive_available
+
+        def counting_lookup(task_id, session_id):
+            lookups.append((task_id, session_id))
+            return real_lookup(task_id, session_id)
+
+        consumed: list[object] = []
+        real_reasons = harness._session_resume_reasons
+
+        def spying_reasons(session_arg, config_dir, *, archive_available):
+            consumed.append(archive_available)
+            return real_reasons(
+                session_arg, config_dir, archive_available=archive_available
+            )
+
+        harness._archive_available = counting_lookup  # type: ignore[method-assign]
+        harness._session_resume_reasons = spying_reasons  # type: ignore[method-assign]
+
+        resume_id = await _drive_session_slot(harness, 'ar12', session)
+
+        assert resume_id is None
+        assert lookups == [('ar12', 'uuid-arch-once')], (
+            f'expected exactly one hoisted archive lookup, got {lookups!r}'
+        )
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['aged_out']
+        # The predicate saw it, the event reports it, and they are the SAME
+        # bool — not merely equal by luck of a second lookup agreeing.
+        assert consumed == [True]
+        assert kwargs['data']['archive_available'] is consumed[0]
+
+    async def test_kill_switch_does_no_archive_lookup_at_all(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """B6, PRESERVED under δ: with ``session_resume.enabled`` False the
+        hoisted lookup never runs — zero filesystem I/O, as today.
+
+        The lookup is on the dispatch path now, not only on the fallback emit,
+        so hoisting it carelessly (above the ``enabled`` check rather than
+        inside it) would make the kill switch cost a glob per dispatch for a
+        feature that is switched off. The predicate returns ``{'disabled'}``
+        alone without consulting the archive, so there is nothing for the
+        lookup to inform.
+
+        This is also the one D8 zero-I/O property δ genuinely preserves: the
+        ELIGIBLE path now pays one glob, and the plan records that as a stated
+        regression rather than an oversight.
+        """
+        session = {
+            'session_id': 'uuid-arch-killed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-killed')
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar13', 'uuid-arch-killed')
+
+        lookups: list[tuple] = []
+        real_lookup = harness._archive_available
+
+        def counting_lookup(task_id, session_id):
+            lookups.append((task_id, session_id))
+            return real_lookup(task_id, session_id)
+
+        harness._archive_available = counting_lookup  # type: ignore[method-assign]
+
+        resume_id = await _drive_session_slot(harness, 'ar13', session, config_dir=cfg)
+
+        assert resume_id is None
+        assert lookups == [], (
+            f'the disabled path must touch the filesystem 0 times, saw {lookups!r}'
+        )
+        assert _session_resume_emits(harness) == []

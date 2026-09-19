@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import extract_cypher, extract_params
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import AmbiguousEntityError, GraphitiBackend
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend._identity_lock_for
@@ -511,3 +511,149 @@ class TestEnsureEntityNode:
         )
         assert extract_params(_create_calls(backend._test_graph)[0])['group_id'] == 'dark_factory'
         backend._driver._get_graph.assert_called_with('dark_factory')
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-1/2: ensure_entity_node(..., merge_duplicates=False) — guard (c)
+# ---------------------------------------------------------------------------
+
+class TestEnsureEntityNodeNoMerge:
+    """ensure_entity_node(..., merge_duplicates=False) — the no-merge mode.
+
+    Mirrors task 4932 guard 2's semantics one layer down: 0 matches mint,
+    1 match resolves, >=2 matches REFUSE structurally and merge NOTHING.
+
+    The >=2 arm exists because a destructive collapse is only ever a
+    deliberate act, never a side effect of a repair. The default
+    (merge_duplicates=True) keeps Seam S1's episode-write dedup path
+    byte-identical, which test_the_default_still_collapses pins.
+    """
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend, make_graph_mock):
+        """Same shape as TestEnsureEntityNode's fixture: the REAL resolve half
+        runs against mocked reads, and the graph mock captures every write."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        backend.merge_entities = AsyncMock()
+        backend.update_node_embedding = AsyncMock()
+        backend.client.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        backend._test_graph = graph
+        return backend
+
+    @staticmethod
+    def _two_matches(backend) -> None:
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-a', 'name': 'Task 3127', 'summary': '', 'labels': []},
+            {'uuid': 'u-b', 'name': 'Task 3127', 'summary': '', 'labels': []},
+        ]
+        backend.find_duplicate_entity_nodes.return_value = [
+            {'uuid': 'u-a', 'created_at': 1, 'edge_count': 5},
+            {'uuid': 'u-b', 'created_at': 2, 'edge_count': 0},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_matches_raise_ambiguous_entity_error(self, backend_with_mocks):
+        """(1) >=2 matches refuse with AmbiguousEntityError instead of collapsing."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError):
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+
+    @pytest.mark.asyncio
+    async def test_refusal_carries_structured_name_group_and_uuids(self, backend_with_mocks):
+        """(1) The refusal is DATA, not a message to parse: .name/.group_id/.uuids."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError) as excinfo:
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        exc = excinfo.value
+        assert exc.name == 'Task 3127'
+        assert exc.group_id == 'dark_factory'
+        assert exc.uuids == ('u-a', 'u-b')
+        assert isinstance(exc.uuids, tuple)
+
+    @pytest.mark.asyncio
+    async def test_refusal_message_still_lists_the_conflicting_uuids(self, backend_with_mocks):
+        """(1) An operator reading a log line loses nothing to the new fields."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError) as excinfo:
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        message = str(excinfo.value)
+        assert 'Task 3127' in message
+        assert 'u-a' in message
+        assert 'u-b' in message
+
+    @pytest.mark.asyncio
+    async def test_refusal_merges_nothing_and_mints_nothing(self, backend_with_mocks):
+        """(1) The whole point: no merge_entities, no CREATE."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError):
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        backend.merge_entities.assert_not_awaited()
+        assert _create_calls(backend._test_graph) == []
+
+    @pytest.mark.asyncio
+    async def test_single_match_resolves_without_consulting_duplicates(self, backend_with_mocks):
+        """(2) Exactly one match returns that uuid; no merge, no CREATE, and
+        find_duplicate_entity_nodes is never even asked."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-1', 'name': 'Task 3127', 'summary': '', 'labels': []}
+        ]
+        result = await backend.ensure_entity_node(
+            'Task 3127', group_id='dark_factory', merge_duplicates=False
+        )
+        assert result == 'u-1'
+        backend.find_duplicate_entity_nodes.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+        assert _create_calls(backend._test_graph) == []
+
+    @pytest.mark.asyncio
+    async def test_zero_matches_mint_exactly_as_the_default_mode_does(self, backend_with_mocks):
+        """(3) The mint arm is unforked: same CREATE params, same summary, same
+        group_id as test_zero_matches_mints_an_entity_node pins for the default."""
+        backend = backend_with_mocks
+        result = await backend.ensure_entity_node(
+            'dark_factory:2500',
+            group_id='reify',
+            summary='cross-project ref',
+            merge_duplicates=False,
+        )
+        creates = _create_calls(backend._test_graph)
+        assert len(creates) == 1
+        cypher = extract_cypher(creates[0])
+        params = extract_params(creates[0])
+        assert 'CREATE' in cypher
+        assert ':Entity' in cypher
+        assert params['name'] == 'dark_factory:2500'
+        assert params['group_id'] == 'reify'
+        assert params['summary'] == 'cross-project ref'
+        assert params['created_at']
+        assert uuid.UUID(params['uuid'])
+        assert result == params['uuid']
+
+    @pytest.mark.asyncio
+    async def test_the_default_still_collapses(self, backend_with_mocks):
+        """(4) REGRESSION PIN, not a RED: omitting merge_duplicates on a
+        2+-match fixture still collapses and returns the survivor, so Seam S1's
+        episode-write dedup keeps its ratified collapse."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        result = await backend.ensure_entity_node('Task 3127', group_id='dark_factory')
+        assert result == 'u-a'
+        backend.merge_entities.assert_awaited_once_with('u-b', 'u-a', group_id='dark_factory')
+        assert _create_calls(backend._test_graph) == []

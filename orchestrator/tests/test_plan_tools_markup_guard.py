@@ -45,11 +45,9 @@ tool-call argument, which reproduces the very over-consumption defect under
 test — the Write/Edit argument terminates early, truncating this file and
 silently dropping that call's sibling arguments.
 
-So every specimen is assembled from :func:`_close` / :func:`_open_param`, which
-build their angle bracket from ``chr(60)``, and
-:func:`_assert_no_raw_sentinels` enforces that on this module's OWN BYTES at
-import — checked against ``shared.toolcall_markup.ENVELOPE_LITERALS``, the
-single owner of the literal set (INV-5), plus the two structural prefixes.
+So every specimen is assembled from ``_markup_helpers``' builders, which build
+their angle bracket from ``chr(60)``, and its ``assert_no_raw_sentinels``
+enforces that on this module's OWN BYTES at import.
 """
 
 from __future__ import annotations
@@ -61,65 +59,28 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _markup_helpers import (
+    INVOKE_CLOSER,
+    assert_no_raw_sentinels,
+    closer,
+    param_opener,
+    type_alternatives,
+)
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import (
-    ENVELOPE_LITERALS,
-    MARKUP_OVERRIDE_KEY,
-    detect,
-    detect_for,
-    repair,
-)
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_tools
 from orchestrator.workflow import _is_gating_escalation
 
-# ---------------------------------------------------------------------------
-# Sentinel BUILDERS — the only way markup enters this module.
-# ---------------------------------------------------------------------------
-
-#: The opening angle bracket, spelled so it never appears verbatim in the file.
-_LT = chr(60)
-
-
-def _close(name: str) -> str:
-    """Build the closing tag for *name* (the mis-close shape the harness emits)."""
-    return _LT + '/' + name + '>'
-
-
-def _open_param(name: str) -> str:
-    """Build the canonical opening tag for parameter *name*."""
-    return _LT + 'parameter name="' + name + '">'
-
-
-#: The bare invoke closer — the terminator that trails a last-parameter leak.
-_INVOKE_CLOSER = _close('invoke')
-
-
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal.
-
-    Checked against ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single
-    owner of the literal set, INV-5) plus the two structural prefixes every
-    built specimen uses, so a builder output spelled out by hand is caught even
-    when it is not itself one of the enumerated literals.
-    """
-    source = Path(__file__).read_text(encoding='utf-8')
-    forbidden = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
-    for sequence in forbidden:
-        if sequence in source:
-            raise AssertionError(
-                f'{Path(__file__).name} contains a RAW envelope sentinel '
-                f'({sequence!r}). Build it from _close()/_open_param() instead '
-                '— a verbatim literal here corrupts the tool call that writes '
-                'this file. See the module docstring.'
-            )
-
-
-_assert_no_raw_sentinels()
+# The sentinel builders and the import-time self-scan live in
+# ``_markup_helpers``: three suites in this package need them and none may hold
+# a second copy (INV-5). Imported under this module's own local spellings so
+# every specimen below still reads as it always did.
+assert_no_raw_sentinels(__file__)
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +105,13 @@ _ANALYSIS_PROSE = 'The registration site is create_server, which owns the declar
 #: ``rationale`` parameter into it; the final opener is UNTERMINATED because its
 #: closer was consumed as the terminator.
 ABSORBED_RATIONALE = (
-    _DECISION_PROSE + _close('decision') + '\n' + _open_param('rationale') + _RATIONALE_PROSE
+    _DECISION_PROSE + closer('decision') + '\n' + param_opener('rationale') + _RATIONALE_PROSE
 )
 
 #: The same shape on ``create_plan.title``, absorbing ``analysis``. This is the
 #: tool ``_create_plan``'s own comment delegates to the write-time middleware.
 ABSORBED_ANALYSIS = (
-    _TITLE_PROSE + _close('title') + '\n' + _open_param('analysis') + _ANALYSIS_PROSE
+    _TITLE_PROSE + closer('title') + '\n' + param_opener('analysis') + _ANALYSIS_PROSE
 )
 
 #: TRAILING RESIDUE on a STORED ``design_decisions[].rationale`` — the dominant
@@ -158,13 +119,13 @@ ABSORBED_ANALYSIS = (
 #: absorbed: the parameter was last in the call, so only the mis-close and the
 #: invoke closer trail it.
 STORED_TRAILING_RATIONALE = (
-    _RATIONALE_PROSE + _close('rationale') + '\n' + _INVOKE_CLOSER + '\n'
+    _RATIONALE_PROSE + closer('rationale') + '\n' + INVOKE_CLOSER + '\n'
 )
 
 #: Prose that QUOTES the literals deliberately — a plan about this very leak
 #: (worktree 2939 is the live specimen). The escape hatch, not a leak.
 QUOTED_DECISION = (
-    'The harness emits ' + _close('decision') + ' mid-value and then ' + _INVOKE_CLOSER
+    'The harness emits ' + closer('decision') + ' mid-value and then ' + INVOKE_CLOSER
     + ', which is what the guard matches on.'
 )
 
@@ -302,7 +263,7 @@ class TestAbsorbedSiblingIsRejected:
         assert payload['outcome'] == 'rejected'
         assert payload['tool'] == 'add_design_decision'
         assert payload['field'] == 'decision'
-        assert payload['misclose'] == _close('decision')
+        assert payload['misclose'] == closer('decision')
         assert payload['recovered_params'] == ['rationale']
 
     @pytest.mark.asyncio
@@ -513,27 +474,61 @@ class TestTheDeclarationIsMachineChecked:
 
 
 # ---------------------------------------------------------------------------
-# (h) — the deliberate-quoting override on a metadata-less tool.
+# (h) — the deliberate-quoting override, on the tool that now DECLARES it.
 # ---------------------------------------------------------------------------
 
 
 class TestDeliberateQuotingOverride:
     """An architect planning a task ABOUT this leak has to be able to say so.
 
-    ``add_design_decision`` declares no ``metadata`` parameter, so this
-    exercises ``_apply_override``'s DROP branch: the flag is stripped before
-    dispatch rather than forwarded as an unexpected argument.
+    Since task 5283 ``add_design_decision`` DECLARES ``metadata`` — every tool
+    on this server does, through ``accepts_markup_override`` — so this
+    exercises ``_apply_override``'s FORWARD branch: the map travels to the
+    tool unchanged and the decorator consumes it there. What the caller sees
+    is unchanged, and these rows are what says so rather than assuming it.
     """
+
+    #: The rationale every row below sends alongside its decision. Clean, so
+    #: only the decision is ever the subject of a refusal.
+    _RATIONALE = 'Quoting the literals is the subject of the plan.'
+
+    #: A decision carrying NO markup at all. The byte-identity row needs two
+    #: calls whose only difference is the flag, which means the prose must not
+    #: be something the guard would treat differently in the two runs.
+    _CLEAN_DECISION = 'Register the guard at the boundary, not in each tool.'
+
+    @staticmethod
+    async def _plan_bytes_after(root: Path, metadata: dict[str, Any] | None) -> bytes:
+        """Seed a plan, add one CLEAN decision, and return the file's bytes.
+
+        A fresh artifacts root per call, because the two runs this feeds must
+        differ in the flag and in nothing else — including document history.
+        """
+        artifacts = TaskArtifacts(root)
+        artifacts.init('test-1', 'Test task', 'A test')
+        harness = Harness(artifacts)
+        await harness.seed_plan()
+
+        arguments: dict[str, Any] = {
+            'decision': TestDeliberateQuotingOverride._CLEAN_DECISION,
+            'rationale': TestDeliberateQuotingOverride._RATIONALE,
+        }
+        if metadata is not None:
+            arguments['metadata'] = metadata
+        await harness.call('add_design_decision', arguments)
+
+        return harness.plan_bytes()
 
     @pytest.mark.asyncio
     async def test_the_quoted_decision_lands_verbatim(self, harness: Harness):
+        """(a) The hatch works — now on the branch the declaration selects."""
         await harness.seed_plan()
 
         await harness.call(
             'add_design_decision',
             {
                 'decision': QUOTED_DECISION,
-                'rationale': 'Quoting the literals is the subject of the plan.',
+                'rationale': self._RATIONALE,
                 'metadata': {MARKUP_OVERRIDE_KEY: True},
             },
         )
@@ -543,6 +538,333 @@ class TestDeliberateQuotingOverride:
         assert 'metadata' not in stored, (
             'the override is write-time-only control, never payload'
         )
+
+    @pytest.mark.asyncio
+    async def test_the_same_call_without_the_flag_is_still_refused(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(b) Without it, (a) would prove nothing: the guard must still bite.
+
+        Driven through the residue rig rather than the bare harness because
+        this decision is UNREPAIRABLE — its tail does not parse — so the call
+        files residue, and the rig is this suite's way of keeping that in a
+        fake queue.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision',
+            {'decision': QUOTED_DECISION, 'rationale': self._RATIONALE},
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'decision'
+        assert rig.harness.plan()['design_decisions'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_flag_changes_not_one_byte_of_the_document(self, tmp_path):
+        """(c) Byte-identity, which is stronger than ``'metadata' not in``.
+
+        A key absent from the record it was sent with says nothing about the
+        rest of the document; identical bytes say the flag left no trace
+        anywhere in it.
+        """
+        without = await self._plan_bytes_after(tmp_path / 'without', None)
+
+        with_flag = await self._plan_bytes_after(
+            tmp_path / 'with', {MARKUP_OVERRIDE_KEY: True}
+        )
+
+        assert with_flag == without
+
+    @pytest.mark.asyncio
+    async def test_the_flag_beside_another_key_no_longer_raises(
+        self, harness: Harness
+    ):
+        """(e) The sharp edge the declaration removes.
+
+        Before the declaration ``_apply_override`` stripped the flag and left
+        whatever else the caller sent, so a second key reached pydantic as an
+        unexpected argument and the caller was bounced a second time, with no
+        working way out. A declared parameter accepts the whole map.
+        """
+        await harness.seed_plan()
+
+        await harness.call(
+            'add_design_decision',
+            {
+                'decision': QUOTED_DECISION,
+                'rationale': self._RATIONALE,
+                'metadata': {MARKUP_OVERRIDE_KEY: True, 'note': 'ignored payload'},
+            },
+        )
+
+        assert harness.plan()['design_decisions'][-1]['decision'] == QUOTED_DECISION
+
+    @pytest.mark.asyncio
+    async def test_the_leftover_key_is_REPORTED_not_silently_dropped(
+        self, harness: Harness, caplog
+    ):
+        """The other half of (e): removing an error must not remove the signal.
+
+        The pydantic bounce was wrong as a RESPONSE and right as a REPORT — a
+        caller sending payload keys a tool does not own has a bug, and the one
+        thing worse than being bounced for it is having it silently discarded.
+        The decorator is the only place that residue exists, so it is the only
+        place that can say so, and it names KEYS only — the same names-only
+        convention ``_emit_fact`` and ``_forward`` already hold to.
+        """
+        await harness.seed_plan()
+        secret = 'THIS VALUE IS THE CALLER PAYLOAD'
+
+        with caplog.at_level(logging.WARNING, logger='shared.mcp_markup_middleware'):
+            await harness.call(
+                'add_design_decision',
+                {
+                    'decision': self._CLEAN_DECISION,
+                    'rationale': self._RATIONALE,
+                    'metadata': {MARKUP_OVERRIDE_KEY: True, 'note': secret},
+                },
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('note' in message for message in warnings), (
+            f'the leftover metadata key vanished without a word: {warnings}'
+        )
+        assert any('add_design_decision' in message for message in warnings), (
+            'a residue report that does not name the tool is not actionable'
+        )
+        assert not any(secret in message for message in warnings), (
+            'names only — the report must not become a second copy of the '
+            "caller's payload"
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the RIPPLE of declaring it: metadata joins the repair vocabulary.
+# ---------------------------------------------------------------------------
+
+
+#: A leak whose swallowed tail declares ``metadata`` — a pseudo-parameter that
+#: was OUT of this tool's vocabulary until the declaration put it in. The
+#: middleware resolves ``schema_params`` from the LIVE tool schema, so
+#: ``repair`` now qualifies a ``metadata`` closer as a mis-close candidate and
+#: can recover a tail into it.
+METADATA_TAIL_DECISION = (
+    _DECISION_PROSE + closer('decision') + '\n' + param_opener('metadata')
+    + 'swallowed tail'
+)
+
+
+class TestTheWidenedRepairVocabularyStaysContained:
+    """Declaring a parameter widens what a repair may RECOVER, not just accept.
+
+    This is the non-obvious consequence of workstream B and the reason it is
+    pinned rather than left to be rediscovered: nothing about "make the hatch
+    schema-legal" says "let repair() recover a value into ``metadata``", but
+    the middleware reads the vocabulary off the live schema, so it does.
+
+    On THIS tier the containment is structural — REJECT_WITH_REPAIR writes
+    nothing at all — and the recovered value is handed back for the caller to
+    resubmit. That resubmission is where the widening could have gone wrong,
+    so it is driven here rather than assumed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_now_a_recovery_TARGET(self, harness: Harness):
+        """The premise. Without it every row below would be vacuously green."""
+        await harness.seed_plan()
+
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        assert _refusal(excinfo)['recovered_params'] == ['metadata']
+
+    @pytest.mark.asyncio
+    async def test_nothing_reaches_the_plan(self, harness: Harness):
+        """The containment that matters: the document is not touched."""
+        await harness.seed_plan()
+        before = harness.plan_bytes()
+
+        with pytest.raises(ToolError):
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        assert harness.plan_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_the_recovered_tail_is_handed_back_not_swallowed(
+        self, harness: Harness
+    ):
+        """``repaired_call`` is the COMPLETE map, so the tail is not lost."""
+        await harness.seed_plan()
+
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+
+        repaired_call = _refusal(excinfo)['repaired_call']
+        assert repaired_call['decision'] == _DECISION_PROSE
+        assert repaired_call['metadata'] == 'swallowed tail'
+
+    @pytest.mark.asyncio
+    async def test_resubmitting_it_fails_LEGIBLY_rather_than_writing_a_string(
+        self, harness: Harness
+    ):
+        """The one edge the widening really does add, pinned as contained.
+
+        The recovered slice is a ``str`` and the declared parameter is
+        object-or-null, so a caller who resubmits the map verbatim is bounced
+        a second time — by pydantic, naming ``metadata``, with the plan still
+        untouched. That is ``_coerce_recovered``'s unchanged-on-doubt rule
+        behaving as documented: a value it cannot confidently type is left
+        alone to produce a legible declared-type error, never retyped and
+        never invented. Loud and legible beats a string written into a field
+        the document does not have.
+        """
+        await harness.seed_plan()
+        with pytest.raises(ToolError) as first:
+            await harness.call(
+                'add_design_decision',
+                {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
+            )
+        before = harness.plan_bytes()
+
+        with pytest.raises(ToolError) as second:
+            await harness.call(
+                'add_design_decision', _refusal(first)['repaired_call']
+            )
+
+        assert 'metadata' in str(second.value)
+        assert harness.plan_bytes() == before
+        assert harness.plan()['design_decisions'] == []
+
+
+# ---------------------------------------------------------------------------
+# task 5283 — the hatch is DECLARED in the schema, not tolerated by one client.
+# ---------------------------------------------------------------------------
+
+
+class TestEveryToolDeclaresTheOverrideParameter:
+    """``metadata`` must be part of the ADVERTISED contract of every tool here.
+
+    The deliberate-quoting hatch is the documented remediation this server's
+    own rejection hint gives a caller (``_OVERRIDE_SENTENCE``), and until this
+    task it worked on plan-tools only because ``claude`` CLI 2.1.250 transmits
+    an argument the schema does not declare — measured 2026-08-28 on a
+    transparent stdio JSON-RPC tee proxy (task 4817 / esc-4817-1; memory
+    records 4012ec18-55c0-4a7c-9806-04d2d397f868 and
+    decb3e1b-05af-4761-9e08-486fa08044c0). Every tool here advertises
+    ``additionalProperties: false``, so a stricter client is entitled to reject
+    that call before it is ever sent, and the remediation would simply not
+    exist for it. A property of one client build is not a contract.
+
+    UNIFORM over the whole listing, ENUMERATED FROM THE LISTING. The guard
+    scans every string argument of every tool on this server, so any tool here
+    can be the one that bounces a caller — which makes "the tools that happen
+    to carry prose" the wrong scope. Reading the names off the round-trip
+    rather than spelling them means a seventeenth tool cannot be added without
+    the parameter.
+    """
+
+    @staticmethod
+    async def _listing(harness: Harness) -> dict[str, dict[str, Any]]:
+        """``{tool name: inputSchema}`` from a real ``tools/list`` round-trip.
+
+        Through the ``Client``, not off ``server._tool_manager``: the schema a
+        caller is held to is the one that crosses the wire.
+        """
+        async with Client(harness.server) as client:
+            tools = await client.list_tools()
+        assert tools, 'the plan-tools server registered no tools at all'
+        return {tool.name: tool.inputSchema for tool in tools}
+
+    @pytest.mark.asyncio
+    async def test_every_registered_tool_declares_metadata(self, harness: Harness):
+        listing = await self._listing(harness)
+
+        missing = sorted(
+            name for name, schema in listing.items()
+            if 'metadata' not in schema.get('properties', {})
+        )
+        assert missing == [], (
+            f'{len(missing)} of {len(listing)} plan-tools tools do not declare '
+            f'metadata: {missing} — the documented override is unavailable to '
+            'any client that honours additionalProperties: false'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_never_required(self, harness: Harness):
+        """The hatch is opt-in; requiring it would break every ordinary call."""
+        listing = await self._listing(harness)
+
+        required = {
+            name: schema.get('required', [])
+            for name, schema in listing.items()
+            if 'metadata' in schema.get('required', [])
+        }
+        assert required == {}
+
+    @pytest.mark.asyncio
+    async def test_metadata_accepts_an_object_or_null(self, harness: Harness):
+        """An object because the flag lives in a map; null because it defaults."""
+        listing = await self._listing(harness)
+
+        for name, schema in listing.items():
+            declared = schema.get('properties', {}).get('metadata')
+            assert isinstance(declared, dict), name
+            assert type_alternatives(declared) == {'object', 'null'}, (
+                f'{name} declares metadata as {declared!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_metadata_SAYS_WHAT_IT_IS_FOR(self, harness: Harness):
+        """An undescribed ``metadata`` on sixteen tools INVITES the wrong call.
+
+        A bare ``object|null`` named ``metadata`` on ``create_plan`` or
+        ``mark_step_done`` reads exactly like somewhere to attach metadata to
+        the plan, and a caller who believes that has its payload dropped by
+        ``_consume_override`` with nothing said on a channel it can read.
+        Declaring the parameter is what removed the pydantic bounce that used
+        to be that caller's only diagnostic, so the description is the
+        replacement — the mistake is forestalled in the contract instead of
+        reported after the fact.
+
+        Asserted by MEANING, not by text: the description must NAME the flag
+        key, so the remediation is actionable from the schema alone.
+        """
+        listing = await self._listing(harness)
+
+        for name, schema in listing.items():
+            description = schema['properties']['metadata'].get('description', '')
+            assert MARKUP_OVERRIDE_KEY in description, (
+                f'{name} advertises metadata with no mention of the flag it '
+                f'exists for: {description!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_schemas_stay_CLOSED(self, harness: Harness):
+        """Declaring one parameter must not be done by opening the door.
+
+        ``additionalProperties: true`` would also make the hatch legal, and it
+        would legalise every typo alongside it — the unknown-parameter error is
+        a real diagnostic these tools should keep.
+        """
+        listing = await self._listing(harness)
+
+        open_schemas = sorted(
+            name for name, schema in listing.items()
+            if schema.get('additionalProperties') is not False
+        )
+        assert open_schemas == []
 
 
 # ---------------------------------------------------------------------------
@@ -771,14 +1093,26 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """(b) INV-7's contracted keys, and the only surviving copy of the data.
 
-        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
-        reject and forward paths the two coincide; here ``repair`` returned
-        ``None``, so there is no ``Repair`` to read one off and the guard
-        publishes what ``_first_markup_argument`` actually matched on --
-        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        ``matched_pattern`` is the SCAN's pattern. Since task 5283 that is the
+        ONLY pattern there is: the reject and forward paths read it off
+        ``Repair.pattern``, which is derived from the same
+        ``detect_for(value, param, schema_params)`` triple the scan asks, so
+        the three sites agree BY CONSTRUCTION rather than coinciding. Here
+        ``repair`` returned ``None``, so there is no ``Repair`` to read one off
+        at all and the guard publishes what ``_first_markup_argument``
+        actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.
+
+        The expectation is SPELLED, not computed by calling ``detect_for``
+        here. An expectation derived from the predicate under test moves with
+        it, so it can only ever catch a disagreement between
+        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
+        closer sits at offset 459 and the blanket ``detect``'s answer at 471,
+        so the widened value is the HEAD of the leak and the blanket one
+        trails it by twelve characters.
         """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
@@ -793,7 +1127,7 @@ class TestUnrepairableResidueIsPreserved:
         assert record['level'] == 2
         assert record['tool'] == 'add_design_decision'
         assert record['field'] == 'decision'
-        assert record['matched_pattern'] == detect_for(UNREPAIRABLE_DECISION, 'decision')
+        assert record['matched_pattern'] == closer('decision')
         assert record['raw_value'] == UNREPAIRABLE_DECISION
 
     @pytest.mark.asyncio
@@ -949,14 +1283,26 @@ class TestUnrepairableResidueIsPreserved:
         The refusal is already decided before escalation is attempted, so every
         failure mode degrades to a logged ``None`` plus an unchanged payload.
 
-        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
-        reject and forward paths the two coincide; here ``repair`` returned
-        ``None``, so there is no ``Repair`` to read one off and the guard
-        publishes what ``_first_markup_argument`` actually matched on --
-        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        ``matched_pattern`` is the SCAN's pattern. Since task 5283 that is the
+        ONLY pattern there is: the reject and forward paths read it off
+        ``Repair.pattern``, which is derived from the same
+        ``detect_for(value, param, schema_params)`` triple the scan asks, so
+        the three sites agree BY CONSTRUCTION rather than coinciding. Here
+        ``repair`` returned ``None``, so there is no ``Repair`` to read one off
+        at all and the guard publishes what ``_first_markup_argument``
+        actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
         event, which already carries the widened value.
+
+        The expectation is SPELLED, not computed by calling ``detect_for``
+        here. An expectation derived from the predicate under test moves with
+        it, so it can only ever catch a disagreement between
+        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
+        closer sits at offset 459 and the blanket ``detect``'s answer at 471,
+        so the widened value is the HEAD of the leak and the blanket one
+        trails it by twelve characters.
         """
         queue = _FakeQueue(submit_error=OSError('queue is unwritable'))
         rig = build_residue_rig(monkeypatch, artifacts, queue)
@@ -967,9 +1313,7 @@ class TestUnrepairableResidueIsPreserved:
         )
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['matched_pattern'] == detect_for(
-            UNREPAIRABLE_DECISION, 'decision'
-        )
+        assert payload['matched_pattern'] == closer('decision')
         assert payload['escalation_id'] is None, (
             'the caller is better told nothing than pointed at a record that '
             'was never written'

@@ -31,7 +31,12 @@ from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, sweep_stale_pid_dirs
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
+)
 from shared.config_models import UsageCapConfig
 from shared.invocation_outcome import (
     OK,
@@ -129,13 +134,6 @@ _SPAWN_FAULT_THRESHOLD = 3
 _PROBE_TASK_ID_PREFIX = 'usage-gate-probe-'
 _PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
 
-# Set once the stale-probe-dir sweep has run in this process. The sweep
-# reclaims OTHER (dead) processes' leftovers, so it is a process-wide
-# one-shot: re-running it per gate would re-scan /tmp for no benefit, and the
-# pathological /tmp this bounds has a 40 MB directory inode.
-_probe_dir_sweep_done: bool = False
-
-
 def _sweep_stale_probe_dirs_once() -> int:
     """Reclaim dead-PID probe config dirs left by earlier processes.
 
@@ -151,38 +149,35 @@ def _sweep_stale_probe_dirs_once() -> int:
     dead-PID leftovers bounds the population, at
     (live processes x accounts).
 
-    Never raises — for ANY exception class, not just OSError: tmp hygiene must
-    not be able to fail gate construction, and therefore orchestrator startup.
+    The once-per-process bookkeeping, the set-before-call ordering and the
+    never-raise contract all live in
+    ``config_dir.sweep_stale_pid_dirs_once``, whose docstring carries the
+    rationale for each; this wrapper supplies only what is genuinely local —
+    the prefix and this module's logging voice. Never raises, for ANY
+    exception class: tmp hygiene must not be able to fail gate construction,
+    and therefore orchestrator startup.
     """
-    global _probe_dir_sweep_done
-    if _probe_dir_sweep_done:
-        return 0
-    # Set BEFORE the call, not after, so a raising sweep still cannot re-run
-    # on every subsequent gate construction.
-    _probe_dir_sweep_done = True
-    try:
-        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
-        if reclaimed:
-            # Silent on the zero case so the steady state stays quiet; loud
-            # when there is something to say, so an operator can see the /tmp
-            # population draining rather than rebuilding.
-            logger.info(
-                'UsageGate: reclaimed %d stale probe config dir(s) under %s '
-                '(dead-PID sweep, task 3086)', reclaimed, _PROBE_DIR_PREFIX,
-            )
-        return reclaimed
-    except Exception:
-        # Deliberately broad. sweep_stale_pid_dirs already contains OSError
-        # internally, so anything that reaches here is an UNFORESEEN failure —
-        # a future bug, a pathological tree, a mocked side effect in a sibling
-        # suite. Letting it escape would fail UsageGate.__init__ and therefore
-        # orchestrator startup, which is strictly worse than leaving a stale
-        # /tmp dir behind. Logged at WARNING with a traceback, never silent.
-        logger.warning(
+    return sweep_stale_pid_dirs_once(
+        _PROBE_DIR_PREFIX,
+        # Passed EXPLICITLY, resolved from this module's globals at call time,
+        # and deliberately not defaulted inside the helper: this name is the
+        # interception point every patch site in test_usage_gate.py relies on
+        # (pinned by test_the_module_level_sweep_name_is_still_the_interception_point).
+        sweep=sweep_stale_pid_dirs,
+        # Silent on the zero case so the steady state stays quiet; loud when
+        # there is something to say, so an operator can see the /tmp population
+        # draining rather than rebuilding.
+        on_reclaimed=lambda reclaimed: logger.info(
+            'UsageGate: reclaimed %d stale probe config dir(s) under %s '
+            '(dead-PID sweep, task 3086)', reclaimed, _PROBE_DIR_PREFIX,
+        ),
+        # exc_info=True works here: the callback runs inside the helper's own
+        # `except` block, so sys.exc_info() is live (verified, not assumed).
+        on_failure=lambda _exc: logger.warning(
             'UsageGate: stale probe-dir sweep of %s failed — continuing without it '
             '(the next process start retries)', _PROBE_DIR_PREFIX, exc_info=True,
-        )
-        return 0
+        ),
+    )
 
 
 def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
