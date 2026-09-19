@@ -1481,7 +1481,7 @@ class TestRow7SceneIsGuarded:
             'measured cost and mean nothing detached from it.'
         )
 
-        verdict = 'deep_gate_spawn_budget_violation'
+        verdict = 'spawn_budget_violation'
         guarded = [
             fixture.name
             for fixture in _autouse_fixtures(row7)

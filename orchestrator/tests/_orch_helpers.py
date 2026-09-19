@@ -19,7 +19,7 @@ import time
 from collections.abc import Awaitable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, NamedTuple, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -388,6 +388,40 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
     return bounded_secs + out_of_bound_spawns * MEASURED_SPAWN_LATENCY_SECS
 
 
+class SpawnBudget(NamedTuple):
+    """What ONE spawn-bound scene may cost, and the constants that say so.
+
+    Four fields and not two, and the two NAMES are the load-bearing half.
+    :func:`spawn_budget_violation` reports a breach by telling the reader
+    which constants to re-derive, so a descriptor that carried only the
+    numbers would leave that function naming a fixed pair while accepting any
+    budget -- and a second caller would be sent to re-derive constants with
+    nothing to do with its failure (the defect task 5333's reviewer amendment
+    caught, and the reason that function was narrowed rather than generalised
+    at the time).  Carrying the names is what lets the parameters and the
+    message agree about how wide the function is.
+
+    A BUNDLE, never a second definition: every number here is read from the
+    module-level scalar that defines it.  Those scalars stay the single home
+    of each value, so a marker, ``_SANCTIONED_TIMEOUT_NAMES`` and this
+    descriptor cannot drift into three readings of one figure.  The constant
+    names are spelled as strings because a name cannot refer to itself.
+
+    STATED LIMIT, recorded rather than engineered around: nothing resolves
+    those strings back to this module's attributes, so renaming a constant
+    without editing its descriptor leaves a stale name in a failure message.
+    What IS pinned is the property the message depends on -- that each
+    caller's verdict names ITS OWN pair and neither of the other's
+    (test_timeout_marker_inversion_guard.py::TestSpawnBudgetVerdict::
+    test_each_descriptors_message_names_only_its_own_constants).
+    """
+
+    spawns: int
+    timeout_secs: int
+    spawns_constant: str
+    timeout_constant: str
+
+
 # task 5333: what TestRow7KillSwitchByteIdentity
 # (test_merge_queue_deep_integration_gate.py) is ALLOWED to cost, and the
 # per-test timeout derived from it.  This comment is the SINGLE home of that
@@ -517,6 +551,12 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
 #     needs no grandfathering.
 DEEP_GATE_SCENE_SPAWN_BUDGET = 260
 DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
+DEEP_GATE_SCENE_BUDGET = SpawnBudget(
+    DEEP_GATE_SCENE_SPAWN_BUDGET,
+    DEEP_GATE_SCENE_TEST_TIMEOUT,
+    'DEEP_GATE_SCENE_SPAWN_BUDGET',
+    'DEEP_GATE_SCENE_TEST_TIMEOUT',
+)
 
 # task 5582: what the nine real-git classes in
 # test_merge_queue_deep_landing.py are ALLOWED to cost, and the per-test
@@ -644,53 +684,62 @@ DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
 DEEP_LANDING_SCENE_SPAWN_BUDGET = 190
 DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS = 180
 DEEP_LANDING_SCENE_TEST_TIMEOUT = 1080
+DEEP_LANDING_SCENE_BUDGET = SpawnBudget(
+    DEEP_LANDING_SCENE_SPAWN_BUDGET,
+    DEEP_LANDING_SCENE_TEST_TIMEOUT,
+    'DEEP_LANDING_SCENE_SPAWN_BUDGET',
+    'DEEP_LANDING_SCENE_TEST_TIMEOUT',
+)
 
 
-def deep_gate_spawn_budget_violation(count: int, nodeid: str) -> str | None:
+def spawn_budget_violation(count: int, nodeid: str, *, budget: SpawnBudget) -> str | None:
     """Why *count* git spawns is an unacceptable cost for *nodeid*, or None.
 
     Returns the MESSAGE and never raises: the CALLER decides how to fail.
     That is what keeps the check reachable from a plain unit test rather than
-    only from the autouse fixture that uses it -- a budget check living
-    inside a fixture teardown is exercised only on the path where it passes.
+    only from the fixtures that use it -- a budget check living inside a
+    fixture teardown is exercised only on the path where it passes.
 
-    SCOPED TO :data:`DEEP_GATE_SCENE_SPAWN_BUDGET`, which it reads rather than
-    accepts (task 5333 reviewer amendment).  An earlier revision took the
-    budget as a parameter while its message named the DEEP_GATE_SCENE_*
-    constants as the pair to re-derive, so any second caller the general
-    signature invited would have been told to re-derive constants that had
-    nothing to do with it.  The narrow spelling makes the parameters and the
-    message agree about how wide this function is, and lets its unit tests pin
-    the REAL budget boundary instead of a synthetic one.
+    SCOPED BY ITS *budget* DESCRIPTOR, which carries the constant NAMES as
+    well as their values (task 5333 reviewer amendment, generalised by task
+    5582).  An earlier revision took the budget as a bare parameter while its
+    message named the DEEP_GATE_SCENE_* constants as the pair to re-derive, so
+    any second caller the general signature invited would have been told to
+    re-derive constants that had nothing to do with it.  The amendment's
+    requirement is that the parameters and the message agree about how wide
+    this function is -- not that it stay single-caller -- and a descriptor
+    carrying the names meets it exactly: each caller's failure names its own
+    pair.  See :class:`SpawnBudget`.
 
     TWO offences, kept distinct because their remedies differ.  A count ABOVE
     the budget means the scene got heavier and both constants need
     re-deriving.  A count of ZERO means the caller's counting seam saw no git
     at all, so the budget is enforcing nothing -- and since zero is inside
-    every budget, nothing else here would catch it.
+    every budget, nothing else here would catch it.  Only the first names
+    constants: a broken counting seam is repaired, not re-derived.
 
-    The derivation behind these numbers is NOT restated here; see
-    :data:`DEEP_GATE_SCENE_TEST_TIMEOUT`'s comment above.
+    The derivation behind any caller's numbers is NOT restated here; see the
+    comment on the descriptor's own ``timeout_constant`` above.
     """
-    budget = DEEP_GATE_SCENE_SPAWN_BUDGET
     if count == 0:
         return (
             f'{nodeid} made NO git subprocess calls, so its spawn budget of '
-            f'{budget} is enforcing nothing. The counting seam has gone blind, '
-            'and a guard that passes because it was silently disconnected is '
-            'worse than no guard at all. Repair the fixture that counts spawns '
-            'before trusting any later green run of this class.'
+            f'{budget.spawns} is enforcing nothing. The counting seam has gone '
+            'blind, and a guard that passes because it was silently '
+            'disconnected is worse than no guard at all. Repair the fixture '
+            'that counts spawns before trusting any later green run of this '
+            'class.'
         )
-    if count > budget:
+    if count > budget.spawns:
         return (
-            f'{nodeid} made {count} git spawns, over its budget of {budget}. '
-            'The scene got heavier, so @pytest.mark.timeout('
-            f'DEEP_GATE_SCENE_TEST_TIMEOUT) ({DEEP_GATE_SCENE_TEST_TIMEOUT}s) '
+            f'{nodeid} made {count} git spawns, over its budget of '
+            f'{budget.spawns}. The scene got heavier, so @pytest.mark.timeout('
+            f'{budget.timeout_constant}) ({budget.timeout_secs}s) '
             'is no longer sized for what this class costs -- and an '
             'under-sized marker does not fail as a red test, it dies as an '
             'unattributed xdist worker crash on a loaded host. Re-measure the '
             'per-test spawn counts, then re-derive BOTH '
-            'DEEP_GATE_SCENE_SPAWN_BUDGET and DEEP_GATE_SCENE_TEST_TIMEOUT '
+            f'{budget.spawns_constant} and {budget.timeout_constant} '
             'from the new figure (their comment in this file has the model). '
             'Raising the budget alone leaves the marker under-sized.'
         )

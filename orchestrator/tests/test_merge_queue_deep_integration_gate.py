@@ -341,9 +341,10 @@ from _merge_lane_census import lanes_by_task, queued_in_lane
 # their spawn counts has been measured, and widening an unmeasured marker is the
 # guessing this task replaced. The asymmetry is a decision, not an oversight.
 from _orch_helpers import (
+    DEEP_GATE_SCENE_BUDGET,
     DEEP_GATE_SCENE_TEST_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    deep_gate_spawn_budget_violation,
+    spawn_budget_violation,
 )
 from shared.task_metadata import RetryLedger
 
@@ -4403,7 +4404,9 @@ class TestRow7KillSwitchByteIdentity:
         for seam in seams:
             monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
         yield
-        violation = deep_gate_spawn_budget_violation(spawns, request.node.nodeid)
+        violation = spawn_budget_violation(
+            spawns, request.node.nodeid, budget=DEEP_GATE_SCENE_BUDGET,
+        )
         assert violation is None, violation
 
     async def _sequence(
