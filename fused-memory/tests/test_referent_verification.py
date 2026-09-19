@@ -41,16 +41,16 @@ from _fm_helpers import (
 )
 
 from fused_memory.services import memory_service as memory_service_module
-from fused_memory.services.memory_service import (
+from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.write_journal import WriteJournal
+from fused_memory.utils import canonical_labels, referent_verification
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_verification import (
     REFERENT_CHECKS,
     REFERENT_FINDING_AXES,
-    MemoryService,
     ReferentFinding,
     ReferentStats,
 )
-from fused_memory.services.write_journal import WriteJournal
-from fused_memory.utils import canonical_labels
-from fused_memory.utils.canonical_labels import Referent
 
 
 @pytest.fixture
@@ -100,6 +100,26 @@ class TestReferentRecordVocabulary:
     def test_check_vocabulary_is_closed_and_exactly_the_two_named_checks(self):
         """The single normative site for "WHICH CHECK FIRED" (INV-5)."""
         assert REFERENT_CHECKS == ('set-membership', 'per-edge-pairing')
+
+    def test_the_check_vocabulary_lives_at_exactly_one_site(self):
+        """INV-5/SPOT across the leaf split: `memory_service` RE-IMPORTS the
+        vocabulary from `utils.referent_verification`, it does not keep a copy.
+
+        Identity, not equality, and that is the whole point: two tuples spelled
+        the same in two modules compare equal on the day they are written and
+        drift silently afterwards. `MemoryService.__init__` seeds
+        `_referent_finding_counts` from these names while `ReferentFinding`
+        validates against them, so a second copy would let a counter bucket and
+        a record validator disagree about what a check is called.
+        """
+        assert (
+            memory_service_module.REFERENT_CHECKS
+            is referent_verification.REFERENT_CHECKS
+        )
+        assert (
+            memory_service_module.REFERENT_FINDING_AXES
+            is referent_verification.REFERENT_FINDING_AXES
+        )
 
     def test_required_fields_construct_and_defaults_are_fail_closed(self):
         finding = _finding()
@@ -1151,7 +1171,7 @@ class TestCandidateTargetSelection:
 
     def test_the_pool_is_the_fact_cited_intersection_when_it_is_non_empty(self):
         """Mode (iii): the fact cites 3075, the edge sits on 3074."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1164,7 +1184,7 @@ class TestCandidateTargetSelection:
     def test_it_falls_back_to_the_declared_set_when_the_intersection_is_empty(self):
         """The MEMBERSHIP shape: the endpoint is outside the declared set, so
         subtracting it is a no-op and the sole declared referent survives."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='10')}),
@@ -1175,7 +1195,7 @@ class TestCandidateTargetSelection:
         ) == (Referent(number='10'),)
 
     def test_the_other_endpoint_is_subtracted_so_no_repair_forms_a_self_loop(self):
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='2519')}),
@@ -1188,7 +1208,7 @@ class TestCandidateTargetSelection:
     def test_the_order_is_deterministic_and_not_frozenset_iteration_order(self):
         """A finding must be stable across runs and diffable in eta's audit;
         frozenset iteration order is not stable across processes."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         refs = frozenset({
             Referent(number='11'), Referent(number='10'),
@@ -1221,7 +1241,7 @@ class TestCandidateTargetSelection:
         records `resolvable=False` with a reason, which is the fail-closed
         "recorded and left alone" direction.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074')}),
@@ -1233,7 +1253,7 @@ class TestCandidateTargetSelection:
 
     def test_both_endpoints_are_subtracted_together(self):
         """Neither end of an edge can ever be its own repair target."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1247,7 +1267,7 @@ class TestCandidateTargetSelection:
         """Asserted rather than merely argued: the pool is always a SUBSET of
         `referents`, and membership fires precisely when the endpoint is NOT in
         `referents`, so the subtraction provably cannot bite on that arm."""
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='10'), Referent(number='11')}),
@@ -1269,7 +1289,7 @@ class TestCandidateTargetSelection:
         node it landed on — the strongest possible evidence the attachment is
         CORRECT — so the declared set {3668} must not be mined for a target.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3668')}),
@@ -1296,7 +1316,7 @@ class TestCandidateTargetSelection:
         endpoint undeclared and pairing needs it uncited — and so pinned the
         wrong behaviour on an input no arm can reach.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3668')}),
@@ -1314,7 +1334,7 @@ class TestCandidateTargetSelection:
         below still decides, and the fact's citation of `Task 3075` remains the
         repair target.
         """
-        from fused_memory.services.memory_service import _candidate_targets
+        from fused_memory.utils.referent_verification import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
@@ -1333,7 +1353,7 @@ class TestUnresolvableReason:
     """
 
     def test_more_than_one_candidate_names_the_ambiguity(self):
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (Referent(number='10'), Referent(number='11')),
@@ -1349,7 +1369,7 @@ class TestUnresolvableReason:
 
     def test_zero_candidates_names_the_endpoint_already_attached_condition(self):
         """The pool held only the flagged endpoint itself."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1366,7 +1386,7 @@ class TestUnresolvableReason:
 
     def test_zero_candidates_still_names_the_self_loop_for_the_live_2519_row(self):
         """referents {2519}, endpoints (Task 2519, Task 2520), a unary fact."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1381,7 +1401,7 @@ class TestUnresolvableReason:
         assert 'self-loop' in reason
 
     def test_the_two_zero_candidate_reasons_are_distinguishable(self):
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         already_attached = _unresolvable_reason(
             (), cited=frozenset(), pool=frozenset({Referent(number='3074')}),
@@ -1401,7 +1421,7 @@ class TestUnresolvableReason:
         """Tested against the PRE-subtraction pool rather than inferred from
         `other_endpoint is None`, which is what keeps the message HONEST when
         both ends were subtracted."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1419,7 +1439,7 @@ class TestUnresolvableReason:
         """"The fact names the node it landed on" is the reason an operator and
         leaf eta need; it cannot be inferred from the pool, which the guard
         deliberately empties."""
-        from fused_memory.services.memory_service import _unresolvable_reason
+        from fused_memory.utils.referent_verification import _unresolvable_reason
 
         reason = _unresolvable_reason(
             (),
@@ -1640,10 +1660,15 @@ class TestTheAmbiguousScanBoundaryRow:
     """PRD boundary row: "Ambiguous scan | ref routed to ``.ambiguous``;
     treated as undeclared; recorded, not guessed".
 
-    Leaf epsilon drops ``.ambiguous`` from the wire on purpose, so zeta
-    RE-DERIVES it from ``content``; without that, an ambiguous endpoint is
-    indistinguishable from a genuine conflation and gets a destructive repair
-    instruction instead of being recorded and left alone.
+    Without the ambiguity set an ambiguous endpoint is indistinguishable from a
+    genuine conflation and gets a destructive repair instruction instead of
+    being recorded and left alone.
+
+    Every case here passes `content` and NO `ambiguous=`, so they all exercise
+    the LEGACY-ROW path — the permissive re-derivation, which is what a queue
+    row enqueued before task 5262 gets. The preference rule that supersedes it
+    is pinned in `TestTheWireAmbiguitySetIsPreferred` below; these stay as they
+    are because the fallback has to keep behaving byte-identically to HEAD.
     """
 
     @pytest.mark.asyncio
@@ -1736,6 +1761,208 @@ class TestTheAmbiguousScanBoundaryRow:
         assert len(stats.findings) == 1
         assert stats.findings[0].resolvable is True
         assert stats.findings[0].intended_referent == Referent(number='3200')
+
+
+#: Content whose ONLY task mention is 3200 — it contests nothing, so a
+#: re-derivation over it yields an EMPTY ambiguity set. Every wire-value test
+#: below uses it, so a veto that fires can ONLY have come from the wire.
+_UNCONTESTED_CONTENT = 'Task 3200 tracks the rollout.'
+
+#: Content in which 3127 IS contested (a bare own-project mention and a
+#: foreign-qualified reference to the same number), so a re-derivation over it
+#: yields {Task 3127}. Used to prove the fallback still fires and that `()`
+#: suppresses the fallback entirely.
+_CONTESTED_CONTENT = (
+    'Task 3127 was reconciled; see reify:3127 for the mirror. '
+    'Task 3200 tracks it.'
+)
+
+
+def _scan_spy(monkeypatch) -> list[tuple[str, dict]]:
+    """Every (text, kwargs) `_verify_episode_referents` hands `scan_content`.
+
+    Records the KWARGS too, unlike `TestPerEdgeFactScanIsLazy._spy`, because
+    two separate contracts are properties of how the scanner is CALLED rather
+    than of what it returns: the legacy-row fallback is permissive, and the
+    per-edge fact scan stays permissive even under a populated registry.
+
+    Patches the name as imported into `memory_service`, the binding the pass
+    actually calls, and delegates to the real scanner so the findings under
+    test are the production ones.
+    """
+    calls: list[tuple[str, dict]] = []
+    real = memory_service_module.scan_content
+
+    def _recording(text, **kwargs):
+        calls.append((text, dict(kwargs)))
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
+    return calls
+
+
+class TestTheWireAmbiguitySetIsPreferred:
+    """Task 5262 workstream C: the producer's `.ambiguous` rides the wire, so
+    zeta reads it instead of re-deriving it.
+
+    WHY IT MATTERS RATHER THAN BEING A TIDY-UP. The re-derivation is a SECOND
+    SCAN SITE — the INV-5 lockstep duplication canonical_labels exists to
+    prevent — and it is sound only while both scans are parameterized
+    identically. They stop being so the moment the producer narrows its scan
+    with the project registry (workstream B): the producer scans at ENQUEUE,
+    this pass runs at DEQUEUE on the far side of a durable SQLite queue, and a
+    restart with a changed registry between them desynchronizes the two sets
+    silently. A desynchronized set means `_candidate_pool`'s VETO 1 does not
+    fire where the producer said it should, and an AMBIGUOUS endpoint is handed
+    to eta as a repair instruction — destructive edge surgery onto the wrong
+    node, the precise failure this PRD exists to prevent.
+
+    Threading the RESULT rather than the INPUT makes the two sets incapable of
+    disagreeing, which is strictly stronger than narrowing both in lockstep.
+    """
+
+    @staticmethod
+    def _landed_on(number: str):
+        """One edge whose source endpoint is the task node named *number*."""
+        return _episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-end', target='n-mirror')],
+            nodes=[MockNode(name=f'Task {number}', uuid='n-end'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_wire_value_decides_and_the_content_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """ARM 1. The producer says 6379 was ambiguous; the content says
+        nothing of the kind. The wire wins, and no second scan happens.
+
+        A re-derivation over this content yields an EMPTY set, so a fired veto
+        can only have come from the wire — this test cannot pass by accident.
+        """
+        calls = _scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('6379'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_UNCONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(Referent(number='6379'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.endpoint_referent == Referent(number='6379')
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'AMBIGUOUS' in finding.reason
+        assert stats.unresolvable_findings == 1
+        # THE SECOND SCAN SITE IS GONE when the wire carries the answer. The
+        # per-EDGE fact scan is untouched and may still appear here; what must
+        # not is the episode BODY.
+        assert _UNCONTESTED_CONTENT not in [text for text, _ in calls]
+
+    @pytest.mark.asyncio
+    async def test_a_self_qualified_wire_spelling_is_normalized_on_the_way_in(
+        self, service,
+    ):
+        """The wire set goes through `local_referent` exactly as the re-derived
+        one does, so 'dark_factory:2500' compares equal to the locally-classified
+        endpoint referent instead of sneaking past the veto.
+
+        Not hypothetical: `scan_content` preserves the qualifier it read, so a
+        producer whose content spelled the ambiguous mention self-qualified puts
+        that spelling on the wire verbatim.
+        """
+        stats = await service._verify_episode_referents(
+            self._landed_on('2500'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_UNCONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(Referent(number='2500', project_id='dark_factory'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+    @pytest.mark.asyncio
+    async def test_None_falls_back_to_a_permissive_re_derivation(
+        self, service, monkeypatch,
+    ):
+        """ARM 2. A legacy row (no `'ambiguous'` key) behaves exactly as HEAD.
+
+        `None` means "the producer did not tell us", and a row with no such key
+        was necessarily enqueued by pre-change code — whose producer scanned
+        PERMISSIVELY. Only a permissive re-derivation reproduces that producer,
+        so the fallback must pass no `known_project_ids`.
+        """
+        calls = _scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=None,
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+        body_scans = [kwargs for text, kwargs in calls if text == _CONTESTED_CONTENT]
+        assert body_scans, 'the fallback did not re-derive from the content'
+        for kwargs in body_scans:
+            assert 'known_project_ids' not in kwargs or (
+                kwargs['known_project_ids'] is None
+            ), f'the legacy fallback must scan PERMISSIVELY; got {kwargs!r}'
+
+    @pytest.mark.asyncio
+    async def test_omitting_the_keyword_is_the_same_as_None(self, service):
+        """The default is the legacy path, so every existing caller — and every
+        test in `TestTheAmbiguousScanBoundaryRow` — keeps its behaviour."""
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+    @pytest.mark.asyncio
+    async def test_an_empty_tuple_is_not_None_and_suppresses_the_fallback(
+        self, service, monkeypatch,
+    ):
+        """ARM 3, and the assertion that stops a later reader "simplifying" the
+        sentinel into a falsy check.
+
+        `()` means "the producer told us: nothing was ambiguous" and must be
+        BELIEVED. Same contested content as the fallback test above, which would
+        veto — but the producer's answer wins, the finding stays resolvable, and
+        the body is never scanned. Under a truthiness test this test is the one
+        that goes red.
+        """
+        calls = _scan_spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            self._landed_on('3127'), group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=_CONTESTED_CONTENT,
+            referent_source='derived',
+            ambiguous=(),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='3200')
+        assert 'AMBIGUOUS' not in finding.reason
+        assert _CONTESTED_CONTENT not in [text for text, _ in calls]
 
 
 def _rows(*uuids) -> list[dict]:
@@ -2273,6 +2500,98 @@ class TestPerEdgeFactScanIsLazy:
             Referent(number='3075'), True, '')
 
 
+    @pytest.mark.asyncio
+    async def test_the_edge_fact_scan_stays_permissive_under_a_live_registry(
+        self, service, monkeypatch,
+    ):
+        """PERMISSIVE ON PURPOSE, and now a DELIBERATE ASYMMETRY.
+
+        The producer narrows with `self._known_projects` (task 5262 workstream
+        B); this scan must not. It asks a different question — "does this edge's
+        fact NAME the node the edge landed on" — and a fact that genuinely
+        cites an out-of-registry foreign task is evidence about this edge
+        whether or not the factory knows that project. Narrowing it would drop
+        that citation and turn a true negative into a false pairing finding.
+        """
+        calls = _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                         source='n-3128', target='n-3129')],
+            nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                   MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+
+        assert [text for text, _kwargs in calls] == ['Task 3128 supersedes Task 3129']
+        assert all('known_project_ids' not in kwargs for _text, kwargs in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_citation_outside_the_registry_still_counts_as_evidence(
+        self, service, monkeypatch,
+    ):
+        """The behavioural half of the assertion above: the fact cites a task
+        in a project the registry has never heard of, and that citation must
+        still reach the pairing rules. Under a narrowed scan it would vanish
+        and the endpoint would be reported as mis-paired."""
+        _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+        result = _episode(
+            edges=[_edge('e1', fact='mirrors unknown_proj:3129',
+                         source='n-3129', target='n-mirror')],
+            nodes=[MockNode(name='unknown_proj:3129', uuid='n-3129'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+        narrowed_registry = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+        service.set_known_projects({})
+        permissive_registry = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            ambiguous=(),
+        )
+        assert narrowed_registry.findings == permissive_registry.findings
+
+    @pytest.mark.asyncio
+    async def test_permissiveness_and_deferral_hold_together(
+        self, service, monkeypatch,
+    ):
+        """Both properties of this site at once, so neither can be satisfied by
+        breaking the other: with a POPULATED registry the endpointless edge is
+        still never scanned (deferral) and the two-task-endpoint edge is still
+        scanned exactly once, permissively (asymmetry)."""
+        calls = _scan_spy(monkeypatch)
+        service.set_known_projects({'dark_factory': '/src/dark-factory'})
+
+        await service._verify_episode_referents(
+            _episode(
+                edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                             source='n-x', target='n-y')],
+                nodes=[MockNode(name='deploy pipeline', uuid='n-x'),
+                       MockNode(name='merge lane', uuid='n-y')],
+            ),
+            group_id='dark_factory', referents=(Referent(number='3127'),), ambiguous=(),
+        )
+        assert calls == []
+
+        await service._verify_episode_referents(
+            _episode(
+                edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                             source='n-3128', target='n-3129')],
+                nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                       MockNode(name='Task 3129', uuid='n-3129')],
+            ),
+            group_id='dark_factory', referents=(Referent(number='3127'),), ambiguous=(),
+        )
+        assert [text for text, _kwargs in calls] == ['Task 3128 supersedes Task 3129']
+        assert calls[0][1].get('known_project_ids') is None
+
 def _corroborated_membership_episode() -> MockAddEpisodeResult:
     """esc-3671-3's reachable shape, verbatim from `_candidate_pool`'s docstring.
 
@@ -2492,7 +2811,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         edge, which is the entire reason it is derived from `cited` rather than
         stored beside it.
         """
-        from fused_memory.services.memory_service import _candidate_pool
+        from fused_memory.utils.referent_verification import _candidate_pool
 
         stats = await service._verify_episode_referents(
             _corroborated_membership_episode(), group_id='dark_factory',
@@ -2801,7 +3120,7 @@ def _warn_cap() -> int:
     locally, the idiom this file already uses for module-private symbols
     (`_candidate_targets`).
     """
-    from fused_memory.services.memory_service import _REFERENT_FINDING_WARN_CAP
+    from fused_memory.utils.referent_verification import _REFERENT_FINDING_WARN_CAP
 
     return _REFERENT_FINDING_WARN_CAP
 

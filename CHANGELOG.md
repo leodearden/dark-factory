@@ -226,6 +226,73 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### The referent write path is finished: registry wiring, `.ambiguous` on the wire, and a pure verification layer (task 5262)
+
+**The wire blob gained a third key, `'ambiguous'`, and `_decode_referents` now returns
+three values.** Strictly additive, exactly as adding `'referents'` was: no
+`payload_version`, no unknown-operation guard, no migration. An old consumer draining a
+new row ignores one more unknown key; a new consumer draining an old two-key row finds
+`'ambiguous'` absent, which decodes to `None` — the load-bearing sentinel meaning "the
+producer did not tell us", distinct from `()` meaning "the producer told us: nothing was
+ambiguous". `.conflicts` remains dropped, and that is a decision rather than an omission:
+a conflict is a property of what the CALLER declared versus what the prose says, and the
+verifier asks a different question. All-or-nothing degradation extends to the new key —
+any unreadable element in either list degrades the whole blob, never a good `refs` beside
+a dropped `ambiguous`.
+
+**The verifier now reads the producer's ambiguity set OFF THE WIRE instead of re-deriving
+it.** That re-derivation was a SECOND SCAN SITE — the INV-5 lockstep duplication
+`canonical_labels` exists to prevent — and it was sound only while both scans were
+parameterized identically. Producer narrowing (below) ends that: the producer scans at
+ENQUEUE, the verifier runs at DEQUEUE on the far side of a durable SQLite queue, and a
+restart with a changed `DASHBOARD_KNOWN_PROJECT_ROOTS` between them would desynchronize
+the two sets silently — handing an AMBIGUOUS endpoint to the repair path as an
+instruction, which is destructive edge surgery onto the wrong node. Threading the RESULT
+rather than the INPUT makes the two sets incapable of disagreeing at all, which is
+strictly stronger than narrowing both in lockstep. The fallback re-derivation survives for
+legacy rows only, and is PERMISSIVE on purpose: a payload with no `'ambiguous'` key was
+enqueued by pre-change code whose producer scanned permissively, so only a permissive
+re-derivation reproduces it.
+
+**`resolve_referents` gained `known_project_ids`, wired from
+`MemoryService._known_projects` at all three producer call sites** (`add_episode`,
+`add_memory`, `replay_from_store`), so junk qualifiers — `localhost:6379`, `INFO:1234`,
+`redis:6379` — no longer mint referents. Measured over 3,229 real episode bodies (task
+5262's corpus study): 91.14% unchanged, 6.81% narrowed, and the 2.01% that narrowing
+would have PROMOTED are now held back, with all 26 genuine in-registry foreign refs
+preserved. That last 2.01% is why narrowing is now STRICTLY SUBTRACTIVE in `scan_content`:
+the allowlist `continue` fired inside the qualified-ref loop, so a dropped junk qualifier
+never reached the candidate set and the ambiguity contest it created vanished with it —
+promoting the bare number it had been suppressing out of `.ambiguous` and into `.refs`.
+The contest is now decided against the PERMISSIVE candidate set while the emitted refs
+stay narrowed, so the dropped candidate leaves the output entirely and only its contest
+survives. Narrowing can therefore only ever remove a referent, never add one — an episode
+that produces no referent set today, which every consumer no-ops on, can no longer become
+one a repair path acts on. `set_known_projects` now logs one structured INFO line naming
+the project count and whether narrowing is consequently `active` or `permissive`; the
+permissive arm is logged too, because `MemoryService` is constructed before
+`build_known_projects_map` runs and that window is otherwise invisible.
+
+**The per-edge cited-fact scan stays PERMISSIVE — now a deliberate asymmetry rather than a
+shared default.** It asks whether an edge's FACT names the node the edge landed on, and a
+citation is evidence whether or not the factory knows that project; narrowing it would
+drop the citation and turn a true negative into a false pairing finding. The
+`server/entities_gate.py` call also stays permissive: the gate holds no registry, and it
+rejects on CONFLICT and never on absence, so narrowing there could only subtract
+rejections it currently makes.
+
+**The pure verification policy/record layer moved to `utils/referent_verification.py` with
+zero behaviour change** — `REFERENT_CHECKS`, `REFERENT_FINDING_AXES`, `ReferentFinding`,
+`ReferentStats`, `_candidate_pool`, `_candidate_targets` and their siblings, re-imported by
+`memory_service` so the check vocabulary `MemoryService.__init__` seeds its counters from
+still lives at exactly one site. `_verify_episode_referents` — the behaviour — deliberately
+stays in `memory_service.py`.
+
+**Workstream D of this task required no work.** Deferring the per-edge fact scan until an
+endpoint parses as a task label had already landed as commit `d266471409` under task
+4506's A3 — the two were separate filings of the same esc-3671-1 suggestion. Noted so a
+reader diffing the task description against the change set does not read it as an omission.
+
 #### Both of `merge_gates.py`'s `--no-renames` diff gates are now rename-aware (task 5342)
 
 **Behaviour change, two sites plus a message.** Both gates built a path-string set

@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_helpers import MockNode, poll_until
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -87,6 +87,7 @@ class TestReferentWireCodec:
                 Referent(number='3127'),
                 Referent(number='2500', project_id='reify'),
             ),
+            ambiguous=(Referent(number='6379', project_id='reify'),),
         ))
 
         assert blob == {
@@ -94,6 +95,9 @@ class TestReferentWireCodec:
             'refs': [
                 {'kind': 'task', 'project_id': '', 'number': '3127'},
                 {'kind': 'task', 'project_id': 'reify', 'number': '2500'},
+            ],
+            'ambiguous': [
+                {'kind': 'task', 'project_id': 'reify', 'number': '6379'},
             ],
         }
 
@@ -112,25 +116,33 @@ class TestReferentWireCodec:
         from fused_memory.services.memory_service import _encode_referents
 
         assert _encode_referents(ReferentResolution(source='none')) == {
-            'source': 'none', 'refs': [],
+            'source': 'none', 'refs': [], 'ambiguous': [],
         }
 
-    def test_ambiguity_is_deliberately_not_threaded(self):
-        """`.ambiguous` and `.conflicts` are DROPPED on the wire — a decision,
-        not an oversight, so it gets a named test rather than only a docstring.
+    def test_ambiguity_is_threaded(self):
+        """`.ambiguous` RIDES the wire; `.conflicts` still does not.
 
-        Gamma excludes ambiguous referents from `.referents` on purpose
-        ("recorded, not guessed"), so a consumer reading only `refs` sees an
-        ambiguous endpoint as a plain non-member — indistinguishable from a
-        genuine conflation. Leaf zeta must NOT treat non-membership alone as
-        grounds for leaf eta to repoint the edge; it re-derives ambiguity from
-        `payload['content']`/`payload['group_id']`, which reproduce the
-        producer's set exactly because `.ambiguous` is `scan_content(...)`
-        verbatim on every precedence path.
+        This is task 3670's `test_ambiguity_is_deliberately_not_threaded`,
+        rewritten rather than repaired — it was written to go red exactly here,
+        routing this author through `_encode_referents`' docstring instead of
+        past it.
 
-        When the follow-up that carries `'ambiguous'` as a third key lands, this
-        test is the thing that fails — which is the point: it routes that author
-        through `_encode_referents`' docstring instead of past it.
+        WHY IT CHANGED. Gamma excludes ambiguous referents from `.referents` on
+        purpose ("recorded, not guessed"), so a consumer reading only `refs`
+        sees an ambiguous endpoint as a plain non-member — indistinguishable
+        from a genuine conflation, which leaf eta would repair by destructively
+        repointing the edge. Zeta used to recover the set by RE-DERIVING it from
+        `payload['content']`/`payload['group_id']`; that is a second scan site,
+        the INV-5 lockstep duplication canonical_labels exists to prevent, and
+        it desynchronizes the moment the producer scans with a project registry
+        the consumer no longer has. Threading the producer's actual set makes
+        the two INCAPABLE of disagreeing.
+
+        `.conflicts` STAYS DROPPED, and that is not an oversight either: a
+        conflict is a property of what the CALLER DECLARED versus what the prose
+        says — it is reported to the caller at resolution time and has no
+        consumer downstream of the queue. Zeta asks "did this edge land on
+        something the write was about"; a conflict answers a different question.
         """
         from fused_memory.services.memory_service import _encode_referents
 
@@ -141,8 +153,12 @@ class TestReferentWireCodec:
             conflicts=(Referent(number='42'),),
         ))
 
-        assert set(blob) == {'source', 'refs'}
+        assert set(blob) == {'source', 'refs', 'ambiguous'}
         assert blob['refs'] == [{'kind': 'task', 'project_id': '', 'number': '3127'}]
+        assert blob['ambiguous'] == [
+            {'kind': 'task', 'project_id': '', 'number': '9'},
+        ]
+        assert 'conflicts' not in blob
 
     def test_decode_rebuilds_the_exact_referent_tuple(self):
         from fused_memory.services.memory_service import (
@@ -156,12 +172,17 @@ class TestReferentWireCodec:
                 Referent(number='3127'),
                 Referent(number='2500', project_id='reify'),
             ),
+            ambiguous=(
+                Referent(number='6379'),
+                Referent(number='4242', project_id='reify'),
+            ),
         )
         payload = {'referents': _encode_referents(resolution)}
 
         assert _decode_referents(payload) == (
             (Referent(number='3127'), Referent(number='2500', project_id='reify')),
             'derived',
+            (Referent(number='6379'), Referent(number='4242', project_id='reify')),
         )
 
     def test_digits_survive_verbatim(self):
@@ -177,10 +198,11 @@ class TestReferentWireCodec:
         ))
         assert blob['refs'][0]['number'] == '0132'
 
-        referents, source = _decode_referents({'referents': blob})
+        referents, source, ambiguous = _decode_referents({'referents': blob})
         assert referents == (Referent(number='0132'),)
         assert referents[0].number == '0132'
         assert source == 'declared'
+        assert ambiguous == ()
 
     def test_decode_pops_the_key(self):
         """Matches how `_execute_graphiti_write` already treats
@@ -272,6 +294,64 @@ _UNREADABLE_PAYLOADS = [
         ]}},
         id='partially-malformed-set',
     ),
+    # The `'ambiguous'` key is decoded through the SAME validation as `refs`,
+    # so every shape above has a twin here. All-or-nothing spans BOTH lists:
+    # a good `refs` beside an unreadable `ambiguous` is the half-decoded blob
+    # `_decode_referents`' docstring argues is worse than no blob at all —
+    # zeta would then read a genuinely ambiguous endpoint as a conflation and
+    # eta would repoint the edge, which is precisely what threading the key
+    # exists to prevent.
+    pytest.param(
+        {'referents': {
+            'source': 'derived', 'refs': [], 'ambiguous': 'not-a-list',
+        }},
+        id='ambiguous-not-a-list',
+    ),
+    # JSON `null` is the one non-list shape that could pass for the LEGACY
+    # blob, because a plain `.get('ambiguous')` answers `None` for both. It
+    # must not: this row's `refs` came from a NARROWED producer, so answering
+    # it with the legacy permissive re-derivation would hand zeta an ambiguity
+    # set the producer never computed — quietly, with readable refs attached.
+    pytest.param(
+        {'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': None,
+        }},
+        id='ambiguous-explicit-null',
+    ),
+    pytest.param(
+        {'referents': {
+            'source': 'derived', 'refs': [], 'ambiguous': ['6379'],
+        }},
+        id='ambiguous-entry-not-a-dict',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'task', 'number': 6379},
+        ]}},
+        id='ambiguous-int-number',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'task', 'number': '6379', 'project_id': 7},
+        ]}},
+        id='ambiguous-int-project-id',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
+            {'kind': 'unregistered_kind', 'number': '6379'},
+        ]}},
+        id='ambiguous-unregistered-kind',
+    ),
+    pytest.param(
+        {'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
+        }},
+        id='good-refs-beside-a-malformed-ambiguous',
+    ),
 ]
 
 
@@ -297,7 +377,7 @@ class TestReferentWireCodecDegradation:
     def test_unreadable_blob_degrades_to_the_empty_set(self, payload):
         from fused_memory.services.memory_service import _decode_referents
 
-        assert _decode_referents(dict(payload)) == ((), 'none')
+        assert _decode_referents(dict(payload)) == ((), 'none', None)
 
     @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
     def test_key_is_popped_in_every_case(self, payload):
@@ -337,12 +417,105 @@ class TestReferentWireCodecDegradation:
 
         assert not caplog.records
 
+    def test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None(self):
+        """A row written before `'ambiguous'` was threaded: `refs` decode
+        normally, and the third value is `None` — NOT `()`.
+
+        `None` is the load-bearing sentinel and the two are NOT
+        interchangeable. `None` means "the producer did not tell us", which is
+        the only state in which a consumer may re-derive the set; `()` means
+        "the producer told us: nothing was ambiguous", which it must believe.
+        Collapsing the distinction to a truthiness test would make an honest
+        empty answer trigger a spurious re-scan — reopening the producer /
+        consumer drift that threading the key closes, and doing it silently.
+        """
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source, ambiguous = _decode_referents({'referents': {
+            'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
+        }})
+
+        assert referents == (Referent(number='3127'),)
+        assert source == 'derived'
+        assert ambiguous is None
+
+    def test_a_legacy_two_key_blob_does_not_warn(self, caplog):
+        """The same argument as the absent key one register down: a two-key
+        blob is every row enqueued before this change, not an anomaly. It is
+        READABLE — its refs are used — so warning would be both wrong and
+        loud."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            _decode_referents({'referents': {
+                'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
+            }})
+
+        assert not caplog.records
+
+    def test_an_explicitly_empty_ambiguous_is_not_None(self):
+        """The other side of the sentinel: a post-change producer that found
+        nothing ambiguous sends `[]`, and that must decode to `()`."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        _, _, ambiguous = _decode_referents({'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [],
+        }})
+
+        assert ambiguous == ()
+        assert ambiguous is not None
+
+    def test_an_explicitly_null_ambiguous_is_not_the_legacy_blob(self, caplog):
+        """The third state, named separately because it is the one that LOOKS
+        like the first.
+
+        `test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None` above
+        shows the absent key keeping its refs and answering `None` in silence.
+        A key present as JSON `null` decodes to `None` through a plain
+        `.get(...)` too, so without the `_ABSENT` sentinel it would take that
+        same arm — a corrupt row wearing the back-compat path's clothes,
+        handing the consumer a permissive re-derivation over refs a NARROWED
+        producer wrote, with nothing in the log to say so. It is a malformed
+        field, so it warns and takes the refs down with it like every other.
+        """
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            decoded = _decode_referents({'referents': {
+                'source': 'derived',
+                'refs': [{'kind': 'task', 'number': '3127'}],
+                'ambiguous': None,
+            }})
+
+        assert decoded == ((), 'none', None)
+        assert caplog.records
+
+    def test_a_malformed_ambiguous_takes_the_good_refs_down_with_it(self):
+        """Named separately from the parametrized sweep for the same reason
+        `test_the_one_salvageable_referent_does_not_escape` is: all-or-nothing
+        spans BOTH lists, and a readable `refs` beside an unreadable
+        `ambiguous` is the exact half-decode that would let zeta read an
+        ambiguous endpoint as a conflation."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source, ambiguous = _decode_referents({'referents': {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'number': '3127'}],
+            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
+        }})
+
+        assert referents == ()
+        assert source == 'none'
+        assert ambiguous is None
+
     def test_the_one_salvageable_referent_does_not_escape(self):
         """Named separately from the parametrized sweep because it is the whole
         reason the decode is all-or-nothing."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, source = _decode_referents({'referents': {
+        referents, source, ambiguous = _decode_referents({'referents': {
             'source': 'derived',
             'refs': [
                 {'kind': 'task', 'number': '3127'},
@@ -352,6 +525,7 @@ class TestReferentWireCodecDegradation:
 
         assert referents == ()
         assert source == 'none'
+        assert ambiguous is None
         assert Referent(number='3127') not in referents
 
     @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
@@ -363,7 +537,7 @@ class TestReferentWireCodecDegradation:
         degrade-rather-than-raise design exists to prevent."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, _ = _decode_referents(dict(payload))
+        referents, _, _ = _decode_referents(dict(payload))
 
         assert set(referents) == set()
 
@@ -373,12 +547,13 @@ class TestReferentWireCodecDegradation:
         would produce is indistinguishable from a correctly-encoded row."""
         from fused_memory.services.memory_service import _decode_referents
 
-        referents, source = _decode_referents({'referents': {
+        referents, source, ambiguous = _decode_referents({'referents': {
             'source': 'derived', 'refs': [{'kind': 'task', 'number': 3127}],
         }})
 
         assert referents == ()
         assert source == 'none'
+        assert ambiguous is None
 
 
 class TestAddMemoryStampsReferents:
@@ -400,6 +575,7 @@ class TestAddMemoryStampsReferents:
         assert payload['referents'] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -418,6 +594,7 @@ class TestAddMemoryStampsReferents:
         assert payload['referents'] == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -431,7 +608,7 @@ class TestAddMemoryStampsReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_mem0_only_write_never_enqueues_at_all(self, service):
@@ -502,6 +679,7 @@ class TestAddMemoryStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -522,11 +700,12 @@ class TestAddMemoryStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
     async def test_the_empty_declaration_is_distinct_from_none(self, service):
-        """`{'source': 'declared', 'refs': []}` vs `{'source': 'none', ...}` IS
+        """`{'source': 'declared', 'refs': [], 'ambiguous': []}` vs `{'source': 'none', ...}` IS
         the "considered referents and none applied" vs "never looked" signal
         leaf iota counts. Collapsing [] onto None anywhere on this path would
         erase it silently."""
@@ -538,7 +717,7 @@ class TestAddMemoryStampsDeclaredReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': []}
+        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -567,6 +746,7 @@ class TestAddMemoryStampsDeclaredReferents:
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
+                'ambiguous': [],
             }, f'{extra!r}: {payload["referents"]!r}'
 
         service.durable_queue.enqueue.reset_mock()
@@ -577,7 +757,7 @@ class TestAddMemoryStampsDeclaredReferents:
             **kwargs,
         )
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_declared_digits_are_verbatim(self, service):
@@ -698,6 +878,7 @@ class TestADeclarationIsScopedToTheGraphitiLeg:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
 
@@ -717,6 +898,7 @@ class TestAddEpisodeStampsReferents:
         assert payload['referents'] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -726,7 +908,7 @@ class TestAddEpisodeStampsReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': []}
+        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_never_reaches_the_metadata_source(self, service):
@@ -820,6 +1002,7 @@ class TestAddEpisodeStampsDeclaredReferents:
         assert payload['referents'] == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -834,7 +1017,7 @@ class TestAddEpisodeStampsDeclaredReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': []}
+        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -858,6 +1041,7 @@ class TestAddEpisodeStampsDeclaredReferents:
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
+                'ambiguous': [],
             }, f'{content!r}: {payload["referents"]!r}'
 
     @pytest.mark.asyncio
@@ -945,12 +1129,12 @@ class TestAddEpisodeStampsDeclaredReferents:
         assert json.loads(json.dumps(payload['referents'])) == payload['referents']
 
 
-def _encoded(source, *referents):
+def _encoded(source, *referents, ambiguous=()):
     from fused_memory.services.memory_service import _encode_referents
 
-    return _encode_referents(
-        ReferentResolution(source=source, referents=tuple(referents)),
-    )
+    return _encode_referents(ReferentResolution(
+        source=source, referents=tuple(referents), ambiguous=tuple(ambiguous),
+    ))
 
 
 #: The exact kwargs `_execute_graphiti_write` hands the backend today, for
@@ -1267,12 +1451,14 @@ class TestReplayFromStoreStampsReferents:
         assert blobs[0] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
         assert blobs[1] == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '2500'}],
+            'ambiguous': [],
         }
-        assert blobs[2] == {'source': 'none', 'refs': []}
+        assert blobs[2] == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_the_metadata_bridge_is_live_on_this_producer(self, service):
@@ -1289,6 +1475,7 @@ class TestReplayFromStoreStampsReferents:
         assert blob == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1406,6 +1593,57 @@ class TestReferentsSurviveTheRealQueue:
         assert stats['counts'].get('completed') == 1
 
     @pytest.mark.asyncio
+    async def test_a_flagged_ambiguity_still_vetoes_the_repair_after_the_round_trip(
+        self, real_queue, service,
+    ):
+        """The whole chain in ONE assertion: producer -> JSON -> SQLite ->
+        decode -> executor -> the real reconcile -> zeta's VETO 1.
+
+        Everything else in this file pins one hop, and every OTHER executor-seam
+        assertion uses `()` or `None` — the values that make the veto a no-op.
+        So a defect at ANY hop that lost the set (a dropped key, a fresh empty
+        local, a kwarg not forwarded) would leave those green while re-opening
+        the exact failure the wire key closes: with the set gone, `Task 6379` is
+        simply a non-member of the declared set, `_candidate_pool` falls back to
+        that set, and the finding arrives at eta RESOLVABLE — a repair
+        instruction to repoint the edge onto `Task 3127`.
+
+        `unresolvable` is the observable because the counter increments exactly
+        when `not finding.resolvable`. `set-membership` is asserted beside it so
+        a chain that produced NO finding at all (a silently failed sub-pass)
+        cannot pass by leaving both at zero.
+        """
+        from test_referent_verification import _edge, _episode
+
+        service.graphiti.add_episode = AsyncMock(return_value=_episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-end', target='n-mirror')],
+            nodes=[MockNode(name='Task 6379', uuid='n-end'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        ))
+
+        await real_queue.enqueue(
+            group_id='dark_factory',
+            operation='add_episode',
+            payload=_graphiti_payload(
+                group_id='dark_factory',
+                referents=_encoded(
+                    'derived', Referent(number='3127'),
+                    ambiguous=(Referent(number='6379'),),
+                ),
+            ),
+        )
+
+        await poll_until(
+            lambda: service.referent_finding_counts()['set-membership'] == 1,
+            message='the chain produced no set-membership finding at all',
+        )
+        assert service.referent_finding_counts()['unresolvable'] == 1, (
+            'the finding came out RESOLVABLE, so the producer ambiguity set was '
+            'lost somewhere between enqueue and zeta'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_callback_still_sees_the_key_the_executor_popped(
         self, real_queue, service,
     ):
@@ -1477,6 +1715,35 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
 
     @pytest.mark.asyncio
+    async def test_a_populated_ambiguity_set_reaches_it_intact(self, service):
+        """The one value that makes zeta's VETO 1 actually FIRE.
+
+        Every other assertion at this seam is `()` or `None` — the two values
+        that make the veto a no-op — so a plumbing defect substituting a fresh
+        empty local for the decoded set would leave all of them green. The unit
+        halves are covered on either side (`_decode_referents` returns the set;
+        `test_referent_verification.py::TestTheWireAmbiguitySetIsPreferred`
+        drives the verifier with a populated one); this is the hop between them,
+        and dropping it hands eta an AMBIGUOUS endpoint as a destructive repair
+        instruction — the failure threading the key exists to close.
+        """
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded(
+                'derived', Referent(number='3127'),
+                ambiguous=(Referent(number='6379'),),
+            )),
+        )
+
+        kwargs = service._reconcile_episode_identity.call_args[1]
+        assert kwargs['ambiguous'] == (Referent(number='6379'),)
+        # Asserted together: the two lists are decoded by one helper, so a
+        # defect that crossed them would otherwise read as a pass here.
+        assert kwargs['referents'] == (Referent(number='3127'),)
+
+    @pytest.mark.asyncio
     async def test_the_backend_kwargs_are_still_untouched(self, service):
         """zeta reads the set AFTER the write; the backend never sees it."""
         service._reconcile_episode_identity = AsyncMock(return_value={})
@@ -1498,14 +1765,17 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         lock = service.graphiti._identity_lock_for('test')
         observed = {}
 
-        async def _probe(result, *, group_id, referents, content, referent_source):
+        async def _probe(result, *, group_id, referents, content, referent_source,
+                         ambiguous):
             observed['locked'] = lock.locked()
             observed['same_lock'] = service.graphiti._identity_lock_for(group_id) is lock
             observed['referents'] = referents
-            # zeta re-derives the producer's ambiguity set from the FULL episode
-            # body, and reads the source to decide whether the whole-declared-set
-            # fallback is licensed -- both must reach it through this same locked
-            # call, not a second unlocked one.
+            # zeta reads the producer's ambiguity set off the wire, falls back to
+            # the FULL episode body for a legacy row, and reads the source to
+            # decide whether the whole-declared-set fallback is licensed -- all
+            # three must reach it through this same locked call, not a second
+            # unlocked one.
+            observed['ambiguous'] = ambiguous
             observed['content'] = content
             observed['referent_source'] = referent_source
             return {}
@@ -1520,8 +1790,12 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         assert observed['locked'] is True
         assert observed['same_lock'] is True
         assert observed['referents'] == (Referent(number='3127'),)
+        # `_encoded` builds a post-task-5262 blob, so the producer DID tell us
+        # — an empty set, not the `None` of a legacy row.
+        assert observed['ambiguous'] == ()
         # The FULL body, not the 200-char journal excerpt: a truncated content
-        # would silently lose the second half of an ambiguity pair.
+        # would silently lose the second half of an ambiguity pair on the
+        # legacy-row fallback.
         assert observed['content'] == 'test content'
         assert observed['referent_source'] == 'derived'
         assert lock.locked() is False, 'the lock must be released on return'
@@ -1586,6 +1860,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1630,6 +1905,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1656,6 +1932,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
@@ -1686,6 +1963,7 @@ class TestDeclaredReferentsEndToEnd:
         assert self._referents(service) == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+            'ambiguous': [],
         }
 
     @pytest.mark.asyncio
