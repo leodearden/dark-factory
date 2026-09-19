@@ -1,7 +1,10 @@
-"""Unit tests for fused_memory.utils.task_naming.canonicalize_task_node_name.
+"""Unit tests for fused_memory.utils.task_naming.
 
-canonicalize_task_node_name is a pure, dependency-free helper used by the
-post-add_episode node-name-normalization hook (MemoryService.
+The module answers one question — "which task-node family does this name belong
+to?" — in two views over ONE acceptance rule: ``canonicalize_task_node_name``
+returns the family's canonical NAME and ``task_node_referent`` returns its
+structured ``Referent`` identity. Both are pure and dependency-free, and are
+used by the post-add_episode node-name-normalization hook (MemoryService.
 _normalize_task_node_names, task 2110) to detect and correct non-canonical
 task-entity node names (e.g. 'task 132', 'tasks 153') minted by graphiti-core's
 LLM entity extraction, without ever touching legitimate non-task-node names.
@@ -13,12 +16,47 @@ import re
 import pytest
 
 from fused_memory.utils import task_naming
-from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.canonical_labels import Referent, parse_node_name
+from fused_memory.utils.task_naming import (
+    canonicalize_task_node_name,
+    task_node_referent,
+)
 
 # A Unicode decimal digit that ``str.isdigit()`` accepts but ``str.isascii()``
 # does not — spelled by ESCAPE so the fixture survives transport and a reader
 # sees the codepoint rather than a glyph that renders like an ASCII '3'.
 ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
+
+#: Every name the two views are asserted to agree on \u2014 matches and non-matches
+#: in one table, because the equivalence has to hold in BOTH directions. Shared
+#: by TestTaskNodeReferent's agreement test, which is what pins
+#: canonicalize_task_node_name and task_node_referent to a SINGLE acceptance
+#: rule: an edit that loosens or tightens either one alone fails here.
+TWO_VIEW_AGREEMENT_NAMES = [
+    'task 132',
+    'tasks 153',
+    'TASK 42',
+    'Task  7',
+    ' tasks 9 ',
+    'task #1153',
+    'task#1153',
+    'TASK # 1153',
+    'Task: 132',
+    'Task 42',
+    'task 0132',
+    'Alice',
+    '',
+    'task',
+    'subtask 5',
+    'multitask 3',
+    'taskforce 9',
+    'Task 42 orchestrator',
+    'reify task 12',
+    'task132',
+    'reify:132',
+    'Task ' + ARABIC_INDIC_THREE,
+    'Task 12' + ARABIC_INDIC_THREE,
+]
 
 
 class TestCanonicalizeTaskNodeNameMatches:
@@ -128,6 +166,107 @@ class TestCanonicalizeTaskNodeNameVariantSpellings:
         assert once == 'Task 1153'
         assert once is not None  # narrows str | None -> str for the chained call
         assert canonicalize_task_node_name(once) == 'Task 1153'
+
+
+class TestTaskNodeReferent:
+    """``task_node_referent`` is the STRUCTURED view of the acceptance rule
+    ``canonicalize_task_node_name`` answers as a string.
+
+    It exists because the family-keyed normalizer needs BOTH halves of a task
+    label: the canonical NAME to rename onto, and the bare DIGITS to probe the
+    backend with (``find_entity_nodes_by_name_substring``). Recovering the
+    digits by splitting 'Task 605' back apart would be an ad-hoc parser over a
+    meaningful string; ``canonical_labels.Referent`` is already the frozen
+    structured carrier of exactly that pair, so returning it costs no new type
+    and cannot drift from the name it renders.
+    """
+
+    @pytest.mark.parametrize(
+        ('name', 'expected_number'),
+        [
+            ('task 132', '132'),
+            ('tasks 153', '153'),
+            ('TASK 42', '42'),
+            ('Task  7', '7'),
+            (' tasks 9 ', '9'),
+            ('task #1153', '1153'),
+            ('task#1153', '1153'),
+            ('TASK # 1153', '1153'),
+            ('Task: 132', '132'),
+            ('Task 42', '42'),  # idempotence: already-canonical still parses
+        ],
+    )
+    def test_returns_own_project_referent_carrying_number_and_canonical_name(
+        self, name, expected_number
+    ):
+        referent = task_node_referent(name)
+        assert referent == Referent(kind='task', number=expected_number)
+        assert referent is not None  # narrows Referent | None for the reads below
+        assert referent.number == expected_number
+        assert referent.node_name == f'Task {expected_number}'
+        assert referent.project_id == ''
+
+    def test_number_preserves_leading_zeros_verbatim(self):
+        """'0132' is a DIFFERENT family from '132' and must stay one.
+
+        The number is the substring the normalizer probes with, so
+        int-normalizing it here would both invent a task number and make two
+        distinct families share one key.
+        """
+        referent = task_node_referent('task 0132')
+        assert referent == Referent(kind='task', number='0132')
+        assert referent is not None  # narrows Referent | None for the reads below
+        assert referent.number == '0132'
+        assert referent.node_name == 'Task 0132'
+        assert referent != Referent(kind='task', number='132')
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            'Alice',
+            '',
+            'task',  # no number
+            'subtask 5',
+            'multitask 3',
+            'taskforce 9',
+            'Task 42 orchestrator',
+            'reify task 12',
+            'task132',  # the separator is required
+            'Task ' + ARABIC_INDIC_THREE,
+            'Task 12' + ARABIC_INDIC_THREE,
+        ],
+    )
+    def test_returns_none_for_every_non_task_node_name(self, name):
+        assert task_node_referent(name) is None
+
+    def test_project_qualified_name_is_never_a_local_family_key(self):
+        """The load-bearing refusal: 'reify:132' PARSES but is not our family.
+
+        ``parse_node_name`` resolves it to a foreign referent, and folding that
+        into the local 'Task 132' family would have the normalization hook
+        commit the very cross-project misattribution utils/cross_project_refs.py
+        exists to detect — so the rejection lives in this adapter, at the one
+        site both views read.
+        """
+        assert parse_node_name('reify:132') == Referent(
+            kind='task', project_id='reify', number='132'
+        )
+        assert task_node_referent('reify:132') is None
+
+    @pytest.mark.parametrize('name', TWO_VIEW_AGREEMENT_NAMES)
+    def test_the_two_views_agree_by_construction(self, name):
+        """One acceptance rule, two renderings — asserted, not asserted-about.
+
+        ``canonicalize_task_node_name`` is re-expressed over
+        ``task_node_referent``, so this can only fail if a future edit gives one
+        of them a rule of its own.
+        """
+        referent = task_node_referent(name)
+        canonical = canonicalize_task_node_name(name)
+        if referent is None:
+            assert canonical is None
+        else:
+            assert canonical == referent.node_name
 
 
 class TestNoSecondCopyOfTheLabelPattern:
