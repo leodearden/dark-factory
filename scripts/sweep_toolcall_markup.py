@@ -601,11 +601,19 @@ REASON_UNREPAIRABLE = 'unrepairable'
 #: behaviour has changed, not something to paper over.
 ACTION_DID_NOT_CONVERGE = 'did-not-converge'
 
-#: How many times the walk may repeat before giving up. Small on purpose: a
-#: recovered value can carry markup at most one level deep before B5 refuses
-#: the parse, so anything past two rounds already means repair() is behaving
-#: differently than measured. Four leaves headroom without turning a runaway
-#: into a hang.
+#: How many times the walk may repeat before giving up. Small on purpose, but
+#: NOT for the reason recorded here until task **5620**: "a recovered value can
+#: carry markup at most one level deep before B5 refuses the parse" was true
+#: when written and was falsified by task **4502**, which narrowed B5 so a
+#: recovered value may quote a closing tag and still parse. DEPTH IS NOT WHAT
+#: BOUNDS THIS.
+#:
+#: What justifies the small ceiling is the round count actually recorded for
+#: both live corpora: every document converges in one round, a second yielding
+#: zero repairs. So anything past two rounds still means repair() is behaving
+#: differently than measured — the conclusion is unchanged, only its grounds.
+#: Four leaves headroom, and the ceiling's real job is to turn a runaway into a
+#: LOUD :data:`ACTION_DID_NOT_CONVERGE` failure rather than a hang.
 _MAX_REPAIR_ROUNDS = 4
 
 #: Paired with :data:`ACTION_DID_NOT_CONVERGE`.
@@ -883,12 +891,26 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     Landing such a value in a hole and stopping would leave a repairable string
     behind and break the binding "a second run reports 0" invariant.
 
-    Measured today, the loop never runs twice: ``_parse_tail`` refuses outright
-    when a recovered item contains a further mis-close (B5), so on every shape
-    repair() accepts, one pass already converges and a second yields zero
-    repairs on both live corpora. The loop is therefore INSURANCE — it makes
-    the second-run-zero invariant STRUCTURAL rather than an empirical
-    observation that a future widening of repair() could quietly invalidate.
+    A SECOND ROUND IS REACHABLE IN PRINCIPLE, which is what makes this loop
+    LOAD-BEARING rather than merely structural. This paragraph used to read:
+    "Measured today, the loop never runs twice: ``_parse_tail`` refuses
+    outright when a recovered item contains a further mis-close (B5), so on
+    every shape repair() accepts, one pass already converges." That was true
+    when written, and task **4502** FALSIFIED ITS PREMISE by narrowing B5: a
+    recovered item may now contain a further closing tag and still parse,
+    because a faithful report of a markup leak quotes the leak and quoting is
+    no longer a refusal. Task **5620** widened the rule again — a well-formed
+    parameter OPENER in a recovered value now blocks — without restoring the
+    old premise: a quoted CLOSER still repairs, which is 4502's whole
+    carve-out. So the loop is no longer insurance against a hypothetical future
+    widening. The widening happened, and the loop is what keeps the binding "a
+    second run reports 0" invariant true across it.
+
+    What remains EMPIRICAL is narrower than the old sentence claimed: no
+    document in either live corpus has been OBSERVED to need a second round.
+    That is an observation about those corpora, not a guarantee from the
+    repairer, and it is inherited rather than re-measured here — ``data/`` is
+    gitignored, so a task worktree cannot see either live corpus.
 
     Exceeding the bound is reported LOUDLY as a
     :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still
@@ -901,9 +923,15 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     LOUDLY means all the way to the operator, not merely into this return
     value: :func:`run_sweep` counts it into ``Summary.did_not_converge``,
     :func:`main` prints it, and it forces :data:`EXIT_DID_NOT_CONVERGE`. The
-    outcome is unreachable with today's repair() (B5 refuses a nested parse),
-    which is precisely why the wiring has to exist BEFORE a future widening
-    makes it reachable — a tripwire connected to nothing is not a tripwire.
+    outcome has never been observed on either live corpus, which is precisely
+    why the wiring has to exist BEFORE something makes it reachable — a
+    tripwire connected to nothing is not a tripwire. This sentence used to
+    ground that on the repairer instead: "unreachable with today's repair() (B5
+    refuses a nested parse)". Task **4502** falsified the parenthetical and
+    task **5620** corrected it. The point it was making survives intact; what
+    changed is that unreachability was never a guarantee from B5 and is now an
+    empirical claim about the corpora alone, which is a far weaker thing to
+    rest a tripwire on.
     """  # noqa: D205
     # The two outcome classes accumulate DIFFERENTLY across rounds, because
     # they mean different things:
