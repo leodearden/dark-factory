@@ -560,6 +560,41 @@ _RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
     OSError,
 )
 
+_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (TimeoutError, httpx.TimeoutException)
+_CAUSE_CHAIN_LIMIT = 20
+
+
+def is_timeout_failure(exc: BaseException) -> bool:
+    """Was *exc* caused, at any depth, by something timing out?
+
+    Inverts the wrap performed a few hundred lines below: ``_raw_call``
+    retries ``httpx.TimeoutException`` along with the rest of
+    ``_RETRYABLE_EXCEPTIONS`` and, on exhaustion, re-raises a plain
+    ``RuntimeError(...) from last_exc``. That erases the timeout from the
+    exception's TYPE while preserving it as ``__cause__`` — so a caller
+    holding the raised error cannot tell a service that is alive and slow
+    from one that is unreachable by an ``isinstance`` check, only by
+    unwrapping. This is that unwrap, and it lives here, beside the wrap it
+    inverts, so the pairing has one home (SPOT) and callers such as
+    ``agents/briefing.py`` need know nothing of httpx's exception taxonomy.
+
+    ``asyncio.TimeoutError`` is an alias of the builtin from 3.11 on, so
+    naming ``TimeoutError`` covers both. The walk is bounded and
+    cycle-guarded: ``__cause__`` is writable, so a chain can be circular,
+    and a diagnostic predicate must never be the thing that hangs a caller.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(_CAUSE_CHAIN_LIMIT):
+        if current is None or id(current) in seen:
+            return False
+        if isinstance(current, _TIMEOUT_EXCEPTIONS):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
 MCP_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',

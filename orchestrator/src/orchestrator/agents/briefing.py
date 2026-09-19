@@ -18,7 +18,7 @@ from shared.briefing_queries import (
 
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -2052,12 +2052,19 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 {'name': 'search', 'arguments': arguments},
                 timeout=10,
             )
-        except TimeoutError as e:
-            logger.warning(f'Memory search timed out for {query!r}: {e}')
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_TIMEOUT)
         except Exception as e:
-            logger.warning(f'Memory search failed for {query!r}: {e}')
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_TRANSPORT)
+            # One handler, because the TYPE raised here says nothing: on retry
+            # exhaustion `mcp_call` re-raises a plain RuntimeError that keeps
+            # the original only as `__cause__`, so an `except TimeoutError`
+            # branch could never fire and every timeout was reported as a
+            # transport failure. `is_timeout_failure` does the unwrap, in the
+            # module that does the wrap.
+            failure = (
+                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
+                else MEMORY_FAILURE_TRANSPORT
+            )
+            logger.warning(f'Memory search failed for {query!r} ({failure}): {e}')
+            return MemoryQueryOutcome(failure=failure)
 
         reply = result.get('result') if isinstance(result, dict) else None
         if not isinstance(reply, dict):
