@@ -22,6 +22,7 @@ import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
 
@@ -1463,6 +1464,83 @@ class TestMemoryContextProvenanceCaveat:
 
 
 @pytest.mark.asyncio
+class TestFailureClassification:
+    """A slow memory service reads differently from an unreachable one.
+
+    Task 3659 (review fix 3). ``MEMORY_FAILURE_*`` promises that "a timeout
+    says the service is alive and slow, a transport failure says it is
+    unreachable" — but ``mcp_call`` re-raises a plain ``RuntimeError`` once
+    its retries exhaust, so the ``except TimeoutError`` branch that was meant
+    to honour that promise could never fire and every timeout was measured as
+    ``transport``. These tests patch ``mcp_call`` to raise exactly what it
+    really raises.
+    """
+
+    @staticmethod
+    def _exhausted(cause: Exception) -> RuntimeError:
+        """The wrap ``McpSession._raw_call`` raises on retry exhaustion.
+
+        Mirrors the production f-string so the test fails if that wrap stops
+        carrying its cause; the shape itself is pinned against the real
+        retry loop in ``test_mcp_retry.py::TestTimeoutCausePredicate``.
+        """
+        err = RuntimeError(
+            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}'
+        )
+        err.__cause__ = cause
+        return err
+
+    async def test_an_exhausted_timeout_is_classified_as_a_timeout(
+        self, briefing: BriefingAssembler,
+    ):
+        from orchestrator.agents.briefing import MEMORY_FAILURE_TIMEOUT
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._exhausted(httpx.ReadTimeout(''))),
+        ):
+            outcome = await briefing._mcp_search(
+                TASK_SEMANTIC, 'anything',
+                caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
+            )
+
+        assert outcome.failure == MEMORY_FAILURE_TIMEOUT
+
+    async def test_an_exhausted_connect_error_is_classified_as_transport(
+        self, briefing: BriefingAssembler,
+    ):
+        from orchestrator.agents.briefing import MEMORY_FAILURE_TRANSPORT
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._exhausted(httpx.ConnectError('refused'))),
+        ):
+            outcome = await briefing._mcp_search(
+                TASK_SEMANTIC, 'anything',
+                caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
+            )
+
+        assert outcome.failure == MEMORY_FAILURE_TRANSPORT
+
+    async def test_a_timeout_reaches_the_reader_as_a_timeout(
+        self, briefing: BriefingAssembler,
+    ):
+        """The reason class is what an operator actually sees in the block."""
+        from orchestrator.agents.briefing import MEMORY_FAILURE_TRANSPORT
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=self._exhausted(httpx.ReadTimeout(''))),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert 'timeout' in context
+        assert MEMORY_FAILURE_TRANSPORT not in context, (
+            'an alive-but-slow service must not be reported as unreachable'
+        )
+
+
+@pytest.mark.asyncio
 class TestScopedSearch:
     """Direct coverage of ``_scoped_search``, the seam between
     ``_mcp_search`` and ``_get_memory_context``.
@@ -1487,6 +1565,14 @@ class TestScopedSearch:
     async def test_a_failed_search_keeps_its_reason_class(
         self, briefing: BriefingAssembler,
     ):
+        """The filter layer passes a reason class through untouched.
+
+        NOT coverage of how a reason class is CHOSEN: ``_mcp_search`` is
+        patched to RETURN a canned outcome here, so no exception is ever
+        classified. What the classifier does with a real timeout is pinned by
+        ``TestFailureClassification`` below and by
+        ``test_mcp_retry.py::TestTimeoutCausePredicate``.
+        """
         failed = MemoryQueryOutcome(failure='timeout')
 
         with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=failed)):
