@@ -549,8 +549,9 @@ def _inner_closer_blocks(
 
     CONDITION (i)'S OPENER MIRROR — the one clause here that is not about a
     closer at all, and the reason this function's name is narrower than its
-    rule (task **5620**). A well-formed CANONICAL parameter OPENER anywhere in
-    the value blocks recovery outright, before any closer is examined. Task
+    rule (task **5620**). A well-formed parameter OPENER anywhere in the value
+    — EITHER dialect's, exactly as condition (i) lists either dialect's closer
+    — blocks recovery outright, before any closer is examined. Task
     **4502** fixed the CLOSER side of exactly this class — condition (i)'s
     separately-listed ``parameter`` entry, esc-4502-3 — but reasoned only about
     closers, and this function iterates over closers alone, so the opener side
@@ -571,6 +572,28 @@ def _inner_closer_blocks(
     carries a closing tag, because the depth-1 bound reads that remainder as
     "does not parse". With the probe unable to answer and the failure mode
     being a silent partial repair, refusing is the only safe direction.
+
+    BOTH DIALECTS ARE LISTED for the reason condition (i) already gives for the
+    canonical closer. :func:`_parse_body` tries :data:`_CANONICAL_OPENER_RE`
+    first and falls back to :data:`_ECHO_OPENER_RE`, so BOTH forms are shapes
+    it would have opened a sibling item on, and which dialect the ENCLOSING
+    item happens to use says nothing about which one a quoted sibling wears.
+    That is a property of the parser rather than of the opener — the same
+    reasoning that puts ``parameter`` in condition (i) independent of the
+    item's own dialect, and the same asymmetry esc-4502-3 was.
+
+    THE ECHO PATTERN IS DELIBERATELY BROAD: it matches any identifier-named
+    tag, so a recovered value quoting an ARBITRARY opening tag now refuses, not
+    only one naming a real parameter. Qualifying it on schema membership was
+    available and is rejected, because this function is not given the schema
+    and taking it would couple the boundary rule to the caller's tool. Measured
+    safe for the whole known population at ``1b9fedeb97`` — the 504-record
+    corpus replay, both ``esc-3514`` specimens and 4502's own positive control
+    stay green, the last because its quoted literal is a CLOSER rather than an
+    opener. It is also the conservative direction for a guard whose failure
+    mode is silently writing another parameter's text into this one: refusing
+    returns ``None`` and the caller keeps its value intact, while accepting
+    wrongly is unrecoverable.
 
     IT MUST NOT TOUCH ``considered``, whose final ``return considered == 0`` is
     the malformed-closer fallback (negative control (e)) and has to keep
@@ -605,7 +628,10 @@ def _inner_closer_blocks(
     substring behaviour restored, so it cannot recurse. Beyond the budget the
     answer is BLOCK, the conservative direction.
     """
-    if _CANONICAL_OPENER_RE.search(item_value) is not None:
+    if (
+        _CANONICAL_OPENER_RE.search(item_value) is not None
+        or _ECHO_OPENER_RE.search(item_value) is not None
+    ):
         return True  # (i)'s OPENER MIRROR: a sibling this parser would have opened
 
     considered = 0
