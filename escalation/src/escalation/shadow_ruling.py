@@ -479,9 +479,8 @@ class AgreementReport:
     ``resolver_tiers`` is NOT the tier breakdown of every in-window stamp its
     bare name suggests: it is tallied after the gated and self-resolved
     exclusions, so it covers only the subset that reached the resolver check.
-    Its non-human entries are a fifth way a sample is lost, and which class lost
-    it is on :attr:`ClassAgreement.non_human_resolver` — the tier says what took
-    the sample, the class row says who paid.
+    It is also aggregate — which class a non-human resolution took a sample from
+    is on :attr:`ClassAgreement.non_human_resolver`, which owns that reading.
     """
 
     since: datetime
@@ -576,20 +575,14 @@ def agreement_report(
     first. The non-human-resolver step tallies per class as well as per tier;
     :attr:`ClassAgreement.non_human_resolver` owns why.
 
-    THE WINDOW COMES BEFORE THE TWO EXCLUDED BUCKETS THAT CAN BE WINDOWED, so
-    that every number printed under the window header is a number from that
-    window. Counting them first made them lifetime totals rendered beside a
-    weekly denominator: on the real archive they grow monotonically forever, so
-    a weekly report would eventually show ``gated_stamps=140`` next to a
-    four-item comparable denominator — the inverse of the "a small sample and a
-    discarded one must not look alike" property the buckets exist to give.
-
-    Pendingness is decided FIRST because a pending record has no ``resolved_at``
-    to window on: it would otherwise be dropped by the window filter and vanish
-    from every bucket. That order also decides where a pending GATED or pending
-    UNREADABLE stamp lands — ``unresolved_lifetime``, not ``gated_stamps`` or
-    ``rejected_stamps`` — which is the honest reading: nothing has been ruled on
-    it yet, and an unwindowable record must not enter a windowed number.
+    TWO OF THOSE POSITIONS FOLLOW FROM THE FIELD SEMANTICS :class:`AgreementReport`
+    states, and this docstring does not restate them. Pendingness is decided
+    FIRST, so a record with no ``resolved_at`` to window on cannot be dropped by
+    the window filter and vanish from every bucket — which is also what puts a
+    pending GATED or pending UNREADABLE stamp in ``unresolved_lifetime`` rather
+    than in a windowed bucket. The window is applied BEFORE the three excluded
+    buckets that CAN be windowed, so every number printed under the window
+    header is a number from that window.
 
     ``self_resolved`` — ``triaged_by is not None and triaged_by ==
     resolved_by`` — is the bucket task 5361 made necessary.
@@ -743,9 +736,10 @@ def _as_table(report: AgreementReport) -> str:
     not let the two look alike.
 
     The excluded buckets sit on their own line under the window header, and the
-    one that is NOT from the window says so in its own name
+    one that is NOT from that window carries it in its own name
     (``unresolved_lifetime``) rather than relying on the reader to know which
-    numbers on that line share the header's window.
+    numbers on the line share the header — see :class:`AgreementReport` for why
+    that one cannot be windowed.
     """
     lines = [
         f'shadow ruling agreement — window {report.since.isoformat()} .. '
