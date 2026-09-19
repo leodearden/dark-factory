@@ -443,6 +443,23 @@ def survey_locks(
     )
 
 
+def _is_abandoned(finding: LockFinding, stale_after_seconds: float) -> bool:
+    """Does *finding* satisfy the removal conjunction?
+
+    THE single statement of "this lock may be cleared", so the removing path
+    and every path that merely REPORTS cannot drift into disagreeing about
+    which locks matter.  They did drift: the report-only preflight used to
+    describe an abandoned lock as merely retained, so a worktree the repairing
+    run would have fixed came back ``clean`` and a skill branching on that
+    verdict walked into the rc 128 the module exists to prevent.
+    """
+    return (
+        finding.holders_confirmed
+        and not finding.holder_pids
+        and finding.age_seconds > stale_after_seconds
+    )
+
+
 def sweep_stale_locks(
     *,
     git_dir: Path,
@@ -476,11 +493,7 @@ def sweep_stale_locks(
     retained: list[LockFinding] = []
 
     for finding in survey_locks(git_dir, now=now, proc_root=proc_root):
-        if (
-            finding.holder_pids
-            or not finding.holders_confirmed
-            or finding.age_seconds <= stale_after_seconds
-        ):
+        if not _is_abandoned(finding, stale_after_seconds):
             retained.append(finding)
             continue
         lock = finding.path
@@ -520,28 +533,26 @@ class PreflightResult:
     locks_retained: tuple[LockFinding, ...]
     resolved: bool = True
     merge_rr_unreadable: bool = False
+    lock_stale_after_seconds: float = DEFAULT_LOCK_STALE_AFTER_SECONDS
 
     @property
     def unrepaired(self) -> tuple[str, ...]:
         """Findings this run did NOT fix — the reason a caller must not proceed.
 
-        Three arms.  A lock with a live holder is a human's decision: something
-        is using it, and this module will not guess what.  A lock whose holders
-        could not be determined is the same decision with less evidence, and is
-        named rather than passed over in silence — an unscannable process table
-        is exactly when an operator most needs to be told why a lock survived.
-        A suspect MERGE_RR with no backup means the damage is still in place —
-        the ``report_only`` case, where leaving it is the whole point, and also
-        a quarantine that failed.
+        Two sources.  A retained lock is judged by
+        :func:`_retained_lock_reason`, against the same threshold that decided
+        the sweep — carried on :attr:`lock_stale_after_seconds` precisely so
+        the report-only path cannot answer a different question from the
+        repairing one.  A suspect MERGE_RR with no backup means the damage is
+        still in place — the ``report_only`` case, where leaving it is the
+        whole point, and also a quarantine that failed.
         """
         reasons = [
-            f'lock {finding.path} held by pids '
-            f'{", ".join(str(pid) for pid in finding.holder_pids)}'
-            if finding.holder_pids else
-            f'lock {finding.path} left in place — holders unknown, so finding '
-            f'none is not evidence there are none'
+            reason
             for finding in self.locks_retained
-            if finding.holder_pids or not finding.holders_confirmed
+            if (reason := _retained_lock_reason(
+                finding, self.lock_stale_after_seconds,
+            ))
         ]
         suspect = self.dangling or self.unparsable or self.merge_rr_unreadable
         if self.merge_rr_backup is None and suspect:
@@ -587,6 +598,40 @@ class PreflightResult:
             'locks_removed': [_lock_json(f) for f in self.locks_removed],
             'locks_retained': [_lock_json(f) for f in self.locks_retained],
         }
+
+
+def _retained_lock_reason(
+    finding: LockFinding, stale_after_seconds: float,
+) -> str | None:
+    """Why a retained lock still needs attention, or ``None`` if it does not.
+
+    Three arms.  A lock with a live holder is a human's decision: something is
+    using it, and this module will not guess what.  A lock whose holders could
+    not be determined is the same decision with less evidence, and is named
+    rather than passed over in silence — an unscannable process table is
+    exactly when an operator most needs to be told why a lock survived.  The
+    third arm is a lock that MET the removal conjunction and is on disk anyway:
+    report-only, or an unlink that failed.  Why it survived does not change
+    what the caller must do about it, so both render as one reason — the abort
+    ahead will hit git's "Another git process seems to be running" either way.
+    """
+    if finding.holder_pids:
+        return (
+            f'lock {finding.path} held by pids '
+            f'{", ".join(str(pid) for pid in finding.holder_pids)}'
+        )
+    if not finding.holders_confirmed:
+        return (
+            f'lock {finding.path} left in place — holders unknown, so finding '
+            f'none is not evidence there are none'
+        )
+    if _is_abandoned(finding, stale_after_seconds):
+        return (
+            f'lock {finding.path} left in place — abandoned for '
+            f'{finding.age_seconds:.0f}s with no holder (threshold '
+            f'{stale_after_seconds:.0f}s), and this run did not remove it'
+        )
+    return None
 
 
 def _lock_json(finding: LockFinding) -> dict:
@@ -692,7 +737,11 @@ def preflight_rebase_recovery(
     :data:`RECOVERY_GIT` — see :func:`guarded_abort`, which pairs the two.
 
     *report_only* performs detection and reporting with no mutation, so an
-    operator can inspect before authorising a repair.
+    operator can inspect before authorising a repair.  It changes WHAT IS DONE
+    about a finding, never WHETHER IT IS A FINDING: *lock_stale_after_seconds*
+    still decides which locks count, and everything a repairing run would have
+    fixed comes back under :attr:`PreflightResult.unrepaired` with the verdict
+    ``blocked``.
 
     FAIL-SAFE, and TOTAL: no filesystem state makes this raise.  Every failure
     — a worktree git cannot be spawned in, a MERGE_RR that cannot be read, a
@@ -743,6 +792,7 @@ def preflight_rebase_recovery(
         locks_removed=sweep.removed,
         locks_retained=sweep.retained,
         merge_rr_unreadable=scan.unreadable,
+        lock_stale_after_seconds=lock_stale_after_seconds,
     )
 
 

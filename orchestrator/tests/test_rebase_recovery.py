@@ -1605,6 +1605,63 @@ class TestPreflightCli:
         assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
         assert conflict_id in ' '.join(payload['unrepaired'])
 
+    def test_report_only_names_the_lock_a_repairing_run_would_have_removed(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """The lock half of the same contract the dangling half already holds.
+
+        A stale unheld lock is one of the exact two failure modes this module
+        exists for.  Report-only used to render it as merely *retained* — the
+        bucket reserved for locks nothing will touch — so the verdict came back
+        `clean` for a worktree the repairing run fixes, and `skills/unblock`
+        reads any non-`blocked` verdict as licence to run a plain
+        `git rebase --abort`.  That abort fails rc 128 on the lock still
+        sitting there.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+        os.utime(lock, (0, 0))
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(lock) in ' '.join(payload['unrepaired'])
+        assert lock.exists(), 'report-only must not remove it'
+        assert payload['locks_removed'] == []
+
+    def test_report_only_honours_the_staleness_threshold_flag(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """`--report-only` and `--lock-stale-after-seconds` must compose.
+
+        The flag used never to reach the report-only path at all, which made
+        the combination silently inert: the two answers a caller can ask for —
+        "what is wrong" and "what would you fix at THIS threshold" — have to be
+        the same question asked of the same predicate, or report-only is not a
+        preview of anything.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, 'rebase', '--abort')
+        lock = repo / '.git' / 'MERGE_RR.lock'
+        lock.touch()
+
+        _, defaulted = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+        )
+        _, lowered = self._run_cli(
+            capsys, 'preflight', '--worktree', str(repo), '--report-only',
+            '--lock-stale-after-seconds', '0',
+        )
+
+        assert defaulted['verdict'] == rebase_recovery.VERDICT_CLEAN
+        assert lowered['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(lock) in ' '.join(lowered['unrepaired'])
+        assert lock.exists(), 'report-only must not remove it at any threshold'
+
     def test_a_held_lock_blocks_even_when_everything_else_was_repaired(
         self, tmp_path: Path, capsys,
     ) -> None:
