@@ -88,12 +88,20 @@ class TestPendingScanThread:
 
 
 class _RendezvousQueue(EscalationQueue):
-    """A REAL queue whose ``get_pending`` parks mid-scan so the loop can act.
+    """A REAL queue that parks on ENTRY to ``get_pending``, so the loop can act.
 
-    Delegates through ``super()`` like ``_ThreadProbeQueue``, so the scan it
-    brackets is the real one.  The release wait is bounded at 2.0 s: under an
-    INLINE implementation nothing on the loop can ever set the release event,
-    so the wait must time out rather than hang — that turns the inline case
+    The park BRACKETS the real scan rather than interposing inside it — record
+    ``'scan-start'``, wait, record ``'scan-end'``, and only then delegate to
+    ``super()``.  So what the loop does while parked happens-before the glob,
+    not during it.  That is exactly enough to pin the ORDER this test exists
+    for, and deliberately NOT a claim about interleaving WITHIN the directory
+    read; a record moving between the glob and the per-file read is
+    test_queue.py::TestScanSurvivesRecordArchivedMidScan's subject, via
+    ``_scan_race_helpers.relocating_read_text``.
+
+    The release wait is bounded at 2.0 s: under an INLINE implementation
+    nothing on the loop can ever set the release event, so the wait must time
+    out rather than hang — that turns the inline case
     into a clean order-assertion failure in ~2 s instead of a test that sits
     until this suite's 300 s per-test cap (see escalation/pyproject.toml).
     """
@@ -123,13 +131,16 @@ async def _await_event(event: threading.Event) -> None:
 @pytest.mark.asyncio
 class TestLoopStaysLiveDuringScan:
     async def test_loop_runs_and_can_file_while_the_scan_is_in_flight(self, tmp_path):
-        """The same property stated behaviourally, plus the concurrent-submit ask.
+        """The same property stated behaviourally, and what a submit gets to do.
 
         Asserting an ORDER makes this a happens-before fact rather than a
-        duration, so it does not depend on how loaded the host is.  Filing a
-        record from the loop thread mid-scan is the interleaving this task was
-        asked to verify nothing depends on being absent — and the check that it
-        is harmless is that every returned row is still whole.
+        duration, so it does not depend on how loaded the host is.  The record
+        filed from the loop thread lands between the tool ENTERING the scan and
+        the queue read beginning (see ``_RendezvousQueue`` for why that is the
+        window, and where the inside-the-read one is covered) — a submit
+        concurrent with the tool, which is the interleaving this task was asked
+        to verify nothing depends on being absent.  The check that it was
+        harmless is that every returned row is still whole.
         """
         queue = _RendezvousQueue(tmp_path / 'esc')
         _file(queue, '970', level=1)
@@ -147,7 +158,7 @@ class TestLoopStaysLiveDuringScan:
             # below catches.
             await asyncio.wait_for(_await_event(queue.scan_entered), 3.0)
             queue.events.append('loop-alive')
-            # The concurrent mutation, from the loop thread, mid-scan.
+            # The concurrent mutation, from the loop thread, while it parks.
             _file(queue, '971', level=1)
         finally:
             queue.release.set()
@@ -156,9 +167,10 @@ class TestLoopStaysLiveDuringScan:
         assert queue.events == ['scan-start', 'loop-alive', 'scan-end'], (
             f'the loop did not run while the scan was in flight: {queue.events}'
         )
-        # Every row is well-formed: the mid-scan submit produced no partial or
-        # malformed record, and no false `[]` — pins_recovery is present and
-        # correct on each, which is the annotation's UNKNOWN-vs-empty contract.
+        # Every row is well-formed: the submit that landed while the tool was
+        # parked produced no partial or malformed record, and no false `[]` —
+        # pins_recovery is present and correct on each, which is the
+        # annotation's UNKNOWN-vs-empty contract.
         assert recs, 'the scan returned nothing'
         for rec in recs:
             assert rec['pins_recovery'] == [rec['task_id']], rec

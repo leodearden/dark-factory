@@ -9,9 +9,14 @@ duck-typed harness, and the ``await tool.fn(...)`` invocation.
 
 Not a ``conftest.py`` fixture: ``_file`` and ``_harness`` are parameterised
 factories rather than per-test setup, so a plain importable module is the
-honest shape; ``escalation/tests`` is on ``sys.path`` under pytest's default
-prepend import mode (see ``conftest.py``), so a flat import works from both
-suites.  ``_Scheduler`` in particular must not be copied: it encodes the real
+honest shape.  The flat import resolves in every collection configuration
+because ``escalation/tests/conftest.py`` explicitly inserts this directory at
+the front of ``sys.path`` (enforced by
+``tests/scripts/test_pytest_workspace_collection.py``) — prepend import mode
+alone does NOT put it there: conftest records the measurement that in a
+repo-root multi-package run another subproject's tests dir wins that slot.
+
+``_Scheduler`` in particular must not be copied: it encodes the real
 ``(statuses, error)`` TUPLE shape, which a drifted second copy would get wrong
 silently.
 """
