@@ -212,7 +212,7 @@ lane, a gzipped `attempt-N[.<module>].junit-<ts>.xml.gz` per-test report.
 The greens are deliberate: a failures-only corpus answers questions about
 cost and scope with a red-conditioned sample.
 
-Four things a census must not assume:
+Three things a census must not assume:
 
 - **Junit exists only under `merge_verify_breadth: full`.** The shipped
   default (`config.py`) is `scoped`; this repo's
@@ -222,14 +222,14 @@ Four things a census must not assume:
   attempt id, so their files stem at `attempt-1`. Logs and junit carry a
   `.<module>` infix; the plan does not — under per-module fan-out one plan
   sits against N junit reports.
-- **Report count ≠ leg count.** One merge attempt can archive more than one
-  junit for the same module when the flake gate's isolated re-run fires
-  (`verify.py::confirm_isolated_rerun_verdict`).
 - **Several merge-path callers archive nothing at all**, because they pass
   no `archive_root`: the pre-existing-main baseline probe, the shadow/drift
-  runners, the unscoped type-check gate and the workflow pre-merge
-  re-verify. `archive_root is None` is the whole rule — absence from this
-  tree is not evidence a verify did not run.
+  runners, the unscoped type-check gate, the workflow pre-merge re-verify,
+  and the flake gate's isolated re-run
+  (`verify.py::confirm_isolated_rerun_verdict`) — so a module's archived
+  report is always the leg's own, never the re-run's. `archive_root is None`
+  is the whole rule — absence from this tree is not evidence a verify did
+  not run.
 
 Retention is one policy for the whole tree: `.log`, `.json` and `.gz` are
 deleted past 30 days, then oldest-first until the tree is under 500MB
