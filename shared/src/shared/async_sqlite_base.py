@@ -242,15 +242,20 @@ class AtomicConnection:
         oversight: a unit that SELECTs before it writes opens a read snapshot
         ahead of its first write, so a commit from a DIFFERENT connection to the
         same file landing between the two statements can still raise
-        ``SQLITE_BUSY_SNAPSHOT``.  Four units have that shape today —
-        ``EventBuffer.claim_deferred_writes``, ``EventBuffer.release_stale_claims``,
-        ``ReconLedgerStore.gc``'s TTL flip, and ``ReconLedgerStore.mark_addressed``.
+        ``SQLITE_BUSY_SNAPSHOT``.  Three units have that shape today —
+        ``EventBuffer.claim_deferred_writes``, ``EventBuffer.release_stale_claims``
+        and ``ReconLedgerStore.mark_addressed`` — verified by reading the FIRST
+        statement of every write unit in the three stores.  A unit that batches a
+        read AFTER its first write does not have it: ``ReconLedgerStore.gc`` opens
+        with its ``DELETE`` and only then SELECTs the rows to TTL-flip, by which
+        point the transaction has already been promoted to a write transaction and
+        no other connection can commit into the gap.
 
         The lock removes the in-process, cross-COROUTINE collision, which is the
         failure this primitive owns and the one the incidents were.  Closing the
         remaining cross-CONNECTION window would need ``BEGIN IMMEDIATE`` — which
         the RCA measured still raising, and excludes by name — or a bounded
-        retry, which is separate work.  Do not read the four units above as
+        retry, which is separate work.  Do not read the three units above as
         sites awaiting conversion: batching their read inside the unit is
         deliberate, because each must see its own uncommitted write.
         """
@@ -271,6 +276,13 @@ class AtomicConnection:
         depend on: the checkpoint cycle unpacks the tuple and logs raises
         separately, so turning a benign empty result into an exception would
         report a checkpoint failure on every affected tick.
+
+        That is the OPPOSITE of :meth:`AsyncSqliteBase.checkpoint`, which raises
+        ``RuntimeError`` on the identical condition — and both live in this one
+        module.  Read both before moving a store from one to the other: the swap
+        turns "raises on an impossible pragma result" into "returns a sentinel
+        that unpacks as three ints" with no type or test signal.  The divergence
+        is deliberate and temporary; task 5562's adoption unifies it.
         """
         async with self._held('checkpoint()'):
             rows = list(
@@ -391,6 +403,14 @@ class AsyncSqliteBase(abc.ABC):
             RuntimeError: If the store has not been opened.
             RuntimeError: If ``PRAGMA wal_checkpoint(TRUNCATE)`` returns no rows
                 (unexpected; SQLite always returns a row for this pragma).
+
+        Note:
+            :meth:`AtomicConnection.checkpoint` answers that same no-rows case
+            with ``CheckpointResult(-1, -1, -1)`` instead, preserving the
+            contract the reconciliation stores' callers already had.  Two
+            opposite contracts under one name in one module: a store migrating
+            between them changes behaviour silently, so see both.  Deliberate
+            and temporary; task 5562's adoption unifies it.
         """
         conn = self._require_conn()
         async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
