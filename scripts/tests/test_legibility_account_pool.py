@@ -25,6 +25,7 @@ deselected by default (``addopts = -m 'not integration'``).
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Literal
@@ -38,6 +39,33 @@ import pytest
 # below would stop matching what it is supposed to catch.
 from legibility import coder as coder_mod
 from shared.usage_gate import AccountLease
+
+from shared import usage_gate as usage_gate_mod
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """Snapshot and restore ``os.environ`` around every test in this module.
+
+    ``build_pool`` calls ``load_dotenv`` and does its own
+    ``os.environ.pop("ANTHROPIC_API_KEY", None)`` — both act on the real
+    process environment directly, so neither is undone by ``monkeypatch``'s
+    teardown, which only reverses its OWN sets. In a worktree there is no
+    ``.env`` for ``load_dotenv`` to find, so this is inert there; in the main
+    checkout (whose ``.env`` carries real
+    ``CLAUDE_OAUTH_TOKEN_*``/``ANTHROPIC_API_KEY``) it is what stops one
+    test's dotenv load or key-strip from outliving it and changing what a
+    LATER test observes. Autouse so it wraps every test here, including
+    ``test_live_one_shot_completes_when_a_pool_token_is_missing``, which
+    reads the real ambient environment on purpose.
+    """
+    before = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
+
 
 # ---------------------------------------------------------------------------
 # The narrow gate interface account_pool consumes, hand-rolled.
@@ -260,6 +288,10 @@ def test_pool_invoke_confirms_the_account_on_success():
     assert gate.confirmed == ['tok-max-b'], (
         f'the leased account must be confirmed OK on success; got {gate.confirmed}'
     )
+    assert gate.released == ['tok-max-b'], (
+        f"the finally must release the probe claim on the success path too; "
+        f"got {gate.released}"
+    )
 
 
 def test_pool_invoke_defaults_to_the_real_coder_seam():
@@ -341,6 +373,12 @@ def test_a_banner_caps_that_account_and_the_same_digest_completes_next_door():
     # (d) Nothing was fabricated: the second account's real reply came back.
     assert out == '{"matches": [], "candidates": []}'
 
+    # (e) every leased account's claim is handed back. A set, not a list:
+    #     InvokeSlot.detect_cap_hit also releases max-c on its True verdict,
+    #     and how often the gate is told is the gate's business, not this
+    #     module's.
+    assert set(gate.released) == {'tok-max-c', 'tok-max-b'}, gate.released
+
 
 def test_a_loose_false_positive_propagates_unrotated():
     """THE guard that keeps a loose matcher from burning the pool.
@@ -373,6 +411,10 @@ def test_a_loose_false_positive_propagates_unrotated():
         'consequence there is account failover (cap_markers docstring)'
     )
     assert len(gate.lease_calls) == 1
+    assert gate.released == ['tok-max-c'], (
+        f'the finally must release the probe claim even when the original '
+        f'exception propagates unrotated; got {gate.released}'
+    )
 
 
 def test_an_ordinary_failure_never_consults_the_gate_at_all():
@@ -397,6 +439,38 @@ def test_an_ordinary_failure_never_consults_the_gate_at_all():
     )
     assert len(invoke.calls) == 1
     assert gate.account_named('max-c').capped is False
+    assert gate.released == ['tok-max-c'], (
+        f'the finally must release the probe claim even for a failure the '
+        f'gate never saw; got {gate.released}'
+    )
+
+
+def test_a_bare_exception_still_releases_the_probe_claim_and_never_rotates():
+    """The `finally` covers EVERY exit path, not only the two coder
+    exceptions this module knows how to interpret. A bare ``ValueError`` is
+    not caught by ``except coder.CoderCapExhausted`` at all, so this is the
+    one case that proves ``finally: gate.release_probe_slot(...)`` itself
+    releases the claim rather than one of the `except` arms doing it.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    boom = ValueError('unexpected')
+    invoke = _RecordingInvoke(raises={'tok-max-c': boom})
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value is boom
+    assert len(invoke.calls) == 1, (
+        f'no rotation on an exception the pool does not interpret at all; '
+        f'got {invoke.calls}'
+    )
+    assert gate.released == ['tok-max-c'], (
+        f'the leaked-claim invariant holds for ANY exception, not only the '
+        f'two coder ones; got {gate.released}'
+    )
+    assert gate.account_named('max-c').capped is False, (
+        'a bare exception is not a cap signal'
+    )
 
 
 def test_rotation_walks_the_whole_pool_before_giving_up():
@@ -934,15 +1008,34 @@ def roster_file(tmp_path):
     return path
 
 
+@pytest.fixture
+def empty_env_file(tmp_path):
+    """A guaranteed-empty ``.env`` for every ``build_pool`` call that is not
+    itself testing dotenv loading.
+
+    ``build_pool``'s default ``env_file=None`` resolves to
+    ``_REPO_ROOT / ".env"`` -- inert in a worktree (no such file) but, run
+    from the main checkout, a file carrying real ``CLAUDE_OAUTH_TOKEN_*``
+    and ``ANTHROPIC_API_KEY``. Passing this fixture instead of leaving
+    ``env_file`` unset is what keeps a `build_pool()` call hermetic to which
+    checkout the suite happens to run from.
+    """
+    path = tmp_path / "empty.env"
+    path.write_text("")
+    return path
+
+
 def _set_pool_tokens(monkeypatch, *letters):
     for letter in letters:
         monkeypatch.setenv(f"CLAUDE_OAUTH_TOKEN_{letter}", f"tok-{letter.lower()}")
 
 
-def test_build_pool_resolves_the_roster_in_file_order(roster_file, monkeypatch):
+def test_build_pool_resolves_the_roster_in_file_order(
+    roster_file, monkeypatch, empty_env_file,
+):
     _set_pool_tokens(monkeypatch, "B", "C", "D")
 
-    gate = mod.build_pool(accounts_file=str(roster_file))
+    gate = mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
 
     assert gate.account_count == 3
     assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"], (
@@ -951,11 +1044,10 @@ def test_build_pool_resolves_the_roster_in_file_order(roster_file, monkeypatch):
     )
 
 
-def test_build_pool_defaults_to_the_repo_accounts_file_file_relatively(monkeypatch):
+def test_default_accounts_file_resolves_relative_to_this_checkout():
     """Never a hardcoded absolute: a copy of this script running from a
     worktree must read ITS OWN roster, the same reason coder.py resolves
     `shared` __file__-relatively (tasks 2881/2882/3329)."""
-    monkeypatch.delenv("USAGE_ACCOUNTS_FILE", raising=False)
     repo_root = Path(mod.__file__).resolve().parents[2]
 
     assert mod.default_accounts_file() == repo_root / "config" / "usage-accounts.yaml"
@@ -966,20 +1058,48 @@ def test_build_pool_defaults_to_the_repo_accounts_file_file_relatively(monkeypat
     )
 
 
+def test_build_pool_actually_uses_the_default_accounts_file_when_nothing_else_is_set(
+    monkeypatch, roster_file, empty_env_file,
+):
+    """The fall-through this pins is ``build_pool``'s own
+    ``resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or
+    str(default_accounts_file())`` with BOTH sources absent. The test above
+    only proves ``default_accounts_file()`` points at the right path in
+    isolation -- it never calls ``build_pool`` at all, so this exact branch
+    had no coverage before this test existed. ``default_accounts_file`` is
+    monkeypatched to a tmp roster rather than relying on the real
+    ``config/usage-accounts.yaml`` so the resolved names are pinned
+    regardless of what that file happens to contain today.
+    """
+    monkeypatch.delenv("USAGE_ACCOUNTS_FILE", raising=False)
+    monkeypatch.setattr(mod, "default_accounts_file", lambda: roster_file)
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+
+    gate = mod.build_pool(env_file=str(empty_env_file))
+
+    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"], (
+        "build_pool must have resolved the roster through "
+        "default_accounts_file(), the only source left once accounts_file "
+        "and USAGE_ACCOUNTS_FILE are both unset"
+    )
+
+
 def test_build_pool_honours_the_USAGE_ACCOUNTS_FILE_override(
-    roster_file, monkeypatch,
+    roster_file, monkeypatch, empty_env_file,
 ):
     """The fleet convention, shared with fused_memory/config/schema.py and
     scripts/run_vllm_eval.py."""
     _set_pool_tokens(monkeypatch, "B", "C", "D")
     monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(roster_file))
 
-    gate = mod.build_pool()
+    gate = mod.build_pool(env_file=str(empty_env_file))
 
     assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"]
 
 
-def test_build_pool_hands_the_validator_an_ABSOLUTE_path(roster_file, monkeypatch):
+def test_build_pool_hands_the_validator_an_ABSOLUTE_path(
+    roster_file, monkeypatch, empty_env_file,
+):
     """A relative accounts_file is `.resolve()`d against the CWD by
     UsageCapConfig's validator, and a path that misses degrades to an empty
     pool with only a warning. The trickle's CWD is the systemd unit's, not
@@ -988,7 +1108,7 @@ def test_build_pool_hands_the_validator_an_ABSOLUTE_path(roster_file, monkeypatc
 
     assert mod.default_accounts_file().is_absolute()
 
-    gate = mod.build_pool(accounts_file=str(roster_file))
+    gate = mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
     assert gate.account_count == 3
 
 
@@ -1104,12 +1224,12 @@ def test_a_capped_pool_never_hands_the_census_an_api_key(tmp_path, monkeypatch):
 
 
 def test_build_pool_logs_the_resolved_roster_but_never_a_token(
-    roster_file, monkeypatch, caplog,
+    roster_file, monkeypatch, caplog, empty_env_file,
 ):
     _set_pool_tokens(monkeypatch, "B", "C", "D")
 
     with caplog.at_level("INFO", logger="legibility.account_pool"):
-        mod.build_pool(accounts_file=str(roster_file))
+        mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
 
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "max-b" in logged and "max-d" in logged, logged
@@ -1119,35 +1239,103 @@ def test_build_pool_logs_the_resolved_roster_but_never_a_token(
     )
 
 
+def _module_warnings(caplog) -> list[str]:
+    """WARNING records THIS module actually emitted.
+
+    ``caplog.at_level(logger=...)`` only raises that logger's level; per the
+    pytest docs it does NOT scope capture to that logger. ``UsageGate.
+    _init_accounts`` logs its own ``Account 'max-b': env var
+    CLAUDE_OAUTH_TOKEN_B not set — skipping`` WARNING for every token-less
+    account, which alone would satisfy an unfiltered ``caplog.records``
+    assertion regardless of whether ``build_pool``'s own warning fired.
+    Filtering by ``r.name`` is what proves the warning came from
+    ``account_pool.build_pool`` and not merely from the gate underneath it.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "legibility.account_pool"
+    ]
+
+
 def test_build_pool_warns_LOUDLY_when_it_resolves_no_accounts(
-    tmp_path, monkeypatch, caplog,
+    tmp_path, monkeypatch, caplog, empty_env_file,
 ):
-    """The degradation that must never be silent. _init_accounts skips a
-    token-less account with a warning and, if ZERO survive, falls back to
-    ~/.claude/.credentials.json as an account literally named 'default' —
-    which is precisely today's broken behaviour. It has to be VISIBLE, or
-    this task's fix silently un-does itself the day a token env var is
-    dropped from the unit.
+    """The degradation that must never be silent: no token env var resolves
+    AND no ``~/.claude/.credentials.json`` fallback exists either, so the
+    gate ends up with literally zero accounts. It has to be VISIBLE, or this
+    task's fix silently un-does itself the day a token env var is dropped
+    from the unit.
+
+    ``CREDENTIALS_PATH`` is pinned to a path that does not exist so this
+    arm's premise (zero accounts, not the OTHER zero-usable-account arm
+    below) does not depend on whether the host running the suite happens to
+    hold real Claude credentials.
     """
     roster = tmp_path / "roster.yaml"
     roster.write_text(_ROSTER_YAML)
     for letter in ("B", "C", "D"):
         monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
-    empty_env = tmp_path / "empty.env"
-    empty_env.write_text("")
+    monkeypatch.setattr(
+        usage_gate_mod, "CREDENTIALS_PATH", tmp_path / "no-such-credentials.json",
+    )
 
     with caplog.at_level("WARNING", logger="legibility.account_pool"):
-        mod.build_pool(accounts_file=str(roster), env_file=str(empty_env))
+        gate = mod.build_pool(accounts_file=str(roster), env_file=str(empty_env_file))
 
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert gate.account_count == 0, (
+        f"this arm's premise: no token env vars AND no default credential "
+        f"on disk; got {gate.account_count} accounts"
+    )
+    warnings = _module_warnings(caplog)
     assert warnings, (
         "a pool that resolved no real accounts must SAY so — silently "
         "returning the ~/.claude fallback is the defect this task removes"
+    )
+    assert any("resolved NO usable accounts" in w for w in warnings), (
+        f"the module's own distinctive phrase must be present -- the gate "
+        f"logs its own per-account skip warning too, which this assertion "
+        f"must not be satisfied by; got {warnings}"
     )
     assert any("max-b" in w for w in warnings), (
         f"name the accounts it could not resolve, so an operator knows which "
         f"env var is missing; got {warnings}"
     )
+
+
+def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
+    tmp_path, monkeypatch, caplog, empty_env_file,
+):
+    """The OTHER zero-usable-account arm, and the exact pre-5488 defect:
+    every ``CLAUDE_OAUTH_TOKEN_*`` is missing but
+    ``~/.claude/.credentials.json`` exists, so ``_init_accounts`` resolves
+    ONE account named 'default' -- ``build_pool``'s ``names == ["default"]``
+    branch. Before this test existed, that branch was exercised only on a
+    host that happened to carry real Claude credentials, so it could pass
+    CI green while carrying a defect no run of the suite would ever see.
+    """
+    roster = tmp_path / "roster.yaml"
+    roster.write_text(_ROSTER_YAML)
+    for letter in ("B", "C", "D"):
+        monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+    cred_file = tmp_path / "credentials.json"
+    cred_file.write_text(json.dumps({"accessToken": "tok-default"}))
+    monkeypatch.setattr(usage_gate_mod, "CREDENTIALS_PATH", cred_file)
+
+    with caplog.at_level("WARNING", logger="legibility.account_pool"):
+        gate = mod.build_pool(accounts_file=str(roster), env_file=str(empty_env_file))
+
+    assert [a.name for a in gate._accounts] == ["default"], (
+        f"this arm's premise: the ~/.claude fallback resolved exactly one "
+        f"account named 'default'; got "
+        f"{[a.name for a in gate._accounts]}"
+    )
+    warnings = _module_warnings(caplog)
+    assert warnings, (
+        "the 'default' fallback IS today's broken behaviour and must warn "
+        "just as loudly as the zero-account arm"
+    )
+    assert any("resolved NO usable accounts" in w for w in warnings), warnings
+    assert any("max-b" in w for w in warnings), warnings
 
 
 # ---------------------------------------------------------------------------
