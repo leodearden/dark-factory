@@ -1504,9 +1504,11 @@ whatever login `~/.claude` happened to hold, so one capped account deferred a
 whole night while six live ones sat idle.
 
 **What the unit must supply.** `legibility-trickle@.service` carries
-`EnvironmentFile=/home/leo/src/dark-factory/.env` — that is where the
-`CLAUDE_OAUTH_TOKEN_*` values the roster names come from, and without them the
-gate resolves zero accounts — and `UnsetEnvironment=ANTHROPIC_API_KEY`,
+`EnvironmentFile=/home/leo/src/dark-factory/.env` — belt and braces rather
+than the pool's lifeline, since `build_pool`'s own `load_dotenv` reads that
+same file and resolves all seven accounts even with no `CLAUDE_OAUTH_TOKEN_*`
+in the environment (measured); the directive is there so the unit states the
+dependency instead of burying it in Python — and `UnsetEnvironment=ANTHROPIC_API_KEY`,
 because the CLI prefers an API key over the OAuth token and one inherited from
 the `systemd --user` manager would silently authenticate every invocation as
 that identity. The unit pins **no** account; choosing one is the gate's job,
