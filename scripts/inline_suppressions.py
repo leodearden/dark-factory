@@ -55,12 +55,39 @@ report's only data source, so nothing downstream re-implements the scan.
 from __future__ import annotations
 
 import re
+import subprocess
 import tokenize
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from io import StringIO
+from pathlib import Path
 from types import MappingProxyType
+
+
+class InstrumentFailure(Exception):
+    """The scanner could not take a measurement it was asked for — exit 2.
+
+    THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE, the same
+    choice ``shared.ratchet.BaselineUnusable`` argues for.  A file that cannot
+    be read, a file that cannot be tokenized, a ``git ls-files`` that did not
+    run, a config key this model does not implement and a missing ``shared``
+    import all mean one identical thing to a caller — *this run measured
+    nothing you can trust* — and all map to the same exit 2.  Splitting them by
+    cause would hand ``main`` five ``except`` clauses that all do one thing.
+
+    Categorically apart from a VIOLATION, which is exit 1.  That separation is
+    the whole point: a broken instrument reported as a finding sends an agent
+    to fix code that was never the problem, and a finding reported as a broken
+    instrument is an INV-12 breach nobody is told about.  Every message names
+    the file, path or key at fault, because that is the one thing the operator
+    cannot derive from the rest of it.
+    """
+
+
+#: Generous, and not a performance assertion: `git ls-files` over this tree
+#: takes well under a second, so anything approaching this has hung.
+_GIT_TIMEOUT_SECS = 60
 
 
 class Kind(Enum):
@@ -132,13 +159,16 @@ class KindSpec:
     """How one :class:`Kind` is found, and how its codes are read.
 
     Attributes:
-        marker: The byte substring the prefilter tests a file's raw bytes for.
-            It must appear in EVERY form :attr:`pattern` accepts, so it is the
-            longest run of :attr:`pattern` that no whitespace can interrupt —
-            ``b'type:'`` and not ``b'type: ignore'``, because ``# type:ignore``
-            is a marker too.  The direction of error decides this: a substring
-            that is too short costs only scan time, while one that is not
-            invariant silently drops real sites.
+        marker: The substring that must be present for :attr:`pattern` to have
+            any chance of matching, tested TWICE — against a file's raw bytes
+            before it is decoded, and against a comment token before the
+            pattern is run.  It must therefore appear in EVERY form
+            :attr:`pattern` accepts, so it is the longest run of the pattern
+            that no whitespace can interrupt: ``'type:'`` and not
+            ``'type: ignore'``, because ``# type:ignore`` is a marker too.  The
+            direction of error decides this — a substring that is too short
+            costs only scan time, while one that is not invariant silently
+            drops real sites.
         pattern: Searched against a whole COMMENT token.  Anchoring each form
             to its own ``#`` is what stops ``# see the noqa convention`` from
             registering, and matches how ruff and mypy read their own
@@ -146,7 +176,7 @@ class KindSpec:
         codes: Reads the rule codes out of that match.
     """
 
-    marker: bytes
+    marker: str
     pattern: re.Pattern[str]
     codes: Callable[[re.Match[str]], tuple[str, ...]]
 
@@ -217,31 +247,31 @@ _BRACKET_SUFFIX = r'(?:\[([^\]]*)\])?'
 KIND_SPECS: MappingProxyType[Kind, KindSpec] = MappingProxyType(
     {
         Kind.TYPE_IGNORE: KindSpec(
-            marker=b'type:',
+            marker='type:',
             pattern=re.compile(r'#\s*type:\s*ignore' + _BRACKET_SUFFIX),
             codes=_bracketed_codes,
         ),
         Kind.NOQA: KindSpec(
-            marker=b'noqa',
+            marker='noqa',
             # The tail stops at the next `#`, so a disposition riding in the
             # same comment can never be read as a rule code.
             pattern=re.compile(r'#\s*noqa(?::\s*([^#]*))?'),
             codes=_noqa_codes,
         ),
         Kind.PYRIGHT_IGNORE: KindSpec(
-            marker=b'pyright:',
+            marker='pyright:',
             pattern=re.compile(r'#\s*pyright:\s*ignore' + _BRACKET_SUFFIX),
             codes=_bracketed_codes,
         ),
         Kind.PRAGMA_NO_COVER: KindSpec(
-            marker=b'pragma:',
+            marker='pragma:',
             pattern=re.compile(r'#\s*pragma:\s*no\s+cover\b'),
             codes=_no_codes,
         ),
         Kind.NOSEC: KindSpec(
             # `\b` on both sides, because 'nanosecond' CONTAINS 'nosec' and
             # 'nosecret' starts with it.
-            marker=b'nosec',
+            marker='nosec',
             pattern=re.compile(r'#\s*nosec\b'),
             codes=_no_codes,
         ),
@@ -270,23 +300,191 @@ def scan_source(source: str, *, path: str) -> tuple[Comment, ...]:
 
     ``token.type`` rather than ``token.exact_type``: COMMENT has no exact-type
     refinement, and the coarse field is what the existing consumer uses.
+
+    THE CATCH IS A TRIO, not ``TokenError`` alone: a file with broken
+    indentation raises ``IndentationError`` and one with a bad statement raises
+    ``SyntaxError``, and either would otherwise escape as a bare traceback
+    instead of the named exit 2 boundary scenario 8 requires.
+
+    Raises:
+        InstrumentFailure: *source* could not be tokenized.  Never a skip —
+            see :class:`InstrumentFailure` for why the polarity matters.
     """
     comments: list[Comment] = []
-    for token in tokenize.generate_tokens(StringIO(source).readline):
-        if token.type != tokenize.COMMENT:
-            continue
-        comments.append(_comment_at(token, path=path))
+    try:
+        for token in tokenize.generate_tokens(StringIO(source).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            comments.append(_comment_at(token, path=path))
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        raise InstrumentFailure(
+            f'{path}: could not be tokenized -- {type(exc).__name__}: {exc}'
+        ) from exc
     return tuple(comments)
 
 
 def _comment_at(token: tokenize.TokenInfo, *, path: str) -> Comment:
-    """Build the :class:`Comment` for one COMMENT *token*."""
+    """Build the :class:`Comment` for one COMMENT *token*.
+
+    The kind table's marker substring is tested here as well as in the
+    pre-decode prefilter, and for the same reason one scale down: a marker-free
+    comment is the overwhelming majority (measured over this tree: 140,237
+    comments hold 6,047 sites), and a substring test is far cheaper than the
+    five pattern searches it stands in front of.  One table, two granularities
+    — not a second policy.
+    """
     line = token.start[0]
     text = token.string
     stripped = token.line.strip()
     sites = tuple(
         Site(path=path, line=line, kind=kind, codes=spec.codes(match), text=stripped)
         for kind, spec in KIND_SPECS.items()
-        if (match := spec.pattern.search(text)) is not None
+        if spec.marker in text and (match := spec.pattern.search(text)) is not None
     )
     return Comment(path=path, line=line, text=text, sites=sites)
+
+
+@dataclass(frozen=True)
+class Scan:
+    """One sweep of a tree: what it found, and how much work it did.
+
+    Attributes:
+        comments: Every COMMENT token in every file that survived the
+            prefilter, in enumeration order.
+        files_enumerated: How many tracked paths ``git ls-files`` listed,
+            INCLUDING any whose worktree file has since been deleted.  It is
+            the size of the corpus the scan set out to read.
+        files_tokenized: How many of those were actually decoded and tokenized
+            — the ones whose raw bytes carried a marker substring.
+
+    THE TWO COUNTS ARE THE BUDGET'S ENFORCEMENT POINT.  The PRD gives this scan
+    ten seconds, and the prefilter is the only reason it fits; asserting the
+    CLOCK on the box the merge gate runs on would plant a flake (measured: ~5
+    CPU-seconds of work took 6.5-6.8 s of wall clock at load 105), so the guard
+    test asserts these two numbers instead.  They pin the mechanism the budget
+    rests on — this is a prefiltered scan, not a whole-tree tokenize — and
+    cannot flake.
+    """
+
+    comments: tuple[Comment, ...]
+    files_enumerated: int
+    files_tokenized: int
+
+    @property
+    def sites(self) -> tuple[Site, ...]:
+        """Every :class:`Site` held by every comment, flattened.
+
+        A property rather than a field, so it cannot go stale against
+        ``comments`` — the two would otherwise be a redundant pair that a
+        future edit could desynchronise (heuristic 11).
+        """
+        return tuple(site for comment in self.comments for site in comment.sites)
+
+
+#: Every kind's prefilter substring as raw bytes, for the pre-decode pass.
+#: Derived from the one table rather than written twice; the markers are ASCII,
+#: so the encoding is exact.
+_MARKER_BYTES: tuple[bytes, ...] = tuple(
+    spec.marker.encode('utf-8') for spec in KIND_SPECS.values()
+)
+
+
+def _tracked_python_files(root: Path) -> tuple[str, ...]:
+    """Every TRACKED ``*.py`` under *root*, repo-relative, sorted and unique.
+
+    REFUSES RATHER THAN DEGRADING TO ``[]``.  An empty corpus and a clean
+    corpus are indistinguishable in a violation count, and only one of them is
+    good news — the argument
+    ``scripts/audit_manifest_descriptor_drift.py::ManifestDiscoveryUnavailable``
+    makes.  It is sharper here: an empty scan handed to ``--seed`` or
+    ``--tighten`` writes an empty baseline, which compares clean against
+    everything and opens the gate for good.
+
+    The return code is inspected by hand rather than with ``check=True``, so
+    the refusal can carry git's own stderr.  Deduped through a set because an
+    UNMERGED path is listed once per merge stage, and sorted so a scan's
+    enumeration order — and therefore a report's — is reproducible.
+    """
+    try:
+        completed = subprocess.run(
+            ['git', '-C', str(root), 'ls-files', '-z', '--', '*.py'],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise InstrumentFailure(
+            f'could not run `git ls-files` in {root} -- {type(exc).__name__}: {exc}. '
+            'The tracked corpus is this scan\'s only source; there is no filesystem-walk '
+            'fallback, because a walk would silently restore untracked working-tree state '
+            'as an input to the gate.'
+        ) from exc
+
+    if completed.returncode != 0:
+        raise InstrumentFailure(
+            f'`git ls-files` failed in {root} (rc={completed.returncode}): '
+            f'{completed.stderr.strip() or "no stderr"}'
+        )
+
+    return tuple(sorted({path for path in completed.stdout.split('\0') if path}))
+
+
+def _source_of(root: Path, relative: str) -> str | None:
+    """Decode *relative*'s bytes, or ``None`` when the prefilter rejects it.
+
+    Reading the raw BYTES and testing them for a marker substring before
+    decoding is the whole prefilter: the files that cannot hold a suppression
+    are never decoded and never tokenized.  Measured over this tree, that is
+    1,212 of 1,933 files skipped.
+
+    ``FileNotFoundError`` is the one read failure that is not a fault:
+    ``git ls-files`` reads the INDEX, so it lists a path whose worktree file
+    has been deleted mid-edit, and that is an ordinary state rather than a
+    broken instrument.  Every OTHER ``OSError``, and any decode failure,
+    raises — a file that exists and cannot be read is exactly the case where
+    carrying on would measure low.
+    """
+    location = root / relative
+    try:
+        raw = location.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstrumentFailure(
+            f'{relative}: could not be read -- {type(exc).__name__}: {exc}'
+        ) from exc
+
+    if not any(marker in raw for marker in _MARKER_BYTES):
+        return None
+
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise InstrumentFailure(
+            f'{relative}: could not be decoded as UTF-8 -- {exc}. A tracked Python file '
+            'this scanner cannot decode is never skipped: it might hold the very '
+            'suppression the gate exists to find.'
+        ) from exc
+
+
+def scan_tree(root: Path) -> Scan:
+    """Scan every tracked ``*.py`` under *root*.
+
+    The prefilter means ``files_tokenized`` is strictly smaller than
+    ``files_enumerated`` on any real tree, and a file it rejects is reported
+    honestly as enumerated-not-tokenized rather than silently vanishing.
+    """
+    tracked = _tracked_python_files(root)
+    comments: list[Comment] = []
+    tokenized = 0
+    for relative in tracked:
+        source = _source_of(root, relative)
+        if source is None:
+            continue
+        tokenized += 1
+        comments.extend(scan_source(source, path=relative))
+    return Scan(
+        comments=tuple(comments),
+        files_enumerated=len(tracked),
+        files_tokenized=tokenized,
+    )

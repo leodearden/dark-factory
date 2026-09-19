@@ -413,10 +413,16 @@ def test_a_tracked_file_that_cannot_be_tokenized_is_an_instrument_failure(tmp_pa
 
 def test_a_tracked_file_with_broken_indentation_is_an_instrument_failure(tmp_path: Path):
     """The trio is ``(TokenError, IndentationError, SyntaxError)``, not
-    ``TokenError`` alone — a file with broken indentation raises the second and
-    would otherwise escape as a bare traceback."""
+    ``TokenError`` alone — a file whose dedent matches no outer level raises
+    the second and would otherwise escape as a bare traceback.
+
+    A mismatched DEDENT specifically, not merely a surprising indent: measured
+    against this interpreter, ``tokenize`` accepts an over-indented line
+    without complaint (the parser rejects it later, but the tokenizer does not),
+    so a fixture built on one would assert nothing.
+    """
     _write_fixture_tree(
-        tmp_path, {'bad_indent.py': 'if True:\n  a = 1  # noqa: E402\n      b = 2\n'}
+        tmp_path, {'bad_indent.py': 'if True:\n      a = 1  # noqa: E402\n   b = 2\n'}
     )
 
     with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
