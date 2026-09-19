@@ -32,7 +32,7 @@ This module reads no clock and performs no I/O.
 from __future__ import annotations
 
 import enum
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -101,7 +101,9 @@ class CensusVocabularyError(ValueError):
     does not need to: the access layer above wraps the call, catches this, and
     serves the census as an ``unknown``/``stale``
     :class:`~dashboard.data.datum.Datum` carrying this message verbatim as its
-    ``reason``. That is what makes the failure visible instead of fatal.
+    ``reason``. That is what makes the failure visible instead of fatal —
+    and because that message then crosses the wire on every poll, its SIZE is
+    bounded by construction (see :func:`_vocabulary_drift_message`).
 
     The store's vocabulary is already closed by
     ``fused_memory/server/tools.py::_VALID_TASK_STATUSES``, which imports from
@@ -143,6 +145,47 @@ class TaskCensus:
         }
 
 
+REPORTED_VALUES = 5
+"""How many distinct off-vocabulary values the error message spells out."""
+
+
+def _vocabulary_drift_message(offenders: Sequence[tuple[Any, str]]) -> str:
+    """Summarise off-vocabulary rows in a message of BOUNDED size.
+
+    Grouped by value and capped at :data:`REPORTED_VALUES`, deliberately. The
+    realistic drifts make EVERY row an offender at once — a tenth status
+    shipping upstream, or ``fetch_statuses`` changing the shape of its values
+    — so a per-row enumeration would grow with the task tree. This message is
+    served verbatim to the browser as a Datum's ``reason``, which would turn
+    a diagnostic into a payload-degradation event on every poll of every
+    project. A thousand rows sharing one unknown status carry one bit of
+    information: the distinct VALUES are the diagnosis, and the two counts —
+    rows and distinct values, both exact — say how far the drift reaches.
+
+    Values are grouped by their ``repr`` rather than by themselves because a
+    shape drift can hand us an UNHASHABLE value (``{'status': ...}``), which
+    is one of the very drifts this reports. The repr is also exactly what the
+    message prints, so the grouping and the rendering cannot disagree.
+    """
+    by_value: dict[str, list[Any]] = {}
+    for task_id, status in offenders:
+        by_value.setdefault(repr(status), []).append(task_id)
+
+    shown = list(by_value.items())[:REPORTED_VALUES]
+    listed = ', '.join(
+        f'{value} ({len(ids)} row(s), first id={ids[0]!r})' for value, ids in shown
+    )
+    if len(by_value) > len(shown):
+        listed += f', (+{len(by_value) - len(shown)} more distinct value(s))'
+
+    legal = ', '.join(repr(member.value) for member in TaskStatus)
+    return (
+        f'status map carried {len(offenders)} row(s) outside TaskStatus '
+        f'across {len(by_value)} distinct value(s): {listed}. '
+        f'Legal members are: {legal}'
+    )
+
+
 def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
     """Tally *status_map* into a :class:`TaskCensus`.
 
@@ -162,8 +205,9 @@ def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
 
     Raises:
         CensusVocabularyError: If any value falls outside ``TaskStatus``.
-            Every offender is collected and reported in one raise, so a
-            vocabulary drift is not found one rerun at a time.
+            Every distinct offending VALUE is reported in one raise, so a
+            vocabulary drift is not found one rerun at a time, and the
+            enumeration is capped so the message cannot grow with the tree.
     """
     counts = dict.fromkeys(TaskStatus, 0)
     offenders: list[tuple[Any, str]] = []
@@ -176,12 +220,7 @@ def build_census(status_map: Mapping[Any, str]) -> TaskCensus:
             counts[member] += 1
 
     if offenders:
-        listed = ', '.join(f'id={task_id!r} status={status!r}' for task_id, status in offenders)
-        legal = ', '.join(repr(member.value) for member in TaskStatus)
-        raise CensusVocabularyError(
-            f'status map carried {len(offenders)} value(s) outside TaskStatus: '
-            f'{listed}. Legal members are: {legal}'
-        )
+        raise CensusVocabularyError(_vocabulary_drift_message(offenders))
 
     def tally(members: frozenset[TaskStatus]) -> int:
         return sum(counts[member] for member in members)

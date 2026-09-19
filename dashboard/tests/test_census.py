@@ -195,13 +195,48 @@ def test_build_census_vocabulary_error_names_the_legal_members():
     assert all(repr(member.value) in message for member in TaskStatus)
 
 
-def test_build_census_reports_every_offender_at_once():
-    """One raise carries all offenders, so a fix is not found one rerun at a time."""
+def test_build_census_reports_every_offending_value_at_once():
+    """One raise names every distinct offender, so a fix is not found one rerun at a time."""
     with pytest.raises(CensusVocabularyError) as excinfo:
         build_census({1: 'archived', 2: 'retired', 3: TaskStatus.DONE.value})
     message = str(excinfo.value)
     assert repr('archived') in message
     assert repr('retired') in message
+
+
+# The message crosses the wire verbatim as a Datum's `reason` on every poll of
+# every project, so its SIZE is part of the contract. Both drifts below make
+# EVERY row an offender at once, which is what the realistic ones do: a tenth
+# status shipping upstream, or fetch_statuses changing the shape of its values.
+# A per-row enumeration of either fixture would run past 100_000 characters.
+MESSAGE_CEILING = 2000
+
+
+def test_build_census_vocabulary_error_stays_bounded_when_one_value_drifts():
+    """A thousand rows sharing one unknown status carry one bit of information."""
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census(dict.fromkeys(range(5000), 'archived'))
+    message = str(excinfo.value)
+    assert repr('archived') in message
+    assert '5000' in message
+    assert len(message) < MESSAGE_CEILING
+
+
+def test_build_census_vocabulary_error_stays_bounded_when_the_value_shape_drifts():
+    """Every row a DISTINCT offender — the enumeration is capped, the count is not."""
+    drifted = {index: f'unknown-{index}' for index in range(5000)}
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census(drifted)
+    message = str(excinfo.value)
+    assert '5000' in message
+    assert len(message) < MESSAGE_CEILING
+
+
+def test_build_census_vocabulary_error_survives_an_unhashable_value():
+    """The shape drift it must report is exactly the one that resists grouping."""
+    with pytest.raises(CensusVocabularyError) as excinfo:
+        build_census({1: {'status': 'done'}})  # type: ignore[dict-item]
+    assert repr('status') in str(excinfo.value)
 
 
 def test_build_census_does_not_mutate_the_mapping_it_was_handed():
