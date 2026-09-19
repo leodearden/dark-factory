@@ -174,6 +174,12 @@ class TestNoteLineRendering:
         assert line.startswith(SHADOW_RULING_MARKER)
 
     def test_the_remainder_is_a_json_object_with_the_four_keys(self):
+        """THE DELIBERATE LITERAL COPY of the wire vocabulary, and the only
+        one: `PAYLOAD_WIRE_KEYS` is the single source the encoder, the decoder
+        and the doc-contract guard all read, so nothing else states what the
+        spelling actually IS. The archive freezes it — stamps already written
+        carry these four keys — so a rename must fail here rather than quietly
+        become the new format. Do not derive this from the module."""
         line = _A_RULING.to_note_line()
         payload = json.loads(line[len(SHADOW_RULING_MARKER):])
         assert isinstance(payload, dict)

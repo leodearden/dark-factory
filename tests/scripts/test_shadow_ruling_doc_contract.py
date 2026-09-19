@@ -37,6 +37,7 @@ import pytest
 from escalation.shadow_ruling import (
     FIRST_TRANCHE_CLASSES,
     HUMAN_FOREVER_GATES,
+    PAYLOAD_WIRE_KEYS,
     REVERSIBLE_ACTIONS,
     SHADOW_RULING_MARKER,
     ShadowRuling,
@@ -223,12 +224,17 @@ def test_at_least_one_counter_example_is_really_rejected():
 
 def test_payload_literals_are_json_objects_carrying_the_documented_keys():
     """The skill's fenced literals must be readable as JSON by a human too —
-    a payload that only the parser's leniency saves is not a good example."""
+    a payload that only the parser's leniency saves is not a good example.
+
+    The key set is READ OFF `PAYLOAD_WIRE_KEYS`, never re-typed here: a
+    re-typed copy agrees with whichever of the encoder/decoder it happened to
+    match and goes on reporting green while the other drifts away from it.
+    """
     positive, _ = _fenced_payload_literals(_read(SKILL))
     for block in positive:
         for line in _marker_lines(block):
             payload = json.loads(line[len(SHADOW_RULING_MARKER):])
-            assert set(payload) == {"class", "proposed_action", "evidence", "confidence"}
+            assert set(payload) == set(PAYLOAD_WIRE_KEYS)
 
 
 # ---------------------------------------------------------------------------

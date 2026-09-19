@@ -167,10 +167,28 @@ _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
 #: watcher identity string and ``action_effects.py`` for its target statuses.
 COMPARABLE_ACTIONS: frozenset[str] = frozenset({'close_only', 'resume'})
 
-#: Wire keys of the JSON payload. ``class`` rather than ``ruling_class`` because
-#: that is what a reader of the note sees; the Python attribute cannot be
-#: spelled ``class``.
-_PAYLOAD_KEYS = frozenset({'class', 'proposed_action', 'evidence', 'confidence'})
+#: Each wire key of the JSON payload against the :class:`ShadowRuling` attribute
+#: it carries — the ONE place that vocabulary is written. The encoder renders
+#: from it, the decoder validates and reads through it, and
+#: ``tests/scripts/test_shadow_ruling_doc_contract.py`` checks the skill's
+#: literals against it. Three independent copies is how a key renamed on the
+#: encoding side alone would make every freshly-rendered stamp unreadable while
+#: a guard that had re-typed the old spelling stayed green (SPOT).
+#:
+#: ``class`` rather than ``ruling_class`` because that is what a reader of the
+#: note sees; the Python attribute cannot be spelled ``class``. The wire
+#: spelling is FROZEN by the archive — stamps already written carry it — and is
+#: pinned as literals by ``escalation/tests/test_shadow_ruling.py``, the one
+#: deliberate copy.
+PAYLOAD_WIRE_KEYS: Mapping[str, str] = MappingProxyType({
+    'class': 'ruling_class',
+    'proposed_action': 'proposed_action',
+    'evidence': 'evidence',
+    'confidence': 'confidence',
+})
+
+#: The key set a payload must carry EXACTLY, read off the vocabulary above.
+_PAYLOAD_KEYS: frozenset[str] = frozenset(PAYLOAD_WIRE_KEYS)
 
 
 @dataclass(frozen=True)
@@ -233,10 +251,8 @@ class ShadowRuling:
         note's other lines.
         """
         payload = {
-            'class': self.ruling_class,
-            'proposed_action': self.proposed_action,
-            'evidence': self.evidence,
-            'confidence': self.confidence,
+            wire: getattr(self, attribute)
+            for wire, attribute in PAYLOAD_WIRE_KEYS.items()
         }
         return f'{SHADOW_RULING_MARKER} {json.dumps(payload, sort_keys=True)}'
 
@@ -276,12 +292,9 @@ def _decode_marker_line(line: str) -> ShadowRuling | None:
         )
         return None
     try:
-        return ShadowRuling(
-            ruling_class=payload['class'],
-            proposed_action=payload['proposed_action'],
-            evidence=payload['evidence'],
-            confidence=payload['confidence'],
-        )
+        return ShadowRuling(**{
+            attribute: payload[wire] for wire, attribute in PAYLOAD_WIRE_KEYS.items()
+        })
     except (TypeError, ValueError) as exc:
         # ValueError is what ShadowRuling raises for EVERY rejection, and the
         # type checks in its __post_init__ are what keep that true. TypeError is
