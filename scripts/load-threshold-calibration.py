@@ -99,6 +99,15 @@ class ArmSpec(NamedTuple):
 _PRESSURE_LADDER = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0)
 _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 
+# The corpus's TICK CLOCK: the one metric ``collect_load_metrics`` writes on
+# every tick it completes, readable or not — an unreadable /proc/stat is a 0.0
+# row, never a missing one. Every ``own_read_ok:<leaf>`` comes out of that same
+# call but only for the leaves discovered that tick, so a leaf's own row count
+# is not the tick count; this metric's is. Public because the lockstep test in
+# sampler/tests/test_load_metrics.py asserts the sampler really does emit it on
+# every completed tick, which is the whole of what makes it a clock.
+TICK_METRIC = 'runqueue_read_ok'
+
 # Arm name -> its ArmSpec. The `selector` half is duplicated from
 # sampler.metrics.ARM_METRIC_STEMS BY NECESSITY: that module cannot be
 # imported here, because at gate time this script runs under the system
@@ -120,7 +129,7 @@ ARM_METRIC_SELECTORS = {
     'runqueue_ratio': ArmSpec(
         'runqueue_ratio',
         (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
-        'runnable threads per CPU (ratio)', 'runqueue_read_ok'),
+        'runnable threads per CPU (ratio)', TICK_METRIC),
     # One series per cgroup leaf, so ':' — reported per leaf, never pooled.
     'own_cpu_some_avg10': ArmSpec(
         'own_cpu_some10', _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
@@ -279,7 +288,11 @@ def read_series(
 
     The two are returned apart and never merged: a ``*_read_ok`` row is
     evidence ABOUT a series, not a sample of it, so pooling them would corrupt
-    the very percentiles and hold fractions it exists to qualify.
+    the very percentiles and hold fractions it exists to qualify. The
+    readability series always carries ``TICK_METRIC``, whichever *arm* was
+    asked for, because it is the denominator of every coverage row
+    (``coverage_table``) — an ``--arm own_cpu_some_avg10`` run needs the corpus
+    tick count as much as a full one does.
 
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
@@ -313,9 +326,9 @@ def read_series(
 
     try:
         series = _fetch(con, selectors)
-        readability = _fetch(
-            con, [spec.readability for spec in specs if spec.readability]
-        )
+        readability = _fetch(con, sorted(
+            {TICK_METRIC} | {spec.readability for spec in specs if spec.readability}
+        ))
     except sqlite3.Error as exc:
         return {}, {}, [f'db_unavailable: {db} ({exc})']
     finally:
@@ -777,15 +790,19 @@ def _rung(
 class Coverage(TypedDict):
     """One metric's readable-tick coverage, as reported and as serialised.
 
-    A TypedDict rather than a ``dict[str, float]``: the entry carries two
-    counts, a fraction that is ``None`` when there is nothing to divide by,
-    and the NAME of the readability metric the counts came from, and every
-    consumer reads those four back at different types. At runtime it is a
-    plain dict, so the JSON payload and the tests asserting on it are
-    unchanged.
+    A TypedDict rather than a ``dict[str, float]``: the entry carries three
+    counts, a fraction that is ``None`` when it cannot be known, and the NAME
+    of the readability metric the counts came from, and every consumer reads
+    those back at different types. At runtime it is a plain dict, which is
+    what lands in the JSON payload.
+
+    ``ticks_in_corpus`` is the fraction's denominator; ``ticks_with_a_row`` is
+    not, and is reported beside it so "the leaf existed for 3 of 14 days" stays
+    visible instead of being rounded into a single number.
     """
 
-    ticks: int
+    ticks_in_corpus: int
+    ticks_with_a_row: int
     readable: int
     readable_fraction: float | None
     readability_metric: str
@@ -799,13 +816,18 @@ def coverage_table(
     """Per VALUE metric, the readable-tick coverage its numbers rest on.
 
     A failed read emits no value row at all, so ``hold_fraction``'s denominator
-    is the number of SUCCESSFUL reads rather than the number of ticks. A
-    ``*_read_ok`` row IS emitted every tick, so its row count is the tick count
-    and its 1.0 count is the readable count — which is the whole reason
-    ``collect_load_metrics`` persists it as a metric instead of a log line.
-    Without this, "holds on 12% of samples" reads identically whether the
-    corpus covered a fortnight or the 3% of it that was readable, and those are
-    opposite verdicts for setting a dispatch threshold.
+    is the number of SUCCESSFUL reads rather than the number of ticks. Without
+    this, "holds on 12% of samples" reads identically whether the corpus covered
+    a fortnight or the 3% of it that was readable, and those are opposite
+    verdicts for setting a dispatch threshold.
+
+    The fraction is readable ticks over the CORPUS tick count, ``TICK_METRIC``'s
+    row count — not over the row count of the arm's own ``*_read_ok`` metric.
+    The two agree only for a readability metric written on every tick, which
+    ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is not: that one is
+    written only on ticks its leaf was discovered, so a leaf present for 3 days
+    of a 14-day corpus has 3 days of rows, all readable, and dividing by its
+    own row count reported that as full coverage.
 
     ``None`` for an arm whose collector emits no readability metric — the four
     host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
@@ -815,6 +837,7 @@ def coverage_table(
     unreadable while its siblings are fine, which is exactly the case worth
     seeing.
     """
+    ticks_in_corpus = len(readability.get(TICK_METRIC, []))
     out: dict[str, Coverage | None] = {}
     for metric in series:
         arm = _arm_for(metric, specs)
@@ -827,20 +850,64 @@ def coverage_table(
         _stem, separator, tail = metric.partition(':')
         key = f'{spec.readability}:{tail}' if separator else spec.readability
         points = readability.get(key, [])
-        ticks = len(points)
         readable = sum(1 for _ts, value in points if value == 1.0)
         out[metric] = {
-            'ticks': ticks,
+            'ticks_in_corpus': ticks_in_corpus,
+            'ticks_with_a_row': len(points),
             'readable': readable,
-            # None, not 0.0, when there is nothing to divide by. Zero ticks is
-            # an UNKNOWN coverage; 0.0 is the claim "we looked and it was never
-            # readable", and the floor check below would then report absence of
-            # evidence as a below-floor verdict about the corpus. Same class of
-            # defect as the fabricated 1.0 refused above.
-            'readable_fraction': round(readable / ticks, 4) if ticks else None,
+            # None, not 0.0, when either count is zero. No clock is an unknown
+            # denominator and no readability row is no evidence about the
+            # series; 0.0 is the claim "we looked and it was never readable",
+            # and the floor check below would then report absence of evidence
+            # as a below-floor verdict about the corpus. Same class of defect
+            # as the fabricated 1.0 refused above.
+            'readable_fraction': (
+                round(readable / ticks_in_corpus, 4)
+                if ticks_in_corpus and points else None
+            ),
             'readability_metric': key,
         }
     return out
+
+
+def _absence_clause(stats: Coverage) -> str:
+    """Name the part of a coverage shortfall that is ABSENCE, not failed reads.
+
+    A corpus tick with no ``*_read_ok`` row for the series is a tick its leaf
+    was not discovered on — a unit restarted, added or removed — and sends an
+    operator somewhere different from a tick that was read and failed.
+    """
+    absent = stats['ticks_in_corpus'] - stats['ticks_with_a_row']
+    if absent <= 0:
+        return ''
+    return (
+        f"; `{stats['readability_metric']}` has no row at all on {absent} of "
+        'those ticks (its leaf was not discovered), so that much of the '
+        'shortfall is absence, not failed reads'
+    )
+
+
+def _coverage_line(stats: Coverage | None) -> str:
+    """The report's one-line coverage verdict printed beside a hold ladder."""
+    if stats is None:
+        return (
+            'Coverage: no readability metric for this arm, so the hold '
+            'fractions below are over readable ticks of unknown count.'
+        )
+    if stats['readable_fraction'] is None:
+        return (
+            f"Coverage: UNKNOWN — the corpus holds {stats['ticks_with_a_row']} "
+            f"`{stats['readability_metric']}` rows and {stats['ticks_in_corpus']} "
+            f'`{TICK_METRIC}` clock rows, and a coverage needs both, so the '
+            'hold fractions below are over readable ticks of unknown count. '
+            'See degradations.'
+        )
+    return (
+        f"Coverage: readable on {stats['readable']}/{stats['ticks_in_corpus']} "
+        f"corpus ticks ({stats['readable_fraction']:.1%}){_absence_clause(stats)}"
+        + ('' if stats['readable_fraction'] >= D11_READABILITY_FLOOR
+           else ' — **BELOW THE FLOOR**, see degradations')
+    )
 
 
 def readability_degradations(
@@ -861,17 +928,20 @@ def readability_degradations(
             continue
         if stats['readable_fraction'] is None:
             out.append(
-                f"unknown_readability: {metric} has no "
-                f"{stats['readability_metric']} rows in the corpus, so its "
-                'coverage is unknown — not zero. Its hold fractions below are '
-                'over readable ticks of unknown count.'
+                f"unknown_readability: {metric} coverage is unknown — not zero: "
+                f"the corpus holds {stats['ticks_with_a_row']} "
+                f"{stats['readability_metric']} rows and "
+                f"{stats['ticks_in_corpus']} {TICK_METRIC} clock rows, and a "
+                'coverage needs both. Its hold fractions below are over '
+                'readable ticks of unknown count.'
             )
         elif stats['readable_fraction'] < D11_READABILITY_FLOOR:
             out.append(
                 f"low_readability: {metric} readable on {stats['readable']}/"
-                f"{stats['ticks']} ticks ({stats['readable_fraction']:.1%}), below "
-                f'the {D11_READABILITY_FLOOR:.0%} floor — read its hold fractions '
-                'against that coverage, not as a fortnight'
+                f"{stats['ticks_in_corpus']} corpus ticks "
+                f"({stats['readable_fraction']:.1%}), below the "
+                f'{D11_READABILITY_FLOOR:.0%} floor{_absence_clause(stats)} — '
+                'read its hold fractions against that coverage, not as a fortnight'
             )
     return out
 
@@ -1034,25 +1104,6 @@ def main(argv: list[str] | None = None) -> int:
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
         in_force = configured.get(arm) if arm else None
-        stats = coverage.get(metric)
-        if stats is None:
-            readable = (
-                'Coverage: no readability metric for this arm, so the hold '
-                'fractions below are over readable ticks of unknown count.'
-            )
-        elif stats['readable_fraction'] is None:
-            readable = (
-                f"Coverage: UNKNOWN — no `{stats['readability_metric']}` rows in "
-                'the corpus, so the hold fractions below are over readable ticks '
-                'of unknown count. See degradations.'
-            )
-        else:
-            readable = (
-                f"Coverage: readable on {stats['readable']}/{stats['ticks']} "
-                f"ticks ({stats['readable_fraction']:.1%})"
-                + ('' if stats['readable_fraction'] >= D11_READABILITY_FLOOR
-                   else ' — **BELOW THE FLOOR**, see degradations')
-            )
         lines += [
             f'### `{metric}` — {spec.unit if spec else ""}',
             '',
@@ -1060,7 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
             '',
             # A hold fraction's denominator is readable ticks, not ticks, so it
             # is printed beside the coverage it was computed over — never alone.
-            readable,
+            _coverage_line(coverage.get(metric)),
             '',
             '| candidate | hold fraction | <= target | longest hold run |',
             '|---|---|---|---|',

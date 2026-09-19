@@ -1338,6 +1338,36 @@ class TestCalibrationScriptArmTableLockstep:
             'nothing in the calibration report is computed from them.'
         )
 
+    @pytest.mark.parametrize('read_ok', [True, False])
+    def test_the_scripts_tick_clock_is_emitted_on_every_completed_tick(
+        self, tmp_path, read_ok
+    ):
+        """Every coverage row's DENOMINATOR is this metric's row count.
+
+        So it must be written on every tick ``collect_load_metrics`` completes
+        — with no leaf discovered and with /proc/stat unreadable alike. Were it
+        per-leaf or per-successful-read, the script would divide by the ticks
+        something happened to be there, and report full coverage for a leaf
+        observed over a fraction of the corpus.
+        """
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        module = self._load_calibration_script()
+        tree = build_cgroup_tree(tmp_path, groups={})
+        emitted = collect_load_metrics(
+            read_runqueue=lambda **_kwargs: RunqueueReading(0.0, read_ok),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert module.TICK_METRIC in emitted, (
+            f'scripts/load-threshold-calibration.py::TICK_METRIC '
+            f'({module.TICK_METRIC!r}) is missing from a completed tick with no '
+            f'leaves and read_ok={read_ok}; emitted: {sorted(emitted)}'
+        )
+
     def test_loading_the_script_needs_no_first_party_package(self):
         """The property that makes this lockstep test possible at all."""
         module = self._load_calibration_script()

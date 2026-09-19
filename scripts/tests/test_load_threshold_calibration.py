@@ -587,7 +587,7 @@ def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: P
     for setting a dispatch threshold, and the report could not tell them apart.
     """
     db = seed_db(tmp_path / 'db.sqlite', {
-        # read_ok is emitted EVERY tick, so its row count IS the tick count.
+        # runqueue_read_ok is the tick clock: one row every tick, readable or not.
         'runqueue_read_ok': [1.0] * 10 + [0.0] * 90,
         'runqueue_ratio': [5.0] * 10,
     })
@@ -596,7 +596,8 @@ def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: P
     assert result.returncode == 0, result.stderr
 
     coverage = trailing_json(result.stdout)['coverage']['runqueue_ratio']
-    assert coverage['ticks'] == 100
+    assert coverage['ticks_in_corpus'] == 100
+    assert coverage['ticks_with_a_row'] == 100
     assert coverage['readable'] == 10
     assert coverage['readable_fraction'] == pytest.approx(0.1)
 
@@ -639,6 +640,7 @@ def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: 
     stem's coverage would hide exactly the case worth seeing.
     """
     db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 20,
         'own_read_ok:orchestrator-reify.service': [1.0] * 20,
         'own_cpu_some10:orchestrator-reify.service': [30.0] * 20,
         'own_read_ok:orchestrator-know-live.service': [1.0] * 2 + [0.0] * 18,
@@ -652,11 +654,106 @@ def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: 
     assert coverage['own_cpu_some10:orchestrator-reify.service'][
         'readable_fraction'] == pytest.approx(1.0)
     assert coverage['own_cpu_some10:orchestrator-know-live.service'] == {
-        'ticks': 20, 'readable': 2, 'readable_fraction': 0.1,
+        'ticks_in_corpus': 20, 'ticks_with_a_row': 20,
+        'readable': 2, 'readable_fraction': 0.1,
         # Named, so a reader of the escalation can tell WHICH series was
         # counted — the per-leaf join is the thing this test is about.
         'readability_metric': 'own_read_ok:orchestrator-know-live.service',
     }
+
+
+def seed_leaf_present_for_the_last_fifth(path: Path) -> Path:
+    """A 100-tick corpus in which one leaf exists only for the last 20 ticks.
+
+    The shape a restarted, added or renamed ``orchestrator-*.service`` leaves
+    behind, and the one task 3394's ``df-*.slice`` migration produces
+    mid-corpus: the sampler writes ``own_read_ok:<leaf>`` only on ticks it
+    DISCOVERED the leaf, so the late leaf has 20 rows, all readable, while the
+    tick clock and the steady leaf have 100.
+    """
+    seed_db(path, {
+        'runqueue_read_ok': [1.0] * 100,
+        'own_read_ok:orchestrator-reify.service': [1.0] * 100,
+        'own_cpu_some10:orchestrator-reify.service': [30.0] * 100,
+    })
+    return seed_db(path, {
+        'own_read_ok:orchestrator-new.service': [1.0] * 20,
+        'own_cpu_some10:orchestrator-new.service': [30.0] * 20,
+    }, start_ts=1_000_000 + 80 * 5)
+
+
+def test_a_leaf_present_for_part_of_the_corpus_is_covered_over_all_of_it(
+    tmp_path: Path,
+):
+    """The denominator is the corpus tick count, not the leaf's own row count.
+
+    Dividing by the leaf's own ``own_read_ok`` rows reported 20/20 = 100% for a
+    leaf observed over a fifth of the window, and the floor never fired — the
+    misreading the coverage block exists to prevent, delivered to the human
+    setting a production threshold. Run with ``--arm own_cpu_some_avg10`` on
+    purpose: the clock belongs to the runqueue arm, and must be read even when
+    that arm is not the one asked for.
+    """
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['own_cpu_some10:orchestrator-new.service'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 20,
+        'readable': 20, 'readable_fraction': 0.2,
+        'readability_metric': 'own_read_ok:orchestrator-new.service',
+    }
+    assert payload['coverage']['own_cpu_some10:orchestrator-reify.service'][
+        'readable_fraction'] == pytest.approx(1.0)
+    low = [d for d in payload['degradation_details']
+           if d.startswith('low_readability')]
+    assert len(low) == 1 and 'orchestrator-new.service' in low[0], low
+    assert '20/100' in low[0] and 'no row at all on 80' in low[0], (
+        'the degradation must say the shortfall is ABSENCE, or an operator goes '
+        f'hunting a flaky read that never happened: {low[0]}'
+    )
+
+
+def test_the_report_line_separates_absence_from_failed_reads(tmp_path: Path):
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    [late] = [line for line in result.stdout.splitlines()
+              if line.startswith('Coverage:') and 'orchestrator-new' in line]
+    assert '20/100 corpus ticks (20.0%)' in late, late
+    assert 'no row at all on 80' in late and 'BELOW THE FLOOR' in late, late
+    [steady] = [line for line in result.stdout.splitlines()
+                if line.startswith('Coverage:') and 'orchestrator-new' not in line]
+    assert steady == 'Coverage: readable on 100/100 corpus ticks (100.0%)', steady
+
+
+def test_a_series_with_no_read_ok_rows_is_unknown_even_when_the_clock_ran(
+    tmp_path: Path,
+):
+    """A clock alone is a denominator with no numerator evidence — not 0%.
+
+    Without the guard the fraction is 0/30, and the floor check reports a
+    below-floor read rate for a series nothing was ever recorded about.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 30,
+        'own_cpu_some10:orchestrator-reify.service': [30.0] * 30,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:orchestrator-reify.service']
+    assert coverage['ticks_in_corpus'] == 30
+    assert coverage['ticks_with_a_row'] == 0
+    assert coverage['readable_fraction'] is None, coverage
+    assert 'unknown_readability' in payload['degradations'], payload['degradations']
+    assert 'low_readability' not in payload['degradations'], payload['degradations']
 
 
 def test_an_arm_whose_read_ok_rows_are_absent_reports_unknown_not_zero(
@@ -683,7 +780,8 @@ def test_an_arm_whose_read_ok_rows_are_absent_reports_unknown_not_zero(
 
     payload = trailing_json(result.stdout)
     coverage = payload['coverage']['runqueue_ratio']
-    assert coverage['ticks'] == 0
+    assert coverage['ticks_in_corpus'] == 0
+    assert coverage['ticks_with_a_row'] == 0
     assert coverage['readable_fraction'] is None, (
         'a coverage computed over zero ticks reported a number; '
         f'got {coverage!r}'
