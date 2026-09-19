@@ -22,6 +22,7 @@ import json
 import logging
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1840,7 +1841,7 @@ async def _run_architect_eval_hermetic(
         if mock_cap_retry is not None:
             p(patch('orchestrator.evals.runner.invoke_with_cap_retry',
                     mock_cap_retry))
-        extra = (
+        extra: dict[str, Any] = (
             {} if injected_gate is _NO_INJECTED_GATE
             else {'usage_gate': injected_gate}
         )
@@ -5008,6 +5009,7 @@ class TestCampaignUsageGate:
             assert yielded is gate
 
         build.assert_awaited_once()
+        assert build.await_args is not None
         assert build.await_args.args[0] is base
 
     async def test_gate_is_shut_down_on_normal_exit(

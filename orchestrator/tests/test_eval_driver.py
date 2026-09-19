@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -442,7 +443,7 @@ async def _run_eval_hermetic(
     captured['build_gate'] = mock_build_gate
     captured['wf'] = fake_wf
 
-    extra = (
+    extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_eval(
@@ -565,7 +566,7 @@ async def _run_end_to_end_hermetic(
     monkeypatch.setattr(runner, 'save_result', mock_save)
     monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
 
-    extra = (
+    extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_end_to_end(
@@ -722,7 +723,7 @@ class TestRunEvalInjectedGate:
 
         gate = make_gate_mock()
         boom = RuntimeError('boom')
-        kwargs = (
+        kwargs: dict[str, Any] = (
             {'run_side_effect': boom} if failure == 'run'
             else {'collect_side_effect': boom}
         )
@@ -837,7 +838,7 @@ class TestRunEndToEndInjectedGate:
 
         gate = make_gate_mock()
         boom = RuntimeError('boom')
-        kwargs = (
+        kwargs: dict[str, Any] = (
             {'run_side_effect': boom} if failure == 'run'
             else {'collect_side_effect': boom}
         )
@@ -958,6 +959,7 @@ async def _assert_one_gate_serves_every_cell(probe: _CampaignGateProbe, stage):
     assert _distinct_gates(probe) == {id(probe.gate)}
     # Torn down exactly once, and (per the in-cell assert above) only after the
     # last cell returned.
+    assert probe.gate is not None
     probe.gate.shutdown.assert_awaited_once()
 
 
@@ -967,6 +969,7 @@ async def _assert_teardown_survives_a_failing_cell(probe: _CampaignGateProbe, st
     # The surviving cells still completed (the pre-existing continue-on-failure
     # contract is untouched) and the gate is still torn down exactly once.
     assert results, 'the non-failing cells must still return their results'
+    assert probe.gate is not None
     probe.gate.shutdown.assert_awaited_once()
 
 
@@ -976,6 +979,7 @@ async def _assert_teardown_survives_cancellation(probe: _CampaignGateProbe, stag
 
     # Cancellation still propagates AND the gate is torn down — no leaked probe
     # loop on the SIGINT path, which is the one an operator actually takes.
+    assert probe.gate is not None
     probe.gate.shutdown.assert_awaited_once()
 
 

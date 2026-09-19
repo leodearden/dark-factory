@@ -557,6 +557,7 @@ class TestRunEvalMatrixCampaignGate:
         # …literally the same object in every cell (one cap-state view)…
         assert {id(g) for g in probe.seen} == {id(probe.gate)}
         # …torn down exactly once, and only after the last cell returned.
+        assert probe.gate is not None
         probe.gate.shutdown.assert_awaited_once()
 
     async def test_teardown_survives_a_failing_cell(
@@ -574,6 +575,7 @@ class TestRunEvalMatrixCampaignGate:
 
         # log-and-continue is untouched, and the gate still comes down once.
         assert [r.task_id for r in results] == ['task_b']
+        assert probe.gate is not None
         probe.gate.shutdown.assert_awaited_once()
 
     async def test_teardown_survives_cancellation(
@@ -596,6 +598,7 @@ class TestRunEvalMatrixCampaignGate:
                 force=True,
             )
 
+        assert probe.gate is not None
         probe.gate.shutdown.assert_awaited_once()
 
     async def test_a_degraded_campaign_stays_ungated(
