@@ -590,7 +590,8 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > is the rule's REACH, so it is rewritten rather than deleted. 4502 narrowed B5 off a
 > bare substring refusal but reasoned only about inner CLOSERS — this entry, the
 > implementation and its negative controls alike — so the OPENER half of the same
-> class stayed open. `_inner_closer_blocks` iterates over closers, so a well-formed
+> class stayed open. `_inner_markup_blocks` (renamed from `_inner_closer_blocks`,
+> whose name had stopped describing its rule) iterated over closers alone, so a well-formed
 > sibling parameter opener inside a recovered value was invisible to it: glued into
 > that value verbatim while the parameter it named was silently NOT recovered, which
 > is the no-silent-partial-repair failure of committed-corpus record 25 reached
@@ -633,12 +634,19 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > and after 4502, so not a 4502 regression. It never reaches the rule, because
 > `_parse_body`'s cheap prefilter only fires on a closing-tag sequence; closing it
 > means moving the test up beside that prefilter, which rewrites the sweep's
-> documented unterminated-inner-opener convergence case. Ticket
-> `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`. (2) The widened rule leaves `_parse_body`'s
-> depth-1 probe short-circuit unreachable by construction (instrumented: 1 execution
-> before, 0 after). It is documented in place and kept, because deleting it removes a
-> recursion bound 4502 landed deliberately. Ticket `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`.
-> Named here so both stay greppable instead of being rediscovered as inconsistencies.
+> documented unterminated-inner-opener convergence case. **Task 5639** (filed as
+> `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
+> `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
+> so 5639 landing fails loudly here instead of silently contradicting this
+> paragraph. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> unreachable by construction (instrumented: 1 execution before, 0 after). It is
+> documented in place and kept, because deleting it removes a recursion bound 4502
+> landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
+> Named here so both stay greppable instead of being rediscovered as
+> inconsistencies — by TASK id, because a `tkt_…` is a transient submit_task
+> receipt: the first of these two resolved to status `combined` ("already pending in
+> the pool"), so following it alone lands a reader on a dropped duplicate rather
+> than on the open work.
 >
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and
