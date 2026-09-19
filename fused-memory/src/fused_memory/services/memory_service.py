@@ -3237,10 +3237,13 @@ class MemoryService:
         not family-keying on its own. Renaming first would leave the
         just-renamed survivor and the family's pre-existing canonical member
         BOTH named 'Task N' between the two awaits, and this pass is
-        best-effort — so a merge failing there would leave that pair behind
-        permanently, with ``_dedup_episode_nodes`` already run earlier in
-        ``_reconcile_episode_identity`` and nothing later in the chain to
-        collapse it. Merging first cannot mint a same-name twin, and a failed
+        best-effort — so a merge failing there would leave that pair behind.
+        ``_dedup_episode_nodes`` has already run by then, earlier in
+        ``_reconcile_episode_identity``, and nothing later in the chain
+        collapses it, so the pair would survive until some future episode
+        mentions that task again — which for the fragmented families this
+        repair exists for is exactly what may never happen.
+        Merging first cannot mint a same-name twin, and a failed
         rename merely leaves one fully-collapsed node under a non-canonical
         name, which the next episode touching that task renames.
 

@@ -52,39 +52,53 @@ IDENTICAL for `Task 605`, `task 605` and the pluralized-container `tasks 605`.
 **Survivor selection changed, and it changes which uuid survives.** The old
 policy had a special case — a canonically-named node wins regardless of edge
 count — whose only purpose was to avoid recreating the exact-name duplicate
-`_dedup_episode_nodes` resolves. Family-keying removes that hazard outright (the
-whole family collapses in one pass, so a rename cannot leave a same-name twin
-behind), so one uniform rule replaces the two branches: the survivor is
-`family[0]` under the backend's existing survivor-first ordering (most valid
-edges, then oldest, then uuid), renamed onto the canonical name only if it is
-not already canonical, with every other member merged into it. It degenerates to
-the old behaviour whenever the canonical node genuinely is the best member. Where
-the two diverge is the low-edge-canonical/high-edge-variant pair: the old rule
-made the low-edge canonical node the survivor and dragged the variant's edges
-across, the new rule keeps the high-edge node and moves fewer edges, then renames
-it. Fewer edges moved is less write amplification on a best-effort post-commit
+`_dedup_episode_nodes` resolves. What rules that hazard out now is the ORDER of
+the two writes, not family-keying: every other member is merged into the
+survivor FIRST and the survivor is renamed onto `Task N` LAST. Renaming first
+would leave the just-renamed survivor and the family's pre-existing canonical
+member both carrying that name between the two awaits, and the pass is
+best-effort by design — so a merge failing there would leave the exact-name pair
+behind. `_dedup_episode_nodes` has already run by then, earlier in
+`_reconcile_episode_identity`, and nothing later in the chain collapses it, so
+the pair would survive until some future episode mentions that task again —
+which for the fragmented families this repair exists for is exactly what may
+never happen. Merging first cannot mint a same-name twin, and a failed rename
+merely leaves one fully-collapsed node under a non-canonical name, which the
+next episode touching that task renames. With the hazard handled by ordering,
+one uniform rule replaces the two branches: the survivor is `family[0]` under
+the backend's existing survivor-first ordering (most valid edges, then oldest,
+then uuid), renamed onto the canonical name only if it is not already canonical,
+with every other member merged into it. It degenerates to the old behaviour
+whenever the canonical node genuinely is the best member. Where the two diverge
+is the low-edge-canonical/high-edge-variant pair: the old rule made the low-edge
+canonical node the survivor and dragged the variant's edges across, the new rule
+keeps the high-edge node and moves fewer edges, then renames it. Fewer edges moved is less write amplification on a best-effort post-commit
 pass. This is recorded explicitly because it is a change of surviving uuid, not
 an implementation detail — and it is the mechanism doing its job, not an
 adjudication of any specific family by hand.
 
-**The residue that fix can never reach is now countable, and was counted: 297
-fragmented families over 626 nodes.** No amount of correct write-path behaviour
+**The residue that fix can never reach is now countable, and was counted: 296
+fragmented families over 624 nodes.** No amount of correct write-path behaviour
 collapses a family belonging to a task no future episode will mention again,
 because nothing will ever trigger the write path for it — so
 `fused_memory/maintenance/task_family_census.py` goes and looks. Measured
 2026-09-19 against the live FalkorDB store with
 `python -m fused_memory.maintenance.task_family_census --json`: every one of 154
-graphs enumerated in full (`complete: true`, no per-graph failures, exit 0,
-11.7s). Only 5 graphs hold any residue at all — **reify 199** families over 421
-nodes, **dark_factory 64** over 137, **know_live 25** over 50,
-**solar_challenge 6** over 12, **autopilot_video 3** over 6; the other 149
-(test and probe leftovers) report 0. Of the 297, **235 are split across more
-than one spelling** — the shape the write-path fix addresses when such a task is
-next mentioned — and 62 are exact-name duplicate pairs only. 269 families hold 2
-nodes, 27 hold 3, and one (reify `Task 2923`) holds 7 across three spellings.
-**146 of the 297 have a survivor whose spelling is not the canonical one**,
-which is the population where the survivor-selection change above decides a
-different uuid than the old policy would have.
+graphs enumerated in full (`complete: true`, no per-graph failures, no
+unconfirmed families, exit 0, 8.2s). Only 5 graphs hold any residue at all —
+**reify 199** families over 421 nodes, **dark_factory 64** over 137,
+**know_live 25** over 50, **solar_challenge 5** over 10, **autopilot_video 3**
+over 6; the other 149 (test and probe leftovers) report 0. Of the 296, **235 are
+split across more than one spelling** — the shape the write-path fix addresses
+when such a task is next mentioned — and 61 are exact-name duplicate pairs only.
+268 families hold 2 nodes, 27 hold 3, and one (reify `Task 2923`) holds 7 across
+three spellings. **145 of the 296 have a survivor whose spelling is not the
+canonical one**, which is the population where the survivor-selection change
+above decides a different uuid than the old policy would have.
+
+The store is live, so these are a measurement rather than a constant: an
+earlier run the same day reported 297 over 626, and the difference is one
+`solar_challenge` family that collapsed in between.
 
 **The census is read-only by construction, and that is asserted rather than
 promised.** It calls only `enumerate_entity_nodes`,
@@ -97,11 +111,25 @@ one because it can delete, whereas every census run is already a dry run and
 offering the flag would imply an unsafe mode exists. Completeness is carried
 rather than smoothed over — a truncated or failed graph forces
 `complete: false` and a non-zero exit, so a lower bound can never be mistaken
-for a total by a script reading the exit status. Wiring the census into
-`_scan_duplicate_entity_names` and running an unattended collapse sweep were
-both explicitly out of scope, and no family — including the `Task 605` pair the
-task record names, present in `dark_factory` as `task 605` (1 edge) and
-`Task 605` (0 edges) — was adjudicated by hand.
+for a total by a script reading the exit status.
+
+**The count is also guarded against its own two reads disagreeing.**
+Membership comes from `enumerate_entity_nodes`, whose `MATCH (n:Entity)` carries
+no `group_id` property predicate, while the per-family edge-count probe does —
+that predicate is what keeps task-2115's cross-graph leak out of a collapse. A
+leaked node therefore counts toward the "more than one node" threshold and then
+vanishes from the probe, and the store being live means a concurrent write-path
+collapse produces the same shortfall. A family that thins below two spellings in
+between is recorded as an `UnconfirmedFamily` — canonical name plus both
+membership counts — and excluded from the total, rather than reported as a
+fragmented family holding one node or none. It does not move `complete` or the
+exit code: the graph was read in full, and the count is honest precisely because
+that family was left out of it. The measured sweep above reported zero.
+
+Wiring the census into `_scan_duplicate_entity_names` and running an unattended
+collapse sweep were both explicitly out of scope, and no family — including the
+`Task 605` pair the task record names, present in `dark_factory` as `task 605`
+(1 edge) and `Task 605` (0 edges) — was adjudicated by hand.
 
 #### `merge_request` gained a `lane` parameter, and `merge_lane` is blessed into Tier-A (task 4888)
 

@@ -4886,9 +4886,10 @@ class TestNormalizeTaskNodeNames:
         already-canonically-named member, so renaming the survivor FIRST would
         leave two nodes named 'Task 605' until the merge landed. The pass is
         best-effort by design — a merge failing in that window would leave the
-        exact-name pair behind permanently, and _dedup_episode_nodes has
-        already run by then (see the call-order tests below), so nothing later
-        in the chain collapses it.
+        exact-name pair behind, and _dedup_episode_nodes has already run by
+        then (see the call-order tests below), so nothing later in the chain
+        collapses it and the pair survives until some future episode mentions
+        the task again.
 
         Both calls are recorded on one parent mock because each mock knows only
         its own await list; the interleaving is exactly what is under test.
