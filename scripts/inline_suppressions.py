@@ -54,6 +54,7 @@ report's only data source, so nothing downstream re-implements the scan.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import tokenize
@@ -487,4 +488,75 @@ def scan_tree(root: Path) -> Scan:
         comments=tuple(comments),
         files_enumerated=len(tracked),
         files_tokenized=tokenized,
+    )
+
+
+# ---------------------------------------------------------------------------
+# D7 — the multiset key.
+
+#: How many hex characters of the sha256 the key keeps.  Twelve is the PRD's,
+#: and it is part of the ratchet's ``params`` block: changing it makes two
+#: baselines not two measurements of the same thing, which is exactly what
+#: ``shared.ratchet.ParamsMismatch`` exists to refuse.
+_DIGEST_HEX = 12
+
+
+@dataclass(frozen=True)
+class SuppressionKey:
+    """D7's multiset key: ``(kind, sorted codes, digest of the stripped line)``.
+
+    AND DELIBERATELY NO PATH.  That single omission is what buys the ratchet
+    its two best properties: a file rename or split moves every marker without
+    inventing a single new key, and an ordinary task therefore never has to
+    touch the baseline.  Its cost is stated in D7 rather than hidden — two
+    identical lines share one key, so an un-tightened baseline lets an
+    identical line back in where one was removed, which is what ``slack``
+    measures and what D11's sweep files a tighten task for.
+
+    Attributes:
+        kind: Which suppression this is.
+        codes: The rule codes, SORTED at construction — ``[b, a]`` and
+            ``[a, b]`` are the same suppression, and a multiset that
+            disagreed would ratchet on the author's typing order.
+        digest: ``sha256`` of the stripped physical line, truncated.  Digesting
+            the LINE rather than the comment is what makes an edit anywhere on
+            it a touch, which is D7's whole conversion mechanism.
+    """
+
+    kind: Kind
+    codes: tuple[str, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'codes', tuple(sorted(self.codes)))
+
+    def render(self) -> str:
+        """The key as one string, for JSON and for a violation line.
+
+        A RENDERING EXISTS; AN INVERSE DOES NOT, and that asymmetry is the
+        point.  JSON object keys are strings by the format's definition, so
+        something has to render — ``shared.ratchet``'s docstring makes the same
+        argument for the same reason.  What must not exist is a reader that
+        parses one back: ``shared.ratchet`` treats every key as an opaque
+        identity token, so a parser would be the ad-hoc parser of an internal
+        value heuristic 12 forbids, and it would silently promote this spelling
+        to a wire format nobody could ever change.
+
+        The codes group is omitted entirely when there are none, because
+        ``pragma: no cover[]`` reads as a missing code rather than as a kind
+        that never has one.  The digest is separated by a SPACE, never by
+        ``@`` — ``@`` is :meth:`SuppressionClass.render`'s separator, and two
+        key spellings a reader could confuse is the one thing worth spending a
+        character to avoid.
+        """
+        codes = f'[{",".join(self.codes)}]' if self.codes else ''
+        return f'{self.kind.value}{codes} {self.digest}'
+
+
+def key_for(site: Site) -> SuppressionKey:
+    """The D7 key *site* contributes to the multiset."""
+    return SuppressionKey(
+        kind=site.kind,
+        codes=site.codes,
+        digest=hashlib.sha256(site.text.encode('utf-8')).hexdigest()[:_DIGEST_HEX],
     )
