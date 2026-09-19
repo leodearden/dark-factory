@@ -1078,14 +1078,28 @@ def test_a_disposition_on_a_line_with_no_suppression_is_a_violation(tmp_path: Pa
     here; its docstring says so outright and delegates this violation to the
     scanner, because deciding it needs the kind table.  So the detection is
     "this comment yielded a Disposition and no Site", never a parser outcome.
+
+    THE PREFILTER'S REACH BOUNDS THIS FINDING, and the bound is asserted rather
+    than left to be discovered.  A file carrying no marker byte substring at
+    all is never decoded, so a stray disposition alone in such a file is
+    invisible.  That is the honest limit and it lands on the harmless side: in
+    a file with no suppressions there is nothing anywhere for the marker to
+    answer for, so it is inert prose.  The dangerous case — an author who
+    believes a REAL marker in this file is now dispositioned when it is not —
+    is exactly the case that IS caught, because that file carries a marker.
     """
     result = _classify(
-        tmp_path, {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'x = 1  # debt: task 5\n'}
+        tmp_path,
+        {
+            'pyproject.toml': _RUFF_CONFIG,
+            'm.py': 'a = 1  # noqa: E402  # debt: task 5601\nx = 2  # debt: task 5\n',
+            'markerless.py': 'y = 3  # debt: task 7\n',
+        },
     )
 
     (violation,) = result.violations
     assert violation.path == 'm.py'
-    assert violation.line == 1
+    assert violation.line == 2
     assert result.counts == {}
 
 
