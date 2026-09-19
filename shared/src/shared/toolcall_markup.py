@@ -663,6 +663,19 @@ def _parse_body(body: str, *, probe: bool, start: int = 0) -> dict[str, str] | N
     construction — deliberately a flag rather than a depth counter, because
     there is exactly one legal depth and a counter would invite a second.
 
+    THAT DEPTH-1 REFUSAL NO LONGER FIRES (task **5620**), and is kept anyway.
+    :func:`_inner_closer_blocks` now blocks any value carrying a well-formed
+    parameter opener, and an opener at the remainder's start position is the
+    only thing the probe could have parsed an item from — so the branch is
+    unreachable BY CONSTRUCTION rather than merely untested, and condition (ii)
+    decides only whether the remainder is blank. Instrumented across the five
+    markup suites: 1 execution at ``1b9fedeb97``, 0 at ``715bf54b9d``. Stated
+    here as the measurement it is, with the collapse owned by ticket
+    ``tkt_0RTT9N05CHRSHN2MSCHNXX4A8D``, so a reader meets a known dead branch
+    rather than an oversight. Note what the collapse may NOT take with it:
+    *start* below carries its own separately-measured performance contract and
+    has nothing to do with this rule.
+
     *start* is where in *body* to begin, and is what keeps the probe CHEAP. It
     exists instead of the obvious ``_parse_body(body[offset:], ...)`` because
     that slice is O(len(body)) and runs once per inner closer per tail item per
@@ -713,6 +726,18 @@ def _parse_body(body: str, *, probe: bool, start: int = 0) -> dict[str, str] | N
             if probe:
                 # Depth 1. The probe only has to answer "does this remainder
                 # parse at all"; re-entering the narrowing here would recurse.
+                #
+                # MEASURED UNREACHABLE as of task 5620, and deliberately kept.
+                # Instrumented across the five markup suites: 1 execution at
+                # 1b9fedeb97, 0 at 715bf54b9d. The probe can only parse an item
+                # when an opener sits at its start position, and that value is
+                # now blocked by the opener mirror before condition (ii) is
+                # consulted, so (ii) decides only whether the remainder is
+                # blank. Collapsing the apparatus belongs to ticket
+                # tkt_0RTT9N05CHRSHN2MSCHNXX4A8D, not here: it means deleting a
+                # recursion bound task 4502 landed with an explicit
+                # flag-not-counter argument. *start* must survive that collapse
+                # regardless — its contract is independent of this rule.
                 return None
             if _inner_closer_blocks(body, match.end(), item_value, name, closer_name):
                 return None  # a SECOND mis-close: the boundary is a guess (B5)
