@@ -2362,7 +2362,7 @@ def create_server(
         if task_id:
             all_pending = queue.get_by_task(task_id, status='pending')
         else:
-            all_pending = queue.get_pending()
+            all_pending = await asyncio.to_thread(queue.get_pending)
         escalations = (
             all_pending if level is None
             else [e for e in all_pending if e.level == level]
