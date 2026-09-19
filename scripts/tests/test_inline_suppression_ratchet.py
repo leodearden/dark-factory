@@ -701,33 +701,32 @@ def test_type_ignore_and_pyright_ignore_resolve_to_pyright_whatever_the_code(tmp
             ), (kind, codes)
 
 
-def test_a_kind_with_no_row_in_the_consumer_model_is_an_instrument_failure(
-    tmp_path: Path, monkeypatch
-):
-    """The guard that stops a sixth kind inheriting ``noqa``'s behaviour by
-    omission.
+def test_every_kind_the_scanner_scans_resolves_to_a_consumer(tmp_path: Path):
+    """The totality that ``consumer_for``'s guard defends, asserted one stage
+    earlier than the guard can fire.
 
-    ``_KIND_CONSUMERS`` is deliberately PARTIAL — ``noqa`` has no row because its
-    answer depends on the code and the config — so the read site cannot tell a
-    deliberate absence from a forgotten one by looking at the table alone.  A
-    kind added to ``KIND_SPECS`` and forgotten here would fall straight through
-    to the noqa path and be resolved against a ruff config that has never heard
-    of it, which is a wrong answer delivered confidently.  Exit 2 instead.
+    The consumer table is deliberately PARTIAL — ``noqa`` has no row because its
+    answer depends on the code and the config — so a sixth kind added to
+    ``KIND_SPECS`` and forgotten there falls through to the noqa path and is
+    resolved against a ruff config that has never heard of it.  The guard turns
+    that into a loud exit 2 for whoever next runs a scan; this turns it into a
+    red for the author who added the kind, while they still hold the context to
+    fix it.  Both, because the two catch it at different moments (heuristic 10).
 
-    Emptied rather than extended, because :class:`Kind` is a closed enum and no
-    sixth member can be invented from outside: to the one read site, a kind with
-    no row is a kind with no row however the table came to lack it.
+    DRIVEN OFF ``KIND_SPECS`` AND THE PUBLIC RESOLVER, never by patching the
+    private table by dotted path: that is the one shape ``docs/code-quality.md``
+    names outright, and design decision 10 already turned down the same
+    shortcut for the first-party code table.  A behavioural assertion is also
+    strictly stronger here — it fails for a kind whose row exists but resolves
+    by accident, which a patched-out table could not detect.
     """
     _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
-    monkeypatch.setattr(inline_suppressions, '_KIND_CONSUMERS', {})
 
-    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
-        _consumer_of(
-            tmp_path, kind=inline_suppressions.Kind.TYPE_IGNORE, codes=('arg-type',)
-        )
-
-    assert 'type: ignore' in str(caught.value)
-    assert 'consumer model' in str(caught.value)
+    for kind in inline_suppressions.KIND_SPECS:
+        assert isinstance(
+            _consumer_of(tmp_path, kind=kind, codes=('E402',)),
+            inline_suppressions.Consumer,
+        ), kind
 
 
 def test_pragma_no_cover_and_nosec_resolve_to_no_consumer(tmp_path: Path):
