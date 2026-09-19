@@ -19,6 +19,7 @@ from fused_memory.utils import task_naming
 from fused_memory.utils.canonical_labels import Referent, parse_node_name
 from fused_memory.utils.task_naming import (
     canonicalize_task_node_name,
+    group_task_node_families,
     task_node_referent,
 )
 
@@ -267,6 +268,112 @@ class TestTaskNodeReferent:
             assert canonical is None
         else:
             assert canonical == referent.node_name
+
+
+class TestGroupTaskNodeFamilies:
+    """Partitioning nodes by family is THE operation both consumers need.
+
+    ``MemoryService._normalize_task_node_names`` uses it to filter the backend's
+    substring candidates down to one family; ``maintenance/task_family_census``
+    uses it to partition a whole graph. It is a named function rather than two
+    inlined loops so the family rule stays at one site.
+    """
+
+    def test_every_spelling_of_one_number_collapses_into_one_family(self):
+        """The keying the whole task turns on: four spellings, one key."""
+        nodes = [
+            {'name': 'Task 605'},
+            {'name': 'task 605'},
+            {'name': 'tasks 605'},
+            {'name': 'task #605'},
+        ]
+
+        families = group_task_node_families(nodes)
+
+        assert list(families) == [Referent(kind='task', number='605')]
+        assert families[Referent(kind='task', number='605')] == nodes
+
+    def test_distinct_numbers_are_distinct_families(self):
+        nodes = [{'name': 'Task 605'}, {'name': 'task 700'}]
+
+        families = group_task_node_families(nodes)
+
+        assert families == {
+            Referent(kind='task', number='605'): [nodes[0]],
+            Referent(kind='task', number='700'): [nodes[1]],
+        }
+
+    def test_numbers_merely_containing_the_digits_do_not_join_the_family(self):
+        """The precision the normalizer's substring prefilter relies on.
+
+        A ``CONTAINS '605'`` probe hands back 'Task 6051' and 'Task 1605' too;
+        this filter is what keeps them out of the 605 family, so the label
+        vocabulary never has to be re-expressed inside a Cypher predicate.
+        """
+        nodes = [{'name': 'Task 605'}, {'name': 'Task 6051'}, {'name': 'Task 1605'}]
+
+        families = group_task_node_families(nodes)
+
+        assert families[Referent(kind='task', number='605')] == [nodes[0]]
+        assert families[Referent(kind='task', number='6051')] == [nodes[1]]
+        assert families[Referent(kind='task', number='1605')] == [nodes[2]]
+
+    def test_non_task_and_project_qualified_names_are_dropped(self):
+        """'reify:605' names a FOREIGN task and must never join the local family.
+
+        It is exactly the kind of node a ``CONTAINS '605'`` probe returns, and
+        folding it in would have the normalizer merge another project's node
+        into ours.
+        """
+        nodes = [
+            {'name': 'Alice'},
+            {'name': 'deploy pipeline'},
+            {'name': 'reify:605'},
+            {'name': 'release 605 notes'},
+        ]
+
+        assert group_task_node_families(nodes) == {}
+
+    def test_within_a_family_input_order_is_preserved_exactly(self):
+        """Load-bearing, not incidental: the normalizer takes ``members[0]`` as
+        the merge survivor, so the backend's survivor-first ordering has to
+        survive the grouping untouched.
+        """
+        survivor = {'name': 'task 605', 'uuid': 'u-high-edges'}
+        second = {'name': 'Task 605', 'uuid': 'u-mid'}
+        third = {'name': 'tasks 605', 'uuid': 'u-low'}
+
+        members = group_task_node_families([survivor, second, third])[
+            Referent(kind='task', number='605')
+        ]
+
+        assert members[0] is survivor
+        assert members[1] is second
+        assert members[2] is third
+
+    def test_leading_zeros_make_a_different_family(self):
+        """Digits are compared verbatim, never int-normalized."""
+        padded = {'name': 'Task 0605'}
+        bare = {'name': 'Task 605'}
+
+        families = group_task_node_families([padded, bare])
+
+        assert families == {
+            Referent(kind='task', number='0605'): [padded],
+            Referent(kind='task', number='605'): [bare],
+        }
+
+    def test_empty_input_yields_an_empty_dict(self):
+        assert group_task_node_families([]) == {}
+
+    def test_a_node_with_a_missing_or_empty_name_is_skipped_not_raised(self):
+        """This runs on a best-effort post-commit path, where raising on one
+        malformed row would abandon every other family in the batch."""
+        good = {'name': 'Task 605'}
+
+        families = group_task_node_families([{'uuid': 'u-1'}, {'name': ''}, good])
+
+        assert families == {Referent(kind='task', number='605'): [good]}
 
 
 class TestNoSecondCopyOfTheLabelPattern:
