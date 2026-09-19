@@ -1169,3 +1169,134 @@ def test_a_suppression_class_renders_d9s_published_key():
     )
 
     assert row.render() == 'noqa[E402]@tests'
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — the ratchet and the verbs.
+
+
+def _revise(root: Path, files: Mapping[str, str], *, removing: tuple[str, ...] = ()) -> None:
+    """Evolve an already-tracked fixture tree and re-stage the result.
+
+    The ratchet's whole subject matter is a tree that CHANGED after a baseline
+    was seeded, so every scenario from here down needs a second edit against a
+    live index.  ``git add -A`` stages deletions too, which is what makes the
+    rename half of scenario 4 a real rename rather than a copy.
+    """
+    for relative in removing:
+        (root / relative).unlink()
+    _write_files(root, files)
+    _run_git(['add', '-A', '-f'], cwd=root)
+
+
+def _grandfathered(count: int) -> str:
+    """*count* distinct lines, each carrying one undisposed suppression.
+
+    Distinct rather than identical on purpose: identical lines collapse to one
+    D7 key with a multiplicity, which is a different scenario (5 and 9) from
+    the many-keys-survive-a-rename one this feeds.
+    """
+    return ''.join(f'a{index} = {index}  # type: ignore[arg-type]\n' for index in range(count))
+
+
+def test_a_new_undisposed_suppression_is_one_violation_line(tmp_path: Path, capsys):
+    """BOUNDARY SCENARIO 1 — the gate's headline case.
+
+    The line has to carry everything an agent needs to act without opening the
+    PRD: where it is, what kind it is, its codes, why it is a finding, and how
+    to spell the fix.  The accepted forms are asserted against
+    ``INLINE_MARKER_FORMS`` itself rather than against retyped strings, so a
+    later edit to the published grammar cannot leave this message behind.
+    """
+    baseline = _write_fixture_tree(tmp_path, {'m.py': 'a = 1\n'}, baseline=True)
+    _revise(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 1
+
+    (violation,) = capsys.readouterr().err.strip().splitlines()
+    assert violation.startswith('m.py:1:')
+    assert 'type: ignore' in violation
+    assert 'arg-type' in violation
+    for form in INLINE_MARKER_FORMS:
+        assert form in violation
+
+
+def test_the_same_suppression_with_a_disposition_is_green(tmp_path: Path):
+    """BOUNDARY SCENARIO 2 — the escape hatch the gate exists to push authors
+    towards, asserted on the very marker scenario 1 rejects."""
+    baseline = _write_fixture_tree(tmp_path, {'m.py': 'a = 1\n'}, baseline=True)
+    _revise(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]  # debt: task 5601\n'})
+
+    assert _check(tmp_path, baseline) == 0
+
+
+def test_editing_a_grandfathered_markers_code_is_a_new_violation(tmp_path: Path, capsys):
+    """BOUNDARY SCENARIO 3 — D7's conversion mechanism, at the gate.
+
+    The marker is not new and the file is not new; only the CODE on the line
+    changed, which is exactly the edit that ought to make an author own what
+    they are silencing.  The digest is of the whole stripped line, so the old
+    key stops being claimed and the new one is in excess.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    _revise(tmp_path, {'m.py': 'a = 1  # type: ignore[attr-defined]\n'})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 1
+    assert 'attr-defined' in capsys.readouterr().err
+
+
+def test_renaming_and_splitting_a_file_of_grandfathered_markers_is_green(tmp_path: Path):
+    """BOUNDARY SCENARIO 4 — the pathless key, end to end.
+
+    Forty grandfathered markers move to two new filenames and the gate does not
+    notice, because no key mentions a path.  This is the property that keeps an
+    ordinary refactor out of the baseline: a key set that moved with the code
+    needs no diff to the committed file at all.
+    """
+    lines = _grandfathered(40).splitlines(keepends=True)
+    baseline = _write_fixture_tree(tmp_path, {'big.py': ''.join(lines)}, baseline=True)
+    _revise(
+        tmp_path,
+        {'moved/first.py': ''.join(lines[:17]), 'moved/second.py': ''.join(lines[17:])},
+        removing=('big.py',),
+    )
+
+    assert _check(tmp_path, baseline) == 0
+
+
+def test_several_new_suppressions_print_one_violation_each(tmp_path: Path, capsys):
+    baseline = _write_fixture_tree(tmp_path, {'m.py': 'a = 1\n'}, baseline=True)
+    _revise(
+        tmp_path,
+        {
+            'm.py': 'a = 1  # type: ignore[arg-type]\n',
+            'n.py': 'b = 2  # pyright: ignore[reportArgumentType]\n',
+        },
+    )
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 1
+
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 2
+    assert {line.split(':')[0] for line in lines} == {'m.py', 'n.py'}
+
+
+def test_a_clean_whole_tree_run_labels_its_green_clean(tmp_path: Path, capsys):
+    """Three greens exist and they are not interchangeable, so the report says
+    which one this is.  ``clean`` is the only one that means the whole tree was
+    measured against a real baseline and nothing was in excess."""
+    baseline = _write_fixture_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 0
+
+    report = capsys.readouterr().out
+    assert 'clean' in report
+    assert 'partial' not in report
