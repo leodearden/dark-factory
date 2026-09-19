@@ -218,8 +218,9 @@ lands in exactly one bucket:
   measurement lost, and one a pasted report must not be able to hide.
 - `unresolved_lifetime` — stamps still pending, including a pending record that
   would also have been gated or whose marker is unreadable. The one number in
-  the report that is not from the window: a pending record has no `resolved_at` to window on, so this is the
-  standing backlog as of the sweep, and its name carries that.
+  the report that is not from the window: a pending record has no `resolved_at`
+  to window on, so this is the standing backlog as of the sweep, and its name
+  carries that.
 
 The rate is computed over the comparable subset only, and the comparable
 denominator is printed beside it, so "95% or better over at least 10 items" is
