@@ -466,9 +466,11 @@ def _normalize_record_keys(keys: object) -> list[tuple[Any, Any]]:
     Non-raising: a non-iterable, or an entry that is not a 2-tuple, degrades
     to "no such key" rather than to an exception.
     """
+    if not isinstance(keys, Iterable):
+        return []
     normalized: list[tuple[Any, Any]] = []
     try:
-        for key in keys or ():
+        for key in keys:
             if isinstance(key, tuple) and len(key) == 2:
                 normalized.append(key)
     except TypeError:
