@@ -2359,10 +2359,34 @@ def create_server(
         # not become a filtered CLASSIFICATION).  Reading with `level=` and then
         # re-reading per task to recover what was just discarded is what made
         # this O(T) full-directory scans.
-        if task_id:
-            all_pending = queue.get_by_task(task_id, status='pending')
-        else:
-            all_pending = await asyncio.to_thread(queue.get_pending)
+        #
+        # That ONE scan runs off the loop, because the loop is not ours: this
+        # server has no process of its own — `harness.py::_start_escalation_server`
+        # runs it under `asyncio.create_task` on the ORCHESTRATOR's loop — so an
+        # inline scan stalls the scheduler and merge worker, not a dedicated
+        # server.  Measured 13.12 ms median / 30.92 ms p95 (40 warm reps, live
+        # root), and DIRENT-dominated: 9,461 entries served 41 records.  That
+        # population tracks LIFETIME escalation count via the record-lock
+        # sidecars retained for archived records, not the pending set, so it only
+        # grows.  Safe because this path is read-only, has no in-process caller,
+        # and `_annotate_pins_recovery` already awaits `scheduler.get_statuses`
+        # between this scan and the response — the yield point moves, it is not
+        # introduced.
+        #
+        # BOUNDARY, so the rest does not read as an oversight: the plain-`def`
+        # tools here (`get_task_escalations` and friends) need nothing — FastMCP
+        # threadpools sync tool functions (`FunctionTool.run` ->
+        # `call_sync_fn_in_threadpool`), so only `async def` tools run inline.
+        # The other inline scans are in the WRITE paths (`escalate_info`/
+        # `escalate_blocker` via `dedupe.find_dedupe_parent`, `promote_to_l2` via
+        # `find_pending_l2_by_root_cause`); hopping a lock-holding mutation
+        # changes submit/dedupe interleaving, which needs its own task.
+        def read_pending():
+            if task_id:
+                return queue.get_by_task(task_id, status='pending')
+            return queue.get_pending()
+
+        all_pending = await asyncio.to_thread(read_pending)
         escalations = (
             all_pending if level is None
             else [e for e in all_pending if e.level == level]
