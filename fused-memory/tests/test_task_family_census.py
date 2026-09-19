@@ -12,6 +12,7 @@ driver itself — rather than by reading the source and trusting it.
 """
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -196,17 +197,31 @@ class TestTaskFamilyCensusRun:
     async def test_the_result_is_frozen_all_the_way_down(self):
         """A census is evidence an operator may act on destructively, so no
         consumer gets to edit it after the fact — the same reason
-        canonical_labels.Referent is frozen."""
+        canonical_labels.Referent is frozen.
+
+        The collections are TUPLES, not lists: frozen=True blocks attribute
+        REBINDING only, so a list field would leave ``families.append(...)``
+        wide open and the frozen-ness would not notice.
+
+        The writes go through ``setattr`` because the two gates disagree here:
+        pyright rejects a direct assignment to a frozen dataclass field before
+        the test can ever run it, while ruff's B010 rejects ``setattr`` with a
+        constant name. The targeted ``noqa`` is this repo's established
+        resolution for that standoff (cf. test_project_scope.py,
+        test_consolidation_gate.py) — neither gate is weakened.
+        """
         census = TaskFamilyCensus(backend=make_census_backend())
 
         result = await census.run(group_id='home')
 
-        with pytest.raises(Exception):
-            result.group_id = 'elsewhere'
-        with pytest.raises(Exception):
-            result.families[0].canonical_name = 'Task 1'
-        with pytest.raises(Exception):
-            result.families[0].variants[0].edge_count = 999
+        with pytest.raises(FrozenInstanceError):
+            setattr(result, 'group_id', 'elsewhere')  # noqa: B010
+        with pytest.raises(FrozenInstanceError):
+            setattr(result.families[0], 'canonical_name', 'Task 1')  # noqa: B010
+        with pytest.raises(FrozenInstanceError):
+            setattr(result.families[0].variants[0], 'edge_count', 999)  # noqa: B010
+        assert isinstance(result.families, tuple)
+        assert isinstance(result.families[0].variants, tuple)
 
 
 class TestTaskFamilyCensusIsReadOnly:
@@ -238,14 +253,18 @@ class TestTaskFamilyCensusIsReadOnly:
         graph.query = AsyncMock()
 
         async def dispatch_ro(cypher, params=None):
+            # CONTAINS is tested FIRST: the substring probe's own Cypher carries
+            # a `count(DISTINCT e)` edge-count aggregate, so a `count(` test
+            # would claim it and answer a four-column read with a one-column
+            # census row.
             result = MagicMock()
-            if 'count(' in cypher:
-                result.result_set = [[len(FIXTURE_NODES)]]
-            elif 'CONTAINS' in cypher:
+            if 'CONTAINS' in cypher:
                 result.result_set = [
                     [row['uuid'], row['name'], row['created_at'], row['edge_count']]
-                    for row in FIXTURE_PROBES.get(params['substring'], [])
+                    for row in FIXTURE_PROBES.get((params or {})['substring'], [])
                 ]
+            elif 'count(' in cypher:
+                result.result_set = [[len(FIXTURE_NODES)]]
             else:
                 result.result_set = [
                     [node['uuid'], node['name'], node['summary']] for node in FIXTURE_NODES
