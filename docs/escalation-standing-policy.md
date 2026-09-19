@@ -91,7 +91,11 @@ agreement rate promotes one of them.
 - `milestone_gate` — a milestone gate of any kind. **Mechanically detected** by
   `escalation/src/escalation/shadow_ruling.py::mechanically_gated`.
 - `deterministic_runner_filing` — anything filed by the deterministic runner's
-  sentinel role. **Mechanically detected** by the same function.
+  sentinel role. **Mechanically detected** by the same function, by that role
+  and also by a runner-filed category that is not itself a milestone
+  (`curator_adjudication_missing`): the slug names the gate a record actually
+  trips, so such a record is not reported as a milestone it has nothing to do
+  with.
 - `model_admission` — admitting a model to the routing allowlist, or changing
   which model a role gets.
 - `physical_operator_action` — anything needing hands on the machine.

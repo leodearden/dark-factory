@@ -28,6 +28,7 @@ exactly the breakage it was written to catch.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import pathlib
 import re
@@ -110,9 +111,21 @@ def _fenced_payload_literals(text: str) -> tuple[list[str], list[str]]:
 
 
 def _marker_lines(block: str) -> list[str]:
-    return [line.strip() for line in block.splitlines() if line.strip().startswith(
-        SHADOW_RULING_MARKER
-    )]
+    """Every line the block PRESENTS as a stamp, returned VERBATIM.
+
+    Recognised by the stripped form, so an indented literal is still SEEN —
+    but returned unstripped, so the live parser judges exactly the bytes a
+    reader would copy. `parse_shadow_ruling` requires the marker at index 0
+    (`line.startswith(...)`, no strip), so stripping here would normalise away
+    the one difference that matters: an `x_shadow_ruling:` literal nested
+    inside a list item or a numbered step would pass this guard and still be
+    rejected in production, which is precisely the equivalence the guard
+    exists to hold.
+    """
+    return [
+        line for line in block.splitlines()
+        if line.strip().startswith(SHADOW_RULING_MARKER)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +148,39 @@ def test_every_presented_payload_literal_parses_into_a_valid_ruling():
                 f"the skill presents a payload the live parser rejects — a reader "
                 f"following it would lose the sample silently:\n{line}"
             )
+
+
+def test_an_indented_literal_is_caught_rather_than_normalised_away():
+    """Non-vacuity for `_marker_lines` returning the line VERBATIM.
+
+    The guard's whole claim is that a literal the skill presents is one the
+    parser accepts. Indentation is the one transformation that breaks that
+    equivalence without changing a single payload byte, so this drives a block
+    the extractor would have passed when it stripped: the line is still SEEN
+    (a silently-empty extraction would be the worse failure) and the live
+    parser still REJECTS it.
+    """
+    indented = "    " + ShadowRuling(
+        ruling_class=sorted(FIRST_TRANCHE_CLASSES)[0],
+        proposed_action=sorted(REVERSIBLE_ACTIONS)[0],
+        evidence="probe output quoted verbatim",
+        confidence=0.9,
+    ).to_note_line()
+
+    lines = _marker_lines(indented)
+
+    assert lines == [indented], (
+        "an indented literal must still be seen, or the guard reports green by "
+        "extracting nothing"
+    )
+    assert parse_shadow_ruling(lines[0]) is None, (
+        "the live parser requires the marker at index 0; if this now passes, "
+        "_marker_lines has started normalising the presented bytes again"
+    )
+    assert parse_shadow_ruling(lines[0].strip()) is not None, (
+        "sanity: the same payload unindented must parse, so the rejection "
+        "above is about the indentation and not a malformed fixture"
+    )
 
 
 def test_at_least_one_payload_literal_was_extracted():
@@ -217,16 +263,28 @@ def test_the_shadow_section_names_the_policy_document_and_it_exists():
 
 
 def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
+    """The module spelling is EXTRACTED from the doc and run against the
+    import system, never compared to a literal written here.
+
+    Asserting `escalation.shadow_ruling.__name__ == "escalation.shadow_ruling"`
+    cannot fail — a module's `__name__` is its import path by construction — so
+    it tested nothing the file-level import had not already proved, and a doc
+    quoting `python -m escalation.shadow_ruling_v2` would have passed it while
+    naming a module that does not exist.
+    """
     section = _section(_read(SKILL), _SHADOW_SECTION)
-    assert "python -m escalation.shadow_ruling" in section, (
+    assert "--queue-dir" in section
+
+    quoted = re.findall(r"python -m ([A-Za-z_][\w.]*)", section)
+    assert quoted, (
         "the shadow section must quote the weekly-count command, or the "
         "measurement half has no operator."
     )
-    assert "--queue-dir" in section
 
-    # The module path inside the quoted command is real: importing this test
-    # module already proved it, and this asserts the SPELLING in the doc is the
-    # one that imports rather than a plausible neighbour.
-    import escalation.shadow_ruling as live
-
-    assert live.__name__ == "escalation.shadow_ruling"
+    for spelling in sorted(set(quoted)):
+        module = importlib.import_module(spelling)
+        assert callable(getattr(module, "main", None)), (
+            f"the shadow section quotes `python -m {spelling}`, but that module "
+            f"exposes no callable main() — the command it tells the operator to "
+            f"run is not runnable."
+        )

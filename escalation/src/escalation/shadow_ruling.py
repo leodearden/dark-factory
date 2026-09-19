@@ -134,6 +134,24 @@ _UNGATED_DENIED_CATEGORY: str = 'design_concern'
 GATED_CATEGORIES: frozenset[str] = L2_AUTO_CLOSE_DENY_CATEGORIES - {_UNGATED_DENIED_CATEGORY}
 GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
 
+#: Of the gated categories, the ones that name a MILESTONE. The rest report the
+#: runner slug instead of being mislabelled as milestones: per
+#: ``escalation/src/escalation/authority.py``, every member of
+#: :data:`GATED_CATEGORIES` is filed by ``orchestrator.deterministic_runner``
+#: under ``agent_role='orchestrator-deterministic'``, and
+#: ``curator_adjudication_missing`` — the re-ask raised when a
+#: ``human_curator_gate`` task resumes with no adjudication stamp — is not a
+#: milestone in any sense.
+#:
+#: The MILESTONE side is listed rather than the runner side so the derivation
+#: property survives: a category added to authority.py still gates for free and
+#: falls to ``deterministic_runner_filing``, which is what a new runner-filed
+#: category would in fact be.
+_MILESTONE_CATEGORIES: frozenset[str] = frozenset({
+    'milestone_gate',
+    'milestone_check_failed',
+})
+
 #: The reversible actions that are ALSO C1 ``resolution_action`` values, so an
 #: observed outcome can be checked against the proposal. The rest of
 #: :data:`REVERSIBLE_ACTIONS` is task-side and leaves ``resolution_action``
@@ -267,6 +285,14 @@ def mechanically_gated(record: Escalation) -> str | None:
     ``escalation/src/escalation/authority.py`` already relies on: neither benign
     half can mask the other.
 
+    The returned slug names the gate actually tripped, which is NOT the same for
+    every gated category. Only :data:`_MILESTONE_CATEGORIES` reports
+    ``'milestone_gate'``; ``curator_adjudication_missing`` reports
+    ``'deterministic_runner_filing'``, the gate it genuinely trips, rather than
+    being labelled a milestone it has nothing to do with. The slug is the only
+    machine-readable reason a caller receives, so it has to survive being read
+    on its own.
+
     ``design_concern`` IS NOT GATED HERE, and that is the deliberate answer to
     esc-5374-1 rather than an omission: see :data:`_UNGATED_DENIED_CATEGORY` for
     the two questions this detector and authority.py's denylist separately
@@ -283,7 +309,10 @@ def mechanically_gated(record: Escalation) -> str | None:
     authority.py change; adopting one for the interactive session would not.
     """
     if record.category in GATED_CATEGORIES:
-        return 'milestone_gate'
+        return (
+            'milestone_gate' if record.category in _MILESTONE_CATEGORIES
+            else 'deterministic_runner_filing'
+        )
     if record.agent_role in GATED_ROLES:
         return 'deterministic_runner_filing'
     return None

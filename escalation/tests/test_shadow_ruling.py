@@ -302,6 +302,16 @@ def _record(**overrides: object) -> Escalation:
 _DESIGN_CONCERN = 'design_concern'
 
 
+#: Which gate slug each gated category reports, written out by hand ON PURPOSE.
+#: Deriving it from the detector's own `_MILESTONE_CATEGORIES` would assert the
+#: branch against itself; the point is an independent statement of the answer.
+_EXPECTED_CATEGORY_SLUGS: dict[str, str] = {
+    'milestone_gate': 'milestone_gate',
+    'milestone_check_failed': 'milestone_gate',
+    'curator_adjudication_missing': 'deterministic_runner_filing',
+}
+
+
 class TestMechanicallyGated:
     """The detectable subset of the human-forever gate list, read off
     ``escalation.authority`` rather than restated here."""
@@ -313,8 +323,29 @@ class TestMechanicallyGated:
     def test_flags_every_gated_category(self, category: str):
         """Every gated member flags — not only the one named `milestone_gate`.
         Parametrized over the detector's OWN set, so a member added to
-        authority.py is covered here the moment it propagates."""
-        assert mechanically_gated(_record(category=category)) == 'milestone_gate'
+        authority.py is covered here the moment it propagates. Asserts only
+        that SOME real gate slug comes back; which one is each category's is
+        stated by name below rather than by restating the production rule."""
+        assert mechanically_gated(_record(category=category)) in DETECTABLE_GATES
+
+    @pytest.mark.parametrize('category, expected', sorted(_EXPECTED_CATEGORY_SLUGS.items()))
+    def test_each_gated_category_reports_the_gate_it_actually_trips(
+        self, category: str, expected: str,
+    ):
+        """The slug is the only machine-readable reason a caller gets, so a
+        category must not be labelled with a gate it has nothing to do with.
+        `curator_adjudication_missing` is the re-ask raised when a
+        `human_curator_gate` task resumes unstamped — a deterministic-runner
+        filing, never a milestone — and authority.py's own comments say so.
+        Expectations are written out here rather than recomputed from
+        `_MILESTONE_CATEGORIES`, which would only restate the branch."""
+        assert mechanically_gated(_record(category=category)) == expected
+
+    def test_every_gated_category_has_a_stated_expectation(self):
+        """Forces the table above to keep up with authority.py: a category
+        added there propagates into the detector for free, and must not reach
+        a slug nobody ever wrote down."""
+        assert set(_EXPECTED_CATEGORY_SLUGS) == GATED_CATEGORIES
 
     def test_design_concern_is_denied_auto_close_but_not_gated_here(self):
         """esc-5374-1. The two tables answer different questions, and this is
