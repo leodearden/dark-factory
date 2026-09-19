@@ -1197,44 +1197,83 @@ class TestDeepLandingSceneBudget:
         )
 
 
-class TestSpawnBudgetVerdict:
-    """``deep_gate_spawn_budget_violation`` -- the budget check as a pure verdict.
+#: The two scenes sized by an ENFORCED spawn budget, each paired with real
+#: per-test counts MEASURED for it -- task 5333's 234/113/113 for Row 7, task
+#: 5582's nine per-class maxima for the deep-landing module.  The counts are
+#: test INPUTS chosen to span the range those classes really occupy rather
+#: than three arbitrary numbers under the ceiling; nothing here asserts them,
+#: so they are not a second definition of a measurement.
+_SPAWN_BUDGET_SCENES: tuple[tuple[_orch_helpers.SpawnBudget, tuple[int, ...]], ...] = (
+    (_orch_helpers.DEEP_GATE_SCENE_BUDGET, (113, 234)),
+    (_orch_helpers.DEEP_LANDING_SCENE_BUDGET, (39, 108, 169)),
+)
 
-    Split out as a FUNCTION rather than written inline in the autouse fixture
-    that calls it, so the fixture stays a thin wire and every branch below is
+_SPAWN_BUDGETS = tuple(budget for budget, _ in _SPAWN_BUDGET_SCENES)
+_SPAWN_BUDGET_IDS = tuple(budget.spawns_constant for budget in _SPAWN_BUDGETS)
+
+
+class TestSpawnBudgetVerdict:
+    """``spawn_budget_violation`` -- the budget check as a pure verdict.
+
+    Split out as a FUNCTION rather than written inline in the fixtures that
+    call it, so those fixtures stay thin wires and every branch below is
     reachable from a test.  A budget check buried in a fixture teardown is
     exercised only when it PASSES; these are the cases that matter and they
     are the ones a fixture-only implementation would never run.
+
+    EXERCISED OVER BOTH DESCRIPTORS, because the function now has two callers.
+    The 5333 reviewer amendment that narrowed it to read
+    ``DEEP_GATE_SCENE_SPAWN_BUDGET`` rather than accept it was answering a real
+    defect -- a general signature whose MESSAGE still named one fixed pair
+    would tell a second caller to re-derive constants that have nothing to do
+    with it.  The requirement is that the parameters and the message agree
+    about width, not that the function stay single-caller, so the budget is
+    now a descriptor carrying the constant NAMES as well as their values, and
+    :meth:`test_each_descriptors_message_names_only_its_own_constants` is what
+    holds that agreement.
     """
 
-    def test_a_count_within_budget_is_no_violation(self) -> None:
-        """The ordinary case, across the range the class really spans."""
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-
-        for count in (1, 113, 234, budget):
-            assert _orch_helpers.deep_gate_spawn_budget_violation(count, 'm.py::t') is None, (
-                f'{count} spawns against a budget of {budget} was reported as '
-                'a violation. Only a count ABOVE the budget (or a zero count, '
-                'which means the counting seam saw no git at all) is one.'
+    @pytest.mark.parametrize(
+        ('budget', 'measured'), _SPAWN_BUDGET_SCENES, ids=_SPAWN_BUDGET_IDS
+    )
+    def test_a_count_within_budget_is_no_violation(
+        self, budget: _orch_helpers.SpawnBudget, measured: tuple[int, ...]
+    ) -> None:
+        """The ordinary case, across the range each scene really spans."""
+        for count in (1, *measured, budget.spawns):
+            assert (
+                _orch_helpers.spawn_budget_violation(count, 'm.py::t', budget=budget) is None
+            ), (
+                f'{count} spawns against {budget.spawns_constant} '
+                f'({budget.spawns}) was reported as a violation. Only a count '
+                'ABOVE the budget (or a zero count, which means the counting '
+                'seam saw no git at all) is one.'
             )
 
-    def test_the_budget_itself_is_inside_the_budget(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_the_budget_itself_is_inside_the_budget(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """``count == budget`` passes -- the boundary is inclusive.
 
         Called out separately from the range above because an off-by-one here
-        would fail a run that is exactly at the figure
-        DEEP_GATE_SCENE_TEST_TIMEOUT was derived from, which is the one count
-        the pair is guaranteed to be correctly sized for.
+        would fail a run that is exactly at the figure the paired timeout was
+        derived from, which is the one count the pair is guaranteed to be
+        correctly sized for.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-
-        assert _orch_helpers.deep_gate_spawn_budget_violation(budget, 'm.py::t') is None, (
-            f'a count of exactly {budget} -- the budget itself -- was reported '
-            'as a violation. DEEP_GATE_SCENE_TEST_TIMEOUT is derived from this '
-            'exact number, so it is the one count that must pass.'
+        assert (
+            _orch_helpers.spawn_budget_violation(budget.spawns, 'm.py::t', budget=budget)
+            is None
+        ), (
+            f'a count of exactly {budget.spawns} -- the budget itself -- was '
+            f'reported as a violation. {budget.timeout_constant} is derived '
+            'from this exact number, so it is the one count that must pass.'
         )
 
-    def test_going_over_budget_names_everything_the_reader_needs(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_going_over_budget_names_everything_the_reader_needs(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """The failure must say what got heavier, by how much, and what to re-derive.
 
         A bare "too many spawns" would leave the reader to discover on their
@@ -1242,22 +1281,21 @@ class TestSpawnBudgetVerdict:
         asserted individually so a message that drops one fails naming the
         fragment it dropped.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-        count = budget + 1
-        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+        count = budget.spawns + 1
+        nodeid = 'tests/test_a_deep_module.py::TestSomeScene::test_x'
 
-        message = _orch_helpers.deep_gate_spawn_budget_violation(count, nodeid)
+        message = _orch_helpers.spawn_budget_violation(count, nodeid, budget=budget)
 
         assert message is not None, (
-            f'{count} spawns against a budget of {budget} was not reported as '
-            'a violation. One spawn over is over.'
+            f'{count} spawns against a budget of {budget.spawns} was not '
+            'reported as a violation. One spawn over is over.'
         )
         for fragment, why in (
             (nodeid, 'the node id, so the reader knows WHICH test got heavier'),
             (str(count), 'the observed count'),
-            (str(budget), 'the budget it broke'),
+            (str(budget.spawns), 'the budget it broke'),
             (
-                'DEEP_GATE_SCENE_TEST_TIMEOUT',
+                budget.timeout_constant,
                 'the constant to re-derive -- the point of the check is that a '
                 'heavier scene needs a re-sized marker, not merely a raised budget',
             ),
@@ -1267,7 +1305,10 @@ class TestSpawnBudgetVerdict:
                 f'got: {message}'
             )
 
-    def test_a_zero_count_is_a_violation_although_it_is_within_budget(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_a_zero_count_is_a_violation_although_it_is_within_budget(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """Zero means the counting seam went blind, which is worse than over-budget.
 
         A guard that passes because it has been silently DISCONNECTED is worse
@@ -1275,10 +1316,9 @@ class TestSpawnBudgetVerdict:
         the budget it appears to enforce becomes vacuous.  Zero is inside any
         budget, so nothing else in the check would catch it.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+        nodeid = 'tests/test_a_deep_module.py::TestSomeScene::test_x'
 
-        message = _orch_helpers.deep_gate_spawn_budget_violation(0, nodeid)
+        message = _orch_helpers.spawn_budget_violation(0, nodeid, budget=budget)
 
         assert message is not None, (
             'a count of ZERO was accepted as within budget. It is arithmetically '
@@ -1289,12 +1329,70 @@ class TestSpawnBudgetVerdict:
         assert nodeid in message, (
             f'the zero-count message omits the node id.\n\ngot: {message}'
         )
-        assert message != _orch_helpers.deep_gate_spawn_budget_violation(budget + 1, nodeid), (
+        assert message != _orch_helpers.spawn_budget_violation(
+            budget.spawns + 1, nodeid, budget=budget
+        ), (
             'the zero-count message is identical to the over-budget message, so '
             'a reader cannot tell "this scene got heavier" (re-derive the '
             'constants) from "the counting seam broke" (fix the fixture). They '
             'are different failures with different remedies.'
         )
+
+    def test_each_descriptors_message_names_only_its_own_constants(self) -> None:
+        """A caller must be told to re-derive ITS OWN pair, never the other's.
+
+        THE REGRESSION THE DESCRIPTOR EXISTS TO PREVENT, and the one the 5333
+        amendment predicted: a shared message naming one fixed pair of
+        constants passes every other test in this class -- each still finds
+        its count, its budget and a plausible-looking constant name -- while
+        telling the deep-landing fixture to go and re-derive Row 7's numbers.
+        That is why the descriptor carries the constant NAMES and not just the
+        two values.
+
+        Read off the OVER-BUDGET message, the only one of the two branches
+        that names constants at all: the zero-count branch reports a broken
+        counting seam, whose remedy is to repair the fixture rather than to
+        re-derive anything.
+        """
+        count = max(budget.spawns for budget in _SPAWN_BUDGETS) + 1
+        messages = {
+            budget.spawns_constant: _orch_helpers.spawn_budget_violation(
+                count, 'm.py::t', budget=budget
+            )
+            for budget in _SPAWN_BUDGETS
+        }
+
+        for budget in _SPAWN_BUDGETS:
+            message = messages[budget.spawns_constant]
+            assert message is not None, (
+                f'{count} spawns is over every budget here, including '
+                f'{budget.spawns_constant} ({budget.spawns}), yet no violation '
+                'was reported.'
+            )
+            mine = (budget.spawns_constant, budget.timeout_constant)
+            theirs = [
+                name
+                for other in _SPAWN_BUDGETS
+                if other.spawns_constant != budget.spawns_constant
+                for name in (other.spawns_constant, other.timeout_constant)
+            ]
+            for name in mine:
+                assert name in message, (
+                    f'the over-budget message for {budget.spawns_constant} '
+                    f'omits {name!r}, so the caller is not told which of '
+                    f'its own constants to re-derive.\n\ngot: {message}'
+                )
+            for name in theirs:
+                assert name not in message, (
+                    f'the over-budget message for {budget.spawns_constant} '
+                    f'names {name!r}, which belongs to a DIFFERENT scene. A '
+                    'message that names a fixed pair regardless of the budget '
+                    'it was handed sends the reader to re-derive constants '
+                    'that have nothing to do with their failure -- exactly '
+                    'the defect the 5333 amendment narrowed this function to '
+                    'avoid, reintroduced by generalising the parameters '
+                    f'without generalising the prose.\n\ngot: {message}'
+                )
 
 
 class TestRow7SceneIsGuarded:
