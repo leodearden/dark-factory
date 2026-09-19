@@ -614,9 +614,12 @@ def test_coverage_below_the_floor_is_a_named_degradation(tmp_path: Path):
 
     payload = trailing_json(result.stdout)
     assert 'low_readability' in payload['degradations'], payload['degradations']
+    # The clock is this arm's own readability metric, so it is present on
+    # every tick by construction and its shortfall is all failed reads.
+    assert 'partial_presence' not in payload['degradations'], payload['degradations']
     detail = next(d for d in payload['degradation_details']
                   if d.startswith('low_readability'))
-    assert 'runqueue_ratio' in detail and '3' in detail, detail
+    assert 'runqueue_ratio' in detail and '3/100' in detail, detail
 
 
 def test_full_coverage_raises_no_readability_degradation(tmp_path: Path):
@@ -662,14 +665,14 @@ def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: 
     }
 
 
-def seed_leaf_present_for_the_last_fifth(path: Path) -> Path:
+def seed_leaf_present_for_the_last_fifth(path: Path, *, readable: int = 20) -> Path:
     """A 100-tick corpus in which one leaf exists only for the last 20 ticks.
 
     The shape a restarted, added or renamed ``orchestrator-*.service`` leaves
     behind, and the one task 3394's ``df-*.slice`` migration produces
     mid-corpus: the sampler writes ``own_read_ok:<leaf>`` only on ticks it
-    DISCOVERED the leaf, so the late leaf has 20 rows, all readable, while the
-    tick clock and the steady leaf have 100.
+    DISCOVERED the leaf, so the late leaf has 20 rows — *readable* of them
+    readable — while the tick clock and the steady leaf have 100.
     """
     seed_db(path, {
         'runqueue_read_ok': [1.0] * 100,
@@ -677,9 +680,14 @@ def seed_leaf_present_for_the_last_fifth(path: Path) -> Path:
         'own_cpu_some10:orchestrator-reify.service': [30.0] * 100,
     })
     return seed_db(path, {
-        'own_read_ok:orchestrator-new.service': [1.0] * 20,
-        'own_cpu_some10:orchestrator-new.service': [30.0] * 20,
+        'own_read_ok:orchestrator-new.service':
+            [1.0] * readable + [0.0] * (20 - readable),
+        'own_cpu_some10:orchestrator-new.service': [30.0] * readable,
     }, start_ts=1_000_000 + 80 * 5)
+
+
+def details(payload: dict, cause: str) -> list[str]:
+    return [d for d in payload['degradation_details'] if d.startswith(cause)]
 
 
 def test_a_leaf_present_for_part_of_the_corpus_is_covered_over_all_of_it(
@@ -707,28 +715,69 @@ def test_a_leaf_present_for_part_of_the_corpus_is_covered_over_all_of_it(
     }
     assert payload['coverage']['own_cpu_some10:orchestrator-reify.service'][
         'readable_fraction'] == pytest.approx(1.0)
-    low = [d for d in payload['degradation_details']
-           if d.startswith('low_readability')]
-    assert len(low) == 1 and 'orchestrator-new.service' in low[0], low
-    assert '20/100' in low[0] and 'no row at all on 80' in low[0], (
-        'the degradation must say the shortfall is ABSENCE, or an operator goes '
-        f'hunting a flaky read that never happened: {low[0]}'
-    )
+    [absent] = details(payload, 'partial_presence')
+    assert 'orchestrator-new.service' in absent and '20/100' in absent, absent
 
 
-def test_the_report_line_separates_absence_from_failed_reads(tmp_path: Path):
+def test_absence_is_not_reported_as_failed_reads(tmp_path: Path):
+    """A leaf that was simply not there is not a flaky read.
+
+    Every one of the late leaf's reads succeeded, so ``low_readability`` —
+    which sends an operator hunting a failing collector — must stay silent
+    while ``partial_presence`` names the span.
+    """
     db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite')
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
-    [late] = [line for line in result.stdout.splitlines()
-              if line.startswith('Coverage:') and 'orchestrator-new' in line]
-    assert '20/100 corpus ticks (20.0%)' in late, late
-    assert 'no row at all on 80' in late and 'BELOW THE FLOOR' in late, late
-    [steady] = [line for line in result.stdout.splitlines()
-                if line.startswith('Coverage:') and 'orchestrator-new' not in line]
-    assert steady == 'Coverage: readable on 100/100 corpus ticks (100.0%)', steady
+    payload = trailing_json(result.stdout)
+    assert 'partial_presence' in payload['degradations'], payload['degradations']
+    assert 'low_readability' not in payload['degradations'], (
+        f'absence was reported as failed reads: {payload["degradation_details"]}'
+    )
+
+
+def test_absence_and_failed_reads_are_each_counted_against_their_own_base(
+    tmp_path: Path,
+):
+    """20 rows of 100 ticks, 10 of them readable: 20/100 absent, 10/20 failed.
+
+    With no failed reads in the fixture, counting presence off READABLE rows
+    and counting it off ROWS give the same answer, so a fixture that mixes the
+    two is the only one that can tell them apart.
+    """
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite', readable=10)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:orchestrator-new.service']
+    assert (coverage['ticks_in_corpus'], coverage['ticks_with_a_row'],
+            coverage['readable'], coverage['readable_fraction']) == (100, 20, 10, 0.1)
+    [absent] = details(payload, 'partial_presence')
+    [failed] = details(payload, 'low_readability')
+    assert '20/100' in absent, absent
+    assert '10/20' in failed, failed
+
+
+def test_the_report_line_names_each_cause_below_the_floor(tmp_path: Path):
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite', readable=10)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    lines = [line for line in result.stdout.splitlines() if line.startswith('Coverage:')]
+    [late] = [line for line in lines if '10/100' in line]
+    assert late == (
+        'Coverage: readable on 10/100 corpus ticks (10.0%), present on 20/100'
+        ' — **BELOW THE FLOOR**: partial_presence, low_readability, see degradations'
+    ), late
+    [steady] = [line for line in lines if line is not late]
+    assert steady == (
+        'Coverage: readable on 100/100 corpus ticks (100.0%), present on 100/100'
+    ), steady
 
 
 def test_a_series_with_no_read_ok_rows_is_unknown_even_when_the_clock_ran(

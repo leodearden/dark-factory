@@ -827,7 +827,7 @@ def coverage_table(
     ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is not: that one is
     written only on ticks its leaf was discovered, so a leaf present for 3 days
     of a 14-day corpus has 3 days of rows, all readable, and dividing by its
-    own row count reported that as full coverage.
+    own row count would call that full coverage.
 
     ``None`` for an arm whose collector emits no readability metric — the four
     host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
@@ -870,21 +870,36 @@ def coverage_table(
     return out
 
 
-def _absence_clause(stats: Coverage) -> str:
-    """Name the part of a coverage shortfall that is ABSENCE, not failed reads.
+def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
+    """Each cause of a KNOWN coverage's shortfall that is below the D11 floor.
 
-    A corpus tick with no ``*_read_ok`` row for the series is a tick its leaf
-    was not discovered on — a unit restarted, added or removed — and sends an
-    operator somewhere different from a tick that was read and failed.
+    ``(degradation, detail)`` pairs, one per cause, each judged on its own
+    ratio. Absence is rows over corpus ticks: a tick with no ``*_read_ok`` row
+    is a tick the series' leaf was not discovered on — a unit restarted, added,
+    removed or renamed. Failed reads are readable ticks over the ticks the
+    series was present. A shortfall split between the two can leave both above
+    the floor while ``readable_fraction`` dips below it; that fraction is still
+    printed beside every hold ladder, but neither cause alone is a finding.
     """
-    absent = stats['ticks_in_corpus'] - stats['ticks_with_a_row']
-    if absent <= 0:
-        return ''
-    return (
-        f"; `{stats['readability_metric']}` has no row at all on {absent} of "
-        'those ticks (its leaf was not discovered), so that much of the '
-        'shortfall is absence, not failed reads'
-    )
+    corpus, rows, readable = (
+        stats['ticks_in_corpus'], stats['ticks_with_a_row'], stats['readable'])
+    out = []
+    if rows / corpus < D11_READABILITY_FLOOR:
+        out.append((
+            'partial_presence',
+            f"`{stats['readability_metric']}` has a row on only {rows}/{corpus} "
+            f'corpus ticks ({rows / corpus:.1%}); its leaf was not discovered on '
+            'the rest, so its hold fractions describe that span, not the whole '
+            'corpus',
+        ))
+    if readable / rows < D11_READABILITY_FLOOR:
+        out.append((
+            'low_readability',
+            f'readable on {readable}/{rows} of the ticks it was present '
+            f'({readable / rows:.1%}), below the {D11_READABILITY_FLOOR:.0%} '
+            'floor — read its hold fractions against that coverage',
+        ))
+    return out
 
 
 def _coverage_line(stats: Coverage | None) -> str:
@@ -902,11 +917,13 @@ def _coverage_line(stats: Coverage | None) -> str:
             'hold fractions below are over readable ticks of unknown count. '
             'See degradations.'
         )
+    causes = [cause for cause, _detail in _below_floor(stats)]
     return (
         f"Coverage: readable on {stats['readable']}/{stats['ticks_in_corpus']} "
-        f"corpus ticks ({stats['readable_fraction']:.1%}){_absence_clause(stats)}"
-        + ('' if stats['readable_fraction'] >= D11_READABILITY_FLOOR
-           else ' — **BELOW THE FLOOR**, see degradations')
+        f"corpus ticks ({stats['readable_fraction']:.1%}), present on "
+        f"{stats['ticks_with_a_row']}/{stats['ticks_in_corpus']}"
+        + (f" — **BELOW THE FLOOR**: {', '.join(causes)}, see degradations"
+           if causes else '')
     )
 
 
@@ -915,12 +932,14 @@ def readability_degradations(
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 
-    The two are separate degradations because they call for different operator
-    actions: ``low_readability`` says the collector ran and often failed, so
-    read the hold fractions against that coverage; ``unknown_readability`` says
-    the corpus carries no evidence either way, which usually means the
-    collector never ran at all. Folding the second into the first would send an
-    operator hunting a flaky read that never happened.
+    Three separate degradations, because they call for three different operator
+    readings: ``low_readability`` says the collector ran on the series and often
+    failed, so read the hold fractions against that coverage;
+    ``partial_presence`` says the series existed for only part of the corpus,
+    so its hold fractions describe that span, not the whole window; and
+    ``unknown_readability`` says the corpus carries no evidence either way,
+    which usually means the collector never ran at all. Folding any one into
+    another sends an operator hunting a flaky read that never happened.
     """
     out = []
     for metric, stats in sorted(coverage.items()):
@@ -935,14 +954,8 @@ def readability_degradations(
                 'coverage needs both. Its hold fractions below are over '
                 'readable ticks of unknown count.'
             )
-        elif stats['readable_fraction'] < D11_READABILITY_FLOOR:
-            out.append(
-                f"low_readability: {metric} readable on {stats['readable']}/"
-                f"{stats['ticks_in_corpus']} corpus ticks "
-                f"({stats['readable_fraction']:.1%}), below the "
-                f'{D11_READABILITY_FLOOR:.0%} floor{_absence_clause(stats)} — '
-                'read its hold fractions against that coverage, not as a fortnight'
-            )
+            continue
+        out += [f'{cause}: {metric} {detail}' for cause, detail in _below_floor(stats)]
     return out
 
 
