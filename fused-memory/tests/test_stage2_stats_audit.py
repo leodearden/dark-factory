@@ -31,13 +31,16 @@ the confirmed-action-only standard, already met.
    ``(project_id, task_id)`` key is now resolved to that project's own root
    via ``known_projects`` and confirmed with ``taskmaster.get_task`` +
    ``flag_dedup.confirm_task_present`` before it may raise the counter.
+   That proves the task EXISTS in that project, not that this cycle created
+   it, so it closes the fabricated-id hole only; binding a record to this
+   run's own creation is task 4873's scope.
 2. ``tasks_hints_updated`` — the only other purely self-reported counter in
    the proactive / cross-project filing path. ``prompts/stage2.py`` already
    mandates a confirmed-action-only rule for it (re-read via ``get_task``,
    increment only when the returned ``memory_hints`` is a SUPERSET), so it
    meets the standard at the prompt layer; it lacks an action-record list and
-   framework corroboration, which is a prompt-contract expansion filed as a
-   follow-up rather than absorbed here.
+   framework corroboration, which is a prompt-contract expansion filed as
+   task 4018 (now in task 4873's scope) rather than absorbed here.
 3. ``stage1_mem0_flags_processed`` / ``stage1_analytical_findings_processed``
    — flag-processing counters outside the task-filing path. The clamps that
    once checked them were removed by tasks 2229/2230 (W5-mu);
@@ -82,7 +85,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 
 # ── Shared harness ───────────────────────────────────────────────────────────
 #
-# Replicated from tests/test_stage2_tasks_created_accounting.py:321-359 rather
+# Replicated from tests/test_stage2_tasks_created_accounting.py::_AllPresentTaskmaster
+# and ::_mock_deps rather
 # than cross-imported, matching the precedent that module's own docstring
 # records (and test_recon_gate_closure_guidance.py::_make_consolidator before
 # it): a module-private fixture is not a shared contract. Extended here with a
@@ -265,7 +269,7 @@ class TestActionRecordKeys:
     ``_count_valid_task_created_records`` becomes ``len()`` of this.
 
     ``valid_statuses`` is a parameter (not a hardcoded constant read) because
-    the follow-up ``tasks_hints_updated`` records work reuses this helper with
+    task 4018's ``tasks_hints_updated`` records work reuses this helper with
     its own accepted-status vocabulary.
     """
 
@@ -382,7 +386,7 @@ class TestActionRecordKeys:
 
     def test_valid_statuses_parameter_is_honoured(self):
         """A custom accepted-status set changes which records key — the seam
-        the follow-up tasks_hints_updated work reuses."""
+        task 4018's tasks_hints_updated work reuses."""
         records = [
             {'task_id': '1', 'status': 'created', 'project_id': 'p'},
             {'task_id': '2', 'status': 'updated', 'project_id': 'p'},
@@ -421,7 +425,8 @@ class TestCorroborateRecordKeys:
     """``_corroborate_record_keys(taskmaster, known_projects, keys)`` (task 3051).
 
     The corroboration pass that makes ``tasks_created``'s upward repair
-    confirmed-action-only: each ``(project_id, task_id)`` key is resolved to
+    existence-checked (a key must name a task that exists in its own project;
+    it need not have been created this cycle — see the function docstring): each ``(project_id, task_id)`` key is resolved to
     its OWN project root via ``known_projects`` and confirmed with
     ``taskmaster.get_task`` + ``flag_dedup.confirm_task_present``.
 
@@ -1026,10 +1031,10 @@ class TestPostFlightLoudDegradation:
 class TestPostFlightFlagCountersAreNeverClamped:
     """Audit conclusion for the adjacent flag counters, as executable behaviour.
 
-    ``prompts/stage2.py`` claimed the framework clamps
-    ``stage1_mem0_flags_processed`` against ``flag_deleted_records`` and
-    ``stage1_analytical_findings_processed`` against
-    ``len(prior_reports[0].items_flagged)``. Neither clamp has existed since
+    Framework clamps once checked ``stage1_mem0_flags_processed`` against
+    ``flag_deleted_records`` and ``stage1_analytical_findings_processed``
+    against ``len(prior_reports[0].items_flagged)``, and ``prompts/stage2.py``
+    never told the agent they were gone. Neither clamp has existed since
     tasks 2229/2230 (W5-mu) — ``_apply_post_flight_guards`` only
     ``setdefault``-normalizes both keys. These pins keep that true (and are
     what makes the step-11 prompt correction verifiable in code rather than

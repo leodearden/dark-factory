@@ -300,7 +300,7 @@ def _action_record_keys(
     """Return the deduped ``(project_id, task_id)`` keys of *records* (task 3046).
 
     *records* is an action-record list such as
-    ``report.stats['task_created_records']`` — the action-shaped ground truth
+    ``report.stats['task_created_records']`` — the action-shaped record list
     the '## Task-Creation Accounting' prompt section mandates Stage 2 append to
     at the moment each ``resolve_ticket`` call confirms a creation, modeled
     directly on ``flag_deleted_records``. A record keys only when its
@@ -340,8 +340,8 @@ def _action_record_keys(
     pairs so each can be confirmed against its OWN project via
     ``taskmaster.get_task`` before it is allowed to raise a counter.
     *valid_statuses* is a parameter rather than a constant read for the same
-    reason the key set is returned — the follow-up ``tasks_hints_updated``
-    records work reuses this helper with its own accepted-status vocabulary,
+    reason the key set is returned — task 4018's ``tasks_hints_updated``
+    records work (now in task 4873's scope) reuses this helper with its own accepted-status vocabulary,
     so it is a call site rather than a second copy of these rules.
 
     Best-effort and non-raising throughout, mirroring
@@ -502,6 +502,12 @@ async def _corroborate_record_keys(
     corroborated, mirroring ``confirm_task_present``'s documented posture that
     "an uncertain or absent result must never be treated as corroboration that
     a task exists".
+
+    What corroboration proves, and what it does not: a corroborated key names
+    a task that EXISTS in that project. It does not prove THIS cycle created
+    it — an id copied from the payload, or the target of a ``combined``
+    ticket, corroborates too — so this closes the fabricated-id hole only.
+    Binding a record to this run's own creation is task 4873's scope.
 
     Fail-SAFE for the stage: the whole body is wrapped defensively and
     degrades to "nothing corroborated, everything unresolvable" rather than
@@ -4206,8 +4212,9 @@ class TaskKnowledgeSync(BaseStage):
         # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
         # so derive_stage_stats cannot recompute it and stats_verifier leaves it
         # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
-        # action-shaped ground truth the prompt now mandates — mirroring
-        # flag_deleted_records — so an increment missed on a mid-cycle
+        # action-shaped record list the prompt now mandates — mirroring
+        # flag_deleted_records — itself an LLM claim, so each key is
+        # corroborated below (task 3051) before it may raise the counter; an increment missed on a mid-cycle
         # proactive/cross-project filing is recovered here instead of lost
         # (run 507bc25b reported tasks_created=0 while filing task 3045).
         report.stats.setdefault('tasks_created', 0)

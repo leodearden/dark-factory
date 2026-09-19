@@ -2745,9 +2745,9 @@ class TestSafeGetTask:
     wrapper's own error-dict path. That normalisation is also what lets every
     caller keep using a PLAIN ``asyncio.gather``.
 
-    It is PUBLIC (no leading underscore) because task 3051 adds a third caller
+    It is PUBLIC (no leading underscore) because task 3051 adds a call site
     outside this module — ``task_knowledge_sync._corroborate_record_keys`` —
-    and a fourth private copy is exactly what this helper exists to prevent.
+    and one more private copy is exactly what this helper exists to prevent.
     """
 
     @pytest.mark.asyncio
