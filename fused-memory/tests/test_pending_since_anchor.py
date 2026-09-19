@@ -44,6 +44,11 @@ _NON_CANCELLED_ORIGINS = tuple(s for s in _ALL_ORIGINS if s != TaskStatus.CANCEL
 _NOW = '2026-09-18T12:00:00.000Z'
 _OLDER = '2026-08-06T10:00:00.000Z'
 
+# The forged anchor a caller would supply to manufacture a queue jump: old
+# enough that task beta's age term saturates, so it is unambiguous whether a
+# stored value came from the machine clock or from the payload.
+_ANCIENT = '2000-01-01T00:00:00.000Z'
+
 
 @pytest_asyncio.fixture
 async def backend(tmp_path):
@@ -451,6 +456,62 @@ class TestPendingSinceThroughStatusWriters:
         )
         assert result['tasks'][0]['newStatus'] == TaskStatus.PENDING
         assert await self._anchor(backend, project_root, dto['id']) is None
+
+    @pytest.mark.asyncio
+    async def test_add_task_ignores_a_caller_supplied_anchor(
+        self, backend, tmp_path, caplog
+    ):
+        """The anchor is MACHINE-authored: an insert cannot supply its own.
+
+        Measured exploit (reviewer_comprehensive, robustness/authority-bypass):
+        ``add_task(metadata='{"pending_since": "2000-01-01T00:00:00.000Z"}')``
+        stored that value verbatim. Mechanism: on an INSERT the helper is
+        called with ``old_status=None``, so its ``usable and old_status !=
+        CANCELLED -> return None`` arm holds (``None != CANCELLED``) and the
+        caller's value is PRESERVED rather than stamped.
+
+        Consequence: task beta scores ``age(t) = AGE_BUDGET*a/(a+AGE_HALF_SECS)``
+        with ``AGE_BUDGET=500`` inside ``TIER_WIDTH=1000``, so any caller of
+        ``submit_task`` hands itself ~the full age bonus and jumps the
+        intra-tier queue permanently — exactly the OVER-aging D4 excluded for
+        the back-fill ("can under-age but never over-age, so it cannot
+        manufacture a queue jump").
+
+        Blessing ``pending_since`` (step 2) is what made the forgery SILENT:
+        the unblessed sibling in the measured payload still minted a
+        ``task_metadata.schema_warning code=unknown_key`` line and the forged
+        anchor minted none. So the authority check has to be explicit — and
+        the refusal must be on authority grounds, not by re-introducing the
+        census line a legitimate machine stamp must never produce.
+        """
+        project_root = str(tmp_path)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            dto = await backend.add_task(
+                project_root=project_root, title='sneaky',
+                status=TaskStatus.PENDING,
+                metadata=json.dumps({'pending_since': _ANCIENT, 'files': ['keep.py']}),
+            )
+
+        one = await backend.get_task(dto['id'], project_root=project_root)
+        stored = one['metadata'] or {}
+        # Pinned to the identity a fresh pending insert already satisfies (D5:
+        # one hoisted `now` binds both the anchor and `updated_at`), which is
+        # sharper than merely asserting the forged value is gone.
+        assert stored['pending_since'] == one['updatedAt'], (
+            'a fresh pending insert must carry the INSERT CLOCK, not the '
+            f'caller-supplied anchor: {stored.get("pending_since")!r}'
+        )
+        assert stored['files'] == ['keep.py'], (
+            'stripping the forged anchor must not disturb the sibling keys'
+        )
+        census_msgs = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+        ]
+        assert census_msgs == [], (
+            f'the forgery is refused on AUTHORITY grounds, not by a schema '
+            f'census line; got: {census_msgs}'
+        )
 
 
 class TestPendingSinceThroughTheAuditWriter:
