@@ -1097,6 +1097,14 @@ def stamp_pending_since(
     v4 -> v5 migration's marker alone, so it keeps identifying the
     back-filled population (PRD D4).
 
+    ASSUMES ``metadata_raw`` has already been sanitized at the caller
+    boundary by :func:`strip_machine_authored_metadata`. The transition table
+    is deliberately NOT the authority check (design decision 9): its
+    "key present -> unchanged" arm HONOURS whatever anchor it is shown, so a
+    future caller wired up without the strip silently reopens the
+    authority-bypass this contract exists to prevent — measured on all four
+    boundaries before the sanitizer landed.
+
     This is the ONE shared implementation (INV-5 ``no-lockstep-duplication``):
     every pending-landing write path — ``add_task``, ``set_task_status``,
     ``set_status_and_stamp_audit`` — calls it, and none reimplements the
