@@ -95,6 +95,20 @@ def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _write_files(root: Path, files: Mapping[str, str]) -> None:
+    """Write every *files* entry under *root*, creating parents as needed.
+
+    Split out of :func:`_write_fixture_tree` because the consumer-model tests
+    need a tree of ``pyproject.toml`` files and no git at all: the nearest-config
+    walk reads the filesystem, so making those tests pay for a repository would
+    be ceremony that tests nothing.
+    """
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding='utf-8')
+
+
 def _write_fixture_tree(
     root: Path, files: Mapping[str, str], *, baseline: bool = False
 ) -> Path:
@@ -117,10 +131,7 @@ def _write_fixture_tree(
     need an ABSENT baseline, or a deliberately corrupt one, need somewhere to
     point ``--baseline`` at just as much as the seeded ones do.
     """
-    for relative, content in files.items():
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding='utf-8')
+    _write_files(root, files)
 
     for args in (['init', '-q'], ['add', '-A', '-f']):
         _run_git(args, cwd=root)
@@ -626,3 +637,246 @@ def test_a_rendered_key_is_a_string_and_the_interface_offers_no_way_back():
         'digest',
         'render',
     }
+
+
+# ---------------------------------------------------------------------------
+# D8 — the consumer model: which tool, if any, actually reads this marker.
+
+#: What all eight of this repository's pyproject.toml files declare, verbatim.
+_RUFF_CONFIG = '[tool.ruff.lint]\nselect = ["E", "F", "UP", "B", "SIM", "I"]\nignore = ["E501"]\n'
+
+
+def _consumer_of(
+    root: Path,
+    *,
+    path: str = 'pkg/mod.py',
+    kind=None,
+    codes: tuple[str, ...] = (),
+):
+    """The consumer *root*'s model resolves for one synthetic site."""
+    site = inline_suppressions.Site(
+        path=path,
+        line=1,
+        kind=kind if kind is not None else inline_suppressions.Kind.NOQA,
+        codes=codes,
+        text='x = 1',
+    )
+    return inline_suppressions.ConsumerModel(root).consumer_for(site)
+
+
+def test_type_ignore_and_pyright_ignore_resolve_to_pyright_whatever_the_code(tmp_path: Path):
+    """No config is consulted for these two: pyright runs over every package as
+    a declared gate, so the marker is read wherever it sits."""
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n'})
+
+    for kind in (
+        inline_suppressions.Kind.TYPE_IGNORE,
+        inline_suppressions.Kind.PYRIGHT_IGNORE,
+    ):
+        for codes in ((), ('arg-type',), ('reportArgumentType',), ('not-a-real-code',)):
+            assert _consumer_of(tmp_path, kind=kind, codes=codes) is (
+                inline_suppressions.Consumer.PYRIGHT
+            ), (kind, codes)
+
+
+def test_pragma_no_cover_and_nosec_resolve_to_no_consumer(tmp_path: Path):
+    """D8's finding: nothing in this repository reads either one today.
+
+    No coverage gate runs ``# pragma: no cover``, and bandit is not installed —
+    the live ``nosec`` count is zero, which is what makes that kind's row a
+    statement about tools rather than about code.
+    """
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    for kind in (
+        inline_suppressions.Kind.PRAGMA_NO_COVER,
+        inline_suppressions.Kind.NOSEC,
+    ):
+        assert _consumer_of(tmp_path, kind=kind) is inline_suppressions.Consumer.NONE, kind
+
+
+def test_a_noqa_code_the_nearest_config_selects_is_consumed_by_ruff(tmp_path: Path):
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    for code in ('E402', 'F401', 'B006', 'SIM102', 'I001', 'UP038'):
+        assert _consumer_of(tmp_path, codes=(code,)) is inline_suppressions.Consumer.RUFF, code
+
+
+def test_a_noqa_code_the_nearest_config_does_not_select_has_no_consumer(tmp_path: Path):
+    """D8's whole point, and its largest single inflow.
+
+    ``PLC0415`` alone accounts for 963 of this tree's markers and no
+    ``pyproject.toml`` here selects ``PL``; every one of them is dead.
+    Reporting them as ruff-consumed would leave the biggest source of new
+    markers entirely unpoliced.
+    """
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    for code in ('PLC0415', 'ANN001', 'ARG002', 'A002', 'N802'):
+        assert _consumer_of(tmp_path, codes=(code,)) is inline_suppressions.Consumer.NONE, code
+
+
+def test_a_selector_matches_by_linter_and_number_never_by_string_prefix(tmp_path: Path):
+    """THE LOAD-BEARING CASE — ``select = ["B"]`` does NOT select ``BLE001``.
+
+    Measured against real ruff, not assumed: ``ruff check --isolated --select
+    B`` does not flag ``BLE001`` while ``--select BLE`` does.  A selector
+    resolves to a (linter, code-prefix) PAIR, so linter ``B``
+    (flake8-bugbear) never reaches linter ``BLE`` (flake8-blind-except).  This
+    tree carries 202 ``# noqa: BLE001`` markers — the second-largest
+    population — and a naive ``code.startswith(selector)`` would silently
+    report every one of them as ruff-consumed, defeating D8 for them.
+
+    Parsing both sides at the boundary into a typed ``(linter, number)`` pair
+    is also exactly what heuristic 12 prescribes, so the correct behaviour and
+    the cited heuristic coincide here.
+    """
+    _write_files(
+        tmp_path,
+        {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': '[tool.ruff.lint]\nselect = ["B"]\n'},
+    )
+
+    assert _consumer_of(tmp_path, codes=('B006',)) is inline_suppressions.Consumer.RUFF
+    assert _consumer_of(tmp_path, codes=('BLE001',)) is inline_suppressions.Consumer.NONE
+
+
+def test_a_partial_selector_matches_on_the_number_prefix(tmp_path: Path):
+    """Within one linter, a selector IS a numeric prefix: ``E4`` selects E402
+    and ``E5`` does not."""
+    _write_files(
+        tmp_path,
+        {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': '[tool.ruff.lint]\nselect = ["E4"]\n'},
+    )
+
+    assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.RUFF
+    assert _consumer_of(tmp_path, codes=('E501',)) is inline_suppressions.Consumer.NONE
+
+
+def test_an_ignored_code_has_no_consumer_even_though_a_selector_matches(tmp_path: Path):
+    """All eight pyprojects here set ``ignore = ["E501"]``, so ruff provably
+    never emits E501 and every ``# noqa: E501`` in the tree is dead.  Reading
+    ``ignore`` as well as ``select`` is the same tomllib read and is strictly
+    more honest."""
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    assert _consumer_of(tmp_path, codes=('E501',)) is inline_suppressions.Consumer.NONE
+
+
+def test_a_bare_noqa_is_consumed_when_the_nearest_config_selects_anything(tmp_path: Path):
+    """A bare ``# noqa`` silences whatever ruff would have said, so it is
+    consumed exactly when ruff has something to say at all."""
+    _write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': _RUFF_CONFIG,
+            'bare/mod.py': 'x = 1\n',
+            'bare/pyproject.toml': '[tool.ruff.lint]\nselect = []\n',
+        },
+    )
+
+    assert _consumer_of(tmp_path) is inline_suppressions.Consumer.RUFF
+    assert _consumer_of(tmp_path, path='bare/mod.py') is inline_suppressions.Consumer.NONE
+
+
+def test_the_nearest_pyproject_wins_and_is_not_merged_with_the_root(tmp_path: Path):
+    """Ruff takes the NEAREST applicable config without merging — stated in
+    this repository's own root ``pyproject.toml``, and modelled here."""
+    _write_files(
+        tmp_path,
+        {
+            'pyproject.toml': _RUFF_CONFIG,
+            'member/pyproject.toml': '[tool.ruff.lint]\nselect = ["ANN"]\n',
+            'member/mod.py': 'x = 1\n',
+            'top.py': 'x = 1\n',
+        },
+    )
+
+    assert _consumer_of(tmp_path, path='member/mod.py', codes=('ANN001',)) is (
+        inline_suppressions.Consumer.RUFF
+    )
+    assert _consumer_of(tmp_path, path='member/mod.py', codes=('E402',)) is (
+        inline_suppressions.Consumer.NONE
+    )
+    assert _consumer_of(tmp_path, path='top.py', codes=('E402',)) is (
+        inline_suppressions.Consumer.RUFF
+    )
+
+
+def test_a_pyproject_with_no_ruff_section_is_skipped_and_the_walk_continues(tmp_path: Path):
+    """Ruff skips a ``pyproject.toml`` carrying no ``[tool.ruff]`` at all, so a
+    packaging-only manifest must not shadow the config above it."""
+    _write_files(
+        tmp_path,
+        {
+            'pyproject.toml': _RUFF_CONFIG,
+            'member/pyproject.toml': '[project]\nname = "member"\nversion = "0"\n',
+            'member/mod.py': 'x = 1\n',
+        },
+    )
+
+    assert _consumer_of(tmp_path, path='member/mod.py', codes=('E402',)) is (
+        inline_suppressions.Consumer.RUFF
+    )
+
+
+def test_a_file_with_no_pyproject_above_it_has_no_ruff_consumer(tmp_path: Path):
+    """The walk stops at the scan ROOT, never climbing out of the tree under
+    measurement — otherwise a scan of a fixture tree would silently read this
+    repository's own config."""
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n'})
+
+    assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.NONE
+
+
+def test_a_config_key_that_could_widen_the_selected_set_is_an_instrument_failure(
+    tmp_path: Path,
+):
+    """THE SPLIT IS BY DIRECTION OF ERROR, which is the only thing that matters
+    for a gate.
+
+    Under-reading the selected set makes the scanner reject a marker ruff
+    genuinely honours — a false red on a legitimate suppression, the expensive
+    failure — so it refuses to guess rather than proceeding on a config it does
+    not fully model.  Exit 2, naming the file AND the key.
+    """
+    _write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': '[tool.ruff.lint]\nselect = ["E"]\nextend-select = ["ANN"]\n',
+        },
+    )
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        _consumer_of(tmp_path, codes=('E402',))
+
+    assert 'pyproject.toml' in str(caught.value)
+    assert 'extend-select' in str(caught.value)
+
+
+def test_config_keys_that_only_ever_subtract_are_tolerated(tmp_path: Path):
+    """Over-reading the selected set only grandfathers a dead marker — the
+    cheap failure — so it is tolerated with the reason recorded rather than
+    modelled.
+
+    ``per-file-ignores`` is the concrete case: present only in
+    ``orchestrator/pyproject.toml`` (``tests/**/*.py: ["F811"]``), affecting 13
+    grandfathered markers, and modelling it would need path-glob machinery for
+    no change in the direction that can hurt.
+    """
+    _write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': (
+                '[tool.ruff.lint]\n'
+                'select = ["E", "F"]\n'
+                'extend-ignore = ["E731"]\n'
+                '[tool.ruff.lint.per-file-ignores]\n'
+                '"tests/**/*.py" = ["F811"]\n'
+            ),
+        },
+    )
+
+    assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.RUFF
