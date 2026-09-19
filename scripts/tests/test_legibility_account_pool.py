@@ -47,17 +47,10 @@ from shared import usage_gate as usage_gate_mod
 def _restore_environ():
     """Snapshot and restore ``os.environ`` around every test in this module.
 
-    ``build_pool`` calls ``load_dotenv`` and does its own
-    ``os.environ.pop("ANTHROPIC_API_KEY", None)`` — both act on the real
-    process environment directly, so neither is undone by ``monkeypatch``'s
-    teardown, which only reverses its OWN sets. In a worktree there is no
-    ``.env`` for ``load_dotenv`` to find, so this is inert there; in the main
-    checkout (whose ``.env`` carries real
-    ``CLAUDE_OAUTH_TOKEN_*``/``ANTHROPIC_API_KEY``) it is what stops one
-    test's dotenv load or key-strip from outliving it and changing what a
-    LATER test observes. Autouse so it wraps every test here, including
-    ``test_live_one_shot_completes_when_a_pool_token_is_missing``, which
-    reads the real ambient environment on purpose.
+    Every ``build_pool`` call pops ``ANTHROPIC_API_KEY`` and its
+    ``load_dotenv`` sets variables, both directly on ``os.environ``;
+    ``monkeypatch`` reverses neither, so without this one test's effects
+    would reach every later test in the process.
     """
     before = dict(os.environ)
     try:
@@ -1061,10 +1054,9 @@ def test_default_accounts_file_resolves_relative_to_this_checkout():
 def test_build_pool_actually_uses_the_default_accounts_file_when_nothing_else_is_set(
     monkeypatch, tmp_path, empty_env_file,
 ):
-    """The fall-through in ``build_pool``'s ``resolved = accounts_file or
-    os.environ.get("USAGE_ACCOUNTS_FILE") or str(default_accounts_file())``
-    with BOTH earlier sources absent. The test above never calls
-    ``build_pool``. The roster's one account exists in no other roster, so
+    """With neither ``accounts_file`` nor ``USAGE_ACCOUNTS_FILE`` set,
+    ``build_pool`` reads ``default_accounts_file()`` -- the test above never
+    calls ``build_pool``. The roster's one account exists in no other roster, so
     only a pool built from ``default_accounts_file()`` can resolve it -- a
     ``max-*`` name would also resolve from the real
     ``config/usage-accounts.yaml`` and prove nothing.
