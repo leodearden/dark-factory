@@ -236,8 +236,17 @@ def _suspicion(
 
 #: Backup names are ``MERGE_RR.quarantined-<stamp>`` plus a counter when a
 #: same-second repeat would collide.  The stamp orders the evidence for a
-#: reader; the counter is what guarantees nothing is ever overwritten.
+#: reader; the EXCLUSIVE CLAIM in :func:`quarantine_merge_rr` is what
+#: guarantees nothing is ever overwritten — the counter only supplies the next
+#: name to try.
 _QUARANTINE_STAMP = '%Y%m%dT%H%M%S'
+
+#: How many names to try before giving up and reporting the MERGE_RR
+#: un-repaired.  Each failure means another run claimed that exact name in
+#: between, so exhausting this needs a burst of concurrent preflights on one
+#: worktree; the bound exists so the loop cannot spin, not because it is
+#: expected to be reached.
+_QUARANTINE_CLAIM_ATTEMPTS = 5
 
 
 def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
@@ -251,7 +260,14 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
     follows would otherwise destroy it — a successful ``git rebase --abort``
     deletes MERGE_RR outright.  Backup names never collide, so a worktree that
     wedges twice keeps both wedges' evidence rather than overwriting the first
-    with the second.
+    with the second — and that holds for CONCURRENT runs, not just ordered
+    ones, because the name is CLAIMED rather than merely found free.  A counter
+    that checks ``exists()`` and then renames answers only the sequential case:
+    two preflights on the same worktree in the same second both see the base
+    name free, and ``Path.rename`` on POSIX silently replaces its destination,
+    so the second destroys the first backup while both report success.
+    ``os.link`` fails with ``FileExistsError`` instead, which is the whole
+    reason the move is a link-then-unlink rather than a rename.
 
     Logs at WARNING naming the dangling ids and the backup path: a repair that
     happens silently is indistinguishable from a repair that never ran.
@@ -267,16 +283,38 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
     if not scan.suspect:
         return None
 
-    backup = _free_backup_path(scan.merge_rr_path)
-    try:
-        scan.merge_rr_path.rename(backup)
-    except OSError as exc:
+    for _ in range(_QUARANTINE_CLAIM_ATTEMPTS):
+        backup = _free_backup_path(scan.merge_rr_path)
+        try:
+            os.link(scan.merge_rr_path, backup)
+        except FileExistsError:
+            continue          # another run claimed it; take the next name
+        except OSError as exc:
+            logger.warning(
+                'Could not quarantine suspect MERGE_RR %s: %s. Left in place; '
+                'the abort still runs and the result reports it un-repaired.',
+                scan.merge_rr_path, exc,
+            )
+            return None
+        break
+    else:
         logger.warning(
-            'Could not quarantine suspect MERGE_RR %s: %s. Left in place; the '
-            'abort still runs and the result reports it un-repaired.',
-            scan.merge_rr_path, exc,
+            'Could not claim a free backup name for %s after %d attempts. '
+            'Left in place; the abort still runs and the result reports it '
+            'un-repaired.',
+            scan.merge_rr_path, _QUARANTINE_CLAIM_ATTEMPTS,
         )
         return None
+
+    try:
+        scan.merge_rr_path.unlink()
+    except OSError as exc:
+        logger.warning(
+            'Quarantined %s to %s but could not remove the original: %s. The '
+            'evidence is preserved; the next guarded abort will quarantine it '
+            'again.',
+            scan.merge_rr_path, backup, exc,
+        )
     logger.warning(
         'Quarantined suspect MERGE_RR to %s — %s. Evidence preserved; the '
         'abort that follows would have deleted it.',
@@ -287,7 +325,12 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
 
 
 def _free_backup_path(merge_rr_path: Path) -> Path:
-    """First unused ``MERGE_RR.quarantined-<stamp>[-<n>]`` beside the original."""
+    """First unused ``MERGE_RR.quarantined-<stamp>[-<n>]`` beside the original.
+
+    A CANDIDATE, not a reservation: between this answer and the claim another
+    process may take the name, which is why the caller claims it exclusively
+    and asks again rather than trusting this.
+    """
     stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
     base = merge_rr_path.with_name(f'{merge_rr_path.name}.quarantined-{stamp}')
     if not base.exists():

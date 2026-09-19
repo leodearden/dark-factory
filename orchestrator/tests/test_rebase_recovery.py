@@ -465,6 +465,51 @@ class TestQuarantineMergeRr:
         assert b'src/first.py' in first.read_bytes()
         assert b'src/second.py' in second.read_bytes()
 
+    def test_a_name_claimed_between_choosing_and_moving_is_not_overwritten(
+        self, tmp_path: Path,
+    ) -> None:
+        """The SEQUENTIAL counter does not make the docstring's promise true.
+
+        ``quarantine_merge_rr`` promises that a worktree which wedges twice
+        keeps both wedges' evidence, and the counter delivers that only when
+        the two runs are ordered.  Two preflights on the same worktree in the
+        same second both see the base name free, and ``Path.rename`` on POSIX
+        silently REPLACES its destination — so the second destroys the first
+        backup while both report success.
+
+        The interleave is injected once, at the seam where it really happens:
+        between choosing a name and claiming it.  Sequential repeats are
+        already covered by the case above; what this adds is the concurrent
+        one, which no amount of counting can answer on its own.
+        """
+        git_dir = tmp_path / 'gitdir'
+        _plant_merge_rr(git_dir, _record(_HEX, 'src/mine.py'))
+        real_choose = rebase_recovery._free_backup_path
+        raced: list[Path] = []
+
+        def choose_then_lose_the_race(merge_rr_path: Path) -> Path:
+            chosen = real_choose(merge_rr_path)
+            if not raced:                      # one racing process, one loss
+                chosen.write_bytes(b'the other run got here first\n')
+                raced.append(chosen)
+            return chosen
+
+        with patch.object(
+            rebase_recovery, '_free_backup_path',
+            side_effect=choose_then_lose_the_race,
+        ):
+            backup = rebase_recovery.quarantine_merge_rr(
+                rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+            )
+
+        assert raced, 'the fixture must actually have raced'
+        assert raced[0].read_bytes() == b'the other run got here first\n', (
+            "the other run's evidence was overwritten"
+        )
+        assert backup is not None and backup != raced[0]
+        assert b'src/mine.py' in backup.read_bytes()
+        assert not (git_dir / 'MERGE_RR').exists()
+
     def test_intact_scan_leaves_the_file_exactly_where_it_was(
         self, tmp_path: Path,
     ) -> None:
@@ -1342,8 +1387,13 @@ class TestVanishedWorktreeKeepsTheTypedException:
         assert result.resolved is False
         assert result.verdict == rebase_recovery.VERDICT_CLEAN
 
-def _quarantine_rename_fails(monkeypatch, error: OSError) -> None:
-    """Make the quarantine's ``rename`` of MERGE_RR fail with a chosen errno.
+def _quarantine_move_fails(monkeypatch, error: OSError) -> None:
+    """Make the quarantine's MOVE of MERGE_RR fail with a chosen errno.
+
+    Targets ``os.link``, which is the claim half of the link-then-unlink the
+    quarantine performs — chosen over ``rename`` precisely because it fails
+    rather than silently replacing a backup another run just claimed.  The
+    errno must not be ``EEXIST``: that one is the retry path, not a failure.
 
     Monkeypatched rather than ``chmod``ed.  ``chmod`` is a no-op for root, so a
     permission-bit fixture asserts nothing wherever CI runs as root — the same
@@ -1351,19 +1401,19 @@ def _quarantine_rename_fails(monkeypatch, error: OSError) -> None:
     healthy worktree.  A monkeypatch is deterministic and root-independent, and
     it models the likelier race more directly anyway: a concurrent process
     unlinking MERGE_RR between the scan's ``read_bytes`` and the quarantine's
-    ``rename`` produces an errno, not a permission change.
+    move produces an errno, not a permission change.
 
-    Scoped to the MERGE_RR name so every other rename in the process — pytest's
+    Scoped to the MERGE_RR name so every other link in the process — pytest's
     own bookkeeping included — still works.
     """
-    real_rename = Path.rename
+    real_link = os.link
 
-    def rename(self: Path, target):
-        if self.name == 'MERGE_RR':
+    def link(src, dst, **kwargs):
+        if Path(src).name == 'MERGE_RR':
             raise error
-        return real_rename(self, target)
+        return real_link(src, dst, **kwargs)
 
-    monkeypatch.setattr(Path, 'rename', rename)
+    monkeypatch.setattr(os, 'link', link)
 
 
 class TestQuarantineFailureDoesNotSwallowTheAbort:
@@ -1372,7 +1422,7 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
     The module exists to stop a recovery path failing hard, so a preflight that
     raises makes it the NEW reason recovery fails — strictly worse than having
     no preflight at all.  Measured on this branch with a read-only git dir:
-    the quarantine's unguarded ``rename`` raised ``PermissionError`` out through
+    the quarantine's unguarded move raised ``PermissionError`` out through
     ``guarded_abort``, THE ABORT NEVER RAN, and the worktree was left wedged.
 
     ``sweep_stale_locks`` already had the right shape — ``except OSError``
@@ -1395,7 +1445,7 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
         _make_dangling(repo, conflict_id)
         merge_rr = repo / '.git' / 'MERGE_RR'
         original = merge_rr.read_bytes()
-        _quarantine_rename_fails(
+        _quarantine_move_fails(
             monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
         )
         recorded: list[list[str]] = []
@@ -1422,7 +1472,7 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
         repo, conflict_id = build_mid_rebase_repo(tmp_path)
         _make_dangling(repo, conflict_id)
         merge_rr = repo / '.git' / 'MERGE_RR'
-        _quarantine_rename_fails(
+        _quarantine_move_fails(
             monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
         )
 
