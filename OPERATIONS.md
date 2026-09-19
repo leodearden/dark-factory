@@ -1327,6 +1327,42 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   intent, not a guarantee, and read the clock file's timestamp rather than
   assuming it.
 
+### Reading a staleness redeploy's registration
+
+Both staleness redeploys — fleet and fused-memory — are fired as named
+transient units via `systemd-run`, and since task 4131 the watchdog reports
+what became of that registration. Before it, the outcome was discarded
+entirely, so a persistently failing registration was invisible: the journal
+looked identical whether the redeploy had been submitted or had never
+started. (This covers the STALENESS redeploy only — the liveness revive below
+is a different mechanism on a different clock and does not go through here.)
+
+**The exit code is not the discriminator, and that is the whole point.**
+Measured: `systemd-run --user --collect --no-block --unit=X` exits 1 for a
+name collision, 1 for an unrecognised option and 1 for a missing executable
+alike. So on any non-zero exit the watchdog asks systemd whether that
+transient unit is currently active, and reports one of two lines:
+
+- **`<unit> is already in flight; this tick's registration is a no-op`** — the
+  previous redeploy is still running and the fixed unit name did its job as an
+  overlap guard. **No action.** This is expected rather than exceptional: a
+  redeploy routinely outlives the 60s tick — `restart-fused-memory.sh`'s
+  default defer-if-busy path alone can hold up to `RECON_GATE_TIMEOUT` (2100s
+  / 35 min), and fleet sweeps of ~81 minutes are on record above. The next
+  tick retries.
+- **`systemd-run registration of <unit> failed with exit <N>: <stderr>`** —
+  the unit is not running and the submission did not take. **Actionable**: the
+  line carries systemd-run's own captured stderr, so it names the actual
+  reason rather than leaving you a bare number.
+
+A probe that cannot answer (missing `systemctl`, a timeout) is reported as a
+failure, never quietly as a collision — an unclassifiable registration is the
+loud case by design.
+
+Classification lives in
+`scripts/orchestrator-watchdog.py::_register_transient_unit`; the state probe
+is `scripts/orchestrator-watchdog.py::_unit_is_active`.
+
 ### fused-memory liveness revive
 
 `fused-memory.service` has its own liveness pass —
