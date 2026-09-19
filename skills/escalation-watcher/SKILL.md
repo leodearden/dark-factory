@@ -1571,8 +1571,13 @@ uv run --directory escalation python -m escalation.shadow_ruling \
 
 Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
 `not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
-against; `gated_stamps` and `self_resolved` for stamps excluded from every rate. A class whose
-records are mostly `self_resolved` is not a class with a small sample — it is not measurable yet.
+against; `gated_stamps` and `self_resolved` for stamps excluded from every rate — those two are
+counted over the same window as the rate. A class whose records are mostly `self_resolved` is not a
+class with a small sample — it is not measurable yet.
+
+`unresolved_lifetime` is the exception and says so in its name: a pending record has no
+`resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from
+the window in the header.
 
 A class adopts only when task 3346 has landed **and** it has met the threshold in
 `docs/escalation-standing-policy.md`. Until both hold, keep stamping and keep escalating.

@@ -668,7 +668,7 @@ class TestExclusionsAndWindow:
         fixture.stamp(record, _ruling(), by='watcher-a')
 
         report = fixture.report()
-        assert report.unresolved == 1
+        assert report.unresolved_lifetime == 1
         assert report.for_class(_BRANCH_BEHIND) is None, (
             'a still-open record must not appear in any outcome bucket'
         )
@@ -693,8 +693,9 @@ class TestExclusionsAndWindow:
         assert fixture.report().gated_stamps == 1
 
     def test_gating_wins_over_self_resolution(self, tmp_path: Path):
-        """Order is part of the contract: gated -> self_resolved -> ... so a
-        gated stamp is never ALSO counted somewhere that reads as a sample."""
+        """Order is part of the contract: among in-window records, gated ->
+        self_resolved -> ... so a gated stamp is never ALSO counted somewhere
+        that reads as a sample."""
         fixture = _Fixture(tmp_path)
         fixture.stamped_and_resolved(
             _ruling(), observed_action='close_only', category='milestone_gate',
@@ -733,6 +734,84 @@ class TestExclusionsAndWindow:
         report = fixture.report(since=at - timedelta(days=1), until=at - _MICROSECOND)
         assert report.for_class(_BRANCH_BEHIND) is None
 
+    def test_a_gated_stamp_resolved_before_the_window_is_excluded(self, tmp_path: Path):
+        """The excluded buckets are WINDOWED, not lifetime totals printed under
+        a window header. Unwindowed, `gated_stamps` grows monotonically over the
+        whole archive while `agreed`/`diverged` stay weekly, so a weekly report
+        would eventually show a three-digit exclusion beside a four-item
+        comparable denominator — the inverse of the confusion the bucket exists
+        to prevent."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+        )
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        report = fixture.report(since=at + _MICROSECOND, until=at + timedelta(days=1))
+        assert report.gated_stamps == 0
+        assert report.classes == ()
+
+    def test_a_self_close_resolved_before_the_window_is_excluded(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(
+            _ruling(_SEMANTIC_COLLISION, action='close_only'), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+
+        report = fixture.report(since=at + _MICROSECOND, until=at + timedelta(days=1))
+        assert report.self_resolved == 0
+        assert report.classes == ()
+
+    def test_both_windowed_buckets_are_counted_on_the_window_edge(self, tmp_path: Path):
+        """The POSITIVE half of the two exclusions above, so their zeros are
+        read as the window doing its work rather than the buckets being dead."""
+        fixture = _Fixture(tmp_path)
+        gated = fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', category='milestone_gate',
+        )
+        selfclosed = fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only',
+            stamped_by='escalation-watcher', resolved_by='escalation-watcher',
+        )
+        assert gated.resolved_at is not None and selfclosed.resolved_at is not None
+        edges = sorted(
+            datetime.fromisoformat(r.resolved_at)  # type: ignore[arg-type]
+            for r in (gated, selfclosed)
+        )
+
+        report = fixture.report(since=edges[0], until=edges[-1])
+        assert (report.gated_stamps, report.self_resolved) == (1, 1)
+
+    def test_a_pending_stamp_is_counted_outside_every_window(self, tmp_path: Path):
+        """`unresolved_lifetime` is the one bucket that CANNOT be windowed —
+        a pending record has no `resolved_at` to window on — which is why it
+        carries the window's absence in its own name rather than sitting
+        unlabelled under the window header."""
+        fixture = _Fixture(tmp_path)
+        pending = fixture.submit(resolution_action=None)
+        fixture.stamp(pending, _ruling(), by='watcher-a')
+
+        report = fixture.report(
+            since=datetime(2000, 1, 1, tzinfo=UTC), until=datetime(2000, 1, 2, tzinfo=UTC),
+        )
+        assert report.unresolved_lifetime == 1
+        assert report.classes == ()
+
+    def test_a_pending_gated_stamp_is_unresolved_not_gated(self, tmp_path: Path):
+        """Pendingness is decided before the window and therefore before gating:
+        nothing has been ruled on the record yet, so the honest bucket is the
+        backlog one — and counting it as a gated stamp instead would put an
+        unwindowable record back into a windowed number."""
+        fixture = _Fixture(tmp_path)
+        pending = fixture.submit(category='milestone_gate', resolution_action=None)
+        fixture.stamp(pending, _ruling(), by='watcher-a')
+
+        report = fixture.report()
+        assert (report.unresolved_lifetime, report.gated_stamps) == (1, 0)
+
     def test_a_cascade_resolver_is_reported_in_its_tier_not_as_a_human_agreement(
         self, tmp_path: Path,
     ):
@@ -770,7 +849,7 @@ class TestSweepRobustness:
             since=datetime(2000, 1, 1, tzinfo=UTC), until=datetime(2100, 1, 1, tzinfo=UTC),
         )
         assert report.classes == ()
-        assert (report.gated_stamps, report.self_resolved, report.unresolved) == (0, 0, 0)
+        assert (report.gated_stamps, report.self_resolved, report.unresolved_lifetime) == (0, 0, 0)
 
     def test_an_empty_queue_dir_yields_an_empty_report(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
@@ -785,7 +864,7 @@ class TestSweepRobustness:
 
         report = fixture.report()
         assert report.classes == ()
-        assert (report.gated_stamps, report.self_resolved, report.unresolved) == (0, 0, 0)
+        assert (report.gated_stamps, report.self_resolved, report.unresolved_lifetime) == (0, 0, 0)
 
     def test_an_unstamped_record_is_skipped_silently(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
@@ -868,7 +947,7 @@ class TestCliTable:
         out = capsys.readouterr().out
         assert 'gated_stamps=1' in out
         assert 'self_resolved=1' in out
-        assert 'unresolved=1' in out
+        assert 'unresolved_lifetime=1' in out
 
     def test_self_resolved_is_printed_even_when_zero(self, tmp_path: Path, capsys):
         """A reader deciding whether a class cleared "95% over at least 10
@@ -896,7 +975,7 @@ class TestCliTable:
         assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
         out = capsys.readouterr().out
         assert 'self_resolved=2' in out
-        assert 'unresolved=0' in out
+        assert 'unresolved_lifetime=0' in out
         row = _row_for(out, _BRANCH_BEHIND)
         assert '2' not in row.replace(_BRANCH_BEHIND, ''), (
             f'the two self-resolved records leaked into the class row: {row!r}'
@@ -1098,7 +1177,7 @@ class TestCliJson:
 
         assert payload['gated_stamps'] == 1
         assert payload['self_resolved'] == 1
-        assert payload['unresolved'] == 0
+        assert payload['unresolved_lifetime'] == 0
         row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
         assert (row['agreed'], row['diverged'], row['not_comparable']) == (1, 1, 0)
         assert row['comparable'] == 2

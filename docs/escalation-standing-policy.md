@@ -191,8 +191,13 @@ lands in exactly one bucket:
   leave `resolution_action` unset. Counted separately and never folded into
   either side: a class whose proposals are mostly task-side is visibly not yet
   measurable rather than falsely green.
-- `gated_stamps`, `self_resolved`, `unresolved` — records excluded from every
-  rate, reported so a small sample and a discarded one cannot look alike.
+- `gated_stamps`, `self_resolved` — records excluded from every rate, counted
+  over the SAME window as `agreed`/`diverged`, so a small sample and a discarded
+  one cannot look alike.
+- `unresolved_lifetime` — stamps still pending, including a pending record that
+  would also have been gated. The one number in the report that is not from the
+  window: a pending record has no `resolved_at` to window on, so this is the
+  standing backlog as of the sweep, and its name carries that.
 
 The rate is computed over the comparable subset only, and the comparable
 denominator is printed beside it, so "95% or better over at least 10 items" is

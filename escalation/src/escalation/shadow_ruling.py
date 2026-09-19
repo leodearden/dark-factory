@@ -307,6 +307,17 @@ class AgreementReport:
     The three non-rate buckets are findings, not noise: each counts a stamp that
     must not contribute to any class's rate, and each is reported so a reader
     can tell a small sample from a thrown-away one.
+
+    TWO OF THE THREE ARE IN-WINDOW AND THE THIRD CANNOT BE, and the field names
+    say which: ``gated_stamps`` and ``self_resolved`` count records RESOLVED
+    inside ``since..until``, exactly like ``agreed``/``diverged``, so they are
+    comparable with the denominator printed beside them. ``unresolved_lifetime``
+    counts stamps still pending — a record with no resolution instant to window
+    on at all — so it is a standing backlog as of the sweep, not a number from
+    this window, and is named for that. Windowing it on ``triaged_at`` instead
+    was rejected: it would put a second time axis under one window header, and
+    the operator-facing contract (``--since``/``--until`` help text) is that the
+    window is read on ``resolved_at``.
     """
 
     since: datetime
@@ -314,7 +325,7 @@ class AgreementReport:
     classes: tuple[ClassAgreement, ...]
     gated_stamps: int
     self_resolved: int
-    unresolved: int
+    unresolved_lifetime: int
     resolver_tiers: Mapping[str, int]
 
     def for_class(self, ruling_class: str) -> ClassAgreement | None:
@@ -368,11 +379,25 @@ def agreement_report(
     no parsable shadow ruling are skipped — the overwhelming majority carry
     none.
 
-    THE ORDER OF CHECKS IS PART OF THE CONTRACT: gated -> self_resolved ->
-    unresolved -> out-of-window -> non-human resolver -> not_comparable ->
+    THE ORDER OF CHECKS IS PART OF THE CONTRACT: unresolved -> out-of-window ->
+    gated -> self_resolved -> non-human resolver -> not_comparable ->
     agreed/diverged. The first five are all "this record must not contribute to
     a rate at all"; putting any of them later would let an in-window matching
     close fall through to ``agreed`` first.
+
+    THE WINDOW COMES BEFORE THE TWO EXCLUDED BUCKETS THAT CAN BE WINDOWED, so
+    that every number printed under the window header is a number from that
+    window. Counting them first made them lifetime totals rendered beside a
+    weekly denominator: on the real archive they grow monotonically forever, so
+    a weekly report would eventually show ``gated_stamps=140`` next to a
+    four-item comparable denominator — the inverse of the "a small sample and a
+    discarded one must not look alike" property the buckets exist to give.
+
+    Pendingness is decided FIRST because a pending record has no ``resolved_at``
+    to window on: it would otherwise be dropped by the window filter and vanish
+    from every bucket. That order also decides where a pending GATED stamp
+    lands — ``unresolved_lifetime``, not ``gated_stamps`` — which is the honest
+    reading: nothing has been ruled on it yet.
 
     ``self_resolved`` — ``triaged_by is not None and triaged_by ==
     resolved_by`` — is the bucket task 5361 made necessary.
@@ -397,7 +422,7 @@ def agreement_report(
     tiers: Counter[str] = Counter()
     gated_stamps = 0
     self_resolved = 0
-    unresolved = 0
+    unresolved_lifetime = 0
 
     for path in iter_all_escalation_paths(Path(escalations_dir)):
         try:
@@ -410,18 +435,19 @@ def agreement_report(
         if ruling is None:
             continue
 
+        if record.status == 'pending':
+            unresolved_lifetime += 1
+            continue
+
+        resolved_at = _resolved_at(record)
+        if resolved_at is None or not since <= resolved_at <= until:
+            continue
+
         if mechanically_gated(record) is not None:
             gated_stamps += 1
             continue
         if record.triaged_by is not None and record.triaged_by == record.resolved_by:
             self_resolved += 1
-            continue
-        if record.status == 'pending':
-            unresolved += 1
-            continue
-
-        resolved_at = _resolved_at(record)
-        if resolved_at is None or not since <= resolved_at <= until:
             continue
 
         tier = classify_resolver_tier(record.resolved_by)
@@ -451,7 +477,7 @@ def agreement_report(
         ),
         gated_stamps=gated_stamps,
         self_resolved=self_resolved,
-        unresolved=unresolved,
+        unresolved_lifetime=unresolved_lifetime,
         resolver_tiers=MappingProxyType(dict(sorted(tiers.items()))),
     )
 
@@ -482,7 +508,7 @@ def _as_json(report: AgreementReport) -> str:
             ],
             'gated_stamps': report.gated_stamps,
             'self_resolved': report.self_resolved,
-            'unresolved': report.unresolved,
+            'unresolved_lifetime': report.unresolved_lifetime,
             'resolver_tiers': dict(report.resolver_tiers),
         },
         indent=2,
@@ -498,6 +524,11 @@ def _as_table(report: AgreementReport) -> str:
     at zero. A class whose stamps were mostly thrown out for self-agreement is
     not a class with a small sample, and the output must not let the two look
     alike.
+
+    The excluded buckets sit on their own line under the window header, and the
+    one that is NOT from the window says so in its own name
+    (``unresolved_lifetime``) rather than relying on the reader to know which
+    numbers on that line share the header's window.
     """
     lines = [
         f'shadow ruling agreement — window {report.since.isoformat()} .. '
@@ -520,7 +551,7 @@ def _as_table(report: AgreementReport) -> str:
     lines.extend([
         '',
         f'gated_stamps={report.gated_stamps} self_resolved={report.self_resolved} '
-        f'unresolved={report.unresolved}',
+        f'unresolved_lifetime={report.unresolved_lifetime}',
         'resolver_tiers: ' + (
             ' '.join(f'{tier}={n}' for tier, n in report.resolver_tiers.items()) or '(none)'
         ),
