@@ -3410,10 +3410,17 @@ def _make_v4_db_for_backfill(
 
 
 # (id, title, status, metadata_raw, updated_at) — the v4->v5 back-fill corpus.
-# Two anchorless pending rows with DISTINCT updated_at values (so a back-fill
-# that stamped one shared clock instead of each row's own updated_at would be
-# caught), one already-anchored pending row whose anchor differs from its
-# updated_at, one row in each non-pending status, and one corrupt pending row.
+# Covers every arm of the migration's branch logic: anchorless pending rows
+# with DISTINCT updated_at values (so a back-fill stamping one shared clock
+# instead of each row's own updated_at would be caught), an already-anchored
+# pending row whose anchor differs from its updated_at, one row in each
+# non-pending status, and the three SKIP arms — an unparseable blob, a
+# valid-JSON-but-not-a-dict blob, and a row whose updated_at is itself
+# unusable. Row 10 pins the present-but-BLANK anchor, which the
+# `_usable_timestamp` gate deliberately treats as absent and re-back-fills:
+# that is asserted for the pure helper in test_pending_since_anchor.py, but
+# the migration is the writer that has to get it right for the legacy
+# population.
 _BACKFILL_ROWS: list[tuple[int, str, str, str | None, str]] = [
     (1, 'anchorless one', 'pending', None, '2026-01-01T00:00:00.000Z'),
     (2, 'anchorless two', 'pending', '{"source": "keep me"}',
@@ -3425,6 +3432,11 @@ _BACKFILL_ROWS: list[tuple[int, str, str, str | None, str]] = [
     (6, 'finished', 'done', None, '2026-06-06T00:00:00.000Z'),
     (7, 'discarded', 'cancelled', None, '2026-07-07T00:00:00.000Z'),
     (8, 'corrupt', 'pending', 'NOT_JSON_BACKFILL', '2026-08-08T00:00:00.000Z'),
+    (9, 'valid json, not an object', 'pending', '[1,2,3]',
+     '2026-09-09T00:00:00.000Z'),
+    (10, 'blank anchor', 'pending', '{"pending_since": ""}',
+     '2026-10-10T00:00:00.000Z'),
+    (11, 'blank updated_at', 'pending', None, ''),
 ]
 _BACKFILL_UPDATED_AT = {row[0]: row[4] for row in _BACKFILL_ROWS}
 
@@ -3489,9 +3501,12 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
 
     after, user_version = _read_backfill_state(db_path)
 
-    # (a) exactly the two anchorless pending rows are anchored from their OWN
-    # updated_at and marked as back-filled.
-    for task_id in (1, 2):
+    # (a) exactly the anchorless pending rows are anchored from their OWN
+    # updated_at and marked as back-filled. Row 10's anchor is PRESENT but
+    # blank, which reads as absent (`_usable_timestamp`) — leaving it in place
+    # would pin the row at age 0 forever, since this migration is one-shot and
+    # the live stamp only fires on a `* -> pending` landing.
+    for task_id in (1, 2, 10):
         parsed = _backfilled_metadata(after, task_id)
         assert parsed['pending_since'] == _BACKFILL_UPDATED_AT[task_id]
         assert parsed['pending_since_backfilled'] is True
@@ -3505,8 +3520,16 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
     for task_id in (4, 5, 6, 7):
         assert after[task_id] == before[task_id], f'row {task_id} must be untouched'
 
-    # (d) the corrupt row is skipped and its bytes are unchanged.
+    # (d) all three SKIP arms leave their row's bytes exactly as found: the
+    # unparseable blob, the valid-JSON-that-is-not-a-dict blob (a DISTINCT
+    # branch — it parses, it just isn't an object), and the row whose
+    # updated_at is unusable, which has nothing to anchor FROM. An empty
+    # updated_at is representable: the v0->v1 rebuild inserts
+    # COALESCE(updated_at, ''), so a legacy row carried through that path can
+    # hold '' in a NOT NULL column.
     assert after[8] == 'NOT_JSON_BACKFILL'
+    assert after[9] == '[1,2,3]'
+    assert after[11] is None
 
     # (e) the chain lands at the new top.
     assert user_version == 5, f'Expected user_version=5; got {user_version}'
@@ -3517,8 +3540,18 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
         r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()
     ]
     assert len(lines) == 1, f'Expected exactly one v4->v5 log line; got {lines}'
-    assert 'rows_backfilled=2' in lines[0], (
+    assert 'rows_backfilled=3' in lines[0], (
         f'the count of rows touched must be reported; got {lines[0]!r}'
+    )
+    # The skip counts are part of that signal too — without asserting them a
+    # counter wired to the wrong variable, or one that stopped incrementing,
+    # would leave every assertion above green.
+    assert 'skipped_corrupt_metadata=2' in lines[0], (
+        f'both non-dict skip arms must be counted; got {lines[0]!r}'
+    )
+    assert 'skipped_unusable_updated_at=1' in lines[0], (
+        f'a row with no usable seed must be counted, not silently dropped; '
+        f'got {lines[0]!r}'
     )
 
 

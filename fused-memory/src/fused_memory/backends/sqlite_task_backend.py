@@ -929,6 +929,26 @@ async def _candidate_key_index_present(conn: aiosqlite.Connection) -> bool:
     return any(row[1] == 'ux_tasks_candidate_key' for row in index_rows)
 
 
+def _usable_timestamp(value: Any) -> bool:
+    """True iff *value* is a timestamp string a reader can actually use.
+
+    The ONE predicate behind both writers of ``metadata.pending_since``
+    (INV-5 ``no-lockstep-duplication``, heuristic 11 SPOT):
+    :func:`stamp_pending_since` applies it to the anchor it FINDS — a blank,
+    ``None`` or non-string value reads as ABSENT and is re-stamped — and
+    :func:`_migrate_v4_to_v5` applies it both to the anchor it finds and to
+    the ``updated_at`` it would seed FROM.
+
+    That second use is why this is one shared predicate rather than two
+    spellings of the same idea. ``updated_at`` is NOT NULL yet can still hold
+    ``''`` (the v0->v1 rebuild inserts ``COALESCE(updated_at, '')``), and
+    seeding that blank would pin the row at age 0 forever: the migration is
+    one-shot, and the live stamp only fires on a ``* -> pending`` LANDING, so
+    a row that is already pending and stays pending would never be repaired.
+    """
+    return isinstance(value, str) and value.strip() != ''
+
+
 async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     """v4 -> v5 (task 3816, PRD §C1 back-fill): seed ``metadata.pending_since``.
 
@@ -954,13 +974,17 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     counted, because a connection-open migration that raised on one bad row
     would make the whole store unopenable — and the skipped row simply reads
     as anchorless, which C1's reader contract already handles (absent =>
-    age 0, fail-safe).
+    age 0, fail-safe). A row whose ``updated_at`` is itself unusable is
+    skipped under its own count for the same reason, via the same
+    :func:`_usable_timestamp` predicate the live stamp applies — the two
+    writers of this key must not drift on what counts as a usable value.
     """
     cursor = await conn.execute(
         "SELECT tag, id, metadata, updated_at FROM tasks WHERE status = 'pending'",
     )
     updates: list[tuple[str, str, int]] = []
     skipped_corrupt = 0
+    skipped_unusable_updated_at = 0
     for row in await cursor.fetchall():
         metadata_raw = row['metadata']
         if metadata_raw:
@@ -973,12 +997,22 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
                 continue
         else:
             parsed = {}
-        existing = parsed.get('pending_since')
-        if isinstance(existing, str) and existing.strip() != '':
+        if _usable_timestamp(parsed.get('pending_since')):
+            continue
+        updated_at = row['updated_at']
+        if not _usable_timestamp(updated_at):
+            # The seed itself is unusable, so there is nothing to anchor FROM.
+            # Stamping it anyway would pin the row at age 0 forever (one-shot
+            # migration, and the live stamp only fires on a LANDING) and would
+            # miscount it into the D4 census of legitimately back-filled rows.
+            # Skipping is fail-safe and is what the reader contract already
+            # handles: the row stays anchorless (age 0, never a queue jump)
+            # and is repaired on its next pending landing.
+            skipped_unusable_updated_at += 1
             continue
         merged = {
             **parsed,
-            'pending_since': row['updated_at'],
+            'pending_since': updated_at,
             'pending_since_backfilled': True,
         }
         updates.append((json.dumps(merged), row['tag'], row['id']))
@@ -991,10 +1025,11 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     logger.info(
         'sqlite_task_backend: schema v4->v5 migration -- metadata.pending_since '
         'backfilled from updated_at for anchorless pending rows; '
-        'rows_backfilled=%d skipped_corrupt_metadata=%d (task 3816; every '
-        'backfilled row is marked pending_since_backfilled so the deliberate '
-        'under-aging stays countable)',
-        len(updates), skipped_corrupt,
+        'rows_backfilled=%d skipped_corrupt_metadata=%d '
+        'skipped_unusable_updated_at=%d (task 3816; every backfilled row is '
+        'marked pending_since_backfilled so the deliberate under-aging stays '
+        'countable)',
+        len(updates), skipped_corrupt, skipped_unusable_updated_at,
     )
 
     await conn.execute('PRAGMA user_version = 5')
@@ -1152,9 +1187,7 @@ def stamp_pending_since(
             )
         return None
 
-    existing = old.get('pending_since')
-    usable = isinstance(existing, str) and existing.strip() != ''
-    if usable and old_status != TaskStatus.CANCELLED:
+    if _usable_timestamp(old.get('pending_since')) and old_status != TaskStatus.CANCELLED:
         return None
     return json.dumps({**old, 'pending_since': now})
 
