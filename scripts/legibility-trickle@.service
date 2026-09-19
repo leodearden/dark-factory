@@ -25,7 +25,7 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
 # inherits this Environment.
 Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
-ExecStart=/home/leo/.local/bin/uv run --no-sync --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal
 

@@ -19,7 +19,7 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # this timer exit 1 on EVERY run -- a perpetual false alarm (task 2901 DD2).
 # The core lost-transcript detector is authoritative and correct without the
 # guard; the regex false-negative is a separate, out-of-scope 2893 bug.
-ExecStart=/home/leo/.local/bin/uv run --no-sync --frozen --project shared python scripts/legibility/check_transcript_persistence.py --project-id %i
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/check_transcript_persistence.py --project-id %i
 StandardOutput=journal
 StandardError=journal
 
