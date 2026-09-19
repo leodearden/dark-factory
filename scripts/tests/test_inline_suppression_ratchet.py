@@ -1756,7 +1756,13 @@ _REPORT_TREE = {
 
 
 def _json_text(root: Path, baseline_path: Path, capsys, *paths: str) -> str:
-    """Run ``--json`` and return its raw stdout, asserting the exit code is 0."""
+    """Run ``--json`` and return its raw stdout, asserting the exit code is 0.
+
+    The buffer is drained first: a fixture seeded through ``--seed`` has already
+    printed its own report line, and ``json.loads`` of the two concatenated fails
+    on the first character with nothing to say about why.
+    """
+    capsys.readouterr()
     code = inline_suppressions.main(
         ['--json', '--root', str(root), '--baseline', str(baseline_path), *paths]
     )
@@ -1783,7 +1789,7 @@ def test_json_publishes_every_block_the_register_reads(tmp_path: Path, capsys):
     baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
     report = _json_report(tmp_path, baseline, capsys)
 
-    assert report['schema_version'] == SCHEMA_VERSION
+    assert report['schema_version'] == inline_suppressions.REPORT_SCHEMA_VERSION == 1
     assert set(report['params']) == {'kinds', 'key_scheme', 'digest_hex'}
     assert report['status'] == 'advisory'
     assert report['files_enumerated'] == 2

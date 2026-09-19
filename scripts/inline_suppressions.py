@@ -56,12 +56,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
 import tokenize
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from io import StringIO
@@ -70,7 +72,7 @@ from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from shared.governed_exceptions import Disposition, Policy
+    from shared.governed_exceptions import Debt, Disposition, Policy
     from shared.ratchet import Enumeration
 
 
@@ -885,6 +887,23 @@ class ConsumerModel:
             return Consumer.RUFF
         return Consumer.NONE
 
+    def resolved(self) -> tuple[RuffConfig, ...]:
+        """Every config this model actually consulted, sorted by declaring path.
+
+        THE REPORT'S AUDIT TRAIL, and the reason it is the model that publishes
+        it: what a reader needs is not every ``pyproject.toml`` in the tree but
+        the ones whose ``select``/``ignore`` decided an answer here — including,
+        by their absence, the meta-prefix selectors decision 2 records as a known
+        limit.  Deduped by path, because the memo is keyed by directory and one
+        manifest serves a whole subtree.
+        """
+        return tuple(
+            sorted(
+                {config.path: config for config in self._by_directory.values() if config}.values(),
+                key=lambda config: config.path,
+            )
+        )
+
     def _nearest_config(self, directory: Path) -> RuffConfig | None:
         """The config governing *directory*, which is relative to the scan root.
 
@@ -1039,6 +1058,23 @@ class Violation:
         marker = f'{self.kind.value}{codes}' if self.kind is not None else 'no suppression'
         accepted = f' Accepted forms: {" | ".join(self.forms)}' if self.forms else ''
         return f'{self.path}:{self.line}: {marker} -- {self.reason}{accepted}'
+
+    def record(self) -> dict[str, object]:
+        """The same finding as structured data, for ``--json``.
+
+        Not the rendered line re-parsed, and not a second statement of what a
+        finding IS: both come off the same fields, so a consumer reads values
+        where a human reads a sentence and neither has to parse the other
+        (heuristic 12).
+        """
+        return {
+            'path': self.path,
+            'line': self.line,
+            'kind': None if self.kind is None else self.kind.value,
+            'codes': list(self.codes),
+            'reason': self.reason,
+            'forms': list(self.forms),
+        }
 
 
 @dataclass(frozen=True)
@@ -1204,6 +1240,13 @@ def _classify_site(
 #: the path κ1 seeds and the merge gate reads.
 BASELINE_PATH = 'scripts/inline_suppression_baseline.json'
 
+#: The ``--json`` report's own schema version, and deliberately NOT
+#: ``shared.ratchet.SCHEMA_VERSION`` — that one versions the BASELINE FILE's
+#: format, which changes for entirely different reasons.  Two orthogonal schemas
+#: get two numbers, so a report-shape change never reads as a baseline-format
+#: change to the consumer that sees it.
+REPORT_SCHEMA_VERSION = 1
+
 #: The key scheme, as one opaque token in the ratchet's ``params`` block.  It is
 #: a NAME rather than a description: params are compared for equality, so its
 #: only job is to differ when the keys mean something different.
@@ -1297,10 +1340,25 @@ def _status(request: Request) -> Status:
     return Status.PARTIAL if request.scoped else Status.CLEAN
 
 
-def _measure(request: Request) -> tuple[Scan, Classification]:
+@dataclass(frozen=True)
+class Measurement:
+    """One run's scan, its classification, and the model that resolved it.
+
+    The model travels with the other two because ``--json`` publishes the
+    configs it consulted; a report that re-resolved them could publish a
+    different answer than the one the classification used.
+    """
+
+    scan: Scan
+    classification: Classification
+    model: ConsumerModel
+
+
+def _measure(request: Request) -> Measurement:
     """Scan and classify *request*'s tree — the work every verb starts with."""
     scan = scan_tree(request.root, scope=request.scope)
-    return scan, classify(scan, ConsumerModel(request.root))
+    model = ConsumerModel(request.root)
+    return Measurement(scan=scan, classification=classify(scan, model), model=model)
 
 
 def _enumeration(classification: Classification, kernel: ModuleType) -> Enumeration:
@@ -1386,6 +1444,66 @@ def _excess_violations(
     )
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What the gate would say about this run.
+
+    Attributes:
+        status: Which green a zero exit would be.
+        excess: Keys over budget, or ``None`` when no baseline was compared.
+        slack: Headroom, or ``None`` when this run's view cannot honestly
+            measure it — an advisory run has no baseline, and a scoped one would
+            read every unscanned key as headroom.
+        violations: Every exit-1 finding, disposition faults first.
+
+    COMPUTED ONCE AND READ TWICE.  ``--check`` turns it into an exit code and
+    ``--json`` publishes it, so a report reader sees the gate's answer without
+    running the gate — and cannot see a DIFFERENT answer, which is what two
+    scans of a tree that changed in between would give them.
+    """
+
+    status: Status
+    excess: Mapping[str, int] | None
+    slack: Mapping[str, int] | None
+    violations: tuple[Violation, ...]
+
+    @property
+    def exit_code(self) -> int:
+        """1 when this run found something, else 0."""
+        return 1 if self.violations else 0
+
+
+def _verdict(
+    request: Request, classification: Classification, kernel: ModuleType
+) -> Verdict:
+    """What the gate would say about *classification*.
+
+    The disposition faults come first and are baseline-INDEPENDENT: a marker that
+    does not parse is a fault at the site whatever any baseline holds, so an
+    advisory run still reports one.  Only the ratchet's half waits for a baseline.
+    """
+    status = _status(request)
+    if status is Status.ADVISORY:
+        return Verdict(
+            status=status, excess=None, slack=None, violations=classification.violations
+        )
+
+    baseline = kernel.load(request.baseline)
+    current = _enumeration(classification, kernel)
+    over = dict(kernel.excess(current, baseline))
+    return Verdict(
+        status=status,
+        excess=over,
+        slack=None if request.scoped else dict(kernel.slack(current, baseline)),
+        violations=classification.violations + _excess_violations(over, classification),
+    )
+
+
+def _total(counts: Mapping[str, int] | None) -> int | None:
+    """A ratchet block's multiplicity total, preserving "not measured"."""
+    return None if counts is None else sum(counts.values())
+
+
 def _count(total: int, noun: str) -> str:
     """*total* and *noun*, pluralised by the only rule this report needs."""
     return f'{total} {noun}' if total == 1 else f'{total} {noun}s'
@@ -1410,8 +1528,7 @@ def _headline(status: Status, violations: tuple[Violation, ...]) -> str:
 
 
 def _report_line(
-    scan: Scan,
-    classification: Classification,
+    measured: Measurement,
     *,
     headline: str,
     excess_total: int | None,
@@ -1423,7 +1540,8 @@ def _report_line(
     when a run comes back suspiciously clean: a scan that enumerated nothing
     and a tree with nothing wrong are otherwise the same output.
     """
-    counts = classification.counts
+    counts = measured.classification.counts
+    scan = measured.scan
     return (
         f'{headline}: {_count(len(scan.sites), "suppression site")} in '
         f'{scan.files_tokenized} of {scan.files_enumerated} tracked files; '
@@ -1439,35 +1557,21 @@ def _check(request: Request, kernel: ModuleType) -> int:
     faults D6 names, which are faults at the site whatever any baseline says,
     and the ratchet's excess.  Either alone is exit 1.
     """
-    scan, classification = _measure(request)
-    status = _status(request)
-    violations = classification.violations
-    excess_total: int | None = None
-    slack_total: int | None = None
-
-    if status is not Status.ADVISORY:
-        baseline = kernel.load(request.baseline)
-        current = _enumeration(classification, kernel)
-        over = dict(kernel.excess(current, baseline))
-        excess_total = sum(over.values())
-        violations += _excess_violations(over, classification)
-        if not request.scoped:
-            slack_total = sum(kernel.slack(current, baseline).values())
-
+    measured = _measure(request)
+    verdict = _verdict(request, measured.classification, kernel)
     print(
         _report_line(
-            scan,
-            classification,
-            headline=_headline(status, violations),
-            excess_total=excess_total,
-            slack_total=slack_total,
+            measured,
+            headline=_headline(verdict.status, verdict.violations),
+            excess_total=_total(verdict.excess),
+            slack_total=_total(verdict.slack),
         )
     )
-    if status is Status.ADVISORY:
+    if verdict.status is Status.ADVISORY:
         print(_ADVISORY_NOTICE.format(baseline=request.baseline))
-    for violation in violations:
+    for violation in verdict.violations:
         print(violation.render(), file=sys.stderr)
-    return 1 if violations else 0
+    return verdict.exit_code
 
 
 def _require_whole_tree(request: Request, verb: str) -> None:
@@ -1525,12 +1629,11 @@ def _seed(request: Request, kernel: ModuleType) -> int:
             'existing one silently widens the gate by every key this scan added. Use '
             '--tighten to remove what the tree no longer needs.'
         )
-    scan, classification = _measure(request)
-    kernel.dump(_enumeration(classification, kernel), request.baseline)
+    measured = _measure(request)
+    kernel.dump(_enumeration(measured.classification, kernel), request.baseline)
     print(
         _report_line(
-            scan,
-            classification,
+            measured,
             headline=f'{Status.CLEAN.value} -- seeded {request.baseline}',
             excess_total=None,
             slack_total=None,
@@ -1576,9 +1679,9 @@ def _tighten(request: Request, kernel: ModuleType) -> int:
     gate is still red.
     """
     _require_whole_tree(request, '--tighten')
-    scan, classification = _measure(request)
+    measured = _measure(request)
     baseline = kernel.load(request.baseline)
-    current = _enumeration(classification, kernel)
+    current = _enumeration(measured.classification, kernel)
     excess_total = sum(kernel.excess(current, baseline).values())
     tightened = kernel.tighten_into(current, baseline, request.baseline)
 
@@ -1589,8 +1692,7 @@ def _tighten(request: Request, kernel: ModuleType) -> int:
     }
     print(
         _report_line(
-            scan,
-            classification,
+            measured,
             headline=f'tightened {request.baseline}',
             excess_total=excess_total,
             slack_total=0,
@@ -1598,6 +1700,171 @@ def _tighten(request: Request, kernel: ModuleType) -> int:
     )
     for key, count in sorted(removed.items()):
         print(f'  -{count} {key}')
+    return 0
+
+
+def _site_record(site: Site) -> dict[str, object]:
+    """One site, as every block of the report names it."""
+    return {
+        'path': site.path,
+        'line': site.line,
+        'kind': site.kind.value,
+        'codes': list(site.codes),
+    }
+
+
+def _owner(debt: Debt) -> str:
+    """A debt's owner as D6 spells it — ``task 5601`` or ``ticket tkt_…``.
+
+    The same tail the inline marker carries, so a report entry and the line it
+    came from read alike and a consumer following the owner up needs no second
+    vocabulary.  The two nouns come from the two ref TYPES rather than from a
+    string test, which is why a ticket can never be reported as a task.
+    """
+    from shared.governed_exceptions import TaskRef
+
+    noun = 'task' if isinstance(debt.owner, TaskRef) else 'ticket'
+    return f'{noun} {debt.owner.id}'
+
+
+def _tally(values: Iterable[str], vocabulary: Iterable[str]) -> dict[str, int]:
+    """Count *values*, with every word of *vocabulary* present even at zero.
+
+    THE ZERO ROWS ARE THE POINT.  ``nosec`` reading 0 is a measurement — this
+    repository configures no bandit — and a schema that omitted it would make "no
+    bandit markers in the tree" and "the scanner stopped looking for them" the
+    same output.  Every kind, consumer and ownership state therefore appears in
+    every report, which is also what lets the live guard assert a zero.
+    """
+    counted = Counter(values)
+    return {word: counted.get(word, 0) for word in vocabulary}
+
+
+def _by_kind_code(scan: Scan) -> list[dict[str, object]]:
+    """The per-``(kind, code)`` table the exception register renders.
+
+    A site with two codes contributes to BOTH rows, because the question this
+    answers is "how many suppressions silence E402", and a marker silencing E402
+    and F401 silences each of them.  The totals therefore need not sum to the
+    site count, which is why they are published beside ``kind_totals`` rather
+    than instead of it.
+
+    A codeless marker gets ``None`` rather than an empty string: ``""`` is a
+    value a reader could filter on and silently match nothing.
+    """
+    tally: Counter[tuple[str, str | None]] = Counter()
+    for site in scan.sites:
+        for code in site.codes or (None,):
+            tally[(site.kind.value, code)] += 1
+    return [
+        {'kind': kind, 'code': code, 'sites': sites}
+        for (kind, code), sites in sorted(
+            tally.items(), key=lambda row: (row[0][0], row[0][1] or '')
+        )
+    ]
+
+
+def _owned_blocks(classification: Classification) -> dict[str, object]:
+    """The three site-level ownership blocks, built in one pass.
+
+    GROUPED BY WHAT EACH ENTRY CARRIES rather than by its :class:`Ownership`
+    label, and the two agree by construction: :func:`_classify_site` sets exactly
+    one of ``disposition`` and ``suppression_class``, and sets NEITHER on an
+    unowned site — including one whose comment did carry a disposition that D8
+    refused.  Keying off the field removes the unreachable branch a label-first
+    grouping would need, and the report then says what is actually written down.
+
+    THESE ARE THE ONLY SITE-LEVEL BLOCKS, deliberately.  Each is bounded by what
+    somebody wrote down, while the corpus itself is thousands of sites and is
+    published as counts; a report enumerating every one would be a megabyte
+    nobody reads and a second copy of the tree.  ``ratified`` carries its sites
+    because the register's closed-world check cannot report an id it has no
+    sites to point at, and ``classes`` carries its own so a blanket ruling cannot
+    quietly absorb a growing population.
+    """
+    from shared.governed_exceptions import Debt, Policy
+
+    debt: list[dict[str, object]] = []
+    ratified: dict[str, list[dict[str, object]]] = {}
+    classes: dict[str, list[dict[str, object]]] = {}
+    for entry in classification.classified:
+        record = _site_record(entry.site)
+        if isinstance(entry.disposition, Debt):
+            debt.append(record | {'owner': _owner(entry.disposition)})
+        elif isinstance(entry.disposition, Policy):
+            ratified.setdefault(entry.disposition.ratified, []).append(record)
+        if entry.suppression_class is not None:
+            classes.setdefault(entry.suppression_class.render(), []).append(record)
+    return {
+        'debt': debt,
+        'ratified': [{'id': key, 'sites': sites} for key, sites in sorted(ratified.items())],
+        'classes': [{'class': key, 'sites': sites} for key, sites in sorted(classes.items())],
+    }
+
+
+def _report_dict(request: Request, measured: Measurement, verdict: Verdict) -> dict[str, object]:
+    """The whole report, as plain JSON-expressible data.
+
+    ONE BUILDER, so ``--json`` is the only place the report exists and nothing
+    downstream re-implements the scan.  Every mapping is dumped with sorted keys
+    and every list is built in a sorted order — the site-level ones in scan
+    order, which is sorted path then ascending line — so two runs over one
+    unchanged tree emit identical BYTES.  A report that reordered between runs
+    would make its every consumer's diff pure noise.
+    """
+    classification = measured.classification
+    return {
+        'schema_version': REPORT_SCHEMA_VERSION,
+        'status': verdict.status.value,
+        'params': _params(),
+        'files_enumerated': measured.scan.files_enumerated,
+        'files_tokenized': measured.scan.files_tokenized,
+        'sites': len(measured.scan.sites),
+        'kind_totals': _tally(
+            (site.kind.value for site in measured.scan.sites),
+            (kind.value for kind in Kind),
+        ),
+        'consumers': _tally(
+            (entry.consumer.value for entry in classification.classified),
+            (consumer.value for consumer in Consumer),
+        ),
+        'ownership': _tally(
+            (entry.ownership.value for entry in classification.classified),
+            (ownership.value for ownership in Ownership),
+        ),
+        'by_kind_code': _by_kind_code(measured.scan),
+        **_owned_blocks(classification),
+        'baseline': {
+            'path': str(request.baseline),
+            'present': verdict.status is not Status.ADVISORY,
+            'excess': None if verdict.excess is None else dict(verdict.excess),
+            'slack': None if verdict.slack is None else dict(verdict.slack),
+        },
+        'ruff_config': [
+            {
+                'pyproject': config.path,
+                'select': [code.render() for code in config.select],
+                'ignore': [code.render() for code in config.ignore],
+            }
+            for config in measured.model.resolved()
+        ],
+        'violations': [violation.record() for violation in verdict.violations],
+    }
+
+
+def _json(request: Request, kernel: ModuleType) -> int:
+    """Publish the report on stdout — a REPORT verb, never a gate.
+
+    IT EXITS 0 WHENEVER THE SCAN SUCCEEDED, including over a tree that is
+    currently in breach, and that is the contract rather than an oversight: a
+    consumer parsing this report must not also be gated by it, and the state the
+    exception register most needs to read is precisely the one ``--check``
+    refuses.  Only a broken instrument makes it 2, because then there is no
+    report to publish.
+    """
+    measured = _measure(request)
+    verdict = _verdict(request, measured.classification, kernel)
+    print(json.dumps(_report_dict(request, measured, verdict), indent=2, sort_keys=True))
     return 0
 
 
@@ -1639,6 +1906,15 @@ def _build_parser() -> argparse.ArgumentParser:
         '--tighten',
         action='store_true',
         help='remove the baseline headroom the tree no longer uses',
+    )
+    verbs.add_argument(
+        '--json',
+        action='store_true',
+        help=(
+            'publish the whole report on stdout and exit 0 unless the instrument broke. '
+            'Mutually exclusive with the other verbs: --json --seed has two defensible '
+            'readings and no way to say which was meant'
+        ),
     )
     parser.add_argument(
         '--root',
@@ -1693,6 +1969,8 @@ def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
             return _seed(request, kernel)
         if args.tighten:
             return _tighten(request, kernel)
+        if args.json:
+            return _json(request, kernel)
         return _check(request, kernel)
     except kernel.RatchetError as exc:
         raise InstrumentFailure(
