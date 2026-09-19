@@ -15,7 +15,7 @@ upgrade that moves that precedence invalidates one copy and not five.  The sole
 deliberate exception is :func:`test_no_new_inverting_timeout_marker`'s failure
 message, where the reader is looking at a traceback and not at the source.
 
-A RATCHET, NOT A SWEEP.  61 pre-existing in-band sites are grandfathered in
+A RATCHET, NOT A SWEEP.  52 pre-existing in-band sites are grandfathered in
 :data:`_GRANDFATHERED`; see its comment for why they were not migrated here and
 :func:`test_grandfather_allowlist_has_no_stale_entries` for what forces that
 list to shrink.
@@ -168,6 +168,7 @@ _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
     'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
+    'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
 }
 
 #: Qualname suffix for a ``pytestmark`` binding inside a class body, and the
@@ -1886,10 +1887,13 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
-#: The pre-existing in-band sites, MEASURED at authorship time: 61 across 18
-#: modules, at 90/120/150/180s.  Entries may only ever be REMOVED, never added
-#: -- a new marker in the band is what this module exists to reject, and
-#: `test_no_new_inverting_timeout_marker`'s failure message says so outright.
+#: The pre-existing in-band sites: 61 across 18 modules at 90/120/150/180s
+#: when MEASURED at authorship time; 52 across 17 since task 5582 migrated
+#: test_merge_queue_deep_landing.py's nine off a grandfathered 180s onto a
+#: measured DEEP_LANDING_SCENE_TEST_TIMEOUT.  Entries may only ever be
+#: REMOVED, never added -- a new marker in the band is what this module exists
+#: to reject, and `test_no_new_inverting_timeout_marker`'s failure message
+#: says so outright.
 #:
 #: Not mechanically migrated in task 5147, deliberately: these are the hottest
 #: files in the repo (test_merge_queue.py and its deep_* siblings,
@@ -1898,7 +1902,8 @@ _MIN_EXPECTED_MARKER_SITES = 100
 #: and would itself have risked destabilising the very verify path the task
 #: existed to de-flake.  Stopping the bleeding is what prevents a fourth task
 #: being blamed; the migration is ordinary follow-up work, filed as
-#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY.
+#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY -- PARTIALLY
+#: DISCHARGED by task 5582, which took the nine deep-landing sites.
 #:
 #: Keyed on ``(module, qualname)`` -- *module* being the path RELATIVE to this
 #: directory (``test_cli.py``, and ``fixtures/x.py`` for anything nested), NOT
@@ -1956,16 +1961,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     ('test_merge_queue_deep_dispatch.py', 'TestRunInflightVerifyChainRedirect'),
     ('test_merge_queue_deep_dispatch.py', 'TestDeepTipVerifyNeverAdopts'),
     ('test_merge_queue_deep_dispatch.py', 'TestDeepDispatchRoundsIntegration'),
-    # test_merge_queue_deep_landing.py -- 9 sites at 180s
-    ('test_merge_queue_deep_landing.py', 'TestTipPassAdoptionSignal'),
-    ('test_merge_queue_deep_landing.py', 'TestInOrderCasWalk'),
-    ('test_merge_queue_deep_landing.py', 'TestStaleCasAbortLeavesTheRestAlone'),
-    ('test_merge_queue_deep_landing.py', 'TestContendedLeaseDeferInheritance'),
-    ('test_merge_queue_deep_landing.py', 'TestHeadCancelOnAdoption'),
-    ('test_merge_queue_deep_landing.py', 'TestHeadCancelLeavesTheLaneIdle'),
-    ('test_merge_queue_deep_landing.py', 'TestAdoptedHeadLandsWithThePostVerifyWorktree'),
-    ('test_merge_queue_deep_landing.py', 'TestChainWalkConsumesNoPermits'),
-    ('test_merge_queue_deep_landing.py', 'TestDeepLandingEndToEnd'),
     # test_merge_queue_request_liveness.py -- 1 site at 180s
     ('test_merge_queue_request_liveness.py', 'TestDeadVerifyAbortSelfHealsEndToEnd'),
     # test_merge_queue_restart_hook.py -- 1 site at 180s
@@ -2097,10 +2092,10 @@ def test_no_new_inverting_timeout_marker() -> None:
     worker.  Three tasks (4176, 4384, 4405) were failed that way by ONE such
     marker.
 
-    A RATCHET AND NOT A SWEEP, deliberately.  The 61 surviving in-band sites
-    span ~20 modules, most of them the hottest files in the repo
-    (test_merge_queue.py, test_merge_queue_deep_landing.py,
-    test_merge_queue_build_chain.py, test_crash_recovery.py).  Rewriting them
+    A RATCHET AND NOT A SWEEP, deliberately.  The 52 surviving in-band sites
+    span 17 modules, most of them the hottest files in the repo
+    (test_merge_queue.py, test_merge_queue_build_chain.py,
+    test_crash_recovery.py).  Rewriting them
     here would take a concurrency lock on nearly every file in-flight fleet
     tasks are editing, and would risk destabilising the very verify path this
     guard exists to de-flake.  Blocking NEW instances at commit time is what
