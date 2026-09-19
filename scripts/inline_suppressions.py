@@ -1281,6 +1281,41 @@ _UNDISPOSED_REASON = (
     'ruling that keeps it'
 )
 
+#: D8's rejection arm, in the same clause shape.  It names no remedy but
+#: deletion, because there is no other one that works.
+_DEAD_REASON = (
+    'delete this marker -- no tool reads it, so it silences nothing and protects '
+    'nothing. A disposition does not answer for it either: with no detector silenced '
+    'there is nothing for an owner to own or for the operator to rule on'
+)
+
+
+def _violation_for(entry: Classified) -> Violation:
+    """The exit-1 finding one excess *entry* renders.
+
+    THE TWO REASONS ARE NOT INTERCHANGEABLE ADVICE.  An undisposed live
+    suppression is fixed by writing a disposition, so the line publishes the
+    accepted forms; a marker nothing consumes is fixed only by deleting it, so
+    the line publishes none.  Handing an author forms that would not clear the
+    finding is worse than handing them nothing: they would write one, rerun,
+    and see the identical red with no idea why.
+
+    Which of the two applies is read off the entry's consumer rather than
+    recomputed, because the classification already resolved it — in the fixed
+    order that made the site unowned in the first place.
+    """
+    from shared.governed_exceptions import INLINE_MARKER_FORMS
+
+    dead = entry.consumer is Consumer.NONE
+    return Violation(
+        path=entry.site.path,
+        line=entry.site.line,
+        kind=entry.site.kind,
+        codes=entry.site.codes,
+        reason=_DEAD_REASON if dead else _UNDISPOSED_REASON,
+        forms=() if dead else INLINE_MARKER_FORMS,
+    )
+
 
 def _excess_violations(
     over: Mapping[str, int], classification: Classification
@@ -1293,22 +1328,19 @@ def _excess_violations(
     them all is the only honest rendering — the alternative picks an arbitrary
     line and sends the reader to code that may have been there for a year.
 
+    "ABSENT FROM THE BASELINE" IS MADE PRECISE AS "IN EXCESS", and that one
+    substitution is what folds D8's rejection arm INTO the ratchet instead of
+    standing it beside one.  A dead marker is not a separate rule with its own
+    exemption list: it is an ordinary member of the multiset, so the baseline
+    grandfathers the existing population, a second copy of a grandfathered line
+    is over budget, and removing one shows up as slack — all without a second
+    mechanism to keep in step with this one.
+
     Sorted by key so a rerun over one tree prints the same lines in the same
     order; within a key, scan order, which is path then line.
     """
-    from shared.governed_exceptions import INLINE_MARKER_FORMS
-
     return tuple(
-        Violation(
-            path=entry.site.path,
-            line=entry.site.line,
-            kind=entry.site.kind,
-            codes=entry.site.codes,
-            reason=_UNDISPOSED_REASON,
-            forms=INLINE_MARKER_FORMS,
-        )
-        for key in sorted(over)
-        for entry in classification.unowned[key]
+        _violation_for(entry) for key in sorted(over) for entry in classification.unowned[key]
     )
 
 
