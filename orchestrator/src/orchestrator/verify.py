@@ -1809,25 +1809,44 @@ def _prepare_junit_report_path(
     Reuses :func:`_make_infix` for the per-module sanitized filename infix
     (``pkg/sub`` -> ``.pkg_sub``) so a per-module fan-out never collides.
 
-    REMOVES any report left at that path by an earlier pass.  A merge worktree
-    is reused across passes (merge_queue's cross-check, the retry paths), and
-    pytest only truncates the file when it actually runs — so a leg killed
-    before pytest wrote anything would otherwise leave its predecessor's
-    report in place, to be read back as THIS run's failing test ids and
-    archived again as THIS run's cost. Unlinking here fixes both readers at
-    their one shared source; each then degrades to "no report", which is the
-    outcome both already model.
+    Computes and creates only — clearing a stale report belongs to
+    :func:`_clear_junit_report`, at the write.  The DIRECTORY is resolved
+    rather than the file, so the returned path is absolute (module commands
+    ``cd``, so a relative ``--junitxml`` would land in the wrong place) while
+    its final component stays unresolved: a symlink there must be unlinked as
+    a link, not followed to its target.
     """
     if not worktree.is_dir():
         return None
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
-        report = (junit_dir / f'report{_make_infix(module_prefix)}.xml').resolve()
-        report.unlink(missing_ok=True)
+        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}.xml'
     except OSError:
         return None
     return report
+
+
+def _clear_junit_report(junit_path: Path) -> None:
+    """Remove any report left at *junit_path* by an earlier pytest invocation.
+
+    Belongs immediately before each test-leg run that injects ``--junitxml``,
+    NOT where the path is computed: pytest is invoked 1..N times inside one
+    ``run_verification`` (the pure-timeout retry loop, and the env-recovery
+    re-run, which fires regardless of ``max_retries`` and so is live on the
+    merge lane where every caller passes 0).  A pass killed before pytest
+    started would otherwise inherit its predecessor's report — read back as
+    THIS run's failing test ids and archived as THIS run's cost.
+
+    Siting it at the write also means a leg with no test command clears
+    nothing, so a type-only gate cannot delete a report it could never write.
+    """
+    try:
+        junit_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            '_clear_junit_report: could not remove %s: %s', junit_path, exc,
+        )
 
 
 def _write_run_log(
@@ -2030,8 +2049,11 @@ def _archive_attempt_id(attempt_id: 'int | None') -> int:
     (``verify_runner.LocalRunner.run_merge_verify`` passes none), so every
     archive writer must agree on one fallback — otherwise a run's plan, logs
     and junit stop sharing a stem and cannot be joined.
+
+    Tests ``is not None`` rather than truthiness so a real attempt 0 stems at
+    ``attempt-0``, matching the worktree copy beside it.
     """
-    return attempt_id or 1
+    return attempt_id if attempt_id is not None else 1
 
 
 def _archive_junit_report(
@@ -2062,7 +2084,11 @@ def _archive_junit_report(
             f'attempt-{attempt_id}{_make_infix(module_prefix)}'
             f'.junit-{_archive_stamp()}.xml.gz'
         )
-        with junit_path.open('rb') as report, gzip.open(dest, 'wb') as archived:
+        # compresslevel 6, not gzip's default 9: this runs synchronously on
+        # the event loop that also carries the scheduler, the MCP server and
+        # the merge worker, and 9 costs twice the wall-clock for half a
+        # percent of size (measured on a 6MB report: 0.429s vs 0.214s).
+        with junit_path.open('rb') as report, gzip.open(dest, 'wb', 6) as archived:
             shutil.copyfileobj(report, archived)
     except Exception:  # noqa: BLE001 — observability may not fail a verify
         logger.warning(
@@ -5692,6 +5718,11 @@ async def run_verification(
         # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
         # parse_config_command can no longer see as pytest.
         if junit_path is not None and label == 'test':
+            # THE chokepoint: every test-leg invocation in this call reaches
+            # here — all three branches of the retry loop and the env-recovery
+            # re-run — so clearing here is once per pytest run, which is the
+            # granularity the report's ownership actually has.
+            _clear_junit_report(junit_path)
             cmd = _with_junitxml_str(cmd, str(junit_path))
             assert cmd is not None  # None only when the input is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is

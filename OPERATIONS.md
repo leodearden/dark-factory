@@ -210,14 +210,31 @@ red alike archive `attempt-N.plan-<ts>.json` (the scope decision — which
 legs ran full-suite rather than file-scoped, and why) and, on the merge
 lane, a gzipped `attempt-N[.<module>].junit-<ts>.xml.gz` per-test report.
 The greens are deliberate: a failures-only corpus answers questions about
-cost and scope with a red-conditioned sample. Merge verifies carry no
-attempt id, so their files stem at `attempt-1`; a run's plan, logs and
-junit share that stem and can be joined on it.
+cost and scope with a red-conditioned sample.
+
+Four things a census must not assume:
+
+- **Junit exists only under `merge_verify_breadth: full`.** The shipped
+  default (`config.py`) is `scoped`; this repo's
+  `dark-factory-orchestrator.yaml` opts in. A project on the default
+  archives plans and logs but no junit at all.
+- **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
+  attempt id, so their files stem at `attempt-1`. Logs and junit carry a
+  `.<module>` infix; the plan does not — under per-module fan-out one plan
+  sits against N junit reports.
+- **Report count ≠ leg count.** One merge attempt can archive more than one
+  junit for the same module when the flake gate's isolated re-run fires
+  (`verify.py::confirm_isolated_rerun_verdict`).
+- **Several merge-path callers archive nothing at all**, because they pass
+  no `archive_root`: the pre-existing-main baseline probe, the shadow/drift
+  runners, the unscoped type-check gate and the workflow pre-merge
+  re-verify. `archive_root is None` is the whole rule — absence from this
+  tree is not evidence a verify did not run.
 
 Retention is one policy for the whole tree: `.log`, `.json` and `.gz` are
 deleted past 30 days, then oldest-first until the tree is under 500MB
-(`verify.py::_prune_archive`). `flaky-ledger.jsonl` lives in the same
-directory and is deliberately outside that sweep.
+(`verify.py::_prune_archive`). `flaky-ledger.jsonl` sits one level up, in
+`data/verify-logs/` itself, and is deliberately outside that sweep.
 
 ### Reading the merge-lane throughput baseline
 

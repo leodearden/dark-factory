@@ -4069,6 +4069,121 @@ class TestJunitReportRetention:
             'either — "no report" is the degrade both readers already model'
         )
 
+    async def test_first_pass_report_is_not_kept_by_a_killed_env_recovery_rerun(
+        self, tmp_path: Path,
+    ):
+        """pytest runs 1..N times inside ONE run_verification.
+
+        The env-recovery re-run fires regardless of ``max_retries``, so it is
+        live on the merge lane where every caller passes 0.  Seeding the
+        report outside the call cannot catch this: the first pass writes it
+        legitimately, and only the SECOND invocation must not inherit it.
+        """
+        env_transient = (
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0'
+        )
+        first_pass_report = (
+            '<?xml version="1.0"?><testsuites><testsuite name="pytest" errors="0"'
+            ' failures="1" tests="1"><testcase classname="tests.test_old"'
+            ' name="test_from_first_pass"><failure message="x"/></testcase>'
+            '</testsuite></testsuites>'
+        )
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/ -n auto',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        test_leg_runs = 0
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            nonlocal test_leg_runs
+            if 'pytest' not in cmd:
+                return 0, '', False
+            test_leg_runs += 1
+            if test_leg_runs > 1:
+                return -9, '', False  # recovery run: killed, writes nothing
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(first_pass_report)
+            return 4, env_transient, False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert test_leg_runs == 2, (
+            f'expected the env-recovery re-run to fire; pytest ran {test_leg_runs}x'
+        )
+        assert result.failing_test_ids is None, (
+            'the recovery run never started pytest, so it owns no failing ids; '
+            f'got {result.failing_test_ids!r} from the first pass'
+        )
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'the first pass\'s report was archived as the recovery run\'s cost'
+        )
+
+    async def test_a_leg_with_no_test_command_clears_nothing(self, tmp_path: Path):
+        """The unscoped type-check gate can never WRITE a report, so it must
+        not delete the scoped phase's one."""
+        report = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        report.parent.mkdir(parents=True)
+        report.write_text('<testsuites><testsuite name="SCOPED PHASE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        type_only = ModuleConfig(
+            prefix='pkg', test_command=None,
+            lint_command=None, type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, type_only, max_retries=0, role='merge',
+            )
+
+        assert report.is_file(), (
+            'a gate that never writes a junit report deleted one it did not own'
+        )
+
+    async def test_report_at_a_symlink_is_unlinked_as_a_link(self, tmp_path: Path):
+        """Clearing must remove the link, never follow it to its target."""
+        target = tmp_path / 'somebody_elses.xml'
+        target.write_text('<testsuites/>')
+        link = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert target.is_file(), 'the symlink target was deleted instead of the link'
+        assert not link.is_symlink(), 'the stale link was not cleared'
+
     async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):
         """A non-pytest command injects no flag — absence, not degradation."""
         config = OrchestratorConfig(

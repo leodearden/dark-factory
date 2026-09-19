@@ -917,7 +917,7 @@ design is in [RECONCILIATION_PLAN.md](RECONCILIATION_PLAN.md).
 | Escalations | `data/escalations/` + `get_pending_escalations`/`get_escalation` | Open L0/L1/L2 escalations, categories, resolution history |
 | Reconciliation findings | `data/reconciliation/`, consumed via `/recon-escalation-watcher` | Integrity findings from the `:8103` queue |
 | Dashboard | `dashboard/src/dashboard/data/*.py` (read-only pool over the same SQLite DBs) | Web UI: active tasks, merge queue, halt state, escalation analytics, task runtime, scheduler state, costs, burndown, recon status |
-| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and gzipped merge-lane junit reports for green AND red, so cost/scope questions get an unconditioned sample. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" |
+| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and — only under `merge_verify_breadth: full`, not the shipped default — gzipped merge-lane junit reports, both for green AND red, so cost/scope questions get an unconditioned sample. Callers passing no `archive_root` write nothing. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" for the join and counting caveats |
 | journalctl | systemd units (`StandardOutput=journal`) | Raw process logs — the event store is the durable structured record; journalctl is for live tailing and crash forensics |
 
 When debugging, prefer the event store and `get_merge_queue`/
