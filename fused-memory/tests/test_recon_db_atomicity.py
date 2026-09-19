@@ -153,7 +153,9 @@ async def _seed_runs(conn, *, filler: int, stale_run: bool) -> None:
     when *stale_run* — is the one row the reaper's scan actually matches.
     """
     now = datetime.now(UTC)
-    rows = [
+    # completed_at is NULL for a running run, so the element type must admit None:
+    # inferred from the all-`str` filler comprehension alone it would not.
+    rows: list[tuple[str, str, str, str, str, str | None, str]] = [
         (
             f'filler-{i}',
             PROJECT_ID,

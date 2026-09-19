@@ -2330,7 +2330,7 @@ class TestStage2CycleSummaryHarnessBackstop:
 
     @staticmethod
     async def _count_cycle_summary_rows(ledger_store, run_id: str) -> int:
-        cursor = await ledger_store._access.connection.execute(
+        cursor = await ledger_store._require_access().connection.execute(
             """
             SELECT COUNT(*) FROM recon_ledger
             WHERE project_id = ? AND record_kind = 'cycle_summary'
@@ -8078,7 +8078,7 @@ async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
     dead_heartbeat = (
         datetime.now(UTC) - timedelta(seconds=cutoff + 100)
     ).isoformat()
-    async with event_buffer._access.write() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat, project_id),
@@ -8142,7 +8142,7 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     dead_heartbeat_a = (
         datetime.now(UTC) - timedelta(seconds=cutoff_a + 100)
     ).isoformat()
-    async with event_buffer._access.write() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat_a, project_a),
@@ -8252,7 +8252,7 @@ async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded
     dead_heartbeat = (
         datetime.now(UTC) - timedelta(seconds=cutoff + 100)
     ).isoformat()
-    async with event_buffer._access.write() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat, project_id),
@@ -8355,7 +8355,7 @@ async def test_recover_stale_runs_no_storm_for_single_restart_multi_project_burs
         # Fabricate the dead owner's lock row directly (bypassing mark_run_active,
         # which always stamps THIS process's own instance_id) so the lock's
         # instance_id matches the run's dead-owner instance_id exactly.
-        async with event_buffer._access.write() as db:
+        async with event_buffer._require_access().write() as db:
             await db.execute(
                 'INSERT INTO reconciliation_locks '
                 '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
@@ -8415,7 +8415,7 @@ async def test_recover_stale_runs_storm_for_distinct_dead_owner_instances(
             instance_id=dead_instance_id,
         )
         await journal.start_run(run)
-        async with event_buffer._access.write() as db:
+        async with event_buffer._require_access().write() as db:
             await db.execute(
                 'INSERT INTO reconciliation_locks '
                 '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
@@ -8876,7 +8876,7 @@ async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
     assert err.get('error_type') == 'StaleRunRecovery'
 
     # X's drained events were restored to 'buffered'.
-    db = event_buffer._access.connection
+    db = event_buffer._require_access().connection
     x_ids = [e.id for e in x_events]
     async with db.execute(
         "SELECT status FROM event_buffer WHERE id IN ({})".format(
@@ -8968,7 +8968,7 @@ async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_even
 
     await harness._recover_stale_runs()
 
-    db = event_buffer._access.connection
+    db = event_buffer._require_access().connection
 
     async def _statuses(events) -> list[str]:
         ids = [e.id for e in events]
@@ -9033,7 +9033,7 @@ async def test_recover_predecessor_runs_recovers_dead_predecessor_orphan(
     acquired = await event_buffer.mark_run_active(project_id)
     assert acquired is True
     fresh_heartbeat = datetime.now(UTC).isoformat()
-    async with event_buffer._access.write() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
             'WHERE project_id = ?',
@@ -9252,7 +9252,7 @@ async def _setup_interrupted_dead_predecessor_run(
     # Stamp completed_at = the interrupt instant (the freshness clock).
     await journal.complete_run(run_id, 'interrupted')
     if completed_at is not None:
-        async with journal._access.write() as db:
+        async with journal._require_access().write() as db:
             await db.execute(
                 'UPDATE runs SET completed_at = ? WHERE id = ?',
                 (completed_at.isoformat(), run_id),
@@ -9269,7 +9269,7 @@ async def _setup_interrupted_dead_predecessor_run(
     acquired = await event_buffer.mark_run_active(project_id)
     assert acquired is True
     fresh_heartbeat = datetime.now(UTC).isoformat()
-    async with event_buffer._access.write() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
             'WHERE project_id = ?',

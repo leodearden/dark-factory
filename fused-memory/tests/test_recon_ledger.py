@@ -108,7 +108,7 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
     await s.close()
     await s.initialize()
     try:
-        db = s._access.connection
+        db = s._require_access().connection
         assert db is not None
 
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
@@ -151,7 +151,7 @@ async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp
     store = ReconLedgerStore(db_path)
     await store.initialize()
     try:
-        db = store._access.connection
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
         cols_after = {row[1] for row in await cursor.fetchall()}
@@ -160,7 +160,7 @@ async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp
         # Idempotent: a second initialize() re-runs the ADD COLUMN as a no-op
         # (does not raise, does not duplicate the column).
         await store.initialize()
-        db = store._access.connection
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
         cols_reinit = {row[1] for row in await cursor.fetchall()}
@@ -290,7 +290,7 @@ async def test_double_upsert_same_identity_keeps_one_row_last_write_wins(store):
     await store.upsert(first)
     await store.upsert(second)
 
-    db = store._access.connection
+    db = store._require_access().connection
     cursor = await db.execute('SELECT COUNT(*) FROM recon_ledger')
     row = await cursor.fetchone()
     assert row[0] == 1
@@ -714,7 +714,7 @@ async def test_build_recon_ledger_store_initializes_schema(tmp_path):
         db_file = tmp_path / 'reconciliation.db'
         assert db_file.exists()
 
-        db = built_store._access.connection
+        db = built_store._require_access().connection
         assert db is not None
         cursor = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='recon_ledger'"
@@ -1275,7 +1275,7 @@ async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
             now=datetime(2026, 7, 20, tzinfo=UTC),
         )
 
-    cursor = await store._access.connection.execute(
+    cursor = await store._require_access().connection.execute(
         'SELECT COUNT(*) FROM recon_ledger WHERE record_kind = ?',
         (RECORD_KIND_MEM0_TOMBSTONE,),
     )
