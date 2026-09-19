@@ -760,6 +760,34 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
     )
 
 
+#: The rule codes first-party checkers define, each mapped to the checker that
+#: defines it.  These are not ruff codes at all — no selector can ever match a
+#: kebab-case token — so they are resolved AHEAD of the ruff path.
+#:
+#: A SECOND COPY OF A PRIVATE CONSTANT, knowingly.  The source of truth is
+#: `_RULE_A_CODE` / `_RULE_B_CODE` / `_RULE_C_CODE` in a stdlib-only script in
+#: another package, which offers no public seam to import; a copy is
+#: unavoidable, so heuristic 11 asks that its DRIFT be made loud rather than
+#: that the copy be hidden.  The guard is behavioural and bidirectional:
+#: `scripts/tests/test_inline_suppression_ratchet.py` runs that checker over one
+#: fixture per rule and asserts SET EQUALITY between the codes it emits and this
+#: table.  Equality, not containment — a table that merely holds real codes can
+#: still MISS one, which is the expensive direction (the scanner would tell an
+#: author to delete a marker a live checker reads).
+#:
+#: Rule C's `wall-clock-deadline` is named in neither the PRD's D8 prose nor
+#: this task's plan, both of which list the first two; it is here because the
+#: checker honours it and its violation message tells authors to write it
+#: (measured, esc-5601-1).
+FIRST_PARTY_CODES: Mapping[str, str] = MappingProxyType(
+    {
+        'bare-magicmock': 'fused-memory/scripts/check_bare_magicmock_config.py',
+        'bare-dataclass-double': 'fused-memory/scripts/check_bare_magicmock_config.py',
+        'wall-clock-deadline': 'fused-memory/scripts/check_bare_magicmock_config.py',
+    }
+)
+
+
 class ConsumerModel:
     """Resolves each site's consumer, reading the nearest ``pyproject.toml``.
 
@@ -790,6 +818,12 @@ class ConsumerModel:
     def _noqa_consumer(self, site: Site) -> Consumer:
         """Resolve a ``noqa`` site against the nearest config.
 
+        THE FIRST-PARTY TABLE IS CONSULTED FIRST, because those codes are not
+        ruff codes at all and no config could ever answer for them.  A site is
+        consumed if ANY of its codes is — the direction that over-reads, which
+        decision 3 establishes is the cheap failure (it grandfathers a dead
+        marker) where under-reading would falsely reject a live one.
+
         A CODELESS marker silences whatever ruff would have said, so it is
         consumed exactly when ruff has something to say at all — and a config
         selecting nothing therefore leaves it dead.
@@ -801,6 +835,8 @@ class ConsumerModel:
         in its own corpus.  A docstring is a STRING, which is precisely what
         the token walk exists to tell apart.
         """
+        if any(code in FIRST_PARTY_CODES for code in site.codes):
+            return Consumer.FIRST_PARTY
         config = self._nearest_config(Path(site.path).parent)
         if config is None:
             return Consumer.NONE
