@@ -12,6 +12,8 @@ driver itself — rather than by reading the source and trusting it.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,8 +23,10 @@ from _fm_helpers import pydantic_spec
 from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.task_family_census import (
+    CensusSweep,
     TaskFamilyCensus,
     _build_parser,
+    main,
     run_task_family_census,
 )
 
@@ -229,6 +233,128 @@ class TestTaskFamilyCensusRun:
         assert isinstance(result.families, tuple)
         assert isinstance(result.families[0].variants, tuple)
 
+
+#: A family the ENUMERATION sees whole and the PROBE does not. The two reads
+#: are differently scoped — enumerate_entity_nodes matches every :Entity node
+#: under the graph KEY, while the probe additionally requires
+#: `n.group_id = $group_id` — so a node leaked in by task 2115 counts toward
+#: the >1 threshold and is then dropped from the probe.
+LEAKED_FAMILY_NODES = [
+    {'uuid': 'u-605-canon', 'name': 'Task 605', 'summary': ''},
+    {'uuid': 'u-605-leaked', 'name': 'task 605', 'summary': ''},
+]
+
+#: What the group-scoped probe returns for that family: the leaked node is
+#: correctly invisible to it, leaving one spelling where the enumeration saw two.
+LEAKED_FAMILY_PROBES = {
+    '605': [
+        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50, 'edge_count': 2},
+    ],
+}
+
+
+class TestAFamilyTheProbeDoesNotConfirm:
+    """The enumeration decides membership and the probe supplies the edge
+    counts, and those two reads can disagree: they are scoped differently and
+    they are not one snapshot. A family that thins below two spellings in
+    between is not residue, and must not be counted as any."""
+
+    @pytest.mark.asyncio
+    async def test_a_short_probe_is_not_reported_as_a_fragmented_family(self):
+        """A FragmentedFamily of one variant would contradict its own meaning —
+        'split across more than one node' — while still incrementing the number
+        this module exists to produce."""
+        backend = make_census_backend(
+            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+        )
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert result.families == ()
+
+    @pytest.mark.asyncio
+    async def test_it_is_recorded_rather_than_silently_dropped(self):
+        """Dropping it would hide a leak: one is a race, a persistent count is
+        a group_id leak worth chasing, and only the two membership numbers tell
+        those apart."""
+        backend = make_census_backend(
+            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+        )
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert [
+            (u.canonical_name, u.enumerated_members, u.probed_members)
+            for u in result.unconfirmed
+        ] == [('Task 605', 2, 1)]
+
+    @pytest.mark.asyncio
+    async def test_a_family_that_vanished_entirely_is_recorded_too(self):
+        """The zero case is reachable the same way — every enumerated member
+        was a leaked node — and a zero-variant FragmentedFamily would be the
+        most misleading shape of all."""
+        backend = make_census_backend(nodes=LEAKED_FAMILY_NODES, probes={})
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert result.families == ()
+        assert [u.probed_members for u in result.unconfirmed] == [0]
+
+    @pytest.mark.asyncio
+    async def test_a_confirmed_family_alongside_it_is_still_reported(self):
+        """The exclusion is per-family: one unconfirmed family must not cost
+        the census the residue it did confirm.
+
+        The whole fixture corpus, with only the 605 probe thinned — so 605 goes
+        unconfirmed while the 900 pair, probed normally, is still reported.
+        """
+        backend = make_census_backend(
+            probes={**FIXTURE_PROBES, **LEAKED_FAMILY_PROBES},
+        )
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert [family.canonical_name for family in result.families] == ['Task 900']
+        assert [u.canonical_name for u in result.unconfirmed] == ['Task 605']
+
+    @pytest.mark.asyncio
+    async def test_it_is_logged_loudly_with_both_counts(self, caplog):
+        backend = make_census_backend(
+            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+        )
+
+        with caplog.at_level('WARNING'):
+            await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert 'unconfirmed task family Task 605' in caplog.text
+        assert 'NOT counted as residue' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_make_the_graph_incomplete(self):
+        """Coverage and confirmation are different questions. The graph WAS
+        read in full — that is exactly how the divergence became visible — so
+        flipping `complete` would send an operator looking for a truncated read
+        that never happened, and would fail the CLI's exit status too."""
+        backend = make_census_backend(
+            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+        )
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert result.complete is True
+        assert result.incomplete_kind is None
+
+    @pytest.mark.asyncio
+    async def test_the_record_is_frozen_like_the_rest_of_the_result(self):
+        backend = make_census_backend(
+            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+        )
+
+        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+
+        assert isinstance(result.unconfirmed, tuple)
+        with pytest.raises(FrozenInstanceError):
+            setattr(result.unconfirmed[0], 'probed_members', 99)  # noqa: B010
 
 class TestTaskFamilyCensusIsReadOnly:
     """No write reaches the graph from the census path — asserted structurally."""
@@ -531,6 +657,26 @@ class TestTaskFamilyCensusSweepCompleteness:
         assert aggregate.complete is False
 
     @pytest.mark.asyncio
+    async def test_unconfirmed_families_total_up_without_going_incomplete(self):
+        """A graph read in full that reported a probe divergence stays
+        complete: every graph WAS read, and the total is honest precisely
+        because those families were excluded from it."""
+        backend = make_sweep_backend(
+            {'home': whole(LEAKED_FAMILY_NODES), 'other': whole(LEAKED_FAMILY_NODES)},
+        )
+
+        async def thin_probe(substring, *, group_id):
+            return list(LEAKED_FAMILY_PROBES.get(substring, []))
+
+        backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=thin_probe)
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.total_families == 0
+        assert aggregate.total_unconfirmed == 2
+        assert aggregate.complete is True
+
+    @pytest.mark.asyncio
     async def test_incomplete_when_any_graph_errored(self):
         """An errored graph is an unknown, not a zero — so the sweep's own
         completeness flag has to go False even though every graph it DID read
@@ -607,17 +753,16 @@ class TestTheParserExposesNoWayToMutateTheGraph:
     the CLI SURFACE too — not just about the code behind it."""
 
     #: Every option the census CLI is allowed to have. Exact-set equality, so a
-    #: new flag of any kind fails this test until it is added here deliberately.
+    #: new flag of ANY kind — however innocently spelled — fails this test until
+    #: it is added here deliberately. That is the whole surface contract: a
+    #: name-scan for mutating verbs was tried alongside it and deleted, because
+    #: it caught nothing this misses while passing a flag spelled '--heal'.
+    #:
+    #: '--dry-run' is absent, and that absence is itself the point:
+    #: verify_zombie_edges.py needs one because it can delete, whereas every
+    #: census run is already a dry run and offering the flag would imply an
+    #: unsafe mode exists.
     EXPECTED_OPTIONS = {'-h', '--help', '--config', '--group-id', '--json'}
-
-    #: Verbs that would signal a flag capable of changing the graph. '--dry-run'
-    #: is on the list too, and its absence is the point: verify_zombie_edges.py
-    #: needs one because it can delete, whereas every census run is already a
-    #: dry run and offering the flag would imply an unsafe mode exists.
-    MUTATING_VERBS = (
-        'delete', 'remove', 'merge', 'rename', 'collapse', 'repair', 'fix',
-        'write', 'apply', 'prune', 'force', 'dry-run', 'commit',
-    )
 
     def test_exposes_exactly_config_group_id_and_json(self):
         parser = _build_parser()
@@ -629,14 +774,6 @@ class TestTheParserExposesNoWayToMutateTheGraph:
         }
 
         assert options == self.EXPECTED_OPTIONS
-
-    def test_no_option_carries_a_mutating_verb(self):
-        parser = _build_parser()
-
-        for action in parser._actions:
-            for option in action.option_strings:
-                for verb in self.MUTATING_VERBS:
-                    assert verb not in option, f'{option} looks like it could write'
 
     def test_json_is_a_bare_flag_and_the_other_two_take_values(self):
         parser = _build_parser()
@@ -650,3 +787,151 @@ class TestTheParserExposesNoWayToMutateTheGraph:
         assert args.json is True
         assert args.config == '/c.yaml'
         assert args.group_id == 'home'
+
+
+# ---------------------------------------------------------------------------
+# the seam between the sweep and the operator: main(), --json, the summary
+# ---------------------------------------------------------------------------
+
+#: An enumeration that stopped short of the graph. The exit code exists for
+#: exactly this shape: the count it produced is a lower bound, not a total.
+TRUNCATED_READ = PagedRead(
+    rows=[], complete=False, rows_seen=2, expected_rows=9999,
+    reason='page cap reached', incomplete_kind='page_cap',
+)
+
+
+def sweep_of(backend) -> CensusSweep:
+    """The CensusSweep a *backend* really produces.
+
+    Built by running the census rather than by constructing a CensusSweep
+    directly, so the tests below are handed exactly the object main() will be
+    handed and no summary field is invented by the test. Synchronous because
+    main() calls ``asyncio.run`` itself and so cannot be driven from inside an
+    already-running loop.
+    """
+    return asyncio.run(TaskFamilyCensus(backend=backend).sweep())
+
+
+def run_main(sweep: CensusSweep, argv=()) -> int:
+    """Call ``main(argv)`` over a canned *sweep*, returning its exit code.
+
+    ``run_task_family_census`` is stubbed with an AsyncMock so main()'s own
+    ``asyncio.run`` still receives a coroutine to drive. What is under test
+    here is the seam — exit code and output shape — not the census behind it.
+    """
+    with patch(
+        'fused_memory.maintenance.task_family_census.run_task_family_census',
+        AsyncMock(return_value=sweep),
+    ):
+        return main(list(argv))
+
+
+class TestTheExitCodeAnswersCanIActOnThisNumber:
+    """main()'s exit status is the only part of this module an operator's
+    automation reads, and its promise is that a truncated census can never pass
+    for a clean one."""
+
+    def test_a_whole_census_exits_zero(self):
+        assert run_main(sweep_of(make_three_graph_backend())) == 0
+
+    def test_a_truncated_census_exits_non_zero(self):
+        """The number is a lower bound, so a script that treated the exit code
+        as 'did it run' would under-count the residue and never know."""
+        backend = make_sweep_backend({'huge': (FIXTURE_NODES, TRUNCATED_READ)})
+
+        assert run_main(sweep_of(backend)) == 1
+
+    def test_a_census_that_could_not_read_a_graph_exits_non_zero(self):
+        """An unreadable graph is an unknown, not a zero — the same reason the
+        sweep's own completeness flag goes False."""
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'broken': RuntimeError('FalkorDB connection reset'),
+        })
+
+        assert run_main(sweep_of(backend)) == 1
+
+    def test_an_unconfirmed_family_does_not_move_the_exit_code(self):
+        """Coverage and confirmation are different questions. The graph WAS
+        read in full, and the count is honest precisely because the unconfirmed
+        family was excluded from it — failing the run would send an operator
+        looking for a truncated read that never happened."""
+        backend = make_sweep_backend({'home': whole(LEAKED_FAMILY_NODES)})
+
+        async def thin_probe(substring, *, group_id):
+            return list(LEAKED_FAMILY_PROBES.get(substring, []))
+
+        backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=thin_probe)
+        sweep = sweep_of(backend)
+
+        assert sweep.total_unconfirmed == 1
+        assert run_main(sweep) == 0
+
+
+class TestTheTwoOutputShapes:
+    """--json is what a tool consumes and the summary is what a human reads;
+    both are produced by main() and neither had an assertion before."""
+
+    def test_json_round_trips_and_carries_the_whole_aggregate(self, capsys):
+        """`asdict` over a nested tree of frozen dataclasses with
+        ``default=str`` is easy to get subtly wrong — an unserializable field
+        would raise at the very end of a long sweep, after the reads are paid
+        for."""
+        run_main(sweep_of(make_three_graph_backend()), ['--json'])
+
+        emitted = json.loads(capsys.readouterr().out)
+
+        assert set(emitted) == {
+            'graphs', 'failures', 'total_families', 'total_unconfirmed',
+            'complete', 'elapsed_ms',
+        }
+        assert emitted['total_families'] == 3
+        assert [graph['group_id'] for graph in emitted['graphs']] == [
+            'home', 'other', 'clean',
+        ]
+        assert emitted['graphs'][0]['families'][0]['variants'][0]['edge_count'] == 13
+
+    def test_without_json_the_summary_names_each_graph_and_its_count(self, capsys):
+        """'three families somewhere' is not actionable; the breakdown is what
+        an operator goes and looks at."""
+        run_main(sweep_of(make_three_graph_backend()))
+
+        out = capsys.readouterr().out
+
+        assert '3 fragmented family/families across 3 graph(s)' in out
+        assert '[home=2 other=1 clean=0]' in out
+        assert 'complete=True' in out
+
+    def test_the_summary_carries_a_failed_block_naming_every_unread_graph(self, capsys):
+        """A failure folded into a count reads as 'no residue here' when the
+        truth is 'never looked at', so it gets its own line."""
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'broken': RuntimeError('FalkorDB connection reset'),
+        })
+
+        run_main(sweep_of(backend))
+
+        out = capsys.readouterr().out
+
+        assert 'FAILED to census 1 graph(s)' in out
+        assert 'broken' in out
+        assert 'RuntimeError' in out
+        assert 'complete=False' in out
+
+    def test_the_summary_reports_unconfirmed_families_even_when_there_are_none(
+        self, capsys,
+    ):
+        """Reported unconditionally: a field that appears only when non-zero is
+        a field nobody knows to look for, and its normal value IS zero."""
+        run_main(sweep_of(make_three_graph_backend()))
+
+        assert 'unconfirmed=0' in capsys.readouterr().out
+
+    def test_the_summary_survives_a_sweep_that_censused_nothing(self, capsys):
+        """The empty store is the one shape a ' '.join breakdown renders as an
+        empty bracket, which reads as a bug rather than as no data."""
+        run_main(sweep_of(make_sweep_backend({}, graphs=[])))
+
+        assert '(no graphs censused)' in capsys.readouterr().out
