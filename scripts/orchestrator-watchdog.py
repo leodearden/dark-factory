@@ -770,6 +770,20 @@ def _unit_is_active(unit: str) -> bool:
     rather than downgraded to "benign". False means "skip this unit" for
     is_unit_enabled and "say something" here; each is the conservative
     direction for its own caller.
+
+    ANY probe error takes that direction — not merely a missing binary or a
+    timeout. The handler below is blanket for the same reason
+    _register_transient_unit's is: fork/exec raises PermissionError and
+    OSError(EAGAIN|ENOMEM) under memory pressure, and `text=True` decoding
+    raises UnicodeDecodeError, which is not an OSError at all. An enumerated
+    handler honoured this contract for two classes and silently violated it
+    for every other, letting the exception escape past the caller's own
+    try/except — and _delegate_fleet_restart is called from staleness_pass's
+    tail, outside its per-unit guard, so the escape aborted the whole tick and
+    skipped the fused-memory staleness backstop behind it. The irony worth
+    recording: _register_transient_unit's fail-soft rationale already cites
+    exactly those classes as the reason IT wraps subprocess.run in a blanket
+    handler, and the probe it calls did not.
     """
     try:
         result = subprocess.run(
@@ -780,7 +794,7 @@ def _unit_is_active(unit: str) -> bool:
             text=True,
         )
         return (result.stdout or "").strip() in UNIT_IN_FLIGHT_ACTIVE_STATES
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except Exception as exc:  # noqa: BLE001
         log(
             f"is-active probe for {unit} could not complete "
             f"({type(exc).__name__}); treating the registration as failed"
