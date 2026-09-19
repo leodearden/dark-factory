@@ -270,7 +270,26 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     and read as DEFERRED, making the deferral branch a place real failures
     hide. Rotating here instead also stops burning one digest per burned
     account. The payoff: nightly's long-standing "all accounts capped"
-    summary becomes TRUE for the first time.
+    summary becomes TRUE on the NON-ZERO-EXIT cap route -- the one the CLI
+    has actually been observed taking (``CoderInvocationError`` records the
+    2026-08-24 banner-on-stdout-exit-1 incident).
+
+    NOT YET ON THE EXIT-0 BANNER ROUTE, and that gap is known rather than
+    overlooked. ``_invoke_cli`` returns an exit-0 reply raw and deliberately
+    unscanned -- the loose marker list false-positives on this repo's
+    cap-THEMED codebook clusters, the defect
+    ``census._build_default_verify_fn`` records -- so a banner arriving with
+    exit 0 reaches ``slot.confirm()`` below, marks that account HEALTHY, and
+    is labelled ``capped=True`` by ``code_digest``'s own second scan site
+    with no rotation and no cap recorded on the gate. ``tried`` being
+    per-digest, and ``reverse=True``, every later digest then draws the same
+    account first: one account emitting exit-0 banners still loses a night
+    with the rest of the pool idle -- precisely the hazard the paragraph
+    above describes, surviving on one route. Closing it means scanning the
+    reply with the gate's STRICT detector (``slot.detect_cap_hit``, prefix
+    AND confirm) -- the one policy that does not false-positive on
+    cap-themed content -- which is its own change, filed as follow-up rather
+    than smuggled in here.
 
     TERMINATION IS STRUCTURAL, and it is the CALLER's set of already-tried
     names that makes it so — not the gate's handlers. A True verdict from
