@@ -43,6 +43,7 @@ state outside ``monkeypatch``.
 """
 
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -908,3 +909,84 @@ def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(tmp_pat
 
     assert 'pyproject.toml' in str(caught.value)
     assert 'select' in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# D8, first-party half — the codes no ruff selector can ever match.
+
+#: The checker whose private rule-code constants this scanner necessarily
+#: copies.  Its path is named once here, and the guard below runs it.
+_FIRST_PARTY_CHECKER = REPO_ROOT / 'fused-memory' / 'scripts' / 'check_bare_magicmock_config.py'
+
+#: One fixture per rule, each written to trigger exactly one of them, so the
+#: guard below sees every code the checker can name.  Kept as SOURCE rather
+#: than as a list of expected codes: the point is to read the codes back out of
+#: what the checker emits, never to restate them.
+_FIRST_PARTY_TRIGGERS: Mapping[str, str] = {
+    'rule_a.py': 'from unittest.mock import MagicMock\n\nconfig = MagicMock()\n',
+    'rule_b.py': (
+        'from unittest.mock import MagicMock\n\ndouble = MagicMock(passed=True, summary=\'ok\')\n'
+    ),
+    'rule_c.py': (
+        'import asyncio\n\n\nasync def run(req):\n'
+        '    return await asyncio.wait_for(req.result, timeout=5)\n'
+    ),
+}
+
+
+def test_a_first_party_code_resolves_to_the_first_party_consumer(tmp_path: Path):
+    """These are not ruff codes at all, so no selector can ever match them —
+    and the ``(linter, number)`` split must tolerate a kebab-case code, which
+    has no numeric run."""
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    for code in inline_suppressions.FIRST_PARTY_CODES:
+        assert _consumer_of(tmp_path, codes=(code,)) is (
+            inline_suppressions.Consumer.FIRST_PARTY
+        ), code
+
+
+def test_an_invented_neighbouring_code_has_no_consumer(tmp_path: Path):
+    """The table is a closed set, not a kebab-case shape test: a code that
+    merely LOOKS like a first-party one is read by nobody."""
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+
+    assert _consumer_of(tmp_path, codes=('bare-something-else',)) is (
+        inline_suppressions.Consumer.NONE
+    )
+
+
+def test_the_first_party_table_matches_the_codes_that_checker_actually_emits(tmp_path: Path):
+    """THE DRIFT GUARD, and it is BEHAVIOURAL IN BOTH DIRECTIONS.
+
+    The source of truth is a private constant in another package's
+    stdlib-only script, so there is no public seam to import and a second copy
+    is unavoidable.  Heuristic 11 then asks that the copy's drift be made loud
+    rather than that the copy be hidden.
+
+    It asserts on the violation messages the checker EMITS, never on its
+    private ``_RULE_A_CODE`` / ``_RULE_B_CODE`` / ``_RULE_C_CODE`` — reading
+    those would pin implementation rather than behaviour
+    (``docs/code-quality.md``, Tests stance), and the emitted message is
+    strictly the stronger assertion: a checker that renamed its constant while
+    still emitting the old code would remain correctly modelled.
+
+    SET EQUALITY, not containment, and that direction is load-bearing.  A
+    containment check ("every code in our table is real") passes happily while
+    the table MISSES a code the checker honours — which is exactly the defect
+    this test found: ``wall-clock-deadline`` (Rule C, task 4246) is a live
+    first-party code that both the PRD's D8 prose and this task's plan omit.
+    Missing a code is the expensive direction: the scanner would tell an author
+    to delete a marker a live checker genuinely reads.
+    """
+    _write_files(tmp_path, _FIRST_PARTY_TRIGGERS)
+
+    emitted = set()
+    for name in _FIRST_PARTY_TRIGGERS:
+        completed = _run_script(
+            [str(tmp_path / name)], cwd=tmp_path, script=_FIRST_PARTY_CHECKER
+        )
+        emitted.update(re.findall(r'#\s*noqa:\s*([a-z0-9]+(?:-[a-z0-9]+)+)', completed.stdout))
+
+    assert emitted, 'the checker emitted no suppression remedy at all — fixtures stopped triggering'
+    assert emitted == set(inline_suppressions.FIRST_PARTY_CODES)
