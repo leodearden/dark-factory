@@ -38,6 +38,35 @@ class WireShaped(Protocol):
     def to_wire(self) -> dict[str, object]: ...
 
 
+def _render(value: object) -> object:
+    """Render one payload, or one element of a sequence of payloads.
+
+    A value satisfying :class:`WireShaped` renders itself; a ``list`` or
+    ``tuple`` renders elementwise by this same rule; anything else is emitted
+    verbatim. Tuples render AS lists so one sequence spelling crosses the
+    wire whichever the producer built.
+
+    The sequence arm exists because the contract declares
+    ``Datum[list[TaskRow]]`` beside ``Datum[TaskCensus]``: without it a
+    producer would have to pre-convert, which is the shape this envelope was
+    designed NOT to require, and forgetting to would surface as a
+    ``TypeError`` from ``json.dumps`` in the HTTP layer rather than here. It
+    is deliberately NOT a branch per payload family — a new family is still
+    added by writing a ``to_wire()`` beside its own type.
+
+    ``list``/``tuple`` are named rather than ``Sequence`` because every
+    ``str`` is a ``Sequence`` and recursing into one never terminates. Any
+    other container — a dict, a set — passes through, so its producer renders
+    it; ``test_datum.py`` pins that boundary so a later leaf meets it at this
+    seam.
+    """
+    if isinstance(value, WireShaped):
+        return value.to_wire()
+    if isinstance(value, (list, tuple)):
+        return [_render(element) for element in value]
+    return value
+
+
 class DatumState(enum.StrEnum):
     """How much the accompanying value can be trusted.
 
@@ -78,8 +107,9 @@ class Datum(Generic[T]):
     def to_wire(self) -> dict[str, object]:
         """Render the five contract keys as JSON-serialisable values.
 
-        A payload satisfying :class:`WireShaped` renders itself; anything else
-        passes through unchanged.
+        ``value`` is rendered by :func:`_render`: a payload that knows its
+        own wire shape renders itself, a sequence of them renders elementwise,
+        anything else passes through unchanged.
 
         ``as_of`` is normalised to UTC, because the contract spells it as
         ISO-8601 UTC and ``shared.timestamps.parse_timestamp_or_warn``
@@ -97,7 +127,7 @@ class Datum(Generic[T]):
         here.
         """
         return {
-            'value': self.value.to_wire() if isinstance(self.value, WireShaped) else self.value,
+            'value': _render(self.value),
             'as_of': None if self.as_of is None else self.as_of.astimezone(UTC).isoformat(),
             'state': self.state.value,
             'reason': self.reason,

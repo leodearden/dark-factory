@@ -393,3 +393,63 @@ def test_validate_accepts_an_envelope_wrapping_a_census():
 def test_to_wire_still_passes_a_payload_with_no_wire_shape_through(payload):
     """The pass-through arm is unchanged: no to_wire means emitted verbatim."""
     assert fresh_datum(value=payload).to_wire()['value'] == payload
+
+
+# ---------------------------------------------------------------------------
+# A CONTAINER of wire-shaped payloads. The PRD's contract declares
+# `Datum[list[TaskRow]]` beside `Datum[TaskCensus]`, so beta wraps a list of
+# payloads that each know their own wire shape. The alternative — asking the
+# producer to pre-convert — is the shape design decision 4 explicitly rejected,
+# because it loses the `Datum[list[TaskRow]]` typing the contract states.
+# ---------------------------------------------------------------------------
+
+EMPTY_CENSUS_WIRE = build_census({}).to_wire()
+
+
+def wire_value(wire):
+    """The `value` of a wire dict.
+
+    ``to_wire()`` is honestly typed ``dict[str, object]`` — its values are
+    heterogeneous — so a test reaching into the rendered payload narrows here
+    rather than the module weakening its own annotation (the
+    ``test_census.py::wire_section`` precedent).
+    """
+    return wire['value']
+
+
+def test_to_wire_renders_every_wire_shaped_element_of_a_list_payload():
+    """A `list[TaskCensus]` renders as a list of census wire dicts, not of objects."""
+    wire = fresh_datum(value=[build_census(NINE_MEMBER_MAP), build_census({})]).to_wire()
+    assert wire_value(wire) == [build_census(NINE_MEMBER_MAP).to_wire(), EMPTY_CENSUS_WIRE]
+
+
+def test_a_wrapped_list_of_payloads_survives_a_json_round_trip():
+    """The failure this removes was a late `TypeError` from json.dumps, off-seam."""
+    wire = fresh_datum(value=[build_census({})]).to_wire()
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_to_wire_renders_a_tuple_payload_as_a_list():
+    """One sequence spelling crosses the wire, whichever the producer built."""
+    assert wire_value(fresh_datum(value=(build_census({}),)).to_wire()) == [EMPTY_CENSUS_WIRE]
+
+
+def test_to_wire_renders_a_nested_sequence_of_payloads():
+    """The rule is recursive, so a list of lists needs no second rule."""
+    assert wire_value(fresh_datum(value=[[build_census({})]]).to_wire()) == [[EMPTY_CENSUS_WIRE]]
+
+
+def test_to_wire_leaves_a_sequence_of_plain_payloads_alone():
+    """Mapping over elements changes nothing for a list that carries no wire shape."""
+    assert wire_value(fresh_datum(value=[1, 'two', None]).to_wire()) == [1, 'two', None]
+
+
+def test_to_wire_does_not_render_a_payload_inside_an_undeclared_container():
+    """The boundary, pinned: `list` and `tuple` map, and nothing else does.
+
+    A producer wrapping payloads in any other container renders them itself.
+    Pinned rather than left implicit so a later leaf meets the rule HERE, at
+    the seam, instead of at `json.dumps` in the HTTP layer.
+    """
+    census = build_census({})
+    assert wire_value(fresh_datum(value={'census': census}).to_wire()) == {'census': census}
