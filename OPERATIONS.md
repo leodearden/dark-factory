@@ -1503,22 +1503,36 @@ exhausted anyway. Before task 5488 the trickle had no pool at all: it rode
 whatever login `~/.claude` happened to hold, so one capped account deferred a
 whole night while six live ones sat idle.
 
-**What the unit must supply.** `legibility-trickle@.service` carries
-`EnvironmentFile=/home/leo/src/dark-factory/.env` — belt and braces rather
-than the pool's lifeline, since `build_pool`'s own `load_dotenv` reads that
-same file and resolves all seven accounts even with no `CLAUDE_OAUTH_TOKEN_*`
-in the environment (measured); the directive is there so the unit states the
-dependency instead of burying it in Python — and `UnsetEnvironment=ANTHROPIC_API_KEY`,
-because the CLI prefers an API key over the OAuth token and one inherited from
-the `systemd --user` manager would silently authenticate every invocation as
-that identity. The unit pins **no** account; choosing one is the gate's job,
-per invocation. That `.env` *also* defines `ANTHROPIC_API_KEY`, so the strip
-has to happen three times over, not once: systemd's `UnsetEnvironment` for the
-unit, `account_pool.build_pool` again in-process (its own `load_dotenv` of that
-same file would otherwise put the key straight back, and a child that inherits
-this environment — the census launcher when the pool has nothing to lease —
-would then bill the key's identity while the failover still looked like it
-worked), and `coder.child_env` for each child handed an explicit env.
+**What the unit must supply, and the API-key policy.** This paragraph is the
+one statement of that policy; the unit file, `account_pool.build_pool` and the
+unit-template test cite it rather than re-argue it.
+`legibility-trickle@.service` pins **no** account — choosing one is the gate's
+job, per invocation — and carries two directives:
+
+- `EnvironmentFile=/home/leo/src/dark-factory/.env` — belt and braces, not the
+  pool's lifeline: `build_pool` `load_dotenv`s that same file itself and
+  resolves all seven accounts even with no `CLAUDE_OAUTH_TOKEN_*` in the
+  environment (measured), so deleting the directive does not strand the gate.
+  It is there so the unit states the dependency it runs on instead of burying
+  it in Python.
+- `UnsetEnvironment=ANTHROPIC_API_KEY` — load-bearing. The CLI prefers an API
+  key over the OAuth token, so a key inherited from the `systemd --user`
+  manager would authenticate every invocation as that one identity while the
+  pool's failover still *looked* like it worked.
+
+That `.env` *also* defines `ANTHROPIC_API_KEY`, so the strip happens at three
+points, none of which covers another's scope:
+
+1. systemd's `UnsetEnvironment=`, for the unit's own process (it is applied
+   after `EnvironmentFile=`, so it removes the `.env`'s copy too);
+2. `account_pool.build_pool`, in-process, immediately after its own
+   `load_dotenv` of that same file — which would otherwise put the key
+   straight back for every child that *inherits* this environment rather than
+   being handed one. That child is the census launcher whenever the pool has
+   nothing to lease (`subprocess_env` returns `None`): the census and every
+   `claude` it spawns would then bill the key's identity, and its headroom
+   preflight would pass instead of fail-safe deferring, so nothing would show;
+3. `coder.child_env`, for each child handed an explicit env.
 
 **The 2026-09-14 max-h pin is retired.** `legibility-trickle@.service.d/
 10-account-pin.conf` reset `ExecStart` and re-spelled it with one account's

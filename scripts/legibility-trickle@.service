@@ -25,31 +25,13 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
 # inherits this Environment.
 Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
-# The multi-account pool (task 5488). account_pool.build_pool resolves each
-# entry of config/usage-accounts.yaml (max-b..max-h) to its
-# CLAUDE_OAUTH_TOKEN_* value out of os.environ; resolve none of them and the
-# gate falls back to ~/.claude/.credentials.json as an account literally named
-# 'default' -- one login for the whole night, the failure this unit's
-# 2026-09-14 stopgap drop-in was papering over.
-# BELT AND BRACES, not the pool's only loader: build_pool's own load_dotenv
-# reads this same file, and measurably resolves all seven accounts with no
-# CLAUDE_OAUTH_TOKEN_* in the environment at all -- so deleting this line does
-# not strand the gate. It is kept so the unit states the dependency it runs on
-# instead of burying it in Python.
-# EnvironmentFile rather than a token pin: WHICH account each invocation uses
-# is the gate's decision, made per invocation, not this file's.
+# The multi-account pool (task 5488): the CLAUDE_OAUTH_TOKEN_* vars that
+# config/usage-accounts.yaml names. A token source, never a token pin -- the
+# gate picks the account per invocation. Policy for this directive and the
+# next: OPERATIONS.md §"Legibility trickle accounts (03:00)".
 EnvironmentFile=/home/leo/src/dark-factory/.env
-# The other half, and load-bearing rather than tidiness: the CLI prefers
-# ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN, so one inherited from the
-# `systemd --user` manager's environment would authenticate every invocation
-# as the key's identity while the gate's failover still LOOKED like it worked.
-# Stripped here for this process (the EnvironmentFile above DOES define the
-# key, and UnsetEnvironment is applied last, so this removes it again), once
-# more in-process by account_pool.build_pool -- whose own load_dotenv of that
-# same .env would otherwise put it straight back, defeating this directive for
-# every child that inherits rather than being handed an env -- and again by
-# coder.child_env for each child spawned with an explicit env. One policy,
-# three enforcement points, because no one of them covers the others' scope.
+# Load-bearing: the CLI prefers an API key over the OAuth token, and the .env
+# above defines one.
 UnsetEnvironment=ANTHROPIC_API_KEY
 ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal

@@ -110,22 +110,10 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     call is frame-relative and silently switches to the CWD under a
     debugger or an interactive interpreter.
 
-    AND THE LOAD UNDOES THE UNIT'S OWN STRIP, so this repairs it. The
-    project ``.env`` defines ``ANTHROPIC_API_KEY`` and ``load_dotenv`` sets
-    any variable not already present — which is exactly the state
-    ``UnsetEnvironment=ANTHROPIC_API_KEY`` leaves the trickle in, so the
-    call above silently puts back the one variable the unit took away. That
-    matters wherever a child inherits this process's environment rather
-    than a ``coder.child_env`` overlay: ``subprocess_env`` returns None
-    whenever nothing is leasable and ``_default_census_launcher`` then runs
-    with ``env=None``, so the census grandchild and every ``claude`` it
-    spawns would authenticate as the API key's identity instead of
-    deferring — billable spend on an identity the pool never chose, and
-    invisible, since ``census.preflight_headroom`` would SUCCEED rather
-    than fail-safe defer. Popping it here is what makes the unit directive
-    and the Python path enforce the same thing; it is not redundant with
-    ``coder.child_env``'s strip, which only covers children handed an
-    explicit env.
+    The ``ANTHROPIC_API_KEY`` pop repairs that load: the ``.env`` defines
+    the key, so ``load_dotenv`` would put back what the unit's
+    ``UnsetEnvironment=`` removed. Policy and the other two strip points:
+    ``OPERATIONS.md`` §"Legibility trickle accounts (03:00)".
 
     Degrades LOUDLY, never raises, when the pool comes back empty. Copies
     ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
@@ -257,102 +245,32 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     order. The two meet only when the pool is nearly exhausted, which is
     when contention is unavoidable anyway.
 
-    FAILOVER HAPPENS WITHIN A DIGEST, not across digests. A blocking banner
-    marks the account capped and the SAME prompt is retried on the next
-    account; ``CoderCapExhausted`` escapes only when the whole pool is
-    exhausted. That is a reading of the existing code rather than a
-    preference: ``CoderCapExhausted`` already means "there is no headroom
-    left to code this digest", and both ``coder.is_cap_deferral`` and
-    nightly's DEFERRED summary read ``capped`` as "the CLI never looked at
-    this digest". If one account's banner set ``capped=True``, that
-    predicate would silently weaken to "the account I happened to draw was
-    out" — a night with six live accounts could then trip the majority rule
-    and read as DEFERRED, making the deferral branch a place real failures
-    hide. Rotating here instead also stops burning one digest per burned
-    account. The payoff: nightly's long-standing "all accounts capped"
-    summary becomes TRUE on the NON-ZERO-EXIT cap route -- the one the CLI
-    has actually been observed taking (``CoderInvocationError`` records the
-    2026-08-24 banner-on-stdout-exit-1 incident).
+    FAILOVER HAPPENS WITHIN A DIGEST. When the CLI fails with a cap banner
+    and the gate's strict ``slot.detect_cap_hit`` (prefix AND confirm)
+    agrees, the SAME prompt is retried on the next account;
+    ``CoderCapExhausted`` escapes only when no account is left, carrying
+    ``_exhaustion_reason``'s account of which exhaustion it was. Never
+    mark a digest ``capped`` for one account's banner: ``capped`` means "no
+    headroom left anywhere", and weakening it would let a night with live
+    accounts trip nightly's majority rule and read as DEFERRED. When the
+    strict detector disagrees with ``coder``'s loose matcher, the original
+    exception propagates unrotated — this repo's codebook quotes banner
+    text, so a loose false positive may re-label one digest but must never
+    burn the pool.
 
-    NOT YET ON THE EXIT-0 BANNER ROUTE, and that gap is known rather than
-    overlooked. ``_invoke_cli`` returns an exit-0 reply raw and deliberately
-    unscanned -- the loose marker list false-positives on this repo's
-    cap-THEMED codebook clusters, the defect
-    ``census._build_default_verify_fn`` records -- so a banner arriving with
-    exit 0 reaches ``slot.confirm()`` below, marks that account HEALTHY, and
-    is labelled ``capped=True`` by ``code_digest``'s own second scan site
-    with no rotation and no cap recorded on the gate. ``tried`` being
-    per-digest, and ``reverse=True``, every later digest then draws the same
-    account first: one account emitting exit-0 banners still loses a night
-    with the rest of the pool idle -- precisely the hazard the paragraph
-    above describes, surviving on one route.
+    The exit-0 banner route is not rotated — see task 5637.
 
-    REAL BUT NEVER YET OBSERVED, which is why it is recorded here rather
-    than fixed under time pressure. Measured 2026-09-19 across the journal's
-    full retention (2026-08-25 onward, ~24.5 days, 49 trickle runs): the
-    non-zero-exit route fired 46 times, all on one night; this route fired
-    ZERO times, out of 3 occasions when its scan site actually ran -- each
-    of those a fenced JSON reply that merely failed to parse, with
-    ``looks_like_blocking_banner`` correctly returning None. Nothing on disk
-    reaches further back: ``trickle_state`` keeps only the last run.
+    TERMINATION is bounded by the caller's ``tried`` set, passed as
+    ``exclude=``, not by the gate's cap transitions: a near-cap verdict
+    only annotates an account, so re-asking the gate could return it
+    forever. ``tried`` grows by one per pass, so ``try_lease`` returns None
+    within ``account_count`` passes. Do not re-classify streams here to
+    decide anything the gate decides (heuristic 11).
 
-    Closing it means scanning the reply with the gate's STRICT detector
-    (``slot.detect_cap_hit``, prefix AND confirm) -- the one policy that does
-    not false-positive on cap-themed content -- which is its own change,
-    filed as follow-up rather than smuggled in here.
-
-    TERMINATION IS STRUCTURAL, and it is the CALLER's set of already-tried
-    names that makes it so — not the gate's handlers. A True verdict from
-    ``detect_cap_hit`` means only "the gate recorded a cap signal against
-    this account"; a NEAR-cap warning is annotation-only
-    (``_handle_near_cap_warning`` sets ``near_cap`` and takes no phase
-    transition), so the admissible set need not shrink at all and a rotation
-    that merely re-asked would be handed the same account forever. Passing
-    the growing ``tried`` set as ``exclude=`` removes that dependency: the
-    gate never returns an excluded name, so ``tried`` grows by exactly one
-    per pass and ``try_lease`` returns None after at most ``account_count``
-    passes — whatever the handlers did with the verdict.
-
-    The bound is expressed to the gate's ONE selection implementation rather
-    than computed here. Re-classifying the streams the gate is about to
-    classify anyway would put a second copy of cap policy in a caller
-    (heuristic 11) — the rotation-beside-the-gate this module exists not to
-    become.
-
-    AND THE DEFERRAL STAYS HONEST ABOUT WHICH EXHAUSTION IT WAS. Because
-    the bound is the caller's and not the gate's, a digest can now run out
-    of accounts while none of them is capped, so ``_exhaustion_reason``
-    distinguishes three states rather than two: no accounts resolved (a
-    config fault), all accounts capped (clears at the weekly reset), and
-    every account tried while the gate still considers one usable (not a
-    capacity limit at all, and it will never clear on its own). Same
-    requirement as the existing "all capped" vs "no accounts resolved"
-    split, extended to the state this change makes reachable.
-
-    ONLY THE GATE'S STRICT DETECTOR ROTATES. ``coder``'s loose
-    OR-substring matcher keeps its own job — labelling an already-FAILED
-    invocation as a per-digest defer — while ``slot.detect_cap_hit`` (prefix
-    AND confirm) decides whether an ACCOUNT is out. When it disagrees the
-    original exception propagates unrotated, so a loose false positive can
-    re-label one digest and can never burn the pool. That is exactly the
-    split ``shared/src/shared/cap_markers.py``'s docstring argues for, and
-    it matters here because this repo's codebook is dominated by clusters
-    ABOUT usage limits, so healthy model output quotes banner text.
-
-    LEASE DISCIPLINE mirrors ``UsageGate.invoke_slot``'s, because a leaked
-    PROBE_IN_FLIGHT claim is permanent: the account is never admissible
-    again for this process, so the pool would silently shrink by one
-    account per probe. The ``finally`` hands the claim back on every exit
-    path, including an exception raised by the CLI.
-
-    It calls ``release_probe_slot`` UNCONDITIONALLY, which is the idiom
-    ``InvokeSlot.report`` documents for itself: the call is a guarded no-op
-    whenever there is no claim outstanding (``confirm`` and a True
-    ``detect_cap_hit`` each already released it), "which is cheaper than
-    re-deriving what the handler just did". The alternative — reading
-    ``slot._settled`` the way ``invoke_slot`` does — would reach into
-    another module's private state from outside it to recompute an answer
-    the gate already guards.
+    The ``finally`` calls ``release_probe_slot`` on every exit path,
+    unconditionally (a guarded no-op when ``confirm`` or ``detect_cap_hit``
+    already released it): a leaked PROBE_IN_FLIGHT claim makes that account
+    inadmissible for the rest of the process.
     """
 
     def invoke_through_pool(prompt: str, model: str) -> str:

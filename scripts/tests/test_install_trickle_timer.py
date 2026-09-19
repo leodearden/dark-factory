@@ -332,19 +332,11 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     """Template-content invariant (NOT install behavior), task 5488: the unit
     must supply the account POOL and pin no single account out of it.
 
-    Two positives and one negative, and the NEGATIVE is the load-bearing one.
-    `EnvironmentFile=` is belt and braces rather than the pool's lifeline --
-    measured: with no CLAUDE_OAUTH_TOKEN_* in the environment at all,
-    `build_pool`'s own `load_dotenv` of that same file resolves all seven
-    accounts, so deleting the directive does not strand the gate. It is
-    asserted so the unit states the dependency it runs on rather than burying
-    it in Python. `UnsetEnvironment=ANTHROPIC_API_KEY` is the half that
-    genuinely cannot move: the CLI prefers an API key over the OAuth token, so a
-    key inherited from the manager's environment would silently authenticate
-    every invocation as one identity while the failover still LOOKED like it
-    worked. And re-pinning one account here -- which is exactly what the
-    2026-09-14 stopgap drop-in did with max-h -- would make the whole pool
-    inert again while leaving every test above green.
+    Two positives (`EnvironmentFile=`, `UnsetEnvironment=ANTHROPIC_API_KEY`;
+    why each is there: OPERATIONS.md §"Legibility trickle accounts (03:00)")
+    and one negative, which is the load-bearing one: re-pinning one account
+    here -- what the 2026-09-14 stopgap drop-in did with max-h -- would make
+    the whole pool inert again while leaving every test above green.
     """
     service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
 
