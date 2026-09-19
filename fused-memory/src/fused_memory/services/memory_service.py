@@ -123,7 +123,10 @@ from fused_memory.utils.referent_verification import (
     _referent_sort_key,
     _unresolvable_reason,
 )
-from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.task_naming import (
+    group_task_node_families,
+    task_node_referent,
+)
 from fused_memory.utils.validation import _safe_repr, require_full_uuid
 
 if TYPE_CHECKING:
@@ -3189,40 +3192,61 @@ class MemoryService:
         return invalidated
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
-        """Canonicalize non-canonical task-entity node names to 'Task N'.
+        """Collapse every spelling of a touched task's node onto 'Task N'.
 
-        graphiti_core's LLM entity extraction sometimes mints task-entity nodes
-        with non-canonical names (e.g. 'task 132', 'tasks 153') instead of the
-        canonical 'Task N' form. This method scans each distinct entity name
-        this episode touched via ``canonicalize_task_node_name`` (task 2110)
-        and, for every name that canonicalizes to something other than itself,
-        corrects the live node(s):
+        graphiti_core's LLM entity extraction mints task-entity nodes under
+        whichever spelling the source text used — 'task 132', 'tasks 153',
+        'task #1153' — so one task accumulates a FAMILY of same-meaning nodes
+        that split its edges. This pass repairs the families the episode just
+        touched (task 2110; rewritten family-keyed by task 5264).
 
-        - If a canonical 'Task N' node already exists, every bad-named node is
-          MERGED into it via ``merge_entities`` — renaming instead would recreate
-          the exact-name duplicate ``_dedup_episode_nodes`` exists to resolve.
-          Any *other* pre-existing canonical duplicates (e.g. left over from
-          before this hook existed, which this episode never touched) are
-          folded into the same survivor too, so a single hook run fully
-          collapses the canonical-name group rather than only fixing the
-          bad-named arrival.
-        - Otherwise, the bad-named survivor (most valid edges, then oldest, then
-          uuid — same canonical ordering as ``find_duplicate_entity_nodes``) is
-          RENAMED to the canonical name via ``rename_entity_node``, and any
-          remaining bad-named duplicates are merged into it.
+        It is keyed on the FAMILY, not on the arriving spelling. Keying on the
+        arrival had two structural blind spots, and the first is the one that
+        mattered most:
 
-        Modelled on ``_dedup_episode_nodes``; handles None / empty result the
-        same way. Each rename/merge is best-effort (mirrors
-        ``_dedup_episode_nodes``): a transient backend error for one name must
-        not fail an already-committed episode write, and must not stop
-        subsequent names from being processed. Untouched bad names simply
-        survive to be healed the next time an episode touches that name.
+        1. When extraction happened to mint the ALREADY-CANONICAL spelling,
+           the pass returned before issuing a single backend call. An episode
+           about a fragmented task was therefore structurally unable to heal
+           it — the more canonical the extraction, the less repair happened.
+        2. Even on a bad-name arrival only TWO exact names were ever probed,
+           the arriving one and the canonical one. A third spelling in the
+           same family was never looked at, so a 3-way split collapsed to 2 at
+           best and re-split on the next differently-spelled extraction.
+
+        Both are fixed by one group-scoped probe per distinct task NUMBER, via
+        ``find_entity_nodes_by_name_substring``. That probe is a deliberately
+        dumb prefilter — a ``CONTAINS`` match that also returns 'Task 6051',
+        'Task 1605' and the foreign 'reify:605' — and precision comes
+        afterwards from ``group_task_node_families``, which applies
+        ``task_naming``'s one acceptance rule. Keeping the rule in Python is
+        what stops a second copy of the task-label vocabulary appearing inside
+        a Cypher string, where it could be neither tested nor kept in step with
+        utils/canonical_labels.py.
+
+        Survivor selection is ONE rule: the family's first member under the
+        backend's survivor-first ordering (most valid edges, then oldest, then
+        uuid) survives, is renamed onto the canonical name if it is not already
+        canonically named, and every other member is merged into it. The
+        earlier two-branch policy — a canonically-named node wins regardless of
+        edge count — existed to avoid recreating the exact-name duplicate
+        ``_dedup_episode_nodes`` resolves, a hazard family-keying removes
+        outright since the whole family collapses in one pass. Where the two
+        policies differ is the tracked motivating case: with 'Task 605' holding
+        2 edges and 'task 605' holding 13, the old rule dragged 13 edges across
+        and the new one moves 2.
+
+        Each family is best-effort (mirrors ``_dedup_episode_nodes``): this
+        runs after the episode is already committed, so a transient backend
+        error for one family must neither fail that write nor stop the
+        remaining families. An unrepaired family simply survives to be healed
+        the next time an episode touches that task.
 
         Args:
             result: The value returned by ``add_episode`` (typically an
                     AddEpisodeResults object with a ``nodes`` attribute).
                     Handles ``None`` and objects with empty/missing nodes
                     gracefully.
+            group_id: Project graph the episode was written to.
 
         Returns:
             Number of nodes successfully renamed or merged into a canonical
@@ -3235,55 +3259,38 @@ class MemoryService:
         if not nodes:
             return 0
 
-        canonical_by_bad_name: dict[str, str] = {}
+        # De-duplicated on the Referent rather than on the raw spelling, so an
+        # episode carrying both 'Task 605' and 'task 605' probes once: probe
+        # count tracks tasks touched, not spellings extraction produced.
+        referents: dict[Referent, None] = {}
         for node in nodes:
-            name = getattr(node, 'name', '') or ''
-            if not name or name in canonical_by_bad_name:
-                continue
-            canonical = canonicalize_task_node_name(name)
-            if canonical is None or canonical == name:
-                continue
-            canonical_by_bad_name[name] = canonical
+            referent = task_node_referent(getattr(node, 'name', '') or '')
+            if referent is not None:
+                referents[referent] = None
 
         fixed = 0
         failed = 0
-        for bad_name, canonical in canonical_by_bad_name.items():
+        for referent in referents:
             try:
-                bad_matches = await self.graphiti.find_duplicate_entity_nodes(
-                    bad_name, group_id=group_id,
+                candidates = await self.graphiti.find_entity_nodes_by_name_substring(
+                    referent.number, group_id=group_id,
                 )
-                if not bad_matches:
+                members = group_task_node_families(candidates).get(referent, [])
+                if not members:
                     continue
-                canon_matches = await self.graphiti.find_duplicate_entity_nodes(
-                    canonical, group_id=group_id,
-                )
-                if canon_matches:
-                    canon_survivor = canon_matches[0]['uuid']
-                    for dup in bad_matches:
-                        await self.graphiti.merge_entities(
-                            dup['uuid'], canon_survivor, group_id=group_id,
-                        )
-                        fixed += 1
-                    # Pre-existing canonical duplicates this episode never
-                    # touched (e.g. left behind before this hook existed)
-                    # would otherwise only get fixed if some future episode
-                    # happens to touch them again — fold them in now too.
-                    for dup in canon_matches[1:]:
-                        await self.graphiti.merge_entities(
-                            dup['uuid'], canon_survivor, group_id=group_id,
-                        )
-                        fixed += 1
-                else:
-                    survivor = bad_matches[0]['uuid']
+                survivor = members[0]
+                if len(members) == 1 and survivor['name'] == referent.node_name:
+                    continue
+                if survivor['name'] != referent.node_name:
                     await self.graphiti.rename_entity_node(
-                        survivor, canonical, group_id=group_id,
+                        survivor['uuid'], referent.node_name, group_id=group_id,
                     )
                     fixed += 1
-                    for dup in bad_matches[1:]:
-                        await self.graphiti.merge_entities(
-                            dup['uuid'], survivor, group_id=group_id,
-                        )
-                        fixed += 1
+                for member in members[1:]:
+                    await self.graphiti.merge_entities(
+                        member['uuid'], survivor['uuid'], group_id=group_id,
+                    )
+                    fixed += 1
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
@@ -3291,9 +3298,9 @@ class MemoryService:
                 # write timeout) must not fail an already-committed episode
                 # write. Log and continue so the episode reports success.
                 logger.exception(
-                    'Failed to normalize task node name %r -> %r after '
-                    'add_episode; will retry on next episode',
-                    bad_name, canonical,
+                    'Failed to normalize task node family %r after add_episode; '
+                    'will retry on next episode',
+                    referent.node_name,
                 )
                 failed += 1
 
@@ -3303,7 +3310,7 @@ class MemoryService:
             )
         if failed > 0:
             logger.warning(
-                'Failed to normalize %d task-entity node name(s) after add_episode',
+                'Failed to normalize %d task-entity node family/families after add_episode',
                 failed,
             )
         return fixed
