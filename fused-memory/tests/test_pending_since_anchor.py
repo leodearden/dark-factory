@@ -57,7 +57,7 @@ def _assert_machine_clock(anchor: str | None, updated_at: str) -> None:
     """Assert ``anchor`` came from the machine's clock on THIS write.
 
     Bracketed against the row's own ``updatedAt`` rather than an imported
-    ``_now()``: the two writers take their two ``_now()`` readings in
+    ``task_timestamp_now()``: the two writers take their two clock readings in
     OPPOSITE orders (``set_task_status`` binds ``updated_at`` first, the audit
     writer stamps the anchor first), so only a tolerance holds for both — and
     a tolerance measured against an observable field keeps this file off the
@@ -715,7 +715,7 @@ class TestPendingSinceBatchIdentity:
     ``commit_planning`` (server/tools.py) does not write status itself: it
     hands a CSV to ``task_interceptor.set_task_status``, which splits it and
     loops ``_apply_status_transition`` per id. Each per-id backend call would
-    otherwise compute its own ``_now()``, and since each id runs a full gated
+    otherwise compute its own clock reading, and since each id runs a full gated
     transaction the anchors drift by tens of milliseconds across a batch.
 
     That drift is NOT a tie. Under task beta's
@@ -774,7 +774,7 @@ class TestPendingSinceBatchIdentity:
             stamped = [one for one in anchors if one is not None]
             assert len(set(stamped)) == 1, (
                 'a commit_planning batch must stamp ONE identical anchor; got '
-                f'{sorted(set(stamped))} — per-id _now() drift would order the '
+                f'{sorted(set(stamped))} — per-id clock drift would order the '
                 'batch by commit sequence instead of falling through to CPM'
             )
         finally:

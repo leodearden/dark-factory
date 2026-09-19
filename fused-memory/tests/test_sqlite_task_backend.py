@@ -212,7 +212,7 @@ async def test_add_task_pending_insert_stamps_pending_since(backend, project_roo
     """A default (pending) insert carries the wait anchor (task 3816, PRD §C1).
 
     Asserts ``pending_since == updatedAt`` EXACTLY, not within a tolerance
-    window: add_task hoists one ``_now()`` and binds it to both (design
+    window: add_task hoists one ``task_timestamp_now()`` and binds it to both (design
     decision 5), so a freshly inserted pending row satisfies the same identity
     the one-shot back-fill establishes for the legacy population — the two
     populations are indistinguishable in shape as well as in format. A

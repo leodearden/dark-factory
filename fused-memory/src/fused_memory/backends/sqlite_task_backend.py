@@ -203,11 +203,30 @@ class _StatusWriteNotPersisted(Exception):
         }
 
 
-def _now() -> str:
-    """ISO-8601 UTC timestamp matching the Taskmaster ``updatedAt`` format."""
-    return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.') + (
-        f'{datetime.now(UTC).microsecond // 1000:03d}Z'
-    )
+def task_timestamp_now() -> str:
+    """The current UTC instant in the task store's timestamp format.
+
+    Exactly ``%Y-%m-%dT%H:%M:%S.mmmZ`` — millisecond precision, literal ``Z``
+    suffix — matching the Taskmaster ``updatedAt`` format, which is the shape
+    every timestamp this store writes must carry: ``updated_at``,
+    ``heartbeat_at``, and ``metadata.pending_since``.
+
+    PUBLIC because that format is a CONTRACT, not an implementation detail.
+    ``TaskInterceptor``'s CSV ``set_task_status`` branch computes one value
+    here and threads it through ``pending_since_now`` so a whole batch lands
+    on one instant (task 3816, PRD §C1 rule 5); it must not substitute its own
+    ``datetime.now(UTC).isoformat()`` helper, whose offset-suffixed
+    microsecond shape would give the live-stamped and the back-filled
+    populations two incommensurable string shapes for one column.
+
+    ONE clock reading, deliberately: composing the value from two
+    ``datetime.now(UTC)`` calls can straddle a second boundary and emit a
+    timestamp up to a second in the PAST (seconds from the first reading,
+    milliseconds from the next second), which the anchor's
+    monotone-non-decreasing invariant cannot tolerate.
+    """
+    reading = datetime.now(UTC)
+    return reading.strftime('%Y-%m-%dT%H:%M:%S.') + f'{reading.microsecond // 1000:03d}Z'
 
 
 def _parse_task_id(raw: str | int) -> int:
@@ -720,7 +739,7 @@ async def _migrate_v3_to_v4(
 
             _, canonical_id, cancel_ids = classification
             by_id = {row['id']: row for row in group_rows}
-            now = _now()
+            now = task_timestamp_now()
             for cancel_id in cancel_ids:
                 stamp = json.dumps({
                     'auto_cancelled_by_self_heal': {
@@ -2453,7 +2472,7 @@ class SqliteTaskBackend:
         same SQL it did before task 3816.
 
         ``pending_since_now`` supplies the stamp's clock. ``None`` (the
-        default, and every single-id caller) means "compute ``_now()`` here".
+        default, and every single-id caller) means "compute ``task_timestamp_now()`` here".
         The interceptor's CSV branch passes ONE value for the whole batch so a
         ``commit_planning`` commit lands identical anchors and intra-batch
         order falls through to CPM then numeric id (PRD rule 5) instead of
@@ -2484,7 +2503,7 @@ class SqliteTaskBackend:
                 row_candidate_key = row['candidate_key']
 
                 set_columns = ['status = ?', 'updated_at = ?']
-                set_values: list[Any] = [status, _now()]
+                set_values: list[Any] = [status, task_timestamp_now()]
                 # Wait anchor (task 3816, PRD §C1). Appended only when a
                 # stamp is owed, so the overwhelming majority of status
                 # writes -- every `pending` exit, and every re-entry whose
@@ -2499,7 +2518,7 @@ class SqliteTaskBackend:
                     row['metadata'],
                     old_status=old_status,
                     new_status=status,
-                    now=pending_since_now or _now(),
+                    now=pending_since_now or task_timestamp_now(),
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 if stamped is not None:
@@ -2577,7 +2596,7 @@ class SqliteTaskBackend:
         blob (see the composition comment at the merge below).
 
         ``pending_since_now`` supplies the stamp's clock; ``None`` (the
-        default) means "compute ``_now()`` here". See
+        default) means "compute ``task_timestamp_now()`` here". See
         :meth:`set_task_status` for why the interceptor's CSV branch passes
         one value for a whole batch.
 
@@ -2638,14 +2657,14 @@ class SqliteTaskBackend:
                     new_metadata,
                     old_status=old_status,
                     new_status=status,
-                    now=pending_since_now or _now(),
+                    now=pending_since_now or task_timestamp_now(),
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 if stamped is not None:
                     new_metadata = stamped
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
-                set_values: list[Any] = [status, new_metadata, _now()]
+                set_values: list[Any] = [status, new_metadata, task_timestamp_now()]
                 persisted_status = await self._write_status_and_verify(
                     conn,
                     set_columns=set_columns,
@@ -2985,7 +3004,7 @@ class SqliteTaskBackend:
                 # updated_at, so a freshly inserted pending row satisfies
                 # `pending_since == updated_at` exactly -- the same identity the
                 # one-shot v4->v5 back-fill establishes for the legacy
-                # population, rather than two `_now()` calls a millisecond
+                # population, rather than two `task_timestamp_now()` calls a millisecond
                 # apart. `candidate_key` above stays on the pre-stamp value: it
                 # keys off title + metadata['files'] only — neither stripped
                 # key participates, so the strip below cannot move it.
@@ -3001,7 +3020,7 @@ class SqliteTaskBackend:
                 metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
                 )
-                now = _now()
+                now = task_timestamp_now()
                 stamped = stamp_pending_since(
                     metadata, old_status=None, new_status=status, now=now,
                     project_root=project_root, tag=tag, task_id=next_id,
@@ -3377,7 +3396,7 @@ class SqliteTaskBackend:
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.
             set_columns.append('updated_at = ?')
-            set_values.append(_now())
+            set_values.append(task_timestamp_now())
 
             set_clause = ', '.join(set_columns)
             set_values.extend([tag, tid])
@@ -3499,7 +3518,7 @@ class SqliteTaskBackend:
             )
             await conn.execute(
                 'UPDATE tasks SET metadata = ?, updated_at = ? WHERE tag = ? AND id = ?',
-                (new_metadata, _now(), tag, tid),
+                (new_metadata, task_timestamp_now(), tag, tid),
             )
         return {
             'id': task_id,
@@ -3649,7 +3668,7 @@ class SqliteTaskBackend:
                 await conn.execute(
                     'UPDATE tasks SET metadata = ?, updated_at = ? '
                     'WHERE tag = ? AND id = ?',
-                    (new_meta, _now(), tag, tid),
+                    (new_meta, task_timestamp_now(), tag, tid),
                 )
             return {
                 'id': str(tid),
@@ -3756,7 +3775,7 @@ class SqliteTaskBackend:
                         await conn.execute(
                             'UPDATE tasks SET metadata = ?, updated_at = ? '
                             'WHERE tag = ? AND id = ?',
-                            (json.dumps(meta), _now(), tag, tid),
+                            (json.dumps(meta), task_timestamp_now(), tag, tid),
                         )
             return {
                 'id': str(tid),

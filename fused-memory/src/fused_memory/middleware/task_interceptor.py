@@ -36,7 +36,7 @@ from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
-from fused_memory.backends.sqlite_task_backend import _now as _backend_now
+from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -1056,17 +1056,16 @@ class TaskInterceptor:
             # One `metadata.pending_since` clock for the whole batch (task
             # 3816, PRD §C1 invariants / rule 5). A CSV flip -- what
             # `commit_planning` issues -- is ONE atomic release, so it must
-            # read as one instant: per-id `_now()` calls drift by tens of ms
+            # read as one instant: per-id clock reads drift by tens of ms
             # across a batch of gated transactions, and under the scheduler's
             # age term that spread is a real score delta, enough to order the
             # batch by commit sequence when intra-batch order is required to
-            # fall through to CPM and then numeric id. Computed from the
-            # BACKEND's `_now()` -- the same format `updated_at` uses -- not
-            # this module's `datetime.now(UTC).isoformat()` helper, whose
-            # offset-suffixed microsecond shape would give the live-stamped
-            # and back-filled populations two incommensurable string shapes.
+            # fall through to CPM and then numeric id. `task_timestamp_now` is
+            # the store's PUBLIC clock and its docstring carries the format
+            # contract; this module's own `datetime.now(UTC).isoformat()`
+            # helper is deliberately NOT interchangeable with it.
             batch_pending_since = (
-                _backend_now() if status == TaskStatus.PENDING else None
+                task_timestamp_now() if status == TaskStatus.PENDING else None
             )
             for tid in ids:
                 per_result = await self._apply_status_transition(
