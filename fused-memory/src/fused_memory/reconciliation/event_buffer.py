@@ -1149,8 +1149,8 @@ class EventBuffer:
         A connection-wide ``iter_chunk_size`` on ``connect_daemon`` plus
         ``async for`` was considered and rejected: it is a shared knob that
         would silently affect every ``async for row in cursor`` on that
-        connection (``_migrate`` has two today), and the bound would live
-        hundreds of lines from the code whose comment explains it.
+        connection, present and future, and the bound would live hundreds of
+        lines from the code whose comment explains it.
 
         Correction to the assumption this method was originally written
         under: abandoning a ``DELETE ... RETURNING`` cursor early does NOT
@@ -1268,8 +1268,12 @@ class EventBuffer:
         """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
 
         Still ``(-1, -1, -1)`` — never a raise — for a buffer that was never
-        initialized: server/main.py's checkpoint cycle unpacks the result and
-        logs exceptions separately.
+        initialized OR one already closed: server/main.py's checkpoint cycle
+        unpacks the result and logs exceptions separately.
+
+        This is the contract THIS store's callers already had; the journal and
+        ReconLedgerStore raise 'not initialized' in both those cases instead.
+        See ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
         """
         if self._access is None:
             return CheckpointResult(-1, -1, -1)

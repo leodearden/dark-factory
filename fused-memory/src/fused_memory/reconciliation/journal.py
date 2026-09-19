@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import uuid as uuid_mod
@@ -267,24 +266,51 @@ class ReconciliationJournal:
         Each ALTER is its OWN write unit: a column that already exists must roll
         back only its own statement, never a sibling migration that just
         succeeded.
+
+        "duplicate column name" is the ONLY tolerated failure, and the catch is
+        narrowed to it (loud-over-silent) exactly as ``EventBuffer._migrate`` and
+        ``ReconLedgerStore.initialize`` narrow theirs.  SQLite's ALTER TABLE has
+        no IF NOT EXISTS, so re-running these against an already-migrated DB is
+        expected; a locked or partially-created DB or a disk error is NOT, and
+        swallowing it here would let initialize() log success and leave the
+        failure to re-surface much later as a confusing "no such column" from the
+        first statement that needs the column.
         """
         access = self._require_access()
-        with contextlib.suppress(Exception):
+        try:
             async with access.write() as db:
                 await db.execute(ddl)
+        except Exception as exc:
+            # The write unit has already rolled itself back.
+            if 'duplicate column name' not in str(exc).lower():
+                raise  # Not the benign "column already exists" case — surface it.
 
     async def close(self) -> None:
         if self._access is not None:
             # AtomicConnection.close() TRUNCATEs the WAL best-effort first, so
             # the next open starts with an empty one.  Nulling _access matches
-            # EventBuffer and ReconLedgerStore: all three then report
-            # 'not initialized' after close rather than three different errors.
+            # EventBuffer and ReconLedgerStore: all three then raise the same
+            # 'not initialized' from _require_access() after close, instead of
+            # this store alone surfacing aiosqlite's 'Connection closed'.  That
+            # uniformity is the _require_access() guard ONLY — checkpoint() does
+            # not go through it and does not follow it; see checkpoint() below.
             await self._access.close()
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
         """``PRAGMA wal_checkpoint(TRUNCATE)``. Returns ``(busy, log,
-        checkpointed)``. Called by the periodic loop in ``server/main.py``."""
+        checkpointed)``. Called by the periodic loop in ``server/main.py``.
+
+        Post-close this RAISES 'not initialized', as ReconLedgerStore does;
+        EventBuffer alone answers ``(-1, -1, -1)``.  So a checkpoint tick that
+        races shutdown — a real path, since that loop runs on a timer against
+        stores it does not own the shutdown of — is logged for two of the three
+        stores and silent for the third.  The split is deliberate: each store
+        keeps the contract its callers already had, which is what let this
+        migration leave ``server/main.py`` edit-free.  Pinned by
+        ``test_recon_db_atomicity.py::test_the_post_close_checkpoint_contract_of_each_store``
+        so it cannot drift further, and unified by task 5562's adoption.
+        """
         return await self._require_access().checkpoint()
 
     def _require_access(self) -> AtomicConnection:

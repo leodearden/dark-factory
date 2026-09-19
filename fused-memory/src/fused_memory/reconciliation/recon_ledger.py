@@ -798,5 +798,10 @@ class ReconLedgerStore:
     async def checkpoint(self) -> CheckpointResult:
         """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
         checkpointed)``. Called by the periodic checkpoint loop in
-        ``server/main.py``."""
+        ``server/main.py``.
+
+        Post-close this RAISES 'not initialized', as ReconciliationJournal does;
+        EventBuffer alone answers ``(-1, -1, -1)``.  See
+        ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
+        """
         return await self._require_access().checkpoint()

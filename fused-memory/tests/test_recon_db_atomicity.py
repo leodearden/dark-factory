@@ -501,3 +501,35 @@ async def test_a_cancelled_write_does_not_discard_a_concurrent_one(ledger):
     assert await ledger.get_by_identity(PROJECT_ID, 'marker', task_id='victim-0') is None, (
         'the cancelled unit left rows behind: its rollback was partial'
     )
+
+
+@pytest.mark.asyncio
+async def test_the_post_close_checkpoint_contract_of_each_store(journal, event_buffer, ledger):
+    """Post-close, ``checkpoint()`` raises for two of the three stores, not the third.
+
+    ``server/main.py``'s checkpoint cycle runs on a timer against stores whose
+    shutdown it does not own, so a tick landing after ``close()`` is a real
+    production path rather than a hypothetical.  The three stores answer it
+    differently: EventBuffer short-circuits a missing connection to the
+    ``(-1, -1, -1)`` its callers already had, while the journal and the ledger
+    raise 'not initialized' from ``_require_access()``.
+
+    The split is deliberate — preserving each store's existing caller contract is
+    what kept ``server/main.py`` edit-free through this migration — but it is
+    exactly the kind of near-uniform invariant that drifts unwatched, and the
+    only other post-close coverage is the never-initialized EventBuffer above.
+    Pinned here so whoever unifies the two contracts (task 5562) changes it
+    deliberately and sees both halves at once.
+    """
+    await journal.close()
+    await event_buffer.close()
+    await ledger.close()
+
+    assert await event_buffer.checkpoint() == (-1, -1, -1), (
+        'EventBuffer must keep answering the sentinel after close: the checkpoint '
+        'cycle unpacks the result and logs raises separately'
+    )
+    with pytest.raises(RuntimeError, match='not initialized'):
+        await journal.checkpoint()
+    with pytest.raises(RuntimeError, match='not initialized'):
+        await ledger.checkpoint()
