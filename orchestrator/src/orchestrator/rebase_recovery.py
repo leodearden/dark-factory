@@ -342,8 +342,9 @@ def scan_lock_holders(
 ) -> HolderScan:
     """Find the pids holding *paths* open, in ONE pass over the process table.
 
-    Deliberately NOT ``git_ops.lane_lock_holder_pids``, which reads
-    ``/proc/locks``.  That file lists kernel FLOCK/POSIX locks, whereas git's
+    Deliberately NOT
+    ``orchestrator/src/orchestrator/verify_cancel.py::lane_lock_holder_pids``,
+    which reads ``/proc/locks``.  That file lists kernel FLOCK/POSIX locks, whereas git's
     ``*.lock`` files are plain ``O_CREAT|O_EXCL`` sentinels held open by file
     descriptor with no kernel lock at all — so it would report "no holder" for
     every live git lock, and this sweep would delete them.  The two probes
@@ -373,8 +374,18 @@ def scan_lock_holders(
     foreign holder is invisible and no counting of denials would reveal it.
     The conjunction in :func:`sweep_stale_locks` is the mitigation — a file is
     removed only if it ALSO has not been touched for an hour.
+
+    ASKING ABOUT NOTHING COSTS NOTHING.  A worktree with no ``*.lock`` files is
+    the overwhelmingly common case — every healthy git dir — and this runs
+    inside every abort the orchestrator issues, including the ``abort_merge``
+    its caller fires on any non-zero merge rc.  A pass costs ~0.18s measured,
+    so answering the empty request without one is the same syscall-frugality
+    argument that makes the scan per-sweep rather than per-lock.
     """
     wanted = {str(path.resolve()): path for path in paths}
+    if not wanted:
+        return HolderScan(pids_by_path={}, confirmed=True)
+
     holders: dict[Path, set[int]] = {path: set() for path in wanted.values()}
     try:
         entries = list(proc_root.iterdir())

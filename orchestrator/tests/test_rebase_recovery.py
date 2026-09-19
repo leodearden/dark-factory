@@ -572,6 +572,44 @@ class TestScanLockHolders:
         assert scan.confirmed is False
         assert scan.pids_by_path[lock] == ()
 
+    def test_no_candidates_means_no_pass_at_all(self, tmp_path: Path) -> None:
+        """The common case: a git dir with no locks must not walk the fd table.
+
+        Measured by review: a full pass costs ~0.18s, and it runs inside
+        ``guarded_abort`` on all four abort sites — including ``abort_merge``,
+        whose caller invokes it on ANY non-zero merge rc, the no-op
+        'no merge to abort' case included.
+
+        Asserted through the RESULT rather than by counting syscalls: an absent
+        ``proc_root`` is the one input that makes an enumeration observable
+        (it answers ``confirmed=False``), so a trivially-confirmed empty answer
+        is proof that nothing was enumerated.
+        """
+        scan = rebase_recovery.scan_lock_holders(
+            [], proc_root=tmp_path / 'no-such-proc',
+        )
+
+        assert scan.confirmed is True
+        assert dict(scan.pids_by_path) == {}
+
+    def test_a_git_dir_with_no_locks_never_reaches_the_process_table(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Same claim one layer up, where the cost is actually paid."""
+        git_dir = tmp_path / 'gitdir'
+        git_dir.mkdir()
+        (git_dir / 'HEAD').write_text('ref: refs/heads/main\n')
+
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.rebase_recovery',
+        ):
+            findings = rebase_recovery.survey_locks(
+                git_dir, proc_root=tmp_path / 'no-such-proc',
+            )
+
+        assert findings == ()
+        assert caplog.records == [], 'an absent /proc was enumerated anyway'
+
     def test_one_pass_answers_every_candidate_lock(self, tmp_path: Path) -> None:
         """The scan is per SWEEP, not per lock.
 
