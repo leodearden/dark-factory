@@ -1470,8 +1470,45 @@ def _check(request: Request, kernel: ModuleType) -> int:
     return 1 if violations else 0
 
 
+def _require_whole_tree(request: Request, verb: str) -> None:
+    """Refuse a scoped run of a baseline-WRITING verb, before any scan work.
+
+    THE KERNEL'S ARITHMETIC CANNOT REFUSE THIS ONE, which is why the refusal
+    lives here.  A scoped scan is honestly ``complete=True`` for its scope, so it
+    passes ``_require_comparable`` and the tighten goes through — writing
+    ``baseline ∩ scope`` and deleting every key outside it.  The kernel's own
+    docstring names regenerating a baseline from a partial view as the single hole
+    its arithmetic leaves; this is the consumer closing it.
+
+    BEFORE THE SCAN, not after, for two reasons that both matter.  A refusal is
+    not worth minutes of tokenizing, and — the load-bearing one — a tree that
+    also holds an unreadable file would otherwise report THAT as the exit 2,
+    sending the reader to fix a file when the invocation was the problem.
+
+    A scoped ``--check`` is deliberately not refused: ``Counter`` subtraction is
+    per-key and saturating, so a narrower current view can only lower a key's
+    count and therefore only UNDER-report violations.  It can never manufacture
+    one, which is what the ``partial`` label is telling the reader.
+    """
+    if request.scoped:
+        raise InstrumentFailure(
+            f'refusing a scoped {verb}: {" ".join(request.scope)} is part of a tree, and a '
+            'baseline written from a partial view drops every key outside it -- which makes '
+            'each of those suppressions a fresh violation on the next whole-tree run. Re-run '
+            'without PATH arguments. A scoped --check is the supported early-feedback run.'
+        )
+
+
 def _seed(request: Request, kernel: ModuleType) -> int:
     """Write *request*'s tree as a fresh baseline — κ1's one-time verb.
+
+    BOTH REFUSALS PRECEDE ``dump``, and they have to: ``dump`` writes the
+    enumeration it is handed and checks nothing about the file already at the
+    path, because seeding a new baseline and carrying an honestly incomplete one
+    across a file boundary are both legitimate uses of it.  Re-seeding an
+    EXISTING baseline is therefore the one call in the kernel that widens the
+    gate — by every key the current scan added — so the guard belongs to whoever
+    calls it.
 
     The status is :attr:`Status.CLEAN` by construction rather than by
     measurement: a baseline written from this very scan has no excess over it,
@@ -1480,6 +1517,14 @@ def _seed(request: Request, kernel: ModuleType) -> int:
     that was never computed would be the reassuring-direction error
     :func:`_figure` exists to refuse.
     """
+    _require_whole_tree(request, '--seed')
+    if request.baseline.exists():
+        raise InstrumentFailure(
+            f'refusing to seed over the baseline already at {request.baseline}: a baseline is '
+            'seeded ONCE, by the operator step κ1, and tightened thereafter. Re-seeding an '
+            'existing one silently widens the gate by every key this scan added. Use '
+            '--tighten to remove what the tree no longer needs.'
+        )
     scan, classification = _measure(request)
     kernel.dump(_enumeration(classification, kernel), request.baseline)
     print(
