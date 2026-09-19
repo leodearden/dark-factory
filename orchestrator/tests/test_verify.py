@@ -3857,6 +3857,114 @@ class TestVerifyPlanPersistedBesideTheAttempt:
             'a non-archiving caller must not create an archive tree'
         )
 
+    async def test_fallback_scoped_run_persists_its_plan(self, tmp_path: Path):
+        """The no-module_configs fallback branch is a third plan call site."""
+        import json
+        worktree = tmp_path
+        (worktree / '.task').mkdir()
+        (worktree / 'pkg').mkdir()
+        (worktree / 'pkg' / 'mod.py').write_text('x = 1\n')
+        config = OrchestratorConfig(
+            project_root=worktree, test_command='pytest tests/',
+            lint_command='ruff check .', type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config, [], task_files=['pkg/mod.py'],
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+            )
+
+        plan = json.loads(self._plan_path(worktree).read_text())
+        assert plan['runs'], f'fallback branch persisted an empty plan: {plan}'
+
+
+@pytest.mark.asyncio
+class TestVerifyPlanOnTheMergePath:
+    """The merge lane carries NO attempt_id, and is the path this exists for.
+
+    ``verify_runner.LocalRunner.run_merge_verify`` passes ``task_id`` and
+    ``archive_root`` but no ``attempt_id``, so a plan writer gated on one
+    writes nothing on exactly the lane whose worktree is deleted minutes
+    later.  Both artefacts must land, under one joinable stem.
+    """
+
+    _TASK_ID = '4242'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+        (tmp_path / 'pkg' / 'tests' / 'test_changed.py').write_text('def test_x(): pass\n')
+        return tmp_path
+
+    async def _run(self, worktree: Path, archive_root: Path, module_configs):
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text('<testsuites><testsuite name="pytest"/></testsuites>')
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_scoped_verification(
+                worktree, config, module_configs,
+                task_files=['pkg/tests/test_changed.py'],
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+    async def test_plan_and_junit_land_under_one_stem_without_an_attempt_id(
+        self, tmp_path: Path,
+    ):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._run(
+            worktree, archive_root,
+            [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+        )
+
+        archived = archive_root / self._TASK_ID
+        plans = list(archived.glob('attempt-*.plan-*.json'))
+        junits = list(archived.glob('attempt-*.junit-*.xml.gz'))
+        assert len(plans) == 1, f'merge-path plan not archived; got {plans}'
+        assert len(junits) == 1, f'merge-path junit not archived; got {junits}'
+        assert plans[0].name.split('.')[0] == junits[0].name.split('.')[0], (
+            'plan and junit must share an attempt-N stem so a census can join '
+            f'them; got {plans[0].name} vs {junits[0].name}'
+        )
+
+    async def test_per_module_fan_out_persists_its_plan(self, tmp_path: Path):
+        """force_workspace + breadth=full fans out per module — a plan site."""
+        import json
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config,
+                [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+                task_files=None, force_workspace=True,
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+        plans = list((archive_root / self._TASK_ID).glob('attempt-*.plan-*.json'))
+        assert len(plans) == 1, f'fan-out branch plan not archived; got {plans}'
+        assert json.loads(plans[0].read_text())['runs'], 'fan-out plan has no runs'
+
 
 @pytest.mark.asyncio
 class TestJunitReportRetention:
@@ -3922,6 +4030,43 @@ class TestJunitReportRetention:
         )
         assert '<testsuite' in gzip.decompress(archived[0].read_bytes()).decode(), (
             'the archived copy must read back as the report itself, not a husk'
+        )
+
+    async def test_previous_passs_report_is_not_rearchived_as_this_run(
+        self, tmp_path: Path,
+    ):
+        """A merge worktree is reused across passes, and pytest only truncates
+        when it actually runs — so a leg that writes nothing must archive
+        nothing, not its predecessor's report under a fresh timestamp."""
+        stale = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        stale.parent.mkdir(parents=True)
+        stale.write_text('<testsuites><testsuite name="STALE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def killed_before_writing(cmd, cwd, timeout, env=None, log_path=None, **kw):
+            return -9, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=killed_before_writing):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'a stale report from an earlier pass was archived as this run'
+        )
+        assert result.failing_test_ids is None, (
+            'the stale report must not be read back as this run\'s failing ids '
+            'either — "no report" is the degrade both readers already model'
         )
 
     async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):

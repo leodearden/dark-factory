@@ -201,6 +201,24 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 more occurrences than one read returns, so the counters cover a partial
 window.
 
+### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
+
+**A non-empty directory no longer means the task had a verify failure.**
+Red verifies archive their per-leg `attempt-N[.<module>].<label>-<ts>.log`
+output and an `attempt-N[.<module>].summary-<ts>.json` beside it; GREEN and
+red alike archive `attempt-N.plan-<ts>.json` (the scope decision — which
+legs ran full-suite rather than file-scoped, and why) and, on the merge
+lane, a gzipped `attempt-N[.<module>].junit-<ts>.xml.gz` per-test report.
+The greens are deliberate: a failures-only corpus answers questions about
+cost and scope with a red-conditioned sample. Merge verifies carry no
+attempt id, so their files stem at `attempt-1`; a run's plan, logs and
+junit share that stem and can be joined on it.
+
+Retention is one policy for the whole tree: `.log`, `.json` and `.gz` are
+deleted past 30 days, then oldest-first until the tree is under 500MB
+(`verify.py::_prune_archive`). `flaky-ledger.jsonl` lives in the same
+directory and is deliberately outside that sweep.
+
 ### Reading the merge-lane throughput baseline
 
 ```bash

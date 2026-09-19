@@ -1808,15 +1808,26 @@ def _prepare_junit_report_path(
 
     Reuses :func:`_make_infix` for the per-module sanitized filename infix
     (``pkg/sub`` -> ``.pkg_sub``) so a per-module fan-out never collides.
+
+    REMOVES any report left at that path by an earlier pass.  A merge worktree
+    is reused across passes (merge_queue's cross-check, the retry paths), and
+    pytest only truncates the file when it actually runs — so a leg killed
+    before pytest wrote anything would otherwise leave its predecessor's
+    report in place, to be read back as THIS run's failing test ids and
+    archived again as THIS run's cost. Unlinking here fixes both readers at
+    their one shared source; each then degrades to "no report", which is the
+    outcome both already model.
     """
     if not worktree.is_dir():
         return None
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
+        report = (junit_dir / f'report{_make_infix(module_prefix)}.xml').resolve()
+        report.unlink(missing_ok=True)
     except OSError:
         return None
-    return (junit_dir / f'report{_make_infix(module_prefix)}.xml').resolve()
+    return report
 
 
 def _write_run_log(
@@ -1943,14 +1954,10 @@ def _persist_attempt_logs(
     # Build summary.json via the shared helper (same shape as merge-path summary).
     summary_payload = _build_summary_payload(runs, category, cause_hint)
 
-    summary_path = verify_dir / f'attempt-{attempt_id}{infix}.summary.json'
-    try:
-        summary_path.write_text(
-            json.dumps(summary_payload, indent=2, ensure_ascii=False),
-            encoding='utf-8',
-        )
-    except OSError as exc:
-        logger.warning('_persist_attempt_logs: could not write %s: %s', summary_path, exc)
+    _write_json_artifact(
+        verify_dir / f'attempt-{attempt_id}{infix}.summary.json',
+        summary_payload, '_persist_attempt_logs',
+    )
 
     return written
 
@@ -2007,6 +2014,26 @@ def _archive_attempt_log(
     return archived
 
 
+def _archive_stamp() -> str:
+    """The microsecond UTC stamp every durable archive filename is keyed by.
+
+    Microsecond rather than second precision so back-to-back retries for one
+    task never overwrite each other; still lexicographically sortable.
+    """
+    return datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+
+
+def _archive_attempt_id(attempt_id: 'int | None') -> int:
+    """The attempt number a durable archive filename is stemmed with.
+
+    Merge verifies carry no ``attempt_id`` at all
+    (``verify_runner.LocalRunner.run_merge_verify`` passes none), so every
+    archive writer must agree on one fallback — otherwise a run's plan, logs
+    and junit stop sharing a stem and cannot be joined.
+    """
+    return attempt_id or 1
+
+
 def _archive_junit_report(
     junit_path: Path,
     archive_root: 'Path | None',
@@ -2019,27 +2046,28 @@ def _archive_junit_report(
 
     Ungated on ``passed``: this is a COST record, and a red-only cost corpus
     describes a different population from the one being measured.  Gzipped
-    because raw greens (~78MB/day, measured 2026-09-19) against the shared
-    500MB oldest-first cap would evict the failure logs.  A missing report is
-    normal — nothing injected ``--junitxml`` — so it returns ``None`` quietly;
-    every other failure warns, because observability may not fail a verify.
+    because the greens are what make the volume bite against the shared
+    oldest-first ``_DEFAULT_ARCHIVE_MAX_BYTES`` cap, which would otherwise
+    start evicting the failure logs.  A missing report is normal — nothing
+    injected ``--junitxml`` — so it returns ``None`` quietly; every other
+    failure warns, because observability may not fail a verify.
     """
-    if archive_root is None or task_id is None or not junit_path.is_file():
-        return None
-    target_dir = archive_root / task_id
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
-    dest = (
-        target_dir
-        / f'attempt-{attempt_id}{_make_infix(module_prefix)}.junit-{utc_ts}.xml.gz'
-    )
+    dest: Path | None = None
     try:
+        if archive_root is None or task_id is None or not junit_path.is_file():
+            return None
+        target_dir = archive_root / task_id
         target_dir.mkdir(parents=True, exist_ok=True)
+        dest = target_dir / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}'
+            f'.junit-{_archive_stamp()}.xml.gz'
+        )
         with junit_path.open('rb') as report, gzip.open(dest, 'wb') as archived:
             shutil.copyfileobj(report, archived)
-    except OSError as exc:
+    except Exception:  # noqa: BLE001 — observability may not fail a verify
         logger.warning(
-            '_archive_junit_report: could not archive %s → %s: %s',
-            junit_path, dest, exc,
+            '_archive_junit_report: could not archive %s → %s',
+            junit_path, dest, exc_info=True,
         )
         return None
     return dest
@@ -2065,7 +2093,7 @@ def _persist_verify_plan(
     attempt_id: 'int | None',
     task_id: 'str | None',
     archive_root: 'Path | None',
-) -> list[Path]:
+) -> None:
     """Persist the derived verify plan as an attempt artefact, green or red.
 
     ``PlannedRun.reason`` — why a leg ran full-suite rather than file-scoped —
@@ -2074,26 +2102,28 @@ def _persist_verify_plan(
     ``.task/`` scrubbed and there is no worktree file to copy.  Call it where
     the plan is DECIDED, before the legs run, so a killed leg still leaves its
     scope decision behind.
+
+    Only the WORKTREE copy needs a real ``attempt_id``, because that is what
+    distinguishes one attempt's file from the next within a living worktree.
+    The archive copy is stamped and so cannot collide, and gating it on
+    ``attempt_id`` too would have silently skipped the entire MERGE lane —
+    the one this artefact exists for — which carries no attempt id.
     """
-    if plan_dict is None or attempt_id is None:
-        return []
-    written: list[Path] = []
-    if (worktree / '.task').is_dir():
-        path = _write_json_artifact(
+    if plan_dict is None:
+        return
+    if attempt_id is not None and (worktree / '.task').is_dir():
+        _write_json_artifact(
             worktree / '.task' / 'verify' / f'attempt-{attempt_id}.plan.json',
             plan_dict, '_persist_verify_plan',
         )
-        if path is not None:
-            written.append(path)
     if archive_root is not None and task_id is not None:
-        utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
-        path = _write_json_artifact(
-            archive_root / task_id / f'attempt-{attempt_id}.plan-{utc_ts}.json',
+        _write_json_artifact(
+            archive_root / task_id / (
+                f'attempt-{_archive_attempt_id(attempt_id)}'
+                f'.plan-{_archive_stamp()}.json'
+            ),
             plan_dict, '_persist_verify_plan',
         )
-        if path is not None:
-            written.append(path)
-    return written
 
 
 def _archive_merge_verify_logs(
@@ -2141,10 +2171,7 @@ def _archive_merge_verify_logs(
         return []
 
     infix = _make_infix(module_prefix)
-    # Use microsecond precision so rapid back-to-back merge-verify retries for
-    # the same task (same attempt_id=1 default, same second) never overwrite each
-    # other.  The format is still lexicographically sortable.
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+    utc_ts = _archive_stamp()
     ts_suffix = f'-{utc_ts}'
     archived: list[Path] = []
 
@@ -2160,18 +2187,13 @@ def _archive_merge_verify_logs(
             archived.append(path)
 
     # Write summary.json using the shared payload builder.
-    summary_path = target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json'
-    try:
-        summary_payload = _build_summary_payload(runs, category, cause_hint)
-        summary_path.write_text(
-            json.dumps(summary_payload, indent=2, ensure_ascii=False),
-            encoding='utf-8',
-        )
+    summary_path = _write_json_artifact(
+        target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json',
+        _build_summary_payload(runs, category, cause_hint),
+        '_archive_merge_verify_logs',
+    )
+    if summary_path is not None:
         archived.append(summary_path)
-    except OSError as exc:
-        logger.warning(
-            '_archive_merge_verify_logs: could not write %s: %s', summary_path, exc,
-        )
 
     return archived
 
@@ -2214,9 +2236,9 @@ def _prune_archive(
     cutoff = now - max_age_days * 86_400
 
     # Single rglob walk — collect all archivable files once, avoiding a second
-    # directory scan for the size-cap pass.  Every suffix WRITTEN into this
-    # tree must be listed: an uncounted one is never pruned and never counted
-    # toward the size budget, so it accumulates unbounded.
+    # directory scan for the size-cap pass.  These suffixes are the ones
+    # counted and pruned; anything else in the tree (chronic_flake's
+    # flaky-ledger.jsonl) is deliberately neither.
     _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.gz'))
     all_entries: list[tuple[Path, float, int]] = []
     for path in archive_root.rglob('*'):
@@ -6238,7 +6260,7 @@ async def run_verification(
         if archive_root is not None and task_id is not None and not passed:
             try:
                 arch_paths = _archive_merge_verify_logs(
-                    runs, archive_root, task_id, attempt_id or 1,
+                    runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
@@ -6278,10 +6300,10 @@ async def run_verification(
     failing_test_ids: list[str] | None = None
     if junit_path is not None:
         failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
-        # The report dies with the merge worktree; the LOG archival below is
+        # The report dies with the merge worktree; the LOG archival above is
         # gated on `not passed`, this deliberately is not.
         _archive_junit_report(
-            junit_path, archive_root, task_id, attempt_id or 1,
+            junit_path, archive_root, task_id, _archive_attempt_id(attempt_id),
             module_prefix=module_prefix,
         )
 
