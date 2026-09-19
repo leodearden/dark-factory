@@ -42,6 +42,7 @@ test here keeps its mutable state inside ``tmp_path`` and changes no process-wid
 state outside ``monkeypatch``.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -53,6 +54,7 @@ from pathlib import Path
 import inline_suppressions
 import pytest
 from shared.governed_exceptions import INLINE_MARKER_FORMS, Policy
+from shared.ratchet import BASELINE_README, SCHEMA_VERSION, load
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'
@@ -1525,3 +1527,107 @@ def test_a_baseline_that_exists_but_cannot_be_read_is_never_green(
     assert 'advisory' not in report.out
     assert 'clean' not in report.out
     assert str(baseline) in report.err
+
+
+def _seed(root: Path, baseline_path: Path, *paths: str) -> int:
+    """Run ``--seed`` over *root*, optionally scoped to *paths*."""
+    return inline_suppressions.main(
+        ['--seed', '--root', str(root), '--baseline', str(baseline_path), *paths]
+    )
+
+
+def test_seed_writes_the_unowned_multiset_under_the_kernels_preamble(tmp_path: Path):
+    """``--seed`` is κ1's one call, so what it writes has to be reviewable.
+
+    The kernel owns the file's shape and its preamble — the paragraph stating
+    that the only legal diff is a DELETION is re-emitted on every write, which is
+    the only handle a reviewer has on a file keyed by content digests.  What this
+    scanner owns is the CONTENT: exactly the unowned multiset, and a params block
+    naming the kinds it swept and the digest width D7 fixes.
+    """
+    files = {
+        'pyproject.toml': _RUFF_CONFIG,
+        'm.py': _grandfathered(3) + 'b = 2  # noqa: E402  # debt: task 5601\n',
+    }
+    baseline = _write_fixture_tree(tmp_path, files)
+
+    assert _seed(tmp_path, baseline) == 0
+
+    raw = json.loads(baseline.read_text(encoding='utf-8'))
+    assert raw['_README'] == BASELINE_README
+    assert raw['schema_version'] == SCHEMA_VERSION
+    written = load(baseline)
+    scan = inline_suppressions.scan_tree(tmp_path)
+    expected = inline_suppressions.classify(
+        scan, inline_suppressions.ConsumerModel(tmp_path)
+    ).counts
+    assert dict(written.counts) == expected
+    assert len(written.counts) == 3
+    assert set(written.params) == {'kinds', 'key_scheme', 'digest_hex'}
+    assert written.params['kinds'] == tuple(kind.value for kind in inline_suppressions.Kind)
+    assert written.params['digest_hex'] == 12
+    assert written.complete is True
+
+
+def test_a_baseline_just_seeded_makes_the_same_tree_clean(tmp_path: Path, capsys):
+    """The round trip, which is the only thing that proves the two halves agree.
+
+    A key the seed writes and a key the check computes are produced by the same
+    code, so equality is unsurprising; what this catches is a params block or a
+    schema version that differs between the write and the read, which turns every
+    later run into an exit 2 nobody can explain.
+    """
+    baseline = _write_fixture_tree(tmp_path, {'m.py': _grandfathered(4)})
+    assert _seed(tmp_path, baseline) == 0
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 0
+    assert 'clean' in capsys.readouterr().out
+
+
+def test_seeding_over_an_existing_baseline_is_refused_and_changes_nothing(
+    tmp_path: Path, capsys
+):
+    """BOUNDARY SCENARIO 6 — and it is asserted on BYTES, not on mtime.
+
+    ``shared.ratchet.dump`` is deliberately unpoliced against whatever already
+    sits at its path: seeding a new baseline and carrying an honestly incomplete
+    one across a file boundary are both legitimate, and neither survives a writer
+    that refuses unfamiliar keys.  So regenerating an existing baseline from a
+    fresh scan is the one call that widens the gate, and closing that hole is this
+    consumer's job rather than the kernel's.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    before = baseline.read_bytes()
+    _revise(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\nb = 2  # nosec\n'})
+    capsys.readouterr()
+
+    assert _seed(tmp_path, baseline) == 2
+
+    assert baseline.read_bytes() == before
+    assert str(baseline) in capsys.readouterr().err
+
+
+def test_a_scoped_seed_is_refused_before_any_scan_work(tmp_path: Path, capsys):
+    """A baseline seeded from part of a tree makes every unscanned suppression a
+    fresh violation, so the scope is refused rather than honoured.
+
+    REFUSED BEFORE THE SCAN, which is asserted the only way it can be asserted
+    from outside: the tree also holds a file that cannot be tokenized, and that
+    file is an exit 2 of its own with a message naming it.  A refusal that came
+    after the scan would report the file instead of the scope.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {'pkg/m.py': 'a = 1  # type: ignore[arg-type]\n', 'broken.py': 'a = (  # nosec\n'},
+    )
+    capsys.readouterr()
+
+    assert _seed(tmp_path, baseline, 'pkg') == 2
+
+    error = capsys.readouterr().err
+    assert 'scoped' in error
+    assert 'broken.py' not in error
+    assert not baseline.exists()
