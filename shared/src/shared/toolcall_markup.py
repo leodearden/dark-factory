@@ -547,6 +547,41 @@ def _inner_closer_blocks(
 
     Otherwise the occurrence is QUOTED PROSE and recovery proceeds.
 
+    CONDITION (i)'S OPENER MIRROR — the one clause here that is not about a
+    closer at all, and the reason this function's name is narrower than its
+    rule (task **5620**). A well-formed CANONICAL parameter OPENER anywhere in
+    the value blocks recovery outright, before any closer is examined. Task
+    **4502** fixed the CLOSER side of exactly this class — condition (i)'s
+    separately-listed ``parameter`` entry, esc-4502-3 — but reasoned only about
+    closers, and this function iterates over closers alone, so the opener side
+    was left open: a well-formed sibling opener was invisible to the rule and
+    was glued into the value verbatim while the sibling it named was silently
+    NOT recovered. Measured across 4502 (``b88919ad25^`` vs ``1b9fedeb97``):
+    such a value went from ``None`` to ``recovered={'evidence': ...}``.
+
+    An opener naming a parameter is a shape :func:`_parse_body` would have
+    opened a SIBLING ITEM on, so reading it as prose instead is a guess about
+    where this item ends — precisely what B5 refuses — and guessing wrong
+    writes one argument's text into another and reports it as ``repaired``.
+    Stated CATEGORICALLY for the same reason (i) is, and on a measurement
+    rather than a reading: probe (ii) cannot decide this. Run from each inner
+    CLOSER, as it is, the remainder ahead of such an opener begins mid-prose
+    and does not parse. Run from each inner OPENER instead — the alternative
+    weighed for 5620 — it still stays silent whenever the sibling's own text
+    carries a closing tag, because the depth-1 bound reads that remainder as
+    "does not parse". With the probe unable to answer and the failure mode
+    being a silent partial repair, refusing is the only safe direction.
+
+    IT MUST NOT TOUCH ``considered``, whose final ``return considered == 0`` is
+    the malformed-closer fallback (negative control (e)) and has to keep
+    meaning "no WELL-FORMED CLOSER was present".
+
+    THE COST IS ONE BOUNDED SEARCH at the same level as the cheap prefilter —
+    once per (candidate, tail item), never inside the inner-closer loop — over
+    a string that prefilter has just scanned, and only when it fired. The clean
+    path pays nothing, and nothing is added to the innermost of the three
+    multiplying ceilings :data:`_MAX_CANDIDATES` warns about.
+
     CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
     way a reimplementation goes wrong. The ambiguity probe alone — or
     qualifying inner closers only on schema membership — also accepts
@@ -570,6 +605,9 @@ def _inner_closer_blocks(
     substring behaviour restored, so it cannot recurse. Beyond the budget the
     answer is BLOCK, the conservative direction.
     """
+    if _CANONICAL_OPENER_RE.search(item_value) is not None:
+        return True  # (i)'s OPENER MIRROR: a sibling this parser would have opened
+
     considered = 0
     for inner in _CLOSER_RE.finditer(item_value):
         considered += 1
