@@ -12,6 +12,12 @@ periodically so the WAL cannot grow without bound.
 their only writer, and the migration each performs on ``open()`` exists so
 its loop can run. ``app.py``'s ``lifespan`` constructs both and spawns both
 loops, importing the four names back.
+
+Those four names carry a leading underscore from when this was all one
+file, and they are now this module's interface rather than private detail.
+Read the underscore as vestigial, not as a private-use signal — the move
+that created this module was a pure extraction, with renaming outside its
+scope.
 """
 
 from __future__ import annotations

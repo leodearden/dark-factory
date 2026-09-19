@@ -17,6 +17,20 @@ for these would be a circular import.
 A missing DB file is not an error here: ``DbPool.get`` yields ``None`` for
 it, so a consumer fans out over whatever exists and a project that has not
 produced a given DB yet simply contributes nothing.
+
+All four names carry a leading underscore from when they were private to
+``app.py``, and all four are now this module's entire interface. Read the
+underscore as vestigial, not as a private-use signal — the move that
+created this module was a pure extraction, with renaming outside its scope.
+
+This is the canonical home for that primary-root-first, de-duplicated walk
+but not yet its only copy: ``app.py::_performance_resources``,
+``app.py::_analytics_project_dirs``,
+``dashboard/data/escalations.py::build_escalation_queues`` and
+``dashboard/data/active_tasks.py::_all_project_roots`` each still hand-roll
+the same iteration, differing only in what they derive per root. Rebuilding
+them on one shared root iterator is a logic change the extraction
+deliberately did not make; it is filed as a follow-up rather than dropped.
 """
 
 from __future__ import annotations

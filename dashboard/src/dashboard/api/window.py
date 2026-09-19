@@ -10,6 +10,12 @@ what ``7d`` means and an unknown label degrades the same way everywhere
 ``dashboard.api.burndown`` deliberately does NOT use this vocabulary: the
 burndown chart offers ``90d`` where this one offers ``all``, and the two
 sets are pinned as distinct by ``static/redux/app.jsx``.
+
+Both names below carry a leading underscore from when they were private to
+``app.py``, and both are now this module's entire interface: ``app.py`` and
+``dashboard/api/merge_queue.py`` import them. Read the underscore as
+vestigial, not as a private-use signal — the move that created this module
+was a pure extraction, with renaming outside its scope.
 """
 
 from __future__ import annotations
