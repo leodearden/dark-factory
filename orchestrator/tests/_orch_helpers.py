@@ -518,6 +518,133 @@ def required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> floa
 DEEP_GATE_SCENE_SPAWN_BUDGET = 260
 DEEP_GATE_SCENE_TEST_TIMEOUT = 1260
 
+# task 5582: what the nine real-git classes in
+# test_merge_queue_deep_landing.py are ALLOWED to cost, and the per-test
+# timeout derived from it.  This comment is the SINGLE home of that
+# derivation; those classes point HERE rather than restating it, and
+# test_timeout_marker_inversion_guard.py::TestDeepLandingSceneBudget
+# re-derives the third constant from the first two at runtime so no literal
+# can drift from its inputs.
+#
+# MEASURED, 2026-09-18 at main 8ef4bd385d, serially under `-p no:randomly`, by
+# counting `asyncio.create_subprocess_exec`/`_shell` and summing
+# `asyncio.sleep` per test over the whole module (64 passed in 329.57s on a
+# loaded host).  Per-CLASS worst-test spawn counts:
+#     TestDeepLandingEndToEnd                      169 spawns
+#     TestAdoptedHeadLandsWithThePostVerifyWorktree 165 spawns
+#     TestHeadCancelOnAdoption                     163 spawns
+#     TestInOrderCasWalk                           139 spawns
+#     TestChainWalkConsumesNoPermits               135 spawns
+#     TestContendedLeaseDeferInheritance           115 spawns
+#     TestStaleCasAbortLeavesTheRestAlone          108 spawns
+#     TestHeadCancelLeavesTheLaneIdle               67 spawns
+#     TestTipPassAdoptionSignal                     39 spawns
+# Summed `asyncio.sleep` is 0.00s for EVERY test in the module, which is the
+# load-bearing half: this module is ~100% SUBPROCESS-SPAWN-BOUND, so its wall
+# clock is spawn count multiplied by per-spawn latency -- and per-spawn
+# latency is exactly what host CPU oversubscription inflates.
+#
+# ALL NINE CLASSES, not just the one that crashed.  The crash census names
+# TestStaleCasAbortLeavesTheRestAlone, which is the SEVENTH-heaviest of the
+# nine, and the crashing test inside it (test_two_consecutive_tip_fails_
+# render_nothing_for_any_link) is the LIGHTEST in that class at 75 spawns /
+# 2.53s isolated, in a class that passes in 32.27s standalone.  Under a
+# starved worker the kill lands on whichever test the timer happened to
+# catch, so sizing only the class that got caught would have left the three
+# genuinely heavier siblings on the tighter budget and moved the same failure
+# onto the next innocent branch.
+#
+# BUDGET = 169 + 21 (~12% headroom) = 190.  Headroom rather than a snug fit
+# because an unrelated change adding a few spawns must not fail the run --
+# only a change that makes a scene materially heavier should.
+#
+# BOUNDED WAITS = 60 + 120 = 180s, read from SOURCE rather than from the
+# census, and this is where the derivation departs from task 5333's Row 7 pair
+# above.  Row 7 could price `bounded_secs` at 0.0 because it composes no
+# `wait_for` at all; here `asyncio.wait_for(parked.wait(), timeout=60)` and
+# `_adopt_head_only`'s `timeout: float = 120` default sit on ONE
+# TestAdoptedHeadLandsWithThePostVerifyWorktree path.  The sleep instrument is
+# blind to a `wait_for` CEILING -- a bounded wait consumes nothing until it is
+# approached -- so a 0.0 term here would have hidden the defect instead of
+# stating it: those 180s exactly equal the marker those classes carried, i.e.
+# that class's bounded waits ALONE consumed its whole budget, leaving zero
+# headroom for the 165 real-git spawns it also makes.  Priced at the CEILING
+# rather than at the 0.00s actually consumed, because a starved host is
+# precisely when a bounded wait IS approached.
+#
+# TIMEOUT = 180 + 190 x 4.71 = 1074.9s, rounded UP the 60s pyproject grid to
+# 1080 (the same rounding rule the offline lane's `@pytest.mark.timeout(120)`
+# comment works, and the same `required_timeout_secs` call Row 7 makes).
+#
+# DELIBERATELY NOT DERIVED FROM DEEP_GATE_SCENE_TEST_TIMEOUT despite both
+# being deep merge-queue scenes.  That constant is scoped to ONE class in a
+# different module and its own comment says outright "do not read 1260 as a
+# claim about what this class costs", so borrowing it would let a Row 7
+# re-measurement silently move this module's ceiling -- the identical hazard
+# WHOLE_TREE_SCAN_TEST_TIMEOUT cites when it declines to borrow
+# HEAVY_BARRIER_TEST_TIMEOUT's 300 despite the numbers matching.  The two
+# scenes are sized by different arithmetic anyway: Row 7 is 234 spawns with
+# zero bounded waits, this is 169 spawns plus a 180s bounded-wait path.
+#
+# THREE CEILINGS it sits under, not two, all pinned by
+# TestDeepLandingSceneBudget:
+#   * `>= VERIFY_CLI_PER_TEST_TIMEOUT` (300) -- 1080 is far above it, so the
+#     marker loosens under the budget verify's CLI passes and cannot invert;
+#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (540) -- the never-narrow rule this file
+#     states a few constants above, at WHOLE_TREE_SCAN_TEST_TIMEOUT: a mark
+#     meant as a FLOOR must never fall below the ambient ini default, or it
+#     starts narrowing its own module.  Until 2026-09-17 these first two were
+#     the SAME number and one check covered both; task 5442 raised the ini
+#     default 300 -> 540 on measurement and deliberately left verify's CLI at
+#     300, so a value can now clear the verify edge while narrowing the
+#     ambient one.  That is not hypothetical -- the same commit recorded its
+#     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 and now below the
+#     default it used to equal.  1080 clears 540 today, so this pin changes
+#     nothing now; it exists so a future re-derivation landing somewhere like
+#     360 cannot satisfy the verify edge and reproduce that gap in silence;
+#   * `<= verify_command_timeout_secs` (7200, orchestrator/orchestrator.yaml)
+#     -- a per-test backstop larger than the whole verify run's own budget
+#     could never fire, so it would be no backstop at all.
+#
+# WHAT IS OBSERVED, AND WHAT IS ONLY HYPOTHESISED (stated separately, as the
+# Row 7 block above does, so a later reader does not inherit a guess as a
+# finding).  OBSERVED: all nine markers sat at 180, inside the inversion band
+# `DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT`, so under
+# verify's `--timeout=300` they ran TIGHTER than the run gating the merge; the
+# module is spawn-bound with 0.00s of sleep; the per-class maxima above; one
+# class's bounded waits alone consume its whole former marker.  HYPOTHESIS:
+# that the 180s marker is what fired in the two recorded crashes
+# (data/verify-logs/5440/attempt-1 and data/verify-logs/4039/attempt-1).  NOT
+# OBSERVED: the worker's fd or memory state at death.  The widened marker is
+# therefore a measurement-sized HEDGE against the timeout cause; the ENFORCED
+# spawn budget below is what this change contributes unconditionally, because
+# it reports scene growth whatever the mechanism turns out to be.  If a class
+# in this module crashes again at 1080s the timeout hypothesis is falsified --
+# look at fd and memory ceilings next, and do not widen further.
+#
+# A FALSIFIER THE ROW 7 BLOCK ABOVE RELIES ON DOES NOT HOLD, and it is
+# corrected here rather than inherited.  That block reads "NO `+++ Timeout +++`
+# banner anywhere in that log" as evidence the worker was not dying of its
+# timeout.  MEASURED with a purpose-built probe -- a `@pytest.mark.timeout(3)`
+# test sleeping 30s, run under `-n 2 --dist loadgroup --max-worker-restart=0
+# --timeout-method=thread` -- a GENUINE pytest-timeout kill under xdist prints
+# exactly `[gw0] node down: Not properly terminated` plus `worker 'gw0'
+# crashed while running '<nodeid>'` and NO banner: pytest-timeout writes the
+# banner to the WORKER's own terminal, which xdist does not forward to the
+# master.  That is byte-for-byte the signature in both crash logs above, so
+# banner-absence is the EXPECTED shape of a timeout kill rather than evidence
+# against it.  Row 7's own conclusions are deliberately left untouched -- its
+# leading hypothesis may still be right for other reasons -- but the mistaken
+# inference stops being inherited here.
+#
+# SIZED AGAINST THE BUDGET, NOT AGAINST THE RAW 169, for the reason the Row 7
+# block argues at length and this one does not restate: the marker can only be
+# wrong if the budget is breached, and a breach fails loudly, in-process, on
+# the test that caused it.
+DEEP_LANDING_SCENE_SPAWN_BUDGET = 190
+DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS = 180
+DEEP_LANDING_SCENE_TEST_TIMEOUT = 1080
+
 
 def deep_gate_spawn_budget_violation(count: int, nodeid: str) -> str | None:
     """Why *count* git spawns is an unacceptable cost for *nodeid*, or None.
