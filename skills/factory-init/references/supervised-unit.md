@@ -32,7 +32,10 @@ Type=simple
 # CWD must be dark-factory so `uv run --project orchestrator` resolves the package.
 WorkingDirectory=<DF>
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config <CONFIG>
+# --no-sync: every project's orchestrator shares dark-factory's ONE root .venv, and
+# without this flag a start installs into it. Do NOT add --frozen or --locked back —
+# both are no-ops beside it (task 5553; tests/scripts/test_uv_run_venv_isolation.py).
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project orchestrator orchestrator run --config <CONFIG>
 # Replicate PATH so verify subprocesses find their toolchain (a user service gets a minimal PATH).
 Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 Environment=LANG=en_US.UTF-8
