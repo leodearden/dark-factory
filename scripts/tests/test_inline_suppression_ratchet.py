@@ -880,3 +880,31 @@ def test_config_keys_that_only_ever_subtract_are_tolerated(tmp_path: Path):
     )
 
     assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.RUFF
+
+
+def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(tmp_path: Path):
+    """The same direction-of-error rule as ``extend-select``, applied to an
+    ABSENT key rather than an unmodelled one.
+
+    A ``[tool.ruff]`` section with no ``select`` anywhere does not mean "ruff
+    checks nothing" — it means ruff applies its BUILT-IN default rule set,
+    which is wider than the nothing this model would otherwise infer and which
+    drifts with the ruff version.  Reading it as empty is precisely the
+    under-read that rejects a marker ruff genuinely honours.  This repository's
+    own root ``pyproject.toml`` records having been in that state, with two
+    gated directories reporting "All checks passed!" while running a rule set
+    nobody chose.
+
+    Nothing in this tree reaches the refusal: all eight pyprojects declare
+    ``select`` explicitly.
+    """
+    _write_files(
+        tmp_path,
+        {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'},
+    )
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        _consumer_of(tmp_path, codes=('E402',))
+
+    assert 'pyproject.toml' in str(caught.value)
+    assert 'select' in str(caught.value)

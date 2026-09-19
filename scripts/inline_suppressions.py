@@ -58,7 +58,8 @@ import hashlib
 import re
 import subprocess
 import tokenize
-from collections.abc import Callable
+import tomllib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from io import StringIO
@@ -560,3 +561,267 @@ def key_for(site: Site) -> SuppressionKey:
         codes=site.codes,
         digest=hashlib.sha256(site.text.encode('utf-8')).hexdigest()[:_DIGEST_HEX],
     )
+
+
+# ---------------------------------------------------------------------------
+# D8 — the consumer model: which tool, if any, actually reads a marker.
+
+
+class Consumer(Enum):
+    """Who honours a suppression.
+
+    :attr:`NONE` is the finding D8 exists to surface, not an absence of
+    information: a marker nothing reads is not protecting anything, so it is
+    deleted rather than dispositioned.
+    """
+
+    PYRIGHT = 'pyright'
+    RUFF = 'ruff'
+    FIRST_PARTY = 'first-party'
+    NONE = 'none'
+
+
+#: Which consumer a kind resolves to WITHOUT consulting the code or any
+#: config.  ``noqa`` is deliberately absent — it is the one kind whose answer
+#: depends on both.  Totality over :class:`Kind` is enforced at the one read
+#: site rather than assumed, so a sixth row added to :data:`KIND_SPECS` with no
+#: consumer row is a loud exit 2 instead of silently inheriting ``noqa``'s
+#: behaviour.
+_KIND_CONSUMERS: Mapping[Kind, Consumer] = MappingProxyType(
+    {
+        # pyright runs over every package as a declared gate, so both of its
+        # marker spellings are read wherever they sit.
+        Kind.TYPE_IGNORE: Consumer.PYRIGHT,
+        Kind.PYRIGHT_IGNORE: Consumer.PYRIGHT,
+        # Nothing in this repository reads either one today: no coverage gate
+        # is configured, and bandit is not installed — which is why the live
+        # `nosec` count is zero.  Both rows are statements about TOOLS, and
+        # they change when a tool is adopted, not when code changes.  (Neither
+        # marker is spelled out here with its leading `#`: inside a comment
+        # that would BE a marker, and this scanner would read its own prose.)
+        Kind.PRAGMA_NO_COVER: Consumer.NONE,
+        Kind.NOSEC: Consumer.NONE,
+    }
+)
+
+_LEADING_LETTERS = re.compile(r'^[A-Za-z]+')
+_TRAILING_DIGITS = re.compile(r'[0-9]+$')
+
+
+@dataclass(frozen=True)
+class RuleCode:
+    """A ruff rule code or selector, split at the boundary into its two parts.
+
+    Attributes:
+        linter: The leading run of letters — ``E``, ``BLE``, ``PLC``.  This is
+            the linter ruff resolves the selector against.
+        number: The trailing run of digits, which may be empty for a bare
+            linter selector like ``B`` and for a first-party kebab-case code
+            like ``bare-magicmock``.  An empty number is tolerated rather than
+            raising: a code this split cannot read is simply one no selector
+            can match, which is the correct answer for it.
+    """
+
+    linter: str
+    number: str
+
+    def render(self) -> str:
+        """The code as the model READ it, for ``--json``.
+
+        Deliberately the parsed form rather than the source string: the report
+        exists so a reader can audit what the consumer model used, and a
+        selector the model mis-read is exactly what they are looking for.
+        """
+        return f'{self.linter}{self.number}'
+
+
+def parse_rule_code(raw: str) -> RuleCode:
+    """Split *raw* into its leading letters and trailing digits."""
+    linter = _LEADING_LETTERS.match(raw)
+    number = _TRAILING_DIGITS.search(raw)
+    return RuleCode(
+        linter=linter.group() if linter is not None else '',
+        number=number.group() if number is not None else '',
+    )
+
+
+def selects(selector: RuleCode, code: RuleCode) -> bool:
+    """Whether *selector* selects *code*, ruff's way and never by string prefix.
+
+    MEASURED AGAINST REAL RUFF, not assumed: ``ruff check --isolated --select
+    B`` does not flag ``BLE001`` while ``--select BLE`` does, and within one
+    linter ``--select E4`` flags E402 only while ``--select E5`` flags E501
+    only.  A selector is therefore a (linter, code-prefix) PAIR: the linter
+    must be EQUAL — ``B`` (flake8-bugbear) never reaches ``BLE``
+    (flake8-blind-except) — and the number is a prefix within it.
+
+    A naive ``code.startswith(selector)`` would report this tree's 202
+    ``# noqa: BLE001`` markers as ruff-consumed, defeating D8 for its
+    second-largest population.
+
+    KNOWN LIMIT, recorded rather than hidden: ruff's meta-prefix selectors
+    (``PL`` covering PLC/PLE/PLR/PLW) read as unselected under this rule.  No
+    ``pyproject.toml`` in this repository uses one, and ``--json`` publishes
+    the resolved select lists so a reader can see exactly what the model used.
+    """
+    return selector.linter == code.linter and code.number.startswith(selector.number)
+
+
+@dataclass(frozen=True)
+class RuffConfig:
+    """The ``select``/``ignore`` pair one ``pyproject.toml`` declares.
+
+    Attributes:
+        path: The declaring file, repo-relative, so ``--json`` can name it.
+        select: The selectors, parsed.
+        ignore: The suppressors, parsed.  Read because it is the same tomllib
+            call and is strictly more honest: all eight pyprojects here set
+            ``ignore = ["E501"]``, so ruff provably never emits E501 and every
+            ``# noqa: E501`` in the tree is dead — which is exactly what D8
+            exists to say.
+    """
+
+    path: str
+    select: tuple[RuleCode, ...]
+    ignore: tuple[RuleCode, ...]
+
+    def consumes(self, code: RuleCode) -> bool:
+        """Whether ruff would emit *code* under this config."""
+        return any(selects(selector, code) for selector in self.select) and not any(
+            selects(suppressor, code) for suppressor in self.ignore
+        )
+
+
+#: Keys this model does not implement that could WIDEN the selected set.  The
+#: split is by DIRECTION OF ERROR, which is the only thing that matters for a
+#: gate: under-reading the selected set rejects a marker ruff genuinely
+#: honours — a false red on a legitimate suppression, the expensive failure —
+#: so the scanner refuses to guess.  Keys that only ever SUBTRACT
+#: (`extend-ignore`, `per-file-ignores`) are tolerated and deliberately not
+#: modelled, because over-reading only grandfathers a dead marker.
+#:
+#: An ABSENT `select` belongs in this family for the same reason and is
+#: enforced with it: ruff then applies its BUILT-IN default rule set, which is
+#: wider than the nothing this model would otherwise infer and which drifts
+#: with the ruff version.  All eight pyprojects here declare `select`
+#: explicitly, so nothing in this tree reaches that refusal.
+_WIDENING_KEYS: tuple[str, ...] = ('extend-select',)
+
+
+def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
+    """Read *location*'s ruff config, or ``None`` when it declares none.
+
+    ``None`` covers two cases ruff itself treats identically: the file is not
+    there, and the file carries no ``[tool.ruff]`` section at all.  Ruff SKIPS
+    such a manifest and keeps looking upward, so a packaging-only
+    ``pyproject.toml`` must not shadow the config above it — stated in this
+    repository's own root ``pyproject.toml``.
+    """
+    try:
+        raw = tomllib.loads(location.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise InstrumentFailure(
+            f'{relative}: could not be read as TOML -- {type(exc).__name__}: {exc}'
+        ) from exc
+
+    tool = raw.get('tool')
+    ruff = tool.get('ruff') if isinstance(tool, dict) else None
+    if not isinstance(ruff, dict):
+        return None
+
+    lint = ruff.get('lint')
+    tables = [ruff] + ([lint] if isinstance(lint, dict) else [])
+    for table in tables:
+        for key in _WIDENING_KEYS:
+            if key in table:
+                raise InstrumentFailure(
+                    f'{relative}: [tool.ruff.lint] carries {key!r}, which this consumer '
+                    'model does not implement and which could WIDEN the selected rule '
+                    'set. Refusing to guess: under-reading the selected set would reject '
+                    'a marker ruff genuinely honours.'
+                )
+
+    declaring = next((table for table in reversed(tables) if 'select' in table), None)
+    if declaring is None:
+        raise InstrumentFailure(
+            f'{relative}: has a [tool.ruff] section but declares no `select`, so ruff '
+            "applies its BUILT-IN default rule set. This consumer model does not "
+            'implement those defaults — they are wider than the nothing it would '
+            'otherwise infer, and they drift with the ruff version. Declare `select` '
+            'explicitly, as all eight pyprojects in this repository do.'
+        )
+
+    return RuffConfig(
+        path=relative,
+        select=tuple(parse_rule_code(code) for code in declaring.get('select', ())),
+        ignore=tuple(parse_rule_code(code) for code in declaring.get('ignore', ())),
+    )
+
+
+class ConsumerModel:
+    """Resolves each site's consumer, reading the nearest ``pyproject.toml``.
+
+    STATEFUL FOR ONE REASON ONLY — the memo.  Resolution walks from a site's
+    directory up to the scan root, and a tree of 6,000 sites in 800 files would
+    otherwise re-read and re-parse the same eight manifests thousands of times.
+    The memo is keyed by DIRECTORY rather than by file, so one read serves every
+    file in a package, and it is private to one scan.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = Path(root)
+        self._by_directory: dict[Path, RuffConfig | None] = {}
+
+    def consumer_for(self, site: Site) -> Consumer:
+        """Who honours *site*'s marker — :attr:`Consumer.NONE` if nobody does."""
+        fixed = _KIND_CONSUMERS.get(site.kind)
+        if fixed is not None:
+            return fixed
+        if site.kind is not Kind.NOQA:
+            raise InstrumentFailure(
+                f'{site.path}:{site.line}: kind {site.kind.value!r} is in KIND_SPECS but '
+                'has no row in the consumer model, so this scanner cannot say whether '
+                'anything reads it. Add its row beside the others.'
+            )
+        return self._noqa_consumer(site)
+
+    def _noqa_consumer(self, site: Site) -> Consumer:
+        """Resolve a ``noqa`` site against the nearest config.
+
+        A CODELESS marker silences whatever ruff would have said, so it is
+        consumed exactly when ruff has something to say at all — and a config
+        selecting nothing therefore leaves it dead.
+
+        EVERY MARKER THIS MODULE MENTIONS IS MENTIONED IN A DOCSTRING, never in
+        a ``#`` comment, and that is a rule rather than a habit.  A ``#``
+        comment quoting one is a real marker: ruff parses it and warns
+        ``Invalid # noqa directive``, and this very scanner reads it as a site
+        in its own corpus.  A docstring is a STRING, which is precisely what
+        the token walk exists to tell apart.
+        """
+        config = self._nearest_config(Path(site.path).parent)
+        if config is None:
+            return Consumer.NONE
+        if not site.codes:
+            return Consumer.RUFF if config.select else Consumer.NONE
+        if any(config.consumes(parse_rule_code(code)) for code in site.codes):
+            return Consumer.RUFF
+        return Consumer.NONE
+
+    def _nearest_config(self, directory: Path) -> RuffConfig | None:
+        """The config governing *directory*, which is relative to the scan root.
+
+        The walk stops AT the root and never climbs out of the tree under
+        measurement; otherwise a scan of a fixture tree would silently read
+        this repository's own configuration and report a stranger's answer.
+        """
+        if directory in self._by_directory:
+            return self._by_directory[directory]
+        relative = str(directory / 'pyproject.toml') if str(directory) != '.' else 'pyproject.toml'
+        config = _ruff_config_at(self._root / relative, relative=relative)
+        if config is None and str(directory) != '.':
+            config = self._nearest_config(directory.parent)
+        self._by_directory[directory] = config
+        return config
