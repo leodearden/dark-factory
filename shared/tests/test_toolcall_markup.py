@@ -985,6 +985,16 @@ class TestQuotedReportIsRepairable:
     fix. It pins the dialect mirror of (a), which (a) does not reach. Keep the
     pair together — the gap existed precisely because one pairing was pinned
     and its mirror was not.
+
+    TASK **5620** ADDED THE OPENER-SIDE PAIR, (g) and (h), and the warning
+    above is why. 4502 reasoned about inner CLOSERS throughout — this class
+    included — so a well-formed sibling OPENER inside a recovered value was
+    admitted by omission: glued into that value while the parameter it named
+    was silently not recovered. (g) and (h) pin the canonical and name-echoing
+    openers respectively, so the controls now read as two mirrored pairs,
+    (a)/(d) on the closer side and (g)/(h) on the opener side. The pin below
+    that USED to assert a recovery was inverted in the same task; its docstring
+    carries the old reading and why it moved.
     """
 
     # escalate_info's eleven parameters, and the five the corrupted call
@@ -1287,6 +1297,41 @@ class TestQuotedReportIsRepairable:
             self._CLEAN
             + _CANONICAL_CLOSER + '\n'
             + _canonical_opener('evidence') + self._sibling_opener_tail(_canonical_opener)
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
+    def test_an_echo_dialect_sibling_opener_inside_a_value_is_refused(self):
+        """NEGATIVE CONTROL (h) — the DIALECT MIRROR of (g).
+
+        Identical to control (g) in every cell but one: the quoted
+        ``suggested_action`` opener is the name-echoing form rather than the
+        canonical one. That single cell gets its own control rather than a
+        parametrize for the reason the (a)/(d) pair already records, because it
+        is the same asymmetry: (a) pinned canonical-opener/echo-closer and (d)
+        had to be added for the opposite pairing, which (a) did not reach. The
+        gap (a) left was not hypothetical — esc-4502-3 was exactly a dialect
+        mirror left unpinned, and it recovered a corrupt ``agent_id`` carrying
+        the head of the NEXT tool call straight into a tool's arguments.
+
+        The dialects demonstrably BLEND rather than staying in their lanes —
+        ``_CLOSER_RE``'s stray-quote tolerance exists for a measured specimen
+        that interpolates between them — so which dialect a leaked call opens
+        with is not something the rule may assume. This class's own docstring
+        states the standing instruction: keep the pair together, because "the
+        gap existed precisely because one pairing was pinned and its mirror was
+        not". With (g) and (h) added, the four read as two mirrored pairs:
+        (a)/(d) on the closer side, (g)/(h) on the opener side.
+
+        The trailing ``xyz`` closer inside the sibling's text is kept for (g)'s
+        reason — so that ONLY the opener rule can refuse this, and the
+        ambiguity probe demonstrably cannot, from either position.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + self._sibling_opener_tail(_opener)
             + '\n' + INVOKE_CLOSER
         )
 
