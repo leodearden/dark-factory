@@ -510,7 +510,7 @@ class TestQuarantineMergeRr:
         assert b'src/second.py' in second.read_bytes()
 
     def test_a_name_claimed_between_choosing_and_moving_is_not_overwritten(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch,
     ) -> None:
         """The SEQUENTIAL counter does not make the docstring's promise true.
 
@@ -521,33 +521,33 @@ class TestQuarantineMergeRr:
         silently REPLACES its destination — so the second destroys the first
         backup while both report success.
 
-        The interleave is injected once, at the seam where it really happens:
-        between choosing a name and claiming it.  Sequential repeats are
-        already covered by the case above; what this adds is the concurrent
-        one, which no amount of counting can answer on its own.
+        The interleave is injected once, at the instant the race really turns:
+        the claim itself.  The wrapper puts another run's bytes at the
+        destination and then delegates to the REAL ``os.link``, so what is
+        exercised is the kernel's exclusivity rather than a simulation of it.
+        Sequential repeats are covered by the case above; what this adds is the
+        concurrent one, which no amount of counting can answer on its own.
         """
         git_dir = tmp_path / 'gitdir'
         _plant_merge_rr(git_dir, _record(_HEX, 'src/mine.py'))
-        real_choose = rebase_recovery._free_backup_path
+        theirs = b'the other run got here first\n'
+        real_link = os.link
         raced: list[Path] = []
 
-        def choose_then_lose_the_race(merge_rr_path: Path) -> Path:
-            chosen = real_choose(merge_rr_path)
-            if not raced:                      # one racing process, one loss
-                chosen.write_bytes(b'the other run got here first\n')
-                raced.append(chosen)
-            return chosen
+        def lose_the_race_once(src, dst, **kwargs):
+            if not raced and Path(src).name == 'MERGE_RR':
+                Path(dst).write_bytes(theirs)   # one racing run, one loss
+                raced.append(Path(dst))
+            return real_link(src, dst, **kwargs)
 
-        with patch.object(
-            rebase_recovery, '_free_backup_path',
-            side_effect=choose_then_lose_the_race,
-        ):
-            backup = rebase_recovery.quarantine_merge_rr(
-                rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
-            )
+        monkeypatch.setattr(os, 'link', lose_the_race_once)
+
+        backup = rebase_recovery.quarantine_merge_rr(
+            rebase_recovery.scan_merge_rr(git_dir=git_dir, common_dir=git_dir),
+        )
 
         assert raced, 'the fixture must actually have raced'
-        assert raced[0].read_bytes() == b'the other run got here first\n', (
+        assert raced[0].read_bytes() == theirs, (
             "the other run's evidence was overwritten"
         )
         assert backup is not None and backup != raced[0]
