@@ -1081,9 +1081,11 @@ def track_async_mock_coroutines() -> None:
     reference cycle survives to the drain.  ``deque.append`` is atomic, so a
     background thread calling an AsyncMock can never corrupt a drain in progress.
 
-    Fails loudly when ``AsyncMockMixin._execute_mock_call`` stops being the
-    coroutine function every AsyncMock call goes through: a silent no-op here
-    would hand the task-1714 order-dependent failures back to innocent tests.
+    A silent no-op here would hand the task-1714 order-dependent failures back
+    to innocent tests, so this refuses to start when ``_execute_mock_call`` is
+    no longer a coroutine function.  That AsyncMock calls still GO THROUGH it is
+    pinned by test_async_mock_coroutine_isolation.py, which plants an orphan and
+    requires the drain to find it without searching the heap.
     """
     create_coroutine = AsyncMockMixin._execute_mock_call
     if not inspect.iscoroutinefunction(create_coroutine):
@@ -1100,7 +1102,10 @@ def track_async_mock_coroutines() -> None:
         _created_mock_call_coroutines.append(weakref.ref(coroutine))
         return coroutine
 
-    AsyncMockMixin._execute_mock_call = inspect.markcoroutinefunction(create_tracked_coroutine)
+    # pyright reads this package as Python 3.11; markcoroutinefunction arrived in 3.12.
+    AsyncMockMixin._execute_mock_call = inspect.markcoroutinefunction(  # pyright: ignore[reportAttributeAccessIssue]
+        create_tracked_coroutine
+    )
 
 
 def drain_async_mock_coroutines() -> int:
@@ -1125,7 +1130,7 @@ def drain_async_mock_coroutines() -> int:
     Returns the number of coroutines closed.
     """
     closed = 0
-    while _created_mock_call_coroutines:
+    for _ in range(len(_created_mock_call_coroutines)):
         coroutine = _created_mock_call_coroutines.popleft()()
         if coroutine is not None and inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
             coroutine.close()
@@ -1137,7 +1142,6 @@ def drain_async_mock_coroutines() -> int:
             'AsyncMock calls in the preceding test',
             closed,
         )
-        gc.collect()
     return closed
 
 

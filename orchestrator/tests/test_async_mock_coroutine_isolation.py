@@ -7,9 +7,10 @@ Design decisions:
 - Tests are self-contained unit tests of the helper itself (not a cross-test
   polluter→victim pair), so they are deterministic under -n auto --dist loadgroup
   without requiring an xdist_group co-location tag.
-- The _count_open_mock_coros() probe and drain use the same selection predicate
-  (cr_code.co_name == "_execute_mock_call", state CORO_CREATED), so the test
-  is a direct behavioral assertion of the helper's correctness.
+- The _count_open_mock_coros() probe searches the heap for CORO_CREATED
+  ``_execute_mock_call`` coroutines; the drain finds them through the registry
+  ``track_async_mock_coroutines`` fills.  The two share no selection logic, so
+  the probe is an independent observation of what the drain left behind.
 """
 from __future__ import annotations
 
@@ -113,8 +114,8 @@ async def test_awaited_asyncmock_is_not_an_orphan():
 def test_product_coroutine_is_not_closed_by_drain():
     """drain_async_mock_coroutines() does NOT close product (non-mock) coroutines.
 
-    A genuine product async def has co_name == 'product_coro' (not
-    '_execute_mock_call'), so it must survive a drain call intact.  This is the
+    A genuine product async def is never registered by
+    ``track_async_mock_coroutines``, so it must survive a drain call intact.  This is the
     safety-net assertion: a forgotten `await` on product code must still trip
     filterwarnings=error and fail the test; drain must not silently swallow it.
     """
@@ -134,7 +135,7 @@ def test_product_coroutine_is_not_closed_by_drain():
         # The product coroutine must still be CORO_CREATED after the drain
         assert inspect.getcoroutinestate(coro) == inspect.CORO_CREATED, (
             'drain_async_mock_coroutines() must not close product coroutines '
-            '(co_name != "_execute_mock_call")'
+            '(only AsyncMock call coroutines are registered for draining)'
         )
     finally:
         # Close the coro explicitly here to avoid "was never awaited" warning
