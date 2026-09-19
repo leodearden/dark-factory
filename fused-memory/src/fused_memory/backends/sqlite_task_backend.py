@@ -1073,9 +1073,9 @@ def stamp_pending_since(
     non-string) is treated as ABSENT and re-stamped: the reader parses the
     value, so leaving one in place would pin the task at age 0 forever.
 
-    Fail-safe contract — NEVER raises and NEVER clobbers. A corrupt or
-    non-dict blob skips the stamp, emits one deduped WARNING, and lets the
-    status write proceed: before this key existed a corrupt blob could not
+    Fail-safe contract — NEVER raises and NEVER clobbers. A corrupt, non-dict
+    or non-string blob skips the stamp, emits one deduped WARNING, and lets
+    the status write proceed: before this key existed a corrupt blob could not
     block a status write at all (``set_task_status`` never touched the
     metadata column), and a stamping scheme that raised would mean one
     corrupt row could no longer be moved out of ``pending`` — a new wedge.
@@ -1117,8 +1117,12 @@ def stamp_pending_since(
         # makes "never cleared" structural rather than merely intended.
         return None
 
-    if not metadata_raw:
-        # NULL/empty metadata column is absence, not corruption.
+    if metadata_raw is None or metadata_raw == '':
+        # NULL/empty metadata column is absence, not corruption. Narrower than
+        # a falsiness test deliberately: an empty DICT is falsy but is not an
+        # absent column — it is a caller that bypassed the documented
+        # ``str | None`` signature, and answering one with a JSON *string*
+        # would silently change the value's type on the way to the INSERT.
         return json.dumps({'pending_since': now})
 
     # Parse ONCE, defensively — the `_row_to_task` idiom (one json.loads, one
@@ -1126,7 +1130,14 @@ def stamp_pending_since(
     # shapes parse_metadata would flag as 'unparseable_json'/'not_an_object'.
     try:
         old = json.loads(metadata_raw)
-    except ValueError:
+    except (TypeError, ValueError):
+        # TypeError is the non-str/bytes arm (measured: a dict raises "the JSON
+        # object must be str, bytes or bytearray"). Caught for the same reason
+        # :func:`_merge_metadata` and :func:`_files_for_key` catch it, and
+        # because ``add_task`` feeds this helper the return of
+        # :func:`strip_machine_authored_metadata` — which deliberately tolerates
+        # a dict and hands one straight back. Without this arm the "NEVER
+        # raises" contract above breaks exactly where the line before it holds.
         old = None
     if not isinstance(old, dict):
         resolution = 'skipped pending_since stamp — original bytes preserved'

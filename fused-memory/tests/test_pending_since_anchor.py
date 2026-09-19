@@ -19,6 +19,7 @@ Three layers, deliberately separated:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from datetime import datetime, timedelta
@@ -310,6 +311,50 @@ class TestStampPendingSinceTransitionTable:
             )
         assert result is None, f'must not rewrite a malformed blob; got {result!r}'
         assert raw_blob == original, 'input bytes must be left exactly as found'
+        malformed = [r for r in caplog.records if 'malformed metadata' in r.message]
+        assert len(malformed) == 1, (
+            f'expected exactly one deduped WARNING; got {[r.message for r in malformed]}'
+        )
+
+    @pytest.mark.parametrize(
+        ('raw_blob', 'task_id'),
+        (
+            ({}, 38170),
+            ({'pending_since': _ANCIENT}, 38171),
+            ([1, 2, 3], 38172),
+            (42, 38173),
+        ),
+    )
+    def test_a_non_string_blob_fails_safe_rather_than_raising(
+        self, raw_blob, task_id, caplog
+    ):
+        """The same fail-safe arm for a caller that bypassed ``str | None``.
+
+        ``add_task`` feeds this helper the return of
+        ``strip_machine_authored_metadata``, which deliberately ACCEPTS a dict
+        and hands one straight back, so the two neighbouring lines have to
+        agree on that posture — and they did not. ``json.loads`` raises
+        ``TypeError`` (not ``ValueError``) for a dict, which escaped the parse
+        guard into ``add_task``, where ``task_interceptor``'s legacy
+        ``except TypeError`` two-step would swallow it, retry with ``metadata``
+        dropped entirely and create the task with NO metadata and no error
+        surfaced — the silent fail-soft the design invariants forbid. An empty
+        dict was worse still: falsy, so it took the ABSENCE arm and was
+        quietly answered with a ``str``.
+        """
+        original = copy.deepcopy(raw_blob)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = stamp_pending_since(
+                raw_blob,  # type: ignore[arg-type]
+                old_status=None,
+                new_status=TaskStatus.PENDING,
+                now=_NOW,
+                project_root='/tmp/proj',
+                tag='master',
+                task_id=task_id,
+            )
+        assert result is None, f'must not answer a non-string blob; got {result!r}'
+        assert raw_blob == original, 'input must be left exactly as found'
         malformed = [r for r in caplog.records if 'malformed metadata' in r.message]
         assert len(malformed) == 1, (
             f'expected exactly one deduped WARNING; got {[r.message for r in malformed]}'
