@@ -62,9 +62,22 @@ RECOVERY_GIT = ('git', '-c', 'rerere.enabled=false')
 _PROBE_TIMEOUT_SECONDS = 10.0
 
 #: One MERGE_RR record: a conflict id and the path it belongs to.  The id is
-#: ``<40-hex>`` with an OPTIONAL rerere variant suffix ``.<N>``; the suffix is
-#: part of the rr-cache directory name, so the group must capture it.
-_RECORD = re.compile(rb'^([0-9a-f]{40}(?:\.\d+)?)\t(.+)$', re.DOTALL)
+#: hex with an OPTIONAL rerere variant suffix ``.<N>``; the suffix is part of
+#: the rr-cache directory name, so the group must capture it.
+#:
+#: 40 hex OR 64, and nothing between or beyond.  rerere hashes with the
+#: REPOSITORY's algorithm, so a ``--object-format=sha256`` repository writes
+#: 64 — measured on git 2.43.0, with a matching ``rr-cache/<64-hex>/``.  The
+#: orchestrator is documented as operating projects other than this one, so
+#: SHA-1 is not a safe assumption; against a 40-only grammar every record of
+#: such a repository is ``unparsable``, which makes the scan suspect and
+#: quarantines a HEALTHY MERGE_RR on every guarded abort.  The two widths are
+#: spelled as a pair rather than as ``{40,64}`` because the in-between lengths
+#: no git can produce are exactly the truncation the corruption arm must keep
+#: catching.
+_RECORD = re.compile(
+    rb'^([0-9a-f]{40}(?:[0-9a-f]{24})?(?:\.\d+)?)\t(.+)$', re.DOTALL,
+)
 
 
 @dataclass(frozen=True)

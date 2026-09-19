@@ -232,6 +232,54 @@ class TestParseMergeRr:
             b'e' * 40 + b'src/no-tab.py',
         )
 
+    def test_a_sha256_repository_id_is_a_record_not_corruption(self) -> None:
+        """rerere hashes with the REPOSITORY's algorithm, so 64 hex is legal.
+
+        MEASURED on git 2.43.0: ``git init --object-format=sha256`` plus a
+        conflicted rebase writes a 64-hex id with a matching
+        ``rr-cache/<64-hex>/`` directory.  Against a 40-only grammar every
+        record of such a repository lands in ``unparsable``, which makes the
+        scan SUSPECT, which quarantines a perfectly healthy MERGE_RR on every
+        guarded abort and verdicts the worktree ``repaired`` — or ``blocked``
+        under ``--report-only``, where a skill branching on the enum then
+        refuses to proceed on a healthy worktree.  Measured against the real
+        file before the widening: 0 records, 1 unparsable, suspect True.
+        """
+        data = _record(_HEX_SHA256, 'f.txt') + b'\x00'
+
+        parsed = rebase_recovery.parse_merge_rr(data)
+
+        assert [r.conflict_id for r in parsed.records] == [_HEX_SHA256]
+        assert parsed.unparsable == ()
+
+    def test_a_sha256_id_keeps_its_variant_suffix_too(self) -> None:
+        """The widening must not cost the variant suffix the 40-hex case pins."""
+        parsed = rebase_recovery.parse_merge_rr(
+            _record(f'{_HEX_SHA256}.1', 'f.txt') + b'\x00',
+        )
+
+        assert [r.conflict_id for r in parsed.records] == [f'{_HEX_SHA256}.1']
+
+    def test_widths_between_and_beyond_the_two_hash_algorithms_are_corruption(
+        self,
+    ) -> None:
+        """Only the two widths git can actually produce are records.
+
+        ``{40,64}`` would accept every length in between, which no git writes,
+        and would reclassify a truncated id as healthy — losing the corruption
+        arm the module deliberately treats as suspect.
+        """
+        data = (
+            _record('a' * 41) + b'\x00'
+            + _record('b' * 63) + b'\x00'
+            + _record('c' * 65) + b'\x00'
+        )
+
+        parsed = rebase_recovery.parse_merge_rr(data)
+
+        assert parsed.records == ()
+        assert len(parsed.unparsable) == 3
+
     def test_trailing_bytes_without_a_nul_are_not_dropped(self) -> None:
         """A truncated final record is evidence of damage, not something to skip."""
         parsed = rebase_recovery.parse_merge_rr(b'a' * 40 + b'\tsrc/one.py')
@@ -243,6 +291,12 @@ class TestParseMergeRr:
 # ---------------------------------------------------------------------------
 
 _HEX = 'd932b0e1e48d84453c25373f569e77581b8cc648'
+#: The conflict id git 2.43.0 writes for the same one-line conflict in a
+#: repository created with ``--object-format=sha256`` — measured, not
+#: constructed.  rerere hashes with the repository's algorithm, so an id is 40
+#: hex OR 64, and the orchestrator is documented as operating projects beyond
+#: this one.
+_HEX_SHA256 = 'a47652b46dc0309b3584fa863d414f52633f44a5b1f89c45d6b6ca378879d45a'
 
 
 def _plant_merge_rr(git_dir: Path, *records: bytes) -> None:
