@@ -49,6 +49,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import inline_suppressions
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'
@@ -345,3 +346,147 @@ def test_scan_source_yields_every_comment_not_only_the_suppressing_ones():
         (1, '# debt: task 5', 0),
         (2, '# noqa: E402', 1),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 — tracked-file enumeration, the byte prefilter, and the failure
+# polarity that makes an unreadable file loud instead of invisible.
+
+
+def test_only_tracked_files_are_scanned(tmp_path: Path):
+    """An untracked marker-bearing file is invisible.
+
+    ``git ls-files``, never a filesystem walk: a scratch copy, a gitignored
+    watcher artifact or a half-written module must not be able to turn the gate
+    red on nothing but local working-tree state.  The cost is stated rather
+    than hidden — a new file that has not been ``git add``ed is not scanned
+    either, and an author running this locally before staging gets a green
+    verdict on content the gate will see once it is staged.
+    """
+    _write_fixture_tree(tmp_path, {'tracked.py': 'a = 1  # noqa: E402\n'})
+    (tmp_path / 'untracked.py').write_text('b = 2  # noqa: F401\n', encoding='utf-8')
+
+    scan = inline_suppressions.scan_tree(tmp_path)
+
+    assert [site.path for site in scan.sites] == ['tracked.py']
+
+
+def test_scan_counts_the_files_it_enumerated_and_the_files_it_tokenized(tmp_path: Path):
+    """THE COUNTED WORK THE ≤10 s BUDGET RESTS ON.
+
+    The prefilter is the whole reason the scan fits the budget, and the only
+    honest way to assert it on a loaded box is to count files rather than
+    seconds — see the module docstring.  A file with no marker byte substring
+    is ENUMERATED and not TOKENIZED.
+    """
+    _write_fixture_tree(
+        tmp_path,
+        {
+            'marked.py': 'a = 1  # noqa: E402\n',
+            'plain.py': 'b = 2\nc = 3\n',
+            'also_plain.py': '"""Just a docstring."""\n',
+        },
+    )
+
+    scan = inline_suppressions.scan_tree(tmp_path)
+
+    assert scan.files_enumerated == 3
+    assert scan.files_tokenized == 1
+
+
+def test_a_tracked_file_that_cannot_be_tokenized_is_an_instrument_failure(tmp_path: Path):
+    """BOUNDARY SCENARIO 8 — never skipped, and never a violation.
+
+    A file the scanner cannot read is not evidence about that file's
+    suppressions; it is evidence that the instrument is broken.  Skipping it
+    would make the count read LOW, which is the direction that reports a breach
+    as a clean tree (INV-11 ``no-silent-fail-soft``).  Exit 2, and the message
+    names the file so the operator knows which one to open.
+    """
+    _write_fixture_tree(tmp_path, {'broken.py': 'value = (  # noqa: E402\n'})
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        inline_suppressions.scan_tree(tmp_path)
+
+    assert 'broken.py' in str(caught.value)
+
+
+def test_a_tracked_file_with_broken_indentation_is_an_instrument_failure(tmp_path: Path):
+    """The trio is ``(TokenError, IndentationError, SyntaxError)``, not
+    ``TokenError`` alone — a file with broken indentation raises the second and
+    would otherwise escape as a bare traceback."""
+    _write_fixture_tree(
+        tmp_path, {'bad_indent.py': 'if True:\n  a = 1  # noqa: E402\n      b = 2\n'}
+    )
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        inline_suppressions.scan_tree(tmp_path)
+
+    assert 'bad_indent.py' in str(caught.value)
+
+
+def test_a_tracked_file_that_is_not_utf8_is_an_instrument_failure(tmp_path: Path):
+    """Decoding is its own step with its own catch, ahead of tokenize."""
+    _write_fixture_tree(tmp_path, {'placeholder.py': 'a = 1\n'})
+    (tmp_path / 'undecodable.py').write_bytes(b'a = 1  # noqa: E402\nb = "\xff\xfe"\n')
+    _run_git(['add', '-A', '-f'], cwd=tmp_path)
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        inline_suppressions.scan_tree(tmp_path)
+
+    assert 'undecodable.py' in str(caught.value)
+
+
+def test_a_broken_file_with_no_marker_substring_is_never_read(tmp_path: Path):
+    """The prefilter's REACH, stated rather than discovered later.
+
+    A file carrying no marker byte substring cannot hold a suppression, so it
+    is never decoded and never tokenized — and therefore a syntactically broken
+    one is not an instrument failure either.  That is honest: this scanner
+    never claimed to parse the tree, only to find its markers, and the bytes it
+    did read prove there is nothing here to find.
+    """
+    _write_fixture_tree(tmp_path, {'broken.py': 'value = (\n'})
+
+    scan = inline_suppressions.scan_tree(tmp_path)
+
+    assert scan.files_enumerated == 1
+    assert scan.files_tokenized == 0
+    assert scan.sites == ()
+
+
+def test_enumeration_refuses_rather_than_returning_an_empty_corpus(tmp_path: Path):
+    """An empty corpus and a clean corpus are INDISTINGUISHABLE downstream.
+
+    Only one of them is good news, so a failed ``git ls-files`` raises instead
+    of degrading to ``[]`` — the argument
+    ``scripts/audit_manifest_descriptor_drift.py::ManifestDiscoveryUnavailable``
+    makes, and it is sharper here because an empty scan would seed or tighten a
+    baseline to nothing and silently open the gate.
+    """
+    not_a_repo = tmp_path / 'loose'
+    not_a_repo.mkdir()
+
+    with pytest.raises(inline_suppressions.InstrumentFailure):
+        inline_suppressions.scan_tree(not_a_repo)
+
+
+def test_enumeration_refuses_when_git_cannot_be_run_at_all(tmp_path: Path, monkeypatch):
+    """A missing ``git`` is an OSError, not a non-zero return — a refusal that
+    only checked the return code would let this one through as a clean scan."""
+    _write_fixture_tree(tmp_path, {'a.py': 'x = 1  # noqa: E402\n'})
+    monkeypatch.setenv('PATH', str(tmp_path / 'empty-bin'))
+
+    with pytest.raises(inline_suppressions.InstrumentFailure):
+        inline_suppressions.scan_tree(tmp_path)
+
+
+def test_a_tracked_path_whose_worktree_file_is_gone_is_passed_over(tmp_path: Path):
+    """``git ls-files`` reads the INDEX, so it lists a file deleted from the
+    worktree.  That is an ordinary mid-edit state, not a broken instrument."""
+    _write_fixture_tree(tmp_path, {'kept.py': 'a = 1  # noqa: E402\n', 'gone.py': 'b = 2\n'})
+    (tmp_path / 'gone.py').unlink()
+
+    scan = inline_suppressions.scan_tree(tmp_path)
+
+    assert [site.path for site in scan.sites] == ['kept.py']
