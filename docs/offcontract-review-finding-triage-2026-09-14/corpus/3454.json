@@ -1,0 +1,49 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-08-01T22:09:51.738789+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "medium",
+        "category": "correctness",
+        "file": "shared/tests/test_cli_invoke_integration.py",
+        "line": 159,
+        "title": "Documented-but-unfixed capacity marker gap makes the key probe fail misleadingly",
+        "description": "The new docstring records a KNOWN MISLEADING FAILURE: when account B is capped the CLI answers with \"You've hit your weekly limit \u00b7 resets Aug 5, 11am\", which `_CAPACITY_FAILURE_MARKERS` does not match (confirmed \u2014 the list holds \"you've hit your usage\", \"usage limit\", \"rate limit\", none of which are substrings of that text). So the test does not skip; it fails the ZEPPELIN assertion with a cap message as the \"output\", indistinguishable at a glance from genuine context loss. The rationale given for leaving it \u2014 \"the marker list is intentionally left alone here; it is owned by the task that narrowed it\" \u2014 does not hold for this list: that same helper's own docstring states it is a **local** list deliberately NOT imported from `shared.usage_gate`, so adding a marker has zero blast radius outside this test module. This matters more after this diff, not less, because the docstring now advertises `-m integration` and names this test as the thing that would settle the open question. Suggest adding `'weekly limit'` (and `'session limit'`) to `_CAPACITY_FAILURE_MARKERS`; both are unambiguous capacity signals and neither risks the false-positive-skip the conservative-bias comment guards against.",
+        "suggestion": "Add 'weekly limit' and 'session limit' to _CAPACITY_FAILURE_MARKERS, and replace the KNOWN MISLEADING FAILURE paragraph with a one-line note that capped-account runs now skip."
+      },
+      {
+        "severity": "low",
+        "category": "correctness",
+        "file": "shared/src/shared/cli_invoke.py",
+        "line": 1493,
+        "title": "Reachability guard is existence-only; a contentless transcript still resumes",
+        "description": "`transcript_exists` only asks whether the file is on disk. The prose above it justifies the guard as preventing a resume into an \"effectively EMPTY session\", but the empty-file case is exactly the one the guard lets through: the measurement note itself records that a capped account still gets its cap message appended as a transcript record, so a turn-1 cap can produce a present-but-workless transcript that passes the check. The same module already exposes `count_transcript_turns` for precisely this question, and the timeout path uses it (cli_invoke.py:2397). This is a narrowing, not a bug \u2014 the resumed session at least still contains the original prompt \u2014 but the guard is weaker than the comment claims, and the mismatch between claim and check is the kind of thing that misleads the next reader.",
+        "suggestion": "Either tighten to a turns-based check via count_transcript_turns, or narrow the comment to state that only the file-absent case is vetoed."
+      },
+      {
+        "severity": "low",
+        "category": "maintainability",
+        "file": "shared/src/shared/cli_invoke.py",
+        "line": 1402,
+        "title": "~60-line inconclusive measurement journal embedded in the cap-hit branch",
+        "description": "The block records a specific CLI build (2.1.220), two run session UUIDs, per-account cap reset dates (Aug 5 / Aug 6, 2026), a VERDICT of INCONCLUSIVE, and a WHAT WOULD SETTLE IT section. This repo does favour heavy inline rationale, but the durable part here is short \u2014 'sessions are local JSONL, so reachability not OAuth identity governs resume; the loop reuses one config_dir on purpose' \u2014 and the rest is experiment provenance that is already stale-dated by construction (the account cap dates are meaningless after Aug 6). Sitting inside a hot retry branch it will rot in place and no future reader can tell which sentences still hold.",
+        "suggestion": "Keep the MECHANISM paragraph and the config_dir-reuse invariant inline; move RUNS / VERDICT / WHAT WOULD SETTLE IT to the task 3454 record or a plans/ note with a one-line pointer."
+      },
+      {
+        "severity": "low",
+        "category": "test-coverage",
+        "file": "shared/tests/test_cap_retry.py",
+        "line": 886,
+        "title": "One of the four reason-strings has no log-wording test",
+        "description": "The delivered feature is 'the cap-hit log names the reason', and three of the four variants get a dedicated wording assertion ('transcript present', 'no session_id', 'transcript unreachable'). The fourth \u2014 'resuming (transcript unchecked \u2014 no config dir)' \u2014 is the one whose whole point is not making a false claim in the log, yet `test_no_config_dir_resumes_unconditionally` asserts only the resume kwargs, not the message. A future edit could collapse it back to the unqualified 'resuming' with the suite still green.",
+        "suggestion": "Add a caplog assertion for 'transcript unchecked' to test_no_config_dir_resumes_unconditionally."
+      }
+    ],
+    "summary": "The core change is sound and I verified it: the cap-hit resume branch now vetoes a resume whose transcript is provably absent under a known `config_dir`, falling back to a fresh retry with a rebuilt prompt. It correctly reuses the existing `transcript_exists` helper (already the orchestrator's own `no_transcript` guard at harness.py:2885), scopes the veto narrowly to `config_dir is not None` so the ambient-CLAUDE_CONFIG_DIR callers (recon agent_loop, task_curator, taggers, review_checkpoint \u2014 none of which pass `config_dir`) are byte-identical to before, and keeps the `resuming`/`fresh` log prefix first so existing greps still match. I grepped for consumers of the old `resume_or_fresh` wording and found none outside the module. `uv run pytest tests/test_cap_retry.py` is 134/134 green, including the 7 new tests, and the new integration-module claim that `addopts = \"-m 'not integration'\"` deselects it is accurate (shared/pyproject.toml:48). Findings are all non-blocking: one actionable correctness gap the diff documents rather than fixes (the test-local capacity-marker list still misses \"weekly limit\", so the very probe this task hinges on fails misleadingly when account B is capped), plus three maintainability/coverage nits."
+  }
+}

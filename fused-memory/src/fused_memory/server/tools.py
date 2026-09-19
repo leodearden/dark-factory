@@ -88,6 +88,7 @@ from fused_memory.server.consolidation import (
     build_consolidation_result,
     validate_consolidate_args,
 )
+from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.entity_mint_authz import (
     resolve_entity_mint_authorization,
     validate_mint_name,
@@ -2970,6 +2971,14 @@ def create_mcp_server(
         metadata: dict | None = None,
         temporal_context: str | None = None,
         reference_time: str | None = None,
+        # `Any`, not `list[dict] | None`, on purpose — see the identical note
+        # at `add_memory` below and `entities_gate`'s module docstring: a
+        # narrower annotation would let pydantic reject the two commonest
+        # mistakes (a bare string, a single un-wrapped dict) BEFORE the gate
+        # runs, with a raw ToolError carrying no remediation. Same precedent as
+        # `get_tasks(statuses: Any = None)`, which is `Any` for this exact
+        # reason.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
@@ -3006,6 +3015,16 @@ def create_mcp_server(
         :mod:`fused_memory.services.completion_claim_gate` for why the fail
         direction is inverted there.
 
+        Optionally DECLARE what the episode is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct prose that names a task ambiguously or not at all. A
+        declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the episode is not
+        ingested — the block names both what you declared and what the content
+        actually cites. Only a conflict is ever rejected: omitting `entities`,
+        or passing [] to record that you considered referents and none applied,
+        always succeeds.
+
         Args:
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
@@ -3029,6 +3048,29 @@ def create_mcp_server(
                 time instead of the date the described state was current).
                 Complements temporal_context='retrospective': temporal_context marks
                 the *kind* of episode; reference_time sets the *timestamp*.
+            entities: Optional explicit declaration of WHICH referents this
+                episode is about. TRI-STATE: omit it (or None) to say you never
+                considered referents and let the content scan derive them; pass
+                [] to say you DID consider them and none apply; pass a list to
+                declare them. Each entry is
+                {'kind': 'task', 'id': <digits>, 'project_id': <optional>} —
+                'kind' and 'project_id' are optional and default to 'task' and
+                the local project; 'id' is the task number's digits (an int, or
+                a string of ASCII digits), never a label like "Task 3127". This
+                is NOT "all entities": extraction legitimately derives entities
+                no caller could predict, and this parameter names only the
+                referents the episode is ABOUT. A declaration the content
+                contradicts is REJECTED
+                (error_type=DeclaredReferentConflictRejected) and nothing is
+                ingested. ANY wrong shape — a bare string, a single un-wrapped
+                dict, a bad entry inside the list — is rejected as a
+                ValidationError whose message carries the accepted entry shape,
+                so you never have to guess the remedy. Absence is never
+                rejected, so omitting this always succeeds.
+                One asymmetry against add_memory, and it is a tier below this
+                parameter: add_episode persists no metadata, so there is no
+                metadata['task_id'] fallback here — a declaration overrides
+                only the derived content scan.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3062,6 +3104,25 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 3669 / PRD leaf delta: reject a declaration the content
+        # contradicts. Grouped with the structural argument validations above
+        # deliberately — everything BELOW this line does live authority I/O
+        # (the 2824 premature-completion gate reads task statuses,
+        # _completion_claim_gate reads statuses / tickets / git), and a
+        # self-contradictory or malformed declaration should cost none of it.
+        # This gate is a pure in-memory scan and, for the undeclared majority,
+        # not even that: `entities is None` short-circuits before scanning.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        if err := entities_gate(
+            entities, content=content, group_id=project_id, agent_id=agent_id,
+        ):
+            return err
         # task 2022: auto-upgrade the batch-queue / decompose-and-queue plan-episode
         # shape to temporal_context='planning' so its Graphiti-extracted completion
         # edges are registered as planned (excluded from default search) instead of
@@ -3185,6 +3246,13 @@ def create_mcp_server(
             causation_id=causation_id,
             temporal_context=temporal_context,
             reference_time=parsed_reference_time,
+            # Forwarded VERBATIM, unparsed: `entities_gate` above has already
+            # proved this list parses, and the service is the single site that
+            # resolves and encodes it onto the durable-queue payload. Parsing
+            # twice would fork what `declared` means between the boundary and
+            # the producer. Unlike add_memory, this tool has exactly ONE
+            # service call site, so there is no fallback path to keep in step.
+            declared_referents=entities,
             _source=op_source,
             **extra,
         )
@@ -3203,6 +3271,21 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
+        # `Any`, not `list[dict] | None`, on purpose. This parameter's whole
+        # error surface is `entities_gate`, whose rejection folds gamma's
+        # `_DECLARED_REFERENT_HINT` — the accepted entry shape AND the
+        # remediation — into one structured house-shape block. A narrower
+        # annotation hands the shape check to pydantic, which runs BEFORE this
+        # body and answers a bare `'task 3127'` or a single un-wrapped
+        # `{'kind': ..., 'id': ...}` — precisely the two mistakes an agent is
+        # likeliest to make — with a raw ToolError carrying no hint at all, so
+        # the remediation reaches an agent or not depending on WHICH way it got
+        # the shape wrong. `Any` makes every wrong shape reach the one gate and
+        # get the one answer. Precedent: `get_tasks(statuses: Any = None)`,
+        # widened for the same reason (a bare string there is rejected in the
+        # body, not by pydantic). The accepted shape stays documented in the
+        # Args block below, which is what an agent actually reads.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a classified memory directly. Skips the extraction pipeline.
@@ -3260,9 +3343,10 @@ def create_mcp_server(
         DETECTS that your write contradicts the memory it names, it does not
         adjudicate which of the two is right. Your full text is stored and
         readable in the canonical's grouped document (amendment text is
-        digested there; sighting text is only counted), the flag is picked up
-        by the existing gate machinery, and the memory you contradict is left
-        untouched for a human to settle. Getting a ``contested`` ack is not a
+        digested there; sighting text is only counted) and marked as
+        contesting it, and the memory you contradict is left untouched. No
+        adjudication is scheduled and nothing is escalated: the flag is a
+        marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
         rejection and needs no action from you — but it is the ack worth
         reading, because it says the corpus now holds two claims that cannot
         both be true.
@@ -3274,6 +3358,30 @@ def create_mcp_server(
         sets ``parent_id`` or ``kind`` — the two keys an attach would
         overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
+
+        Optionally DECLARE what the memory is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct a body whose prose names a task ambiguously or not at
+        all. A declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the write does not
+        happen — the block names both what you declared and what the content
+        actually cites. Only a conflict is ever rejected: omitting `entities`,
+        or passing [] to record that you considered referents and none applied,
+        always succeeds.
+
+        Two halves of that, and they have DIFFERENT scopes — the rejection is
+        universal, the recording is not. Every add_memory call is checked for a
+        declared/prose conflict, whatever its category. But a declaration is
+        RECORDED only on a write that reaches Graphiti — an
+        entities_and_relations, temporal_facts or decisions_and_rationale
+        category, or dual_write=True. On a Mem0-primary write
+        (procedural_knowledge, preferences_and_norms,
+        observations_and_summaries) the referent set has nowhere to live: your
+        `entities` is validated against the content and then discarded, and
+        nothing downstream can tell it apart from a call that omitted the
+        parameter. So on those three categories `entities` buys you the
+        typo-catch and nothing else — which is still worth having, but do not
+        expect it to steer retrieval.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
@@ -3309,6 +3417,30 @@ def create_mcp_server(
                       Both flags are write-time-only and are stripped before
                       persistence — neither is ever stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
+            entities: Optional explicit declaration of WHICH referents this
+                      memory is about. TRI-STATE: omit it (or None) to say you
+                      never considered referents and let the content scan derive
+                      them; pass [] to say you DID consider them and none apply;
+                      pass a list to declare them. Each entry is
+                      {'kind': 'task', 'id': <digits>, 'project_id': <optional>}
+                      — 'kind' and 'project_id' are optional and default to
+                      'task' and the local project; 'id' is the task number's
+                      digits (an int, or a string of ASCII digits), never a
+                      label like "Task 3127". This is NOT "all entities": the
+                      extraction pipeline legitimately derives entities no caller
+                      could predict, and this parameter names only the referents
+                      the memory is ABOUT. A declaration the content contradicts
+                      is REJECTED (error_type=DeclaredReferentConflictRejected)
+                      and nothing is written. ANY wrong shape — a bare string,
+                      a single un-wrapped dict, a bad entry inside the list — is
+                      rejected as a ValidationError whose message carries the
+                      accepted entry shape, so you never have to guess the
+                      remedy. Absence is never rejected, so omitting this
+                      parameter always succeeds. RECORDED only on a write that
+                      reaches Graphiti (a GRAPHITI_PRIMARY category, or
+                      dual_write=True); on a Mem0-primary category it is
+                      checked for a conflict and then discarded — see the
+                      scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3328,6 +3460,24 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 3669 / PRD leaf delta: reject a declaration the content itself
+        # contradicts. Grouped with the structural argument validations above
+        # and deliberately ahead of EVERY I/O-bearing gate below — the
+        # `_premature_completion_block` live task-status lookup, write triage's
+        # judge call and the near-duplicate embedding round trip. This gate is
+        # a pure in-memory scan; a structurally invalid or self-contradictory
+        # declaration should cost none of them.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        if err := entities_gate(
+            entities, content=content, group_id=project_id, agent_id=agent_id,
+        ):
+            return err
         # MCP-markup rejection no longer happens here: task 4458 retired this
         # tool body's in-line gate in favour of the ONE boundary guard
         # (fused_memory.server.markup_guard), which runs before this function is
@@ -3696,9 +3846,16 @@ def create_mcp_server(
                 # flagged in a way nothing reads.
                 #
                 # Triage DETECTS the contradiction; it does not adjudicate it
-                # (D3). The flag is a marker for the existing gate machinery
-                # and a human, and the canonical it contradicts is left
-                # exactly as it was.
+                # (D3). What the flag actually does, measured rather than
+                # assumed: the only consumer of CONTESTED_METADATA_KEY /
+                # is_contested_child is grouped_read's READ-SIDE suppression,
+                # which keeps the submitted text visible and digested in the
+                # canonical's grouped document while marking it as contesting.
+                # There is no gate, no escalation and no operator surface --
+                # reconciliation/consolidation_gate.py keys on a DIFFERENT
+                # metadata key (x_recon_consolidation_gate) and never reads
+                # this one. The canonical it contradicts is left exactly as it
+                # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
@@ -3711,6 +3868,12 @@ def create_mcp_server(
                 dual_write=dual_write,
                 causation_id=causation_id,
                 _source=source,
+                # Forwarded VERBATIM, unparsed: `entities_gate` above has
+                # already proved this list parses (a malformed one cannot reach
+                # here), and `MemoryService` is the single site that resolves
+                # and encodes it. Parsing twice would fork what `declared` means
+                # between this boundary and the producer.
+                declared_referents=entities,
             )
         except Exception:
             if attached_to is None:
@@ -3744,6 +3907,13 @@ def create_mcp_server(
                 dual_write=dual_write,
                 causation_id=causation_id,
                 _source=source,
+                # KEPT, unlike the failed parent link this fallback deliberately
+                # drops — and for the same reason it keeps the full content: the
+                # retry is meant to reproduce the exact pre-triage outcome. A
+                # silently downgraded referent source is content loss in the
+                # telemetry dimension: the write would land stamped `derived`
+                # while the agent believes it declared, and nothing would say so.
+                declared_referents=entities,
             )
         if attached_to is not None and not attach_write_landed(result):
             # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
@@ -7351,6 +7521,21 @@ def create_mcp_server(
 
         * The top-level ``counts`` are the DURABLE WRITE queue — a separate
           subsystem that stays ~0 in steady state.
+        * ``dead_by_operation`` breaks that queue's ``dead`` count down by
+          operation name (always present; ``{}`` when nothing is dead, so you
+          never have to tell "no deaths" from "an older server"). A nonzero
+          entry means writes of that operation have been PERMANENTLY abandoned
+          after their caller was told they were accepted — which operation is
+          dying is the first thing triage needs, and ``counts['dead']`` alone
+          cannot say. This is the health-probe CONFIRMATION; the matching PUSH
+          signal is the ``durable_write_dead_letter`` escalation, which
+          survives cleanup. This counter reads the LIVE queue table, so it
+          returns to zero once ``delete_dead_letters`` sweeps the rows.
+          A ``project_id``-scoped call covers only that project's GRAPHITI
+          group: its Mem0 deaths (``mem0_classify_and_add``) sit in group
+          ``mem0_<project_id>``, so pass THAT as the ``project_id``, or call
+          unscoped, to see them. An alarm naming an operation the scoped
+          probe reports nothing for is that gap, not a contradiction.
         * ``reconciliation_backlog`` (present only when a ``project_id`` is
           supplied and a backlog policy is wired) is the reconciliation EVENT
           backlog = buffered events + event-queue depth + in-flight retries.
@@ -9341,7 +9526,13 @@ def create_mcp_server(
         Prefer structured fields (``title``, ``description``, ``details``,
         ``priority``, ``status``, ``dependencies``) — agents already have
         the full context needed to set them directly. Each non-None field
-        overwrites the corresponding column.
+        overwrites the corresponding column; only ``details``/``prompt``
+        can APPEND, and only when ``append=True``. ``title``,
+        ``description`` and ``priority`` are REPLACE-ONLY, so combining any
+        of them with ``append=True`` is REJECTED rather than silently
+        overwriting what is already there (task 4039) — to EXTEND one of
+        them, ``get_task`` first, concatenate locally, and send back the
+        COMPLETE new value with ``append`` omitted.
 
         ``prompt`` is legacy: it routes through the LLM-driven Taskmaster
         path which can drift on re-rewrite. It will be removed once the
@@ -9392,11 +9583,26 @@ def create_mcp_server(
                 affect the details path, so callers that need details-append
                 must still pass ``append=True``; a bare ``append=False`` with NO
                 metadata is still fine (a details-only replace is not rejected).
+                Aiming ``append=True`` at a column that CANNOT append —
+                ``title``/``description``/``priority`` — is **rejected** by the
+                backend (single-sourced, same as the task-2180 guard above) and
+                surfaces as ``error_type='AppendUnsupportedFieldError'`` naming
+                the offending field(s). It used to be accepted silently and
+                OVERWRITE the column, destroying authored prose in four
+                recorded live repros (task 4039).
             tag: Tag context (optional)
-            title: New title (overwrites)
-            description: New description (overwrites)
+            title: REPLACE-ONLY. New title (overwrites). Passing it together
+                with ``append=True`` is REJECTED — see ``append`` above.
+            description: REPLACE-ONLY. New description (overwrites — it does
+                NOT append, and never has). Passing it together with
+                ``append=True`` is REJECTED (task 4039). To EXTEND a
+                description: ``get_task`` to read the current text,
+                concatenate locally, then resend the COMPLETE new description
+                with ``append`` omitted.
             details: New details (overwrites, or appends when ``append=True``)
-            priority: New priority (e.g. "high"/"medium"/"low")
+            priority: REPLACE-ONLY. New priority (e.g. "high"/"medium"/"low").
+                Passing it together with ``append=True`` is REJECTED — see
+                ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
             dependencies: Replacement list of dependency task ids (top-level only)
             agent_id: Which agent is writing (optional, auto-derived from MCP

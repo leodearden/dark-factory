@@ -649,9 +649,8 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 # Two consumers, both of which benefit — kept as ONE constant deliberately, a
 # parallel undecorated-only pattern would recreate the very
 # two-places-that-must-stay-in-sync drift task 4066 exists to fix:
-#   * _is_bare_xdist_worker_crash's no-FAILED-lines fallback, where a wider
-#     match strictly INCREASES strictness (it can only flip True -> False,
-#     never mask more).
+#   * _is_bare_xdist_worker_crash's veto set, where a wider match strictly
+#     INCREASES strictness (it can only flip True -> False, never mask more).
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
 #     match.
@@ -679,84 +678,27 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 )
 
 
-# Small, ENUMERATED allow-list of known load-induced test flakes (esc-2496-3),
-# grounded in the same config.yaml task-2361 worker-kill-catalog reasoning as
-# _XDIST_WORKER_CRASH_RE above: under host CPU oversubscription, a bare
-# second-worker hard-crash ([gwN] node down) can co-occur with an unrelated,
-# already-known load-induced flake in a DIFFERENT test — one whose ``FAILED``
-# line would otherwise defeat _is_bare_xdist_worker_crash's veto below and
-# misroute a code-complete task to the debugger instead of the bounded infra
-# retry (task 2496). Kept to a single entry today — the PGID-liveness race in
-# test_verify_merge_cancel_end_to_end — to minimize the accepted fail-safe
-# tradeoff documented on _is_bare_xdist_worker_crash below.
-#
-# Patterns are anchored on the full repo-relative node-id path (not just the
-# bare filename) since pytest is invoked with cwd=config.project_root and the
-# orchestrator verifies multiple projects — a bare ``test_cli.py::...`` match
-# would also discount a same-named test living anywhere else, including in an
-# unrelated project's own test suite. Future entries should follow the same
-# repo-path-anchored convention.
-_KNOWN_LOAD_FLAKE_NODEID_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r'(?:^|/)orchestrator/tests/test_cli\.py::test_verify_merge_cancel_end_to_end\b'),
-)
-
-
-def _is_known_load_flake_nodeid(nodeid: str) -> bool:
-    """Return True iff *nodeid* matches an enumerated known load-flake test."""
-    return any(rx.search(nodeid) for rx in _KNOWN_LOAD_FLAKE_NODEID_RES)
-
-
 def _is_bare_xdist_worker_crash(output: str) -> bool:
     """Return True when *output* is a bare xdist worker crash with no real failure.
 
     A hard ``os._exit()`` worker kill (task 2361) produces no assertion
-    traceback, so the presence of a genuine pytest failure marker normally
-    indicates a real failure occurred alongside the crash. However, under
-    host CPU oversubscription a bare crash can co-occur with an unrelated,
-    already-known load-induced test flake (esc-2496-3) whose own ``^FAILED
-    `` line would otherwise defeat this discriminator and misroute a
-    code-complete task to the debugger (task 2496).
+    traceback, so ANY genuine pytest failure surface alongside the crash
+    signature means a real failure occurred and this returns ``False`` —
+    never mask a real failure. The surfaces are one flat veto set: a
+    ``^FAILED `` line, an ``^E   `` traceback line, a failure summary, an
+    ``INTERNALERROR>`` line, or either ``ERROR`` short-summary form (node-id
+    or bare-file).
 
-    To stay strict while accommodating that case: once the crash signature
-    is present, every ``^FAILED `` line is inspected individually. If ANY
-    names a test that is not on the narrow, enumerated
-    ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list (or has no extractable
-    node-id), this returns ``False`` — never mask a real failure. A
-    co-occurring ``INTERNALERROR>`` line or ``ERROR`` short-summary line
-    (a fixture/setup error or a whole-module collection failure) is
-    likewise never attributable to a known FAILED-line flake, so either one
-    also forces ``False`` even when every FAILED line is allow-listed —
-    those failure surfaces produce no FAILED line of their own, so the
-    per-FAILED-line check alone would never see them. Only when there is at
-    least one ``FAILED`` line, every one of them is an allow-listed known
-    flake, AND no such ERROR/INTERNALERROR surface is present, are the
-    accompanying ``^E   `` traceback lines and ``=== N failed ===`` summary
-    treated as attributable to those flakes and this returns ``True``. When
-    there are NO ``FAILED`` lines at all, the fallback vetoes on the SAME
-    set of surfaces as the branch above — an ``^E   `` traceback line, a
-    failure summary, an ``INTERNALERROR>`` line, or either ``ERROR``
-    short-summary form (node-id or bare-file) — any one of which suppresses
-    reclassification.
+    The set is flat on purpose. It used to be two branches keyed on whether
+    a ``FAILED`` line was present, and they drifted (task 4066): verify-log
+    2829 — 8 genuine failures, 47 ``^INTERNALERROR>`` lines, and zero
+    ``^FAILED ``/``^E   `` lines because the INTERNALERROR aborted the
+    session before pytest printed its short summary — was reclassified as
+    transient infra by the branch that lacked the INTERNALERROR veto.
 
-    That last sentence used to name only the first two (task 4066): the two
-    branches had drifted apart, since tasks 3514/3597 added the
-    INTERNALERROR/ERROR veto to the FAILED-lines branch alone. verify-log
-    2829 is the real captured run that billed for the drift — 8 genuine
-    failures, 47 ``^INTERNALERROR>`` lines, and (because the INTERNALERROR
-    aborted the session before pytest could print its short-summary and
-    decorated stats lines) zero ``^FAILED `` lines and zero ``^E   ``
-    lines, which the old fallback reclassified as transient infra.
-
-    Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
-    known-flake test, co-occurring with a crash, is discounted here and
-    goes to the bounded infra-retry; if it recurs (a real regression
-    doesn't self-heal, unlike a load flake) the retry window is exhausted
-    and it lands in infra_hold + escalate_to_human instead of the debugger
-    — a human sees it, nothing is silently greened.
-
-    Second accepted tradeoff, in the OPPOSITE direction, deliberately
-    taken by task 4066: the ``INTERNALERROR>`` veto keys on a surface the
-    worker crash can itself PRODUCE. Under ``--max-worker-restart=0`` a
+    Accepted tradeoff, deliberately taken by task 4066: the
+    ``INTERNALERROR>`` veto keys on a surface the worker crash can itself
+    PRODUCE. Under ``--max-worker-restart=0`` a
     node-down can trip xdist's own scheduler — verify-log 2829's is
     ``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``,
     an artefact of the node-down handling, not of any test. So a truly
@@ -775,10 +717,11 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     ``test_crash_induced_loadscope_internalerror_is_false_by_design``
     pins this verdict so a future reader knows it is a decision.
 
-    The opposite-direction case — an UNLISTED co-occurring load flake that
-    defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
-    by broadening the allow-list; see ``_main_probe_failure_is_isolated_flake``
-    (task 3597) for the downstream confirm gate that catches it instead.
+    The opposite-direction case — a load flake co-occurring with the crash,
+    whose ``FAILED`` line defeats this veto (esc-2496-3, esc-3514-2) — is
+    deliberately NOT fixed by exempting named tests here: no test is exempt.
+    See ``_main_probe_failure_is_isolated_flake`` (task 3597) for the
+    downstream confirm gate that catches it instead.
 
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
@@ -787,28 +730,9 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
-    failed_lines = _PYTEST_FAILED_LINE_RE.findall(output)
-    if failed_lines:
-        if (
-            _PYTEST_INTERNALERROR_RE.search(output)
-            or _ERROR_LINE_NODEID_RE.search(output)
-            or _ERROR_LINE_FILE_RE.search(output)
-        ):
-            # A collection/fixture/internal error produces no FAILED line
-            # of its own, so the per-line allow-list check below would
-            # never see it — veto here instead of silently masking it.
-            return False
-        for line in failed_lines:
-            match = _FAILED_LINE_NODEID_RE.match(line)
-            if match is None or not _is_known_load_flake_nodeid(match.group(1)):
-                return False
-        return True
-    # Same three surfaces the FAILED-lines branch vetoes on above. They
-    # produce no FAILED line of their own — which is precisely why they land
-    # in THIS branch, so omitting them here (as this fallback did until task
-    # 4066) leaves the very outputs the veto exists for unguarded.
     return not (
-        _PYTEST_TRACEBACK_E_RE.search(output)
+        _PYTEST_FAILED_LINE_RE.search(output)
+        or _PYTEST_TRACEBACK_E_RE.search(output)
         or _PYTEST_FAILURE_SUMMARY_RE.search(output)
         or _PYTEST_INTERNALERROR_RE.search(output)
         or _ERROR_LINE_NODEID_RE.search(output)

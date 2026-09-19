@@ -108,6 +108,47 @@ logger = logging.getLogger(__name__)
 # re-cross the wall.
 _SNAPSHOT_PAGE_SIZE = 10
 
+# Whole-operation bound for ONE root's snapshot read, enforced by
+# collect_snapshot's Phase-2 gather.
+#
+# SHARES task 4788's CONVENTION, DIFFERS ONLY IN VALUE.  The convention is a
+# named module constant (never a restated literal), an ``asyncio.wait_for``
+# around the whole operation rather than a per-HTTP-request ``timeout``, and an
+# expiry that surfaces as a handled per-root exception.  All three hold here.
+# What does NOT carry over is the NUMBER.
+#
+# Deliberately NOT ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET`` (7.0).  That value
+# is derived from ONE cold MCP session (``DEFAULT_PER_CALL_TIMEOUT`` 2.0 x
+# ``len(COLD_SESSION_POSTS)`` 3, plus slack) and is correct for a request-path
+# caller issuing one unpaginated read.  This caller is not that:
+# ``_fetch_snapshot_tasks`` probes unpaginated first and, on transport
+# rejection, falls back to ``fetch_tasks(..., paginate=True)`` — ONE call that
+# internally walks ``ceil(N/_SNAPSHOT_PAGE_SIZE)`` SEQUENTIAL round trips,
+# MEASURED at ~209 s for one root of this repo's size (the measurement and its
+# derivation live on _SNAPSHOT_PAGE_SIZE above; do not restate them here).
+#
+# A 7.0 s bound would therefore time out every big root on EVERY cycle.  That
+# is not a degraded read, it is a permanent one: ``snapshots`` is an
+# APPEND-ONLY historical record and no later cycle backfills a missing row, so
+# the chart would grow an unexplained hole for exactly the projects an operator
+# most needs the burndown for.  Wrapping at the route convention's value would
+# be a REGRESSION, not a fix.
+#
+# DERIVATION of 300.0, from two real limits rather than by analogy:
+#   * >= the MEASURED ~209 s paginated worst case, with ~1.4x headroom for a
+#     tree that has grown since the measurement or a slower server day;
+#   * <= half of ``app._SAMPLE_INTERVAL_SECONDS`` (600), so one collector cycle
+#     can never still be running when the next one starts.  A root that cannot
+#     finish inside one cycle can never finish at all.
+#
+# Rejected alternative: bound only the unpaginated probe at 7.0 and leave the
+# paginated fallback unbounded.  That leaves the actual long pole unbounded,
+# which is the whole point of the bound.
+#
+# Pinned by TestCollectSnapshotPerRootBudget in
+# dashboard/tests/test_burndown_data.py.
+_SNAPSHOT_PER_ROOT_BUDGET = 300.0
+
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -456,8 +497,26 @@ async def collect_snapshot(
         #
         # Request-path callers are unaffected: page_size is opt-in and
         # active_tasks still calls fetch_tasks with no page_size at all.
+        #
+        # WHOLE-OPERATION BOUND, per root (task 4884 / #4424).  Before this,
+        # collect_snapshot was the last unbounded fetch_tasks caller in the
+        # tree: a single hung MCP fan-out parked the collector task forever and
+        # every project's burndown row stopped, silently.  Each element is now
+        # wrapped in asyncio.wait_for at _SNAPSHOT_PER_ROOT_BUDGET (see that
+        # constant for why the value is not the route convention's 7.0).
+        # Expiry is a SKIPPED ROOT, not an aborted cycle: return_exceptions=True
+        # turns the TimeoutError into that root's own result, which the Phase-3
+        # triage below already handles in its isinstance(result, BaseException)
+        # branch — logged with exc_info, then continue.  Nothing in the triage
+        # changed, and task 519's partial-success semantics are untouched.
         all_results = await asyncio.gather(
-            *(_fetch_snapshot_tasks(client, config, root) for root in roots_to_snapshot),
+            *(
+                asyncio.wait_for(
+                    _fetch_snapshot_tasks(client, config, root),
+                    timeout=_SNAPSHOT_PER_ROOT_BUDGET,
+                )
+                for root in roots_to_snapshot
+            ),
             return_exceptions=True,
         )
 

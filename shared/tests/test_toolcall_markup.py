@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from shared import toolcall_markup
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     ENVELOPE_LITERALS,
@@ -283,6 +284,112 @@ class TestParameterAwareDetection:
         assert detect_for(self._SILENT_RATIONALE, param) is None
 
 
+class TestTheWidenedGateCostsWhatItClaims:
+    """The COST contract of ``detect_for``, on the 99.7%-clean path.
+
+    This class reaches module internals, which is normally an interface smell.
+    It is the deliberate exception: cost is not observable through the public
+    interface — ``detect_for`` returns the same answer whether it allocates
+    three frozensets per call or none — so a contract about allocation and
+    caching can only be stated against the mechanism. Everything about the
+    ANSWER stays pinned through the public predicate in the class above.
+
+    Why it is worth pinning at all: this predicate sits on a per-tool-call
+    boundary and returns ``None`` for 99.7% of the values it sees, so the
+    whole of its cost on the dominant path is setup that finds nothing. The
+    rows below pin the three properties that keep that setup bounded.
+    """
+
+    #: Reused from the class above, so the cost rows and the answer rows are
+    #: measured against the same specimen rather than two that could drift.
+    _SILENT_RATIONALE = TestParameterAwareDetection._SILENT_RATIONALE
+
+    def test_the_normalization_is_cached_across_identical_calls(self):
+        """(1) Repeated identical calls normalize ONCE.
+
+        Asserted on ``cache_info()`` deltas, never on wall-clock: a timing
+        assertion on a shared machine is a flake generator, and the property
+        that matters is "did it do the work again", which the counters answer
+        exactly.
+        """
+        toolcall_markup._extra_names.cache_clear()
+
+        for _ in range(20):
+            detect_for(self._SILENT_RATIONALE, 'rationale', ('decision', 'rationale'))
+
+        info = toolcall_markup._extra_names.cache_info()
+        assert info.misses == 1, 'the normalization ran once for twenty calls'
+        assert info.hits == 19
+
+    def test_a_param_already_in_the_literal_set_reaches_the_module_pattern(self):
+        """(2) The zero-allocation short-circuit, asserted by IDENTITY.
+
+        ``content``'s closer is already in :data:`ENVELOPE_LITERALS`, so with
+        no schema there is nothing to add and the widened set is empty. An
+        empty set must resolve to the module-level ``_ENVELOPE_RE`` OBJECT —
+        the identity guarantee ``_widened_re``'s own docstring already makes —
+        so the widest-used call shape compiles nothing and allocates nothing
+        beyond the two cache lookups.
+        """
+        names = toolcall_markup._extra_names('content', frozenset())
+
+        assert names == frozenset(), 'a closer already in the set is not re-added'
+        assert toolcall_markup._widened_re(names) is toolcall_markup._ENVELOPE_RE
+
+        # ...and the public answer is unchanged by the short-circuit.
+        value = 'body' + closer_for('content')
+        assert detect_for(value, 'content') == detect(value) == closer_for('content')
+
+    @pytest.mark.parametrize(
+        'param',
+        ['not-an-identifier', 'a b', '9lives', 'a/b', 'a.b', 'a-b', 'has\nnewline'],
+    )
+    def test_a_param_outside_the_tag_name_shape_never_becomes_a_needle(self, param):
+        """(3) The cache-thrash bound, and the coherence argument behind it.
+
+        ``param`` is CALLER-CONTROLLED: ``_first_markup_argument`` passes each
+        key of the caller's ``arguments`` mapping straight through, so a caller
+        sending unknown argument names would otherwise evict the bounded
+        ``_widened_re`` cache with a fresh ``re.compile`` per name.
+
+        The bound is the ``_TAG_NAME`` identifier shape rather than a bigger
+        cache, because it answers something stronger: ``repair`` qualifies a
+        mis-close candidate through ``_CLOSER_RE``, whose name group is
+        ``[A-Za-z_]\\w*``. A needle built for a name outside that shape can be
+        DETECTED and can never be QUALIFIED for repair, so spelling it would
+        manufacture detections that are unrepairable by construction — routing
+        authored text into the human queue for nothing.
+        """
+        value = 'prose ' + closer_for(param) + ' tail ' + INVOKE_CLOSER
+
+        assert detect_for(value, param) == detect(value) == INVOKE_CLOSER
+        assert param not in toolcall_markup._extra_names(param, frozenset())
+
+    def test_an_identifier_param_is_still_widened_onto(self):
+        """The bound's other side: a REAL parameter name is never dropped.
+
+        MCP parameter names are Python function parameters and are therefore
+        already identifiers, which is why the bound costs nothing in coverage.
+        """
+        assert detect_for(self._SILENT_RATIONALE, 'rationale') == closer_for('rationale')
+        assert toolcall_markup._extra_names('rationale', frozenset()) == frozenset(
+            {'rationale'}
+        )
+
+    def test_a_schema_name_outside_the_shape_is_dropped_too(self):
+        """One rule, not two: the bound is on every name that becomes a needle.
+
+        ``schema_params`` is not the caller-controlled vector — it is resolved
+        from the invoked tool's own schema — but it lands in the same widened
+        set and therefore the same cache key, and ``repair`` cannot qualify a
+        non-identifier from it either. Filtering in one place keeps the gate's
+        widening vocabulary exactly equal to the repairer's candidate grammar.
+        """
+        names = toolcall_markup._extra_names('rationale', frozenset({'a-b', 'decision'}))
+
+        assert names == frozenset({'rationale', 'decision'})
+
+
 def test_this_module_spells_no_raw_envelope_literal():
     """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
 
@@ -324,6 +431,25 @@ def _canonical_opener(name: str) -> str:
 
 #: The canonical closing tag. Specimen 4's mis-close, and always a candidate.
 _CANONICAL_CLOSER = '\x3c/parameter>'
+
+#: Two MALFORMED closing sequences: a slash where the tag name should start,
+#: and the degenerate empty-name tag. Both carry the two-character sequence the
+#: repairer's cheap prefilter scans for, and NEITHER matches the closing-tag
+#: grammar, whose name must be an identifier. That is the shape the narrowed
+#: boundary row B5 rule deliberately does not widen onto — see
+#: ``TestQuotedReportIsRepairable`` negative control (e).
+_MALFORMED_CLOSERS = '\x3c/ note> and \x3c/>'
+
+
+def _invoke_opener(tool: str) -> str:
+    """The opening ``invoke`` tag that heads a whole tool-call block.
+
+    Not an envelope LITERAL (only the closing half is), but the head of a
+    following block is what distinguishes a genuinely doubly-corrupted tail
+    from prose that merely quotes markup — see ``TestQuotedReportIsRepairable``
+    negative control (a).
+    """
+    return '\x3cinvoke name="' + tool + '">'
 
 
 def _blend_opener(name: str) -> str:
@@ -522,14 +648,23 @@ class TestRepairSpecimens:
         assert result.pattern == _CANONICAL_CLOSER
         assert result.misclose == _CANONICAL_CLOSER
 
-    def test_pattern_is_the_envelope_literal_misclose_is_the_wrong_tag(self):
-        """The two fields differ whenever the mis-closed name is not a literal.
+    def test_pattern_names_the_HEAD_of_the_leak_not_the_literal_trailing_it(self):
+        """PRD section 2.2's diagnostic ambiguity, and its resolution.
 
-        PRD section 2.2's diagnostic ambiguity in miniature: ``/rationale`` is
-        a real drift but is not in the literal set, so ``pattern`` reports the
-        envelope literal that actually matched (the trailing invoke closer,
-        earliest by text position among the literals) while ``misclose``
-        reports the tag that actually went wrong.
+        ``/rationale`` is a real drift and is not in the FIXED literal set, so
+        this specimen used to report ``pattern`` as the trailing invoke closer
+        — earliest by text position among the fixed literals, and about 60
+        characters downstream of where the envelope actually starts. That is
+        section 2.2's complaint verbatim: a guard reporting whatever follows.
+
+        MOVED BY TASK 5283 (expectation ``INVOKE_CLOSER`` -> the ``rationale``
+        closer). ``pattern`` is now derived from ``detect_for`` on the same
+        ``(value, param, schema_params)`` triple the candidate qualification
+        above already uses, so it names the earliest needle over the literals
+        WIDENED by those names — here the self-name closer that opens the leak.
+        ``misclose`` is unchanged and still reports the tag that went wrong;
+        the two coincide on this specimen because the head of the leak IS the
+        mis-close, which is the common case rather than a special one.
         """
         clean = 'Because the split is calibrated in opposite directions.'
         value = (
@@ -549,7 +684,11 @@ class TestRepairSpecimens:
         assert result is not None
         assert_repair_invariants(value, result)
         assert result.misclose == _closer('rationale')
-        assert result.pattern == INVOKE_CLOSER
+        assert result.pattern == _closer('rationale')
+        assert value.index(result.pattern) < value.index(INVOKE_CLOSER), (
+            'the reported pattern must be the HEAD of the leak — the trailing '
+            'invoke closer is what this row used to report'
+        )
         assert result.recovered == {'agent_id': 'claude-interactive'}
 
 
@@ -812,6 +951,384 @@ class TestQuotationIsNotATruncation:
         assert result.recovered == {'priority': 'high'}
 
 
+
+class TestQuotedReportIsRepairable:
+    """Task **4502**: a report that QUOTES a leak pattern is still repairable.
+
+    PRD boundary row B5 refuses a tail whose recovered item is "itself doubly
+    corrupted, so its boundary is a guess". Its implementation was a BARE
+    SUBSTRING test — any closing-tag opening sequence anywhere in a recovered
+    item's value — which is strictly wider than that stated intent. The shape
+    it over-refuses is a faithful REPORT of a markup leak: such a report
+    necessarily quotes the pattern that tripped the tripwire (the
+    ``matched_pattern=...`` field of an escalation record), so the quote lands
+    inside the swallowed ``evidence`` argument and B5 fires on the caller's own
+    prose.
+
+    MEASURED POPULATION at this task's HEAD, so the carve-out's size is on the
+    record rather than assumed small: committed-corpus record
+    ``toolu_01XbCz5NFCA6pCvmseyqFgvy`` plus the two ``esc-3514`` specimens
+    (``escalation/tests/fixtures/markup_specimens/``) — and those are the SAME
+    underlying leaked call, so it is one call and its two filings.
+
+    The specimen below is hand-authored from the parsed-input column the way
+    ``TestRepairSpecimens``' S1-S4 are, NOT copied out of a fixture, so it
+    documents the SHAPE rather than one captured byte string.
+
+    Negative controls (a)-(c) pass BOTH before and after the narrowing. They
+    exist because the naive rule — ambiguity alone, or schema membership alone
+    — breaks exactly there, and it is far cheaper to read that as a red test
+    than to rediscover it as a corpus surprise.
+
+    Control (d) is different in kind and is NOT a both-ways control: it FAILED
+    on the narrowing as first written (esc-4502-3) and passes only with the
+    fix. It pins the dialect mirror of (a), which (a) does not reach. Keep the
+    pair together — the gap existed precisely because one pairing was pinned
+    and its mirror was not.
+    """
+
+    # escalate_info's eleven parameters, and the five the corrupted call
+    # actually arrived with. Both siblings recovered below are disjoint from
+    # the supplied set, which is what stops the assertion going vacuous:
+    # repair() refuses any candidate whose recovered names intersect supplied.
+    _ESCALATE_INFO_PARAMS = frozenset(
+        {
+            'task_id',
+            'agent_role',
+            'category',
+            'summary',
+            'detail',
+            'suggested_action',
+            'evidence',
+            'severity',
+            'terminal_state_is_the_bug',
+            'workflow_state',
+            'worktree',
+        }
+    )
+    _SUPPLIED = frozenset({'task_id', 'agent_role', 'category', 'summary', 'detail'})
+
+    # The prose the caller meant to send as `detail`, and the two arguments the
+    # harness parser dropped into its tail. The evidence entry quotes the
+    # content closer verbatim, exactly as a real leak report does.
+    _CLEAN = (
+        'The write-time tripwire fired on a memory body that had absorbed its '
+        'siblings. Recording the raw observation here so the population is '
+        'countable.'
+    )
+    _ACTION = 'Re-file the escalation once the guard is narrowed; no data was lost.'
+    _EVIDENCE = (
+        '[{"observation": "tripwire matched_pattern=' + _closer('content')
+        + ', agent_id=claude-task-4502", "measured_at": "HEAD=b2035cf8c6", '
+        '"ref": "rerun#1"}]'
+    )
+
+    def _specimen(self) -> str:
+        """The leaked call as the harness delivered it, in one string.
+
+        Canonical dialect throughout: ``detail``'s prose is mis-closed with the
+        canonical ``parameter`` closer, a well-formed ``suggested_action`` pair
+        follows, and ``evidence`` is a FINAL UNTERMINATED opener whose value
+        runs to end-of-string — the parser consumed its closer as the
+        terminator. That last value is the one that quotes a literal.
+        """
+        return (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('suggested_action') + self._ACTION
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + self._EVIDENCE + '\n'
+            + INVOKE_CLOSER
+        )
+
+    def _repair(self, value: str) -> Repair | None:
+        return repair(
+            value,
+            param='detail',
+            schema_params=self._ESCALATE_INFO_PARAMS,
+            supplied=self._SUPPLIED,
+        )
+
+    def test_the_quoted_report_recovers_both_dropped_siblings(self):
+        """THE RED ASSERTION. Returns None today; must return a Repair.
+
+        Both dropped arguments are real caller text — 261 characters of
+        recommendation and a full evidence array in the live specimens — that
+        the current guard drops on the floor while reporting ``unrepairable``.
+        """
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert set(result.recovered) == {'suggested_action', 'evidence'}
+        assert result.recovered['suggested_action'] == self._ACTION
+        assert result.recovered['evidence'] == self._EVIDENCE
+
+    def test_the_recovered_evidence_still_QUOTES_the_literal_verbatim(self):
+        """The point of the carve-out, stated as an assertion.
+
+        A recovered value is the caller's OWN text — invariant D5 guarantees it
+        is a verbatim substring of the input — so it may legitimately contain a
+        literal. That is categorically different from ``clean_value``, which is
+        the value the guard REWROTE and whose envelope-free post-condition is
+        contract C1's and is unchanged by this task (pinned just below).
+        """
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert _closer('content') in result.recovered['evidence']
+
+    def test_clean_value_is_the_prose_prefix_and_stays_envelope_free(self):
+        """C1's post-condition, UNCHANGED. Stated against ``detect_for``, the
+        parameter-aware predicate the gates actually consume."""
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert result.clean_value == self._CLEAN
+        assert detect_for(result.clean_value, 'detail', self._ESCALATE_INFO_PARAMS) is None
+
+    def test_d5_structural_invariants_hold(self):
+        """The same non-circular predicate the 504-record corpus replay uses,
+        so the new carve-out cannot pass here while failing there."""
+        value = self._specimen()
+
+        assert_repair_invariants(value, self._repair(value))
+
+    # -- negative controls -------------------------------------------------
+
+    def test_a_cross_dialect_self_close_is_still_refused(self):
+        """NEGATIVE CONTROL (a) — the shape of committed-corpus record 25.
+
+        ``rationale`` opens in the CANONICAL dialect but closes with the
+        name-echoing ``rationale`` closer, and is followed by an invoke closer
+        and then the head of a whole NEXT invoke block ending in an
+        unterminated opener. An ambiguity probe alone does not catch this (the
+        residue does not itself parse as pseudo-parameters), so a narrowing
+        that qualified inner closers only on ambiguity — or only on schema
+        membership — would ACCEPT it and silently swallow the next tool call's
+        fragment into the recovered ``rationale``. That is the
+        no-silent-partial-repair failure this module exists to prevent, and a
+        strictly worse outcome than the ``None`` returned here.
+
+        An item's OWN closing tag appearing inside its value is a cross-dialect
+        mis-close by definition, never prose about itself — which is why the
+        rule may state that condition categorically.
+        """
+        clean = 'Recording the rationale for the routing change.'
+        value = (
+            clean
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('rationale')
+            + 'The scheduler indexes merge markers instead of shelling out.'
+            + _closer('rationale')
+            + INVOKE_CLOSER + '\n'
+            + _invoke_opener('mcp__plan-tools__add_design_decision')
+            + _canonical_opener('decision')
+            + 'Index the markers.'
+        )
+
+        assert repair(
+            value,
+            param='decision',
+            schema_params=frozenset({'decision', 'rationale', 'task_id'}),
+            supplied=frozenset({'task_id', 'decision'}),
+        ) is None
+
+    def test_an_invoke_closer_inside_a_recovered_value_is_still_refused(self):
+        """NEGATIVE CONTROL (b) — same reason, stated on ``invoke`` alone.
+
+        ``_parse_tail`` strips ONE trailing invoke closer as the terminator it
+        expects; a SECOND one inside an item's value means the tail spans a
+        tool-call boundary, so the item's end is a guess and recovery would
+        swallow whatever follows.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'high'
+            + INVOKE_CLOSER
+            + ' trailing text from the next block'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset({'project_root', 'title', 'description'}),
+        ) is None
+
+    def test_boundary_row_b5s_own_ambiguous_case_is_still_refused(self):
+        """NEGATIVE CONTROL (c) — B5's ORIGINAL case, unchanged.
+
+        Referenced by SHAPE rather than duplicated: this is exactly
+        ``TestRepairRefuses::test_doubly_corrupted_tail_is_refused`` — a
+        name-echoing ``agent_id`` item closed by the ``details`` closer, where
+        reading that closer as the terminator ALSO yields a valid parse of the
+        remainder. That is the genuine ambiguity B5 was written for ("its
+        boundary is a guess"), it is NOT quoted prose, and it stays refused.
+        Asserted here too so the two halves of the narrowed rule — own-name and
+        alternative-boundary — are both pinned inside this class.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'medium' + _closer('priority') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _closer('details') + '\n'
+            + INVOKE_CLOSER
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
+    def test_an_echo_opened_item_closed_canonically_is_still_refused(self):
+        """NEGATIVE CONTROL (d) — the MIRROR of (a), and a real regression.
+
+        Control (a) pins canonical-opener/echo-closer. This pins the opposite
+        pairing, echo-opener/CANONICAL-closer, which (a) does not reach. The
+        asymmetry was live: condition (i) tested ``inner_name in (name,
+        closer_name)``, and for an ECHO-dialect item ``closer_name`` IS the
+        item's own name, so the tuple collapsed to one entry and the canonical
+        ``parameter`` closer fell out of the block set entirely.
+
+        MEASURED before the fix (esc-4502-3): this exact value recovered
+        ``agent_id`` as ``'claude-interactive'`` + the canonical closer + the
+        whole trailing paragraph, reported as ``outcome=repaired`` — so under
+        FORWARD_REPAIR a corrupt ``agent_id`` carrying the head of the NEXT
+        tool call went straight into the tool's arguments. Probe (ii) cannot
+        save this: the trailing prose does not itself parse as pseudo-
+        parameters, which is the same argument control (a) makes.
+
+        The fix lists ``parameter`` categorically, independent of the item's
+        opener dialect, because ``_parse_body`` treats the canonical closer as
+        a UNIVERSAL terminator — a property of the parser, not of the opener.
+        """
+        clean = 'The reconciler re-reads the plan.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _CANONICAL_CLOSER
+            + ' ...and then a whole paragraph of the NEXT tool call fragment'
+            + ' that does not parse.'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
+    # -- the narrowed rule's own BOUNDS -------------------------------------
+    #
+    # Three branches decide how far the narrowing does NOT reach: the
+    # malformed-closer fallback, the inner-closer budget, and the probe's depth
+    # bound. Measured with ``pytest --cov=shared.toolcall_markup`` before these
+    # pins existed, all three were UNEXECUTED by the entire suite — so for a
+    # change whose whole subject is loosening a safety guard, the parts that
+    # bound the loosening carried no regression pin at all. Each specimen below
+    # is mutation-verified: deleting the branch it names flips that specimen and
+    # leaves every other test in this file green.
+
+    def test_a_malformed_closing_sequence_alone_is_still_refused(self):
+        """NEGATIVE CONTROL (e) — the prefilter fires, nothing is WELL-FORMED.
+
+        The recovered value carries the two-character sequence the cheap
+        prefilter scans for, but no closing tag that actually matches the
+        grammar (a tag name must be an identifier). The alternative-boundary
+        rule therefore has NOTHING to reason about, and it keeps B5's original
+        answer — refuse — rather than widening the carve-out onto a shape it
+        was never measured against.
+
+        MUTATION-VERIFIED: replacing that fallback with a bare ``return False``
+        flips this specimen from refused to RECOVERED, silently widening the
+        carve-out in precisely the direction controls (a)-(d) exist to bound,
+        while every other test in this file stays green.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence')
+            + 'the sweep logged a malformed fragment ' + _MALFORMED_CLOSERS + ' here.'
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
+    def test_more_inner_closers_than_the_budget_is_still_refused(self):
+        """NEGATIVE CONTROL (f) — past the bound the answer is BLOCK.
+
+        At most ``_MAX_CANDIDATES`` inner closers are considered; beyond that
+        the rule refuses rather than keeping a value under examination, which is
+        the conservative direction and the one that makes the cost ceiling mean
+        something. Every closer here is individually harmless — none names the
+        item, either dialect's closer for it, or ``invoke``, and no remainder
+        parses — so the budget is the ONLY thing refusing.
+
+        The ceiling is READ from the module rather than restated: a test that
+        hardcoded the number would pass vacuously the day the bound moved.
+
+        MUTATION-VERIFIED: deleting the budget guard flips this specimen from
+        refused to RECOVERED.
+        """
+        from shared.toolcall_markup import _MAX_CANDIDATES
+
+        quoted = ' '.join(_closer(f'note{i}') for i in range(_MAX_CANDIDATES + 1))
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence')
+            + 'the sweep quoted ' + quoted + ' and then prose that does not parse.'
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
+    def test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE(self):
+        """The probe's DEPTH-1 bound, pinned by the shape whose answer it decides.
+
+        Not a negative control: it asserts a RECOVERY, because the bound can
+        only push the answer that way. The probe asks "does the remainder after
+        this inner closer ALSO parse?", and at depth 1 it restores the blanket
+        substring refusal — so a remainder that WOULD parse into an item whose
+        own value quotes markup reads as "does not parse", condition (ii) stays
+        silent, and the tail is recovered whole.
+
+        This specimen is exactly that shape: the quoted report carries a closer
+        immediately followed by a canonical opener, so the remainder is itself a
+        quoting item. MUTATION-VERIFIED: deleting the ``probe`` short-circuit —
+        i.e. letting the probe re-enter the narrowed rule — makes that remainder
+        parse, fires condition (ii), and flips this specimen to ``None``.
+
+        So the bound is a DESIGN CHOICE with an observable consequence rather
+        than a free safety net, and moving it must be a decision rather than a
+        tidy-up. What is delivered stays verbatim caller text under D5, which
+        the invariant assertion states rather than assumes.
+        """
+        quoted_tail = (
+            'the report quotes ' + _closer('foo') + ' '
+            + _canonical_opener('suggested_action')
+            + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
+        )
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + quoted_tail
+            + '\n' + INVOKE_CLOSER
+        )
+
+        result = self._repair(value)
+
+        assert result is not None
+        assert set(result.recovered) == {'evidence'}
+        assert result.recovered['evidence'] == quoted_tail
+        assert_repair_invariants(value, result)
+
+
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
 
@@ -1065,12 +1582,19 @@ class TestNoSilentPartialRepairOfSelfNameMisclose:
 
     THIS CANNOT REGRESS THE COMMITTED CORPUS, and that is measured rather than
     hoped. Replaying every record of
-    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` at this HEAD: **504
-    records, 443 accepted by repair(), and ZERO of those 443 produce a
+    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` at TASK 4696's HEAD:
+    **504 records, 443 accepted by repair(), and ZERO of those 443 produce a
     clean_value carrying a qualifying closer** — under the self-name-only
     widening AND under the full ``param + schema_params`` widening alike. So no
-    per-specimen expectation flips and the corpus fixture is NOT edited by task
+    per-specimen expectation flips and the corpus fixture was NOT edited by task
     4696.
+
+    The accepted count is **444** as of task **4502**, which narrowed boundary
+    row B5 and moved one record repaired-ward; 4696's 443 is left as it was
+    measured rather than retyped, so the two figures stay attributable. The
+    ZERO clause is the substantive half and was RE-VERIFIED at 4502, not merely
+    restated: the newly-accepted record's ``clean_value`` carries no qualifying
+    closer either, so all 444 still satisfy it.
     """
 
     #: The tool the specimen was captured against: ``add_design_decision``.

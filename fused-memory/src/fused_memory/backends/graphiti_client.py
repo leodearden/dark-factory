@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
@@ -410,11 +410,50 @@ class ActiveEdgesError(Exception):
 
 
 class AmbiguousEntityError(Exception):
-    """Raised when multiple entity nodes share the same name.
+    """Raised when multiple entity nodes share the same name in one graph.
+
+    ONE condition, two callers who differ in what they do about it:
+    - a READ that cannot answer (``resolve_entity_by_name``: which of these
+      did you mean?), and
+    - a WRITE that REFUSES to collapse (``ensure_entity_node`` under
+      ``merge_duplicates=False``: collapsing them is irreversible and is
+      deliberately not a side effect of a repair — adjudicate the duplicates
+      by hand).
 
     The error message includes all matching UUIDs so the caller can
-    disambiguate and call refresh_entity_summary with a specific UUID.
+    disambiguate and call refresh_entity_summary with a specific UUID. The
+    same facts are also carried as STRUCTURED fields — ``.name``,
+    ``.group_id``, ``.uuids`` — so a consumer can name the duplicate-name
+    group without an ad-hoc parse of the message.
+
+    THEY ARE REQUIRED KEYWORD ARGUMENTS, NOT DEFAULTED ONES. A structured
+    field present at one raise site and empty at another is not an invariant
+    a consumer can key off, and this one HAS a consumer that keys off it:
+    ``MemoryService._repair_edge_findings`` composes its whole refusal record
+    out of these three. Permissive defaults would let a future raise site —
+    or any construction from a bare message — book a structurally valid
+    ``'unrepairable'`` reading ``Repair target '' names a duplicate-name
+    group in '': []``: a record that passes every check while carrying no
+    evidence at all, which is the silent degradation INV-4 exists to prevent.
+    Requiring them costs nothing (both raise sites already pass all three)
+    and turns the invariant from documented into enforced.
+
+    ``uuids`` is stored as a tuple: the error is the EVIDENCE for a refusal
+    and must not be mutable.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        name: str,
+        group_id: str,
+        uuids: Iterable[str],
+    ) -> None:
+        super().__init__(message)
+        self.name = name
+        self.group_id = group_id
+        self.uuids = tuple(uuids)
 
 
 class IncompleteEnumerationError(Exception):
@@ -3107,7 +3146,10 @@ class GraphitiBackend:
         if len(rows) > 1:
             uuids = [row[0] for row in rows]
             raise AmbiguousEntityError(
-                f'Multiple entities found with name {name!r}: {uuids}'
+                f'Multiple entities found with name {name!r}: {uuids}',
+                name=name,
+                group_id=group_id,
+                uuids=uuids,
             )
         return rows[0][0]
 
@@ -3366,8 +3408,64 @@ class GraphitiBackend:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
         return survivor['uuid']
 
+    async def _resolve_without_collapsing(self, name: str, *, group_id: str) -> str | None:
+        """Exact-name resolve that REFUSES a duplicate-name group instead of collapsing it.
+
+        The orthogonal sibling of :meth:`_resolve_or_create_entity`, carrying
+        that method's exact contracts so ``ensure_entity_node`` can fork the
+        resolve half alone:
+        - Same lock contract: callers MUST hold ``_identity_lock_for(group_id)``;
+          this method performs no locking of its own.
+        - Same ``str | None`` return: 0 matches -> None (the caller mints),
+          1 match -> that node's uuid.
+        - >=2 matches -> raise ``AmbiguousEntityError`` with the structured
+          ``.name``/``.group_id``/``.uuids`` fields populated. Nothing is merged,
+          nothing is written.
+
+        WHY THE COLLAPSE IS UNREACHABLE HERE. A merge is irreversible: it folds
+        one node's edges into another and destroys the distinction. That is only
+        ever a DELIBERATE act — Ratified Decision 1 of the memory-identity
+        programme — never a side effect of some other operation that happened to
+        find two nodes. The PRD's S1 scope amendment
+        (``plans/fm-memory-identity-prd.md``) licenses the collapse on exactly
+        one path, the episode-write dedup, which reaches
+        ``_resolve_or_create_entity`` directly; every other caller must refuse
+        the >=2 arm with a structured refusal rather than merge. This method is
+        how they do it.
+
+        Args:
+            name: Exact name of the Entity to resolve.
+            group_id: Project graph to target.
+
+        Returns:
+            The uuid of the one Entity node with this name in *group_id*'s
+            graph, or None if none existed.
+
+        Raises:
+            AmbiguousEntityError: if two or more nodes share this name.
+        """
+        nodes = await self.get_nodes_by_exact_name(name, group_id=group_id)
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]['uuid']
+        uuids = [node['uuid'] for node in nodes]
+        raise AmbiguousEntityError(
+            f'Multiple entities found with name {name!r}: {uuids}',
+            name=name,
+            group_id=group_id,
+            uuids=uuids,
+        )
+
     @_canonicalize_group_args
-    async def ensure_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+    async def ensure_entity_node(
+        self,
+        name: str,
+        *,
+        group_id: str,
+        summary: str = '',
+        merge_duplicates: bool = True,
+    ) -> str:
         """Resolve an Entity node by exact name, MINTING one if none exists.
 
         The resolve-or-MINT sibling of :meth:`_resolve_or_create_entity`, whose
@@ -3412,6 +3510,30 @@ class GraphitiBackend:
             group_id: Project graph to target.
             summary: Summary property for a newly minted node. Ignored on the
                 resolve path — an existing node's summary is never overwritten.
+            merge_duplicates: whether a duplicate-name group may be COLLAPSED
+                to resolve this name. The three arms are 0 -> mint,
+                1 -> resolve, and >=2 -> collapse-and-return-the-survivor when
+                True (the default) or refuse when False. The default
+                reproduces this method's historical behaviour verbatim, so no
+                existing caller changes and Seam S1's episode-write dedup path
+                keeps the collapse the PRD licenses for it. Pass False from any
+                other caller: a merge is irreversible and is only ever a
+                deliberate act, never a side effect (Ratified Decision 1).
+
+                BOTH current False callers are in ``services/memory_service.py``,
+                named here so a reader need not grep for them:
+                ``MemoryService._repair_edge_findings`` (the referent repair
+                pass, which catches the refusal and books the finding
+                ``'unrepairable'`` rather than ``'failed'`` — the backend did
+                not fail, it declined), and ``MemoryService.ensure_entity_node``
+                (task 4932's gated mint wrapper, where the flag is redundant by
+                construction with that wrapper's own pre-read and is passed
+                anyway so Ratified Decision 1 is structural at both non-S1 call
+                sites rather than dependent on one caller's ordering).
+
+                Seam S1 is absent from that list BY CONSTRUCTION, not by
+                omission: it calls ``_resolve_or_create_entity`` directly and
+                never reaches this method at all.
 
         Returns:
             The UUID of the single canonical Entity node with this name in
@@ -3419,8 +3541,18 @@ class GraphitiBackend:
 
         Raises:
             RuntimeError: if the backend is not initialized.
+            AmbiguousEntityError: if ``merge_duplicates`` is False and two or
+                more nodes share this name. Carries the conflicting uuids as
+                structured data, so the caller can name the duplicate group.
         """
-        resolved = await self._resolve_or_create_entity(name, group_id=group_id)
+        # Only the RESOLVE half forks — the two resolvers share one `str | None`
+        # contract, so the short-circuit below and the whole mint/embedding block
+        # stay a single unforked site.
+        resolve = (
+            self._resolve_or_create_entity if merge_duplicates
+            else self._resolve_without_collapsing
+        )
+        resolved = await resolve(name, group_id=group_id)
         if resolved is not None:
             return resolved
 

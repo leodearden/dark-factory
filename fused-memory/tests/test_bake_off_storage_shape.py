@@ -30,11 +30,12 @@ tests assert exact values with no tolerances.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import re
 import types
 from collections.abc import Container
 from pathlib import Path
+
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -47,32 +48,9 @@ DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
 REGROWTH_INJECTION_PATH = FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 
-def _load_module() -> types.ModuleType:
-    """Load bake_off_storage_shape.py from its file path.
-
-    The module is registered in sys.modules under its bare name so that
-    @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'bake_off_storage_shape'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='bake_off_storage_shape')
 
 
 # ===========================================================================

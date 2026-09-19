@@ -1980,13 +1980,14 @@ async def test_concurrent_add_task_produces_single_task(
     """
     from fused_memory.middleware.task_curator import (
         CuratorDecision,
+        PoolWithheld,
         TaskCurator,
     )
 
     # Use a real curator so the exact-match cache is exercised; stub
     # corpus + LLM so we don't spin up Qdrant.
     async def empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     real_curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
     real_curator.record_task = AsyncMock()

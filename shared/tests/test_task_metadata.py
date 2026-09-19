@@ -2069,6 +2069,36 @@ class TestParseMetadataFailurePolicy:
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
         assert 'recurrence' not in unknown_key_fields
 
+    def test_merge_lane_metadata_key_is_blessed(self):
+        """The merge-queue priority-lane selector must not census-warn (task 4888).
+
+        ``merge_lane`` is the sole selector for a merge-queue priority lane
+        anywhere in the system: it is machine-written by the orchestrator on
+        the hotfix/main-health task classes and read by
+        ``orchestrator/src/orchestrator/merge_queue.py::lane_for_task_metadata``,
+        which is what decides whether a request is picked ahead of the normal
+        lane. Unblessed, every carrier emits a ``code=unknown_key`` census
+        line. RED until ``'merge_lane'`` is added to
+        ``_BLESSED_METADATA_KEYS``.
+
+        The blessing ground and the carrier census live in the frozenset
+        entry's own comment, which is their single in-repo copy; this
+        docstring cites it rather than restating the figures.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above picks the key up for free once blessed — this test pins the
+        specific key with a real in-vocabulary value, matching the two named
+        precedents above, and carries the rationale rather than the coverage.
+        """
+        _, warnings = parse_metadata({'merge_lane': 'high'}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'merge_lane'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for merge_lane; got: {offending}'
+        )
+
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
 

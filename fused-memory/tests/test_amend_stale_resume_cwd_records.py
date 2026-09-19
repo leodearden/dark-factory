@@ -7,40 +7,18 @@ test_tag_cgl_eta_rehome_scope.py / test_prune_recon_cycle_summaries.py.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
-import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'amend_stale_resume_cwd_records.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load amend_stale_resume_cwd_records.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    mod_name = 'amend_stale_resume_cwd_records'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='amend_stale_resume_cwd_records')
 
 STALE_ID = '6403e96b-f1af-403a-9513-59f007ed6d39'
 WARNING_ID = 'd007aa46-5800-455c-af3c-32d8fd8445b2'

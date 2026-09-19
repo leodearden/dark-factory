@@ -309,7 +309,14 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
-        "suggested_action, task_id) -> {'finding_id': ...}  "
+        "suggested_action, task_id, supersedes) -> {'finding_id': ...}  "
+        '# supersedes (task-4653) = the finding_id of an earlier finding in '
+        'this run that this one makes historical — file it when your finding '
+        'RESOLVES an earlier claim rather than restating it. The dedup key '
+        'below cannot relate a claim to its resolution (the resolving '
+        'finding carries a different flag_type), so the relation must be '
+        'asserted explicitly or both stay live and a reader acts on the '
+        'first. The target is stamped and stays readable, not retracted. '
         '# actionable is a COMPUTED default (task-2432): when omitted, it '
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "

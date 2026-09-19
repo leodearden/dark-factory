@@ -434,6 +434,36 @@ def _finding_has_citation_failures(finding: dict) -> bool:
     return bool(finding.get('citation_failures'))
 
 
+def _finding_is_live_actionable(finding: dict) -> bool:
+    """Return True iff *finding* is actionable and not superseded.
+
+    Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
+    run mark an earlier one historical, stamping the target's
+    ``superseded_by``.  A superseded claim has already been refuted by the
+    run that filed it, so acting on it is acting on a known-false instruction.
+
+    ``get_assembled_report`` already projects such a finding with
+    ``actionable`` forced False, which would make the ``superseded_by`` check
+    here look redundant.  It is kept anyway, and NOT because some production
+    path is known to skip that projection: both partition sites read
+    ``s3_report`` duck-typed — a ``StageReport`` or the equivalent dict off
+    persisted JSON, from a producer they cannot identify — so neither can
+    verify that the ``actionable`` it is trusting was computed by that
+    projection at all.  Enforcing the invariant locally is cheap, and it keeps
+    the rule readable at the point it is applied instead of implied by an
+    upstream projection two modules away.
+
+    Applied at the actionable/non-actionable partition in
+    ``_maybe_remediate`` and ``_run_remediation_pass``, so the complement
+    feeds the existing ``_log_non_actionable_finding`` branch unchanged.
+    Deliberately UPSTREAM of ``_maybe_remediate``'s task-4781 three-way
+    split: a superseded finding is neither a phantom-cited drop nor a
+    never-cited placeholder, so counting it as either would corrupt the
+    drop-cause attribution that split exists to get right.
+    """
+    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
+
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
@@ -4593,7 +4623,27 @@ class ReconciliationHarness:
     # ── Remediation support ───────────────────────────────────────────
 
     async def _get_prior_s3_findings(self, project_id: str) -> list[dict] | None:
-        """Extract S3 findings from the last completed run's stage reports."""
+        """Extract S3 findings from the last completed run's stage reports.
+
+        Superseded findings are dropped (task-4653).  This return value becomes
+        the next cycle's Stage-1 ``prior_s3_findings``, which
+        ``MemoryConsolidator.assemble_payload`` renders under "These issues were
+        found in the last integrity check and should be addressed during this
+        consolidation pass if possible" — so a claim a LATER finding of the
+        producing run already refuted would come back as a live to-do.  Its
+        renderer (``_format_findings``) emits description / severity / category
+        / suggested_action and the typed citation lists only, never
+        ``superseded_by``, so an agent reading the payload could not tell that
+        the claim had been retired.  Same rationale as the Stage-2 channel's
+        filter in ``stages/task_knowledge_sync.py::_query_recon_report_findings``,
+        applied to a stricter instruction.
+
+        The filter runs BEFORE the ``if items:`` fall-through, so a run whose
+        every finding was retired behaves exactly like a run that flagged
+        nothing: an older completed run still gets its turn, and no empty
+        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
+        a finding dict that never carried the key is unaffected.
+        """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
             for r in recent:
@@ -4606,6 +4656,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
+                items = [f for f in items if not f.get('superseded_by')]
                 if items:
                     return items
         except Exception as e:
@@ -4820,6 +4871,11 @@ class ReconciliationHarness:
 
         Called from both _maybe_remediate (parent pass) and _run_remediation_pass (after
         the second-pass actionable partition) so both sites stay in sync as fields evolve.
+
+        Task 4653: both partitions now route two different kinds of finding here —
+        one that was never actionable, and one a later finding of the same run
+        RETIRED (``_finding_is_live_actionable``).  ``superseded_by`` is logged so
+        the two are distinguishable in the journal; it is None for the first kind.
         """
         logger.info(
             'reconciliation.non_actionable_integrity_finding',
@@ -4830,6 +4886,7 @@ class ReconciliationHarness:
                 'affected_ids': _derive_affected_ids(finding),
                 'description': finding.get('description', ''),
                 'severity': finding.get('severity', ''),
+                'superseded_by': finding.get('superseded_by'),
             },
         )
 
@@ -5020,8 +5077,8 @@ class ReconciliationHarness:
                 return
 
             # Partition into actionable vs escalation
-            actionable = [f for f in all_findings if f.get('actionable', False)]
-            non_actionable = [f for f in all_findings if not f.get('actionable', False)]
+            actionable = [f for f in all_findings if _finding_is_live_actionable(f)]
+            non_actionable = [f for f in all_findings if not _finding_is_live_actionable(f)]
 
             # Task 1512 / plans/afk-A7-recon-closure.md:
             # Non-actionable findings are NOT escalated.  Per the Stage-3 contract
@@ -5685,8 +5742,10 @@ class ReconciliationHarness:
                     all_remaining = s3_report.get('items_flagged', [])
                 else:
                     all_remaining = s3_report.items_flagged
-                actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
-                non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
+                actionable_remaining = [f for f in all_remaining if _finding_is_live_actionable(f)]
+                non_actionable_remaining = [
+                    f for f in all_remaining if not _finding_is_live_actionable(f)
+                ]
                 # Non-actionable findings are logged but never escalated — same
                 # contract as the parent pass in _maybe_remediate.
                 for finding in non_actionable_remaining:

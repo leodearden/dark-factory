@@ -1,0 +1,518 @@
+"""Each lifespan's background loops must be bound to the resources IT opened.
+
+WHY this module exists (task 3771 — the runtime half of task 3466):
+``app.state`` is a single mutable namespace on the one shared ``FastAPI``
+instance, and starlette runs a full lifespan per ``TestClient`` context.  When
+two lifespans overlap over that one ``app`` (~15 module-scoped
+``TestClient(app)`` fixtures coexist with the function-scoped ``client``
+fixture in ``tests/conftest.py``; ``tests/test_fixture_isolation.py`` documents
+the module-scoped idiom as deliberate), the INNER lifespan overwrites
+``app.state.db`` / ``app.state.http_client`` and does **not** restore them on
+exit.  Task 3466 fixed the *shutdown* half by closing locals rather than
+``app.state``.  This module pins the *runtime* half: a long-lived loop that
+re-reads ``app.state`` on every cycle keeps polling whichever handles are
+installed there — which, for the whole remainder of the outer lifespan, are the
+inner's already-**closed** pool and HTTP client.  The failure is silent (a
+closed ``DbPool.get()`` returns ``None``; a closed ``httpx`` client raises into
+``_run_once``'s ``except Exception``), so it surfaces only as a generic
+``'Metrics snapshot error'`` warning that masks real faults.
+
+The contract asserted here has two halves, and the asymmetry is deliberate:
+
+* **Handles bind to arguments.** ``pool`` and ``http_client`` are passed into
+  ``_metrics_loop`` by the lifespan that created them and are never re-read
+  from ``app.state``.  ``lifespan`` likewise binds ``config`` to a local for
+  its own startup reads — both store paths and the burndown loop's config
+  argument — closing the interleave window across
+  ``await burndown_store.open()``.
+* **Config binds to ``app.state``.** ``_run_once`` re-reads
+  ``app.state.config`` every cycle **on purpose**: ~25 tests swap
+  ``client.app.state.config`` mid-test and depend on that being observable.
+  A "consistency" refactor that hoists config out of ``_run_once`` must break
+  a test here rather than 25 tests elsewhere.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+from fastapi import FastAPI
+from starlette.testclient import TestClient
+
+from dashboard.app import (
+    _build_http_limits,
+    _BurndownStore,
+    _metrics_loop,
+    _MetricsStore,
+)
+from dashboard.config import DashboardConfig
+
+
+async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
+    """Stand-in for _burndown_loop so nesting two lifespans stays hermetic.
+
+    The burndown loop fans out over HTTP; it is irrelevant to the resource
+    binding under test and is replaced so neither lifespan does real I/O.
+    """
+    return None
+
+
+def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
+    """A lifespan's metrics loop gets the DbPool/AsyncClient THAT lifespan built.
+
+    Nests two ``TestClient(app)`` contexts over the shared global ``app`` — the
+    situation the suite creates routinely — and asserts each lifespan's loop was
+    handed its own handles, not whatever ``app.state`` points at.
+    """
+    from dashboard.app import app
+
+    recorded: list[dict[str, Any]] = []
+
+    async def _recording_metrics_loop(
+        store: object,
+        app_arg: FastAPI,
+        *,
+        pool: object,
+        http_client: object,
+    ) -> None:
+        # Snapshot both the arguments and app.state AT LOOP START, then return
+        # immediately so no real snapshot cycle runs.
+        recorded.append(
+            {
+                'pool': pool,
+                'http_client': http_client,
+                'state_db': app_arg.state.db,
+                'state_http': app_arg.state.http_client,
+            }
+        )
+
+    with (
+        patch('dashboard.app._metrics_loop', new=_recording_metrics_loop),
+        patch('dashboard.app._burndown_loop', new=_noop_burndown_loop),
+        TestClient(app) as _outer,
+    ):
+        outer_pool = app.state.db
+        outer_http = app.state.http_client
+        with TestClient(app) as _inner:
+            inner_pool = app.state.db
+            inner_http = app.state.http_client
+        # The inner lifespan has shut down and closed inner_pool/inner_http,
+        # but it did NOT restore app.state.  Capture what the outer lifespan
+        # would see if it re-read app.state from here on.
+        state_db_after_inner = app.state.db
+        state_http_after_inner = app.state.http_client
+
+    assert len(recorded) == 2, (
+        f'task 3771: expected 2 lifespans (nested TestClient(app)) to each start a '
+        f'metrics loop, got {len(recorded)}'
+    )
+
+    # Each loop was handed its own lifespan's handles.
+    assert recorded[0]['pool'] is outer_pool, (
+        'task 3771: the OUTER lifespan must hand its metrics loop the DbPool it created'
+    )
+    assert recorded[0]['http_client'] is outer_http, (
+        'task 3771: the OUTER lifespan must hand its metrics loop the AsyncClient it created'
+    )
+    assert recorded[1]['pool'] is inner_pool, (
+        'task 3771: the INNER lifespan must hand its metrics loop the DbPool it created'
+    )
+    assert recorded[1]['http_client'] is inner_http, (
+        'task 3771: the INNER lifespan must hand its metrics loop the AsyncClient it created'
+    )
+
+    for index, rec in enumerate(recorded):
+        assert rec['pool'] is rec['state_db'], (
+            f'task 3771: lifespan #{index} passed a pool that is not the one it '
+            f'installed on app.state — the argument and app.state disagree at loop start'
+        )
+        assert rec['http_client'] is rec['state_http'], (
+            f'task 3771: lifespan #{index} passed an http_client that is not the one it '
+            f'installed on app.state — the argument and app.state disagree at loop start'
+        )
+
+    # The two lifespans really did build distinct resources; without this the
+    # per-lifespan assertions above could pass on a single shared object.
+    assert recorded[0]['pool'] is not recorded[1]['pool'], (
+        'task 3771: nested lifespans must build distinct DbPools for this test to mean anything'
+    )
+    assert recorded[0]['http_client'] is not recorded[1]['http_client'], (
+        'task 3771: nested lifespans must build distinct AsyncClients for this test to '
+        'mean anything'
+    )
+
+    # The defect mechanism, asserted directly: app.state is LEFT pointing at the
+    # inner lifespan's (now closed) handles once the inner exits...
+    assert state_db_after_inner is inner_pool, (
+        'task 3771: precondition — the inner lifespan is expected to leave its own DbPool '
+        'installed on app.state after it exits (it does not restore the outer one)'
+    )
+    assert state_http_after_inner is inner_http, (
+        'task 3771: precondition — the inner lifespan is expected to leave its own '
+        'AsyncClient installed on app.state after it exits'
+    )
+    # ...and the outer loop must NOT be reading those closed handles.
+    assert recorded[0]['pool'] is not state_db_after_inner, (
+        'task 3771 CROSS-TALK: the outer metrics loop is bound to the INNER lifespan closed '
+        'DbPool via app.state — pool must be an argument, not an app.state re-read'
+    )
+    assert recorded[0]['http_client'] is not state_http_after_inner, (
+        'task 3771 CROSS-TALK: the outer metrics loop is bound to the INNER lifespan closed '
+        'AsyncClient via app.state — http_client must be an argument, not an '
+        'app.state re-read'
+    )
+
+
+async def _noop_metrics_loop(*args: object, **kwargs: object) -> None:
+    """Stand-in for _metrics_loop where only the burndown binding is under test."""
+    return None
+
+
+def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> None:
+    """Every startup read binds to the config THIS lifespan built, not a later swap.
+
+    ``lifespan`` assigns ``app.state.config`` at the top of startup and then
+    consumes it three more times: ``burndown_path``, ``_burndown_loop``'s
+    config argument, and ``metrics_path``.  ``await burndown_store.open()``
+    sits between the first and the last two, and that await is a real
+    suspension point -- so a concurrently starting lifespan can install its own
+    config there and this one would wire its store paths and loops to a config
+    it never built.
+
+    The interleave is simulated deterministically by swapping
+    ``app.state.config`` from inside the lifespan itself.  The swap is
+    installed at the EARLIEST reachable hook -- ``_build_http_limits``, the
+    first call after ``app.state.config`` is assigned -- rather than only
+    inside ``_BurndownStore.open``.  Two reasons:
+
+    * ``burndown_path`` is read BEFORE the first await, so a swap confined to
+      the ``open()`` window cannot reach it and an ``app.state`` re-read there
+      would go unpunished.  Installing the swap earlier pins the whole
+      invariant ("startup never re-reads ``app.state.config`` after building
+      its own") rather than only the window that happens to be reachable
+      today -- which would silently stop being enough the moment an ``await``
+      is introduced earlier in startup.
+    * It subsumes the genuine ``open()`` window: ``captured['across_await']``
+      below asserts the foreign config is still installed there, so the two
+      post-await reads are exposed to it exactly as a real interleave would.
+
+    The interleaving config points at a DIFFERENT project_root, so every
+    derived path (``burndown_db``, ``metrics_db``) differs in VALUE and not
+    merely in object identity -- without that the two store-path assertions
+    would hold under a swap and prove nothing.
+
+    Not pinned here: ``_build_http_limits``'s own argument, because that call
+    IS the hook (its argument is evaluated before the swap runs).  It derives
+    a connection-pool bound and touches no path or handle, so a stale read
+    there is inert.
+    """
+    from dashboard.app import app
+
+    real_build_http_limits = _build_http_limits
+    real_open = _BurndownStore.open
+    captured: dict[str, Any] = {}
+
+    # A DIVERGENT project_root -- burndown_db/metrics_db derive from it, so the
+    # swapped config's paths differ in value from the lifespan's own.  Under
+    # tmp_path, so a regression that actually opens these writes nothing
+    # outside pytest's temp tree.
+    swapped = DashboardConfig(project_root=tmp_path / 'interleaved-root')
+
+    def _swapping_limits(config: DashboardConfig) -> httpx.Limits:
+        # Stand in for an interleaving lifespan, at the earliest point after
+        # this lifespan installed its own config on app.state.
+        captured['original'] = app.state.config
+        app.state.config = swapped
+        return real_build_http_limits(config)
+
+    async def _recording_open(self: _BurndownStore) -> None:
+        # Real open first: the lifespan must still get a usable store.
+        await real_open(self)
+        # The genuine interleave window.  Recorded (not swapped again) to prove
+        # the foreign config is installed across it, so the reads that follow
+        # would pick it up if they went through app.state.
+        captured['across_await'] = app.state.config
+
+    recorded: list[Any] = []
+
+    async def _recording_burndown_loop(
+        store: object,
+        config: object,
+        client: object,
+    ) -> None:
+        recorded.append(config)
+
+    config_before = getattr(app.state, 'config', None)
+    try:
+        with (
+            patch('dashboard.app._build_http_limits', new=_swapping_limits),
+            patch.object(_BurndownStore, 'open', _recording_open),
+            patch('dashboard.app._burndown_loop', new=_recording_burndown_loop),
+            patch('dashboard.app._metrics_loop', new=_noop_metrics_loop),
+            TestClient(app),
+        ):
+            # Read inside the lifespan: these are what startup actually built.
+            burndown_db_path = app.state.burndown_store.db_path
+            metrics_db_path = app.state.metrics_db_path
+    finally:
+        # Do not leak a hand-built config into sibling tests; every lifespan
+        # rebuilds it from_env anyway, so this only restores the idle state.
+        if config_before is not None:
+            app.state.config = config_before
+
+    assert 'original' in captured, (
+        'task 3771: _build_http_limits was never called -- the simulated interleave '
+        'never ran, so this test proves nothing'
+    )
+    original = captured['original']
+    assert original is not swapped, (
+        'task 3771: the simulated interleave must install a DISTINCT config object'
+    )
+    # Precondition for the two path assertions below: the roots really diverge,
+    # so "came from the lifespan's own config" is observable by VALUE.
+    assert original.burndown_db != swapped.burndown_db, (
+        'task 3771: the interleaving config must derive DIFFERENT store paths, '
+        'or the store-path assertions below hold under a swap and prove nothing'
+    )
+    assert original.metrics_db != swapped.metrics_db, (
+        'task 3771: the interleaving config must derive DIFFERENT store paths, '
+        'or the store-path assertions below hold under a swap and prove nothing'
+    )
+    assert captured.get('across_await') is swapped, (
+        'task 3771: the foreign config must still be installed on app.state across '
+        'await burndown_store.open() -- otherwise the post-await reads were never '
+        'actually exposed to an interleave and the assertions below are vacuous'
+    )
+
+    assert len(recorded) == 1, (
+        f'task 3771: expected exactly one _burndown_loop start per lifespan, '
+        f'got {len(recorded)}'
+    )
+    assert recorded[0] is original, (
+        'task 3771 INTERLEAVE: _burndown_loop received a config installed on app.state '
+        'AFTER its own lifespan built one -- lifespan must bind config to a local before '
+        'the first await, not re-read app.state.config across it'
+    )
+    assert burndown_db_path == original.burndown_db, (
+        f'task 3771 INTERLEAVE: the burndown store opened {burndown_db_path}, derived '
+        f'from a config this lifespan did not build (expected {original.burndown_db}). '
+        f'burndown_path must come from the lifespan-local config.'
+    )
+    assert metrics_db_path == original.metrics_db, (
+        f'task 3771 INTERLEAVE: the metrics store opened {metrics_db_path}, derived '
+        f'from a config this lifespan did not build (expected {original.metrics_db}). '
+        f'metrics_path must come from the lifespan-local config -- it is read AFTER '
+        f'await burndown_store.open(), squarely inside the interleave window.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
+    tmp_path: Path,
+) -> None:
+    """config stays an app.state re-read -- the deliberate half of the asymmetry.
+
+    The handles bind to arguments (see the tests above), but ``config`` must NOT:
+    ~25 dashboard tests swap ``client.app.state.config`` mid-test
+    (test_tab_escalation_analytics.py, test_escalation_lifecycle_gate.py,
+    test_memory_evals_data.py, ...) and depend on the swap being picked up.
+    This guard is what makes an over-eager "make it consistent" refactor break
+    ONE test here instead of ~25 elsewhere.
+
+    Drives ``_metrics_loop`` directly, reusing the harness in
+    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    """
+    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # Two REAL configs (not MagicMocks -- check_bare_magicmock_config.py Rule A),
+    # distinct in both identity and value.
+    config_a = DashboardConfig(project_root=tmp_path)
+    config_b = DashboardConfig(project_root=tmp_path / 'swapped')
+
+    mock_pool = MagicMock()
+    mock_pool.get = AsyncMock(return_value=None)
+    mock_http_client = MagicMock()
+    mock_app = MagicMock()
+    mock_app.state.config = config_a
+
+    seen_configs: list[Any] = []
+    saw_swapped = asyncio.Event()
+
+    async def _recording_collect(*args: object, **kwargs: Any) -> None:
+        seen = kwargs['config']
+        seen_configs.append(seen)
+        if seen is config_a:
+            # Stand in for the mid-test swap those ~25 sites perform.
+            mock_app.state.config = config_b
+        elif seen is config_b:
+            # Set from inside the recorder, so the wait below is racefree.
+            saw_swapped.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        # Must actually suspend.  A plain AsyncMock never yields, creating a
+        # tight synchronous loop that starves asyncio.wait_for of event-loop
+        # cycles -- see test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_recording_collect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+        ):
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_http_client,
+                )
+            )
+            try:
+                # Suppressed, not raised: on regression the swap never lands and
+                # a bare TimeoutError says nothing.  Falling through lets the
+                # named assertions below explain what actually broke.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(saw_swapped.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    assert seen_configs, 'task 3771: collect_metrics_snapshot was never called'
+    assert seen_configs[0] is config_a, (
+        'task 3771: the first cycle must use the config installed on app.state at the time'
+    )
+    assert any(cfg is config_b for cfg in seen_configs), (
+        'task 3771: a later cycle never picked up the swapped app.state.config. '
+        'config must stay an app.state re-read inside _run_once -- ~25 tests swap '
+        'client.app.state.config mid-test and depend on it. Only pool/http_client '
+        'bind to arguments.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
+    tmp_path: Path,
+) -> None:
+    """``_run_once`` must USE its ``pool``/``http_client`` arguments, not app.state.
+
+    The other tests in this module pin the CALL SITE (``lifespan`` hands each
+    loop the handles it built) and the config half of the asymmetry.  None of
+    them pins what ``_run_once`` does with the arguments it received: a
+    ``_metrics_loop`` whose signature still accepts ``pool``/``http_client`` but
+    whose body re-reads ``app.state.db`` / ``app.state.http_client`` reinstates
+    the exact cross-talk this task exists to remove, and was measured to leave
+    the whole dashboard suite green.
+
+    So this test makes argument and ``app.state`` *unmistakably* distinct: four
+    separate sentinels, two passed in and two installed on ``app.state``.  Both
+    pool sentinels get a working ``AsyncMock`` ``get``, so under the mutation the
+    loop still completes a cycle and the failure lands on a named binding
+    assertion rather than an incidental ``TypeError`` in an unrelated test.
+
+    Drives ``_metrics_loop`` directly, reusing the harness in
+    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    """
+    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # A REAL config, not a MagicMock -- check_bare_magicmock_config.py Rule A.
+    config = DashboardConfig(project_root=tmp_path)
+
+    # The two handles handed to the loop...
+    arg_pool = MagicMock()
+    arg_pool.get = AsyncMock(return_value=None)
+    arg_http_client = MagicMock()
+
+    # ...and two DIFFERENT ones parked on app.state, standing in for the
+    # handles an interleaving (already shut down) lifespan leaves behind.
+    # state_pool.get is a working AsyncMock on purpose: a regression must fail
+    # on the named assertions below, not on an un-awaitable auto-MagicMock.
+    state_pool = MagicMock()
+    state_pool.get = AsyncMock(return_value=None)
+    state_http_client = MagicMock()
+
+    mock_app = MagicMock()
+    mock_app.state.config = config
+    mock_app.state.db = state_pool
+    mock_app.state.http_client = state_http_client
+
+    recorded: list[dict[str, Any]] = []
+    saw_call = asyncio.Event()
+
+    async def _recording_collect(*args: object, **kwargs: Any) -> None:
+        recorded.append(kwargs)
+        # Set from inside the recorder, so the wait below is racefree.
+        saw_call.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        # Must actually suspend -- see the note in the config test above.
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_recording_collect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+        ):
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=arg_pool,
+                    http_client=arg_http_client,
+                )
+            )
+            try:
+                # Suppressed, not raised: a bare TimeoutError explains nothing.
+                # Falling through lets the named assertions say what broke.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(saw_call.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    # Without this every assertion below is vacuous: _run_once swallows any
+    # exception from its body into a generic 'Metrics snapshot error' warning.
+    assert recorded, (
+        'task 3771: collect_metrics_snapshot was never called -- the loop body never '
+        'completed a cycle, so nothing below proves anything'
+    )
+    kwargs = recorded[0]
+    assert kwargs['http_client'] is arg_http_client, (
+        'task 3771 CROSS-TALK: _run_once forwarded an http_client that is NOT the one '
+        '_metrics_loop was passed. The handle must come from the argument, never from '
+        'app.state -- app.state holds whichever lifespan wrote last, and its client may '
+        'already be closed.'
+    )
+    assert kwargs['http_client'] is not state_http_client, (
+        'task 3771 CROSS-TALK: _run_once forwarded the AsyncClient parked on '
+        'app.state.http_client (an interleaving lifespan closed handle) instead of its '
+        'own http_client argument'
+    )
+    assert arg_pool.get.await_count >= 1, (
+        'task 3771 CROSS-TALK: _run_once never touched the DbPool it was passed. It must '
+        'open every connection through the argument pool, never through app.state.db.'
+    )
+    assert state_pool.get.await_count == 0, (
+        'task 3771 CROSS-TALK: _run_once opened a connection through the DbPool parked on '
+        'app.state.db (an interleaving lifespan closed pool, whose get() silently returns '
+        'None) instead of its own pool argument'
+    )

@@ -36,19 +36,38 @@ respect to other readers.
 
 ## Running it as the periodic CHECK
 
-The DEFAULT dry run is also the silent-write detector: it exits
-:data:`EXIT_CLEAN` when nothing repairable remains and
-:data:`EXIT_REPAIRABLE_REMAINS` when some does, so a periodic check is one
-invocation and a non-zero exit::
+The DEFAULT dry run answers BOTH operator questions — but through two
+different channels, and conflating them is what made this section wrong until
+task 5283. Read the REPORT, not only the status::
 
     uv run --project shared python scripts/sweep_toolcall_markup.py \
         --lane meta-plans --json
 
+* **"Is there DEAD-LANE WORK PENDING?"** — the EXIT CODE. :data:`EXIT_CLEAN`
+  when nothing actionable remains, :data:`EXIT_REPAIRABLE_REMAINS` when some
+  does. NOTHING observed about a REFUSED file feeds it (see
+  :meth:`Summary.exit_code`) — not ``skipped``, not
+  :attr:`Summary.skipped_with_markup`, and not
+  :attr:`Summary.skipped_did_not_converge` — so a file this sweep refuses to
+  write can never redden the status. That is a property of the counters, not of
+  the scan: since the scan now runs BEFORE the gates it sees those files, and
+  each refused observation is banked into a report-only counter of its own.
+* **"Is it STILL HAPPENING?"** — ``strings_detected``,
+  :attr:`Summary.skipped_with_markup` and
+  :attr:`Summary.skipped_did_not_converge`. Every LOADED target is scanned,
+  including ones a write gate then refuses, so a corrupt plan under a LIVE lane
+  is reported. It was not, before: detection ran after the write gate, which made
+  this check structurally blind to live lanes — and new corruption is by
+  definition written by a RUNNING task into a LIVE lane, i.e. exactly the
+  population it claims to watch. A non-zero ``skipped_with_markup`` means
+  "corruption seen, not actionable here"; plan-tools' lazy read-repair (PRD D4)
+  owns that half of the corpus.
+
 A separate detector script was deliberately NOT written: it would have had to
 enumerate the envelope literals a second time, which is the one thing INV-5
 forbids. The lane's ``--apply`` mode is the disposition mechanism for the same
-population, so one command answers both "is it still happening" and "clean up
-what is dead".
+population, so one command still answers both questions — through its report,
+not through its status.
 
 ## Running it
 
@@ -235,10 +254,11 @@ def _has_dot_component(relative: Path) -> bool:
 def discover_targets(root: Path | str) -> list[Target]:
     """Every sweepable file under *root*, sorted, deterministic.
 
-    Returns the union of the two pinned path sets described in the module
+    Returns the union of the three pinned path sets described in the module
     docstring. An absent lane directory yields nothing rather than raising:
     ``.worktrees-orphaned`` only exists once the reclaim timer has rotated at
-    least one lane, so a fresh checkout legitimately has neither.
+    least one lane and ``.worktrees/.task-meta`` only once a lane has been
+    provisioned, so a fresh checkout legitimately has none of the three.
 
     Dot-prefixed files under ``data/escalations`` are EXCLUDED, explicitly.
     ``data/escalations/.watch-fire.json`` carries a full escalation-record
@@ -1289,6 +1309,23 @@ class Summary(NamedTuple):
     repaired_not_written: int = 0
     #: Documents that were still changing when the round bound ran out.
     did_not_converge: int = 0
+    #: Files a write gate refused that WERE carrying repairable markup. This is
+    #: what makes "not looked at" distinguishable from "clean": a corrupt plan
+    #: under a live lane and a clean one used to produce the same report.
+    #: Deliberately NOT read by :meth:`exit_code` — the status answers "is
+    #: there DEAD-lane work pending", and this counter answers "is it still
+    #: happening". Defaulted and trailing, so every positional construction
+    #: keeps working.
+    skipped_with_markup: int = 0
+    #: Non-convergence observed on a file a write gate then REFUSED. The same
+    #: split as :attr:`skipped_with_markup`, for the same reason: the scan now
+    #: runs before the gates, so it SEES documents this sweep will never write,
+    #: and folding their stalls into :attr:`did_not_converge` would hand
+    #: :meth:`exit_code` a red it can never clear — a non-converging plan under
+    #: a LIVE lane would redden the periodic check on every run forever, with
+    #: no action the sweep is permitted to take. Report-only, like every other
+    #: counter describing a refused file.
+    skipped_did_not_converge: int = 0
 
     def as_dict(self) -> dict:
         return dict(self._asdict())
@@ -1310,6 +1347,15 @@ class Summary(NamedTuple):
         document is still WRITTEN, ``failed`` and ``pending`` both stay 0, and
         exiting 0 there would be exactly the false "second run reports 0"
         signal this task is measured by.
+
+        A REFUSED file is outside every clause above. Nothing this status
+        reports can be true of a document the sweep declines to write, so
+        non-convergence seen on one goes to
+        :attr:`skipped_did_not_converge` and is read off the report — the same
+        rule ``skipped`` and :attr:`skipped_with_markup` already follow. It has
+        to be a separate counter rather than a narrower read here, because by
+        this point the two populations are indistinguishable: one integer
+        cannot say which of its stalls belonged to a writable file.
         """
         if self.did_not_converge:
             return EXIT_DID_NOT_CONVERGE
@@ -1321,11 +1367,21 @@ class Summary(NamedTuple):
 def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     """Sweep *root*; return ``(summary, diffs)``.
 
-    Pipeline order is deliberate: load-and-gate, then resolve-the-write-target,
-    THEN repair. Resolving before repairing means a gate-skip (a live lane, a
-    dangling link, committed evidence) is counted as ``skipped`` and never as
-    pending work — otherwise a permanently-skipped file would keep the exit
-    code at 1 forever and break the second-run-zero invariant.
+    Pipeline order is deliberate: LOAD, then SCAN, then resolve-the-write-target
+    and the remaining gates. Scanning first is what lets the report see a file
+    this sweep will never write (task 5283); it is safe because
+    :func:`repair_document` is non-mutating and returns a NEW object, so the
+    scan changes what is COUNTED and nothing about what is WRITTEN.
+
+    The invariant that order used to defend is now carried by the ``continue``s
+    instead, and is stronger for it: EVERY gate refusal continues before the
+    ``pending``, ``repaired`` and ``did_not_converge`` increments, so a
+    permanently-skipped file (a live lane, a dangling link, committed evidence)
+    contributes to no counter :meth:`Summary.exit_code` reads and can never
+    keep the status non-zero forever. What it DOES contribute to is the
+    report-only pair ``skipped_with_markup`` / ``skipped_did_not_converge``,
+    which is how "refused, and it was dirty" stays distinguishable from
+    "clean" now that the scan can tell them apart.
 
     ``repaired`` counts what is ON DISK. Under ``--apply`` a file's repairs are
     added only AFTER its write returns success; a failed write puts them in
@@ -1345,7 +1401,7 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     skipped: dict[str, int] = {}
     diffs: list[str] = []
     scanned = detected = repaired_count = leaks = quotes = failed = pending = 0
-    not_written = stalled = 0
+    not_written = stalled = skipped_with_markup = skipped_stalled = 0
 
     for target in targets:
         scanned += 1
@@ -1355,18 +1411,17 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
             skipped[loaded.reason] = skipped.get(loaded.reason, 0) + 1
             continue
 
-        resolved = resolve_write_target(target, root_path)
-        if isinstance(resolved, Refusal):
-            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
-            continue
-
-        if not round_trips(loaded.raw, loaded.obj):
-            reason = REASON_FORMAT_NOT_REPRODUCIBLE
-            skipped[reason] = skipped.get(reason, 0) + 1
-            continue
-
+        # DETECTION RUNS BEFORE THE WRITE GATES, deliberately (task 5283).
+        # ``repair_document`` is non-mutating and returns a NEW object, so
+        # scanning here changes what is COUNTED without changing what is
+        # WRITTEN. Gating the scan behind the write decision made this sweep
+        # structurally blind to live lanes — and new corruption is BY
+        # DEFINITION written by a RUNNING task into a LIVE lane, so the check
+        # advertised as the silent-write detector could not see the one
+        # population it exists to watch. ``load_target`` stays first: nothing
+        # can be scanned that cannot be loaded.
         new_obj, outcomes = repair_document(loaded.obj)
-        file_repairs = 0
+        file_repairs = file_stalls = 0
         for outcome in outcomes:
             if outcome.action == ACTION_REPAIRED:
                 detected += 1
@@ -1383,7 +1438,41 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
                 # would corrupt the one-outcome-per-string arithmetic the
                 # residue counters rest on. It gets its own counter, its own
                 # report line, and its own exit code.
-                stalled += 1
+                #
+                # Tallied PER FILE and banked past the gates below, never
+                # straight into `stalled`: this scan sees files the sweep is
+                # about to refuse, and `did_not_converge` is the one residue
+                # counter `exit_code()` DOES read. Banking it here would give a
+                # non-converging plan under a live lane a permanent red the
+                # sweep is not allowed to clear.
+                file_stalls += 1
+
+        # ...and only NOW the write gates. A refusal still increments
+        # ``skipped[reason]`` and leaves ``pending`` untouched, so the
+        # second-run-zero invariant and the exit-code contract are preserved
+        # verbatim; the one addition is ``skipped_with_markup``, which is what
+        # makes "not looked at" distinguishable from "clean" in the report.
+        resolved = resolve_write_target(target, root_path)
+        if isinstance(resolved, Refusal):
+            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
+            if file_repairs:
+                skipped_with_markup += 1
+            skipped_stalled += file_stalls
+            continue
+
+        if not round_trips(loaded.raw, loaded.obj):
+            reason = REASON_FORMAT_NOT_REPRODUCIBLE
+            skipped[reason] = skipped.get(reason, 0) + 1
+            if file_repairs:
+                skipped_with_markup += 1
+            skipped_stalled += file_stalls
+            continue
+
+        # Past every gate: this file is one the sweep may write, so its stalls
+        # are the operator-actionable kind the exit code exists to surface.
+        # Banked BEFORE the no-repairs shortcut below, so a document that
+        # stalls without landing a repair is still reported.
+        stalled += file_stalls
 
         if not file_repairs:
             continue
@@ -1418,6 +1507,8 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
         pending=pending,
         repaired_not_written=not_written,
         did_not_converge=stalled,
+        skipped_with_markup=skipped_with_markup,
+        skipped_did_not_converge=skipped_stalled,
     ), diffs
 
 
@@ -1431,8 +1522,11 @@ def main(argv: list[str] | None = None) -> int:
             'only), .worktrees-orphaned/*/.task/plan.json and '
             '.worktrees/.task-meta/*/plan.json (dead lanes only — a plan a '
             'live lane still shares is refused). Dry run by default, which is '
-            'also the periodic silent-write CHECK: exit 0 when nothing '
-            'remains, 1 when repairable markup does. Never touches '
+            'also the periodic silent-write CHECK: the exit code answers "is '
+            'there dead-lane work pending" (0 none, 1 some), while '
+            '"strings detected" and "skipped w/ markup" answer "is it still '
+            'happening" — every loaded file is scanned, including ones the '
+            'write gate refuses. Never touches '
             'docs/task-recovery-2026-05-13/worktree-inventory.json or '
             'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json, '
             'which are committed evidence that legitimately quotes specimens.'
@@ -1476,6 +1570,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f'write failures     : {summary.failed}')
     print(f'repairs not written: {summary.repaired_not_written}')
     print(f'did not converge   : {summary.did_not_converge}')
+    print(f'skipped w/ markup  : {summary.skipped_with_markup}')
+    print(f'skipped/no converge: {summary.skipped_did_not_converge}')
     for reason in sorted(summary.skipped):
         print(f'skipped/{reason:<10}: {summary.skipped[reason]}')
     return summary.exit_code()

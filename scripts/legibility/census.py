@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import copy
 import functools
 import json
@@ -408,6 +409,120 @@ class CensusHeadroomExhausted(Exception):
         self.reason = reason
         self.verified = verified
         self.unverified = unverified
+
+
+class CensusPostRefusedUnderTest(RuntimeError):
+    """Raised when a pytest process tries to POST to a real MCP endpoint
+    through this module.
+
+    The contract: a pytest process never speaks to a real MCP endpoint
+    through census.py. A caller that serves or fakes its OWN endpoint is
+    entitled to, and DECLARES that by wrapping those calls in
+    :func:`own_endpoint`.
+
+    A distinct type, not a bare ``RuntimeError``, so the regression test has
+    something falsifiable to assert on and an operator reading a log can tell
+    a refused test POST from an ordinary transport failure.
+    """
+
+
+_own_endpoint_declared: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "census_own_endpoint_declared", default=False,
+)
+"""Whether the calls being made right here post to an endpoint the CALLER
+owns. Set only by :func:`own_endpoint`, and only for the duration of its
+block -- a ``ContextVar`` rather than a module global so the grant cannot
+outlive the ``with`` that made it, and so concurrent contexts cannot inherit
+one another's entitlement."""
+
+
+@contextlib.contextmanager
+def own_endpoint():
+    """Declare that the MCP POSTs made inside this block target an endpoint
+    the CALLER owns -- a server it brought up itself on an ephemeral port, or
+    a faked transport below httpx -- so
+    :func:`_refuse_real_post_under_test` stands aside for exactly those calls.
+
+    THE supported way to reach a real POST from inside a pytest process; see
+    that function for why the default is to refuse. Use it as narrowly as the
+    call it entitles::
+
+        with census.own_endpoint():
+            escalate_fn(category="infra_issue", ...)
+
+    Call-SCOPED on purpose. The entitlement is a claim about one endpoint, and
+    census posts to two (``escalate_info`` on the project's escalation server,
+    ``submit_task`` on fused-memory) -- a grant that lasted a whole test or
+    fixture would silently cover the other one too, which is more than any
+    caller means to claim. Being a public function also gives the two test
+    suites that need it (``scripts/tests/test_legibility_census.py`` and
+    ``escalation/tests/test_legibility_census_escalation_e2e.py``, in
+    different packages) a supported seam to depend on instead of each reaching
+    in and rebinding a private name.
+    """
+    token = _own_endpoint_declared.set(True)
+    try:
+        yield
+    finally:
+        _own_endpoint_declared.reset(token)
+
+
+def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
+    """Refuse a real MCP POST from inside a pytest process; no-op otherwise.
+
+    WHY HERE. :func:`_post_mcp_tool_call` is THE single MCP boundary for both
+    consumers -- :func:`default_submit_fn`'s ``submit_task`` (:8002) and
+    :func:`_build_default_escalate_fn`'s ``escalate_info`` (:8103) -- so one
+    call covers both with no second mechanism. It is also default-safe for
+    tests not yet written: a new ``main()``-level test is protected without
+    doing anything, which matters because the leak arrives through
+    ``main()``'s fail-loud catch-all, i.e. through a test whose
+    monkeypatched ``run_census`` raised UNEXPECTEDLY.
+
+    WHY IT MATTERS. A test-minted escalation is indistinguishable at triage
+    from a genuine census failure -- same synthetic ``task_id``, same
+    ``agent_role`` -- in the one human-facing channel the
+    recon-escalation-watcher closes; ``esc-legibility-census-dark_factory-2``
+    reached ``dedupe_count=21`` that way.
+
+    WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return is
+    indistinguishable from a real MCP response at every consumer. ``{}`` is
+    what ``_escalate_fn`` already returns when a POST genuinely fails, and
+    what ``run_census`` reads as "submit_fn returned no usable id" -- so a
+    suppressed POST would arrive looking like an ordinary weak response
+    rather than like a suppression, and any future caller that checks only
+    for an exception would read it as success. A typed exception says which
+    one it is at both consumers. Raising costs nothing on the escalation
+    path -- ``_escalate_fn``'s existing ``except Exception`` already turns
+    any transport failure into its established WARNING and returns ``{}``,
+    so ``main()`` still prints ``census: FAILED`` and returns 1.
+
+    WHY A DECLARED HATCH RATHER THAN A SNIFFED ONE. No automatic signal
+    separates "a server this test brought up on an ephemeral port" from "the
+    ambient production server on 8103": the leaking tests write
+    ``escalation_port: 8103`` into their own tmp_path config, so port, config
+    shape and project_id all match. Entitlement is therefore a human
+    judgement about who owns the endpoint, declared by wrapping the entitled
+    calls in :func:`own_endpoint` -- see
+    ``escalation/tests/test_legibility_census_escalation_e2e.py`` (task
+    3644's live-server acceptance suite, which must keep reaching the real
+    streamable-HTTP protocol). A caller who forgets fails loud with a message
+    naming the hatch; the opposite default -- allow, and remember to block --
+    is what produced the dedupe_count above.
+    """
+    if _own_endpoint_declared.get():
+        return
+    current_test = os.environ.get("PYTEST_CURRENT_TEST")
+    if current_test is None:
+        return
+    raise CensusPostRefusedUnderTest(
+        f"census: refusing to POST MCP tool {tool_name!r} to a real endpoint "
+        f"({url}) from inside a pytest process (PYTEST_CURRENT_TEST="
+        f"{current_test!r}). A test-minted escalation is indistinguishable at "
+        f"triage from a genuine census failure. If this caller serves or fakes "
+        f"its OWN endpoint, declare that around the call: "
+        f"`with census.own_endpoint(): ...`."
+    )
 
 
 @dataclass
@@ -789,7 +904,56 @@ class DryRunFiling:
     payload_count: int
 
 
-def render_report(
+SECTION_HEADER = "header"
+SECTION_FORCE_MARKER = "force-marker"
+SECTION_SATURATION = "saturation"
+SECTION_VERIFICATION = "verification"
+SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
+SECTION_MATRIX = "matrix"
+SECTION_SYNTHESIS = "synthesis"
+SECTION_FILED_TASKS = "filed-tasks"
+SECTION_COST = "cost"
+"""Stable machine keys for the blocks :func:`census_report_sections` emits.
+
+Never rendered -- they exist so a caller can ask WHICH blocks a report
+carries and in what order without matching on the English inside them."""
+
+
+@dataclass(frozen=True)
+class ReportSection:
+    """One block of the census report, under a STABLE machine key.
+
+    The key is never rendered. It exists so a caller can ask WHICH blocks a
+    report carries and in what order without matching on the English inside
+    them. Prose is the part of this function expected to be reworded, and a
+    check that keys on prose constrains wording rather than behaviour; keying
+    on the structure keeps the NO-SILENT-CAPS disclosure guarantees
+    falsifiable instead -- a section that stops being emitted, or is emitted
+    on the wrong run, or lands below the thing it qualifies, fails, and a copy
+    edit does not.
+
+    ``lines`` is the section's own slice of the report, including its own
+    leading blank line, so :func:`join_report_sections` is a plain
+    concatenation. A single element may itself be a multi-line blob (an
+    embedded ``matrix_md`` / ``synthesis_md``).
+
+    Convention, not invention: esc-3208-4, memories
+    53e61951-0704-4436-94bd-bf12ae66c23b and
+    538183c6-6a83-44b6-8a2f-290b75a545d6, shipped in
+    ``fused-memory/scripts/memory_eval_retrieval_probe.py`` and
+    ``memory_eval_staleness_sweep.py``, which each define the dataclass
+    locally as this does.
+    """
+
+    key: str
+    lines: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def census_report_sections(
     *,
     date: str,
     project_id: str,
@@ -801,31 +965,40 @@ def render_report(
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
-) -> str:
-    """Assemble the dated census report as markdown, purely from the
-    pieces passed in -- no clock, no model call, no I/O. *date* and every
-    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
-    so the same inputs always render byte-identical output.
+    dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+) -> tuple[ReportSection, ...]:
+    """The dated census report, decomposed -- see :func:`render_report` for
+    the markdown an operator reads.
 
-    NO SILENT CAPS: when the operator bounded this run, the report says
-    so in as many words. The batch-cap coverage lines in ``## Saturation``
-    are rendered ONLY when ``mining_result.max_batches`` is not None, so a
-    FLAGLESS run's output is byte-identical to what it was before the
-    operator cost-control flags existed (locked by
-    ``test_render_report_flagless_output_is_byte_identical_golden``). The
-    same gating applies to every other cost-control rendering here.
+    THE single source of both: :func:`render_report` joins what this returns,
+    so a section present here is present there by construction and the two
+    cannot drift into disagreeing about what the run disclosed.
+
+    NO SILENT CAPS: when the operator bounded this run, the report says so in
+    as many words. The batch-cap coverage lines in ``## Saturation`` are
+    emitted ONLY when ``mining_result.max_batches`` is not None, so a FLAGLESS
+    run's output is byte-identical to what it was before the operator
+    cost-control flags existed (locked by
+    ``test_render_report_flagless_output_is_byte_identical_golden``). The same
+    gating applies to every other cost-control rendering here.
     """
-    lines = [f"# confusion census {date}", "", f"Project: {project_id}"]
+    sections: list[ReportSection] = []
+
+    def emit(key: str, lines: list[str]) -> None:
+        sections.append(ReportSection(key=key, lines=tuple(lines)))
+
+    emit(SECTION_HEADER, [f"# confusion census {date}", "", f"Project: {project_id}"])
 
     if force:
-        lines.append("")
-        lines.append("_--force: operator-initiated run._")
+        emit(SECTION_FORCE_MARKER, ["", "_--force: operator-initiated run._"])
 
-    lines.append("")
-    lines.append("## Saturation")
-    lines.append("")
-    lines.append(f"- batches: {len(mining_result.batch_stats)}")
-    lines.append(f"- stop reason: {mining_result.stop_reason}")
+    saturation = [
+        "",
+        "## Saturation",
+        "",
+        f"- batches: {len(mining_result.batch_stats)}",
+        f"- stop reason: {mining_result.stop_reason}",
+    ]
     if mining_result.max_batches is not None:
         # Deliberately states only counts this function was actually handed:
         # the total number of ENUMERATED sessions is not knowable here
@@ -865,12 +1038,12 @@ def render_report(
                     f" {drawn - coded} digest(s) FAILED TO CODE and contributed no "
                     "signal (see the per-batch tallies below)."
                 )
-            lines.append(coverage_line)
+            saturation.append(coverage_line)
             # PARTIAL is not the same as "the rest comes later" -- say which
             # one this is. run_census always calls advance_census_state, and
             # _census_window_dates anchors the NEXT window at last_census_at,
             # so the capped-away sessions fall outside every future window.
-            lines.append(
+            saturation.append(
                 "- NOT PICKED UP LATER: this run still advances last_census_at, so the "
                 "next census window starts here -- the capped-away sessions fall outside "
                 "it and are never re-enumerated. Sweeping them means rolling "
@@ -878,24 +1051,23 @@ def render_report(
                 "next run; a plain re-run will not reach them."
             )
         else:
-            lines.append(
+            saturation.append(
                 f"- operator batch cap: {mining_result.max_batches} batch(es) "
                 f"(not reached -- mining stopped by: {mining_result.stop_reason})"
             )
     for stats in mining_result.batch_stats:
-        lines.append(
+        saturation.append(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
             f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
             f"saturated={stats.saturated})"
         )
+    emit(SECTION_SATURATION, saturation)
 
     if verify_coverage is not None:
         deferred = verify_coverage.novel - verify_coverage.verified
-        lines.append("")
-        lines.append("## Verification")
-        lines.append("")
+        verification = ["", "## Verification", ""]
         if deferred > 0:
-            lines.append(
+            verification.append(
                 f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
                 f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
                 "as pending candidates -- merged into the codebook by this run but NOT "
@@ -905,7 +1077,7 @@ def render_report(
             # conditional, not automatic. This window's sightings are not
             # re-mined (last_census_at re-anchors), so a deferred cluster is
             # re-adjudicated only when the same confusion shows up again.
-            lines.append(
+            verification.append(
                 "- a deferred candidate is re-adjudicated only if the same confusion "
                 "RECURS in a later window: this run advances last_census_at, so these "
                 "sightings are never re-mined. A one-off deferred by the cap stays "
@@ -914,43 +1086,112 @@ def render_report(
         else:
             # A cap that was SET BUT NOT REACHED must not emit the deferral
             # clause -- nothing was deferred and nothing went unverified.
-            lines.append(
+            verification.append(
                 f"- verified all {verify_coverage.novel} novel cluster(s); operator "
                 f"verify cap: {verify_coverage.cap} (not reached)."
             )
+        emit(SECTION_VERIFICATION, verification)
 
-    lines.append("")
-    lines.append("## Origin x Manifestation Matrix")
-    lines.append("")
-    lines.append(matrix_md)
+    if dropped_verdicts:
+        # Same NO-SILENT-CAPS reasoning as the coverage lines above, applied to
+        # the other thing this run silently paid for: stdout and the WARNING log
+        # of an unattended nightly run are gone by morning, and the dated report
+        # is the artifact an operator actually reads afterwards. "This run paid
+        # for N adjudications that went nowhere" belongs in the channel that
+        # survives. Gated on a non-empty list so a clean run stays byte-identical
+        # to the golden.
+        unresolved = [
+            "",
+            "## Unresolved Verdicts",
+            "",
+            f"- {len(dropped_verdicts)} verdict(s) this run PAID FOR resolved to no "
+            "pending candidate and were DROPPED. Nothing is lost from the codebook -- "
+            "a standing prior adjudication of the same title holds, which is the "
+            "correct outcome -- but the adjudication spend went nowhere and only a "
+            "hand re-open will change that.",
+        ]
+        unresolved.extend(
+            f"  - {_dropped_verdict_message(record)}" for record in dropped_verdicts
+        )
+        emit(SECTION_UNRESOLVED_VERDICTS, unresolved)
 
-    lines.append("## Synthesis")
-    lines.append("")
-    lines.append(synthesis_md)
+    emit(SECTION_MATRIX, ["", "## Origin x Manifestation Matrix", "", matrix_md])
 
-    lines.append("")
-    lines.append("## Filed Tasks")
-    lines.append("")
+    # NO leading blank line, deliberately: `matrix_md` is embedded verbatim and
+    # carries its own trailing newline, so `## Synthesis` follows it
+    # immediately. The golden pins `matrix\n## Synthesis`; normalising this
+    # during a refactor is the one plausible way to break byte-identity while
+    # every structural assertion still passes.
+    emit(SECTION_SYNTHESIS, ["## Synthesis", "", synthesis_md])
+
+    filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
         # Checked FIRST: under --dry-run-filing, filed_task_ids is empty by
         # construction, and the plain "_none filed._" placeholder would read
         # as a normal run that simply had nothing to file.
-        lines.append(
+        filed_tasks.append(
             f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
             "-- NOTHING filed; review before filing._"
         )
     elif filed_task_ids:
-        lines.extend(f"- {task_id}" for task_id in filed_task_ids)
+        filed_tasks.extend(f"- {task_id}" for task_id in filed_task_ids)
     else:
-        lines.append("_none filed._")
+        filed_tasks.append("_none filed._")
+    emit(SECTION_FILED_TASKS, filed_tasks)
 
-    lines.append("")
-    lines.append("## Cost")
-    lines.append("")
-    lines.append(cost_note)
-    lines.append("")
+    # The trailing "" is the report's final newline, which the join would
+    # otherwise not supply.
+    emit(SECTION_COST, ["", "## Cost", "", cost_note, ""])
 
-    return "\n".join(lines)
+    return tuple(sections)
+
+
+def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
+    """Render *sections* to the markdown an operator reads.
+
+    Each section carries its own leading blank line, so this is a plain
+    concatenation -- there is no separator policy here that could disagree
+    with what a section believes its own shape is."""
+    return "\n".join(line for section in sections for line in section.lines)
+
+
+def render_report(
+    *,
+    date: str,
+    project_id: str,
+    force: bool,
+    matrix_md: str,
+    mining_result: MiningResult,
+    synthesis_md: str,
+    filed_task_ids: list[str],
+    cost_note: str,
+    verify_coverage: VerifyCoverage | None = None,
+    dry_run: DryRunFiling | None = None,
+    dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+) -> str:
+    """Assemble the dated census report as markdown, purely from the
+    pieces passed in -- no clock, no model call, no I/O. *date* and every
+    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
+    so the same inputs always render byte-identical output.
+
+    A pure join of :func:`census_report_sections`, which is the single source
+    of what the report contains and in what order -- including every
+    NO-SILENT-CAPS gating rule. Read that function for the structure; this one
+    exists so callers who only want the text do not have to.
+    """
+    return join_report_sections(census_report_sections(
+        date=date,
+        project_id=project_id,
+        force=force,
+        matrix_md=matrix_md,
+        mining_result=mining_result,
+        synthesis_md=synthesis_md,
+        filed_task_ids=filed_task_ids,
+        cost_note=cost_note,
+        verify_coverage=verify_coverage,
+        dry_run=dry_run,
+        dropped_verdicts=dropped_verdicts,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1024,13 +1265,220 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     """Locate a still-``pending`` candidate in *cb* by *title* -- the same
     key ``codebook.apply_coding_record`` groups new candidates by, so a
     verified/rejected cluster (built pre-merge from a raw mining record) can
-    be resolved to the REAL candidate id the merge just assigned it. Returns
-    ``None`` if no such pending candidate exists (defensive -- should not
-    happen for a title that came from this run's own mining records)."""
+    be resolved to the REAL candidate id the merge just assigned it.
+
+    ``None`` is a NORMAL outcome, not a defensive impossibility. When a
+    re-mined title's only same-title candidate is already adjudicated,
+    ``codebook.apply_coding_record`` deliberately declines to fabricate a
+    pending twin (task 4144 -- fabricating one is how rejected
+    ``cand-20260722-28`` came back as pending ``cand-20260724-2`` in the
+    live codebook) and routes the recurrence sighting to the standing
+    record instead. The prior verdict standing is the CORRECT result; what
+    was wrong was skipping the cluster in silence. Callers are therefore
+    required to SURFACE a ``None`` -- see BOTH of ``run_census``'s
+    adjudication loops (verified and rejected) and
+    ``_find_adjudicated_candidate``, which names which verdict is
+    standing."""
     for candidate in cb.get("candidates") or []:
         if candidate.get("title") == title and candidate.get("disposition") == "pending":
             return candidate.get("id")
     return None
+
+
+def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
+    """Locate the standing already-adjudicated (non-``pending``) candidate
+    in *cb* for *title* -- the one whose verdict explains why
+    ``_find_pending_candidate_id`` found nothing.
+
+    Mirrors ``codebook.apply_coding_record``'s own TWO-STEP precedence for
+    exactly this situation (its ``elif same_title:`` branch, reached when
+    every same-title candidate is adjudicated), so census and the merger
+    cannot disagree about which record is authoritative:
+
+    1. the LAST ``promoted`` same-title candidate whose ``promoted_to``
+       names an entry that actually EXISTS -- the merger routes the
+       recurrence sighting to that ENTRY, so that is what stands;
+    2. otherwise the LAST same-title non-pending candidate, which is where
+       the merger files the sighting instead (``same_title[-1]``, its
+       deterministic tie-break).
+
+    Step 1 is not a refinement of step 2 but a different answer: for
+    ``[promoted(resolvable), rejected]`` the two disagree, and reading step 2
+    alone inverts every label the caller prints -- an operator would be told
+    that a live codebook entry standing against a fresh REJECT is an
+    agreement. Duplicate-title adjudicated pairs are known to exist (the
+    task-4144 ``cand-20260722-28`` / ``cand-20260724-2`` pair), so the order
+    is reachable, not hypothetical.
+
+    A ``promoted`` record whose ``promoted_to`` resolves to nothing
+    (hand-edited, or pre-``promote_candidate``) is NOT authoritative under
+    step 1 -- again matching the merger, which falls through to step 2 for
+    it, because no entry exists to carry the signal.
+
+    ``None`` means no same-title candidate exists at all, which is a
+    different and stranger situation -- the caller says so plainly rather
+    than inventing an explanation."""
+    same_title = [
+        candidate for candidate in cb.get("candidates") or []
+        if candidate.get("title") == title and candidate.get("disposition") != "pending"
+    ]
+    entry_ids = {entry.get("id") for entry in cb.get("entries") or [] if entry.get("id")}
+    for candidate in reversed(same_title):
+        if (
+            candidate.get("disposition") == "promoted"
+            and candidate.get("promoted_to") in entry_ids
+        ):
+            return candidate
+    return same_title[-1] if same_title else None
+
+
+DROP_NO_STANDING = "no-standing-candidate"
+DROP_CONTRADICTION = "contradicts-standing"
+DROP_AGREEMENT = "agrees-with-standing"
+"""Stable machine keys for the three ways a paid-for verdict can be dropped.
+
+Same convention, and the same reason, as the ``SECTION_*`` report keys above:
+the distinction an operator acts on must be readable as DATA, not recovered by
+matching English out of a log line. The three differ in what an operator must
+DO -- the merge and this run disagree about the title / a standing record
+contradicts a fresh verdict / a standing record agrees with it -- which is what
+justified separate messages in the first place, so it is the thing to carry
+structurally and the thing tests assert on."""
+
+
+@dataclass(frozen=True)
+class DroppedVerdict:
+    """One verdict this run PAID FOR that resolved to no pending candidate
+    and was therefore discarded.
+
+    Post-4144 the drop itself is CORRECT: the merger declines to fabricate a
+    pending twin over an already-adjudicated record. What was missing is that
+    it happened at all, and against WHAT. The run summary, the persisted
+    report and the tests all read this one structure."""
+
+    verdict: str
+    """``"verified"`` or ``"rejected"`` -- which adjudication loop paid for it.
+    Inverts against ``standing_disposition``; see :func:`_dropped_verdict`."""
+
+    title: str | None
+    kind: str
+    """``DROP_NO_STANDING`` / ``DROP_CONTRADICTION`` / ``DROP_AGREEMENT``."""
+
+    standing_id: str | None = None
+    standing_disposition: str | None = None
+    standing_first_seen: str | None = None
+    """The standing record that explains the drop -- all three ``None``
+    exactly when ``kind`` is ``DROP_NO_STANDING``. ``first_seen`` and
+    ``disposition`` are ``_CANDIDATE_SCHEMA``-REQUIRED fields
+    (``codebook.py::_CANDIDATE_SCHEMA``), so a standing record always carries
+    them."""
+
+
+def _dropped_verdict(
+    *, verdict: str, cluster: dict, cb: dict, contradicting_disposition: str,
+) -> DroppedVerdict:
+    """Classify one dropped *verdict* against whatever candidate is standing
+    for *cluster*'s title in *cb*.
+
+    THE INVERSION, and the only thing that differs between the two
+    adjudication loops: ``promoted`` and ``rejected`` swap roles. A standing
+    PROMOTION contradicts a fresh REJECT (a live codebook entry stands for a
+    title this run judged unfounded); a standing REJECT contradicts a fresh
+    VERIFY (a pattern this run confirmed enters no entry at all). That
+    inversion is one value -- *contradicting_disposition* -- passed at each
+    call site, where it sits next to the loop it belongs to and is the
+    obvious thing to read when checking whether a label is right.
+
+    A parameter rather than two copies of this ladder: the mislabelling edit
+    both shapes guard against fails
+    ``test_dropped_verdict_contradiction_marker_inverts_between_the_loops``
+    either way, while two copies additionally allow the messages to DRIFT,
+    which no test catches."""
+    standing = _find_adjudicated_candidate(cb, cluster.get("title"))
+    if standing is None:
+        return DroppedVerdict(
+            verdict=verdict, title=cluster.get("title"), kind=DROP_NO_STANDING,
+        )
+    return DroppedVerdict(
+        verdict=verdict,
+        title=cluster.get("title"),
+        kind=(
+            DROP_CONTRADICTION
+            if standing.get("disposition") == contradicting_disposition
+            else DROP_AGREEMENT
+        ),
+        standing_id=standing.get("id"),
+        standing_disposition=standing.get("disposition"),
+        standing_first_seen=standing.get("first_seen"),
+    )
+
+
+_DROPPED_VERDICT_LOSS = {
+    "verified": (
+        "this run CONFIRMED a pattern a prior verdict called unfounded, so it enters "
+        "NO codebook entry and is invisible to every later census"
+    ),
+    "rejected": (
+        "a live codebook entry stands for a title this run judged unfounded"
+    ),
+}
+"""What a CONTRADICTED drop actually COSTS, per loop -- the one clause
+:func:`_dropped_verdict_message` cannot render uniformly, because the two
+losses differ in substance and not merely in wording."""
+
+
+def _dropped_verdict_message(record: DroppedVerdict) -> str:
+    """The operator-facing prose for *record* -- rendered FROM the record, so
+    the wording is free to change without breaking anything that asserts on
+    the drop.
+
+    Carries no ``census:`` prefix and no leading bullet: it is the ONE
+    rendering, read both from the run's WARNING log and from the persisted
+    report's ``## Unresolved Verdicts`` section, and each of those supplies
+    its own framing."""
+    if record.kind == DROP_NO_STANDING:
+        return (
+            f"{record.verdict} cluster {record.title!r} resolved to no pending "
+            "candidate AND no same-title candidate exists at all -- this verdict is "
+            "DROPPED with no standing record to explain it; the merge and this run's "
+            "cluster list disagree about the title."
+        )
+    standing = (
+        f"id={record.standing_id}, disposition={record.standing_disposition}, "
+        f"first_seen={record.standing_first_seen}"
+    )
+    if record.kind == DROP_CONTRADICTION:
+        return (
+            f"{record.verdict} cluster {record.title!r} resolved to no pending "
+            f"candidate -- this verdict is DROPPED and CONTRADICTS the standing "
+            f"record ({standing}): {_DROPPED_VERDICT_LOSS[record.verdict]}. Nothing "
+            "reconciles the two; only a hand re-open will change it."
+        )
+    return (
+        f"{record.verdict} cluster {record.title!r} resolved to no pending "
+        f"candidate -- this verdict is DROPPED and AGREES with the standing record "
+        f"({standing}). Nothing to do; only the verify call was spent."
+    )
+
+
+def _report_dropped_verdicts(records: list[DroppedVerdict]) -> None:
+    """Announce the run's dropped verdicts: one WARNING per record, then ONE
+    run-summary line sizing the total.
+
+    Emitted only when there is something to say -- silence on a clean run
+    keeps the summary informative rather than skimmable. The per-record lines
+    say WHICH titles; the summary says how much of the run went nowhere."""
+    for record in records:
+        logger.warning("census: %s", _dropped_verdict_message(record))
+    if records:
+        logger.warning(
+            "census: %d unresolved verdict(s) -- verdicts that found no pending "
+            "candidate and were dropped. These were PAID FOR and went nowhere: a "
+            "prior adjudication of the same title is standing and only a hand "
+            "re-open will change it. See the per-cluster warnings above for which "
+            "titles.",
+            len(records),
+        )
 
 
 def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
@@ -1113,6 +1561,33 @@ class CensusOutcome:
     sightings are re-mined by the next run. It is the size of the work the
     cap interrupted, which is what makes a defer legible next to an
     ordinary run in which the verifier genuinely rejected everything."""
+
+    dropped_verdicts: tuple[DroppedVerdict, ...] = ()
+    """Every verdict this run PAID FOR that resolved to no pending candidate
+    and was dropped, one record each (``status == "done"`` runs only).
+
+    THE authority on what was dropped: ``unresolved_verdicts`` below is its
+    length, the run-summary WARNING is rendered from it, and the report's
+    unresolved-verdicts section is built from it. A caller asking WHICH titles
+    went nowhere, and whether any of them contradicts a standing record, reads
+    records rather than the English of a log line."""
+
+    unresolved_verdicts: int = 0
+    """How many verify verdicts this run PAID FOR resolved to no pending
+    candidate and were dropped (``status == "done"`` runs only) --
+    ``len(dropped_verdicts)``, kept as its own field because it is what
+    ``main``'s summary line and every count-only caller actually want.
+
+    NOT a loss of persisted state -- the codebook is correct either way. The
+    standing prior verdict holding is the CORRECT outcome; the merger is
+    right not to fabricate a pending twin over an adjudicated record (task
+    4144). It sizes the adjudication effort that went nowhere. Carried as a
+    FIELD, not just a log line, so it is assertable structurally rather than
+    by log-scraping, exactly like ``unverified_clusters`` above.
+
+    A recurring non-zero count is the operator's cue that a title keeps
+    being re-mined and re-verified against a verdict that will never change
+    without a hand re-open."""
 
 
 def _defer(
@@ -1556,9 +2031,33 @@ def run_census(
     for record in mining_result.records:
         updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
 
+    # ONE list for every verdict this run paid for and dropped, shared by both
+    # adjudication loops below -- a per-loop name would fork the tally
+    # permanently. Records, not a bare count, so the run summary, the persisted
+    # report and the tests all read one structure.
+    dropped_verdicts: list[DroppedVerdict] = []
+
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
+            # A verify verdict this run PAID FOR that resolves to no pending
+            # candidate. Post-4144 this is a normal outcome, not an anomaly
+            # (see _find_pending_candidate_id); skipping it is still correct,
+            # announcing it is what was missing. The silence costs MORE here
+            # than on the reject side below: a confusion pattern this run
+            # CONFIRMED enters no codebook entry, and every later census codes
+            # against entries -- so it goes invisible, not merely uncounted.
+            #
+            dropped_verdicts.append(_dropped_verdict(
+                verdict="verified",
+                cluster=cluster,
+                cb=updated_codebook,
+                # THE INVERSION, this loop's half: a standing REJECT is what
+                # contradicts a fresh VERIFY. The `rejected` loop below passes
+                # "promoted". Pinned by
+                # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
+                contradicting_disposition="rejected",
+            ))
             continue
         severity = cluster.get("severity")
         if severity not in _VALID_ENTRY_SEVERITIES:
@@ -1580,11 +2079,27 @@ def run_census(
 
     for cluster in rejected:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
-        if cand_id is not None:
-            updated_codebook = reject_candidate(updated_codebook, cand_id)
+        if cand_id is None:
+            # A reject verdict this run PAID FOR that resolves to no pending
+            # candidate. Post-4144 this is a normal outcome, not an anomaly:
+            # the merger declined to fabricate a pending twin over a standing
+            # verdict. Skipping it is still correct -- announcing it is what
+            # was missing.
+            dropped_verdicts.append(_dropped_verdict(
+                verdict="rejected",
+                cluster=cluster,
+                cb=updated_codebook,
+                # THE INVERSION, this loop's half: a standing PROMOTION is what
+                # contradicts a fresh REJECT.
+                contradicting_disposition="promoted",
+            ))
+            continue
+        updated_codebook = reject_candidate(updated_codebook, cand_id)
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
+
+    _report_dropped_verdicts(dropped_verdicts)
 
     validation_errors = codebook.validate(updated_codebook)
     if validation_errors:
@@ -1703,6 +2218,7 @@ def run_census(
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
+        dropped_verdicts=tuple(dropped_verdicts),
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -1763,6 +2279,8 @@ def run_census(
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
+        dropped_verdicts=tuple(dropped_verdicts),
+        unresolved_verdicts=len(dropped_verdicts),
     )
 
 
@@ -2238,7 +2756,13 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     (:8002) is STATELESS by contrast -- one bare POST, ``application/json``,
     no session -- and ``post_mcp_tool_call`` handshakes only on a 400, so
     :func:`default_submit_fn`'s path is unchanged.
+
+    Being the single boundary is also why the pytest guard lives here:
+    :func:`_refuse_real_post_under_test` covers both consumers in one call,
+    and a caller entitled to post for real under pytest declares that by
+    wrapping the call in :func:`own_endpoint`.
     """
+    _refuse_real_post_under_test(url, tool_name)
     return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)
 
 
@@ -2667,9 +3191,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # Appended ONLY when non-zero, so a normal run's summary line stays
+    # byte-identical: the clause appears exactly when it carries information.
+    # Same reasoning as render_report's coverage-shortfall gating -- a line
+    # trained to be ignored is a line that will be ignored.
+    unresolved = (
+        f" unresolved_verdicts={outcome.unresolved_verdicts}"
+        if outcome.unresolved_verdicts else ""
+    )
     print(
         f"census: done -- report={outcome.report_path} "
-        f"filed_tasks={len(outcome.filed_task_ids)} stop_reason={outcome.stop_reason}"
+        f"filed_tasks={len(outcome.filed_task_ids)} "
+        f"stop_reason={outcome.stop_reason}{unresolved}"
     )
     return 0
 

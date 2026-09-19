@@ -15,15 +15,14 @@ that must agree byte-for-byte with the real one and cannot be kept in agreement.
 
 from __future__ import annotations
 
-import importlib.util
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'repair_recon_citation.py'
 
@@ -33,22 +32,7 @@ DANGLING = 'beacf7fc-b76a-4c0b-876d-f4cf6d906d42'
 SUCCESSOR = '746b4ab9-ca3c-418b-982a-32b85bfcf94b'
 
 
-def _load_module() -> types.ModuleType:
-    mod_name = 'repair_recon_citation'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='repair_recon_citation')
 
 
 def _parse(*argv: str):
@@ -91,6 +75,34 @@ class TestBuildParser:
 
     def test_replacement_defaults_to_none_for_drop_only_mode(self):
         assert _parse(*_REQUIRED).replacement_memory_id is None
+
+    def test_reason_defaults_to_the_dangling_class(self):
+        """The default must stay the class this script shipped with (task 5552).
+
+        ``memory_not_found`` is the corroboration an operator gets without
+        saying anything; ``wrong_memory`` removes a citation that still
+        resolves, so it has to be asked for explicitly.
+        """
+        assert _parse(*_REQUIRED).reason == 'memory_not_found'
+
+    def test_reason_accepts_the_wrong_memory_class(self):
+        assert _parse(*_REQUIRED, '--reason', 'wrong_memory').reason == 'wrong_memory'
+
+    def test_reason_outside_the_enum_is_rejected_by_argparse(self):
+        """Closed at the CLI boundary, mirroring ``--store``'s ``choices``.
+
+        The repair also refuses an unknown reason with ``invalid_reason``, but
+        an operator typo should not need a journal open to be told.
+        """
+        with pytest.raises(SystemExit):
+            _parse(*_REQUIRED, '--reason', 'detach')
+
+    def test_justification_defaults_to_none(self):
+        assert _parse(*_REQUIRED).justification is None
+
+    def test_justification_round_trips_the_supplied_prose(self):
+        prose = 'mis-cites task 168 rolling summary; claim confirmed via get_task(182)'
+        assert _parse(*_REQUIRED, '--justification', prose).justification == prose
 
 
 # ===========================================================================
@@ -145,6 +157,29 @@ class TestRunDelegates:
         await _mod.run(_parse(*_REQUIRED), journal=None, memory=None)
         assert 'repair_recon_citation' in spy.await_args.kwargs['repaired_by']
 
+    @pytest.mark.asyncio
+    async def test_forwards_the_defect_class_and_its_justification(self, spy):
+        """Both reach the repair as kwargs; the script gates neither (task 5552)."""
+        prose = 'cites the pre-consolidation summary, not the decision it claims'
+        args = _parse(*_REQUIRED, '--reason', 'wrong_memory', '--justification', prose)
+
+        await _mod.run(args, journal=None, memory=None)
+
+        assert spy.await_args.kwargs['reason'] == 'wrong_memory'
+        assert spy.await_args.kwargs['justification'] == prose
+
+    @pytest.mark.asyncio
+    async def test_omitted_reason_and_justification_forward_their_defaults(self, spy):
+        """Forwarded EXPLICITLY, not left to the function's own defaults.
+
+        A script that omitted the kwargs would still repair today, and would
+        silently stop tracking the enum the day either default changed.
+        """
+        await _mod.run(_parse(*_REQUIRED), journal=None, memory=None)
+
+        assert spy.await_args.kwargs['reason'] == 'memory_not_found'
+        assert spy.await_args.kwargs['justification'] is None
+
 
 # ===========================================================================
 # Exit-code mapping
@@ -161,6 +196,19 @@ class TestExitCode:
     def test_any_error_exits_one(self):
         assert _mod.exit_code_for({'error': 'citation_not_dangling'}) == 1
         assert _mod.exit_code_for({'error': 'run_still_live'}) == 1
+
+    def test_the_reason_scoped_refusals_exit_one(self):
+        """The task-5552 refusals need no mapping entry — but they are pinned.
+
+        ``exit_code_for`` allowlists the two SUCCESS statuses rather than
+        enumerating errors, so a new refusal exits 1 for free. That is the
+        property worth pinning: it is what keeps the script from having to be
+        edited every time the repair grows a gate.
+        """
+        assert _mod.exit_code_for({'error': 'citation_not_resolving'}) == 1
+        assert _mod.exit_code_for({'error': 'justification_required'}) == 1
+        assert _mod.exit_code_for({'error': 'invalid_reason'}) == 1
+        assert _mod.exit_code_for({'error': 'replacement_is_victim'}) == 1
 
     def test_a_run_status_is_never_read_as_an_outcome_status(self):
         """The real ``run_still_live`` shape, with its own status key present.

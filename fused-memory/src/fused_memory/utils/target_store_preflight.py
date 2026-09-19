@@ -12,8 +12,9 @@ READERS are in scope, not merely mutators, and that is not a widening of
 convenience: a read-only audit reporting "0 offenders" against a store it just
 conjured is exactly as false as a no-op apply, and it is the read paths — dry
 runs, CI predicates — that actually get pointed at the wrong checkout. Of the
-five call sites this guard has, every one is reached in dry-run as well as
-``--apply``.
+six call sites this guard has, every one is reached on a READ path — and,
+where the script has an apply mode at all, on that path too. One of the six is
+a read-only CI/runbook predicate with no ``--apply`` to gate on.
 
 THE TWO MEASURED AUTO-CREATES (task 4319, re-measured at base 56fb6fec97)
 -------------------------------------------------------------------------
@@ -111,17 +112,20 @@ TWO PLACEMENT RULES, which are the non-obvious part
 
   WHAT THAT BUYS, EXACTLY — and what it does not. The property secured is "a
   refusal is never 0". It is NOT "a refusal is distinguishable from every
-  other exit code": each script ends in ``sys.exit(main())`` with ``main()``
-  returning ``asyncio.run(_run(args))``, so an uncaught ``TargetStoreMissing``
-  propagates and CPython exits **1** — which collides with the exit-1 rung the
-  three task-store scripts already use (``audit_duplicate_tasks``'s "apply
-  errors", ``correct_found_on_main_backlog``'s task-1175 "a write did not
-  persist", ``audit_found_on_main_provenance``'s ``--fail-on-findings``
-  middle rung). ``scripts/check_found_on_main_spurious_rate.py`` names this
-  same hazard in its own prose for its own tracebacks, so it is a known repo
-  shape, not an oversight. A caller that needs the two told apart must catch
+  other exit code": each script ends in ``sys.exit(main())``, and wherever
+  ``main()`` merely returns ``asyncio.run(_run(args))`` an uncaught
+  ``TargetStoreMissing`` propagates and CPython exits **1** — which collides
+  with the exit-1 rung the three task-store scripts already use
+  (``audit_duplicate_tasks``'s "apply errors",
+  ``correct_found_on_main_backlog``'s task-1175 "a write did not persist",
+  ``audit_found_on_main_provenance``'s ``--fail-on-findings`` middle rung).
+  A caller that needs the two told apart must catch
   ``TargetStoreMissing`` and map it onto a reserved code of its own; do not
   assume the traceback is self-identifying to an exit-code-only consumer.
+  ``scripts/check_found_on_main_spurious_rate.py`` is the worked exemplar of
+  that remedy: it catches the refusal in ``main()`` and returns a reserved
+  exit 3, off the exit-1 rung its own contract already spends on "gating
+  offenders found" and "backend not configured".
 
 The guard deliberately does NOT require an absolute path and does not try to
 verify the target is "the live store". The documented, working invocation for
@@ -131,20 +135,6 @@ catch a case plain existence already catches. Pinning an expected live path
 would hardcode one deployment into a general-purpose script — the mistake
 ``store_mutation_preflight.py::resolve_history_dir``'s docstring already warns
 about for ``~/.mem0``.
-
-KNOWN UNGUARDED (measured, task 4319)
---------------------------------------
-``scripts/check_found_on_main_spurious_rate.py::_run`` reads the same task
-store and is NOT covered. It does not invoke
-``scripts/audit_found_on_main_provenance.py::_run`` and never reads its exit
-code — it imports ``build_audit_report`` and then builds its OWN
-``SqliteTaskBackend``, calling ``get_tasks(args.project_root)`` directly — so
-it inherits none of this guard by construction. It is the higher-consequence
-consumer of the two: a DeterministicRunner CI predicate whose exit 0 means
-"check passed", so a ``--project-root`` naming a worktree gives 0 tasks, 0
-offenders and a passing check. Closing it was out of this task's lock scope
-and is filed as follow-up; listed here rather than left implicit so the gap is
-discoverable from the guard rather than only from the absence of a call.
 
 Everything above is a DATED MEASUREMENT (task 4319), not an invariant, and must
 not be restated as one: nothing enforces the rule mechanically, so a script
@@ -190,13 +180,13 @@ class TargetStoreMissing(RuntimeError):
 def task_store_path(project_root: Path | str) -> Path:
     """Return the tasks.db a ``--project-root`` resolves to.
 
-    Lives here, rather than being spelled out at each call site, so the three
+    Lives here, rather than being spelled out at each call site, so the four
     task-store scripts in ``fused-memory/scripts/`` (``audit_duplicate_tasks``,
-    ``audit_found_on_main_provenance``, ``correct_found_on_main_backlog``) all
-    guard the SAME path -- ``scripts/`` is not a package, so a shared module is
-    the only place they can agree.
+    ``audit_found_on_main_provenance``, ``check_found_on_main_spurious_rate``,
+    ``correct_found_on_main_backlog``) all guard the SAME path -- ``scripts/``
+    is not a package, so a shared module is the only place they can agree.
 
-    Those three call :func:`assert_task_store_exists`, which applies this
+    Those four call :func:`assert_task_store_exists`, which applies this
     derivation for them; the function stays public for a caller that needs the
     path WITHOUT the assertion -- reporting it, or guarding a store it reaches
     by some other route.
@@ -284,10 +274,10 @@ _QUEUE_DIR_REMEDY = (
 def assert_task_store_exists(project_root: Path | str, *, operation: str) -> None:
     """Refuse *operation* unless ``<project_root>``'s tasks.db already exists.
 
-    The entry point the three task-store scripts in ``fused-memory/scripts/``
+    The entry point the four task-store scripts in ``fused-memory/scripts/``
     actually call. Only ``operation`` varies between them: the target
     derivation, the ``what`` and the twelve-line ``remedy`` are constant across
-    the whole family, so they live here once rather than five times. The same
+    the whole family, so they live here once rather than six times. The same
     SPOT argument :func:`task_store_path` already makes about the path applies
     with more force to the prose — a remedy copied per script is a remedy that
     drifts per script, and it is the sentence an operator actually acts on.

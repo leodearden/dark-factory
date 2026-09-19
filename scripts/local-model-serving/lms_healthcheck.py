@@ -45,7 +45,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1256,11 +1256,11 @@ class HealthReport(BaseModel):
     latency_caveat: str = LATENCY_CAVEAT
 
 
-def _now_iso() -> str:
+def _utc_now() -> datetime:
     """Timezone-AWARE UTC.  A naive stamp would make a stale artifact
     indistinguishable from a fresh one, and this artifact's entire job is to
     prove that a live run happened."""
-    return datetime.now(UTC).isoformat()
+    return datetime.now(UTC)
 
 
 def run_healthcheck(
@@ -1269,6 +1269,7 @@ def run_healthcheck(
     probe: ArmProber | None = None,
     baseline: lms_vram.GpuBaseline | None = None,
     repeat: int = 1,
+    now: Callable[[], datetime] = _utc_now,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -1301,6 +1302,20 @@ def run_healthcheck(
     latency, still behind exactly one warm-up.  It is observability only: the
     first measured result alone supplies the verdict, so no number of repeats
     can turn a row green.
+
+    `now` is the clock, injectable for a reason more specific than "for
+    testing": `render_table` prints `measured_at` in its header line, so a
+    report stamped off the live clock puts six microsecond digits into every
+    rendering.  A test that counts digit runs over a whole table -- the
+    consumer pid counts in
+    `scripts/tests/test_lms_healthcheck.py::test_the_table_lists_who_else_held_the_card_at_each_reading`
+    -- therefore had a ~3e-4 chance per run of counting a timestamp digit as a
+    pid.  On 2026-09-14 it did, and blocked an unrelated branch in the merge
+    lane.  A fixture pins this; a real run leaves it alone.
+
+    It hands over a `datetime`, not a formatted string, and the ISO rendering
+    happens HERE -- so aware-UTC stays a property this function enforces on
+    every path rather than one the default implementation happened to have.
     """
     if repeat < 1:
         # A caller error, never an arm failure -- recording it as a FAIL would
@@ -1369,7 +1384,23 @@ def run_healthcheck(
         baseline_free_mib=base.reading.free_mib,
     )
 
-    measured_at = _now_iso()
+    stamp = now()
+    if stamp.utcoffset() != timedelta(0):
+        # A caller error, in the same sense `repeat < 1` is: the clock is an
+        # injected collaborator, so the aware-UTC invariant `_utc_now`'s
+        # docstring states is only true of the artifact if it is checked here
+        # too.  `utcoffset()` is None when naive, so one comparison rejects
+        # both a naive stamp and an aware non-UTC one.
+        #
+        # NON-UTC is refused rather than normalised because `merge_reports`
+        # picks the slate's stamp with `max()` over these strings: ISO text
+        # orders by instant only while every stamp shares one offset.
+        raise HealthcheckError(
+            f'now() returned {stamp!r}, which is not timezone-aware UTC; a '
+            'stamp that cannot be anchored makes a stale artifact '
+            'indistinguishable from a live run'
+        )
+    measured_at = stamp.isoformat()
     rows: list[ArmRow] = []
     for arm in arms:
         # The PAIRING lives here, not in `probe_arm`, because `run_healthcheck`

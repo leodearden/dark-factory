@@ -620,6 +620,225 @@ class TestCheckProposalMechanical:
 
 
 # ---------------------------------------------------------------------------
+# task 5361 step-1: three-state age reporting — `age_state` closed domain
+# ---------------------------------------------------------------------------
+
+
+class TestAgeStateThreeState:
+    """`check_proposal` names WHY it has no age, instead of collapsing to None.
+
+    Four distinct causes previously all surfaced as a bare `age_seconds: None`,
+    indistinguishable to every consumer: an absent timestamp, an unparseable
+    string (ValueError), an awareness mismatch between the two operands
+    (TypeError), and no clock supplied at all.  THREE states now cover those
+    four causes — hence this class's name.  The mismatch shares
+    `AGE_UNPARSEABLE` with the malformed string because the fault is the PAIR,
+    not one operand; `_age_of`'s warning names both so the shared state cannot
+    misdirect an operator.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _states():
+        from orchestrator.b3_gate import (
+            AGE_ABSENT,
+            AGE_NO_CLOCK,
+            AGE_PARSED,
+            AGE_UNPARSEABLE,
+        )
+        return {AGE_PARSED, AGE_UNPARSEABLE, AGE_ABSENT, AGE_NO_CLOCK}
+
+    def test_valid_aware_timestamp_is_parsed(self):
+        from orchestrator.b3_gate import AGE_PARSED, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_PARSED, result
+        assert result['age_seconds'] == 10800.0, result
+
+    def test_unparseable_timestamp_is_distinguished(self):
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_naive_timestamp_against_aware_clock_is_unparseable(self):
+        """The TypeError branch — a DIFFERENT cause from the ValueError above,
+        and the one most likely to arise from a real producer bug."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': '2026-06-04T09:00:00'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_aware_timestamp_against_naive_clock_is_unparseable(self):
+        """The OPERATOR-side mismatch: `run_check._parse_now` passes any
+        `--now` string straight through `fromisoformat`, so a naive one fails
+        against a perfectly well-formed aware `investigated_at`.  Same
+        TypeError, same state, opposite culprit from the test above."""
+        from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=datetime(2026, 6, 4, 12, 0, 0),
+        )
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        assert result['age_seconds'] is None, result
+
+    def test_warning_names_both_operands_not_just_the_entry(self, caplog):
+        """The state cannot say which operand is at fault, so the message must
+        name both.  Blaming `investigated_at` alone points an operator at the
+        proposal when a naive `--now` of their own is the actual fault."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        naive_now = datetime(2026, 6, 4, 12, 0, 0)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+                run_git=_fake_git_fresh, now=naive_now,
+            )
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(messages) == 1, messages
+        assert _LOW_RISK_ENTRY['investigated_at'] in messages[0], messages[0]
+        assert repr(naive_now) in messages[0], messages[0]
+
+    def test_missing_timestamp_key_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['investigated_at']
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_seconds'] is None, result
+
+    def test_empty_timestamp_is_absent(self):
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': ''}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+
+    def test_no_clock_is_its_own_state(self):
+        from orchestrator.b3_gate import AGE_NO_CLOCK, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=None,
+        )
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert result['age_seconds'] is None, result
+
+    def test_none_entry_early_return_carries_age_state(self):
+        """Shape parity: EVERY return path carries the key, so a consumer never
+        has to distinguish 'absent key' from 'old entry' from a real state."""
+        from orchestrator.b3_gate import AGE_ABSENT, check_proposal
+        result = check_proposal(
+            None, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['age_state'] == AGE_ABSENT, result
+        assert result['age_state'] in self._states(), result
+
+    def test_unparseable_timestamp_warns_instead_of_swallowing(self, caplog):
+        """Replaces today's silent `except Exception: pass`."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            check_proposal(
+                entry, worktree='/tmp', category=None,
+                run_git=_fake_git_fresh, now=self._NOW,
+            )
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+            and 'not-a-date' in r.getMessage()
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly one WARNING under orchestrator.b3_gate naming the '
+            f'offending investigated_at value; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-3: the gate never certifies FRESH without a parsed age
+# ---------------------------------------------------------------------------
+
+
+class TestFreshRequiresParsedAge:
+    """FRESH authorises unattended edits and merges to main.
+
+    A gate with that authority must not certify a proposal fresh when it cannot
+    determine the proposal's age at all — whatever the cause.  The positive
+    control is the load-bearing case here: without it, "fails closed" could be
+    satisfied by a gate that never returns FRESH at all.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _check(self, entry, *, now):
+        from orchestrator.b3_gate import check_proposal
+        return check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=now,
+        )
+
+    def test_parsed_age_still_certifies_fresh(self):
+        """POSITIVE CONTROL — the gate is not made vacuous by the guard."""
+        from orchestrator.b3_gate import AGE_PARSED, FRESH
+        result = self._check(_LOW_RISK_ENTRY, now=self._NOW)
+        assert result['verdict'] == FRESH, result
+        assert result['age_state'] == AGE_PARSED, result
+
+    def test_unparseable_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_UNPARSEABLE
+        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_UNPARSEABLE, result
+        reason = result['reason'].lower()
+        assert 'age' in reason, result['reason']
+        assert AGE_UNPARSEABLE in result['reason'], result['reason']
+
+    def test_absent_timestamp_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_ABSENT
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['investigated_at']
+        result = self._check(entry, now=self._NOW)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_ABSENT, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+    def test_no_clock_aborts(self):
+        from orchestrator.b3_gate import ABORT, AGE_NO_CLOCK
+        result = self._check(_LOW_RISK_ENTRY, now=None)
+        assert result['verdict'] == ABORT, result
+        assert result['age_state'] == AGE_NO_CLOCK, result
+        assert 'age' in result['reason'].lower(), result['reason']
+
+
+# ---------------------------------------------------------------------------
 # step-11: freshness P1/P2 against a REAL git fixture
 # ---------------------------------------------------------------------------
 

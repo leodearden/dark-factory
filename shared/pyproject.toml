@@ -57,6 +57,15 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
+    # For the `scripts` verify leg, NOT for this member's own suite: that leg is
+    # `uv run --project shared pytest tests/scripts/ scripts/tests/ ... -n auto`
+    # (scripts/orchestrator.yaml), so shared is the environment uv resolves the
+    # plugin from. This member's own addopts stays SERIAL deliberately — measured
+    # faster serial, and tests/test_proc_group.py, tests/test_concurrency.py and
+    # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
+    # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
+    # RULED_SERIAL_MEMBERS).
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]

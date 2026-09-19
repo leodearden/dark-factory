@@ -620,6 +620,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 _TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
 _BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
 _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
+_RECON_STATUS_PREFIX = '/static/redux/recon_status.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
@@ -781,6 +782,154 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: recon_status.js must load BEFORE tabs.jsx and app.jsx
+# (task 5320)
+# ---------------------------------------------------------------------------
+
+
+def test_recon_status_js_is_served(client) -> None:
+    """GET /static/redux/recon_status.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Both consumers destructure window.DF_RECON_STATUS at top
+    level with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking the whole dashboard, not just the Recon tab.
+    """
+    resp = client.get(_RECON_STATUS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_RECON_STATUS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_recon_status_js_loads_before_tabs(index_html_body: str) -> None:
+    """recon_status.js must load BEFORE tabs.jsx.
+
+    tabs.jsx destructures {reconRunCounts, reconSuccessPct, reconStatusTone}
+    from window.DF_RECON_STATUS at top-level execution time with no fallback,
+    for ReconTab's tiles and its Recent Runs badges. A later (or missing) tag
+    throws while tabs.jsx is evaluating, so every tab that file defines goes
+    with it.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _TABS_PREFIX,
+        before_label='recon_status.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (ReconTab) destructures window.DF_RECON_STATUS at top '
+            'level; recon_status.js must define it first.'
+        ),
+    )
+
+
+def test_recon_status_js_loads_before_app(index_html_body: str) -> None:
+    """recon_status.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    app.jsx destructures {reconRunCounts} at top level to compute the Recon
+    rail badge. Ordering this one wrong is the quieter failure of the two —
+    the rail count is a single digit an operator has no independent way to
+    check, which is how the vocabulary mismatch this task fixes survived.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='recon_status.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_RECON_STATUS at top level for the '
+            'Recon rail badge; recon_status.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: endpoint_staleness.js is served and loads before app.jsx
+# (task 4884, #4791)
+# ---------------------------------------------------------------------------
+
+_ENDPOINT_STALENESS_PREFIX = '/static/redux/endpoint_staleness.js'
+
+
+def test_endpoint_staleness_js_is_served(client) -> None:
+    """GET /static/redux/endpoint_staleness.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. app.jsx destructures window.DF_ENDPOINT_STALENESS at top
+    level with no fallback, so that 404 throws at app.jsx's evaluation and
+    takes the WHOLE page down, not just the indicator.
+    """
+    resp = client.get(_ENDPOINT_STALENESS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_ENDPOINT_STALENESS_PREFIX}, got '
+        f'{resp.status_code} — the module is registered in index.html but not '
+        'reachable at runtime.'
+    )
+
+
+def test_endpoint_staleness_js_loads_before_app_jsx(index_html_body: str) -> None:
+    """endpoint_staleness.js must load as a classic script BEFORE app.jsx.
+
+    app.jsx destructures {staleNoticesForTab} from
+    window.DF_ENDPOINT_STALENESS at top-level execution time; it decides the
+    per-endpoint staleness notices rendered above every tab body. Load order is
+    the enforced contract here rather than a `|| {}` fallback, precisely
+    because a silently-absent staleness indicator is the failure this task
+    closes: the 2026-08-27 wedge ran 19.8h with the UI showing stale numbers
+    and saying nothing about it.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _ENDPOINT_STALENESS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='endpoint_staleness.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_ENDPOINT_STALENESS at top level; '
+            'endpoint_staleness.js must define it first.'
+        ),
+    )
+
+
+def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
+    """endpoint_staleness.js is present among the VERSIONED redux assets.
+
+    The presence half of what `test_redux_cache_buster_bumped` asserts for its
+    eight top-level-destructured siblings: a tag added without a `?v=` misses
+    every already-open browser, and a tag deleted outright takes app.jsx down
+    with it (that destructure has no fallback). The uniformity half is already
+    covered for this asset with no edit at all — `redux_cache_buster_versions`
+    collects EVERY `/static/redux/*?v=N` tag, so a mismatched version here
+    fails over there automatically.
+
+    WHY IT IS HERE AND NOT IN test_redux_cache_buster_bumped, where the plan
+    for task 4884 put it. That function is called with SYNTHETIC bodies by
+    `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, built from
+    its own `_REQUIRED_ASSETS` roster — a second mirror of the asset list, in
+    a file outside this task's scope. Adding a ninth presence assertion there
+    would have failed those synthetic-body callers until that roster was
+    edited too. Asserting over the `index_html_body` fixture instead keeps the
+    protection identical (it runs against the REAL index.html, which is the
+    body that ships) while leaving the synthetic-body contract untouched.
+    """
+    assert re.search(r'/static/redux/endpoint_staleness\.js\?v=\d+', index_html_body), (
+        'endpoint_staleness.js is not present among the versioned '
+        '/static/redux/* assets in index.html — app.jsx destructures '
+        'window.DF_ENDPOINT_STALENESS at top level with no fallback, so a '
+        'missing tag throws at app.jsx evaluation and blanks the whole page; '
+        'a tag added without a cache-buster misses already-open browsers. Bump '
+        'all /static/redux/* ?v= uniformly.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
@@ -864,6 +1013,11 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'a tag added without a cache-buster misses already-open browsers. Bump '
         'all /static/redux/* ?v= uniformly.'
     )
+    # endpoint_staleness.js's presence check deliberately lives NEXT DOOR, in
+    # test_endpoint_staleness_js_has_cache_buster, rather than here — see that
+    # test's docstring for why (this function is also invoked with SYNTHETIC
+    # bodies from test_cache_buster_freshness.py, whose asset roster is a
+    # separate mirror).
 
 
 # ---------------------------------------------------------------------------

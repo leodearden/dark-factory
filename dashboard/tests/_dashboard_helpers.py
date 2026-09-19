@@ -7,12 +7,13 @@ the same process.
 
 from __future__ import annotations
 
+import asyncio
 import html.parser
 import json
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,26 @@ def live_aiosqlite_worker_threads() -> list[threading.Thread]:
     return live
 
 
+# The fused-memory endpoint the whole suite fans out at, set by
+# apply_isolated_env below (its only consumer, hence its home here).
+#
+# PORT 9 (IANA discard) because it is PRIVILEGED: no unprivileged dev service
+# or test runner can bind it, unlike the 9000/9001 this suite uses elsewhere,
+# which real software does claim (php-fpm, SonarQube, Portainer).  Measured
+# refusing in 10.1ms on 2026-09-14 — and re-measured on every run by
+# test_fixture_isolation.py::TestHermeticFusedMemoryUrls, which is the
+# assertion that actually holds this up.  This sentence is not.
+#
+# 127.0.0.1 LITERAL, not ``localhost``: the name may resolve to ::1 first and
+# cost a whole second connect attempt before refusing, putting latency back
+# into the very path this exists to make instant.
+#
+# ONE url, not several.  The resolved list must stay length-1 like the default
+# it replaces, so _build_http_limits' endpoint count and every "there is
+# exactly one fused-memory URL" assumption in the suite are unchanged.
+HERMETIC_FUSED_MEMORY_URLS = ('http://127.0.0.1:9',)
+
+
 def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     """Point every DashboardConfig-derived path at *root* instead of the live checkout.
 
@@ -106,14 +127,114 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     the empty list, i.e. exactly one root to fan out over; there is no temp
     path to redirect it to that would be more isolated than none.
 
+    SETS ``DASHBOARD_FUSED_MEMORY_URLS``, which inverts the
+    delete-rather-than-redirect rule above — deliberately, and the asymmetry
+    has to be stated or the next reader will "consolidate" it into the
+    ``delenv`` list and silently re-aim the suite at production.  Deleting the
+    three vars above makes the config fall back to ``project_root``-relative
+    paths, which are already inside the isolated root.  Deleting THIS one
+    falls back to ``DEFAULT_FUSED_MEMORY_URLS = ('http://localhost:8002',)`` —
+    the operator's live shared fused-memory instance, measured answering a 404
+    in 1.29ms on 2026-09-14.  For this variable, deleting is the OPPOSITE of
+    isolation, and unset is the state the whole suite ran in until task 5185.
+
+    The traffic that stops: ``lifespan()`` spawns ``_burndown_loop``, which
+    immediately ``await collect_snapshot(...)`` -> ``data/tasks.py::fetch_tasks``
+    -> ``TTLCache.get_or_refresh`` + ``mcp_fanout.first_success`` against that
+    URL, and ``_metrics_loop`` does the same — twice per ``TestClient(app)``
+    lifespan, of which this suite runs many.  A slow real response there keeps
+    that work alive past ``TestClient.__exit__``, which then blocks in
+    ``wait_shutdown`` until pytest-timeout fires, blaming whichever test
+    happened to be holding the fixture.
+
+    A DEFAULT, not a lock, exactly like the paths above: a function-scoped
+    ``monkeypatch.setenv`` is created after — and torn down before — the
+    session-scoped context, so ``two_url_client`` and any test that overrides
+    the URLs itself still wins unchanged.
+
     A plain function rather than a fixture so the env contract is directly
     unit-testable against a simulated operator environment — a session-scoped
     autouse fixture cannot be re-run from inside a test.
     """
     mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
+    mp.setenv('DASHBOARD_FUSED_MEMORY_URLS', ','.join(HERMETIC_FUSED_MEMORY_URLS))
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Detached bypass-refresh wedging (task 5185)
+#
+# ONE definition of "put a genuinely in-flight bypass refresh on a TTLCache",
+# shared by test_mcp_fanout.py (the reaper's own unit tests) and
+# test_app_lifespan_reap.py (the lifespan that calls the reaper).  The idiom
+# reaches into TTLCache's bypass bookkeeping -- ``_locks``, ``_bypass_tasks``
+# -- which is exactly why it is confined to one place: when that bookkeeping
+# moves there is a single definition to re-verify, not one copy per test
+# module drifting apart from the other.
+# ---------------------------------------------------------------------------
+
+
+def never_resolving_refresh() -> tuple[Callable[[], Awaitable[Any]], asyncio.Event]:
+    """Build a refresh stub that enters, signals, and then never resolves.
+
+    A genuinely unresolved ``asyncio.Event``, never a sleep: a sleeping stub
+    finishes on its own account and so proves nothing about whether the thing
+    under test ended it.  Returns ``(refresh, entered)``, where *entered*
+    fires once the refresh body is actually running.
+    """
+    entered = asyncio.Event()
+    wedged = asyncio.Event()
+
+    async def _refresh() -> Any:
+        entered.set()
+        await wedged.wait()  # never set -- genuinely unresolved
+        raise AssertionError('unreachable: the wedged event is never set')
+
+    return _refresh, entered
+
+
+async def wedge_one_bypass(
+    cache: Any,
+    key: str = 'k',
+    refresh_and_entered: tuple[Callable[[], Awaitable[Any]], asyncio.Event] | None = None,
+) -> tuple[asyncio.Task[Any], asyncio.Task[Any]]:
+    """Put exactly one genuinely in-flight bypass task on *cache* for *key*.
+
+    Holds *key*'s lock so the caller's bounded acquisition times out and it
+    takes the bypass path -- the REAL public route, through
+    ``TTLCache.get_or_refresh`` -- then waits until the bypass refresh has
+    actually been ENTERED, not merely scheduled, so the task is in flight by
+    construction rather than by timing luck.  Callers monkeypatch
+    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` down first so that bounded
+    wait is quick.
+
+    *refresh_and_entered* substitutes any other ``(refresh, entered)`` pair of
+    the same shape for the parked-forever default, which is how a test can
+    vary only how a refresh ENDS while reusing this wedging idiom rather than
+    re-deriving it.
+
+    Returns ``(bypass_task, caller_task)``.  The caller is parked on the
+    shielded bypass and never returns on its own; hand it to :func:`drain`
+    once the assertions are done.
+    """
+    refresh, entered = refresh_and_entered or never_resolving_refresh()
+    lock = cache._locks.setdefault(key, asyncio.Lock())
+    await lock.acquire()
+    try:
+        caller = asyncio.create_task(cache.get_or_refresh(key, refresh))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+    finally:
+        lock.release()
+    return cache._bypass_tasks[key][1], caller
+
+
+async def drain(*tasks: asyncio.Task[Any]) -> None:
+    """Cancel and await every still-pending task, swallowing its outcome."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------

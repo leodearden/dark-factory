@@ -89,6 +89,9 @@ Five phases, strictly ordered by dependency. Every task is behaviour-preserving
 (§ Contract) and must leave `test_merge_lane_ratchet.py` green — a task that
 moves code lowers the baseline it moved away from in the same commit; a task can
 never raise one.
+[Scoped by Correction 8 below (2026-09-17, task 5406): the sentence's subject is
+this PRD's five behaviour-preserving phases; net-additive work outside them has
+an authorized-raise path. Left as written.]
 
 **Phase 0 — instruments (α).** A metrics script and a ratchet test with a committed
 baseline. Nothing else starts until this is on `main`.
@@ -581,3 +584,90 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    "skip when nothing changed" gate (INV-10/INV-11) and never a narrower domain.
    Until σ lands the per-verify-leg tax is accepted as measured. Task 5048's
    details carry the constraints.
+   [Left as written: two of this paragraph's claims were disproven on
+   2026-09-13 and are corrected immediately below, not edited here.]
+
+   **Corrected and partly discharged by task 5101** (2026-09-13). Two factual
+   corrections to the paragraph above, both measured on the branch:
+
+   - "13s is 22 separate complexipy **subprocesses**" is wrong on both count and
+     mechanism. It was **50 in-process `complexipy.file_complexity` calls over 25
+     resolved files** — two per file, because `build_report` asked for the file
+     total and the per-function map separately and each fetched its own result.
+     `CLUSTER_PATHS` has 23 entries, two of which are globs, resolving to 25
+     files. No subprocess is involved.
+   - σ's "one complexipy invocation for the whole cluster" is **not available as
+     a drop-in**. complexipy 6.2.0's Python API, as used by
+     `scripts/merge_lane_metrics.py`, exposes only single-path entry points
+     (`file_complexity(file_path: str, check_script=False, no_ignore=False)` and
+     `code_complexity(...)`); there is no multi-path/one-JSON entry point.
+     Reaching for the CLI instead would trade 25 in-process calls for a
+     subprocess and a JSON parse — a design change, not a dedupe. σ should price
+     it that way or drop the constraint.
+
+   DISCHARGED by 5101: one live measurement per session with every anchor
+   reading it (the two real-tree anchors and the `--check` CLI test were
+   each taking their own full sweep), and each cluster file measured by
+   complexipy once instead of twice. Both are held by work-counting guards
+   (`TestBuildReport::test_each_cluster_file_is_measured_by_complexipy_once` and
+   the `no_private_tree_scan` fixture) rather than by discipline.
+
+   Measured on one unchanged tree: 215 items in **237.09s** before; 219 items in
+   **62.45s, 90.60s and 113.87s** over three runs after, and 218 items in
+   **76.79s** once the review amendments had deduped one item and collapsed a
+   third double-measure of merge_queue.py (`--check` alone: 27.66s). Every AFTER sample is
+   reported rather than the flattering one, because the spread between them is
+   as large as the effect. The load-independent figure, taken WITHIN the single
+   BEFORE run so every item saw the same load: the three folded items cost
+   46.78s + 32.88s + 26.41s = **106.07s of that run's 237.09s — 45% of the
+   module** — and now all three fall below pytest's 0.005s reporting floor.
+
+   STILL σ's: the CLI tests on a small committed fixture tree, the session-scope
+   hoist, and the ≤ 60s ceiling assertion itself — which is the reason 5101 does
+   not claim the ceiling. No AFTER sample is under 60s, and wall clock on
+   this host is too noisy to claim it either way: a four-run A/B of `--check`
+   over ONE unchanged tree read 19.1s, 46.0s, 25.6s, 33.2s and 43.4s. σ will
+   need a load-independent way to assert its ceiling, or it will assert a
+   coin flip. The remaining floor
+   σ must attack is the single `build_report` (27.19s of the fastest AFTER run,
+   55.46s of the slowest), plus the radon MI recomputed in each of the five
+   `TestReportCli` items. (The 6–7s in
+   `test_merge_queue_anchor_reproduces_the_prd_background_numbers` was a third
+   double-measure of merge_queue.py — through `cognitive_complexity` and
+   `file_cognitive_total` — and 5101 closed it on review by deleting both
+   now-callerless accessors and reading `file_cognitive_measures` once.) The
+   ceiling and the INV-10/INV-11 prohibitions above are unchanged — this is a
+   correction of measured facts, not a renegotiation.
+
+8. **"A task can never raise one" is scoped to this PRD's own phases; net-additive
+   work has an authorized-raise path** (2026-09-17, task 5406). The Sketch-of-approach
+   sentence is scoped by its own subject — "*Every task* is behaviour-preserving
+   (§ Contract) … a task can never raise one" — and for the five phases it governs
+   "never raise" is exactly right: a refactor that grows the cluster has failed at
+   the thing it was for. But the ratchet TEST measures the cluster regardless of a
+   task's provenance, so it fires on net-additive work too, and under a literal
+   reading of the sentence no bug fix could ever land in the merge lane — which
+   cannot be the intent of an instrument built to improve that lane's quality.
+
+   **Forcing case:** task 5342 (esc-5342-1, commit `bbfbf1059e`) repaired a
+   rename-blind post-merge equivalence gate that false-blocked correct merges —
+   one blocked reify task, two escalations and a human session. The fix was
+   net-additive, so the ratchet fired on a correct change. The alternative to
+   raising was reshaping a landed, tested design to chase a line count, which
+   `~/.claude/CLAUDE.md` forbids outright ("never steer quality work by raw line
+   count or average complexity"), and splitting one coherent unit across files to
+   dodge a derived cluster total fights heuristics 13/14 and SPOT.
+
+   **Resolution:** an unreviewed raise is still refused — now by `--write-baseline`
+   itself rather than only by prose, so a raise can no longer be absorbed by
+   regenerating the file that would have caught it. A reviewed one lands as a diff
+   in `orchestrator/tests/merge_lane_ratchet_authorized_raises.json` naming the
+   task, the reason and the exact per-measure delta, derived from the measurement
+   rather than typed. Ceiling breaches count as raises for that gate too; a ledger
+   entry authorizes nothing in future, since authorization is the act of passing
+   `--authorize-raise`, not a standing record.
+
+   **Rejected:** scoping the rule by a machine-readable "behaviour-preserving"
+   task signal. No trustworthy signal exists — task metadata is author-supplied,
+   and 5342 itself arrived as an ordinary bug-fix task carrying no such marker.
+   Hence the scoping is prose (this entry) and the enforcement is mechanical.

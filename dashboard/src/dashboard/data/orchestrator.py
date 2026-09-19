@@ -51,6 +51,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 
@@ -380,6 +381,20 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
+class _RootFetch(NamedTuple):
+    """What one project root's task fetch yielded, and how it ended.
+
+    *offline* and *degraded* are named rather than positional because they are
+    adjacent booleans written at four sites, where a transposition between them
+    is the very defect this record exists to make unrepresentable.
+    """
+
+    tasks: list[dict]
+    offline: bool
+    degraded: bool
+    error: str | None
+
+
 async def discover_orchestrators(
     client: httpx.AsyncClient,
     config: DashboardConfig,
@@ -402,39 +417,24 @@ async def discover_orchestrators(
     ``_ORCHESTRATORS_PER_ROOT_BUDGET`` and a whole-loop
     ``_ORCHESTRATORS_TOTAL_BUDGET`` deadline.
 
-    Both degraded outcomes — a root that TIMED OUT and a root that never got
-    its TURN — surface through this module's existing offline marker, because
-    that is the honest fact available here: the entry contract carries one
-    boolean and no separate degraded channel, and ``redux_api.shape_orchestrators``
-    projects only ``offline``/``error``. The cause is therefore carried in
-    ``error`` (two distinct messages, so an operator can tell a
-    proven-unreachable root from a merely-unmeasured one) and in a WARNING,
-    rather than being silently dropped. The alternative — leaving ``offline``
-    False with empty tasks — would render a starved root as a healthy project
-    with zero tasks, which is exactly the invisible-failure class this bound
-    exists to close.
+    Both budget outcomes — a root that TIMED OUT and a root that never got its
+    TURN — are reported as *degraded*, and never as *offline*. This entry
+    carries the two as SEPARATE fields because they are distinct facts:
+    *offline* means the fetch demonstrably failed, *degraded* means "the budget
+    expired first and this project's state is simply UNKNOWN"
+    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``
+    states the invariant and what collapsing it costs — an operator sent to
+    restart a healthy service). On this entry, concretely:
 
-    **This site deliberately DIVERGES from the sibling invariant.**
-    ``active_tasks.collect_tasks_with_counts`` states that "*degraded* and
-    *offline* are DISTINCT FACTS and must never be merged by a consumer:
-    *offline* means the fetch demonstrably failed (the project is proven
-    unreachable), *degraded* means the budget expired first and this project's
-    state is simply UNKNOWN"
-    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``),
-    and that is right — collapsing them can send an operator to restart a
-    healthy service. Honouring it HERE, though, means adding a third state to
-    this entry contract, to ``redux_api.shape_orchestrators`` and to the React
-    orchestrators tab, which is outside a change whose remit is "wrap each call
-    site in ``asyncio.wait_for``". So the divergence is a scope boundary, not a
-    disagreement, and it is bounded rather than silent: the distinction
-    survives verbatim in ``error`` and in the WARNING, and a follow-up is filed
-    to widen the entry contract with a ``degraded`` key so the two facts can be
-    carried separately on the wire.
+    - both budget paths set ``degraded=True`` with ``offline=False``, carrying
+      the cause verbatim in ``error`` and in a WARNING;
+    - a fetch that returned the offline marker sets ``offline=True`` with
+      ``degraded=False`` — it was attempted, and it failed;
+    - every other path leaves both ``False``.
 
-    Until that lands, a CONSUMER of this function must not read ``offline``
-    alone as "fused-memory is proven down" — both budget paths set it with an
-    ``error`` that names the budget verbatim, and neither means the fetch was
-    attempted and failed.
+    The alternative — leaving both False with empty tasks — would render a
+    starved root as a healthy project with zero tasks, which is exactly the
+    invisible-failure class this bound exists to close.
 
     The two-layer bound is complementary, not redundant: ``fetch_tasks``'
     ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
@@ -469,8 +469,7 @@ async def discover_orchestrators(
 
     # Cache per-project data so we don't re-fetch the same task list
     # when multiple processes share a project root.
-    # Cache tuple: (tasks, offline, error)
-    project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
+    project_cache: dict[Path, _RootFetch] = {}
 
     result: list[dict] = []
     # Taken BEFORE the loop so every root's cost is inside the budget rather
@@ -481,8 +480,8 @@ async def discover_orchestrators(
         if project_root not in project_cache:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                # Never got its turn. Reported through the offline marker
-                # rather than silently omitted or rendered as zero tasks.
+                # Never got its turn: DEGRADED (state unknown), not offline —
+                # nothing about this root was measured.
                 message = (
                     f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
                     'orchestrators budget was already spent before this root '
@@ -490,7 +489,9 @@ async def discover_orchestrators(
                     '(not zero)'
                 )
                 logger.warning('project %s: %s', project_root, message)
-                project_cache[project_root] = ([], True, message)
+                project_cache[project_root] = _RootFetch(
+                    tasks=[], offline=False, degraded=True, error=message,
+                )
             else:
                 # The EFFECTIVE share, hoisted so the operator message can
                 # report the bound this root actually got. Late in the walk
@@ -519,7 +520,9 @@ async def discover_orchestrators(
                         '(not zero)'
                     )
                     logger.warning('project %s: %s', project_root, message)
-                    project_cache[project_root] = ([], True, message)
+                    project_cache[project_root] = _RootFetch(
+                        tasks=[], offline=False, degraded=True, error=message,
+                    )
                 else:
                     if isinstance(fetched, list):
                         tasks = fetched
@@ -530,9 +533,13 @@ async def discover_orchestrators(
                         tasks = []
                         offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
                         fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-                    project_cache[project_root] = (tasks, offline, fetch_error)
+                    # The fetch ran to completion on both arms, so whatever
+                    # it reports was measured — nothing here is merely unknown.
+                    project_cache[project_root] = _RootFetch(
+                        tasks=tasks, offline=offline, degraded=False, error=fetch_error,
+                    )
 
-        tasks, offline, fetch_error = project_cache[project_root]
+        tasks, offline, degraded, fetch_error = project_cache[project_root]
         summary = {
             'total': len(tasks),
             'done': sum(1 for t in tasks if t.get('status') == 'done'),
@@ -566,6 +573,7 @@ async def discover_orchestrators(
             'tasks': tasks,
             'summary': summary,
             'offline': offline,
+            'degraded': degraded,
         }
         if fetch_error:
             entry['error'] = fetch_error

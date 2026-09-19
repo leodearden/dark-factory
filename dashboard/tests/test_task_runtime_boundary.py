@@ -74,6 +74,8 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
         rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
         return rows
 
+    # ``timeout`` accepted-and-ignored by all three fakes: _shape_one_project
+    # threads active_tasks._TASKS_PER_CALL_TIMEOUT into every call it makes.
     async def _fake_fetch_tasks(
         client, config, project_root, *,
         statuses=None, chunk_size=None, timeout=None,
@@ -86,7 +88,7 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
     ):
         return _filtered(statuses)[offset:offset + page_size]
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {
             r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
         }

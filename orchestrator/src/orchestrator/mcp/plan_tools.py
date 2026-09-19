@@ -92,7 +92,11 @@ from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    accepts_markup_override,
+)
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
@@ -460,6 +464,20 @@ def _repair_one_field(
     silent-wrong-value damage this whole PRD exists to end. Never partial,
     never guessed.
 
+    THE ONE ACCEPTED TRUNCATION, AND WHY IT IS ASYMMETRIC. A value ending in
+    the field's OWN closer is cut at that tag with nothing recovered, and
+    ``_read_plan_repaired`` persists the shorter string. That is chosen, not
+    overlooked — D10a in ``plans/toolcall-markup-containment-prd.md``: 212 of
+    212 invisible specimens are this shape, and the fact's ``misclose`` names
+    the deleted span, so the cut is reversible from the record rather than
+    silent. The same empty tail under a SIBLING's closer is refused and left
+    byte-identical instead, because the discriminator is evidence rather than
+    breadth — this value arrived as a named parameter of a known tool, so its
+    own closer is evidence about that parameter, while the sweep's
+    ``scripts/sweep_toolcall_markup.py::_repair_dict`` qualifies candidates
+    against every sibling KEY of the containing object, a far wider vocabulary
+    in which the same shape is likelier quotation than leak.
+
     A RECOVERY ONLY EVER FILLS A HOLE. ``supplied`` is computed as the sibling
     fields of this same record that already hold authored content, so a
     recovered parameter can land only in an EMPTY or ABSENT sibling and can
@@ -637,7 +655,12 @@ def _repair_one_field(
         'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
         'also_written_by': list(record.also_written_by),
         'param': record.field,
-        'pattern': result.pattern,
+        # The GATE's pattern, exactly as the unrepairable arm above publishes
+        # it, so one field cannot carry two semantics depending on whether the
+        # repair happened to succeed. ``result.pattern`` is the same expression
+        # on the same inputs since task 5283; naming the local keeps the two
+        # arms visibly identical rather than identical by coincidence.
+        'pattern': pattern,
         'misclose': result.misclose,
         'outcome': 'repaired',
         # What was recovered AND WRITTEN, versus what the tail declared and this
@@ -1678,10 +1701,14 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     #   tool has searching for envelope literals as its job, the way
     #   fused-memory's scan_memory_content does. An architect legitimately
     #   QUOTING the literals — planning a task about this very leak — uses the
-    #   deliberate-quoting override instead, which works here even though no
-    #   plan-tools tool declares a `metadata` parameter: the middleware drops
-    #   the flag before dispatch rather than forwarding it as an unexpected
-    #   argument.
+    #   deliberate-quoting override instead, which every tool on this server
+    #   DECLARES (task 5283): `accepts_markup_override` appends the `metadata`
+    #   parameter to each registered signature, so the remediation the
+    #   rejection hint gives is part of the advertised contract rather than a
+    #   client that happens to send an undeclared argument. The middleware
+    #   therefore takes `_apply_override`'s FORWARD branch here, and the
+    #   decorator — not the middleware — is what consumes the flag: no tool
+    #   body ever sees it, so it cannot reach plan.json.
     #
     # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
     # is explicit that unrepairable input is refused AND its full raw payload
@@ -1732,6 +1759,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     )
 
     @mcp.tool()
+    @accepts_markup_override
     def create_plan(
         task_id: str,
         title: str,
@@ -1757,6 +1785,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _create_plan(artifacts, task_id, title, analysis, files)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_plan_step(
         step_id: str,
         step_type: str,
@@ -1772,6 +1801,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_plan_step(artifacts, step_id, step_type, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_prerequisite(
         prereq_id: str,
         description: str,
@@ -1787,6 +1817,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_prerequisite(artifacts, prereq_id, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_design_decision(
         decision: str,
         rationale: str,
@@ -1800,6 +1831,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_design_decision(artifacts, decision, rationale)
 
     @mcp.tool()
+    @accepts_markup_override
     def add_reuse_item(
         what: str,
         where: str,
@@ -1815,6 +1847,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_reuse_item(artifacts, what, where, how)
 
     @mcp.tool()
+    @accepts_markup_override
     def mark_step_done(
         step_id: str,
         commit_sha: str,
@@ -1832,6 +1865,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _mark_step_done(artifacts, step_id, commit_sha)
 
     @mcp.tool()
+    @accepts_markup_override
     def mark_step_committed(
         step_id: str,
         sha: str,
@@ -1863,6 +1897,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     # --- Revalidation tools ---
 
     @mcp.tool()
+    @accepts_markup_override
     def update_plan_metadata(
         files: list[str] | str | None = None,
         analysis: str | None = None,
@@ -1884,6 +1919,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _update_plan_metadata(artifacts, files, analysis)
 
     @mcp.tool()
+    @accepts_markup_override
     def remove_plan_step(
         step_id: str,
     ) -> dict[str, Any]:
@@ -1898,6 +1934,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _remove_plan_step(artifacts, step_id)
 
     @mcp.tool()
+    @accepts_markup_override
     def replace_plan_step(
         step_id: str,
         step_type: str,
@@ -1917,6 +1954,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _replace_plan_step(artifacts, step_id, step_type, description)
 
     @mcp.tool()
+    @accepts_markup_override
     def confirm_plan() -> dict[str, Any]:
         """Mark the plan COMPLETE. Call this as your final plan-tools action.
 
@@ -1935,6 +1973,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _confirm_plan(artifacts)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_blocking_dependency(
         depends_on_task_id: str,
         reason: str,
@@ -1969,6 +2008,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         )
 
     @mcp.tool()
+    @accepts_markup_override
     def report_task_already_done(
         commit: str,
         evidence: str,
@@ -1996,6 +2036,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_task_already_done(artifacts, commit, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_ready_to_merge(
         commit: str,
         evidence: str,
@@ -2039,6 +2080,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_ready_to_merge(artifacts, commit, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_unactionable_task(
         reason: str,
         evidence: str,
@@ -2065,6 +2107,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_unactionable_task(artifacts, reason, evidence)
 
     @mcp.tool()
+    @accepts_markup_override
     def report_false_premise(
         classification: str,
         premise: str,
