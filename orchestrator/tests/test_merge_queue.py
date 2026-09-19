@@ -8522,7 +8522,11 @@ class TestMergeWorkerCasRetryEmitsMergeQueued:
 
 
 class TestWorkflowSubmitUsesEnqueueHelper:
-    """_submit_to_merge_queue delegates to enqueue_merge_request instead of put() directly."""
+    """_submit_to_merge_queue delegates to enqueue_merge_request, and rebinds the branch first.
+
+    Both halves are pinned: the delegation by the enqueue call assertions,
+    and "first" by the recorded relative order of the two calls.
+    """
 
     @pytest.mark.asyncio
     async def test_submit_to_merge_queue_calls_enqueue_helper(self, tmp_path: Path):
@@ -8531,6 +8535,16 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         Before step-12 impl, the function calls self.merge_queue.put() directly and
         never calls enqueue_merge_request — so mock_helper.assert_called_once() fails.
         After step-12, the function calls enqueue_merge_request — assertion passes.
+
+        Task 5461 also makes this test the home of the task-1923
+        belt-and-braces rebind assertion, which task 5030 left unpinned
+        everywhere in orchestrator/tests.  This file is its home because the
+        drive already stubs `git_ops.rebind_branch_to_head`, so the assertion
+        costs no new patch target and no new private read.
+
+        The drive passes the BARE task id, matching every production caller
+        (`branch_name = self.task_id  # matches _submit_to_merge_queue
+        convention`); `_submit_to_merge_queue` is what prepends the prefix.
         """
         from orchestrator.merge_queue import MergeOutcome, MergeRequest
         from orchestrator.workflow import TaskWorkflow
@@ -8568,8 +8582,12 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         workflow.worktree = tmp_path / 'wt'
         workflow.worktree.mkdir()
         # task-1923: _submit_to_merge_queue awaits git_ops.rebind_branch_to_head
-        # (belt-and-braces rebind) before enqueue — stub it async.
+        # (belt-and-braces rebind) before enqueue — stub it async.  The rebind
+        # builds its branch as f'{git_ops.config.branch_prefix}{branch_name}',
+        # and git_ops is a bare MagicMock, so the prefix needs a real value or
+        # the awaited name is a MagicMock repr.
         workflow.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
+        workflow.git_ops.config.branch_prefix = 'task/'
 
         # Before step-12: merge_queue.put() is called directly → resolve future
         # so _submit_to_merge_queue doesn't hang.
@@ -8586,9 +8604,19 @@ class TestWorkflowSubmitUsesEnqueueHelper:
 
         mock_helper = AsyncMock(side_effect=_mock_enqueue)
 
+        # The rebind's ORDER is load-bearing, not merely its occurrence: the
+        # named ref must already match the worktree HEAD when the worker
+        # resolves it, which is why the rebind sits immediately BEFORE the
+        # enqueue in production.  A shared parent records both mocks' calls in
+        # one sequence, so a refactor that moved the rebind after the enqueue --
+        # reopening the stale-ref race it closes -- fails here.
+        call_recorder = MagicMock()
+        call_recorder.attach_mock(workflow.git_ops.rebind_branch_to_head, 'rebind')
+        call_recorder.attach_mock(mock_helper, 'enqueue')
+
         # Patch the source module so both local and module-level imports get the mock.
         with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
-            await workflow._submit_to_merge_queue('task/42')
+            await workflow._submit_to_merge_queue('42')
 
         # KEY: enqueue_merge_request must have been called exactly once
         mock_helper.assert_called_once()
@@ -8598,6 +8626,19 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assert call_req.task_id == '42'
         assert call_req.branch.full_name == 'task/42'
         assert call_es is event_store_mock
+
+        # task-1923 belt-and-braces rebind, re-pinned by task 5461: the merge
+        # worker resolves the queued branch by NAME (merge_to_main ->
+        # resolve_queued_branch_ref), so dropping this rebind is silent.
+        workflow.git_ops.rebind_branch_to_head.assert_awaited_once_with(
+            workflow.worktree, 'task/42',
+        )
+        assert [entry[0] for entry in call_recorder.mock_calls] == [
+            'rebind', 'enqueue',
+        ], (
+            'the rebind must precede the enqueue, or the worker can resolve a '
+            f'stale named ref: saw {call_recorder.mock_calls!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
