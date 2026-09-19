@@ -11,7 +11,9 @@ agent following a skill — with no way forward:
 * **Stale lock.**  A leftover ``MERGE_RR.lock`` whose creating process is long
   gone makes the abort fail rc 128 with git's "Another git process seems to be
   running" advice, which names no remedy the caller can act on.  This is an
-  independent failure: it reproduces with a perfectly intact rr-cache.
+  independent failure: it reproduces with a perfectly intact rr-cache.  The
+  sweep's scope is deliberately wider than the file that motivated it — see
+  :func:`sweep_stale_locks`.
 
 This module is the preflight that makes the abort safe, plus the command
 prefix the abort itself must carry.  Both measures are applied, and they do
@@ -499,6 +501,27 @@ def sweep_stale_locks(
     Size is likewise not a liveness signal: git's lock files are empty for as
     long as they are held, so a 0-byte lock is exactly as likely to be live as
     it is to be abandoned.
+
+    SCOPE IS EVERY ``*.lock`` DIRECTLY UNDER *git_dir*, not just the
+    ``MERGE_RR.lock`` the incident left behind.  git answers rc 128 with the
+    same unactionable advice whichever sentinel is stale, so a sweep that
+    cleared only one of them would leave the identical failure reachable
+    through ``index.lock``.  The breadth is asserted rather than left as a side
+    effect of the glob, by
+    ``test_an_abandoned_index_lock_is_swept_and_a_held_one_is_not``.
+
+    THE BAR IS STRICTER THAN THE ONE ``index.lock`` ALREADY HAS, deliberately.
+    ``orchestrator/src/orchestrator/git_ops.py::_INDEX_LOCK_STALE_FLOOR_S`` is
+    300s and governs ``project_root``'s index lock at two collaborating sites
+    that must never drift from EACH OTHER — one short-circuits a wait, the
+    other renders ``rm -f`` ADVICE from the same bar.  This module neither
+    reads nor moves those: at 3600s every file it removes is one both sites
+    would already call stale, so the agreement they need is untouched.  What it
+    does that they do not is perform the deletion, which is affordable only in
+    this position — on a recovery path, for a worktree whose abort has already
+    been asked for, behind a confirmed-unheld holder scan AND an hour of
+    stillness.  The constant is not imported because git_ops imports THIS
+    module; a reciprocal import is the cycle :data:`AbortRunner` documents.
     """
     removed: list[LockFinding] = []
     retained: list[LockFinding] = []

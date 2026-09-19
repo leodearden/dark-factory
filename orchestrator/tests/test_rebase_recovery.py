@@ -784,6 +784,32 @@ class TestSweepStaleLocks:
         assert '7200' in logged
         assert 'holder' in logged.lower()
 
+    def test_an_abandoned_index_lock_is_swept_and_a_held_one_is_not(
+        self, tmp_path: Path,
+    ) -> None:
+        """The sweep's scope is deliberately wider than the lock that motivated it.
+
+        ``MERGE_RR.lock`` is what incident 3517 left behind, but rc 128 comes
+        equally from ``index.lock``: git refuses the abort with the same
+        unactionable "Another git process seems to be running" whichever
+        sentinel is stale.  A reader deciding whether it is safe to point
+        ``guarded_abort`` at a new path should not have to derive that scope
+        from a glob, so it is asserted here rather than left incidental — with
+        the held control beside it, because the breadth is only defensible
+        while the conjunction holds for every file it reaches.
+        """
+        git_dir = tmp_path / 'gitdir'
+        swept_lock = _plant_lock(git_dir, 'index.lock', age_seconds=_STALE * 2)
+        held_lock = _plant_lock(git_dir, 'config.lock', age_seconds=_STALE * 2)
+
+        with held_lock.open('a'):
+            swept = _swept(git_dir)
+
+        assert [s.path for s in swept.removed] == [swept_lock]
+        assert not swept_lock.exists()
+        assert [s.path for s in swept.retained] == [held_lock]
+        assert held_lock.exists(), 'breadth must not outrun the conjunction'
+
     def test_only_lock_files_directly_under_the_git_dir_are_considered(
         self, tmp_path: Path,
     ) -> None:
