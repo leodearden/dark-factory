@@ -1017,6 +1017,12 @@ class TestQuotedReportIsRepairable:
         'countable.'
     )
     _ACTION = 'Re-file the escalation once the guard is narrowed; no data was lost.'
+    #: The one cell separating negative control (g) from the inverted pin
+    #: below: a sentence of prose where that one has a single space.
+    _SIBLING_PROSE = (
+        ', then a sentence of prose about what the tripwire matched, and only '
+        'then the record it is quoting: '
+    )
     _EVIDENCE = (
         '[{"observation": "tripwire matched_pattern=' + _closer('content')
         + ', agent_id=claude-task-4502", "measured_at": "HEAD=b2035cf8c6", '
@@ -1047,6 +1053,30 @@ class TestQuotedReportIsRepairable:
             param='detail',
             schema_params=self._ESCALATE_INFO_PARAMS,
             supplied=self._SUPPLIED,
+        )
+
+    @staticmethod
+    def _sibling_opener_tail(opener, separator: str = _SIBLING_PROSE) -> str:
+        """An ``evidence`` value that QUOTES a whole record, opener included.
+
+        The three specimens that turn on a sibling opener differ in exactly two
+        cells — which dialect *opener* builds the quoted ``suggested_action``
+        tag, and what *separator* sits between the quoted ``foo`` closer and it
+        — so they are built here rather than spelled three times. A reader can
+        then check the claim each of their docstrings makes about the others by
+        reading the call, not by diffing three string literals.
+
+        The trailing ``xyz`` closer and the prose after it are LOAD-BEARING and
+        must not be tidied away: without them the sibling's text ends the body,
+        the remainder after that closer is empty, an empty remainder parses as
+        an empty recovery, and condition (ii) refuses the whole specimen. Each
+        of these would then pass for a reason that has nothing to do with the
+        opener rule it exists to pin.
+        """
+        return (
+            'the report quotes ' + _closer('foo') + separator
+            + opener('suggested_action')
+            + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
         )
 
     def test_the_quoted_report_recovers_both_dropped_siblings(self):
@@ -1223,6 +1253,45 @@ class TestQuotedReportIsRepairable:
             supplied={'project_root', 'title', 'description'},
         ) is None
 
+    def test_a_canonical_sibling_opener_inside_a_value_is_refused(self):
+        """NEGATIVE CONTROL (g) — condition (i)'s OPENER MIRROR.
+
+        Task **4502** narrowed B5 by reasoning about inner CLOSERS, and its
+        rule iterates over closers alone. A well-formed parameter OPENER inside
+        a recovered value is therefore invisible to it: the opener is glued
+        into that value verbatim while the sibling it names is silently NOT
+        recovered. MEASURED across 4502 (``b88919ad25^`` vs ``1b9fedeb97``),
+        this specimen went from ``None`` to ``recovered={'evidence': ...}`` —
+        a shape that task admitted by omission rather than by decision.
+
+        ``suggested_action`` is a real ``escalate_info`` parameter, disjoint
+        from ``_SUPPLIED``, so the repairer would have recovered it as its own
+        argument had the opener been reached at an item boundary. Accepting
+        this value instead writes one argument's text into another's and
+        reports ``outcome=repaired``; under FORWARD_REPAIR that wrong text goes
+        straight into the tool's arguments. It is the no-silent-partial-repair
+        failure of committed-corpus record 25 (negative control (a)) reached
+        through an OPENER instead of a closer, which is why the opener half is
+        stated as categorically as condition (i) states the closer half.
+
+        THE AMBIGUITY PROBE CANNOT REACH THIS, as it stands OR moved. As it
+        stands, (ii) runs from each inner CLOSER, and both remainders here
+        begin mid-prose, so neither parses. Moved to run from each inner OPENER
+        — the other remedy weighed for this task — it still answers "does not
+        parse", because the sibling's own text carries the trailing ``xyz``
+        closer and the probe's depth-1 bound restores the blanket substring
+        refusal for exactly that. Only a rule stated on the opener refuses this
+        shape.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + self._sibling_opener_tail(_canonical_opener)
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
     # -- the narrowed rule's own BOUNDS -------------------------------------
     #
     # Three branches decide how far the narrowing does NOT reach: the
@@ -1288,46 +1357,49 @@ class TestQuotedReportIsRepairable:
 
         assert self._repair(value) is None
 
-    def test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE(self):
-        """The probe's DEPTH-1 bound, pinned by the shape whose answer it decides.
+    def test_a_sibling_opener_abutting_a_quoted_closer_is_refused_TOO(self):
+        """The narrowing's REACH, re-pinned INVERTED by task **5620**.
 
-        Not a negative control: it asserts a RECOVERY, because the bound can
-        only push the answer that way. The probe asks "does the remainder after
-        this inner closer ALSO parse?", and at depth 1 it restores the blanket
-        substring refusal — so a remainder that WOULD parse into an item whose
-        own value quotes markup reads as "does not parse", condition (ii) stays
-        silent, and the tail is recovered whole.
+        WAS ``test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE``,
+        and it asserted a RECOVERY of this exact specimen, which is unchanged
+        below. THE OLD READING, correct about the machinery when 4502 wrote it:
+        the probe asks "does the remainder after this inner closer ALSO
+        parse?", at depth 1 it restores the blanket substring refusal, so a
+        remainder that WOULD parse into an item whose own value quotes markup
+        reads as "does not parse", condition (ii) stays silent, and the tail is
+        recovered whole. The mutation it cited was real, and the bound it
+        describes still exists.
 
-        This specimen is exactly that shape: the quoted report carries a closer
-        immediately followed by a canonical opener, so the remainder is itself a
-        quoting item. MUTATION-VERIFIED: deleting the ``probe`` short-circuit —
-        i.e. letting the probe re-enter the narrowed rule — makes that remainder
-        parse, fires condition (ii), and flips this specimen to ``None``.
+        IT WAS ALSO A PIN ON THE DEFECT TASK 5620 REMOVES. This specimen
+        differs from negative control (g) in ONE cell — a single space where
+        that one has a sentence of prose, which is why both are built by
+        ``_sibling_opener_tail`` rather than spelled out. Both regressed
+        identically at 4502 (measured: it refused both before, recovered both
+        after), so no rule can block one and spare the other. What the recovery
+        asserted here actually WAS: ``suggested_action``, a real parameter of
+        this tool, silently not recovered, its text written into ``evidence``
+        instead — the same swallowed-sibling partial repair control (g) refuses.
 
-        So the bound is a DESIGN CHOICE with an observable consequence rather
-        than a free safety net, and moving it must be a decision rather than a
-        tidy-up. What is delivered stays verbatim caller text under D5, which
-        the invariant assertion states rather than assumes.
+        SO THE PIN IS INVERTED RATHER THAN DELETED. Its subject — how far the
+        narrowing reaches — is still the thing under test, and this is the
+        decision its own closing sentence demanded: "moving it must be a
+        decision rather than a tidy-up." What changed is only WHICH rule
+        decides the specimen. The depth-1 bound no longer does; the opener rule
+        refuses the value before condition (ii) is consulted, so the old
+        MUTATION-VERIFIED claim — that deleting the ``probe`` short-circuit
+        flips this answer — no longer holds and is deliberately not restated.
+        :func:`shared.toolcall_markup._parse_body` carries the measured
+        consequence for that branch.
         """
-        quoted_tail = (
-            'the report quotes ' + _closer('foo') + ' '
-            + _canonical_opener('suggested_action')
-            + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
-        )
         value = (
             self._CLEAN
             + _CANONICAL_CLOSER + '\n'
-            + _canonical_opener('evidence') + quoted_tail
+            + _canonical_opener('evidence')
+            + self._sibling_opener_tail(_canonical_opener, separator=' ')
             + '\n' + INVOKE_CLOSER
         )
 
-        result = self._repair(value)
-
-        assert result is not None
-        assert set(result.recovered) == {'evidence'}
-        assert result.recovered['evidence'] == quoted_tail
-        assert_repair_invariants(value, result)
-
+        assert self._repair(value) is None
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
