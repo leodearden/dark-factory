@@ -801,9 +801,9 @@ class BacklogPolicy:
         callback re-enters, and the rate-limit gate turns each one away at
         INFO) for an unbounded one. See the merge site below.
 
-        DEFERRED-TASK INTERACTION, recorded rather than absorbed. A 900s
-        cadence is the ``dedupe_children`` growth case deferred task 4335
-        describes and the parent-freshness gap deferred task 4132 describes.
+        PRIOR-TASK INTERACTION, recorded rather than absorbed. A 900s
+        cadence is the ``dedupe_children`` growth case task 4335 describes
+        and the parent-freshness gap task 4132 describes.
         Both are already bounded by task 4885, which landed AFTER they were
         deferred: ``queue._MAX_DEDUPE_CHILDREN = 200`` with
         ``_MAX_DEDUPE_CHILDREN_HEAD = 20`` and a ``dedupe_children_truncated``
@@ -811,7 +811,8 @@ class BacklogPolicy:
         unconditionally. At 900s a parent reaches the 200-child cap in ~50h,
         after which provenance sheds under the cap while ``dedupe_count`` —
         the deliberately uncapped recurrence signal — keeps counting. This
-        task neither re-opens nor closes 4335/4132.
+        task absorbs neither; both were closed out-of-band as already
+        delivered by 4885 (esc-5557-1), so nothing here waits on them.
         """
         async with self._lock:
             state = self._state.setdefault(project_id, _PolicyState())
