@@ -4751,50 +4751,6 @@ class TestMidRunPlanLockExceptionSurvives:
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
-class TestApplierHasNoLocalOpenEscalationTruthiness:
-    """The grep-provable half, scoped to this one method.
-
-    `_reconcile_one_stranded` may test `report.open_escalations` for truthiness
-    in at most ONE place — the re-file DEDUP guard, which asks a DIFFERENT
-    question ("would I be stacking a second record?").  Asserted STRUCTURALLY:
-    the survivor's body must be a bare `return None`, never a veto arm.  The
-    carve-out's rationale lives in the source comment at the site, once; a
-    duplicate of it here would pin wording rather than behaviour.
-    """
-
-    @staticmethod
-    def _method_source() -> str:
-        import inspect
-
-        return inspect.getsource(Harness._reconcile_one_stranded)
-
-    def test_only_the_dedup_guard_tests_open_escalations_for_truth(self) -> None:
-        import ast
-        import textwrap
-
-        lines = textwrap.dedent(self._method_source()).splitlines()
-        offenders = [
-            node.lineno
-            for node in ast.walk(ast.parse('\n'.join(lines)))
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Attribute)
-            and node.test.attr == 'open_escalations'
-            and isinstance(node.test.value, ast.Name)
-            and node.test.value.id == 'report'
-        ]
-
-        assert len(offenders) <= 1, (
-            '_reconcile_one_stranded re-derives the veto locally at '
-            f'{len(offenders)} sites (method-relative lines {offenders}) — '
-            'every recovery veto must consume the shared predicate (INV-5)'
-        )
-        if offenders:
-            # The survivor must be the DEDUP guard, whose body is a bare
-            # `return None` — not a veto arm with an emission.
-            assert lines[offenders[0]].strip() == 'return None', lines[offenders[0]]
-
-
-
 # ---------------------------------------------------------------------------
 # REVIEW FINDING 1 — the dedup guard must stop swallowing a re-file the
 # rewired resolver legitimately ORDERS, and must never hold silently.

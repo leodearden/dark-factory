@@ -87,6 +87,34 @@ def _enclosing_function(tree: ast.AST, target: ast.If) -> str:
     return best
 
 
+def _gate_check_calls(function: str) -> list[tuple[int, frozenset[str]]]:
+    """Every role-scoped `get_by_task` inside *function*, as (line, keywords).
+
+    Structural rather than textual: the gate check is identified by WHAT IT
+    CALLS (`get_by_task`), WHERE (inside *function*), and the one keyword that
+    distinguishes it from an unrelated read (`agent_role`) — so line wrapping,
+    argument order and whitespace are all free to change.
+    """
+    tree = ast.parse(_module_source('harness.py'))
+    enclosing = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name == function
+    )
+    return [
+        (node.lineno, frozenset(kw.arg for kw in node.keywords if kw.arg))
+        for node in ast.walk(enclosing)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'get_by_task'
+        and any(
+            kw.arg == 'agent_role'
+            and ast.unparse(kw.value) == 'DETERMINISTIC_AGENT_ROLE'
+            for kw in node.keywords
+        )
+    ]
+
+
 class _BareTest(NamedTuple):
     """One ``if <a-collection-of-records>:`` found in a scanned module."""
 
@@ -209,19 +237,31 @@ class TestTheGateCheckStaysArchiveInclusive:
     to edit.
     """
 
-    #: The gate check's OWN call — the two-argument, `status`-less form.
-    #: `agent_role=DETERMINISTIC_AGENT_ROLE` alone appears more than once in
-    #: harness.py, so anchoring on that would find an unrelated site.
-    _MARKER = 'tid, agent_role=DETERMINISTIC_AGENT_ROLE,'
+    #: The sweep that owns the gate check.  `agent_role=DETERMINISTIC_AGENT_ROLE`
+    #: alone appears more than once in harness.py, so the enclosing function is
+    #: what makes the anchor unambiguous.
+    _SWEEP = '_run_deterministic_recon_sweep'
 
     def test_the_gate_check_is_still_archive_inclusive(self) -> None:
-        source = _module_source('harness.py')
-        assert self._MARKER in source
-        index = source.index(self._MARKER)
-        window = source[max(0, index - 2500):index + 400]
-        assert "status='pending'" not in window.split(self._MARKER)[-1][:200], (
-            'narrowing the gate read to pending would make a human-resolved '
-            'gate look like a fresh strand'
+        """Keyed on the parsed CALL, never on its source text.
+
+        An earlier version matched the raw substring
+        `'tid, agent_role=DETERMINISTIC_AGENT_ROLE,'`, which existed only
+        because the call happened to wrap that way — so re-wrapping it, a
+        formatting-only edit, failed this test with a message about archive
+        inclusivity.  The keyword set is the behaviour; the line breaks are not.
+        """
+        calls = _gate_check_calls(self._SWEEP)
+
+        assert len(calls) == 1, (
+            f'expected exactly one role-scoped gate read in {self._SWEEP}(), '
+            f'found {len(calls)} (lines {[line for line, _ in calls]})'
+        )
+        _, keywords = calls[0]
+        assert 'status' not in keywords, (
+            'narrowing the gate read to a status would make a human-resolved '
+            'gate look like a fresh strand — it asks "did a human already '
+            'ACT?", so its read stays archive-INCLUSIVE'
         )
 
 

@@ -1579,3 +1579,189 @@ class TestPromotedRecordStillCarriesTheReapersIdentity:
         assert len(promoted) == 1
         assert promoted[0].filing_claimant_run_id == harness._filing_claimant_run_id
         assert promoted[0].filing_claimant_run_id != _FILER_ID
+
+
+@pytest.mark.asyncio
+class TestUnreadableTaskRowUnderALiveSignal:
+    """The `(live_row or {})` fallback, driven rather than read.
+
+    `_task_row()` can legitimately return ``None`` — a `get_task` that finds no
+    row — WHILE a liveness signal reads true, because the two come from
+    different sources (`_escalation_events` / `is_actively_held` are in-process,
+    the row is a Taskmaster read).  The fallback exists for exactly that, and it
+    resolves the live identity to ``None``, which `classify_pins` cannot prove
+    anything from — so the record stays a QUEUE_HANDOFF and is deferred.
+
+    Asserted directly because the alternative reading of that branch —
+    "unknown live identity means the filer must be gone" — would PROMOTE here,
+    and nothing else in this file would notice.
+    """
+
+    async def test_a_none_task_row_defers_rather_than_promoting(
+        self, harness: Harness,
+    ) -> None:
+        _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        getter = AsyncMock(return_value=None)
+        harness.scheduler.get_task = getter  # type: ignore[method-assign]
+
+        assert await harness._reap_orphan_l0_escalations() == 0, (
+            'an unreadable task row proves nothing about the filer — the '
+            'record must be deferred, not promoted'
+        )
+        getter.assert_awaited()
+
+    async def test_the_record_stays_open_for_the_next_sweep(
+        self, harness: Harness,
+    ) -> None:
+        """Deferred, not dropped: the next sweep re-checks it."""
+        esc = _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+        harness.scheduler.get_task = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        await harness._reap_orphan_l0_escalations()
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+
+@pytest.mark.asyncio
+class TestThePromotionIsVisibleToALiveRun:
+    """The downstream consequence, pinned as a DECISION rather than left to emerge.
+
+    `TaskWorkflow._check_escalations` reads
+    `get_by_task(task_id, status='pending')` — TASK-scoped, not
+    incarnation-scoped — so the record this arm dismisses is one a LIVE newer
+    run can be sitting on, and the L1 that replaces it is one
+    `_is_gating_escalation` deliberately does NOT gate (a plain blocking L1 is a
+    prior-run steward hand-off; sinking the current run on it caused the
+    run-2 false-blocked outcome, esc-2911-22).
+
+    So promotion RELEASES a live run that was gated on a prior incarnation's
+    blocker.  That is spec S6's intent — the prior incarnation's handoff was
+    never the current run's to consume, and its visibility moves to a human via
+    the L1 — but it is load-bearing enough that it must be asserted, not
+    inferred.  Task 5222 owns narrowing `_is_gating_escalation` onto
+    `escalation.pins.is_queue_handoff`; these assertions are what will tell it
+    whether it changed this outcome.
+    """
+
+    @staticmethod
+    def _gating(harness: Harness, tid: str) -> list[Escalation]:
+        """Exactly what a live `TaskWorkflow` would compute for *tid*."""
+        from orchestrator.workflow import _is_gating_escalation
+
+        return [
+            e for e in _bound_queue(harness).get_by_task(tid, status='pending')
+            if _is_gating_escalation(e)
+        ]
+
+    async def test_a_live_run_gated_on_the_prior_l0_is_released_by_promotion(
+        self, harness: Harness,
+    ) -> None:
+        _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert self._gating(harness, 'T1'), (
+            "precondition: the prior incarnation's blocking L0 gates the "
+            'live run (_is_gating_escalation disjunct 1)'
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        assert not self._gating(harness, 'T1'), (
+            'after promotion the live run sees only the plain blocking L1, '
+            'which _is_gating_escalation deliberately does not gate — the '
+            "run resumes and the record's visibility moves to a human"
+        )
+        pending = _bound_queue(harness).get_by_task('T1', status='pending')
+        assert [e.level for e in pending] == [1]
+
+    async def test_a_deferred_record_keeps_gating_the_live_run(
+        self, harness: Harness,
+    ) -> None:
+        """The other half: no promotion, no release.
+
+        The filer is still live, so the handoff is genuinely the current run's
+        to consume and must keep gating it.
+        """
+        _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        _make_live(harness, 'T1', claimant_run_id=_FILER_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+        assert self._gating(harness, 'T1')
+
+
+@pytest.mark.asyncio
+class TestThePromotedRecordSaysWhichArmPromotedIt:
+    """A promoted L1 may only claim what the arm that promoted it established.
+
+    The dead-filer arm promotes precisely when a workflow IS live, so the
+    original "no active workflow" wording would be false there — and it is the
+    dismissal note a live agent is handed on resume (see
+    `TestThePromotionIsVisibleToALiveRun`), not merely operator-facing prose.
+    """
+
+    @staticmethod
+    def _promoted(harness: Harness) -> Escalation:
+        promoted = [e for e in _bound_queue(harness).get_pending() if e.level == 1]
+        assert len(promoted) == 1
+        return promoted[0]
+
+    async def test_the_dead_filer_arm_names_both_incarnations(
+        self, harness: Harness,
+    ) -> None:
+        esc = _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        summary = self._promoted(harness).summary
+        assert 'no active workflow' not in summary, (
+            'a workflow IS live on this arm — only the FILER is gone'
+        )
+        assert _FILER_ID in summary
+        assert _LIVE_ID in summary
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+        assert 'no active workflow' not in refreshed.resolution
+        assert _FILER_ID in refreshed.resolution
+        assert _LIVE_ID in refreshed.resolution
+
+    async def test_the_nothing_live_arm_keeps_its_original_wording(
+        self, harness: Harness,
+    ) -> None:
+        """UNCHANGED for every pre-3541 promotion: nothing was running."""
+        esc = _submit_aged_blocking(
+            harness, 'T1', 120.0,
+            filing_claimant_run_id=_FILER_ID,
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        assert 'no active workflow' in self._promoted(harness).summary
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.resolution is not None
+        assert 'no active workflow' in refreshed.resolution
