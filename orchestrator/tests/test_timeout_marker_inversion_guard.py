@@ -117,6 +117,17 @@ _DEEP_GATE_SPELLINGS = frozenset({
 #: pass by finding nothing rather than by finding nothing wrong.
 _MIN_DEEP_GATE_MARKER_SITES = 8
 
+#: The module task 5582 sizes and ratchets: nine real-git classes that all
+#: carried an identical bare ``180`` -- inside the inversion band, so under
+#: verify's CLI budget they ran TIGHTER than the run gating the merge.  They
+#: were the largest single block in :data:`_GRANDFATHERED` until that task
+#: migrated them.
+_DEEP_LANDING_MODULE = 'test_merge_queue_deep_landing.py'
+
+#: How many timeout marker sites that module must carry -- an EQUALITY, argued
+#: at :meth:`TestDeepLandingModuleMarkers.test_the_census_is_not_vacuous`.
+_DEEP_LANDING_MARKER_SITES = 9
+
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
 #: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
@@ -1389,6 +1400,132 @@ class TestRow7SceneIsGuarded:
             'the measured decay behind it, are in _orch_helpers.py::'
             'DEEP_GATE_SCENE_TEST_TIMEOUT. Restore the fixture rather than '
             'widening the marker further.'
+        )
+
+
+class TestDeepLandingModuleMarkers:
+    """What test_merge_queue_deep_landing.py must carry for task 5582.
+
+    THE MODULE-WIDE TWIN of :class:`TestRow7SceneIsGuarded`, which pins one
+    class.  Here all NINE real-git classes share one derived constant, so the
+    census is stated over the module rather than per class: nine separate
+    single-class pins would be nine copies of one claim, and a tenth class
+    added later would join none of them.
+
+    Reads the memoised :func:`_tree_scan` rather than sweeping again -- one
+    pass is MEASURED at 15.03s loaded, and this module already pays for it.
+
+    The derivation these markers are sized by is NOT restated here; see
+    ``_orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT``.
+    """
+
+    def _sites(self) -> list[_Site]:
+        """Every ``timeout`` marker site in the deep-landing module."""
+        return [site for module, site in _tree_scan().sites if module == _DEEP_LANDING_MODULE]
+
+    def test_the_module_has_no_in_band_marker_sites(self) -> None:
+        """Not one marker here may sit in the inversion band.
+
+        Asserted at the MODULE rather than left to the tree-wide ratchet
+        because these nine sites were the largest grandfathered block in it:
+        the ratchet would keep passing over an entry someone re-added under an
+        allowlisted name, and this pin would not.
+        """
+        in_band = sorted(
+            (site for site in self._sites() if _inverts(site.seconds)),
+            key=lambda site: site.lineno,
+        )
+
+        assert not in_band, (
+            f'{len(in_band)} timeout marker(s) in {_DEEP_LANDING_MODULE} sit '
+            f'in the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING} < N < '
+            f'{VERIFY_CLI_PER_TEST_TIMEOUT}), so they run TIGHTER under '
+            "verify's CLI budget than the ambient run that gates the merge -- "
+            'and a breach there is not a red test but an os._exit()d xdist '
+            'worker.\n\n'
+            'Spell them as DEEP_LANDING_SCENE_TEST_TIMEOUT, imported from '
+            '_orch_helpers, which is derived from this module\'s MEASURED '
+            'spawn counts and bounded waits. Do not pick a new number by '
+            'hand, and do not re-add them to _GRANDFATHERED -- that census '
+            'may only ever shrink.\n'
+            + '\n'.join(
+                f'  {_DEEP_LANDING_MODULE}:{site.lineno} {site.qualname} '
+                f'({site.kind}) pins {site.seconds:g}s'
+                for site in in_band
+            )
+        )
+
+    def test_every_marker_site_is_spelled_as_the_named_constant(self) -> None:
+        """Both halves matter, and neither implies the other.
+
+        The ``seconds`` half is what proves the name is registered in
+        :data:`_SANCTIONED_TIMEOUT_NAMES`: an unregistered name resolves to
+        None -- "no opinion" -- which would quietly take these nine sites out
+        of the ratchet's view entirely rather than fail anything.
+
+        The ``spelling`` half is what stops a bare ``1080`` literal, which
+        resolves identically and would leave the constant and the markers as
+        ten independent copies of one figure that no re-derivation can reach.
+        That distinction is the whole reason :attr:`_Site.spelling` exists.
+        """
+        expected = float(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+        wrong = sorted(
+            (
+                site
+                for site in self._sites()
+                if site.spelling != 'DEEP_LANDING_SCENE_TEST_TIMEOUT'
+                or site.seconds != expected
+            ),
+            key=lambda site: site.lineno,
+        )
+
+        assert not wrong, (
+            f'{len(wrong)} timeout marker(s) in {_DEEP_LANDING_MODULE} do not '
+            'pin DEEP_LANDING_SCENE_TEST_TIMEOUT by name at its real value '
+            f'({expected:g}s).\n\n'
+            'A wrong SPELLING (a bare literal, or another constant) is a '
+            'second copy of the number that a re-derivation cannot move. A '
+            'wrong VALUE means _SANCTIONED_TIMEOUT_NAMES has no entry for the '
+            'name, or drifted from it -- an unresolved name reads as "no '
+            'opinion", so the ratchet would stop having any view of these '
+            'sites at all while staying green. Import the constant from '
+            '_orch_helpers, and register it in _SANCTIONED_TIMEOUT_NAMES.\n'
+            + '\n'.join(
+                f'  {_DEEP_LANDING_MODULE}:{site.lineno} {site.qualname} '
+                f'({site.kind}) pins {site.spelling or "<no argument>"} -> '
+                f'{site.seconds}'
+                for site in wrong
+            )
+        )
+
+    def test_the_census_is_not_vacuous(self) -> None:
+        """Exactly nine sites, so a sweep that sees nothing fails loudly.
+
+        An EQUALITY and not a floor, unlike
+        :data:`_MIN_DEEP_GATE_MARKER_SITES` next door.  That module's markers
+        are split across two sanctioned spellings and it is expected to grow
+        new classes at the verify budget; here all nine classes share ONE
+        derived constant, so a tenth marker is not ordinary growth -- it is a
+        class whose cost has not been measured joining a budget sized without
+        it.  Both directions are therefore findings: fewer means the sweep or
+        the markers broke, more means the derivation now covers a scene it was
+        never measured against.
+        """
+        sites = self._sites()
+
+        assert len(sites) == _DEEP_LANDING_MARKER_SITES, (
+            f'{len(sites)} timeout marker site(s) found in '
+            f'{_DEEP_LANDING_MODULE}, expected exactly '
+            f'{_DEEP_LANDING_MARKER_SITES}.\n\n'
+            'FEWER: the module was renamed (update _DEEP_LANDING_MODULE) or '
+            'its real-git classes lost their markers -- which is the '
+            'condition this sweep exists to prevent and would otherwise pass '
+            'here VACUOUSLY, green because it found nothing rather than '
+            'because it found nothing wrong.\n'
+            'MORE: a new class joined the shared budget. Measure its git '
+            'spawn count first and re-derive DEEP_LANDING_SCENE_SPAWN_BUDGET '
+            'and DEEP_LANDING_SCENE_TEST_TIMEOUT if it is heavier than the '
+            'worst already covered, then raise this count in the same commit.'
         )
 
 
