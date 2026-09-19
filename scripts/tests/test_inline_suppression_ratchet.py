@@ -1631,3 +1631,108 @@ def test_a_scoped_seed_is_refused_before_any_scan_work(tmp_path: Path, capsys):
     assert 'scoped' in error
     assert 'broken.py' not in error
     assert not baseline.exists()
+
+
+def _tighten(root: Path, baseline_path: Path, *paths: str) -> int:
+    """Run ``--tighten`` over *root*, optionally scoped to *paths*."""
+    return inline_suppressions.main(
+        ['--tighten', '--root', str(root), '--baseline', str(baseline_path), *paths]
+    )
+
+
+def test_removing_a_marker_becomes_slack_that_tighten_takes_away(tmp_path: Path, capsys):
+    """BOUNDARY SCENARIO 5 — the ratchet's forward click.
+
+    Slack is not a cosmetic figure: because two identical lines share one D7 key,
+    an un-tightened baseline lets an identical line straight back in where one was
+    removed.  The headroom is a standing invitation nobody meant to leave open,
+    which is why ``--check`` reports it and D11's sweep files a task to spend it.
+    """
+    lines = _grandfathered(3).splitlines(keepends=True)
+    baseline = _write_fixture_tree(tmp_path, {'m.py': ''.join(lines)}, baseline=True)
+    _revise(tmp_path, {'m.py': ''.join(lines[:2])})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 0
+    assert 'slack 1' in capsys.readouterr().out
+
+    before = set(load(baseline).counts)
+    assert _tighten(tmp_path, baseline) == 0
+
+    reported = capsys.readouterr().out
+    (gone,) = before - set(load(baseline).counts)
+    assert gone in reported
+
+    assert _check(tmp_path, baseline) == 0
+    assert 'slack 0' in capsys.readouterr().out
+
+
+def test_a_second_tighten_over_an_unchanged_tree_writes_the_same_bytes(
+    tmp_path: Path, capsys
+):
+    """Idempotent, and asserted on BYTES so a rewrite that reordered keys or
+    re-rendered a float would show up.
+
+    ``tighten`` is the pointwise minimum, so this follows from the arithmetic
+    rather than from a guard — which is the property worth pinning, because a
+    baseline that churned on every run would make its own review impossible.
+    """
+    lines = _grandfathered(3).splitlines(keepends=True)
+    baseline = _write_fixture_tree(tmp_path, {'m.py': ''.join(lines)}, baseline=True)
+    _revise(tmp_path, {'m.py': ''.join(lines[:2])})
+
+    assert _tighten(tmp_path, baseline) == 0
+    once = baseline.read_bytes()
+    assert _tighten(tmp_path, baseline) == 0
+    capsys.readouterr()
+
+    assert baseline.read_bytes() == once
+
+
+def test_tighten_never_adds_a_key_so_it_is_not_a_way_to_go_green(tmp_path: Path):
+    """The no-add-key property, from the consumer's side.
+
+    ``tighten``'s result is a pointwise minimum, so a key the baseline does not
+    hold has multiplicity 0 there and the minimum of anything and 0 is 0 — the
+    property is structural rather than a check anyone can forget.  What this test
+    pins is the consequence that matters at the gate: an agent facing a red run
+    cannot clear it by tightening.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    _revise(
+        tmp_path,
+        {'m.py': 'a = 1  # type: ignore[arg-type]\nb = 2  # type: ignore[attr-defined]\n'},
+    )
+    before = set(load(baseline).counts)
+
+    assert _tighten(tmp_path, baseline) == 0
+
+    assert set(load(baseline).counts) == before
+    assert _check(tmp_path, baseline) == 1
+
+
+def test_a_scoped_tighten_is_refused_and_leaves_the_baseline_alone(tmp_path: Path, capsys):
+    """The widening the kernel's arithmetic cannot refuse, refused here.
+
+    A scoped scan is honestly ``complete=True`` for its scope, so it passes
+    ``_require_comparable`` and the pointwise minimum goes through — writing
+    ``baseline ∩ scope`` and silently deleting every key outside the paths.  That
+    is a one-command gate-widening, so the verb refuses the scope outright.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {
+            'pkg/kept.py': 'a = 1  # type: ignore[arg-type]\n',
+            'other/kept.py': 'b = 2  # type: ignore[attr-defined]\n',
+        },
+        baseline=True,
+    )
+    before = baseline.read_bytes()
+    capsys.readouterr()
+
+    assert _tighten(tmp_path, baseline, 'pkg') == 2
+
+    assert baseline.read_bytes() == before
+    assert 'scoped' in capsys.readouterr().err
