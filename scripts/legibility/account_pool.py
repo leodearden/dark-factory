@@ -285,11 +285,21 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     per-digest, and ``reverse=True``, every later digest then draws the same
     account first: one account emitting exit-0 banners still loses a night
     with the rest of the pool idle -- precisely the hazard the paragraph
-    above describes, surviving on one route. Closing it means scanning the
-    reply with the gate's STRICT detector (``slot.detect_cap_hit``, prefix
-    AND confirm) -- the one policy that does not false-positive on
-    cap-themed content -- which is its own change, filed as follow-up rather
-    than smuggled in here.
+    above describes, surviving on one route.
+
+    REAL BUT NEVER YET OBSERVED, which is why it is recorded here rather
+    than fixed under time pressure. Measured 2026-09-19 across the journal's
+    full retention (2026-08-25 onward, ~24.5 days, 49 trickle runs): the
+    non-zero-exit route fired 46 times, all on one night; this route fired
+    ZERO times, out of 3 occasions when its scan site actually ran -- each
+    of those a fenced JSON reply that merely failed to parse, with
+    ``looks_like_blocking_banner`` correctly returning None. Nothing on disk
+    reaches further back: ``trickle_state`` keeps only the last run.
+
+    Closing it means scanning the reply with the gate's STRICT detector
+    (``slot.detect_cap_hit``, prefix AND confirm) -- the one policy that does
+    not false-positive on cap-themed content -- which is its own change,
+    filed as follow-up rather than smuggled in here.
 
     TERMINATION IS STRUCTURAL, and it is the CALLER's set of already-tried
     names that makes it so — not the gate's handlers. A True verdict from
