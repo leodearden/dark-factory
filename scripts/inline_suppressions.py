@@ -15,9 +15,17 @@ and **D12**.
    the kind table's marker substrings drops the files that cannot hold a
    marker; the survivors are tokenized and only COMMENT tokens are read.
 2. *Consumer model* (D8).  Which tool, if any, actually honours this marker.
-3. *Classify.*  Owned by an inline disposition, ratified by class, or unowned.
+3. *Classify.*  Owned by an inline disposition, ratified by class, or unowned
+   — decided in THAT fixed order, which is what makes a marker no tool reads
+   un-rescuable by either of the other two.
 4. *Ratchet.*  ``shared.ratchet`` does all the arithmetic and all the baseline
    I/O; this module supplies the keys and renders the violations.
+
+**The key** (D7).  An unowned site contributes ``(kind, sorted codes, a 12-hex
+sha256 of its stripped physical line)`` to a multiset — and no path.  A rename
+or a file split therefore invents no key and needs no baseline diff, while
+editing the line a marker rides on does invent one, which is how an ordinary
+edit converts a grandfathered suppression into one somebody has to own.
 
 **The exit-code ladder**, which is the PRD Contract's and is restated in the
 argparse epilog:
@@ -50,6 +58,18 @@ check of inline ``ratified:`` ids and for the per-``(kind, code)`` table it
 renders; κ1 runs ``--seed`` once at the cutover; ζb runs ``--tighten`` after
 the rulings land; θ's integration gate reads the report.  ``--json`` is the
 report's only data source, so nothing downstream re-implements the scan.
+
+**Why this is one file, measured rather than asserted.**  ~2,050 raw lines, of
+which ~760 are code and ~46% is prose — and ``docs/code-quality.md`` says in
+terms not to steer by raw line count, citing a 55%-prose precedent.  Heuristic
+14's 2,000-line alarm is nevertheless crossed on the figure it names (one
+default ``Read``), so the alternatives were measured rather than waved off: the
+docstrings carry no redundancy to cut (the largest is this one at ~60 lines and
+the rest are flat, with each load-bearing phrase appearing once), and a split
+is illegitimate because all four layers read :data:`KIND_SPECS` and pass
+:class:`Site` — satellites over that shared state would be the function-bags
+heuristic 14 names as cheating, failing 13 to pass 14.  So: one file, alarm
+acknowledged, and this paragraph is the record that it was weighed.
 """
 
 from __future__ import annotations
@@ -1685,12 +1705,19 @@ def _seed(request: Request, kernel: ModuleType) -> int:
     return 0
 
 
-#: What a green run with no baseline tells the reader, so the next question —
-#: "then why is this green?" — is answered in the same output.
+#: What a run with no baseline tells the reader, so the next question — "then
+#: why is this green?" — is answered in the same output.
+#:
+#: IT SCOPES ITS CLAIM TO THE RATCHET, because the run it accompanies may not be
+#: green at all: a disposition fault is a fault at the site whatever any baseline
+#: holds, so an advisory run still reports one and still exits 1.  The earlier
+#: wording ("nothing is enforced yet: ... none is a violation") contradicted the
+#: violation printed directly above it on this repository's own tree.
 _ADVISORY_NOTICE = (
-    'no baseline at {baseline}, so nothing is enforced yet: every suppression here is '
-    'reported and none is a violation. The baseline is seeded once, on main, by the '
-    'operator step κ1; runs are advisory until then'
+    'no baseline at {baseline}, so the RATCHET is not enforced yet: every suppression '
+    'here is reported and none of them counts as excess. Disposition faults are '
+    'reported regardless, because a marker that does not parse is a fault whatever a '
+    'baseline holds. The baseline is seeded once, on main, by the operator step κ1'
 )
 
 
