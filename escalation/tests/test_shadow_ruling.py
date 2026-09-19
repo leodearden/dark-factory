@@ -976,6 +976,109 @@ class TestCliDegradesLoudly:
         assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
         assert 'no shadow rulings in window' in capsys.readouterr().out
 
+    # -- the window arguments (step-13) ------------------------------------
+    #
+    # EVERY case below drives a stamped AND resolved record. The naive-argument
+    # crash is LATENT ON AN EMPTY ARCHIVE: the naive-vs-aware comparison lives
+    # in the window filter, which is only reached once a parsed shadow stamp
+    # exists, so a case that omitted the record would pass vacuously against
+    # the unfixed code and prove nothing. Measured before these were written:
+    # with a record present, a naive `--since` raised
+    # `TypeError: can't compare offset-naive and offset-aware datetimes`.
+    #
+    # The aware path's own regression guard is TestCliWindow above —
+    # `test_an_explicit_window_is_honoured` and
+    # `test_defaults_to_the_trailing_seven_days` — which must stay green rather
+    # than be restated here.
+
+    def test_a_naive_since_is_coerced_and_the_record_is_still_counted(
+        self, tmp_path: Path, capsys,
+    ):
+        """The operator-facing case, in the operator's own spelling: a bare
+        `--since 2026-09-01` is valid ISO-8601 and simply carries no offset."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        code = main(['--queue-dir', str(fixture.queue.queue_dir), '--since', '2026-09-01'])
+
+        assert code == 0
+        assert _BRANCH_BEHIND in capsys.readouterr().out, (
+            'a record resolved inside the coerced window was not counted'
+        )
+
+    def test_a_naive_until_is_coerced_too(self, tmp_path: Path, capsys):
+        """The same defect, reached through the other flag: with `--since` left
+        to default, `since = until - 7 days` inherits the naiveness, so a fix
+        exercised only through `--since` would leave half of it live.
+
+        The bound is derived from the record rather than written as a literal
+        future date, which would silently stop covering anything once passed.
+        """
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+        naive_until = (at + timedelta(days=1)).replace(tzinfo=None).isoformat()
+
+        code = main(['--queue-dir', str(fixture.queue.queue_dir), '--until', naive_until])
+
+        assert code == 0
+        assert _BRANCH_BEHIND in capsys.readouterr().out, (
+            'the default 7-day window below a coerced --until dropped the record'
+        )
+
+    def test_a_coerced_window_is_echoed_as_aware_utc(self, tmp_path: Path, capsys):
+        """Which INSTANT a naive argument was read as is a decision the report
+        must show, not one the reader has to assume — the self-describing
+        property TestCliWindow requires, extended to cover the coercion."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        assert main([
+            '--queue-dir', str(fixture.queue.queue_dir), '--since', '2026-09-01',
+        ]) == 0
+        window = next(
+            line for line in capsys.readouterr().out.splitlines() if 'window' in line
+        )
+        assert '2026-09-01T00:00:00+00:00' in window, (
+            f'the coerced window must echo the instant actually used: {window!r}'
+        )
+
+    def test_a_naive_window_still_excludes_an_out_of_range_record(
+        self, tmp_path: Path, capsys,
+    ):
+        """Coercion must repair the comparison, not defeat the filter."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        assert record.resolved_at is not None
+        at = datetime.fromisoformat(record.resolved_at)
+        naive = (at - _MICROSECOND).replace(tzinfo=None).isoformat()
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir), '--until', naive]) == 0
+        assert _BRANCH_BEHIND not in capsys.readouterr().out
+
+    @pytest.mark.parametrize('flag', ['--since', '--until'])
+    def test_a_malformed_window_value_names_the_flag_and_prints_no_table(
+        self, tmp_path: Path, capsys, flag: str,
+    ):
+        """Same discipline as the `--queue-dir` case above: a misconfiguration
+        must never be mistaken for an all-zero measurement. Asserted on the
+        RETURNED int, not `pytest.raises(SystemExit)` — the guard belongs after
+        `parse_args`, beside the `--queue-dir` branch, not in an argparse
+        `type=` callback that raises from inside it."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        code = main(['--queue-dir', str(fixture.queue.queue_dir), flag, 'yesterday'])
+
+        assert code == 2
+        captured = capsys.readouterr()
+        assert flag in captured.err
+        assert 'yesterday' in captured.err
+        assert 'gated_stamps' not in captured.out, (
+            'a misconfigured window must not print a table at all'
+        )
+
 
 class TestCliJson:
     def test_json_parses_back_to_the_same_counts_as_the_table(self, tmp_path: Path, capsys):
