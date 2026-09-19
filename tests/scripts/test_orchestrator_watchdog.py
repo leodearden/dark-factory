@@ -7206,15 +7206,67 @@ def test_the_two_registration_outcomes_are_distinguishable(
     )
 
 
+# Every way the is-active probe can fail, stated ONCE. A future reader has to
+# consciously SHORTEN this list to re-open the hole it closes, which is what
+# makes it a drift pin rather than a restatement of the handler.
+#
+# The first two are the ones the probe originally enumerated — which is exactly
+# why the gap was invisible: the pin matched the handler instead of the
+# contract. The rest are the realistic escapes on a fork/exec under memory
+# pressure (PermissionError, OSError(ENOMEM)) and under `text=True` decoding
+# (UnicodeDecodeError, a ValueError subclass, not an OSError one at all).
+#
+# GOTCHA, measured: OSError's constructor maps errno onto a builtin subclass —
+# OSError(11, ...) actually constructs a BlockingIOError, OSError(1, ...) a
+# PermissionError; only OSError(12, ...) stays a bare OSError. So every param
+# carries an explicit id and every assertion is on BEHAVIOUR (no raise plus a
+# loud line), never on type(exc).__name__, or the subclass mapping could make
+# these tests lie about what they cover.
+_PROBE_ERRORS = [
+    pytest.param(
+        FileNotFoundError(2, "No such file or directory", "systemctl"), id="missing-binary"
+    ),
+    pytest.param(subprocess.TimeoutExpired("systemctl", 5), id="timeout"),
+    pytest.param(PermissionError(1, "Operation not permitted"), id="permission-denied"),
+    pytest.param(OSError(12, "Cannot allocate memory"), id="oserror-enomem"),
+    pytest.param(
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), id="decode-error"
+    ),
+]
+
+
+@pytest.mark.parametrize("probe_error", _PROBE_ERRORS)
+def test_the_is_active_probe_never_raises_and_falls_to_not_in_flight(
+    monkeypatch: pytest.MonkeyPatch, probe_error: BaseException
+) -> None:
+    """THE PRIMARY PIN: _unit_is_active owns the fail direction, so it states it.
+
+    Its docstring already promises that "a probe error here returns False,
+    which routes the caller to its LOUD branch" — unqualified, for ANY error.
+    A handler enumerating two exception classes honours that for two and
+    silently violates it for the rest, so this asserts the contract as written
+    rather than as implemented.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+    unit = "orch-fleet-staleness-redeploy.service"
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        raise probe_error
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    assert wdog._unit_is_active(unit) is False, (
+        "an unanswerable probe must fall to not-in-flight, which is the loud direction"
+    )
+    assert any(unit in m for m in log_messages), (
+        f"the probe must log its own inability, naming the unit: {log_messages}"
+    )
+
+
 @pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
-@pytest.mark.parametrize(
-    "probe_error",
-    [
-        FileNotFoundError(2, "No such file or directory", "systemctl"),
-        subprocess.TimeoutExpired("systemctl", 5),
-    ],
-    ids=["missing-binary", "timeout"],
-)
+@pytest.mark.parametrize("probe_error", _PROBE_ERRORS)
 def test_an_unclassifiable_registration_falls_loud(
     monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str, probe_error: BaseException
 ) -> None:
@@ -7239,6 +7291,110 @@ def test_an_unclassifiable_registration_falls_loud(
     assert any(
         _REGISTRATION_FAILURE_TOKEN in m.lower() and unit in m for m in log_messages
     ), f"an unclassifiable registration must be reported loudly: {log_messages}"
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_a_probe_error_reports_systemd_runs_own_reason_not_the_probes(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """A probe failure must not be misreported AS the registration's failure.
+
+    Two facts survive a probe error, separately and accurately: the probe says
+    it could not answer, and the caller says what systemd-run actually did.
+    This is what forbids routing the probe's exception into
+    _register_transient_unit's own handler, whose line reads "systemd-run
+    registration of {unit} failed: {exc!r}" — attributing the probe's error to
+    a registration that in fact returned a real exit code and a real stderr the
+    operator needs to act on.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    probe_marker = "probe-could-not-answer-sentinel"
+    reason = "Failed to start transient service unit: Bad message"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(
+            calls,
+            register_rc=203,
+            register_stderr=reason,
+            probe_raises=PermissionError(1, probe_marker),
+        ),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()  # must not raise
+
+    attributed = [m for m in log_messages if "203" in m and reason in m]
+    assert attributed, (
+        "the failure line must carry systemd-run's OWN exit code and stderr, "
+        f"not the probe's exception: {log_messages}"
+    )
+    assert not any(probe_marker in m for m in attributed), (
+        f"the probe's error must not be reported as the registration's reason: {attributed}"
+    )
+    assert any(unit in m and "probe" in m.lower() for m in log_messages), (
+        f"the probe must still report its own inability, on its own line: {log_messages}"
+    )
+
+
+def test_a_fleet_probe_error_does_not_abort_the_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WHY ANY OF THIS MATTERS, at the level where the cost is paid.
+
+    staleness_pass() calls _delegate_fleet_restart() at its TAIL, outside the
+    per-unit try/except, and _cli() runs staleness_pass() then
+    fused_memory_staleness_pass() with nothing between them. So a probe
+    exception escaping the registration helper aborts the entire tick and
+    silently drops the fused-memory staleness backstop — a second subsystem
+    going unserviced because a probe could not fork. Without this arm the suite
+    would pin "the helper does not raise" and never pin who gets hurt when it
+    does.
+
+    staleness_pass() runs FOR REAL here (its helpers stubbed to present one
+    stale unit) so the delegation is reached the way a live tick reaches it,
+    rather than by calling the delegate directly.
+    """
+    wdog = _load_watchdog()
+    reached: list[str] = []
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(wdog, "main", lambda: reached.append("main"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_liveness_pass", lambda: reached.append("fm_liveness_pass")
+    )
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: reached.append("fm_staleness_pass")
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    unit = "orchestrator-probe-escape.service"
+    commit_epoch = int(time.time()) - wdog.STALENESS_GRACE_SECS - 100
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [unit])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(
+        wdog, "_unit_start_elapsed_secs", lambda _u: float(wdog.STARTUP_GRACE_SECS * 10)
+    )
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(
+            calls,
+            register_rc=1,
+            probe_raises=PermissionError(1, "Operation not permitted"),
+        ),
+    )
+
+    assert wdog._cli([]) == 0, "a probe error must not turn a tick into a crash"
+    assert _probe_calls(calls), (
+        f"the stale unit must have reached the delegation and its probe: {calls}"
+    )
+    assert reached == ["main", "fm_liveness_pass", "fm_staleness_pass"], (
+        f"the fm staleness backstop must still run after a fleet probe error; got {reached}"
+    )
 
 
 @pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
