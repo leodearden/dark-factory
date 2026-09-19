@@ -2033,3 +2033,101 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     assert 'shared' in completed.stderr
     assert 'uv run --project shared' in completed.stderr
     assert 'Traceback' not in completed.stderr
+
+
+# ---------------------------------------------------------------------------
+# The live tree — the merge gate's actual enforcement point.
+
+#: Where κ1 seeds the committed baseline.  Absent until that cutover lands,
+#: which is what makes the enforcing guard below a skip rather than a red.
+LIVE_BASELINE = REPO_ROOT / 'scripts' / _BASELINE_NAME
+
+
+def _live_report(capsys) -> dict:
+    """The ``--json`` report for THIS repository."""
+    capsys.readouterr()
+    code = inline_suppressions.main(['--json', '--root', str(REPO_ROOT)])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    return json.loads(captured.out)
+
+
+def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys):
+    """The NON-VACUITY FLOOR, because "nothing was read" and "nothing was wrong"
+    are otherwise the same output.
+
+    Four kinds are non-zero in this repository and the fifth is zero, and that
+    exact shape is the task's user-observable deliverable: pyright and ruff are
+    both declared gates here, no coverage gate is configured, and bandit is not
+    installed — so ``nosec`` reading 0 is a measurement about TOOLS rather than a
+    scanner that stopped looking.  Asserting the zero beside the four is what
+    makes a broken enumeration loud: a scan that silently read nothing would
+    satisfy the zero and fail every other assertion here.
+    """
+    report = _live_report(capsys)
+
+    assert report['files_enumerated'] >= 1000
+    assert report['sites'] >= 1000
+    for kind in ('type: ignore', 'noqa', 'pragma: no cover', 'pyright: ignore'):
+        assert report['kind_totals'][kind] > 0, kind
+    assert report['kind_totals']['nosec'] == 0
+    assert report['consumers']['none'] > 0
+    assert report['ruff_config'] != []
+
+
+def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
+    """THE ≤10 s BUDGET, PINNED AS COUNTED WORK AND NEVER AS A CLOCK.
+
+    The budget fits only because of the prefilter, so the honest guard is that
+    the prefilter is doing its job: strictly fewer files are tokenized than
+    enumerated, and the ones that are are exactly those whose raw bytes carry a
+    marker substring.  An ``assert elapsed < 10`` would instead be a new flake on
+    the box the merge gate runs on — measured, this scan costs about 5 CPU-seconds
+    and took 6.5-6.8 s of wall clock at load 105 on 32 cores.
+
+    The expected count is re-derived from the PUBLIC kind table rather than read
+    off the scanner's private prefilter constant, so the two can disagree; a
+    marker added to the table with no prefilter byte is exactly what that catches.
+    A tracked path whose worktree file is gone is passed over here for the same
+    reason the scanner passes over it: ``git ls-files`` reads the index.
+    """
+    markers = tuple(spec.marker.encode('utf-8') for spec in inline_suppressions.KIND_SPECS.values())
+    listed = _run_git(['ls-files', '-z', '--', '*.py'], cwd=REPO_ROOT).stdout
+    tracked = {path for path in listed.split('\0') if path}
+    carrying = 0
+    for relative in tracked:
+        try:
+            raw = (REPO_ROOT / relative).read_bytes()
+        except FileNotFoundError:
+            continue
+        carrying += any(marker in raw for marker in markers)
+
+    report = _live_report(capsys)
+
+    assert report['files_enumerated'] == len(tracked)
+    assert report['files_tokenized'] < report['files_enumerated']
+    assert report['files_tokenized'] == carrying
+
+
+def test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded(capsys):
+    """The merge gate's actual assertion — ENFORCING iff the baseline exists.
+
+    It skips rather than reds before the κ1 cutover because D12 makes baseline
+    absence a legitimate state, and a guard that failed on the pre-cutover tree
+    would block every task until κ1 landed.  Everything about the gate MECHANISM
+    is covered hermetically by the fixture-tree tests above, so the skip loses no
+    coverage of this module's behaviour — only of this repository's compliance,
+    which is not yet a thing to be compliant with.
+    """
+    if not LIVE_BASELINE.exists():
+        pytest.skip(
+            f'{LIVE_BASELINE.relative_to(REPO_ROOT)} does not exist yet: the baseline is '
+            'seeded once, on main, by the operator step κ1. Until then every run is '
+            'advisory by design (D12), and the gate mechanism is covered hermetically by '
+            'the fixture-tree tests in this module.'
+        )
+    capsys.readouterr()
+
+    assert inline_suppressions.main(['--check', '--root', str(REPO_ROOT)]) == 0, (
+        capsys.readouterr().err
+    )
