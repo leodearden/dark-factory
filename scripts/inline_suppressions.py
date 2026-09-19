@@ -1548,6 +1548,59 @@ _ADVISORY_NOTICE = (
 )
 
 
+def _tighten(request: Request, kernel: ModuleType) -> int:
+    """Spend the baseline's headroom — ζb's verb, run after the rulings land.
+
+    THROUGH ``tighten_into``, NEVER ``tighten`` PLUS ``dump``.  The kernel makes
+    the composition the SHORT way to write the safe call for a reason: persisting
+    ``tighten``'s bare ``Counter`` by hand means re-supplying ``params``,
+    ``complete`` and ``unreadable``, three chances to commit a baseline claiming
+    more than the scan measured — sitting next to ``dump(current, path)``, a
+    shorter line that widens the gate by every key this scan added.
+
+    THE REMOVALS COME FROM THE RETURN VALUE, not from reading the file back.  The
+    loaded pre-image and the tightened counter are both in hand, so the difference
+    is exact; re-reading would report what the file says rather than what this run
+    did, which are the same thing only when nothing went wrong.
+
+    Excess is measured BEFORE the write and is not stale: tightening lowers a
+    baseline key only where the current count is lower, which is precisely where
+    excess is already zero, so ``excess`` is invariant under it.  Slack afterwards
+    is zero by the same arithmetic — a pointwise minimum is elementwise ≤ the
+    current scan — so the figure is measured, not assumed.
+
+    It reports NO status word, deliberately.  ``--tighten`` does not gate: it
+    returns 0 having done its maintenance even when the tree is still over
+    budget, and a green label beside a non-zero excess would read as a verdict it
+    never made.  The excess figure in the same line is what tells the reader the
+    gate is still red.
+    """
+    _require_whole_tree(request, '--tighten')
+    scan, classification = _measure(request)
+    baseline = kernel.load(request.baseline)
+    current = _enumeration(classification, kernel)
+    excess_total = sum(kernel.excess(current, baseline).values())
+    tightened = kernel.tighten_into(current, baseline, request.baseline)
+
+    removed = {
+        key: count - tightened.get(key, 0)
+        for key, count in baseline.counts.items()
+        if tightened.get(key, 0) < count
+    }
+    print(
+        _report_line(
+            scan,
+            classification,
+            headline=f'tightened {request.baseline}',
+            excess_total=excess_total,
+            slack_total=0,
+        )
+    )
+    for key, count in sorted(removed.items()):
+        print(f'  -{count} {key}')
+    return 0
+
+
 _EPILOG = """exit codes:
   0  clean. A scoped run says `partial`; a run with no baseline yet says
      `advisory`. All three are green, and the label says which green it is.
@@ -1581,6 +1634,11 @@ def _build_parser() -> argparse.ArgumentParser:
         '--seed',
         action='store_true',
         help='write the tree as a fresh baseline; refuses if one already exists',
+    )
+    verbs.add_argument(
+        '--tighten',
+        action='store_true',
+        help='remove the baseline headroom the tree no longer uses',
     )
     parser.add_argument(
         '--root',
@@ -1633,6 +1691,8 @@ def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
     try:
         if args.seed:
             return _seed(request, kernel)
+        if args.tighten:
+            return _tighten(request, kernel)
         return _check(request, kernel)
     except kernel.RatchetError as exc:
         raise InstrumentFailure(
