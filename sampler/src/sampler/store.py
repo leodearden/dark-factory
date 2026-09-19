@@ -356,7 +356,7 @@ class LoadSampleStore:
         self,
         now: int,
         *,
-        retain_seconds: int = 2_592_000,
+        retain_seconds: int = 30 * 24 * 60 * 60,
         interval_seconds: int = 86400,
     ) -> None:
         """Delete samples older than ``retain_seconds``, at most once per interval.
