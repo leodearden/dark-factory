@@ -54,21 +54,24 @@ report's only data source, so nothing downstream re-implements the scan.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import re
 import subprocess
+import sys
 import tokenize
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from io import StringIO
-from pathlib import Path
-from types import MappingProxyType
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from shared.governed_exceptions import Disposition, Policy
+    from shared.ratchet import Enumeration
 
 
 class InstrumentFailure(Exception):
@@ -94,6 +97,16 @@ class InstrumentFailure(Exception):
 #: Generous, and not a performance assertion: `git ls-files` over this tree
 #: takes well under a second, so anything approaching this has hung.
 _GIT_TIMEOUT_SECS = 60
+
+#: This checkout, resolved from ``__file__`` rather than from the working
+#: directory, so a run inside a task worktree measures THAT worktree's tracked
+#: corpus and reads THAT worktree's configuration.  The argument
+#: ``scripts/scan_plan_decision_pairing.py`` makes for the same resolution.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: How this scanner names itself in a refusal, so a reader of a bare exit 2 in
+#: a merge log knows which instrument spoke.
+_PROG = 'inline_suppressions.py'
 
 
 class Kind(Enum):
@@ -357,9 +370,10 @@ class Scan:
     Attributes:
         comments: Every COMMENT token in every file that survived the
             prefilter, in enumeration order.
-        files_enumerated: How many tracked paths ``git ls-files`` listed,
-            INCLUDING any whose worktree file has since been deleted.  It is
-            the size of the corpus the scan set out to read.
+        files_enumerated: How many tracked paths this scan set out to read —
+            what ``git ls-files`` listed, narrowed to the scope when the run is
+            a scoped one, and INCLUDING any whose worktree file has since been
+            deleted.
         files_tokenized: How many of those were actually decoded and tokenized
             — the ones whose raw bytes carried a marker substring.
 
@@ -473,14 +487,35 @@ def _source_of(root: Path, relative: str) -> str | None:
         ) from exc
 
 
-def scan_tree(root: Path) -> Scan:
-    """Scan every tracked ``*.py`` under *root*.
+def _within(relative: str, scope: tuple[str, ...]) -> bool:
+    """Whether *relative* is one of *scope*'s entries, or sits under one.
+
+    COMPARED AS PATH COMPONENTS, never as a string prefix: ``scripts`` must not
+    scope ``scripts_old/`` and ``sc`` must not scope anything, which is the same
+    mistake in the same shape as the selector-matching one decision 2 records.
+    Both sides are ``PurePosixPath``, because ``git ls-files`` emits forward
+    slashes on every platform and a scope typed as ``./pkg`` should mean ``pkg``.
+    """
+    wanted = tuple(PurePosixPath(entry).parts for entry in scope)
+    parts = PurePosixPath(relative).parts
+    return any(parts[: len(entry)] == entry for entry in wanted)
+
+
+def scan_tree(root: Path, *, scope: tuple[str, ...] = ()) -> Scan:
+    """Scan every tracked ``*.py`` under *root*, or only those under *scope*.
 
     The prefilter means ``files_tokenized`` is strictly smaller than
     ``files_enumerated`` on any real tree, and a file it rejects is reported
     honestly as enumerated-not-tokenized rather than silently vanishing.
+
+    A SCOPE NARROWS THE ENUMERATION, not the report of it: a scoped run reads
+    fewer files and says so in both counts, which is what makes it the cheap
+    early-feedback run D12 keeps it for.  Every verb that a partial view could
+    mislead refuses a scope outright rather than relying on this being noticed.
     """
     tracked = _tracked_python_files(root)
+    if scope:
+        tracked = tuple(path for path in tracked if _within(path, scope))
     comments: list[Comment] = []
     tokenized = 0
     for relative in tracked:
@@ -1015,20 +1050,21 @@ class Classification:
         violations: The exit-1 findings that do not depend on the baseline —
             the two disposition faults D6 names.  Ratchet violations are the
             ``--check`` verb's and are computed against the baseline.
-        unowned_sites: Rendered key to the sites that produced it.  The COUNTS
-            are derived from this rather than tracked beside it (heuristic 11):
-            ``--check`` needs the sites behind an excess key in order to name
-            them, and a count kept separately could drift from the list.
+        unowned: Rendered key to the entries that produced it, sorted by key.
+            The COUNTS are derived from this rather than tracked beside it
+            (heuristic 11): ``--check`` needs the entries behind an excess key
+            in order to name their lines and to say why each one is a finding,
+            and a count kept separately could drift from the list.
     """
 
     classified: tuple[Classified, ...]
     violations: tuple[Violation, ...]
-    unowned_sites: Mapping[str, tuple[Site, ...]]
+    unowned: Mapping[str, tuple[Classified, ...]]
 
     @property
     def counts(self) -> dict[str, int]:
         """The multiset :class:`shared.ratchet.Enumeration` compares."""
-        return {key: len(sites) for key, sites in self.unowned_sites.items()}
+        return {key: len(entries) for key, entries in self.unowned.items()}
 
 
 def classify(scan: Scan, model: ConsumerModel) -> Classification:
@@ -1075,7 +1111,7 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
 
     classified: list[Classified] = []
     violations: list[Violation] = []
-    unowned: dict[str, list[Site]] = {}
+    unowned: dict[str, list[Classified]] = {}
 
     for comment in scan.comments:
         try:
@@ -1116,13 +1152,13 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
             entry = _classify_site(site, disposition, model)
             classified.append(entry)
             if entry.ownership is Ownership.UNOWNED:
-                unowned.setdefault(key_for(site).render(), []).append(site)
+                unowned.setdefault(key_for(site).render(), []).append(entry)
 
     return Classification(
         classified=tuple(classified),
         violations=tuple(violations),
-        unowned_sites=MappingProxyType(
-            {key: tuple(sites) for key, sites in sorted(unowned.items())}
+        unowned=MappingProxyType(
+            {key: tuple(entries) for key, entries in sorted(unowned.items())}
         ),
     )
 
@@ -1158,3 +1194,300 @@ def _classify_site(
         ownership=Ownership.DEBT if isinstance(disposition, Debt) else Ownership.POLICY,
         disposition=disposition,
     )
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — the ratchet: the baseline, the verbs and the exit ladder.
+
+#: Where the committed baseline lives, relative to the repository root.  Named
+#: here and nowhere else, so ``--baseline`` has a default that cannot drift from
+#: the path κ1 seeds and the merge gate reads.
+BASELINE_PATH = 'scripts/inline_suppression_baseline.json'
+
+#: The key scheme, as one opaque token in the ratchet's ``params`` block.  It is
+#: a NAME rather than a description: params are compared for equality, so its
+#: only job is to differ when the keys mean something different.
+_KEY_SCHEME = 'kind+codes+sha256-of-stripped-line'
+
+
+def _params() -> dict[str, object]:
+    """This scan's measurement parameters, for the baseline's ``params`` block.
+
+    ONLY WHAT CHANGES THE MEANING OF THE MULTISET.  A params mismatch is exit 2
+    and the only way out of it is re-seeding, which is itself the widening move
+    D7 built the verbs to prevent — so a field belongs here exactly when a
+    change to it makes two baselines two measurements of DIFFERENT things.  The
+    scanned kinds and the key scheme qualify: add a kind, or change the hash, and
+    every count is about something else.
+
+    The resolved ruff ``select``/``ignore`` lists deliberately do NOT qualify,
+    and that omission is the decision worth recording.  Putting them here would
+    convert an ordinary, reviewable ``pyproject.toml`` edit into a forced
+    baseline regeneration — punishing a legitimate config change by demanding
+    the one operation nobody should perform casually.  They are published in
+    ``--json`` instead, so the consumer model stays auditable without arming
+    that tripwire.
+    """
+    return {
+        'kinds': [kind.value for kind in Kind],
+        'key_scheme': _KEY_SCHEME,
+        'digest_hex': _DIGEST_HEX,
+    }
+
+
+@dataclass(frozen=True)
+class Request:
+    """One invocation's resolved inputs, shared by every verb.
+
+    Attributes:
+        root: The checkout under measurement.
+        baseline: The baseline file this run compares against or writes.
+        scope: The positional ``PATH`` arguments, empty for a whole-tree run.
+    """
+
+    root: Path
+    baseline: Path
+    scope: tuple[str, ...] = ()
+
+    @property
+    def scoped(self) -> bool:
+        """Whether this run measured only part of the tree."""
+        return bool(self.scope)
+
+
+def _measure(request: Request) -> tuple[Scan, Classification]:
+    """Scan and classify *request*'s tree — the work every verb starts with."""
+    scan = scan_tree(request.root, scope=request.scope)
+    return scan, classify(scan, ConsumerModel(request.root))
+
+
+def _enumeration(classification: Classification, kernel: ModuleType) -> Enumeration:
+    """The multiset the kernel compares, under this scan's params.
+
+    ``complete=True`` is asserted rather than computed because this scanner has
+    no partial-success mode to report: every unreadable file has already been
+    raised as an :class:`InstrumentFailure`, so a scan that returns at all read
+    everything it enumerated.  The kernel's ``unreadable`` list is therefore
+    always empty here, and the field that would carry names has none to carry.
+    """
+    return kernel.Enumeration(counts=classification.counts, params=_params(), complete=True)
+
+
+#: Why an undisposed suppression is a finding, in one clause.  The forms are
+#: rendered beside it from the published grammar, never retyped.
+_UNDISPOSED_REASON = (
+    'this suppression is not in the baseline and names no owner. INV-12 requires every '
+    'silenced detector to carry a disposition -- who will remove it, or the operator '
+    'ruling that keeps it'
+)
+
+
+def _excess_violations(
+    over: Mapping[str, int], classification: Classification
+) -> tuple[Violation, ...]:
+    """One violation per SITE of every key the baseline does not cover.
+
+    EVERY SITE, NOT ``over[key]`` OF THEM, and the reason is structural: a key
+    IS the content of its line, so two sites sharing one are indistinguishable
+    by construction and the scanner cannot say which is the new one.  Naming
+    them all is the only honest rendering — the alternative picks an arbitrary
+    line and sends the reader to code that may have been there for a year.
+
+    Sorted by key so a rerun over one tree prints the same lines in the same
+    order; within a key, scan order, which is path then line.
+    """
+    from shared.governed_exceptions import INLINE_MARKER_FORMS
+
+    return tuple(
+        Violation(
+            path=entry.site.path,
+            line=entry.site.line,
+            kind=entry.site.kind,
+            codes=entry.site.codes,
+            reason=_UNDISPOSED_REASON,
+            forms=INLINE_MARKER_FORMS,
+        )
+        for key in sorted(over)
+        for entry in classification.unowned[key]
+    )
+
+
+def _headline(label: str, violations: tuple[Violation, ...]) -> str:
+    """The report's first word: which green this is, or how big the red is."""
+    if not violations:
+        return label
+    plural = '' if len(violations) == 1 else 's'
+    return f'{len(violations)} violation{plural}'
+
+
+def _report_line(
+    scan: Scan,
+    classification: Classification,
+    *,
+    headline: str,
+    excess_total: int,
+    slack_total: int,
+) -> str:
+    """The one-line summary every verb prints to stdout.
+
+    The counted-work figures lead because they are what a reader checks first
+    when a run comes back suspiciously clean: a scan that enumerated nothing
+    and a tree with nothing wrong are otherwise the same output.
+    """
+    counts = classification.counts
+    return (
+        f'{headline}: {len(scan.sites)} suppression sites in {scan.files_tokenized} of '
+        f'{scan.files_enumerated} tracked files; {sum(counts.values())} unowned in '
+        f'{len(counts)} keys; excess {excess_total}, slack {slack_total}'
+    )
+
+
+def _check(request: Request, kernel: ModuleType) -> int:
+    """Compare *request*'s tree against its baseline — the merge gate's verb.
+
+    The violations are the two independent kinds added together: the disposition
+    faults D6 names, which are faults at the site whatever any baseline says,
+    and the ratchet's excess.  Either alone is exit 1.
+    """
+    scan, classification = _measure(request)
+    baseline = kernel.load(request.baseline)
+    current = _enumeration(classification, kernel)
+    over = dict(kernel.excess(current, baseline))
+    remaining = dict(kernel.slack(current, baseline))
+
+    violations = classification.violations + _excess_violations(over, classification)
+    print(
+        _report_line(
+            scan,
+            classification,
+            headline=_headline('clean', violations),
+            excess_total=sum(over.values()),
+            slack_total=sum(remaining.values()),
+        )
+    )
+    for violation in violations:
+        print(violation.render(), file=sys.stderr)
+    return 1 if violations else 0
+
+
+def _seed(request: Request, kernel: ModuleType) -> int:
+    """Write *request*'s tree as a fresh baseline — κ1's one-time verb."""
+    scan, classification = _measure(request)
+    kernel.dump(_enumeration(classification, kernel), request.baseline)
+    print(
+        _report_line(
+            scan,
+            classification,
+            headline=f'seeded {request.baseline}',
+            excess_total=0,
+            slack_total=0,
+        )
+    )
+    return 0
+
+
+_EPILOG = """exit codes:
+  0  clean. A scoped run says `partial`; a run with no baseline yet says
+     `advisory`. All three are green, and the label says which green it is.
+  1  violations, one per line on stderr: site, kind, codes, the reason and the
+     accepted disposition forms. A refusal to act is still 1.
+  2  instrument failure -- a file that could not be read or tokenized, a
+     baseline that exists but cannot be compared against, a config key this
+     model does not implement, or a missing import. Never a finding.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI: one verb, a tree, a baseline, and an optional scope."""
+    parser = argparse.ArgumentParser(
+        prog=_PROG,
+        description=(
+            "INV-12's inline-suppression scanner and multiset ratchet: every tracked "
+            'suppression is owned by a disposition, ratified by class, or held by the '
+            'baseline, and the population can shrink but never grow.'
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    verbs = parser.add_mutually_exclusive_group()
+    verbs.add_argument(
+        '--check',
+        action='store_true',
+        help='compare the tree against the baseline (the default verb)',
+    )
+    verbs.add_argument(
+        '--seed',
+        action='store_true',
+        help='write the tree as a fresh baseline; refuses if one already exists',
+    )
+    parser.add_argument(
+        '--root',
+        type=Path,
+        default=_REPO_ROOT,
+        help='the checkout to measure (default: the one holding this script)',
+    )
+    parser.add_argument(
+        '--baseline',
+        type=Path,
+        default=None,
+        help=f'the baseline file (default: <root>/{BASELINE_PATH})',
+    )
+    parser.add_argument(
+        'paths',
+        nargs='*',
+        metavar='PATH',
+        help=(
+            'limit the scan to these files or directories. A scoped --check is early '
+            'feedback and labels its green `partial`; the baseline-writing verbs refuse '
+            'a scope outright'
+        ),
+    )
+    return parser
+
+
+def _refuse(exc: Exception) -> int:
+    """Print *exc* as this scanner's exit-2 refusal and return 2.
+
+    ONE PRINT SITE FOR EVERY BROKEN-INSTRUMENT MESSAGE, so the prefix a log
+    reader greps for cannot differ between causes — which is the same argument
+    :class:`InstrumentFailure` makes for there being one exception type.
+    """
+    print(f'{_PROG}: {exc}', file=sys.stderr)
+    return 2
+
+
+def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
+    """Perform the verb *args* selected, as the exit code it returns.
+
+    The kernel's whole error family is converted to this module's own
+    instrument failure HERE, at the one place the kernel is reachable, because
+    to a caller they mean the identical thing: nothing was compared.  That is
+    the single ``except`` clause ``shared.ratchet``'s docstring says a consumer
+    wants, spent once rather than at every call site.
+    """
+    root = Path(args.root)
+    baseline = Path(args.baseline) if args.baseline is not None else root / BASELINE_PATH
+    request = Request(root=root, baseline=baseline, scope=tuple(args.paths))
+    try:
+        if args.seed:
+            return _seed(request, kernel)
+        return _check(request, kernel)
+    except kernel.RatchetError as exc:
+        raise InstrumentFailure(
+            f'the ratchet kernel refused this run -- {exc}'
+        ) from exc
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """The 0/1/2 entry point, with every broken-instrument path landing on 2."""
+    args = _build_parser().parse_args(argv)
+    from shared import ratchet
+
+    try:
+        return _run(args, ratchet)
+    except InstrumentFailure as exc:
+        return _refuse(exc)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
