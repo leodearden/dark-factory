@@ -201,6 +201,41 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 more occurrences than one read returns, so the counters cover a partial
 window.
 
+### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
+
+**A non-empty directory no longer means the task had a verify failure.**
+Red verifies archive their per-leg `attempt-N[.<module>].<label>-<ts>.log`
+output and an `attempt-N[.<module>].summary-<ts>.json` beside it; GREEN and
+red alike archive `attempt-N.plan-<ts>.json` (the scope decision — which
+legs ran full-suite rather than file-scoped, and why) and, on the merge
+lane, a gzipped `attempt-N[.<module>].junit-<ts>.xml.gz` per-test report.
+The greens are deliberate: a failures-only corpus answers questions about
+cost and scope with a red-conditioned sample.
+
+Three things a census must not assume:
+
+- **Junit exists only under `merge_verify_breadth: full`.** The shipped
+  default (`config.py`) is `scoped`; this repo's
+  `dark-factory-orchestrator.yaml` opts in. A project on the default
+  archives plans and logs but no junit at all.
+- **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
+  attempt id, so their files stem at `attempt-1`. Logs and junit carry a
+  `.<module>` infix; the plan does not — under per-module fan-out one plan
+  sits against N junit reports.
+- **Several merge-path callers archive nothing at all**, because they pass
+  no `archive_root`: the pre-existing-main baseline probe, the shadow/drift
+  runners, the unscoped type-check gate, the workflow pre-merge re-verify,
+  and the flake gate's isolated re-run
+  (`verify.py::confirm_isolated_rerun_verdict`) — so a module's archived
+  report is always the leg's own, never the re-run's. `archive_root is None`
+  is the whole rule — absence from this tree is not evidence a verify did
+  not run.
+
+Retention is one policy for the whole tree: `.log`, `.json` and `.gz` are
+deleted past 30 days, then oldest-first until the tree is under 500MB
+(`verify.py::_prune_archive`). `flaky-ledger.jsonl` sits one level up, in
+`data/verify-logs/` itself, and is deliberately outside that sweep.
+
 ### Reading the merge-lane throughput baseline
 
 ```bash

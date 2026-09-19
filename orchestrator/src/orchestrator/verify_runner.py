@@ -996,7 +996,7 @@ class LocalRunner:
 # ---------------------------------------------------------------------------
 
 
-# Archive timestamp format — mirrors _archive_merge_verify_logs (verify.py:827).
+# Archive timestamp format — mirrors verify.py::_archive_stamp.
 # Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
@@ -1849,8 +1849,8 @@ class RemoteRunner:
         sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
         (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
 
-        The attempt number is pinned to 1, matching the local merge path's ``attempt_id or 1``
-        default (verify.py:2529).  Microsecond-precision timestamps already guarantee filename
+        The attempt number is pinned to 1, matching the local merge path's default
+        (``verify.py::_archive_attempt_id``).  Microsecond-precision timestamps already guarantee filename
         uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
         chain is unnecessary and would complicate the interface for no triage benefit.
 
