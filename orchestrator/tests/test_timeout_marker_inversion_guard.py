@@ -60,6 +60,9 @@ import pytest
 import yaml
 from _orch_helpers import (
     DEEP_GATE_SCENE_TEST_TIMEOUT,
+    DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS,
+    DEEP_LANDING_SCENE_SPAWN_BUDGET,
+    DEEP_LANDING_SCENE_TEST_TIMEOUT,
     DELIBERATE_TIGHT_BOUND_CEILING,
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
@@ -1001,6 +1004,186 @@ class TestDeepGateSceneBudget:
             'worker crash. Shrink the scene or raise the run budget -- '
             'raising this constant alone buys nothing.'
         )
+
+
+class TestDeepLandingSceneBudget:
+    """The three constants that size test_merge_queue_deep_landing.py (task 5582).
+
+    The DERIVATION -- the measured per-class spawn maxima, the bounded-wait
+    term, the headroom, the rounding, and the three ceilings it sits under --
+    has ONE home: the ``DEEP_LANDING_SCENE_TEST_TIMEOUT`` comment block in
+    _orch_helpers.py.  This class is that comment's EXECUTABLE link, exactly as
+    :class:`TestDeepGateSceneBudget` is for the Row 7 pair one anchor above.
+
+    THREE constants and not two, because unlike Row 7 this module really has
+    bounded waits.  A ``wait_for`` CEILING is invisible to the
+    ``asyncio.sleep`` instrument the spawn census reads, so it is measured from
+    source and priced as its own term rather than folded into the spawn count.
+    """
+
+    def test_the_budget_covers_the_measured_worst_case(self) -> None:
+        """The budget may never be tightened below what the module really costs.
+
+        A budget BELOW the measurement would fail every run, loaded or not.
+        The headroom above it is deliberate, and its size is argued in the
+        constant's comment rather than here.
+        """
+        budget = DEEP_LANDING_SCENE_SPAWN_BUDGET
+
+        assert budget >= 169, (
+            f'DEEP_LANDING_SCENE_SPAWN_BUDGET is {budget}, below the 169 git '
+            'spawns test_merge_queue_deep_landing.py\'s heaviest test '
+            '(TestDeepLandingEndToEnd::'
+            'test_flipping_the_cap_in_place_starts_landing_chains) was '
+            'MEASURED to make. Measured 2026-09-18 by counting '
+            'asyncio.create_subprocess_exec/_shell per test; the nine real-git '
+            'classes peak at 169/165/163/139/135/115/108/67/39 spawns, against '
+            '0.00s of summed asyncio.sleep in EVERY test in the module -- '
+            'which is what makes it spawn-bound rather than sleep- or '
+            'CPU-bound, so its wall clock is spawn count x per-spawn latency '
+            'and per-spawn latency is exactly what host oversubscription '
+            'inflates. A budget below the measurement fails every run, not '
+            'just a loaded one. Re-measure before lowering it, and re-derive '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT in the same commit.'
+        )
+
+    def test_the_bounded_wait_allowance_covers_the_worst_path(self) -> None:
+        """The bounded-wait term may never fall below the worst single-test path.
+
+        Read from SOURCE rather than from the spawn census, which cannot see
+        it: instrumenting ``asyncio.sleep`` reports 0.00s for every test here,
+        and a ``wait_for`` ceiling consumes nothing until it is approached.
+        Priced at the CEILING and not at the 0.00s actually consumed, because
+        a starved host is precisely when a bounded wait IS approached.
+        """
+        allowance = DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS
+
+        assert allowance >= 180, (
+            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS is {allowance}, below the '
+            '180s of bounded wait one TestAdoptedHeadLandsWithThePostVerify'
+            'Worktree path can compose: asyncio.wait_for(parked.wait(), '
+            'timeout=60) plus _adopt_head_only\'s `timeout: float = 120` '
+            'default, both in test_merge_queue_deep_landing.py. An allowance '
+            'below that leaves a test whose bounded waits alone exhaust its '
+            'own marker, with nothing left for the real-git spawns it also '
+            'makes -- which is the defect this pair was derived to fix. '
+            'Re-read those two ceilings before lowering it, and re-derive '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT in the same commit.'
+        )
+
+    def test_the_timeout_is_the_budget_priced_and_rounded_to_the_grid(self) -> None:
+        """``ceil(required_timeout_secs(bounded, budget) / 60) * 60``, re-derived here.
+
+        Both inputs are the constants above, so neither literal can drift from
+        what it was derived from.
+
+        Sized against the BUDGET and not against the raw measurement, which is
+        what lets the per-class ``_within_spawn_budget`` fixture in
+        test_merge_queue_deep_landing.py keep the marker honest: the marker can
+        only be wrong if the budget is breached, and a breach fails loudly,
+        in-process, on the test that caused it.
+        """
+        budget = DEEP_LANDING_SCENE_SPAWN_BUDGET
+        bounded = float(DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS)
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+        required = _orch_helpers.required_timeout_secs(bounded, budget)
+        expected = math.ceil(required / 60) * 60
+
+        assert timeout == expected, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT is {timeout}, but '
+            f'{bounded}s of bounded wait plus DEEP_LANDING_SCENE_SPAWN_BUDGET '
+            f'({budget} spawns x '
+            f'{_orch_helpers.MEASURED_SPAWN_LATENCY_SECS}s) = {required}s '
+            f'rounds up the 60s pyproject grid to {expected}. The three '
+            'constants are a SET -- moving a budget without re-deriving the '
+            'timeout leaves the marker sized for a scene that no longer '
+            'exists, which is the exact failure this task was filed to fix.'
+        )
+
+    def test_the_timeout_never_inverts_the_verify_budget(self) -> None:
+        """A marker may only ever LOOSEN verify's per-test budget, never tighten it.
+
+        The general rule and its cost are argued at
+        ``VERIFY_CLI_PER_TEST_TIMEOUT`` in _orch_helpers.py.  Asserted here
+        directly rather than left to the tree sweep because this marker is
+        DERIVED: a future re-derivation could walk it back into the band
+        without anyone writing an in-band number by hand -- which is precisely
+        how the nine sites this constant replaces came to sit at 180.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+
+        assert timeout >= VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}) is below the verify '
+            f'CLI budget ({VERIFY_CLI_PER_TEST_TIMEOUT}), so the marker meant '
+            'to LOOSEN nine slow classes would instead TIGHTEN the run that '
+            'gates the merge. Re-derive the budget upward, or re-measure the '
+            'spawn latency -- do not simply clamp this constant.'
+        )
+
+    def test_the_timeout_never_narrows_the_ini_default(self) -> None:
+        """A marker meant as a FLOOR may not fall below the ambient ini default.
+
+        NOT a duplicate of the verify-budget pin above, and only stopped being
+        one on 2026-09-17: task 5442 raised ``PYPROJECT_DEFAULT_TIMEOUT``
+        300 -> 540 on measurement while deliberately leaving verify's
+        ``--timeout=300`` alone, so the two budgets no longer coincide and a
+        value can now clear one while narrowing the other.
+
+        That same commit made the never-narrow rule explicit in _orch_helpers.py
+        and, in the same breath, recorded a LATENT GAP where it had not been
+        applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300 and now sits
+        below the default it used to equal.  1080 clears 540 today, so this pin
+        changes no number; it exists so a future re-derivation cannot land
+        somewhere like 360 that satisfies the verify edge while silently
+        reproducing that gap.
+
+        :class:`TestDeepGateSceneBudget` pins only the verify edge because the
+        rule this honours postdates it.  That is out of scope here and is NOT
+        to be "fixed" in passing.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+
+        assert timeout >= PYPROJECT_DEFAULT_TIMEOUT, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}) is below the '
+            f'pyproject ini default ({PYPROJECT_DEFAULT_TIMEOUT}), so under a '
+            'bare local or agent run these nine classes would be TIGHTER than '
+            'every unmarked test around them -- a mark meant as a floor '
+            'narrowing its own module. The verify CLI edge '
+            f'({VERIFY_CLI_PER_TEST_TIMEOUT}) is a DIFFERENT and lower one: '
+            'the two stopped coinciding when task 5442 raised the ini default '
+            'to 540 on 2026-09-17, and clearing only the lower of them '
+            'reproduces the HEAVY_BARRIER_TEST_TIMEOUT gap that commit '
+            'recorded. Re-derive upward rather than clamping.'
+        )
+
+    def test_the_timeout_fits_inside_the_whole_verify_run_budget(self) -> None:
+        """A per-test backstop larger than the whole verify's budget is no backstop.
+
+        Read from the REAL orchestrator.yaml at runtime, through the same
+        :data:`_ORCH_YAML` and in the same shape
+        :class:`TestDeepGateSceneBudget` reads it -- so an operator retuning
+        the run budget down past this marker fails here loudly instead of
+        leaving a marker that can never fire.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+        config = yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))
+        run_budget = config.get('verify_command_timeout_secs')
+
+        assert run_budget is not None, (
+            f'{_ORCH_YAML} carries no verify_command_timeout_secs, which '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT is bounded by. Without it this '
+            'pin checks nothing; restore the key or re-argue the bound.'
+        )
+        assert timeout <= run_budget, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}s) exceeds '
+            f'verify_command_timeout_secs ({run_budget}s) in {_ORCH_YAML}. A '
+            'per-test backstop larger than the budget for the WHOLE verify '
+            'run can never fire: verify kills the run first, and the classes '
+            'this marker protects go back to dying as unattributed worker '
+            'crashes. Shrink the scene or raise the run budget -- raising '
+            'this constant alone buys nothing.'
+        )
+
 
 class TestSpawnBudgetVerdict:
     """``deep_gate_spawn_budget_violation`` -- the budget check as a pure verdict.
