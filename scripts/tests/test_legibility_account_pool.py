@@ -1059,28 +1059,32 @@ def test_default_accounts_file_resolves_relative_to_this_checkout():
 
 
 def test_build_pool_actually_uses_the_default_accounts_file_when_nothing_else_is_set(
-    monkeypatch, roster_file, empty_env_file,
+    monkeypatch, tmp_path, empty_env_file,
 ):
-    """The fall-through this pins is ``build_pool``'s own
-    ``resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or
-    str(default_accounts_file())`` with BOTH sources absent. The test above
-    only proves ``default_accounts_file()`` points at the right path in
-    isolation -- it never calls ``build_pool`` at all, so this exact branch
-    had no coverage before this test existed. ``default_accounts_file`` is
-    monkeypatched to a tmp roster rather than relying on the real
-    ``config/usage-accounts.yaml`` so the resolved names are pinned
-    regardless of what that file happens to contain today.
+    """The fall-through in ``build_pool``'s ``resolved = accounts_file or
+    os.environ.get("USAGE_ACCOUNTS_FILE") or str(default_accounts_file())``
+    with BOTH earlier sources absent. The test above never calls
+    ``build_pool``. The roster's one account exists in no other roster, so
+    only a pool built from ``default_accounts_file()`` can resolve it -- a
+    ``max-*`` name would also resolve from the real
+    ``config/usage-accounts.yaml`` and prove nothing.
     """
+    roster = tmp_path / "default-roster.yaml"
+    roster.write_text(
+        "accounts:\n"
+        "  - name: only-in-the-default-roster\n"
+        "    oauth_token_env: CLAUDE_OAUTH_TOKEN_DEFAULT_ROSTER_PROBE\n"
+    )
     monkeypatch.delenv("USAGE_ACCOUNTS_FILE", raising=False)
-    monkeypatch.setattr(mod, "default_accounts_file", lambda: roster_file)
-    _set_pool_tokens(monkeypatch, "B", "C", "D")
+    monkeypatch.setattr(mod, "default_accounts_file", lambda: roster)
+    monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_DEFAULT_ROSTER_PROBE", "tok-probe")
 
     gate = mod.build_pool(env_file=str(empty_env_file))
 
-    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"], (
-        "build_pool must have resolved the roster through "
-        "default_accounts_file(), the only source left once accounts_file "
-        "and USAGE_ACCOUNTS_FILE are both unset"
+    assert [a.name for a in gate._accounts] == ["only-in-the-default-roster"], (
+        "build_pool must resolve the roster through default_accounts_file(), "
+        "the only source left once accounts_file and USAGE_ACCOUNTS_FILE are "
+        "both unset"
     )
 
 
