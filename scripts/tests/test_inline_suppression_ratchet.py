@@ -161,3 +161,187 @@ def _run_script(args: list[str], *, cwd: Path, script: Path, env: dict[str, str]
         timeout=_SUBPROCESS_TIMEOUT_SECS,
         env=env,
     )
+
+
+def _sites(source: str, *, path: str = 'm.py') -> list:
+    """Every Site in *source*, flattened out of the comments that hold them."""
+    return [
+        site
+        for comment in inline_suppressions.scan_source(source, path=path)
+        for site in comment.sites
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 — the kind table and the COMMENT-token scan.
+
+
+def test_scan_finds_every_kind_the_table_declares():
+    """All five kinds, so a row nobody detects turns this red.
+
+    Driven off ``Kind`` itself rather than a hand-written list: a sixth row
+    added to the table (the PRD names ``pytest.mark.skip`` and ``shellcheck
+    disable`` as the expected extensions) with no detection pattern would
+    otherwise pass a list that never mentioned it.
+    """
+    source = '\n'.join(
+        [
+            'a = 1  # type: ignore[arg-type]',
+            'b = 2  # noqa: E402',
+            'c = 3  # pyright: ignore[reportArgumentType]',
+            'd = 4  # pragma: no cover',
+            'e = 5  # nosec',
+        ]
+    )
+
+    assert {site.kind for site in _sites(source)} == set(inline_suppressions.Kind)
+
+
+def test_site_carries_path_line_kind_codes_and_the_stripped_physical_line():
+    source = 'x = 1\n\n    # noqa: E402\n'
+
+    (site,) = _sites(source, path='pkg/mod.py')
+
+    assert site.path == 'pkg/mod.py'
+    assert site.line == 3
+    assert site.kind is inline_suppressions.Kind.NOQA
+    assert site.codes == ('E402',)
+    assert site.text == '# noqa: E402'
+
+
+def test_bracketed_codes_are_extracted_in_source_order():
+    """Order is the SOURCE's here; sorting is the key's job, not the scan's."""
+    (mypy_site,) = _sites('a = 1  # type: ignore[attr-defined, arg-type]')
+    (pyright_site,) = _sites('a = 1  # pyright: ignore[reportArgumentType]')
+
+    assert mypy_site.codes == ('attr-defined', 'arg-type')
+    assert pyright_site.codes == ('reportArgumentType',)
+
+
+def test_noqa_codes_are_extracted_with_or_without_a_space_after_the_colon():
+    (listed,) = _sites('a = 1  # noqa: E402,F401')
+    (tight,) = _sites('a = 1  # noqa:E402')
+
+    assert listed.codes == ('E402', 'F401')
+    assert tight.codes == ('E402',)
+
+
+def test_noqa_code_extraction_stops_at_the_first_token_that_is_not_a_code():
+    """The live tree's dominant shape: a code, then a dash, then prose.
+
+    Measured over this repository 2026-09-19 — 232 distinct ``noqa`` tails, of
+    which the prose-carrying ones (``# noqa: F401  — the binding IS the
+    wiring``, ``# noqa: E402  (import after path fix)``) are common enough that
+    splitting the whole tail on whitespace manufactures 'the', 'never', 'a' and
+    'IS' as rule codes.  Stopping at the first non-code token reproduces ruff's
+    own reading and yields 40 distinct codes over the tree, every one of them
+    real.
+    """
+    (dashed,) = _sites('a = 1  # noqa: F401  — the binding IS the wiring')
+    (parenthesised,) = _sites('a = 1  # noqa: E402  (import after path fix)')
+
+    assert dashed.codes == ('F401',)
+    assert parenthesised.codes == ('E402',)
+
+
+def test_a_kebab_case_code_is_a_code_only_in_first_position():
+    """The union of the two consumers' own grammars, and nothing wider.
+
+    ruff recognises a ``<letters><digits>`` code anywhere in the list;
+    ``fused-memory/scripts/check_bare_magicmock_config.py`` anchors its
+    kebab-case code immediately after ``noqa:``.  Admitting kebab-case
+    ANYWHERE would read the tail of ``# noqa: F401  re-export shim`` as a
+    second code, which is neither consumer's rule.
+    """
+    (first_party,) = _sites('a = 1  # noqa: bare-magicmock — deliberate')
+    (invented,) = _sites('a = 1  # noqa: bare-something-else')
+    (prose,) = _sites('a = 1  # noqa: F401  re-export shim')
+
+    assert first_party.codes == ('bare-magicmock',)
+    assert invented.codes == ('bare-something-else',)
+    assert prose.codes == ('F401',)
+
+
+def test_bare_markers_carry_no_codes():
+    """Absence of codes is an empty tuple, never None — a Site always has a
+    codes tuple, so no consumer of it needs a null check."""
+    bare_noqa, bare_ignore, pragma, nosec = _sites(
+        '\n'.join(
+            [
+                'a = 1  # noqa',
+                'b = 2  # type: ignore',
+                'c = 3  # pragma: no cover',
+                'd = 4  # nosec',
+            ]
+        )
+    )
+
+    assert bare_noqa.codes == ()
+    assert bare_ignore.codes == ()
+    assert pragma.codes == ()
+    assert nosec.codes == ()
+
+
+def test_a_suppression_inside_a_string_literal_is_not_a_site():
+    """THE REASON THIS IS ``tokenize`` AND NOT A REGEX.
+
+    A regex over source text cannot tell a comment from a string that merely
+    mentions one, and this repository is full of the latter — every test that
+    asserts on a marker, and this very module.  Same argument as
+    ``scripts/merge_lane_metrics.py::_comment_lines``.
+    """
+    source = '\n'.join(
+        [
+            'DOC = "# type: ignore[arg-type]"',
+            "OTHER = '# noqa: E402'",
+            'TRIPLE = """',
+            '# pyright: ignore[reportAny]',
+            '"""',
+        ]
+    )
+
+    assert _sites(source) == []
+
+
+def test_the_word_nanosecond_does_not_register_as_nosec():
+    """``nosec`` is a word, not a substring — 'nanosecond' contains it."""
+    assert _sites('a = 1  # 5 nanoseconds is the budget') == []
+    assert _sites('a = 1  # nanosecond') == []
+    assert _sites('a = 1  # nosecret') == []
+
+
+def test_one_comment_carrying_a_suppression_and_a_disposition_is_one_site():
+    """D6's shape: the disposition rides in the SAME comment token.
+
+    The Site's text is the whole stripped physical line — the disposition
+    included — because that is what D7 digests, so editing the disposition
+    changes the key just as editing the code does.
+    """
+    (site,) = _sites('    value = call()  # type: ignore[attr-defined]  # debt: task 5601')
+
+    assert site.kind is inline_suppressions.Kind.TYPE_IGNORE
+    assert site.codes == ('attr-defined',)
+    assert site.text == 'value = call()  # type: ignore[attr-defined]  # debt: task 5601'
+
+
+def test_one_comment_carrying_two_kinds_yields_one_site_per_kind():
+    comment_sites = _sites('a = 1  # type: ignore[arg-type]  # noqa: E402')
+
+    assert [(site.kind, site.codes) for site in comment_sites] == [
+        (inline_suppressions.Kind.TYPE_IGNORE, ('arg-type',)),
+        (inline_suppressions.Kind.NOQA, ('E402',)),
+    ]
+
+
+def test_scan_source_yields_every_comment_not_only_the_suppressing_ones():
+    """The disposition-without-a-suppression violation (scenario 7's second
+    half) is a property of a comment that produced NO Site, so the scan has to
+    hand back the plain comments too."""
+    comments = inline_suppressions.scan_source(
+        'a = 1  # debt: task 5\nb = 2  # noqa: E402\n', path='m.py'
+    )
+
+    assert [(comment.line, comment.text, len(comment.sites)) for comment in comments] == [
+        (1, '# debt: task 5', 0),
+        (2, '# noqa: E402', 1),
+    ]
