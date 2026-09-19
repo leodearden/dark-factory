@@ -13,12 +13,18 @@ driver itself — rather than by reading the source and trusting it.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import pydantic_spec
 
 from fused_memory.backends.graphiti_client import PagedRead
-from fused_memory.maintenance.task_family_census import TaskFamilyCensus
+from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.maintenance.task_family_census import (
+    TaskFamilyCensus,
+    _build_parser,
+    run_task_family_census,
+)
 
 # Every mutating backend method the census must never reach. Named explicitly
 # rather than inferred, so adding one to the backend and quietly calling it from
@@ -315,3 +321,332 @@ class TestTaskFamilyCensusCoverageHonesty:
 
         assert result.complete is True
         assert result.incomplete_kind is None
+
+# ---------------------------------------------------------------------------
+# step-11: the multi-graph sweep and the CLI-callable entrypoint
+# ---------------------------------------------------------------------------
+
+#: A second graph's corpus: the 900 pair and nothing else. Distinct from
+#: FIXTURE_NODES on purpose — a sweep that merged graphs into one number would
+#: report the wrong residue for both, which is why the breakdown is per-graph.
+OTHER_GRAPH_NODES = [
+    {'uuid': 'u-900-a', 'name': 'Task 900', 'summary': ''},
+    {'uuid': 'u-900-b', 'name': 'Task 900', 'summary': ''},
+]
+
+#: A graph with nothing split at all: one clean canonical node.
+CLEAN_GRAPH_NODES = [
+    {'uuid': 'u-700', 'name': 'Task 700', 'summary': ''},
+]
+
+
+def make_sweep_backend(per_graph, graphs=None):
+    """A backend whose ``enumerate_entity_nodes`` answers per group_id.
+
+    ``per_graph`` maps group_id -> either an ``(nodes, PagedRead)`` pair or an
+    Exception INSTANCE to raise. Simulating a per-graph failure by raising from
+    the backend is what lets the isolation test stay outside the census: it
+    never has to reach in and break an internal.
+    """
+    backend = MagicMock()
+
+    async def fake_enumerate(*, group_id):
+        outcome = per_graph[group_id]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    backend.enumerate_entity_nodes = AsyncMock(side_effect=fake_enumerate)
+
+    async def fake_probe(substring, *, group_id):
+        return list(FIXTURE_PROBES.get(substring, []))
+
+    backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=fake_probe)
+    backend.list_graphs = AsyncMock(
+        return_value=list(per_graph if graphs is None else graphs)
+    )
+    for method_name in MUTATING_BACKEND_METHODS:
+        setattr(backend, method_name, AsyncMock())
+    return backend
+
+
+def whole(nodes):
+    """``(nodes, PagedRead)`` for a graph that was enumerated in full."""
+    return (nodes, complete_read(len(nodes)))
+
+
+def make_three_graph_backend():
+    """home (2 families) / other (1 family) / clean (0) — in list_graphs order."""
+    return make_sweep_backend({
+        'home': whole(FIXTURE_NODES),
+        'other': whole(OTHER_GRAPH_NODES),
+        'clean': whole(CLEAN_GRAPH_NODES),
+    })
+
+
+class TestTaskFamilyCensusSweep:
+    """sweep(group_id=None) — every graph, or exactly one."""
+
+    @pytest.mark.asyncio
+    async def test_no_group_id_censuses_every_graph_and_names_each_one(self):
+        """The residue is per-graph, so a whole-store number that cannot be
+        attributed to a graph is not actionable: an operator cannot go and look
+        at 'three families somewhere'."""
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert [graph.group_id for graph in aggregate.graphs] == [
+            'home', 'other', 'clean',
+        ]
+        assert [len(graph.families) for graph in aggregate.graphs] == [2, 1, 0]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_group_id_reads_only_that_graph_and_never_lists(self):
+        """Asking for one graph must not enumerate the store: list_graphs is a
+        read an operator scoping a census to one project did not ask for."""
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep(group_id='other')
+
+        backend.list_graphs.assert_not_awaited()
+        assert [graph.group_id for graph in aggregate.graphs] == ['other']
+        assert aggregate.total_families == 1
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_totals_the_families_across_graphs(self):
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.total_families == 3
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_is_frozen_all_the_way_down(self):
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        with pytest.raises(FrozenInstanceError):
+            setattr(aggregate, 'total_families', 0)  # noqa: B010
+        assert isinstance(aggregate.graphs, tuple)
+        assert isinstance(aggregate.failures, tuple)
+
+    @pytest.mark.asyncio
+    async def test_elapsed_ms_is_recorded_for_the_whole_sweep(self):
+        """Mirrors _run_startup_identity_scan's aggregate elapsed_ms: a sweep
+        over every graph in the store is the kind of cost that has to be
+        observable without guessing."""
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.elapsed_ms >= 0
+
+
+class TestTaskFamilyCensusSweepIsBestEffortPerGraph:
+    """One unreachable graph must not cost the census every other graph."""
+
+    @pytest.mark.asyncio
+    async def test_a_failing_graph_does_not_stop_the_rest_of_the_sweep(self):
+        """Mirrors _run_startup_identity_scan: each graph is processed inside its
+        own try/except so a failure on one never aborts the sweep."""
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'broken': RuntimeError('FalkorDB connection reset'),
+            'clean': whole(CLEAN_GRAPH_NODES),
+        })
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert [graph.group_id for graph in aggregate.graphs] == ['home', 'clean']
+
+    @pytest.mark.asyncio
+    async def test_the_failure_is_recorded_naming_the_graph_and_the_error(self):
+        """Recorded as STRUCTURE, not folded into prose: the group_id is the
+        thing an operator re-runs with, and the exception TYPE is what says
+        whether to retry or to go fix something."""
+        backend = make_sweep_backend({
+            'broken': RuntimeError('FalkorDB connection reset'),
+            'clean': whole(CLEAN_GRAPH_NODES),
+        })
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert [failure.group_id for failure in aggregate.failures] == ['broken']
+        assert 'RuntimeError' in aggregate.failures[0].error
+        assert 'FalkorDB connection reset' in aggregate.failures[0].error
+
+    @pytest.mark.asyncio
+    async def test_a_failure_is_logged(self, caplog):
+        backend = make_sweep_backend({'broken': RuntimeError('FalkorDB connection reset')})
+
+        with caplog.at_level('ERROR'):
+            await TaskFamilyCensus(backend=backend).sweep()
+
+        assert 'broken' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_never_returns_a_silently_smaller_number(self):
+        """The attempted graphs must all be accounted for — censused or
+        recorded as failed. A count that quietly omits an unreachable graph
+        reads as 'two graphs have no residue' when the truth is 'one graph was
+        never looked at'."""
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'broken': RuntimeError('FalkorDB connection reset'),
+            'clean': whole(CLEAN_GRAPH_NODES),
+        })
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert len(aggregate.graphs) + len(aggregate.failures) == 3
+
+
+class TestTaskFamilyCensusSweepCompleteness:
+    """One flag answers 'can I trust this number?' for the whole sweep."""
+
+    @pytest.mark.asyncio
+    async def test_complete_when_every_graph_was_read_whole(self):
+        backend = make_three_graph_backend()
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.complete is True
+        assert aggregate.failures == ()
+
+    @pytest.mark.asyncio
+    async def test_incomplete_when_any_graph_was_truncated(self):
+        truncated = PagedRead(
+            rows=[], complete=False, rows_seen=2, expected_rows=9999,
+            reason='page cap reached', incomplete_kind='page_cap',
+        )
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'huge': (OTHER_GRAPH_NODES, truncated),
+        })
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.complete is False
+
+    @pytest.mark.asyncio
+    async def test_incomplete_when_any_graph_errored(self):
+        """An errored graph is an unknown, not a zero — so the sweep's own
+        completeness flag has to go False even though every graph it DID read
+        was read in full."""
+        backend = make_sweep_backend({
+            'home': whole(FIXTURE_NODES),
+            'broken': RuntimeError('FalkorDB connection reset'),
+        })
+
+        aggregate = await TaskFamilyCensus(backend=backend).sweep()
+
+        assert aggregate.complete is False
+        assert all(graph.complete for graph in aggregate.graphs)
+
+
+class TestRunTaskFamilyCensusDelegation:
+    """run_task_family_census() delegates its lifecycle to maintenance_service."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_maintenance_service_and_uses_service_graphiti(
+        self, make_fake_maintenance_service,
+    ):
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        sentinel = object()
+
+        with (
+            patch(
+                'fused_memory.maintenance.task_family_census.maintenance_service',
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
+            ),
+            patch(
+                'fused_memory.maintenance.task_family_census.TaskFamilyCensus'
+            ) as mock_census_cls,
+        ):
+            mock_census = MagicMock()
+            mock_census.sweep = AsyncMock(return_value=sentinel)
+            mock_census_cls.return_value = mock_census
+
+            result = await run_task_family_census(config_path='/tmp/config.yaml')
+
+        mock_census_cls.assert_called_once_with(backend=mock_service.graphiti)
+        assert result is sentinel
+
+    @pytest.mark.asyncio
+    async def test_passes_the_group_id_through_to_the_sweep(
+        self, make_fake_maintenance_service,
+    ):
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch(
+                'fused_memory.maintenance.task_family_census.maintenance_service',
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
+            ),
+            patch(
+                'fused_memory.maintenance.task_family_census.TaskFamilyCensus'
+            ) as mock_census_cls,
+        ):
+            mock_census = MagicMock()
+            mock_census.sweep = AsyncMock(return_value=MagicMock())
+            mock_census_cls.return_value = mock_census
+
+            await run_task_family_census(group_id='know_live')
+
+        mock_census.sweep.assert_awaited_once_with(group_id='know_live')
+
+
+class TestTheParserExposesNoWayToMutateTheGraph:
+    """Read-only is this workstream's central promise, so it is asserted about
+    the CLI SURFACE too — not just about the code behind it."""
+
+    #: Every option the census CLI is allowed to have. Exact-set equality, so a
+    #: new flag of any kind fails this test until it is added here deliberately.
+    EXPECTED_OPTIONS = {'-h', '--help', '--config', '--group-id', '--json'}
+
+    #: Verbs that would signal a flag capable of changing the graph. '--dry-run'
+    #: is on the list too, and its absence is the point: verify_zombie_edges.py
+    #: needs one because it can delete, whereas every census run is already a
+    #: dry run and offering the flag would imply an unsafe mode exists.
+    MUTATING_VERBS = (
+        'delete', 'remove', 'merge', 'rename', 'collapse', 'repair', 'fix',
+        'write', 'apply', 'prune', 'force', 'dry-run', 'commit',
+    )
+
+    def test_exposes_exactly_config_group_id_and_json(self):
+        parser = _build_parser()
+
+        options = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+        }
+
+        assert options == self.EXPECTED_OPTIONS
+
+    def test_no_option_carries_a_mutating_verb(self):
+        parser = _build_parser()
+
+        for action in parser._actions:
+            for option in action.option_strings:
+                for verb in self.MUTATING_VERBS:
+                    assert verb not in option, f'{option} looks like it could write'
+
+    def test_json_is_a_bare_flag_and_the_other_two_take_values(self):
+        parser = _build_parser()
+
+        args = parser.parse_args([])
+        assert args.json is False
+        assert args.config is None
+        assert args.group_id is None
+
+        args = parser.parse_args(['--json', '--config', '/c.yaml', '--group-id', 'home'])
+        assert args.json is True
+        assert args.config == '/c.yaml'
+        assert args.group_id == 'home'
