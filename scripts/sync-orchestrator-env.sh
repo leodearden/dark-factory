@@ -4,24 +4,38 @@
 #
 # Why this exists
 # ---------------
-# The seven orchestrator units run `uv run --frozen ...`, so process start NEVER
-# re-syncs the venv: a frozen start against a missing/stale venv fails fast
-# instead of bootstrapping. Mutating the runtime env is therefore a deliberate,
-# supervised operation — this script — performed with every orchestrator stopped
-# so no live process is bound to an interpreter that is being rebuilt.
+# The seven orchestrator units run `uv run --no-sync ...`, so process start NEVER
+# installs into the venv: a start against a missing/stale venv fails with
+# ModuleNotFoundError instead of bootstrapping one. Mutating the runtime env is
+# therefore a deliberate, supervised operation — this script — performed with every
+# orchestrator stopped so no live process is bound to an interpreter being rebuilt.
 #
-# This is the 2026-05-29 ghost-venv fix. Before it, the shared runtime venv could
-# be mutated two ways: (a) a target's verify subprocess inheriting our
-# VIRTUAL_ENV and running `uv sync` into OUR venv (fixed in verify.py's
-# _target_subprocess_env scrub), and (b) a unit start implicitly re-syncing
-# (fixed by --frozen). This script rebuilds the env on the .python-version pin
-# (3.13), which also PURGES any leaked torch/insightface stack a pre-fix target
-# verify wrote into our runtime, leaving a clean, lean orchestrator env.
+# CORRECTION (task 5553). This header said the units run `uv run --frozen` and that
+# THAT is what stops a start re-syncing. Both were false, and were believed from the
+# 2026-05-29 ghost-venv fix until 2026-09-19. `--frozen` is a LOCKFILE option ("run
+# without updating the uv.lock file"); measured on uv 0.11.6, `uv run --frozen`
+# REINSTALLED a package deleted from the venv ("Installed 1 package in 50ms") while
+# `--no-sync` left it untouched. So for four months the units were mutating the
+# shared venv at every start and this script's premise was wrong.
+#
+# That fix addressed two hazards. (a) A target's verify subprocess inheriting our
+# VIRTUAL_ENV and running `uv sync` into OUR venv — genuinely fixed, in verify.py's
+# _target_subprocess_env scrub, and still live. (b) A unit start implicitly
+# re-syncing — NOT fixed by --frozen; fixed by --no-sync in task 5553. This script
+# rebuilds the env on the .python-version pin (3.13), which also PURGES any leaked
+# torch/insightface stack a pre-fix target verify wrote into our runtime, leaving a
+# clean, lean orchestrator env.
+#
+# This script is the repair path precisely BECAUSE the units can no longer repair
+# themselves. While a start silently re-synced, a half-synced venv healed itself and
+# this script was one option among several; it is now the only one, as the top of
+# this header has always claimed. Fleet-wide enforcement of the unit side lives in
+# tests/scripts/test_uv_run_venv_isolation.py.
 #
 # Order matters: stop the watchdog TIMER first (else its 60s probe revives a unit
 # we just stopped, mid-sync), then the services; sync; then services; then the
 # timer last. The watchdog only port-probes — it does NOT repair a missing/stale
-# venv, so a frozen unit must be pre-synced by THIS script before it can start.
+# venv, so a unit must be pre-synced by THIS script before it can start.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -104,4 +118,4 @@ done
 echo "==> Restarting watchdog timer (last)"
 systemctl --user start orchestrator-watchdog.timer
 
-echo "==> Done. Frozen units are running against a freshly-synced venv."
+echo "==> Done. Units are running against a freshly-synced workspace venv."

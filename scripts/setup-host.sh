@@ -372,12 +372,20 @@ fi
 # NOT to reconcile RestartSteps=4 back out, since a rebuilt host or a stale
 # re-install would reopen exactly the gap it warns about.
 #
-# The orchestrator units run `uv run --frozen ...`, so process start never
-# implicitly re-syncs the shared dark-factory/.venv. After any dependency change
-# (or a fresh checkout) run scripts/sync-orchestrator-env.sh once to materialize
-# the runtime venv on the .python-version pin — the watchdog only port-probes and
-# will NOT repair a missing/stale venv (a frozen-start failure that exhausts
-# StartLimitBurst is left stopped for operator attention).
+# The orchestrator units run `uv run --no-sync ...`, so process start never
+# installs into the shared dark-factory/.venv. CORRECTION (task 5553): this note
+# said `--frozen` and said it was what stopped the re-sync. It is not — `--frozen`
+# is a LOCKFILE option ("run without updating the uv.lock file"), and a
+# `uv run --frozen` start was MEASURED on uv 0.11.6 reinstalling a package deleted
+# from the venv. `--no-sync` is the flag that actually stops it.
+# After any dependency change (or a fresh checkout) run
+# scripts/sync-orchestrator-env.sh once to materialize the runtime venv on the
+# .python-version pin — it now runs `uv sync --all-packages`, the only form that
+# repairs the whole workspace without pruning siblings. A start against a
+# missing/stale venv now fails with ModuleNotFoundError rather than bootstrapping
+# one (uv still creates an empty .venv first). The watchdog only port-probes and
+# will NOT repair a missing/stale venv, so such a start failure, once it exhausts
+# StartLimitBurst, is left stopped for operator attention.
 #
 # The unit files reference /home/leo/bin/wait-for-port.py from ExecStartPre,
 # so the helper lives under ~/bin (stable absolute path across repo moves).
