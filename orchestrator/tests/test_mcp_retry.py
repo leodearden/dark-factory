@@ -384,12 +384,13 @@ class TestTimeoutCausePredicate:
         """The wrap can nest: the walk follows the chain to its end."""
         from orchestrator.mcp_lifecycle import is_timeout_failure
 
+        slow = httpx.ReadTimeout('')
         inner = RuntimeError('MCP tools/call failed after 3 attempts: ReadTimeout: ')
-        inner.__cause__ = httpx.ReadTimeout('')
+        inner.__cause__ = slow
         outer = RuntimeError('search failed')
         outer.__cause__ = inner
 
-        assert outer.__cause__.__cause__.__cause__ is None
+        assert slow.__cause__ is None, 'the deepest link ends the chain rather than cycling'
         assert is_timeout_failure(outer)
 
     def test_a_cyclic_cause_chain_terminates(self):
