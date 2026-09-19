@@ -3249,6 +3249,101 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    @_canonicalize_group_args
+    async def find_entity_nodes_by_name_substring(
+        self, substring: str, *, group_id: str
+    ) -> list[dict]:
+        """Return every Entity node whose name CONTAINS *substring*, canonical-ordered.
+
+        The substring-match sibling of find_duplicate_entity_nodes above: same
+        group-scoped shape, same valid-edge count, same survivor-first ordering
+        — only the name predicate differs, from exact equality to CONTAINS, and
+        the node's name joins the returned columns.
+
+        A deliberately TASK-AGNOSTIC candidate-NARROWING primitive. It knows
+        nothing about task labels or any other vocabulary: it hands back a
+        superset and the CALLER applies its own precise membership test. The
+        sole caller today, MemoryService._normalize_task_node_names, probes with
+        a task's verbatim digits to reach 'Task 605', 'task 605', 'tasks 605'
+        and 'task #605' in one query, then filters the candidates through
+        utils/task_naming.canonicalize_task_node_name — which is what keeps
+        'Task 6051', 'Task 1605' and the foreign 'reify:605' out. Expressing
+        that membership rule as a Cypher predicate instead would put a second
+        copy of the label vocabulary inside a query string, where it can be
+        neither tested nor kept in step with utils/canonical_labels.py.
+
+        Digits make a good probe for a second reason: they are case-free, so
+        one CONTAINS match reaches every capitalization without needing
+        case-insensitive Cypher. Callers should nevertheless supply a SELECTIVE
+        substring — this is an un-indexed scan of the graph's Entity nodes, and
+        an unselective one both costs more and risks the row cap below.
+
+        Scoped by an explicit `n.group_id = $group_id` property predicate, for
+        the same reason find_duplicate_entity_nodes carries one (2026-07-06
+        amendment): task-2115's cross-graph leak can plant a node whose
+        group_id property names ANOTHER project physically inside this graph
+        key, and a caller collapsing duplicates must never see it.
+
+        Single un-paginated ro_query rather than _paged_ro_query, which needs a
+        total `ORDER BY n.uuid` for stable SKIP/LIMIT paging and so cannot
+        carry the survivor-first ordering that makes rows[0] meaningful. A
+        selective substring returns a handful of rows, so paging would buy
+        nothing. Truncation at the server's row cap is still conceivable for an
+        unselective substring, and it is WARNED rather than swallowed: a
+        silently short view would leave a caller's collapse incomplete with
+        nothing in the logs to explain it.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            substring: Case-SENSITIVE substring to match against n.name.
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts with keys: uuid, name, created_at, edge_count —
+            ordered canonical (survivor) first, exactly as
+            find_duplicate_entity_nodes orders its matches. Empty list when
+            nothing matches.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity) '
+            'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
+            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+            'WITH n, count(DISTINCT e) AS edge_count '
+            'RETURN n.uuid, n.name, n.created_at, edge_count '
+            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+        )
+        start = time.monotonic()
+        result = await graph.ro_query(
+            cypher, {'substring': substring, 'group_id': group_id}
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+            }
+            for row in (result.result_set or [])
+        ]
+        logger.debug(
+            'name-substring scan for %r in graph %r took %.1fms (%d row(s))',
+            substring, group_id, elapsed_ms, len(rows),
+        )
+        if len(rows) >= _RESULTSET_SIZE:
+            logger.warning(
+                'name-substring scan for %r in graph %r returned %d rows, at or above '
+                'the server result-set cap of %d — the result is probably TRUNCATED and '
+                'any family built from it incomplete. Use a more selective substring.',
+                substring, group_id, len(rows), _RESULTSET_SIZE,
+            )
+        return rows
+
     async def _scan_duplicate_entity_names(self, group_id: str) -> list[tuple[str, int]]:
         """Detect exact-name duplicate Entity nodes in *group_id*'s graph — B5 dup-node alarm.
 
