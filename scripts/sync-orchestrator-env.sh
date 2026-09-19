@@ -4,7 +4,7 @@
 #
 # Why this exists
 # ---------------
-# The three orchestrator units run `uv run --frozen ...`, so process start NEVER
+# The seven orchestrator units run `uv run --frozen ...`, so process start NEVER
 # re-syncs the venv: a frozen start against a missing/stale venv fails fast
 # instead of bootstrapping. Mutating the runtime env is therefore a deliberate,
 # supervised operation — this script — performed with every orchestrator stopped
@@ -27,10 +27,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UV=/home/leo/.local/bin/uv
 
+# Every committed scripts/orchestrator-*.service unit EXCEPT orchestrator-watchdog
+# (the probe, whose TIMER is stopped first and started last below). All of them run
+# out of the one shared .venv this script rebuilds, so one left running through the
+# sync is bound to an interpreter being replaced underneath it, and one never
+# restarted afterwards keeps stale bytecode -- which --no-sync means it can no longer
+# fix by re-syncing at its next start. This array is the single source of the list
+# within this script; tests/scripts/test_sync_orchestrator_env.py derives the expected
+# set from the committed units, so an eighth unit turns that guard red on its own.
 SERVICES=(
   orchestrator-reify.service
   orchestrator-dark-factory.service
   orchestrator-autopilot-video.service
+  orchestrator-know-live.service
+  orchestrator-my-solar-challenge.service
+  orchestrator-pump-web-ui.service
+  orchestrator-solar-challenge-platform.service
 )
 
 echo "==> Stopping watchdog timer (first, so it can't revive a unit mid-sync)"
@@ -73,7 +85,18 @@ echo "==> Runtime interpreter (expect 3.13.x — fails loudly if a ghost reappea
 "$REPO_ROOT/.venv/bin/python" --version
 
 echo "==> Restarting orchestrator services"
+# The installed-check is load-bearing under `set -euo pipefail`, NOT defensive
+# tidiness. The stop loop above tolerates absence via `|| true`, but a bare
+# `systemctl start` on a host carrying only a SUBSET of these units would abort
+# the script mid-restart and leave the remaining orchestrators DOWN -- strictly
+# worse than the drift this list widening fixes. So skip what is not installed,
+# loudly and by name, making a subset host a reported fact rather than a silent
+# one. A genuine start failure for a unit that IS installed is still fatal.
 for svc in "${SERVICES[@]}"; do
+  if [[ ! -f "$HOME/.config/systemd/user/$svc" ]]; then
+    echo "    SKIP $svc — not installed on this host (no ~/.config/systemd/user/$svc)"
+    continue
+  fi
   systemctl --user reset-failed "$svc" 2>/dev/null || true
   systemctl --user start "$svc"
 done
