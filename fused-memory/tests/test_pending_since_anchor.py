@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta
 
 import pytest
 import pytest_asyncio
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import (
+    _MACHINE_AUTHORED_METADATA_KEYS,
     SqliteTaskBackend,
     stamp_pending_since,
 )
@@ -48,6 +50,24 @@ _OLDER = '2026-08-06T10:00:00.000Z'
 # enough that task beta's age term saturates, so it is unambiguous whether a
 # stored value came from the machine clock or from the payload.
 _ANCIENT = '2000-01-01T00:00:00.000Z'
+
+
+def _assert_machine_clock(anchor: str | None, updated_at: str) -> None:
+    """Assert ``anchor`` came from the machine's clock on THIS write.
+
+    Bracketed against the row's own ``updatedAt`` rather than an imported
+    ``_now()``: the two writers take their two ``_now()`` readings in
+    OPPOSITE orders (``set_task_status`` binds ``updated_at`` first, the audit
+    writer stamps the anchor first), so only a tolerance holds for both — and
+    a tolerance measured against an observable field keeps this file off the
+    module's internals.
+    """
+    assert anchor is not None, 'a pending landing must be anchored'
+    assert anchor > _ANCIENT, f'the forged payload value was stored: {anchor!r}'
+    skew = abs(datetime.fromisoformat(anchor) - datetime.fromisoformat(updated_at))
+    assert skew < timedelta(seconds=5), (
+        f'anchor {anchor!r} is not this write\'s clock (updatedAt={updated_at!r})'
+    )
 
 
 @pytest_asyncio.fixture
@@ -778,3 +798,264 @@ class TestPendingSinceBatchIdentity:
         finally:
             await backend.close()
             await event_buffer.close()
+
+
+class TestPendingSinceIsMachineAuthored:
+    """No CALLER may write the wait-anchor keys (task 3816 review remediation).
+
+    A separate class from :class:`TestPendingSinceThroughStatusWriters`
+    deliberately: the subject here is write AUTHORITY, not the C1 transition
+    table. The ``add_task``-landing-in-``pending`` row stays with the boundary
+    rows in that class (``test_add_task_ignores_a_caller_supplied_anchor``)
+    because an insert into ``pending`` IS a status-writer boundary row; the
+    four caller boundaries below are covered here.
+
+    Why authority matters more than it looks: the anchor is the scheduler's
+    INPUT, so a caller able to write it prices its own dispatch. Task beta
+    scores ``age(t) = AGE_BUDGET*a/(a+AGE_HALF_SECS)`` with ``AGE_BUDGET=500``
+    inside ``TIER_WIDTH=1000``, so a forged ancient value is ~the full age
+    bonus and a permanent intra-tier queue jump — the OVER-aging PRD D4
+    excluded even for the machine's own back-fill. Every one of the cases
+    below was MEASURED storing the forged value before the sanitizer landed.
+    """
+
+    async def _metadata(self, backend, project_root, task_id) -> dict:
+        one = await backend.get_task(task_id, project_root=project_root)
+        return one['metadata'] or {}
+
+    @pytest.mark.asyncio
+    async def test_parked_insert_cannot_pre_age_its_later_commit(
+        self, backend, tmp_path
+    ):
+        """Case A: ``deferred`` insert + ``commit_planning``'s landing flip.
+
+        MEASURED to keep the forged value: the insert returned early on
+        ``new_status != pending`` without stamping, so the forged key rode
+        along and the later landing then hit the "key present -> unchanged"
+        arm. This is the MORE exploitable path than the reviewed one, since
+        ``planning_mode`` + ``commit_planning`` is how agents actually file
+        tasks. Hence the strip at ``add_task`` is unconditional across every
+        insert status, not scoped to ``pending``.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(
+            project_root=project_root, title='parked', status=TaskStatus.DEFERRED,
+            metadata=json.dumps({'pending_since': _ANCIENT, 'files': ['a.py']}),
+        )
+        parked = await self._metadata(backend, project_root, dto['id'])
+        assert 'pending_since' not in parked, (
+            'a parked row must accrue no wait until it is actually committed'
+        )
+
+        await backend.set_task_status(
+            str(dto['id']), TaskStatus.PENDING, project_root=project_root
+        )
+        one = await backend.get_task(dto['id'], project_root=project_root)
+        _assert_machine_clock(one['metadata']['pending_since'], one['updatedAt'])
+        assert one['metadata']['files'] == ['a.py']
+
+    @pytest.mark.asyncio
+    async def test_update_task_cannot_move_the_anchor_backward(
+        self, backend, tmp_path
+    ):
+        """Case B: the PUBLIC metadata writer, in its default merge mode.
+
+        MEASURED to move a live anchor BACKWARD (``2026-09-19T06:29:11.384Z``
+        -> ``2000-01-01T00:00:00.000Z``), breaking the monotone-non-decreasing
+        invariant ``stamp_pending_since``'s own docstring asserts — and in the
+        over-age direction, which is the exploitable one.
+
+        The forged key is IGNORED, not rejected: ``update_task`` is reachable
+        from blob round-trips, so raising would add a failure mode on data a
+        caller merely echoed back (design decision 9). The call must still
+        succeed and its other keys must still apply.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='public writer')
+        original = (await self._metadata(backend, project_root, dto['id']))[
+            'pending_since'
+        ]
+
+        result = await backend.update_task(
+            str(dto['id']), project_root=project_root,
+            metadata=json.dumps({'pending_since': _ANCIENT, 'files': ['b.py']}),
+        )
+        assert result['updated'] is True, 'ignoring the forged key must not fail the call'
+
+        merged = await self._metadata(backend, project_root, dto['id'])
+        assert merged['pending_since'] == original, (
+            'the stored anchor must be untouched by a caller-supplied value'
+        )
+        assert merged['files'] == ['b.py'], (
+            'the non-anchor keys of the same call must still be applied'
+        )
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_still_drops_the_anchor(self, backend, tmp_path):
+        """Case B, second half: design decision 8 must hold UNCHANGED.
+
+        ``metadata_mode='replace'`` deliberately wipes the blob, anchor
+        included — fail-safe, since the row then reads as anchorless (age 0)
+        rather than pre-aged. Stripping the INCOMING key must not accidentally
+        start preserving the stored one through replace: that would be an
+        unreviewed scope expansion, and it is asserted here so the sanitizer
+        cannot silently acquire it later.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='replaced')
+        assert 'pending_since' in await self._metadata(backend, project_root, dto['id'])
+
+        await backend.update_task(
+            str(dto['id']), project_root=project_root,
+            metadata=json.dumps({'files': ['c.py']}), metadata_mode='replace',
+        )
+        replaced = await self._metadata(backend, project_root, dto['id'])
+        assert 'pending_since' not in replaced, (
+            "metadata_mode='replace' still wipes the anchor (D8) — fail-safe, "
+            'the row reads as anchorless rather than pre-aged'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backfilled_marker_cannot_be_forged_by_a_caller(
+        self, backend, tmp_path
+    ):
+        """Case C: the D4 census marker must identify exactly one population.
+
+        MEASURED stored verbatim. ``pending_since_backfilled`` marks the rows
+        the one-shot v4 -> v5 migration anchored from ``updated_at``, so the
+        under-aging distortion D4 accepted stays countable. A caller able to
+        set it makes that census meaningless.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(
+            project_root=project_root, title='forged marker',
+            metadata=json.dumps({'pending_since_backfilled': True, 'files': ['d.py']}),
+        )
+        stored = await self._metadata(backend, project_root, dto['id'])
+        assert 'pending_since_backfilled' not in stored
+        assert stored['files'] == ['d.py']
+        assert 'pending_since' in stored, (
+            "the machine's own anchor still lands on the same insert"
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_fields_cannot_smuggle_an_anchor(self, backend, tmp_path):
+        """Case D: falsifies the composition-order claim in the writer's comment.
+
+        ``set_status_and_stamp_audit`` merges ``audit_fields`` FIRST and stamps
+        SECOND, and the in-code comment claimed that order alone meant a caller
+        passing ``pending_since`` inside ``audit_fields`` "cannot bypass the
+        transition table". MEASURED FALSE on an ANCHORLESS row: the audit merge
+        injects the key first, so the helper then sees it as already present
+        and returns "unchanged" — persisting
+        ``{"reopen_reason": "x", "pending_since": "2000-01-01T00:00:00.000Z"}``.
+        Composition order was never sufficient; the audit fields have to be
+        sanitized before the merge.
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(
+            project_root=project_root, title='reopened', status=TaskStatus.DEFERRED,
+        )
+        assert 'pending_since' not in await self._metadata(
+            backend, project_root, dto['id']
+        )
+
+        await backend.set_status_and_stamp_audit(
+            str(dto['id']), TaskStatus.PENDING, project_root,
+            audit_fields={
+                'reopen_reason': 'x',
+                'reopen_from': 'deferred',
+                'pending_since': _ANCIENT,
+            },
+        )
+
+        one = await backend.get_task(dto['id'], project_root=project_root)
+        _assert_machine_clock(one['metadata']['pending_since'], one['updatedAt'])
+        assert one['metadata']['reopen_reason'] == 'x'
+        assert one['metadata']['reopen_from'] == 'deferred', (
+            'every legitimate audit field must still persist'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stamp_audit_metadata_cannot_smuggle_an_anchor(
+        self, backend, tmp_path
+    ):
+        """Case E: the same read-modify-write merge shape, privileged.
+
+        Reachable only from the interceptor, so the stakes are lower than the
+        public writers — but asserted anyway so the invariant is UNIFORMLY
+        enforced from one implementation rather than being a per-site
+        judgement call (heuristic 10).
+        """
+        project_root = str(tmp_path)
+        dto = await backend.add_task(project_root=project_root, title='audit stamp')
+        original = (await self._metadata(backend, project_root, dto['id']))[
+            'pending_since'
+        ]
+
+        await backend.stamp_audit_metadata(
+            str(dto['id']), project_root,
+            fields={'reopen_reason': 'y', 'pending_since': _ANCIENT},
+        )
+
+        merged = await self._metadata(backend, project_root, dto['id'])
+        assert merged['pending_since'] == original
+        assert merged['reopen_reason'] == 'y'
+
+    @pytest.mark.asyncio
+    async def test_a_stripped_forgery_is_countable(self, backend, tmp_path, caplog):
+        """The refusal is observable, because the blessing made it silent.
+
+        Before the Tier-A blessing (step 2) a forged ``pending_since`` minted a
+        ``task_metadata.schema_warning code=unknown_key`` line; blessing it
+        removed the only signal a forgery produced. The sanitizer restores
+        one under its OWN token, deliberately distinct from both the schema
+        census and the read-path malformed-blob census so the three never
+        conflate.
+        """
+        project_root = str(tmp_path)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            await backend.add_task(
+                project_root=project_root, title='noisy forgery',
+                metadata=json.dumps({'pending_since': _ANCIENT}),
+            )
+
+        stripped = [
+            r.message for r in caplog.records
+            if 'task_metadata.machine_authored_key_stripped' in r.message
+        ]
+        assert len(stripped) == 1, (
+            f'expected exactly one countable strip WARNING; got: {stripped}'
+        )
+        assert 'pending_since' in stripped[0]
+        conflated = [
+            r.message for r in caplog.records
+            if 'task_metadata.schema_warning' in r.message
+            or 'malformed metadata' in r.message
+        ]
+        assert conflated == [], (
+            f'the strip token must not conflate with the other two censuses; '
+            f'got: {conflated}'
+        )
+
+    def test_machine_authored_keys_are_pinned_and_contained(self):
+        """Drift guard on the two sets, pinning CONTAINMENT and not equality.
+
+        The sets answer different questions — blessed is "the schema
+        recognises this key on READ", machine-authored is "no caller may WRITE
+        it" — and most blessed keys are legitimately caller-authored, so they
+        are deliberately NOT in lockstep (design decision 10). What must hold
+        is one direction: a key no caller may write still has to be a key the
+        schema recognises, or every machine write would mint an
+        ``unknown_key`` census line.
+        """
+        from shared.task_metadata import _BLESSED_METADATA_KEYS
+
+        assert sorted(_MACHINE_AUTHORED_METADATA_KEYS) == [
+            'pending_since', 'pending_since_backfilled',
+        ]
+        assert _MACHINE_AUTHORED_METADATA_KEYS <= _BLESSED_METADATA_KEYS, (
+            'machine-authored keys must be blessed, or the status chokepoints '
+            'mint an unknown_key census line on every write: '
+            f'{sorted(_MACHINE_AUTHORED_METADATA_KEYS - _BLESSED_METADATA_KEYS)}'
+        )
