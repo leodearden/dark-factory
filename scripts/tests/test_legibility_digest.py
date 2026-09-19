@@ -1918,8 +1918,8 @@ _NO_RECALLED_SECTIONS_VARIANTS = _no_recalled_sections_variants()
 
 def _recalled_sections_with_trailing_unavailable_note():
     """The recalled-sections return path's fullest composite shape
-    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
-    fifth of ``_get_memory_context``'s five return paths, distinct from
+    (``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+    -- ``_get_memory_context``'s OTHER return, distinct from
     the ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
     have recalled_sections EMPTY; this one has it non-empty). Builds a
     caveat carrying its own drop_note suffix (a foreign-tagged result was

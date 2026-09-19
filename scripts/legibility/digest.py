@@ -1085,6 +1085,7 @@ literals as one-line additions."""
 
 HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_this context was recalled from the ',
+    '_memory unavailable (',
     '_memory unavailable — proceed with codebase exploration',
     '_no memory context available',
 )
@@ -1093,26 +1094,41 @@ HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
 the standing provenance caveat's prefix
 (``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
 section was actually recalled), and its two no-recalled-sections literal
-families (memory-unavailable / no-memory-context-available). The caveat
-marker deliberately stops BEFORE its ``{project_id}`` interpolation
-point: a marker spanning it would be project-specific and would fail for
-every non-dark_factory project the census runs against (this module has
-no knowledge of which project a transcript belongs to). These three
-markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
-as of this commit: the four no-recalled-sections paths (each of the two
-literal families has a plain and a drop_note-bearing variant, both
-covered by the same family marker), PLUS the recalled-sections path
-(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+families (memory-unavailable / no-memory-context-available). Every
+marker deliberately stops BEFORE an interpolation point -- the caveat's
+``{project_id}`` and MEMORY_OUTAGE_NOTICE's ``{reasons}`` -- because a
+marker spanning one is not stable across call sites: the caveat's would
+be project-specific and would fail for every non-dark_factory project the
+census runs against (this module has no knowledge of which project a
+transcript belongs to), and the outage notice's would pin one reason
+class out of three.
+
+The memory-unavailable family has TWO markers, both live, for the reason
+the sibling ``HARNESS_BRIEFING_SUBHEADINGS`` carries two generations of
+heading spellings: task 3659 reworded that notice to name WHY memory was
+unavailable, so ``'_memory unavailable ('`` covers what is rendered today
+and the longer literal covers the archived pre-3659 corpus. Do not prune
+the retired one -- dropping it silently un-classifies every historical
+outage turn.
+
+These four markers are EXHAUSTIVE over ``_get_memory_context``'s return
+paths as of this commit: the no-recalled-sections paths (each of the two
+literal families has a plain, a drop_note-bearing and a notices-bearing
+variant, all three covered by the same family marker, since the family
+line leads the body and the notices and drop_note are appended after it),
+PLUS the recalled-sections path
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+-- covered by the caveat marker ALONE, including
 its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
 trailing "_Memory unavailable for the remaining queries..._" note a
 later-failing query appends, since both are appended AFTER the caveat
 prefix this marker matches on, never before it. That exhaustiveness
 claim is what
 ``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
-(the four no-recalled-sections paths) and
+(every no-recalled-sections shape) and
 ``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
-(the fifth, composite path) together check, so a new return path added
-to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
+(the composite recalled path) together check, so a new return path added
+to that function should arrive with its own marker here. Matched only in CONJUNCTION with
 a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
 never as a relaxation of the briefing anchor+corroborator guard -- that
 guard is load-bearing and its two negative tests
