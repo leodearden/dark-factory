@@ -901,7 +901,7 @@ class TestPendingSinceIsMachineAuthored:
 
     @pytest.mark.asyncio
     async def test_update_task_cannot_move_the_anchor_backward(
-        self, backend, tmp_path
+        self, backend, tmp_path, caplog
     ):
         """Case B: the PUBLIC metadata writer, in its default merge mode.
 
@@ -914,6 +914,12 @@ class TestPendingSinceIsMachineAuthored:
         from blob round-trips, so raising would add a failure mode on data a
         caller merely echoed back (design decision 9). The call must still
         succeed and its other keys must still apply.
+
+        The refusal must also NAME the row. This writer strips before tag
+        normalization and ``_parse_task_id``, so it has no dedup triple — but
+        an operator reading ``task_id=None`` on the one writer measured to
+        move a live anchor backward cannot tell which task was targeted, so
+        the identity travels on its own argument.
         """
         project_root = str(tmp_path)
         dto = await backend.add_task(project_root=project_root, title='public writer')
@@ -921,11 +927,21 @@ class TestPendingSinceIsMachineAuthored:
             'pending_since'
         ]
 
-        result = await backend.update_task(
-            str(dto['id']), project_root=project_root,
-            metadata=json.dumps({'pending_since': _ANCIENT, 'files': ['b.py']}),
-        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = await backend.update_task(
+                str(dto['id']), project_root=project_root,
+                metadata=json.dumps({'pending_since': _ANCIENT, 'files': ['b.py']}),
+            )
         assert result['updated'] is True, 'ignoring the forged key must not fail the call'
+
+        stripped = [
+            r.message for r in caplog.records
+            if 'task_metadata.machine_authored_key_stripped' in r.message
+        ]
+        assert len(stripped) == 1, f'expected one strip WARNING; got {stripped}'
+        assert f'task_id={dto["id"]} tag=' in stripped[0], (
+            f'the warning must name the task it refused; got {stripped[0]!r}'
+        )
 
         merged = await self._metadata(backend, project_root, dto['id'])
         assert merged['pending_since'] == original, (

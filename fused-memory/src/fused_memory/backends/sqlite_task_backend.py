@@ -1181,6 +1181,7 @@ def strip_machine_authored_metadata(
     project_root: str | None = None,
     tag: str | None = None,
     task_id: int | None = None,
+    task_ref: str | int | None = None,
 ) -> str | dict | None:
     """Remove :data:`_MACHINE_AUTHORED_METADATA_KEYS` from a CALLER-supplied blob.
 
@@ -1230,8 +1231,18 @@ def strip_machine_authored_metadata(
     (``task_metadata.schema_warning``) and the read-path malformed-blob
     census (``'malformed metadata'``) so the three never conflate — see
     :func:`_emit_schema_warning`'s docstring on why the tokens are kept
-    separate. The optional triple only routes the dedup, matching
+    separate. The optional triple only routes the DEDUP, matching
     :func:`stamp_pending_since`'s and :func:`_merge_metadata`'s convention.
+
+    ``task_ref`` answers the OTHER question — who the message NAMES — and is
+    deliberately a separate argument (heuristic 3): overloading the dedup
+    triple on both left ``update_task``'s warning reading ``task_id=None``
+    for the most exposed public metadata writer, the one measured to move a
+    live anchor backward. That caller strips BEFORE tag normalization and
+    :func:`_parse_task_id`, so it genuinely has no triple to dedup on, yet it
+    has held the raw task id all along. ``task_ref`` carries that identity
+    into the message on either path, and falls back to ``task_id`` for the
+    callers whose triple already names the row.
     """
     if metadata is None:
         return None
@@ -1255,7 +1266,7 @@ def strip_machine_authored_metadata(
         ' status chokepoints and the v4->v5 back-fill; a caller-supplied'
         ' value is ignored'
     )
-    args = (task_id, tag, project_root, forged)
+    args = (task_id if task_ref is None else task_ref, tag, project_root, forged)
     dedup_key = (project_root, tag, task_id)
     if project_root is not None and tag is not None and task_id is not None:
         if dedup_key not in _warned_machine_authored_task_ids:
@@ -3129,9 +3140,12 @@ class SqliteTaskBackend:
             # here rather than per-task. That is the honest count for a
             # forged WRITE (one caller, one attempt) — the dedup gate exists
             # for the READ path, where _row_to_task runs once per row on
-            # every get_task(s) and would otherwise flood.
+            # every get_task(s) and would otherwise flood. `task_ref` is the
+            # separate identity axis, so declining the dedup does not also
+            # cost the message the task it names: only the PARSED int needs
+            # _parse_task_id, and the raw id is in hand right here.
             metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
-                metadata, project_root=project_root,
+                metadata, project_root=project_root, task_ref=task_id,
             )
         # Third pre-connection floor, and the last one: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
