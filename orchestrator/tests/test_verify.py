@@ -3753,39 +3753,39 @@ class TestPruneArchive:
         assert not older.exists(), 'Oldest .json file should be deleted to satisfy cap'
         assert newer.exists(), 'Newer .json file should remain'
 
-    # (f) *.xml junit reports share the same retention as the logs beside them
-    def test_old_junit_xml_deleted(self, tmp_path: Path):
-        """Old *.xml junit reports are pruned by age like *.log and *.json."""
+    # (f) gzipped junit reports share the same retention as the logs beside them
+    def test_old_junit_report_deleted(self, tmp_path: Path):
+        """Old junit .xml.gz reports are pruned by age like *.log and *.json."""
         import os
         import time
         archive_root = tmp_path / 'archive'
         archive_root.mkdir()
-        old_xml = archive_root / 'attempt-1.junit-20260101T000000_000000Z.xml'
-        old_xml.write_text('<testsuites/>')
+        old_report = archive_root / 'attempt-1.junit-20260101T000000_000000Z.xml.gz'
+        old_report.write_bytes(b'\x1f\x8b')
         old_mtime = time.time() - 31 * 86_400
-        os.utime(old_xml, (old_mtime, old_mtime))
+        os.utime(old_report, (old_mtime, old_mtime))
         self._prune(archive_root, max_age_days=30)
-        assert not old_xml.exists(), (
-            'Old junit .xml must be pruned — junit is retained on GREEN runs too, '
-            'so this budget is the only thing bounding it'
+        assert not old_report.exists(), (
+            'Old junit report must be pruned — junit is retained on GREEN runs '
+            'too, so this budget is the only thing bounding it'
         )
 
-    def test_junit_xml_counted_toward_size_budget(self, tmp_path: Path):
-        """*.xml files count toward the size budget and are evicted oldest-first."""
+    def test_junit_report_counted_toward_size_budget(self, tmp_path: Path):
+        """Junit reports count toward the size budget and are evicted oldest-first."""
         import os
         import time
         archive_root = tmp_path / 'archive'
         archive_root.mkdir()
         t = time.time() - 60
-        older = archive_root / 'attempt-1.junit-old.xml'
-        newer = archive_root / 'attempt-2.junit-new.xml'
-        older.write_text('x' * 60)
-        newer.write_text('x' * 60)
+        older = archive_root / 'attempt-1.junit-old.xml.gz'
+        newer = archive_root / 'attempt-2.junit-new.xml.gz'
+        older.write_bytes(b'x' * 60)
+        newer.write_bytes(b'x' * 60)
         os.utime(older, (t, t))
         os.utime(newer, (t + 10, t + 10))
         self._prune(archive_root, max_age_days=365, max_total_bytes=100)
-        assert not older.exists(), 'Oldest .xml file should be deleted to satisfy cap'
-        assert newer.exists(), 'Newer .xml file should remain'
+        assert not older.exists(), 'Oldest junit report should be deleted to satisfy cap'
+        assert newer.exists(), 'Newer junit report should remain'
 
 
 @pytest.mark.asyncio
@@ -3923,15 +3923,16 @@ class TestJunitReportRetention:
     async def test_junit_archived_whether_the_leg_passed_or_failed(
         self, tmp_path: Path, rc: int,
     ):
+        import gzip
         archive_root = await self._run(tmp_path, rc=rc)
         archived = list((archive_root / self._TASK_ID).glob(
-            f'attempt-{self._ATTEMPT_ID}.pkg.junit-*.xml',
+            f'attempt-{self._ATTEMPT_ID}.pkg.junit-*.xml.gz',
         ))
         assert len(archived) == 1, (
             f'expected the junit report archived for rc={rc}; got {archived}'
         )
-        assert '<testsuite' in archived[0].read_text(), (
-            'the archived copy must be the report itself, not an empty husk'
+        assert '<testsuite' in gzip.decompress(archived[0].read_bytes()).decode(), (
+            'the archived copy must read back as the report itself, not a husk'
         )
 
     async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):
@@ -3959,7 +3960,7 @@ class TestJunitReportRetention:
                 archive_root=archive_root,
             )
 
-        assert not list(archive_root.rglob('*.xml')), (
+        assert not list(archive_root.rglob('*.junit-*')), (
             'no junit report was written, so none may be archived'
         )
 

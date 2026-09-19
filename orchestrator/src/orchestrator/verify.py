@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
+import gzip
 import hashlib
 import json
 import logging
@@ -2006,47 +2007,57 @@ def _archive_attempt_log(
     return archived
 
 
-def _archive_attempt_artifact(
-    src: Path,
+def _archive_junit_report(
+    junit_path: Path,
     archive_root: 'Path | None',
     task_id: 'str | None',
     attempt_id: int,
-    kind: str,
     *,
     module_prefix: 'str | None' = None,
 ) -> 'Path | None':
-    """Copy one finished-attempt artefact into the durable archive, GREEN OR RED.
+    """Gzip one leg's junit report into the durable archive, GREEN OR RED.
 
-    Target: ``<archive_root>/<task_id>/attempt-{N}[.{safe_prefix}].{kind}-<utc_ts><suffix>``
+    Target: ``<archive_root>/<task_id>/attempt-{N}[.{safe_prefix}].junit-<utc_ts>.xml.gz``
     — the filename grammar ``_archive_merge_verify_logs`` already writes, so
     one prune policy and one naming convention cover every file in the tree.
 
     Deliberately NOT gated on ``_should_archive_category`` the way
-    ``_archive_attempt_log`` is, and not on ``passed`` the way the merge-path
-    log archival is.  Those gates keep FAILURE triage material bounded; this
-    artefact answers "what did this leg cost", a question a red-only corpus
-    cannot answer at all — it is the sample that made two studies read
-    red-conditioned numbers as the population.
+    ``_archive_attempt_log`` is, nor on ``passed`` the way the merge-path log
+    archival is.  Those gates bound FAILURE triage material; this report is
+    the only per-test COST record the factory produces, and a red-only cost
+    corpus describes a different population from the one being measured.
 
-    A *src* that does not exist is a normal, expected outcome (the junit
-    report is only written when something actually injected ``--junitxml``),
-    so it returns ``None`` quietly rather than warning.  Every other failure
-    warns and returns ``None``: observability may never fail a verify.
+    COMPRESSED because retaining the greens is what makes the volume bite.
+    Measured: a breadth=full merge-verify writes ~6MB of junit across its
+    modules, and main takes ~12 merges/day — ~78MB/day against the archive's
+    500MB size cap, which evicts OLDEST-FIRST across every suffix.  Storing
+    these raw would therefore have cut the whole archive's effective
+    retention from the 30-day age rule to under a week, silently evicting
+    the failure logs it exists for.  Gzip keeps the policy untouched and the
+    age rule governing, which is the cheaper of the two ways to stay inside
+    it (the other being a bigger disk budget for a study artefact).
+
+    A *junit_path* that does not exist is normal and expected — the report is
+    written only when something actually injected ``--junitxml`` — so that
+    returns ``None`` quietly.  Every other failure warns and returns ``None``:
+    observability may never fail a verify.
     """
-    if archive_root is None or task_id is None or not src.is_file():
+    if archive_root is None or task_id is None or not junit_path.is_file():
         return None
     target_dir = archive_root / task_id
     utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
     dest = (
         target_dir
-        / f'attempt-{attempt_id}{_make_infix(module_prefix)}.{kind}-{utc_ts}{src.suffix}'
+        / f'attempt-{attempt_id}{_make_infix(module_prefix)}.junit-{utc_ts}.xml.gz'
     )
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        with junit_path.open('rb') as report, gzip.open(dest, 'wb') as archived:
+            shutil.copyfileobj(report, archived)
     except OSError as exc:
         logger.warning(
-            '_archive_attempt_artifact: could not copy %s → %s: %s', src, dest, exc,
+            '_archive_junit_report: could not archive %s → %s: %s',
+            junit_path, dest, exc,
         )
         return None
     return dest
@@ -2243,13 +2254,14 @@ def _prune_archive(
     cutoff = now - max_age_days * 86_400
 
     # Single rglob walk — collect all archivable files once, avoiding a second
-    # directory scan for the size-cap pass.  *.log, *.json and *.xml are all
-    # counted because _archive_merge_verify_logs emits summary.json and
-    # _archive_attempt_artifact emits junit .xml reports into the same tree, and
-    # an uncounted suffix accumulates unbounded (never counted toward the size
-    # budget, never pruned).  The junit reports are retained on GREEN runs too,
-    # so this budget is the only thing bounding them.
-    _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.xml'))
+    # directory scan for the size-cap pass.  Every suffix this tree is written
+    # with must appear here: *.log from the per-leg logs, *.json because
+    # _archive_merge_verify_logs emits summary.json beside them, and *.gz
+    # because _archive_junit_report stores gzipped junit reports here.  An
+    # uncounted suffix accumulates unbounded — never counted toward the size
+    # budget, never pruned — and the junit reports are retained on GREEN runs
+    # too, so this is the only thing bounding them.
+    _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.gz'))
     all_entries: list[tuple[Path, float, int]] = []
     for path in archive_root.rglob('*'):
         if path.suffix not in _PRUNE_SUFFIXES:
@@ -6316,8 +6328,8 @@ async def run_verification(
         # passed or failed: the merge-path LOG archival above is gated on
         # `not passed`, and a cost corpus that holds only the red runs
         # describes a different population from the one being measured.
-        _archive_attempt_artifact(
-            junit_path, archive_root, task_id, attempt_id or 1, 'junit',
+        _archive_junit_report(
+            junit_path, archive_root, task_id, attempt_id or 1,
             module_prefix=module_prefix,
         )
 
