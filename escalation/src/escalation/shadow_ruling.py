@@ -322,6 +322,23 @@ class AgreementReport:
         return next((c for c in self.classes if c.ruling_class == ruling_class), None)
 
 
+def _as_aware(parsed: datetime) -> datetime:
+    """Read a naive datetime as UTC; leave an offset-bearing one alone.
+
+    THE single rule normalising both sides of the window comparison — the
+    record's ``resolved_at`` and the operator's ``--since``/``--until``. Two
+    copies that merely happened to agree is how the naive-argument
+    ``TypeError`` got in: ``_resolved_at`` coerced and the CLI did not, so a
+    perfectly valid ``--since 2026-09-01`` crashed the sweep on the first
+    stamped record it reached.
+
+    UTC rather than local time because every instant this module compares is
+    written as UTC by ``escalation/src/escalation/queue.py::resolve``, so an
+    unqualified operator argument means UTC too.
+    """
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _resolved_at(record: Escalation) -> datetime | None:
     """*record*'s resolution instant as an aware datetime, or ``None``.
 
@@ -336,7 +353,7 @@ def _resolved_at(record: Escalation) -> datetime | None:
     except ValueError:
         logger.warning('unparsable resolved_at %r on %s', record.resolved_at, record.id)
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return _as_aware(parsed)
 
 
 def agreement_report(
@@ -511,6 +528,30 @@ def _as_table(report: AgreementReport) -> str:
     return '\n'.join(lines)
 
 
+class _BadWindowArg(ValueError):
+    """An unparsable ``--since``/``--until``, carrying the flag that carried it.
+
+    Raised rather than exiting so the failure reaches ``main``'s own exit path
+    beside the ``--queue-dir`` branch: this module's CLI discipline is to print
+    to stderr and RETURN 2, which an argparse ``type=`` callback would break by
+    raising ``SystemExit`` from inside ``parse_args``.
+    """
+
+
+def _parse_window_arg(value: str, flag: str) -> datetime:
+    """Parse one window bound, naming the flag AND the value when it is junk.
+
+    Naming both matters: an operator who typed ``--since yesterday`` needs to
+    see which argument the parser rejected, not a bare isoformat complaint.
+    """
+    try:
+        return _as_aware(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise _BadWindowArg(
+            f'{flag} is not an ISO-8601 datetime: {value!r} ({exc})'
+        ) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: ``python -m escalation.shadow_ruling``.
 
@@ -534,11 +575,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         '--since', default=None,
-        help='ISO-8601 window start on resolved_at (default: 7 days ago).',
+        help='ISO-8601 window start on resolved_at, naive values read as UTC '
+             '(default: 7 days ago).',
     )
     parser.add_argument(
         '--until', default=None,
-        help='ISO-8601 window end on resolved_at (default: now).',
+        help='ISO-8601 window end on resolved_at, naive values read as UTC '
+             '(default: now).',
     )
     parser.add_argument(
         '--json', action='store_true', default=False,
@@ -553,8 +596,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     now = datetime.now(UTC)
-    until = datetime.fromisoformat(args.until) if args.until else now
-    since = datetime.fromisoformat(args.since) if args.since else until - _DEFAULT_WINDOW
+    try:
+        until = _parse_window_arg(args.until, '--until') if args.until else now
+        since = (
+            _parse_window_arg(args.since, '--since') if args.since
+            else until - _DEFAULT_WINDOW
+        )
+    except _BadWindowArg as bad:
+        print(bad, file=sys.stderr)
+        return 2
 
     report = agreement_report(args.queue_dir, since=since, until=until)
     print(_as_json(report) if args.json else _as_table(report))
