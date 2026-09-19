@@ -59,6 +59,7 @@ from orchestrator.verify_cmd import (
     split_top_level_and,
     strip_cwd,
     with_junitxml,
+    with_pytest_timeout,
 )
 
 #: Resolved once, absolutely — bash is a hard dependency of the code under
@@ -1581,6 +1582,13 @@ class TestSeparateTokenValueFlagBinding:
             ('--dist', 'loadgroup'),
             ('--numprocesses', '4'),
             ('--maxprocesses', '4'),
+            # The two flags THIS MODULE ITSELF emits (task 5580).
+            # ``with_pytest_timeout`` appends ``--timeout <secs>`` and
+            # ``with_junitxml`` appends ``--junitxml <path>``, and neither was
+            # bound — so a command carrying one, re-parsed at the next rewrite
+            # site, stranded the flag and admitted its value as a TEST TARGET.
+            ('--timeout', '300'),
+            ('--junitxml', '/tmp/j.xml'),
         ],
     )
     def test_value_flag_binds_to_following_token_at_parse_time(self, flag, value):
@@ -1649,6 +1657,53 @@ class TestSeparateTokenValueFlagBinding:
             f'{value!r} is {flag}\'s value, not a test target, but it was '
             f'admitted as one: targets={cmd.targets}'
         )
+
+    def test_self_emitted_value_flag_pair_survives_the_next_rewrite(self):
+        """The same defect, but for the two flags this module ITSELF emits.
+
+        The sibling above reproduces it for a flag an OPERATOR wrote into a
+        config. This one needs no config at all: it replays the merge gate's
+        own production sequence, where every token comes from this module.
+        ``confirm_isolated_rerun_verdict`` builds the isolated re-run as a
+        STRING (scope -> serial -> ``--timeout``), and ``run_verification``
+        then RE-PARSES that string to append ``--junitxml`` (role ``merge``
+        with ``merge_verify_breadth`` ``full``). So ``with_pytest_timeout``'s
+        own output is fed straight back through the parser — and
+        ``_PYTEST_VALUE_FLAGS`` bound neither flag.
+
+        MEASURED on this tree before task 5580 (the exact argv the merge gate
+        ran, 350 times)::
+
+            pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
+            pytest: error: argument --timeout: expected one argument   (rc=4)
+
+        ``300`` is not a test target and ``<path>`` is not the timeout.
+        """
+        node_id = 'orchestrator/tests/test_x.py::test_y'
+        scoped = with_pytest_timeout(
+            serial_pytest(
+                scope_to(
+                    parse_config_command('uv run --project orchestrator pytest'),
+                    [node_id],
+                ),
+            ),
+            300,
+        )
+        reparsed = parse_config_command(render(scoped))
+        rendered = render(with_junitxml(reparsed, '/tmp/j.xml'))
+        tokens = shlex.split(rendered)
+
+        assert tokens[tokens.index('--timeout') + 1] == '300', (
+            f'--timeout lost its value to the --junitxml append in '
+            f'{rendered!r}; this module emits --timeout but does not bind '
+            f'it, so 300 was re-parsed as a test target.'
+        )
+        assert tokens[tokens.index('--junitxml') + 1] == '/tmp/j.xml'
+        assert '300' not in reparsed.targets, (
+            f"300 is --timeout's value, not a test target, but it was "
+            f'admitted as one: targets={reparsed.targets}'
+        )
+        assert reparsed.targets == (node_id,)
 
     def test_serial_pytest_does_not_split_bound_value_flag(self):
         """Acceptance regression: serial_pytest's appended `-p no:xdist -o
