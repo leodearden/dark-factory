@@ -216,12 +216,20 @@ class FakeClock:
     keeping every requested sleep in ``sleeps``.
 
     ``wait_for_any`` is the lane's poll cadence, and it charges ``mono``
-    the FULL requested timeout while really waiting only ``_WAIT_CAP_SECS``.
+    the FULL requested timeout while really waiting only ``wait_cap``.
     So a loop that polls on this clock and measures its budget off
     ``monotonic()`` -- the in-flight verify abort-poll is the one that does
     -- reaches that budget in a bounded number of polls with no real time
     elapsed, and the task being polled still gets real timer slack to
     finish in. Every requested timeout lands in ``waits``.
+
+    That slack is finite and DERIVED, so it is worth stating: a polled task
+    gets ``budget / poll * wait_cap`` seconds of real time before the loop
+    exhausts its budget and calls the task dead -- 0.2s at the settings
+    test_merge_queue_lifecycle_registry.py uses (budget 0.2, poll 0.02). A
+    test whose fake verify genuinely needs longer -- an awaited subprocess,
+    a git operation, a loaded host -- raises ``wait_cap`` rather than
+    false-aborting a healthy verify.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -239,8 +247,6 @@ class FakeClock:
     ``content_probes``, the way ``sleeps`` keeps every requested sleep.
     """
 
-    _WAIT_CAP_SECS = 0.02
-
     def __init__(
         self,
         *,
@@ -248,12 +254,14 @@ class FakeClock:
         tick: float = 0.0,
         content_mtime: float | None = None,
         content_tick: float = 0.0,
+        wait_cap: float = 0.02,
     ) -> None:
         self.time = time
         self.mono = time
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
+        self.wait_cap = wait_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
@@ -285,7 +293,7 @@ class FakeClock:
         # ready queue without letting any timer fire, which starves whatever
         # is being polled. The cap is what makes the fake -- not the wall
         # clock -- own the cadence of a production-sized poll.
-        done, _ = await asyncio.wait(aws, timeout=min(timeout, self._WAIT_CAP_SECS))
+        done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
 
