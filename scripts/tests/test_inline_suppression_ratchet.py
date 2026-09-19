@@ -45,6 +45,7 @@ state outside ``monkeypatch``.
 import os
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -496,3 +497,132 @@ def test_a_tracked_path_whose_worktree_file_is_gone_is_passed_over(tmp_path: Pat
     scan = inline_suppressions.scan_tree(tmp_path)
 
     assert [site.path for site in scan.sites] == ['kept.py']
+
+
+# ---------------------------------------------------------------------------
+# D7 — the multiset key: (kind, sorted codes, digest of the stripped line),
+# and deliberately NO path.
+
+
+def _keys(source: str, *, path: str = 'm.py') -> list:
+    return [inline_suppressions.key_for(site) for site in _sites(source, path=path)]
+
+
+def test_the_same_marker_line_in_two_files_yields_one_key():
+    """NO PATH IN THE KEY, which is what makes D7 a multiset and not a
+    per-file count."""
+    line = 'value = call()  # type: ignore[attr-defined]\n'
+
+    assert _keys(line, path='pkg/a.py') == _keys(line, path='other/deeply/nested/b.py')
+
+
+def test_renaming_and_splitting_a_file_changes_no_key(tmp_path: Path):
+    """BOUNDARY SCENARIO 4 — 40 grandfathered markers survive a rename and a
+    split, at the multiset level.
+
+    Under the per-file counts the brief originally proposed, splitting this
+    repository's 391-marker file would make every moved marker NEW and
+    regenerating the baseline the only exit — the one operation the whole
+    ratchet exists to prevent anybody performing casually.
+    """
+    del tmp_path
+    lines = [f'v{index} = call()  # type: ignore[attr-defined]' for index in range(40)]
+
+    before = Counter(_keys('\n'.join(lines) + '\n', path='big.py'))
+    after = Counter(
+        _keys('\n'.join(lines[:17]) + '\n', path='renamed/part_one.py')
+        + _keys('\n'.join(lines[17:]) + '\n', path='renamed/part_two.py')
+    )
+
+    assert before == after
+    assert sum(before.values()) == 40
+
+
+def test_editing_the_marker_line_changes_its_key():
+    """BOUNDARY SCENARIO 3 — a touch is visible, and editing only the CODE is
+    a touch.
+
+    This is D7's whole conversion mechanism: a grandfathered marker stays
+    grandfathered until somebody edits the line it sits on, at which point it
+    becomes a new key and needs a disposition.
+    """
+    original = _keys('value = call()  # type: ignore[arg-type]')
+    recoded = _keys('value = call()  # type: ignore[attr-defined]')
+    renamed = _keys('other = call()  # type: ignore[arg-type]')
+
+    assert original != recoded
+    assert original != renamed
+
+
+def test_editing_an_unrelated_line_of_the_same_statement_does_not():
+    """The stated LIMIT of "touched", rather than a hidden one.
+
+    The key digests one physical line, so a multi-line call whose marker rides
+    on the closing line is untouched by an edit to its first argument.  D7
+    records this as a cost accepted knowingly, so it belongs in a test rather
+    than in a reader's discovery.
+    """
+    before = _keys('value = call(\n    first,\n)  # type: ignore[arg-type]\n')
+    after = _keys('value = call(\n    SECOND,\n)  # type: ignore[arg-type]\n')
+
+    assert before == after
+
+
+def test_reindenting_the_marker_line_does_not_change_its_key():
+    """The digest is of the STRIPPED line — moving a statement into an ``if``
+    is not an edit to the suppression."""
+    flush = _keys('value = call()  # type: ignore[arg-type]')
+    indented = _keys('if True:\n        value = call()  # type: ignore[arg-type]\n')
+
+    assert flush == indented
+
+
+def test_codes_are_sorted_at_construction():
+    """``[b, a]`` and ``[a, b]`` are the same suppression.
+
+    Asserted on the constructor rather than on two source lines, because two
+    source lines spelling the codes in different orders differ in their DIGEST
+    too — which would make the test pass for the wrong reason.
+    """
+    digest = 'abcdef012345'
+    kind = inline_suppressions.Kind.TYPE_IGNORE
+
+    one = inline_suppressions.SuppressionKey(kind=kind, codes=('b', 'a'), digest=digest)
+    other = inline_suppressions.SuppressionKey(kind=kind, codes=('a', 'b'), digest=digest)
+
+    assert one == other
+    assert one.codes == ('a', 'b')
+
+
+def test_two_kinds_on_one_line_are_two_distinct_keys():
+    """Same digest, different kind — so a line silencing two tools owes two
+    dispositions' worth of accounting, not one."""
+    first, second = _keys('a = 1  # type: ignore[arg-type]  # noqa: E402')
+
+    assert first != second
+    assert first.digest == second.digest
+    assert {first.kind, second.kind} == {
+        inline_suppressions.Kind.TYPE_IGNORE,
+        inline_suppressions.Kind.NOQA,
+    }
+
+
+def test_a_rendered_key_is_a_string_and_the_interface_offers_no_way_back():
+    """``render()`` exists because JSON object keys are strings by the
+    format's definition; a reader that parsed one back would not.
+
+    ``shared.ratchet`` treats every key as an opaque identity token, so an
+    inverse would be exactly the ad-hoc parser of an internal value heuristic
+    12 forbids — and it would quietly make the rendering a wire format that
+    could never be changed again.  Pinned as an INTERFACE assertion: the public
+    surface of the key is its three fields and ``render``, nothing else.
+    """
+    key = inline_suppressions.key_for(_sites('a = 1  # noqa: E402')[0])
+
+    assert isinstance(key.render(), str)
+    assert {name for name in dir(key) if not name.startswith('_')} == {
+        'kind',
+        'codes',
+        'digest',
+        'render',
+    }
