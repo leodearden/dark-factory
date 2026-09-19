@@ -92,6 +92,14 @@ _SCHEMA_VERSION = 5
 # re-emits.
 _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 
+# Second dedup set, deliberately NOT shared with the one above (task 3816
+# review remediation).  A stripped forged-anchor key and a malformed blob are
+# different events with different remedies, and one shared set would let a
+# forgery warning for a task permanently swallow that task's later
+# malformed-metadata warning (and vice versa).  Same ``(project_root, tag, id)``
+# key, same growth bound, same "restart re-emits" discipline.
+_warned_machine_authored_task_ids: set[tuple[str, str, int]] = set()
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1130,6 +1138,115 @@ def stamp_pending_since(
     if usable and old_status != TaskStatus.CANCELLED:
         return None
     return json.dumps({**old, 'pending_since': now})
+
+
+# The wait-anchor keys are MACHINE-authored: ``pending_since`` is written only
+# by :func:`stamp_pending_since` at the status chokepoints, and
+# ``pending_since_backfilled`` only by the one-shot v4 -> v5 migration.  A
+# caller-supplied value for either is a forgery and is stripped at every
+# caller -> store boundary by :func:`strip_machine_authored_metadata`.
+#
+# Deliberately a SEPARATE constant from ``shared.task_metadata``'s
+# ``_BLESSED_METADATA_KEYS``, not a derived view of it (design decision 10):
+# the two sets answer different questions — blessed is "the schema recognises
+# this key on READ", machine-authored is "no caller may WRITE this key" — and
+# most blessed keys are legitimately caller-authored.  The containment
+# direction machine-authored subset-of blessed is what must hold, and is pinned
+# by a drift guard in tests/test_pending_since_anchor.py.
+_MACHINE_AUTHORED_METADATA_KEYS = frozenset({'pending_since', 'pending_since_backfilled'})
+
+
+def strip_machine_authored_metadata(
+    metadata: str | dict | None,
+    *,
+    project_root: str | None = None,
+    tag: str | None = None,
+    task_id: int | None = None,
+) -> str | dict | None:
+    """Remove :data:`_MACHINE_AUTHORED_METADATA_KEYS` from a CALLER-supplied blob.
+
+    Task 3816 review remediation (robustness/authority-bypass). The wait
+    anchor is the scheduler's input, so a caller able to write it can price
+    its own dispatch: task beta scores ``age(t) =
+    AGE_BUDGET*a/(a+AGE_HALF_SECS)`` with ``AGE_BUDGET=500`` inside
+    ``TIER_WIDTH=1000``, so a forged ancient ``pending_since`` is ~the full
+    age bonus and a permanent intra-tier queue jump — the OVER-aging PRD D4
+    excluded even for the machine's own back-fill. A forged
+    ``pending_since_backfilled`` is milder but corrupts the D4 census, which
+    exists to keep the back-filled population countable.
+
+    This is the ONE shared implementation (INV-5 ``no-lockstep-duplication``,
+    heuristic 11 SPOT): every caller -> store metadata boundary applies it —
+    ``add_task``, ``update_task``, ``set_status_and_stamp_audit``'s
+    ``audit_fields`` and ``stamp_audit_metadata``'s ``fields`` — so the
+    authority rule is uniformly enforced (heuristic 10) rather than being a
+    per-site judgement call. The two MACHINE writers are deliberately NOT
+    routed through it: ``_migrate_v4_to_v5`` legitimately writes both keys,
+    and :func:`stamp_pending_since`'s return value IS the authority.
+
+    STRIPS rather than raising, unlike the neighbouring ``done_provenance``
+    write-authority floor (design decision 9): the anchor has a benign
+    "ignore it" semantic, the sanitized sites include blob round-trips that
+    would start failing on data they merely echoed back, and every stripped
+    key is immediately re-derived by the machine on the same write. Rejecting
+    would add a failure mode where ignoring is both sufficient and safer.
+
+    Accepts ``str`` or ``dict``, mirroring the defensive precedent in
+    ``update_task``'s ``done_provenance`` floor — a caller bypassing a
+    documented ``str | None`` signature with a dict must not slip past the
+    guard. Returns the input object UNCHANGED (same object, same bytes) when
+    nothing was stripped, so the overwhelming majority of writes are
+    byte-identical to a pre-remediation write; otherwise returns the same
+    TYPE it was given. Never raises and never clobbers: an unparseable or
+    non-dict blob is returned untouched — it carries no forged key by
+    construction, and the fail-safe contract says a corrupt row must stay
+    movable.
+
+    Emits ONE deduped WARNING per ``(project_root, tag, task_id)`` triple
+    when a key is actually stripped, restoring the observability the Tier-A
+    blessing removed: before step 2 a forged key minted an
+    ``unknown_key`` census line, and blessing it made the forgery silent.
+    The ``task_metadata.machine_authored_key_stripped`` token is deliberately
+    distinct from both the write-boundary schema census
+    (``task_metadata.schema_warning``) and the read-path malformed-blob
+    census (``'malformed metadata'``) so the three never conflate — see
+    :func:`_emit_schema_warning`'s docstring on why the tokens are kept
+    separate. The optional triple only routes the dedup, matching
+    :func:`stamp_pending_since`'s and :func:`_merge_metadata`'s convention.
+    """
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        parsed: Any = metadata
+    else:
+        try:
+            parsed = json.loads(metadata)
+        except (TypeError, ValueError):
+            return metadata
+    if not isinstance(parsed, dict):
+        return metadata
+
+    forged = sorted(_MACHINE_AUTHORED_METADATA_KEYS & parsed.keys())
+    if not forged:
+        return metadata
+
+    message = (
+        'task_metadata.machine_authored_key_stripped task_id=%s tag=%s'
+        ' project_root=%s keys=%s — these keys are written only by the'
+        ' status chokepoints and the v4->v5 back-fill; a caller-supplied'
+        ' value is ignored'
+    )
+    args = (task_id, tag, project_root, forged)
+    dedup_key = (project_root, tag, task_id)
+    if project_root is not None and tag is not None and task_id is not None:
+        if dedup_key not in _warned_machine_authored_task_ids:
+            _warned_machine_authored_task_ids.add(dedup_key)  # type: ignore[arg-type]
+            logger.warning(message, *args)
+    else:
+        logger.warning(message, *args)
+
+    cleaned = {k: v for k, v in parsed.items() if k not in _MACHINE_AUTHORED_METADATA_KEYS}
+    return cleaned if isinstance(metadata, dict) else json.dumps(cleaned)
 
 
 def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
@@ -2793,7 +2910,20 @@ class SqliteTaskBackend:
                 # one-shot v4->v5 back-fill establishes for the legacy
                 # population, rather than two `_now()` calls a millisecond
                 # apart. `candidate_key` above stays on the pre-stamp value: it
-                # keys off title + metadata['files'] only.
+                # keys off title + metadata['files'] only — neither stripped
+                # key participates, so the strip below cannot move it.
+                #
+                # Write-authority floor for the anchor, applied to EVERY
+                # status and not only `pending`: a `deferred` insert is the
+                # planning_mode shape, and a forged key left on it would be
+                # honoured later by the `deferred -> pending` commit (the
+                # helper would then see the key as already present). The
+                # strip is also what makes the helper see "key absent" and
+                # stamp the hoisted `now` unconditionally on an insert, which
+                # is why the helper needs no `force=` parameter (D9).
+                metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
+                    metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
                 now = _now()
                 stamped = stamp_pending_since(
                     metadata, old_status=None, new_status=status, now=now,
