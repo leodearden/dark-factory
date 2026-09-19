@@ -128,6 +128,12 @@ _DEEP_LANDING_MODULE = 'test_merge_queue_deep_landing.py'
 #: at :meth:`TestDeepLandingModuleMarkers.test_the_census_is_not_vacuous`.
 _DEEP_LANDING_MARKER_SITES = 9
 
+#: The ONE module-level fixture those nine classes opt into to have their git
+#: spawns counted against DEEP_LANDING_SCENE_SPAWN_BUDGET.  Non-autouse by
+#: design -- the two classes in that module measured at ZERO spawns would hit
+#: the verdict's blind-seam branch and fail by construction.
+_SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
+
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
 #: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
@@ -440,6 +446,28 @@ def _autouse_fixtures(node: ast.ClassDef) -> tuple[ast.FunctionDef | ast.AsyncFu
             )
             for decorator in statement.decorator_list
         )
+    )
+
+
+def _usefixtures_names(node: ast.ClassDef) -> frozenset[str]:
+    """Fixture names *node*'s own ``@pytest.mark.usefixtures(...)`` marks request.
+
+    Its OWN decorator list only, never a walk and never a base class, for the
+    same reason :func:`_autouse_fixtures` reads only the class body: a mark
+    that reached the class from somewhere else covers a different set of
+    tests, and a pin that accepted one would pass while the class it names
+    went unguarded.
+
+    Only STRING-literal arguments are collected.  ``usefixtures`` takes
+    nothing else, so anything dynamic here is unresolvable rather than a
+    fixture this census may claim.
+    """
+    return frozenset(
+        argument.value
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call) and _marker_name(decorator) == 'usefixtures'
+        for argument in decorator.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     )
 
 
@@ -1625,6 +1653,100 @@ class TestDeepLandingModuleMarkers:
             'spawn count first and re-derive DEEP_LANDING_SCENE_SPAWN_BUDGET '
             'and DEEP_LANDING_SCENE_TEST_TIMEOUT if it is heavier than the '
             'worst already covered, then raise this count in the same commit.'
+        )
+
+    def test_every_widened_class_is_paired_with_its_spawn_budget(self) -> None:
+        """The marker and the budget it was sized from must travel together.
+
+        A marker sized against a budget decays the moment the budget stops
+        being checked, and that decay is MEASURED rather than feared: task
+        5333 watched Row 7's counts move 231/110/110 -> 234/113/113 in a
+        single day, in an unrelated lane, with nothing in the tree reporting
+        it.
+
+        BOTH DIRECTIONS, and neither is redundant.  A marked-but-unbudgeted
+        class is a number that goes stale in silence.  A budgeted-but-unmarked
+        class is the mirror: a budget enforcing a ceiling that nothing is
+        sized to, which reads as coverage while protecting a class still on
+        the ambient default.
+
+        ENFORCEMENT and not mention for the fixture itself -- it must CALL the
+        verdict and an ``assert`` must read the result (see
+        :func:`_assert_enforced_call_names`).  A fixture that computed the
+        verdict and dropped the assert would satisfy a bare name walk while
+        guarding nothing, which is a pin weaker than the claim it carries.
+
+        The two classes measured at ZERO git spawns are correctly outside both
+        halves: the verdict's blind-seam branch would fail them by
+        construction, which is that branch working as designed and exactly why
+        the fixture is not autouse at module scope.
+        """
+        path = _TESTS_DIR / _DEEP_LANDING_MODULE
+        tree = _parse(path.read_text(encoding='utf-8'))
+        assert tree is not None, f'{_DEEP_LANDING_MODULE} did not parse'
+
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        marked = {
+            node.name
+            for node in classes
+            if any(
+                site.spelling == 'DEEP_LANDING_SCENE_TEST_TIMEOUT'
+                for site in _timeout_sites_in(node.decorator_list, node.name, 'class-decorator')
+            )
+        }
+        budgeted = {
+            node.name
+            for node in classes
+            if _SPAWN_BUDGET_FIXTURE in _usefixtures_names(node)
+        }
+
+        assert not marked - budgeted, (
+            f'{len(marked - budgeted)} class(es) in {_DEEP_LANDING_MODULE} '
+            'carry @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT) but '
+            f"do not request the '{_SPAWN_BUDGET_FIXTURE}' fixture, so the "
+            'budget that marker was DERIVED from is not enforced on them and '
+            'the number decays the next time the scene grows -- silently, and '
+            'reported as an unattributed xdist worker crash on someone '
+            "else's branch. Add @pytest.mark.usefixtures("
+            f"'{_SPAWN_BUDGET_FIXTURE}'). The coupling and the measured decay "
+            'behind it are argued at _orch_helpers.py::'
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT.\n  '
+            + '\n  '.join(sorted(marked - budgeted))
+        )
+        assert not budgeted - marked, (
+            f'{len(budgeted - marked)} class(es) in {_DEEP_LANDING_MODULE} '
+            f"request the '{_SPAWN_BUDGET_FIXTURE}' fixture but carry no "
+            '@pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT), so a '
+            'budget is enforcing a ceiling nothing is sized to -- the class '
+            'still runs at the ambient default while reading as covered. '
+            'Either add the marker or drop the fixture; the pair is the whole '
+            'mechanism, and _orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT '
+            'says why.\n  '
+            + '\n  '.join(sorted(budgeted - marked))
+        )
+
+        fixture = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == _SPAWN_BUDGET_FIXTURE
+            ),
+            None,
+        )
+        assert fixture is not None, (
+            f'{_DEEP_LANDING_MODULE} defines no module-level '
+            f"'{_SPAWN_BUDGET_FIXTURE}' fixture, so the usefixtures marks "
+            'above request something that does not exist. One definition '
+            'serves all nine classes; nine copies in nine class bodies would '
+            'be the SPOT violation this shape exists to avoid.'
+        )
+        assert 'spawn_budget_violation' in _assert_enforced_call_names(fixture), (
+            f"{_DEEP_LANDING_MODULE}'s '{_SPAWN_BUDGET_FIXTURE}' does not "
+            'CALL spawn_budget_violation with the result reaching an assert. '
+            'Computing a verdict and dropping it enforces nothing while still '
+            'mentioning the name, which is why this pin reads enforcement '
+            'rather than mention.'
         )
 
 
