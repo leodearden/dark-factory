@@ -198,10 +198,14 @@ class TaskFamilyCensus:
         class for the two ways it happens.
 
         The per-family probe is a second read per fragmented family rather than
-        one join, because edge counts are what turn a count into a decision and
-        ``enumerate_entity_nodes`` does not return them. That cost scales with
-        the residue, not with the graph, so it stays proportionate while the
-        residue is small.
+        one widened enumeration. ``enumerate_entity_nodes`` returns
+        uuid/name/summary and is also consumed by ``list_entity_nodes``,
+        ``detect_stale_with_edges`` and ``rebuild_entity_summaries``; adding an
+        edge count to serve this one new reader would change a hot, shared row
+        shape for every one of them. The probe instead reuses the query the
+        write-path normalizer already depends on, so a regression in it shows up
+        in both, and its cost scales with the residue rather than with the
+        graph.
 
         Args:
             group_id: Project graph to census.
