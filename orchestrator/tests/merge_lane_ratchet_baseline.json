@@ -1488,7 +1488,7 @@
     "orchestrator/tests/test_rebase_branch_reset_guard.py": {"patch_targets": [], "private_reads": 10},
     "orchestrator/tests/test_rebase_verify_cost.py": {"patch_targets": [], "private_reads": 9},
     "orchestrator/tests/test_reconcile_done_step_commits.py": {"patch_targets": [], "private_reads": 25},
-    "orchestrator/tests/test_reconcile_stranded.py": {"patch_targets": [], "private_reads": 186},
+    "orchestrator/tests/test_reconcile_stranded.py": {"patch_targets": [], "private_reads": 185},
     "orchestrator/tests/test_recover_main_cli.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_recovery_emission_wiring.py": {"patch_targets": [], "private_reads": 74},
     "orchestrator/tests/test_remove_merge_worktree_guarded.py": {"patch_targets": [], "private_reads": 0},
