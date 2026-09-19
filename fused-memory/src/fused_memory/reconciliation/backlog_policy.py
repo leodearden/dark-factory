@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
+from shared.safe_io import atomic_write_text
+
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -551,9 +553,12 @@ class BacklogPolicy:
                 stripped = {k: v for k, v in updates.items() if record.get(k) != v}
                 if stripped:
                     record.update(stripped)
-                    tmp = path.with_name(f'{path.name}.tmp')
-                    tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
-                    tmp.replace(path)
+                    # The shared writer, not a hand-rolled tmp+rename: its temp
+                    # name carries a uuid4, so this write cannot collide with a
+                    # concurrent writer to the same record the way a fixed
+                    # `<name>.json.tmp` sibling could. tests/scripts/
+                    # test_atomic_write_regrowth.py enforces the choice.
+                    atomic_write_text(path, json.dumps(record, indent=2))
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning(
                 'backlog_policy: could not merge %s onto record %s: %s',

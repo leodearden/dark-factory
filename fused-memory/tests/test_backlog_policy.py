@@ -15,6 +15,7 @@ import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.reconciliation import backlog_policy
 from fused_memory.reconciliation.backlog_policy import (
     _POLICY_ONLY_KEYS,
     BacklogPolicy,
@@ -1600,17 +1601,15 @@ class TestDegradedFilingPaths:
         first = await policy.check('proj', project_root=str(project_root))
         assert first.escalation_path is not None
 
-        # Fail only _merge_onto_persisted's write: it is the one writer here
-        # using Path.write_text on a '<id>.json.tmp' sibling, while the queue
-        # writes through tempfile.mkstemp + os.fdopen.
-        real_write_text = Path.write_text
+        # Fail only _merge_onto_persisted's write, by patching the name IT
+        # calls: the policy module's own ``atomic_write_text`` binding. The
+        # queue reaches its writer by a different route, so nothing else in
+        # this tick is affected — which a patch of a shared primitive like
+        # Path.write_text could not promise.
+        def failing_write(*_args, **_kwargs):
+            raise OSError('no space left on device')
 
-        def failing_write_text(self, *args, **kwargs):
-            if self.name.endswith('.json.tmp'):
-                raise OSError('no space left on device')
-            return real_write_text(self, *args, **kwargs)
-
-        monkeypatch.setattr(Path, 'write_text', failing_write_text)
+        monkeypatch.setattr(backlog_policy, 'atomic_write_text', failing_write)
 
         # A changed condition, so the merge has something to write.
         await _seed_buffered(event_buffer, 'proj', n=18)
