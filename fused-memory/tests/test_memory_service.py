@@ -4835,12 +4835,12 @@ class TestNormalizeTaskNodeNames:
     digits replaces both.
 
     Survivor policy is now ONE rule: the family's first member under the
-    backend's survivor-first ordering survives, is renamed onto the canonical
-    name if it is not already canonically named, and every other member is
-    merged into it. The old "a canonically-named node wins regardless of edge
-    count" special case is gone — it existed to avoid recreating the exact-name
-    duplicate _dedup_episode_nodes resolves, a hazard family-keying removes
-    outright since the whole family is collapsed in one pass.
+    backend's survivor-first ordering survives, every other member is merged
+    into it, and it is renamed onto the canonical name last. The old "a
+    canonically-named node wins regardless of edge count" special case is gone
+    — it existed to avoid recreating the exact-name duplicate
+    _dedup_episode_nodes resolves, and what rules that duplicate out now is the
+    merge-before-rename ORDER rather than family-keying on its own.
     """
 
     @pytest.mark.asyncio
@@ -4877,6 +4877,58 @@ class TestNormalizeTaskNodeNames:
             (('u-canon', 'u-lower'), {'group_id': 'test'}),
             (('u-plural', 'u-lower'), {'group_id': 'test'}),
         ]
+
+    @pytest.mark.asyncio
+    async def test_the_family_is_merged_before_the_survivor_is_renamed(self, service):
+        """The order is the guarantee, and it is only observable as an order.
+
+        _FAMILY_605 holds both a high-edge non-canonical survivor and an
+        already-canonically-named member, so renaming the survivor FIRST would
+        leave two nodes named 'Task 605' until the merge landed. The pass is
+        best-effort by design — a merge failing in that window would leave the
+        exact-name pair behind permanently, and _dedup_episode_nodes has
+        already run by then (see the call-order tests below), so nothing later
+        in the chain collapses it.
+
+        Both calls are recorded on one parent mock because each mock knows only
+        its own await list; the interleaving is exactly what is under test.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+        recorder = MagicMock()
+        recorder.attach_mock(service.graphiti.merge_entities, 'merge')
+        recorder.attach_mock(service.graphiti.rename_entity_node, 'rename')
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
+        await service._normalize_task_node_names(result, group_id='test')
+
+        assert [name for name, _, _ in recorder.mock_calls] == [
+            'merge', 'merge', 'rename',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_merge_leaves_no_exact_name_duplicate_behind(self, service):
+        """The failure this ordering exists for, exercised end to end.
+
+        The merge of the canonically-named member raises, so the family stays
+        split — that much is unavoidable on a best-effort path. What must NOT
+        happen is the survivor arriving at 'Task 605' alongside the member that
+        already carries that name: the graph would then hold an exact-name pair
+        with no later pass in this chain to resolve it.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+        service.graphiti.merge_entities = AsyncMock(
+            side_effect=RuntimeError('write timeout'),
+        )
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.rename_entity_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_already_canonical_arrival_now_probes_and_collapses(self, service):
@@ -5065,7 +5117,13 @@ class TestNormalizeTaskNodeNames:
     ):
         """Best-effort, unchanged by the rewrite: this runs AFTER the episode is
         already committed, so a transient backend error must neither propagate
-        into an successful write nor abandon the families behind it."""
+        into an successful write nor abandon the families behind it.
+
+        The failing call is the 605 family's RENAME, which merge-before-rename
+        makes the last one — so that family's merges have already landed and
+        are counted. What it is left in is the benign half-repaired state the
+        ordering buys: one collapsed node still spelled 'task 605', with no
+        second node holding the canonical name."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {
@@ -5091,13 +5149,17 @@ class TestNormalizeTaskNodeNames:
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
             count = await service._normalize_task_node_names(result, group_id='test')
 
-        assert count == 2, 'Only the second family (one rename + one merge) should count'
+        assert count == 4, "605's two merges landed before its rename failed, plus 700's pair"
         service.graphiti.rename_entity_node.assert_any_await(
             'u-700-lower', 'Task 700', group_id='test',
         )
-        service.graphiti.merge_entities.assert_awaited_once_with(
+        service.graphiti.merge_entities.assert_any_await(
             'u-700-canon', 'u-700-lower', group_id='test',
         )
+        service.graphiti.merge_entities.assert_any_await(
+            'u-canon', 'u-lower', group_id='test',
+        )  # 605's canonical member was absorbed before the rename was attempted,
+        # so the failure cannot leave two nodes sharing the canonical name.
         assert [r for r in caplog.records if r.levelno >= logging.ERROR], (
             'Expected an exception log for the failed family'
         )

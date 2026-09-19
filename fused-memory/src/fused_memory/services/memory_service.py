@@ -3225,15 +3225,24 @@ class MemoryService:
 
         Survivor selection is ONE rule: the family's first member under the
         backend's survivor-first ordering (most valid edges, then oldest, then
-        uuid) survives, is renamed onto the canonical name if it is not already
-        canonically named, and every other member is merged into it. The
-        earlier two-branch policy — a canonically-named node wins regardless of
-        edge count — existed to avoid recreating the exact-name duplicate
-        ``_dedup_episode_nodes`` resolves, a hazard family-keying removes
-        outright since the whole family collapses in one pass. Where the two
-        policies differ is the tracked motivating case: with 'Task 605' holding
-        2 edges and 'task 605' holding 13, the old rule dragged 13 edges across
-        and the new one moves 2.
+        uuid) survives, every other member is merged into it, and it is renamed
+        onto the canonical name last. The earlier two-branch policy — a
+        canonically-named node wins regardless of edge count — existed to avoid
+        recreating the exact-name duplicate ``_dedup_episode_nodes`` resolves.
+        Where the two policies differ is the tracked motivating case: with
+        'Task 605' holding 2 edges and 'task 605' holding 13, the old rule
+        dragged 13 edges across and the new one moves 2.
+
+        What keeps that exact-name duplicate from reappearing is the ORDER,
+        not family-keying on its own. Renaming first would leave the
+        just-renamed survivor and the family's pre-existing canonical member
+        BOTH named 'Task N' between the two awaits, and this pass is
+        best-effort — so a merge failing there would leave that pair behind
+        permanently, with ``_dedup_episode_nodes`` already run earlier in
+        ``_reconcile_episode_identity`` and nothing later in the chain to
+        collapse it. Merging first cannot mint a same-name twin, and a failed
+        rename merely leaves one fully-collapsed node under a non-canonical
+        name, which the next episode touching that task renames.
 
         Each family is best-effort (mirrors ``_dedup_episode_nodes``): this
         runs after the episode is already committed, so a transient backend
@@ -3279,16 +3288,14 @@ class MemoryService:
                 if not members:
                     continue
                 survivor = members[0]
-                if len(members) == 1 and survivor['name'] == referent.node_name:
-                    continue
-                if survivor['name'] != referent.node_name:
-                    await self.graphiti.rename_entity_node(
-                        survivor['uuid'], referent.node_name, group_id=group_id,
-                    )
-                    fixed += 1
                 for member in members[1:]:
                     await self.graphiti.merge_entities(
                         member['uuid'], survivor['uuid'], group_id=group_id,
+                    )
+                    fixed += 1
+                if survivor['name'] != referent.node_name:
+                    await self.graphiti.rename_entity_node(
+                        survivor['uuid'], referent.node_name, group_id=group_id,
                     )
                     fixed += 1
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
