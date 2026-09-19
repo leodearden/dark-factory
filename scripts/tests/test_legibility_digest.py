@@ -29,7 +29,13 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from orchestrator.agents.briefing import (
+    MEMORY_CONTEXT_CAVEAT,
+    MEMORY_DEGRADED_STORES_NOTICE,
+    MEMORY_EMPTY_NOTICE,
+    MEMORY_OUTAGE_NOTICE,
+    MEMORY_SECTION_FAILURE_NOTICE,
+)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
@@ -1872,29 +1878,49 @@ _DROP_NOTE_EXAMPLE = (
 (``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
 f'{query_word} were tagged to another project and filtered out'``)."""
 
-_NO_RECALLED_SECTIONS_VARIANTS = (
-    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
-    (
-        '# Context\n\n_Memory unavailable — proceed with codebase '
-        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
-    ),
-    '# Context\n\n_No memory context available._',
-    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
-)
-"""The four literal shapes ``_get_memory_context`` returns when
-``recalled_sections`` is empty
-(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
-literal families (memory-unavailable / no-memory-context available), each
-with a plain and a drop_note-bearing variant. Not lockstep-importable
-like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
-``_get_memory_context``'s body, not a module-level constant."""
+_SECTION_NOTICES_EXAMPLE = '\n\n'.join((
+    MEMORY_SECTION_FAILURE_NOTICE.format(section='Task Context', reason='transport'),
+    MEMORY_DEGRADED_STORES_NOTICE.format(section='Conventions & Gotchas', stores='graphiti'),
+))
+"""Representative per-section notice text -- one broken query and one
+server-reported store outage, the two lines ``_section_notices`` emits."""
+
+
+def _no_recalled_sections_variants() -> tuple[str, ...]:
+    """Every shape ``_get_memory_context`` returns with no section recalled.
+
+    Two families -- MEMORY_OUTAGE_NOTICE (nothing worked) and
+    MEMORY_EMPTY_NOTICE (the corpus had nothing to say) -- each in three
+    shapes: plain, drop_note-bearing, and notices-bearing. The third arrived
+    with task 3659 step 20, which stopped discarding the per-section notices
+    on this path; before it, a broken dispatch rendered the empty-corpus
+    sentence verbatim.
+
+    Built by composing the PRODUCTION constants exactly as
+    ``_get_memory_context`` composes them -- family line first, notices
+    joined after it, drop_note appended last -- so a rewording of either
+    family turns this red instead of silently un-covering the marker it
+    pins. Lockstep-importable since task 3659 hoisted both families out of
+    ``_get_memory_context``'s body into module-level constants.
+    """
+    variants = []
+    for family in (MEMORY_OUTAGE_NOTICE.format(reasons='transport'), MEMORY_EMPTY_NOTICE):
+        variants.extend((
+            f'# Context\n\n{family}',
+            f'# Context\n\n{family}\n\n_Note: {_DROP_NOTE_EXAMPLE}._',
+            f'# Context\n\n{family}\n\n{_SECTION_NOTICES_EXAMPLE}',
+        ))
+    return tuple(variants)
+
+
+_NO_RECALLED_SECTIONS_VARIANTS = _no_recalled_sections_variants()
 
 
 def _recalled_sections_with_trailing_unavailable_note():
     """The recalled-sections return path's fullest composite shape
     (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
     fifth of ``_get_memory_context``'s five return paths, distinct from
-    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    the ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
     have recalled_sections EMPTY; this one has it non-empty). Builds a
     caveat carrying its own drop_note suffix (a foreign-tagged result was
     filtered from an earlier query), a genuinely recalled section, AND
@@ -2195,13 +2221,13 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize(
         'text', _NO_RECALLED_SECTIONS_VARIANTS,
         ids=[
-            'memory_unavailable', 'memory_unavailable_with_drop_note',
-            'no_memory_context', 'no_memory_context_with_drop_note',
+            'outage', 'outage_with_drop_note', 'outage_with_notices',
+            'empty', 'empty_with_drop_note', 'empty_with_notices',
         ],
     )
     def test_no_recalled_sections_variant_is_excluded(self, text):
-        # Exhaustive over _get_memory_context's four no-recalled-sections
-        # return paths, not just the caveat-bearing happy path covered
+        # Exhaustive over _get_memory_context's no-recalled-sections
+        # return shapes, not just the caveat-bearing happy path covered
         # above -- the marker set must cover every output of that
         # function, not merely its most common case.
         records = [_user_text(text)]
