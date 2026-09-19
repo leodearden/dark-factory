@@ -127,7 +127,7 @@ _MARKER_KEYWORD_RE = re.compile(r'#\s*(?:debt|ratified):')
 
 # One anchored form per INLINE_MARKER_FORMS entry, matched against the comment
 # from the keyword onward.  The trailing `$` is what rejects extra prose after
-# a disposition: `# debt: task 5601 (see also 5602)` is a note, not a marker,
+# a disposition: `debt: task 5601 (see also 5602)` is a note, not a marker,
 # and honouring its prefix would silently disposition an entry by half a
 # sentence.
 _DEBT_TASK_RE = re.compile(rf'^#\s*debt:\s*task\s+({_TASK_ID_PATTERN})\s*$')
