@@ -159,19 +159,37 @@ def _check(root: Path, baseline_path: Path, *paths: str) -> int:
 def _python_env_without_shared() -> dict[str, str]:
     """An environment in which ``import shared`` cannot resolve.
 
-    ``PYTHONPATH`` is emptied AND ``PYTHONNOUSERSITE`` is set, because the
-    scanner is meant to fail on a missing ``shared`` and not on the ambient
-    editable install that ``sys.path`` would otherwise supply.
+    ``PYTHONPATH`` is emptied and ``PYTHONNOUSERSITE`` is set — and NEITHER IS
+    SUFFICIENT, which is why :data:`_NO_SITE` exists beside this.  Measured from
+    ``/tmp`` with both applied: ``import shared`` still resolved, to
+    ``<worktree>/shared/src/shared/__init__.py``, because the workspace member is
+    installed EDITABLE and the ``.pth`` entry that does it lives in the venv's own
+    ``site-packages``, which neither knob touches.
     """
     env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
     env['PYTHONNOUSERSITE'] = '1'
     return env
 
 
-def _run_script(args: list[str], *, cwd: Path, script: Path, env: dict[str, str] | None = None):
-    """Run *script* as a real subprocess with ``sys.executable``."""
+#: The interpreter flag that actually hides an editable install: ``-S`` skips
+#: site processing altogether, so no ``.pth`` file is read.  Measured: the same
+#: subprocess is rc=0 ``RESOLVED`` without it and rc=1
+#: ``ModuleNotFoundError: No module named 'shared'`` with it.  The scanner only
+#: ever imports stdlib plus ``shared``, so nothing else is lost.
+_NO_SITE = ('-S',)
+
+
+def _run_script(
+    args: list[str],
+    *,
+    cwd: Path,
+    script: Path,
+    env: dict[str, str] | None = None,
+    flags: tuple[str, ...] = (),
+):
+    """Run *script* as a real subprocess with ``sys.executable`` and *flags*."""
     return subprocess.run(
-        [sys.executable, str(script), *args],
+        [sys.executable, *flags, str(script), *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -1980,3 +1998,38 @@ def test_two_json_runs_over_one_tree_emit_identical_bytes(tmp_path: Path, capsys
     assert report['by_kind_code'] == sorted(
         report['by_kind_code'], key=lambda row: (row['kind'], row['code'] or '')
     )
+
+
+def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
+    """The Contract's "an ImportError is 2, never 1", which only a real process
+    can prove.
+
+    Every other test here calls ``main([...])`` in-process, and none of them could
+    catch this: the fault it pins happens before ``main`` is reachable.  A
+    top-level ``from shared… import …`` raises while the module is still
+    executing, so ``main`` is never defined, the ``__main__`` block never runs,
+    and Python's own uncaught-exception exit is 1 — the exact code the Contract
+    reserves for a FINDING.  A gate that reported a broken environment as an
+    INV-12 breach would send an agent to fix code that was never the problem.
+
+    The script is copied ALONE into ``tmp_path``, so the ``<repo>/shared/src`` its
+    bootstrap resolves from ``__file__`` does not exist either, and the run gets
+    ``-S`` because the workspace member is editable-installed in the venv and
+    ``PYTHONPATH`` alone cannot hide it.  A generous subprocess ``timeout``
+    rather than any wall-clock assertion, per this module's docstring.
+    """
+    copied = tmp_path / SCRIPT.name
+    copied.write_text(SCRIPT.read_text(encoding='utf-8'), encoding='utf-8')
+
+    completed = _run_script(
+        ['--check', '--root', str(tmp_path), '--baseline', str(tmp_path / _BASELINE_NAME)],
+        cwd=tmp_path,
+        script=copied,
+        env=_python_env_without_shared(),
+        flags=_NO_SITE,
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    assert 'shared' in completed.stderr
+    assert 'uv run --project shared' in completed.stderr
+    assert 'Traceback' not in completed.stderr
