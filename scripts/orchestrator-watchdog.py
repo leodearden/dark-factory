@@ -290,10 +290,14 @@ try:
 except (KeyError, ValueError):
     FM_RESTART_MIN_INTERVAL_SECS = 28800
 
-# Fixed transient unit name for the detached fm staleness redeploy — the natural
-# overlap guard (a second tick fails to re-register the same unit name while a
-# redeploy is still running), sibling of orch-fleet-staleness-redeploy.service.
+# Fixed transient unit names for the two detached staleness redeploys — the
+# natural overlap guard (a second tick fails to re-register the same unit name
+# while a redeploy is still running). Named constants rather than literals
+# because each is now used twice per call site: once in the ``--unit=`` flag
+# and once as the name _register_transient_unit classifies the outcome for,
+# which it takes explicitly rather than re-parsing out of the flag.
 FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
+FLEET_STALENESS_REDEPLOY_UNIT = "orch-fleet-staleness-redeploy.service"
 
 
 # --- fm liveness streak + restart cap (task 3764) ---
@@ -731,6 +735,55 @@ def is_unit_enabled(unit: str) -> bool:
         log(
             f"is-enabled probe for {unit} could not complete "
             f"({type(exc).__name__}); skipping unit"
+        )
+        return False
+
+
+# systemd's own ActiveState values meaning "this unit has not finished yet".
+UNIT_IN_FLIGHT_ACTIVE_STATES = frozenset({"active", "activating", "reloading"})
+
+
+def _unit_is_active(unit: str) -> bool:
+    """Return True iff systemd reports *unit* still in flight.
+
+    The probe that separates a benign transient-unit name COLLISION from a
+    genuine registration failure (task 4131), a distinction systemd-run's exit
+    code cannot carry: MEASURED on this host, ``systemd-run --user --collect
+    --no-block --unit=X`` exits 1 for a name collision ("Unit X was already
+    loaded or has a fragment file"), 1 for an unrecognised option, and 1 for a
+    missing executable. Asking systemd directly DOES separate them — measured
+    "active" (rc=0) during a live collision, "inactive" (rc=4) for a
+    never-registered or already-collected unit.
+
+    BRANCHES ON THE STDOUT VALUE, NOT THE RETURN CODE: ``is-active`` exits 0
+    only for "active", so an rc-only test would misread a unit still
+    "activating" as not-in-flight. These are systemd's documented ActiveState
+    enum values, so this is a structured read and not an ad-hoc parse of a
+    human-readable message — matching systemd-run's "was already loaded"
+    stderr instead would be a parser over locale- and version-sensitive prose
+    that breaks silently on an upgrade.
+
+    Shape mirrors is_unit_enabled, this file's established probe idiom, but
+    the FAIL DIRECTION IS THE OPPOSITE ONE and deliberately so: a probe error
+    here returns False, which routes the caller to its LOUD branch, so a
+    registration whose outcome cannot be classified is reported as a failure
+    rather than downgraded to "benign". False means "skip this unit" for
+    is_unit_enabled and "say something" here; each is the conservative
+    direction for its own caller.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            check=False,
+            timeout=5,
+            capture_output=True,
+            text=True,
+        )
+        return (result.stdout or "").strip() in UNIT_IN_FLIGHT_ACTIVE_STATES
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log(
+            f"is-active probe for {unit} could not complete "
+            f"({type(exc).__name__}); treating the registration as failed"
         )
         return False
 
@@ -1798,6 +1851,65 @@ def fused_memory_liveness_pass() -> None:
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
 
 
+def _register_transient_unit(argv: list[str], unit: str) -> None:
+    """Run *argv* to register transient *unit*, and REPORT what happened to it.
+
+    The shared run-and-classify tail of _delegate_fleet_restart and
+    _delegate_fm_restart (task 4131). Both used to discard systemd-run's
+    CompletedProcess entirely, so the benign overlap their docstrings describe
+    — a second tick while a redeploy is still running fails to re-register the
+    same unit name and no-ops — was indistinguishable in the journal from a
+    genuine registration failure, and a persistently failing registration was
+    invisible.
+
+    THE EXIT CODE ALONE CANNOT CARRY THAT DISTINCTION (measured: systemd-run
+    exits 1 for a name collision, an unrecognised option and a missing
+    executable alike), so a non-zero exit asks _unit_is_active which case it
+    was and emits ONE of two deliberately distinguishable lines. The residual
+    TOCTOU — an in-flight unit that exits between the failed registration and
+    the probe — misclassifies a collision as a failure, i.e. logs LOUDER than
+    necessary, which is the correct direction under no-silent-fail-soft.
+
+    *unit* IS PASSED EXPLICITLY rather than recovered from argv's ``--unit=``
+    element: re-parsing a flag we just built would be exactly the
+    meaningful-string parse to avoid, and every caller already holds the
+    value.
+
+    The happy path still costs exactly ONE subprocess call — the probe runs
+    only after a non-zero exit. Its banner is relayed only when systemd-run
+    actually emitted one, since an empty capture has nothing to report;
+    relaying it at all is what keeps "Running as unit / invocation ID"
+    attributable to the watchdog's own log tag now that stderr is captured
+    rather than inherited.
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a registration
+    hiccup must not crash the Type=oneshot watchdog. Nothing here changes the
+    recovery cadence: the NEXT tick simply tries again (stateless — I6), so
+    this adds signal without adding state.
+    """
+    try:
+        result = subprocess.run(
+            argv, check=False, timeout=10, capture_output=True, text=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"systemd-run registration of {unit} failed: {exc!r}")
+        return
+
+    banner = (result.stderr or "").strip()
+    if result.returncode == 0:
+        if banner:
+            log(f"registered {unit}: {banner}")
+        return
+    if _unit_is_active(unit):
+        log(f"{unit} is already in flight; this tick's registration is a no-op")
+        return
+    log(
+        f"systemd-run registration of {unit} failed with exit "
+        f"{result.returncode}: {banner or '<no stderr captured>'}"
+    )
+
+
 def _delegate_fleet_restart() -> None:
     """Delegate a fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain.
 
@@ -1807,8 +1919,8 @@ def _delegate_fleet_restart() -> None:
     the fleet restart was triggered by this backstop or by the event-driven
     coordinator / an operator.
 
-    - ``--unit=orch-fleet-staleness-redeploy.service`` is a FIXED transient
-      unit name — the natural overlap guard. A second staleness_pass tick
+    - ``--unit=orch-fleet-staleness-redeploy.service``
+      (FLEET_STALENESS_REDEPLOY_UNIT) is a FIXED transient unit name — the natural overlap guard. A second staleness_pass tick
       while a redeploy is still running fails to re-register the same unit
       name (systemd-run exits non-zero) and no-ops, so this stateless
       oneshot needs no cross-tick bookkeeping to avoid piling up concurrent
@@ -1825,27 +1937,25 @@ def _delegate_fleet_restart() -> None:
       initiated fleet restart drains + stamps identically to an operator- or
       coordinator-driven ``restart-all-orchestrators.sh --drain``.
 
-    Fail-soft: a missing systemd-run binary, a timeout, or any other
-    registration error is logged and swallowed, never raised — a
-    registration hiccup must not crash the oneshot watchdog. The NEXT tick's
-    staleness_pass will simply try again (stateless — I6).
+    Registration OUTCOME handling — including the fail-soft contract, and the
+    distinction between the overlap above and a genuine failure — belongs to
+    _register_transient_unit, shared with the fm sibling. A failed
+    registration is now reported with its exit code and systemd-run's own
+    reason instead of being discarded; the retry cadence is unchanged, since
+    the NEXT tick's staleness_pass simply tries again (stateless — I6).
     """
-    try:
-        subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--collect",
-                "--no-block",
-                "--unit=orch-fleet-staleness-redeploy.service",
-                os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
-                "--drain",
-            ],
-            check=False,
-            timeout=10,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
+    _register_transient_unit(
+        [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--no-block",
+            f"--unit={FLEET_STALENESS_REDEPLOY_UNIT}",
+            os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
+            "--drain",
+        ],
+        FLEET_STALENESS_REDEPLOY_UNIT,
+    )
 
 
 def _delegate_fm_restart() -> None:
@@ -1887,39 +1997,38 @@ def _delegate_fm_restart() -> None:
     script's verified exit-0, and the whole thing stays non-blocking (the stamp
     runs inside the detached unit, not inline in the watchdog).
 
-    Fail-soft: a missing systemd-run binary, a timeout, or any other
-    registration error is logged and swallowed, never raised — a registration
-    hiccup must not crash the oneshot watchdog. The NEXT tick's
-    fused_memory_staleness_pass will simply try again (stateless — I6).
+    Registration OUTCOME handling — including the fail-soft contract, and the
+    distinction between the overlap above and a genuine failure — belongs to
+    _register_transient_unit, shared with the fleet sibling. A failed
+    registration is now reported with its exit code and systemd-run's own
+    reason instead of being discarded; the retry cadence is unchanged, since
+    the NEXT tick's fused_memory_staleness_pass simply tries again
+    (stateless — I6).
     """
     restart_script = os.path.join(REPO_DIR, "scripts", "restart-fused-memory.sh")
     stamp_cmd = (
         f"{shlex.quote(sys.executable)} "
         f"{shlex.quote(os.path.abspath(__file__))} --stamp-fm-deploy-clock"
     )
-    try:
-        subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--collect",
-                "--no-block",
-                # Pin the detached stamp to the SAME clock file the reader
-                # consults — systemd-run --user does not propagate this
-                # process's env, so the chained --stamp-fm-deploy-clock would
-                # otherwise default the path (see docstring). No-op at the
-                # default path; load-bearing under a FM_DEPLOY_CLOCK override.
-                f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
-                f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
-                "/bin/bash",
-                "-c",
-                f"{shlex.quote(restart_script)} && {stamp_cmd}",
-            ],
-            check=False,
-            timeout=10,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"_delegate_fm_restart: systemd-run registration failed: {exc!r}")
+    _register_transient_unit(
+        [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--no-block",
+            # Pin the detached stamp to the SAME clock file the reader
+            # consults — systemd-run --user does not propagate this
+            # process's env, so the chained --stamp-fm-deploy-clock would
+            # otherwise default the path (see docstring). No-op at the
+            # default path; load-bearing under a FM_DEPLOY_CLOCK override.
+            f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
+            f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
+            "/bin/bash",
+            "-c",
+            f"{shlex.quote(restart_script)} && {stamp_cmd}",
+        ],
+        FM_STALENESS_REDEPLOY_UNIT,
+    )
 
 
 def staleness_pass() -> None:
