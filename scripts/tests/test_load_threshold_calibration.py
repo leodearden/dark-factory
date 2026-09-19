@@ -762,6 +762,38 @@ def test_absence_and_failed_reads_are_each_counted_against_their_own_base(
     assert '10/20' in failed, failed
 
 
+def seed_leaf_present_on(path: Path, *, present: int, readable: int) -> Path:
+    """A 100-tick corpus with one leaf missing from its first 100 - *present*."""
+    seed_db(path, {'runqueue_read_ok': [1.0] * 100})
+    return seed_db(path, {
+        'own_read_ok:orchestrator-reify.service':
+            [1.0] * readable + [0.0] * (present - readable),
+        'own_cpu_some10:orchestrator-reify.service': [30.0] * readable,
+    }, start_ts=1_000_000 + (100 - present) * 5)
+
+
+@pytest.mark.parametrize(('present', 'readable', 'expected'), [
+    # A unit restart: a 3-tick gap is not a finding, however badly it read.
+    (97, 50, ['low_readability']),
+    # Exactly AT the floor is not below it — presence, then readability.
+    (95, 95, []),
+    (100, 95, []),
+    (94, 94, ['partial_presence']),
+])
+def test_each_cause_is_judged_on_its_own_ratio_at_the_floor(
+    tmp_path: Path, present: int, readable: int, expected: list[str],
+):
+    db = seed_leaf_present_on(tmp_path / 'db.sqlite', present=present, readable=readable)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    fired = [cause for cause in ('partial_presence', 'low_readability')
+             if cause in payload['degradations']]
+    assert fired == expected, payload['degradation_details']
+
+
 def test_the_report_line_names_each_cause_below_the_floor(tmp_path: Path):
     db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite', readable=10)
 

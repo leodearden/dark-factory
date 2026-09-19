@@ -360,10 +360,11 @@ def percentile_table(
 # PRD D11: "the gate holds on a minority of ticks (target <= 20%)".
 D11_HOLD_FRACTION_TARGET = 0.20
 
-# Below this readable fraction, a series' hold fractions are reported with a
-# named degradation. It is a REPORTING threshold, not a decision one: the exact
-# coverage is printed either way, so no verdict depends on where this sits — it
-# decides only when the report shouts.
+# Below this fraction, a cause of a series' coverage shortfall — too few
+# corpus ticks with a row, or too few readable ticks among those — is reported
+# as a named degradation (see ``_below_floor``). It is a REPORTING threshold,
+# not a decision one: the exact coverage is printed either way, so no verdict
+# depends on where this sits — it decides only when the report shouts.
 D11_READABILITY_FLOOR = 0.95
 
 # The paired .timer's OnUnitActiveSec. Only a FALLBACK for a corpus too short
@@ -874,23 +875,30 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     """Each cause of a KNOWN coverage's shortfall that is below the D11 floor.
 
     ``(degradation, detail)`` pairs, one per cause, each judged on its own
-    ratio. Absence is rows over corpus ticks: a tick with no ``*_read_ok`` row
+    ratio. Presence is rows over corpus ticks: a tick with no ``*_read_ok`` row
     is a tick the series' leaf was not discovered on — a unit restarted, added,
-    removed or renamed. Failed reads are readable ticks over the ticks the
-    series was present. A shortfall split between the two can leave both above
-    the floor while ``readable_fraction`` dips below it; that fraction is still
+    removed or renamed. Readability is readable ticks over the ticks the series
+    was present. A shortfall split between the two can leave both above the
+    floor while ``readable_fraction`` dips below it; that fraction is still
     printed beside every hold ladder, but neither cause alone is a finding.
+
+    An unknown coverage (either count zero) has no cause to name, so it yields
+    nothing here rather than a division by zero — which would be a non-zero rc,
+    an infra fault to ε1/ε2.
     """
     corpus, rows, readable = (
         stats['ticks_in_corpus'], stats['ticks_with_a_row'], stats['readable'])
+    if not corpus or not rows:
+        return []
     out = []
     if rows / corpus < D11_READABILITY_FLOOR:
         out.append((
             'partial_presence',
-            f"`{stats['readability_metric']}` has a row on only {rows}/{corpus} "
-            f'corpus ticks ({rows / corpus:.1%}); its leaf was not discovered on '
-            'the rest, so its hold fractions describe that span, not the whole '
-            'corpus',
+            f'present on only {rows}/{corpus} corpus ticks ({rows / corpus:.1%}), '
+            f'below the {D11_READABILITY_FLOOR:.0%} floor — '
+            f"`{stats['readability_metric']}` has no row on the rest (its leaf "
+            'was not discovered), so its hold fractions describe that span, not '
+            'the whole corpus',
         ))
     if readable / rows < D11_READABILITY_FLOOR:
         out.append((
