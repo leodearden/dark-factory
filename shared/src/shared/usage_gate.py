@@ -57,6 +57,8 @@ from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_stric
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
@@ -1005,6 +1007,156 @@ class UsageGate:
             len(self._accounts),
         )
 
+    def try_lease(
+        self,
+        *,
+        scope: str | None = None,
+        reverse: bool = False,
+        exclude: Collection[str] | None = None,
+    ) -> AccountLease | None:
+        """Select an admissible account and return its lease, or ``None`` —
+        SYNCHRONOUSLY, and WITHOUT ever blocking.
+
+        The selection is :meth:`before_invoke`'s own walk, extracted so there
+        is exactly ONE implementation of "which account serves this turn"
+        (docs/code-quality.md heuristic 11). The two callers differ only in
+        ADMISSION POLICY: ``before_invoke`` waits for headroom that does not
+        exist yet, this returns ``None`` and lets the caller decide.
+
+        WHY THE SYNC POLICY EXISTS (task 5488). The legibility trickle runs
+        33 sequential one-shot ``claude -p`` subprocesses in a plain
+        synchronous process with no event loop, and task 4736 rules that an
+        all-capped night must DEFER at exit 0 within the nightly's own
+        runtime. ``before_invoke`` cannot serve that caller twice over: it is
+        a coroutine, and when nothing is admissible it awaits ``_open``
+        rather than returning, so it would hang the 03:00 unit until the
+        weekly reset instead of deferring. The alternative — a second,
+        hand-rolled rotation inside ``scripts/legibility/`` — would duplicate
+        the skip predicate, the probe-slot claim and the failover event,
+        which is precisely the drift this extraction prevents.
+
+        NARROW CONTRACT, READ IT BEFORE CALLING. This method deliberately
+        does NOT acquire ``self._lock``: that is an ``asyncio.Lock``, which
+        synchronous code cannot hold. It is therefore safe ONLY for a
+        single-threaded caller with no concurrent coroutines touching this
+        gate — one process, one invocation at a time, which is exactly the
+        trickle. Every ASYNC caller must keep using
+        :meth:`before_invoke` / :meth:`invoke_slot`, which call this under
+        the lock and keep the blocking policy.
+
+        Mutating, not a query, despite the name's "try" framing: selecting a
+        PROBING account CLAIMS its probe slot (PROBE_IN_FLIGHT) and a change
+        of account emits the failover cost event, same as before_invoke.
+        Settle the returned lease through :class:`InvokeSlot` so the claim is
+        always released.
+
+        *reverse* walks the roster from the END (max-h → max-b rather than
+        max-b → max-h). It is an ordering PREFERENCE, not a different
+        admission rule: the same skip predicate, the same probe claim, the
+        same lease. The trickle's 33 haiku one-shots drain from the end so
+        they do not contend with the orchestrator's first-available b → h
+        order; the two orders meet only when the pool is nearly exhausted,
+        which is exactly when contention is unavoidable anyway. Opt-in, and
+        that matters: ``before_invoke`` never passes it, so every existing
+        caller keeps the order it has always had. The knob lives HERE, in the
+        gate, rather than in a caller-side rotation that would have to
+        re-implement selection to express it.
+
+        *exclude* skips accounts by NAME. It is a CALLER-SIDE BOUND — a
+        synchronous caller rotating through the pool saying "not this one
+        again" — and it is emphatically NOT a cap rule, NOT a phase
+        transition, and NOT an admissibility change: nothing about the
+        excluded account is written, and the gate keeps deciding on its own
+        who can serve a turn. ``near_cap`` in particular stays non-blocking
+        here, exactly as ``_handle_near_cap_warning`` intends: a near-cap
+        account is still selected unless the caller itself names it.
+
+        That distinction is what makes *exclude* necessary rather than
+        merely convenient. ``detect_cap_hit`` returns True for a near-cap
+        banner while taking NO transition, so a rotation that re-asked for
+        an account after each refusal could be handed the same one forever
+        — its termination would depend on the gate's handler semantics. With
+        a growing exclusion set the bound is structural: the walk never
+        returns an excluded name, so the set grows by one per pass and the
+        selection runs out after at most one pass per account. Like
+        *reverse*, it is opt-in and ``before_invoke`` never passes it, so the
+        blocking policy and the orchestrator's ordering are unchanged.
+        """
+        roster = reversed(self._accounts) if reverse else self._accounts
+        for acct in roster:
+            if acct.capped or acct.probe_in_flight or acct.auth_failed:
+                continue
+            if exclude and acct.name in exclude:
+                # Checked BEFORE the PROBE_IN_FLIGHT claim below: selecting a
+                # PROBING account is mutating, so testing the exclusion after
+                # it would burn one probe slot per excluded account — making
+                # the pool less available the harder a caller bounded itself.
+                # Guarded on a truthy `exclude` so the None/empty path stays
+                # byte-identical for every existing caller.
+                continue
+            if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
+                # Scope-capped for this model (S2): skip for this scope
+                # only — the account still serves general work (S1). The
+                # account-level skip above already dominates (S4), and
+                # this predicate is guarded on scope is not None so the
+                # scope=None path stays byte-identical.
+                continue
+            if acct.probing:
+                # First task claims the probe slot — others block
+                # until confirm_account_ok() or _handle_cap_detected().
+                # _transition owns: the phase write, probe_count
+                # reset, and the centralized _open recompute.
+                self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
+                logger.info(
+                    f'Account {acct.name}: probe slot claimed — single task testing',
+                )
+            logger.debug(f'Using account {acct.name}')
+            # Failover detection: emit event if account changed. The
+            # tracker is updated FIRST to close the race window, then the
+            # event fires non-blocking (fire-and-forget). scope=None uses
+            # the general _last_account_name tracker (byte-identical, S1);
+            # a scoped selection uses an INDEPENDENT per-scope tracker so
+            # it never perturbs the general path and the event carries
+            # `scope` (same 'failover' event name, matching β's cap_hit/
+            # near_cap reuse).
+            if scope is None:
+                if (
+                    self._last_account_name is not None
+                    and self._last_account_name != acct.name
+                ):
+                    old_name = self._last_account_name
+                    self._last_account_name = acct.name
+                    if self._cost_store:
+                        self._fire_cost_event(
+                            acct.name,
+                            'failover',
+                            json.dumps({'from': old_name, 'to': acct.name}),
+                        )
+                else:
+                    self._last_account_name = acct.name
+            else:
+                scope_last = self._scope_last_account_map()
+                prev = scope_last.get(scope)
+                if prev is not None and prev != acct.name:
+                    scope_last[scope] = acct.name
+                    if self._cost_store:
+                        self._fire_cost_event(
+                            acct.name,
+                            'failover',
+                            json.dumps({'from': prev, 'to': acct.name, 'scope': scope}),
+                        )
+                else:
+                    scope_last[scope] = acct.name
+            # The park (if any) is over the moment someone is served.
+            self._park_started_at = None
+            self._park_last_logged_at = None
+            return AccountLease(
+                name=acct.name,
+                token=acct.token,
+                generation=acct.generation,
+            )
+        return None
+
     async def before_invoke(self, scope: str | None = None) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
@@ -1037,70 +1189,9 @@ class UsageGate:
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
-                for acct in self._accounts:
-                    if acct.capped or acct.probe_in_flight or acct.auth_failed:
-                        continue
-                    if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
-                        # Scope-capped for this model (S2): skip for this scope
-                        # only — the account still serves general work (S1). The
-                        # account-level skip above already dominates (S4), and
-                        # this predicate is guarded on scope is not None so the
-                        # scope=None path stays byte-identical.
-                        continue
-                    if acct.probing:
-                        # First task claims the probe slot — others block
-                        # until confirm_account_ok() or _handle_cap_detected().
-                        # _transition owns: the phase write, probe_count
-                        # reset, and the centralized _open recompute.
-                        self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
-                        logger.info(
-                            f'Account {acct.name}: probe slot claimed — single task testing',
-                        )
-                    logger.debug(f'Using account {acct.name}')
-                    # Failover detection: emit event if account changed. The
-                    # tracker is updated FIRST to close the race window, then the
-                    # event fires non-blocking (fire-and-forget). scope=None uses
-                    # the general _last_account_name tracker (byte-identical, S1);
-                    # a scoped selection uses an INDEPENDENT per-scope tracker so
-                    # it never perturbs the general path and the event carries
-                    # `scope` (same 'failover' event name, matching β's cap_hit/
-                    # near_cap reuse).
-                    if scope is None:
-                        if (
-                            self._last_account_name is not None
-                            and self._last_account_name != acct.name
-                        ):
-                            old_name = self._last_account_name
-                            self._last_account_name = acct.name
-                            if self._cost_store:
-                                self._fire_cost_event(
-                                    acct.name,
-                                    'failover',
-                                    json.dumps({'from': old_name, 'to': acct.name}),
-                                )
-                        else:
-                            self._last_account_name = acct.name
-                    else:
-                        scope_last = self._scope_last_account_map()
-                        prev = scope_last.get(scope)
-                        if prev is not None and prev != acct.name:
-                            scope_last[scope] = acct.name
-                            if self._cost_store:
-                                self._fire_cost_event(
-                                    acct.name,
-                                    'failover',
-                                    json.dumps({'from': prev, 'to': acct.name, 'scope': scope}),
-                                )
-                        else:
-                            scope_last[scope] = acct.name
-                    # The park (if any) is over the moment someone is served.
-                    self._park_started_at = None
-                    self._park_last_logged_at = None
-                    return AccountLease(
-                        name=acct.name,
-                        token=acct.token,
-                        generation=acct.generation,
-                    )
+                lease = self.try_lease(scope=scope)
+                if lease is not None:
+                    return lease
 
             # All capped — check if any reset times have passed before blocking.
             refreshed = await self._refresh_capped_accounts()

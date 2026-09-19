@@ -1208,6 +1208,167 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task 5488: the census subprocess must be handed a POOL-CHOSEN account
+#
+# census.py runs as a GRANDCHILD -- run_nightly -> _default_census_launcher ->
+# subprocess.run(census.py) -- and that call carries no `env` of its own, so
+# the grandchild is authenticated today only because the 2026-09-14 stopgap
+# drop-in exported one account's token into the systemd unit. Retiring that
+# drop-in (steps 21-24) without this would leave the census riding whatever
+# ~/.claude holds: strictly WORSE than today, and invisible, because
+# census.preflight_headroom fails SAFE -- a token-less census silently defers
+# the whole run rather than erroring.
+#
+# A non-regression gate, not a new feature. The env is an OVERLAY on the
+# parent's, and "no account available" degrades to inheriting exactly as
+# before: a census launch must never crash or fail the nightly run, and must
+# never be blocked by a pool problem either.
+# ---------------------------------------------------------------------------
+
+def _spy_subprocess_run(monkeypatch):
+    """Capture the kwargs of the launcher's subprocess.run, return the dict."""
+    seen = {}
+
+    def _fake_run(args, **kwargs):
+        seen['args'] = args
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', _fake_run)
+    return seen
+
+
+def test_default_census_launcher_passes_an_explicit_env_through(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-from-the-pool'}
+
+    nightly._default_census_launcher(env=env)
+
+    assert seen['env'] is env, (
+        'the census subprocess must be spawned with the env it was given, or '
+        'the account the pool chose never reaches census.py'
+    )
+    assert seen['check'] is False, (
+        "check=False is the launcher's never-crash-the-nightly contract and "
+        'must survive the new parameter'
+    )
+
+
+def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch):
+    """No env means the pre-5488 behaviour, byte for byte.
+
+    ``env=None`` and an omitted ``env`` are the SAME thing to subprocess --
+    inherit the parent's -- which is what keeps this parameter strictly
+    additive for every other caller of the launcher.
+    """
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher()
+
+    assert seen.get('env') is None
+
+
+class TestRunNightlyBindsTheCensusLauncherToThePool:
+    """The wiring half: the launcher run_nightly hands the census step is
+    bound to THIS run's pool, so the account census.py authenticates as is one
+    the gate believes is live -- rather than the hardcoded max-h of the
+    stopgap drop-in this task retires."""
+
+    class _Lease:
+        def __init__(self, name, token):
+            self.name = name
+            self.token = token
+
+    class _OneAccountGate:
+        """A pool with exactly one leasable account, leased by token."""
+
+        account_count = 1
+
+        def __init__(self, token='tok-census-account'):
+            self.token = token
+            self.released = []
+
+        def try_lease(self, **_kwargs):
+            return TestRunNightlyBindsTheCensusLauncherToThePool._Lease(
+                'max-h', self.token,
+            )
+
+        def release_probe_slot(self, oauth_token):
+            self.released.append(oauth_token)
+
+    @staticmethod
+    def _capture_launcher(monkeypatch):
+        seen = {}
+
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+            seen['launcher'] = launcher
+            return 'census trigger: NO-FIRE -- stub', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+        return seen
+
+    @staticmethod
+    def _env_the_census_would_get(launcher, monkeypatch):
+        """Resolve *launcher* the way evaluate_census_step does, run it with
+        subprocess.run spied, and return the env the census subprocess got."""
+        seen = _spy_subprocess_run(monkeypatch)
+        (launcher if launcher is not None else nightly._default_census_launcher)()
+        return seen.get('env')
+
+    def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
+        gate = self._OneAccountGate()
+        monkeypatch.setattr(nightly.account_pool, 'build_pool', lambda **kw: gate)
+        # The invoke half is stubbed out: this class is about the census env,
+        # and a pool-backed invoker over a FAKE token would spawn the REAL
+        # `claude` on PATH (a 401 here, genuine billable spend the day a test
+        # stub holds a live token). The invoke wiring itself is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool.
+        monkeypatch.setattr(
+            nightly.account_pool, 'pool_invoke',
+            lambda pool, **kw: (
+                lambda prompt, model: '{"matches": [], "candidates": []}'
+            ),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        # No invoke= : the production path, where a pool IS built.
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=None,
+        )
+
+        env = self._env_the_census_would_get(seen['launcher'], monkeypatch)
+        assert env is not None, (
+            'the census inherited the parent env -- after the account-pin '
+            'drop-in is retired that means ~/.claude, and preflight_headroom '
+            'would defer the whole census with no error anyone can see'
+        )
+        assert env['CLAUDE_CODE_OAUTH_TOKEN'] == gate.token
+        assert 'ANTHROPIC_API_KEY' not in env
+
+    def test_a_run_with_no_pool_leaves_the_census_env_inherited(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """An injected invoke= builds no gate, and that must not be allowed to
+        cost the census its env: unchanged inheritance is the fail-safe."""
+        install_fake_httpx(_no_outbound_post)
+        monkeypatch.setattr(
+            nightly.account_pool, 'build_pool',
+            lambda **kw: pytest.fail('no pool may be built on the injected path'),
+        )
+        seen = self._capture_launcher(monkeypatch)
+
+        TestRunNightlyDefaultsTheInvokeSeamToThePool._run_one_digest_night(
+            tmp_path, invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
+        )
+
+        assert self._env_the_census_would_get(seen['launcher'], monkeypatch) is None
+
+
+# ---------------------------------------------------------------------------
 # task 4148: run_nightly must DEFAULT the census status_fetcher seam
 #
 # The production path is the systemd `nightly.py run --project-id %i`
@@ -1252,7 +1413,7 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             factory_calls.append(project_root)
             return sentinel
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None):
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
             seen['status_fetcher'] = status_fetcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -1322,6 +1483,207 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
         assert factory_calls == [], (
             'an injected status_fetcher must short-circuit the default factory'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5488: run_nightly must DEFAULT the coder's `invoke` seam to the shared
+# multi-account pool
+#
+# The SAME asymmetry as the status_fetcher one above, one seam over, and from
+# the same cause: main() holds nothing to build a gate from, so `invoke=None`
+# reached `coder.code_digest`, hit its `invoke or _invoke_cli` fallback, and
+# every one of the night's 33 one-shots authenticated as whatever login
+# ~/.claude happened to hold. ONE capped login therefore deferred an entire
+# night while six live accounts in config/usage-accounts.yaml sat idle, and a
+# 2026-09-14 stopgap drop-in pinned the unit to a single account (max-h) to
+# paper over it. `invoke` was the LAST seam here still resolving None to
+# nothing -- which is precisely the shape task 4148's comment block warns
+# about, three seams and three repairs later.
+# ---------------------------------------------------------------------------
+
+class TestRunNightlyDefaultsTheInvokeSeamToThePool:
+    """Pin run_nightly's invoke seam: None means "build the real pool-backed
+    invoker", an explicit value is honoured.
+
+    The spy replaces ``coder.code_digests`` ITSELF, so what is asserted is
+    the callable that reached the coder -- not merely that a pool was built
+    somewhere. Identity assertions throughout: "some invoker got through"
+    must never pass for "the pool's invoker got through".
+    """
+
+    class _StubGate:
+        """Stands in for the ``UsageGate`` ``build_pool`` returns.
+
+        Deliberately inert: ``run_nightly`` is only ever allowed to THREAD
+        this object (to ``pool_invoke``, and to the census launcher's env),
+        never to interrogate it, so an empty roster is the safest shape a
+        stub can have.
+        """
+
+        account_count = 0
+
+        def try_lease(self, **_kwargs):
+            return None
+
+    @staticmethod
+    def _install_spies(monkeypatch):
+        """Stub the pool factory pair and record what reached the coder.
+
+        Returns ``(gate, invoker, build_calls, pool_calls, seen)``.
+        """
+        gate = TestRunNightlyDefaultsTheInvokeSeamToThePool._StubGate()
+        build_calls = []
+        pool_calls = []
+        seen = {}
+
+        def _invoker(prompt, model):
+            raise AssertionError('the spied coder must never call the invoker')
+
+        def _fake_build_pool(**kwargs):
+            build_calls.append(kwargs)
+            return gate
+
+        def _fake_pool_invoke(pool, **kwargs):
+            pool_calls.append((pool, kwargs))
+            return _invoker
+
+        def _spy_code_digests(digests, cb, *, project=None, model=None, invoke=None):
+            seen['invoke'] = invoke
+            return coder.RunResult(
+                status='ok', records=[], failures=[], total=0, succeeded=0, failed=0,
+            )
+
+        monkeypatch.setattr(nightly.account_pool, 'build_pool', _fake_build_pool)
+        monkeypatch.setattr(nightly.account_pool, 'pool_invoke', _fake_pool_invoke)
+        monkeypatch.setattr(nightly.coder, 'code_digests', _spy_code_digests)
+        # The file's own hazard note (task 4148 block above): a run reaching
+        # the census step must not be able to POST anywhere or subprocess-
+        # launch census.py, which spends real tokens and writes real git.
+        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
+        return gate, _invoker, build_calls, pool_calls, seen
+
+    @staticmethod
+    def _run_one_digest_night(tmp_path, **kwargs):
+        """Drive a night carrying ONE real digest, so ``code_digests`` is
+        genuinely reached.
+
+        The quiet-night helper the status_fetcher class above uses cannot
+        serve here: an empty sample returns before the coder stage, and this
+        seam exists nowhere else.
+        """
+        work_cwd = str(tmp_path / 'work')
+        _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+        projects_root = tmp_path / 'projects'
+        _write_transcript(
+            projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+        )
+        kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
+        return nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            poster=lambda url, envelope: None,
+            **kwargs,
+        )
+
+    def test_defaults_to_the_pool_backed_invoker(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        install_fake_httpx(_no_outbound_post)
+        gate, invoker, _build_calls, pool_calls, seen = self._install_spies(monkeypatch)
+
+        # No invoke argument at all -- exactly what main() passes.
+        self._run_one_digest_night(tmp_path)
+
+        assert seen['invoke'] is invoker, (
+            f'run_nightly handed coder.code_digests {seen["invoke"]!r} instead '
+            'of the pool-backed invoker -- with None, code_digest falls back '
+            'to a bare _invoke_cli and the night rides the ambient ~/.claude '
+            'login again'
+        )
+        assert [pool for pool, _kwargs in pool_calls] == [gate], (
+            'pool_invoke must be handed the gate build_pool returned'
+        )
+
+    def test_the_pool_is_built_exactly_once_per_run(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """Cap state lives in the gate's memory and only there, so ONE gate
+        must serve the whole night: a per-digest pool would forget every cap
+        it had just learned and re-try capped accounts for all 33 digests."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, build_calls, pool_calls, _seen = self._install_spies(monkeypatch)
+
+        self._run_one_digest_night(tmp_path)
+
+        assert len(build_calls) == 1, (
+            f'build_pool must be called exactly once per run, got {len(build_calls)}'
+        )
+        assert len(pool_calls) == 1
+
+    def test_the_trickle_drains_the_roster_from_the_end(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """reverse=True: the trickle's one-shots take accounts h->b so they do
+        not contend with the orchestrator's b->h first-available order."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, _build_calls, pool_calls, _seen = self._install_spies(monkeypatch)
+
+        self._run_one_digest_night(tmp_path)
+
+        assert pool_calls[0][1].get('reverse') is True, (
+            f'run_nightly built the invoker with {pool_calls[0][1]!r} -- the '
+            'trickle must drain the roster in reverse'
+        )
+
+    def test_an_injected_invoke_is_not_overridden(
+        self, tmp_path, monkeypatch, install_fake_httpx,
+    ):
+        """DI-seam regression guard: every other run_nightly test in this file
+        injects an invoke stub and depends on the default never clobbering
+        it. No gate may be constructed on that path either -- a test suite
+        that builds a real pool reads the operator's own .env."""
+        install_fake_httpx(_no_outbound_post)
+        _gate, _invoker, build_calls, pool_calls, seen = self._install_spies(monkeypatch)
+
+        def my_fake(prompt, model):
+            return '{"matches": [], "candidates": []}'
+
+        self._run_one_digest_night(tmp_path, invoke=my_fake)
+
+        assert seen['invoke'] is my_fake
+        assert build_calls == [] and pool_calls == [], (
+            'an injected invoke must short-circuit the pool entirely'
+        )
+
+    def test_the_pool_and_the_coder_share_one_module_object(self):
+        """account_pool's `coder` must BE nightly's `coder`, not a second
+        import of the same file.
+
+        scripts/legibility/ is on sys.path as well as scripts/, so a bare
+        `import coder` and `from legibility import coder` build two distinct
+        module objects carrying two distinct `CoderCapExhausted` classes. The
+        pool raises that exception and `coder.code_digest` catches it by name
+        -- and there is no generic `except Exception` beneath those two arms,
+        so a mismatch would not mislabel the deferral, it would let the
+        exception escape run_nightly entirely and crash the night that task
+        4736 exists to make exit 0.
+        """
+        assert nightly.account_pool.coder is nightly.coder
+        assert (
+            nightly.account_pool.coder.CoderCapExhausted
+            is nightly.coder.CoderCapExhausted
+        )
+
+
+def _no_outbound_post(url, **kwargs):
+    """An httpx.post stub that fails LOUDLY rather than returning a plausible
+    reply. Every seam in these runs is injected, so a POST reaching the wire
+    means a seam silently resolved to its live implementation -- exactly the
+    fault this class exists to pin, and it must not pass quietly."""
+    pytest.fail(f'unexpected outbound POST to {url!r} -- every seam is injected')
 
 
 # ---------------------------------------------------------------------------
@@ -3541,6 +3903,36 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # `nightly._default_census_launcher`. The two tests below are the pattern.
 # ---------------------------------------------------------------------------
 
+def _stub_census_launcher_and_pool(monkeypatch):
+    """Stub both of a ``main()``-driven run's reaches into the real world, and
+    return the launcher's call list.
+
+    MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
+    subprocess-runs scripts/legibility/census.py (real LLM spend + real git
+    writes) and ``_default_entrypoint_exists`` is true in a real checkout --
+    and reaching FIRE is the entire point of the tests that call this. Since
+    task 5488, main() -- which injects no ``invoke`` -- also makes run_nightly
+    build a REAL multi-account pool out of the operator's own
+    CLAUDE_OAUTH_TOKEN_* vars and hand one of those tokens to that launcher.
+    A test about the census trigger has no business touching either.
+    """
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda env=None: launcher_calls.append(1),
+    )
+
+    class _EmptyPool:
+        account_count = 0
+
+        def try_lease(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        nightly.account_pool, 'build_pool', lambda **_kwargs: _EmptyPool(),
+    )
+    return launcher_calls
+
+
 def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     tmp_path, monkeypatch, caplog, install_fake_httpx,
 ):
@@ -3597,14 +3989,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     install_fake_httpx(_fake_post)
 
-    # MANDATORY, not cosmetic: on FIRE the real launcher subprocess-runs
-    # scripts/legibility/census.py (real LLM spend + git writes), and
-    # _default_entrypoint_exists is true in a real checkout -- and reaching
-    # FIRE is the entire point of this test.
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     # Empty -> empty sample -> no digests -> `invoke` is never called and
     # nothing is committed, so no LLM and no git.
@@ -3705,10 +4090,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 
     install_fake_httpx(_refusing_post)
 
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
-    )
+    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
 
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
@@ -4008,12 +4390,20 @@ def test_missing_claude_binary_journals_both_halves_end_to_end(
 
     escalations = []
     with caplog.at_level(logging.DEBUG):
-        # NO invoke= override: the real coder._invoke_cli seam runs.
+        # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than
+        # left to default. Since task 5488 `invoke=None` resolves to the
+        # pool-backed invoker, which builds a real UsageGate over
+        # config/usage-accounts.yaml and draws real CLAUDE_OAUTH_TOKEN_* out of
+        # the ambient environment. This test is about _invoke_cli's own
+        # missing-binary path, so it pins the bare seam and stays hermetic;
+        # the pool wiring is pinned by
+        # TestRunNightlyDefaultsTheInvokeSeamToThePool above.
         result = nightly.run_nightly(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            invoke=coder._invoke_cli,
             status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
         )
@@ -4137,12 +4527,20 @@ def _replay_capped_night(tmp_path, monkeypatch, *, stdout_text, stderr_text):
     monkeypatch.setenv('LEGIBILITY_CLAUDE_BIN', str(fake))
 
     escalations = []
-    # NO invoke= override: the real coder._invoke_cli seam runs.
+    # The real coder._invoke_cli seam runs -- named EXPLICITLY rather than left
+    # to default, for the reason spelled out in
+    # test_missing_claude_binary_journals_both_halves_end_to_end: since task
+    # 5488 `invoke=None` builds a real multi-account pool. What these two cases
+    # pin is the per-digest DEFER a banner from ONE login produces, which is
+    # still exactly what the pool hands its failover loop; the pool's own
+    # all-accounts-capped deferral is pinned end-to-end in
+    # test_legibility_coder.py.
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=coder._invoke_cli,
         status_fetcher=None,
         poster=lambda url, envelope: escalations.append((url, envelope)),
     )

@@ -25,6 +25,14 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
 # inherits this Environment.
 Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
+# The multi-account pool (task 5488): the CLAUDE_OAUTH_TOKEN_* vars that
+# config/usage-accounts.yaml names. A token source, never a token pin -- the
+# gate picks the account per invocation. Policy for this directive and the
+# next: OPERATIONS.md §"Legibility trickle accounts (03:00)".
+EnvironmentFile=/home/leo/src/dark-factory/.env
+# Load-bearing: the CLI prefers an API key over the OAuth token, and the .env
+# above defines one.
+UnsetEnvironment=ANTHROPIC_API_KEY
 ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal
