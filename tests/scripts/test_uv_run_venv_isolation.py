@@ -1,37 +1,37 @@
-"""Fleet-wide guard: starting a unit must not mutate the shared root .venv.
+"""Starting a unit must not mutate the shared root .venv.
 
-Every workspace member named in the root pyproject.toml's
-``[tool.uv.workspace]`` resolves to ONE ``.venv`` at the repo root — there is
-no member-local environment.  Measured on uv 0.11.6 against a throwaway
-two-member workspace: ``uv run --project a`` reports ``sys.prefix`` as the
-WORKSPACE ROOT ``.venv`` and never creates ``a/.venv``.  So a unit's ExecStart
-does not act on an environment of its own; it acts on the environment the
-seven orchestrators, the dashboard, the load sampler, fused-memory and every
-verify subprocess are already running out of.
+SCOPE, stated precisely because the honest boundary is narrower than the
+invariant one would want.  This module sweeps every committed unit whose
+ExecStart is DIRECTLY a ``uv run`` command.  It does NOT follow a unit whose
+ExecStart is a shell wrapper running ``uv run`` internally, and two committed
+timer-driven units are exactly that shape — scripts/fused-memory-flag-marker-
+sweep.service and scripts/memory-metadata-coverage-census.service, whose
+wrappers still carry the old ``--frozen`` and so still sync into the shared venv
+on every timer elapse.  Those wrappers lie outside task 5553's locks; extending
+discovery through them is filed as a follow-up.  Recording the hole here is the
+point: a guard reporting green while a known instance of its own defect runs
+nightly is worse than one that says what it does not cover.
 
-``uv run`` is an INEXACT sync: at process start it INSTALLS the named member's
-missing dependency closure into that shared venv (measured: "Installed 1
-package in 42ms"), and never prunes.  ``--frozen`` does NOT stop it — that flag
-is "run without updating the uv.lock file", a LOCKFILE option, and a
-``uv run --frozen --project a`` start installed the deleted package right back
-("Installed 1 package in 50ms").  ``--no-sync`` is the flag that stops it, and
-under it the venv was untouched.
+WHY THE INVARIANT.  Every member of the root pyproject.toml's
+``[tool.uv.workspace]`` resolves to ONE ``.venv`` at the repo root, so a unit's
+ExecStart acts not on an environment of its own but on the one the seven
+orchestrators, the dashboard, the load sampler, fused-memory and every verify
+subprocess are already running out of.  ``uv run`` is an INEXACT sync: at
+process start it INSTALLS the named member's missing closure into that shared
+venv.  ``--frozen`` does not stop it (a LOCKFILE option); ``--no-sync`` does.
+The measurement behind those two sentences — transcript, exit codes, lockfile
+digest — is written out ONCE, in scripts/orchestrator-autopilot-video.service
+above its ExecStart, and cited from here rather than restated.
 
-That distinction is the whole reason this module exists.  From 2026-05-29 until
-task 5553 the fleet carried ``--frozen`` believing it was the venv guard, and
-nothing mechanical contradicted the belief, because the per-unit assertions of
-the day pinned the flag's TEXT rather than its effect.  This sweep asserts the
-effect's precondition instead, fleet-wide and by content discovery, so a unit
-added next month is covered the day it lands.
-
-Structurally modelled on tests/scripts/test_systemd_restart_backoff.py — the
-same exclusions for the same measured reasons, the same non-empty discovery
-guard, and the same single markdown opt-in.  Its ``_NON_UNIT_PATHSPECS``
-comment states that reasoning at length and is CITED rather than restated here,
-so the two sweeps cannot drift into two different answers about what counts as
-a unit.
+From 2026-05-29 until task 5553 the fleet carried ``--frozen`` believing it was
+the venv guard, and nothing mechanical contradicted the belief, because the
+per-unit assertions of the day pinned the flag's TEXT rather than its effect.
+This sweep asserts the effect's precondition instead, by content discovery, so a
+unit added next month is covered the day it lands.  Structurally modelled on
+tests/scripts/test_systemd_restart_backoff.py.
 """
 import pathlib
+import re
 import subprocess
 
 import pytest
@@ -39,33 +39,29 @@ from systemd_unit_invariants import MalformedExecStart
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# What discovery refuses to treat as a unit, excluded by CATEGORY rather than
-# by naming individual paths.  Verbatim from
-# tests/scripts/test_systemd_restart_backoff.py:31-65, whose comment holds the
-# full reasoning and the measurements behind it; the summary is that
-# ``**/tests/**`` files embed whole units as column-0 triple-quoted fixtures
-# (several per file), and ``**/*.md`` files are prose that may legitimately
-# quote the DEFECT — plans/afk-C1-systemd.md is the live instance, an as-built
-# record whose ExecStart carries no lockfile flag at all and which must not be
-# edited.  Both categories break a file-wide last-occurrence-wins read the same
-# way.  The glob forms are load-bearing: a plain ``:!tests/`` excludes only the
-# top-level directory, leaving fused-memory/tests/, orchestrator/tests/,
-# scripts/tests/ and dashboard/tests/ swept.
+# The ExecStart= anchor, shared by the grep and by logical_exec_start so the
+# discoverer and the parser answer the SAME question.  They did not at first:
+# the grep tolerated systemd's legal `  ExecStart = /usr/bin/uv` while the
+# parser matched a bare `ExecStart=` prefix, so such a unit was discovered and
+# then reported as declaring no ExecStart at all.  The trailing `=` is what
+# excludes `ExecStartPre=`, which offers `P` where the pattern needs `=`.
+_EXEC_START_PREFIX = r"ExecStart[ \t]*="
+_EXEC_START_RE = re.compile(rf"^{_EXEC_START_PREFIX}")
+
+# Copied from tests/scripts/test_systemd_restart_backoff.py::
+# _NON_UNIT_PATHSPECS, which holds the reasoning and the measurements: test
+# files embed whole units as fixtures, and docs may legitimately quote the
+# DEFECT.  The glob forms are load-bearing — a plain `:!tests/` excludes only
+# the top-level directory.
 _NON_UNIT_PATHSPECS = (
     ":(exclude,glob)**/tests/**",
     ":(exclude,glob)**/*.md",
 )
 
 # Every committed unit or template whose ExecStart is a `uv run` against a
-# workspace member, i.e. every file that carries this obligation today.  Fifteen
-# of them, spanning four naming conventions and five directories.
-#
-# Unlike test_systemd_restart_backoff.py's one-sided coverage guard, this set is
-# asserted by EQUALITY (see test_discovery_covers_every_known_uv_run_unit) —
-# discovery here is two-stage (a git grep, then a `uv run` filter), and the
-# second stage is a parser that can silently answer None for a unit it stopped
-# understanding.  A missing-only check cannot see that, and a unit that drops
-# out of the sweep is exactly the failure this module exists to prevent.
+# workspace member.  Asserted by EQUALITY below, unlike the one-sided coverage
+# guard in the restart-backoff sweep, because discovery here ends in a PARSER
+# and a parser can silently answer None for a unit it stopped understanding.
 _EXPECTED_UV_RUN_UNITS = frozenset(
     {
         "dashboard/dark-factory-dashboard.service",
@@ -86,70 +82,87 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
     }
 )
 
-# uv's own render sentinel in the two `.service.template` files, substituted for
-# an absolute uv path at install time by scripts/setup-host.sh.  Recognised so a
-# template is swept in its COMMITTED form rather than only after rendering.
+# uv's render sentinel in the two `.service.template` files, substituted for an
+# absolute uv path by scripts/setup-host.sh.  Recognised so a template is swept
+# in its COMMITTED form rather than only after rendering.
 _UV_PATH_SENTINEL = "__UV_PATH__"
 
-# The one markdown file that OPTS BACK IN to both sweeps, mirroring
-# tests/scripts/test_systemd_restart_backoff.py:61-64.  The `**/*.md` exclusion
-# above is kept for the reason that module states — a doc may legitimately quote
-# the DEFECT, and plans/afk-C1-systemd.md is the live as-built record that must
-# not be edited — but this file is not prose ABOUT a unit, it is the unit new
-# projects are minted from: its own line 16 says the scripts/orchestrator-*
-# .service files are "cp'd verbatim by setup-host.sh" and points at
-# orchestrator-reify.service as the model.  A copy-source still showing the old
-# flags mints this defect into every new project, one unit at a time, with
-# nothing in the sweep able to see it happen.
+# The one markdown file opted back in, mirroring
+# tests/scripts/test_systemd_restart_backoff.py::_FACTORY_INIT_REFERENCE.  It is
+# not prose ABOUT a unit but the unit new projects are minted from, declaring in
+# its Layer 1 section that the scripts/orchestrator-*.service files are "cp'd
+# verbatim by setup-host.sh".  A copy-source still showing the old flags mints
+# this defect into every new project, with nothing in the sweep able to see it.
 _FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 
-# Run-level flags that take a separate value token, so the walk below consumes
-# the value instead of mistaking it for the command token and stopping early.
-# `--project` is the one every unit here uses; the rest are uv's other
-# environment-selecting options, listed so a unit that grows one does not
-# silently truncate its own flag list.
+# How the flag walk classifies each run-level token.  PARTIAL BY DESIGN and
+# backed by a raise, not by a guess: `uv run --help` lists ~80 options, and
+# embedding all of them here would be a copy of uv's interface that drifts
+# silently at the next upgrade.  These cover what a systemd unit plausibly
+# carries; anything else raises, so an unclassified option is a one-line
+# decision rather than the mis-walk the raise message describes.
 _VALUE_TAKING_RUN_FLAGS = frozenset(
-    {"--project", "--package", "--python", "--with", "--directory"}
+    {
+        "--project",
+        "--package",
+        "--python",
+        "--directory",
+        "--with",
+        "--env-file",
+        "--extra",
+        "--group",
+        "--color",
+    }
+)
+_BOOLEAN_RUN_FLAGS = frozenset(
+    {
+        "--no-sync",
+        "--frozen",
+        "--locked",
+        "--active",
+        "--isolated",
+        "--offline",
+        "--exact",
+        "--all-packages",
+        "--all-extras",
+        "--no-dev",
+        "--no-project",
+        "--no-config",
+        "--no-env-file",
+        "--no-editable",
+        "--quiet",
+        "--verbose",
+    }
 )
 
 
 def discover_exec_start_files() -> list[str]:
     """Return every git-tracked file declaring ``ExecStart=``, sans exclusions.
 
-    Discovery is by CONTENT rather than by filename glob or a hand-maintained
-    list, for the reason
-    test_systemd_restart_backoff.discover_units_declaring_a_restart_cap states
-    in full: the affected files span four naming conventions (``*.service``,
-    ``*.service.template``, ``*.example-systemd-config``, and a fenced ini block
-    inside a ``.md``) across five directories, so any glob broad enough to catch
-    them all is broader than the invariant, and a hand-maintained list fails the
-    stated goal outright — a unit added next month is simply not in it.
+    By CONTENT rather than by filename glob or a hand-maintained list, for the
+    reason test_systemd_restart_backoff.py::
+    discover_units_declaring_a_restart_cap states in full: the affected files
+    span four naming conventions across five directories, so any glob broad
+    enough to catch them all is broader than the invariant, and a hand list
+    fails the stated goal outright.
 
-    The anchor is ``ExecStart=`` rather than ``uv run``, i.e. deliberately
-    WIDER than the obligation.  Narrowing the grep to `uv` would make a unit
-    whose ExecStart stopped being recognisable as a uv invocation vanish from
-    discovery silently; anchoring on the directive every unit must have keeps it
-    in the discovered set, where the parser can answer for it and the coverage
-    guard can notice if the answer changed.  Filtering to actual `uv run`
-    commands is the SECOND stage, in uv_run_level_flags.
+    The anchor is ``ExecStart=`` rather than ``uv run``, i.e. deliberately WIDER
+    than the obligation.  Narrowing it to `uv` would let a unit whose ExecStart
+    stopped being recognisable as a uv invocation vanish from discovery
+    silently; anchoring on the directive every unit must have keeps it in the
+    discovered set, where the coverage guard can notice the answer changed.
+    Filtering to actual `uv run` commands is the SECOND stage, below.
 
-    The returncode assertion is load-bearing.  ``git grep`` exits 0 on matches,
-    1 on no matches and >1 on a real error; a helper that swallows non-zero
-    returns [], the parametrize below collects ZERO cases, and the sweep reports
-    green while checking nothing.
-
-    The pattern tolerates leading whitespace and whitespace around the
-    separator, matching systemd.syntax — a valid ``  ExecStart = /usr/bin/uv``
-    must not go undiscovered.  The trailing ``=`` in the pattern is what keeps
-    ``ExecStartPre=`` from matching on its own; a unit whose only match is a
-    pre-hook has no command to check.
+    The returncode assertion is load-bearing: `git grep` exits >1 on a real
+    error, and a helper that swallowed that would return [], collect ZERO
+    parametrized cases, and report the sweep green while checking nothing.
     """
     proc = subprocess.run(
         [
             "git",
             "grep",
             "-lE",
-            r"^[ \t]*ExecStart[ \t]*=",
+            rf"^[ \t]*{_EXEC_START_PREFIX}",
             "--",
             ".",
             *_NON_UNIT_PATHSPECS,
@@ -162,10 +175,9 @@ def discover_exec_start_files() -> list[str]:
     assert proc.returncode in (0, 1), (
         f"`git grep` for ExecStart= exited {proc.returncode} in {REPO_ROOT} "
         "(0=matches, 1=no matches, >1=error), so unit discovery produced "
-        "nothing to check. A non-zero exit here must fail loudly: silently "
-        "returning no paths would collect zero parametrized cases and report "
-        f"this whole sweep green while checking nothing. stderr: "
-        f"{proc.stderr.strip()!r}"
+        "nothing to check. Failing loudly here is deliberate: returning no "
+        "paths would collect zero parametrized cases and report this whole "
+        f"sweep green while checking nothing. stderr: {proc.stderr.strip()!r}"
     )
     return sorted(line.strip() for line in proc.stdout.splitlines() if line.strip())
 
@@ -173,48 +185,39 @@ def discover_exec_start_files() -> list[str]:
 def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
     """Return the effective ExecStart COMMAND in *text* as one logical line.
 
-    Two independent normalisations, each of which a naive read gets wrong on a
-    file committed in this repo today.
+    Two normalisations, each of which a naive read gets wrong on a file
+    committed in this repo today.
 
-    LAST OCCURRENCE WINS, mirroring systemd itself and
-    test_orchestrator_service_files._exec_start_line, whose docstring holds the
-    reasoning: a drop-in override under ``<unit>.d/`` lands as an empty
-    ``ExecStart=`` list RESET followed by the real command, so a first-match
-    read finds the reset, sees no flags at all, and passes a unit whose real
-    command may well be wrong.  Lines are stripped before matching because
-    systemd permits leading whitespace on a directive, and the trailing ``=``
-    in the prefix is what keeps ``ExecStartPre=`` out of the match.
+    LAST OCCURRENCE WINS, mirroring systemd and
+    test_orchestrator_service_files.py::_exec_start_line, whose docstring holds
+    the reasoning: a drop-in override lands as an empty ``ExecStart=`` RESET
+    followed by the real command, so a first-match read finds the reset, sees no
+    flags, and passes a unit whose real command may well be wrong.
 
-    CONTINUATIONS ARE JOINED.  scripts/dashboard.service.template:34 and
-    scripts/fused-memory.service.template:39 (with its committed mirror) write
-    ExecStart as a systemd backslash continuation spanning several physical
-    lines, so a single-physical-line read sees only the first fragment.  For
-    those three that fragment happens to hold the run-level flags today, which
-    is worse than useless: the read would pass them VACUOUSLY and stop noticing
-    the day a flag moved to a continuation line.  The join follows
-    test_dashboard_service_template._logical_exec_start — drop the trailing
-    ``\\``, strip continuation indentation, separate with a single space.
+    CONTINUATIONS ARE JOINED, following
+    test_dashboard_service_template.py::_logical_exec_start.  The ExecStart= of
+    scripts/dashboard.service.template and scripts/fused-memory.service.template
+    (with its committed mirror) spans several physical lines.  For those three
+    the first fragment happens to hold the run-level flags today, which is worse
+    than useless: an unjoined read would pass them VACUOUSLY and stop noticing
+    the day a flag moved to a continuation line.
 
-    Returns the command only, with the ``ExecStart=`` prefix removed, since
-    every caller wants to tokenise a command line and none wants the directive
-    name.  Raises MalformedExecStart — the shared class from
-    systemd_unit_invariants, so a broken unit surfaces as ONE class whichever
-    layer notices it first — when there is no ExecStart= at all, or when the
-    effective one carries no command.  Neither is a legitimate "this unit has
-    no uv flags" answer: the None return belongs to uv_run_level_flags and
-    means something quite different.
+    Returns the command only, with the directive prefix removed.  Raises
+    MalformedExecStart — the shared class, so a broken unit surfaces as ONE
+    class whichever layer notices it first — when there is no ExecStart= at all,
+    or when the effective one carries no command.  Neither is a legitimate "this
+    unit has no uv flags" answer; that is the None return below.
     """
     lines = text.splitlines()
     start_indices = [
-        i for i, ln in enumerate(lines) if ln.strip().startswith("ExecStart=")
+        i for i, ln in enumerate(lines) if _EXEC_START_RE.match(ln.strip())
     ]
     if not start_indices:
         raise MalformedExecStart(
             f"{unit_name} declares no ExecStart= line, so there is no command "
             "to check for run-level uv flags. Treating this as 'not a uv run "
-            "command' would silently drop the unit out of the fleet sweep — "
-            "the exact direction a guard against a silently-mutated venv must "
-            "refuse."
+            "command' would silently drop the unit out of the sweep — the exact "
+            "direction a guard against a silently-mutated venv must refuse."
         )
 
     parts: list[str] = []
@@ -229,7 +232,7 @@ def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
             break
         idx += 1
 
-    command = " ".join(p for p in parts if p).partition("=")[2].strip()
+    command = _EXEC_START_RE.sub("", " ".join(p for p in parts if p), count=1).strip()
     if not command:
         raise MalformedExecStart(
             f"{unit_name}'s effective ExecStart= carries no command: the last "
@@ -244,29 +247,32 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
     """Return *exec_start*'s RUN-LEVEL uv flag names, or None if it is not `uv run`.
 
     None means exactly one thing: this command is not a ``uv run`` invocation,
-    so the invariant does not apply to it and callers SKIP.  That is a real
-    answer — scripts/orchestrator-watchdog.service runs a bare Python probe and
-    scripts/jcodemunch-watcher.service.template runs ``uvx``, which builds an
-    EPHEMERAL environment and never touches the shared root venv.  The
-    None-vs-raise split follows the contract stated once at
-    systemd_unit_invariants.config_arg_from_exec_start: a real answer returns,
-    a defect raises.
+    so the invariant does not apply and callers SKIP.  That is a real answer —
+    scripts/orchestrator-watchdog.service runs a bare Python probe and
+    scripts/jcodemunch-watcher.service.template runs ``uvx``, an EPHEMERAL
+    environment that never touches the shared venv.  The None-vs-raise split
+    follows the contract stated once at
+    systemd_unit_invariants.py::config_arg_from_exec_start.  Note what None does
+    NOT cover: a unit whose ExecStart is a shell wrapper running ``uv run``
+    inside it also answers None, which is the scope hole this module's docstring
+    records rather than hides.
 
-    RUN-LEVEL is the load-bearing word, and the reason this returns a walked
-    prefix rather than doing a substring check on the whole line.  In
+    RUN-LEVEL is the load-bearing word, and the reason this walks a prefix
+    instead of substring-checking the line.  In
 
         uv run --project orchestrator orchestrator run --config <path>
 
-    ``orchestrator`` is the COMMAND token, and every argument after it belongs
-    to the orchestrator CLI, not to uv.  A flag appended there would leave the
-    unit textually satisfying a naive presence check while uv never saw it and
-    the venv was still mutated at start — a guard blessing the exact defect it
-    was written for.  So the walk starts after ``run`` and STOPS at the first
-    token that is neither a ``--flag`` nor the value of one.
-    orchestrator/tests/test_mcp_lifecycle.py:335-363 already guards this same
-    positional property for the plan-tools fast-start argv, where the repo
-    spells the flag ``--no-sync`` — so the hot path had the right flag all
-    along while the units did not.
+    ``orchestrator`` is the COMMAND token and everything after it belongs to the
+    orchestrator CLI, not to uv.  A flag appended there would leave the unit
+    textually satisfying a naive presence check while uv never saw it and the
+    venv was still mutated at start — a guard blessing the exact defect it was
+    written for.  So the walk starts after ``run`` and STOPS at the first token
+    that is neither a ``--flag`` nor the value of one.
+    orchestrator/tests/test_mcp_lifecycle.py::TestMcpServerArgs::
+    test_run_level_flags_before_python guards the same positional property for
+    the plan-tools fast-start argv, where the repo already spelled the flag
+    ``--no-sync`` — so the hot path had it right all along while the units did
+    not.
 
     Flag NAMES are returned, i.e. ``--project=orchestrator`` reports
     ``--project``, so the two spellings of a valued flag cannot give two
@@ -287,6 +293,20 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
         if not token.startswith("--"):
             break
         name = token.partition("=")[0]
+        if name not in _VALUE_TAKING_RUN_FLAGS and name not in _BOOLEAN_RUN_FLAGS:
+            raise MalformedExecStart(
+                f"this walker does not know the run-level flag {name!r} in "
+                f"{exec_start!r}, so it cannot tell where uv's flags end and "
+                "the command begins. Guessing is what makes this raise rather "
+                "than continue. Assumed boolean, the flag's VALUE is mistaken "
+                "for the command token and the walk stops early, reporting a "
+                "unit as missing `--no-sync` when it carries it. Assumed "
+                "valued, a real command token is swallowed and the walk runs "
+                "on into the command's own arguments, where a `--no-sync` "
+                "belonging to something else would satisfy the guard. Classify "
+                "it against `uv run --help` into _VALUE_TAKING_RUN_FLAGS or "
+                "_BOOLEAN_RUN_FLAGS in this module."
+            )
         flags.append(name)
         # A `--flag=value` token carries its own value; only the space-separated
         # spelling consumes the token after it.
@@ -297,35 +317,57 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
 
 
 def discover_uv_run_units() -> list[str]:
-    """Repo-relative paths of every discovered file whose ExecStart is a `uv run`."""
+    """Repo-relative paths of every discovered file whose ExecStart is a `uv run`.
+
+    A MalformedExecStart from either parser INCLUDES the path rather than
+    propagating, for two reasons, the second sharper.  A raise here happens
+    inside the ``@pytest.mark.parametrize`` argument, i.e. at COLLECTION time,
+    so it takes down the whole module — including the coverage guard that exists
+    to report which unit stopped being understood.  And "cannot answer" must
+    never resolve to "silently skipped": the path stays in the sweep, where the
+    per-case body re-parses it and fails with the parser's own message, naming
+    the one unit at fault.
+    """
     units = []
     for rel_path in discover_exec_start_files():
         text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-        if uv_run_level_flags(logical_exec_start(text, rel_path)) is not None:
-            units.append(rel_path)
+        try:
+            if uv_run_level_flags(logical_exec_start(text, rel_path)) is None:
+                continue
+        except MalformedExecStart:
+            pass
+        units.append(rel_path)
     return units
 
 
 def swept_paths() -> list[str]:
-    """Every path both arms below run against: the discovered units plus the opt-in.
-
-    The markdown opt-in is added UNCONDITIONALLY — never as a skip, mirroring
-    test_systemd_restart_backoff.py:61-64 — so the exclusion of the `**/*.md`
-    category costs this file no coverage.  Its guard is therefore strictly
-    stronger than the sweep, not a weaker substitute for it.
-    """
+    """The discovered units plus the markdown opt-in, which is never a skip."""
     return sorted([*discover_uv_run_units(), _FACTORY_INIT_REFERENCE])
+
+
+def _run_level_flags_of(rel_path: str) -> list[str]:
+    """The run-level uv flags of *rel_path*, failing rather than returning None.
+
+    swept_paths only yields paths that parsed as a `uv run` command, so a None
+    here means the file changed shape between collection and the test body.
+    """
+    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+    flags = uv_run_level_flags(logical_exec_start(text, rel_path))
+    assert flags is not None, (
+        f"{rel_path} was swept as a `uv run` unit but no longer parses as one. "
+        "It was discovered by its ExecStart= and must not leave the sweep "
+        "silently — check whether the command shape changed."
+    )
+    return flags
 
 
 def test_factory_init_reference_is_swept() -> None:
     """The opt-in copy-source must exist and still parse as a `uv run` command.
 
-    Without this, a rename of the file or a reformat of its fenced ini block
-    would drop the ONLY copy-source out of both arms silently — the file would
-    simply stop being a path the parametrize produced, and two tests would
-    quietly become fourteen cases instead of fifteen with nothing red.  That is
-    the same silent-shrink hazard the coverage guard above exists for, and it
-    needs its own statement here because this path does not come from discovery.
+    Needs its own statement because this path does not come from discovery: a
+    rename or a reformat of its fenced ini block would otherwise drop the ONLY
+    copy-source out of both arms silently, turning sixteen cases into fifteen
+    with nothing red.
     """
     path = REPO_ROOT / _FACTORY_INIT_REFERENCE
     assert path.exists(), (
@@ -348,31 +390,29 @@ def test_factory_init_reference_is_swept() -> None:
 def test_discovery_covers_every_known_uv_run_unit() -> None:
     """Coverage guard: the swept set must be non-empty and exactly the known units.
 
-    The counterpart to test_orchestrator_service_glob_covers_all_known_units and
-    to test_exec_start_config_parser_answers_for_every_orchestrator_run_unit.
-    Without it a broken discovery shrinks the sweep to zero cases, and a
-    zero-case parametrize collects no tests and reports no failure — masking the
-    very defect the sweep exists to catch.
+    The counterpart to test_orchestrator_service_files.py::
+    test_orchestrator_service_glob_covers_all_known_units.  Without it a broken
+    discovery shrinks the sweep to zero cases, and a zero-case parametrize
+    collects no tests and reports no failure — masking the very defect the sweep
+    exists to catch.
 
-    EQUALITY, not the one-sided missing-only check its structural model
-    test_systemd_restart_backoff.test_discovery_covers_every_known_unit uses,
-    and the difference is deliberate.  There, discovery is a single git grep
-    whose whole point is that a NEW unit declaring a cap is swept automatically,
-    so an equality assertion would turn that success into a failure.  Here the
-    second stage is a PARSER, and a parser has a silent failure mode a grep does
-    not: uv_run_level_flags answers None for anything it no longer recognises as
-    ``uv run``, so a unit reformatted in a way the walker mishandles leaves the
-    sweep quietly rather than failing in it.  A new unit landing here is
-    expected to add its path, and the one-line diff is the price of that being
-    a decision rather than an accident.
+    EQUALITY here, where test_systemd_restart_backoff.py::
+    test_discovery_covers_every_known_unit checks missing-only, and the
+    difference is deliberate.  There, discovery is a single git grep whose whole
+    point is that a NEW unit declaring a cap is swept automatically, so an
+    equality assertion would turn that success into a failure.  Here the second
+    stage is a parser that answers None for anything it no longer recognises, so
+    a unit reformatted past the walker leaves the sweep quietly rather than
+    failing in it.  A new unit is expected to add its path, and that one-line
+    diff is the price of its coverage being a decision rather than an accident.
     """
     discovered = set(discover_uv_run_units())
     assert discovered, (
-        "discovery found no `uv run` units at all. Most likely causes: the "
-        f"git grep ran outside a checkout (REPO_ROOT={REPO_ROOT}), or "
-        "uv_run_level_flags stopped recognising every ExecStart. Either way "
-        "the parametrized sweeps below would collect zero cases and report "
-        "green while checking nothing."
+        "discovery found no `uv run` units at all. Most likely causes: the git "
+        f"grep ran outside a checkout (REPO_ROOT={REPO_ROOT}), or "
+        "uv_run_level_flags stopped recognising every ExecStart. Either way the "
+        "parametrized sweeps below would collect zero cases and report green "
+        "while checking nothing."
     )
     missing = _EXPECTED_UV_RUN_UNITS - discovered
     extra = discovered - _EXPECTED_UV_RUN_UNITS
@@ -388,34 +428,30 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
         f"the sweep picked up files not in _EXPECTED_UV_RUN_UNITS: {sorted(extra)}. "
         "If these are genuinely new units running `uv run` against a workspace "
         "member, add them to the constant — they share the one root .venv and "
-        "so carry the same obligation. If they are not units at all, they must "
-        "be excluded via _NON_UNIT_PATHSPECS rather than checked."
+        "so carry the same obligation. A file whose ExecStart= is MALFORMED also "
+        "lands here, deliberately (see discover_uv_run_units); its own case "
+        "below will name the defect. If they are not units at all, exclude them "
+        "via _NON_UNIT_PATHSPECS rather than checking them."
     )
 
 
 @pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
 def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
-    """A unit's `uv run` must carry `--no-sync` among its RUN-LEVEL flags.
-
-    The fleet-wide arm of the invariant this module's docstring states.
-    """
-    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-    flags = uv_run_level_flags(logical_exec_start(text, rel_path))
-    assert flags is not None and "--no-sync" in flags, (
-        f"{rel_path} runs `uv run` without a run-level `--no-sync` "
-        f"(run-level flags found: {flags}). Measured on uv 0.11.6: a start "
-        "without it INSTALLS the named member's missing dependency closure "
-        "into the ONE shared root .venv — the same environment every other "
-        "workspace member, every running orchestrator and every verify "
-        "subprocess resolves against — because `uv run --project <member>` "
-        "reports sys.prefix as the workspace root and no member-local venv "
-        "exists. `--frozen` does NOT prevent this: it is a LOCKFILE option "
-        "('run without updating the uv.lock file'), and a `uv run --frozen` "
-        "start was measured reinstalling a package deleted from the venv. "
-        "The flag must sit BEFORE the command token, or uv never sees it. "
-        "The accepted cost is that an unsynced venv now fails the unit with "
-        "ModuleNotFoundError instead of repairing itself; the repair path is "
-        "scripts/sync-orchestrator-env.sh (`uv sync --all-packages`)."
+    """A unit's `uv run` must carry `--no-sync` among its RUN-LEVEL flags."""
+    flags = _run_level_flags_of(rel_path)
+    assert "--no-sync" in flags, (
+        f"{rel_path} runs `uv run` without a run-level `--no-sync` (run-level "
+        f"flags found: {flags}). Without it, process start INSTALLS the named "
+        "member's missing dependency closure into the ONE shared root .venv "
+        "every workspace member, every running orchestrator and every verify "
+        "subprocess resolves against. `--frozen` does NOT prevent this — it is "
+        "a LOCKFILE option, measured reinstalling into the venv (the full "
+        "measurement is in scripts/orchestrator-autopilot-video.service, above "
+        "its ExecStart). The flag must sit BEFORE the command token, or uv "
+        "never sees it. The accepted cost is that an unsynced venv now fails "
+        "the unit with ModuleNotFoundError instead of repairing itself; the "
+        "repair path is scripts/sync-orchestrator-env.sh (`uv sync "
+        "--all-packages`)."
     )
 
 
@@ -423,29 +459,23 @@ def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
 def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
     """Beside `--no-sync`, a run-level `--frozen`/`--locked` is a no-op — so forbid it.
 
-    Its own test rather than a second assert inside
-    test_uv_run_unit_passes_no_sync: the two arms fail for different reasons and
-    a reader of a failure should see which one fired, and the presence arm must
-    stay green independently of this one.
+    Its own test rather than a second assert in the arm above: the two fail for
+    different reasons, a reader of a failure should see which one fired, and the
+    presence arm must stay green independently of this one.
     """
-    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-    flags = uv_run_level_flags(logical_exec_start(text, rel_path))
-    assert flags is not None
+    flags = _run_level_flags_of(rel_path)
     lockfile_flags = [f for f in flags if f in ("--frozen", "--locked")]
     assert not lockfile_flags, (
         f"{rel_path} carries run-level {lockfile_flags} beside `--no-sync` "
-        f"(run-level flags found: {flags}). Measured on uv 0.11.6: `--no-sync` "
-        "skips the LOCK step along with the sync, so both lockfile flags buy "
-        "literally nothing next to it. `uv run --locked` exits 2 on lockfile "
-        "drift, but `uv run --locked --no-sync` exits 0 SILENTLY; and "
-        "`uv run --frozen --no-sync` leaves uv.lock's sha256 byte-identical to "
-        "what `--no-sync` alone leaves it — the two invocations are "
-        "indistinguishable. A flag that survives review by looking like it "
-        "strengthens the line while doing nothing is worse than no flag: "
-        "`--frozen` is exactly how this defect was introduced, because it "
-        "READS as a venv guarantee and is in fact a lockfile option ('run "
-        "without updating the uv.lock file'). If loud failure on lockfile "
+        f"(run-level flags found: {flags}). `--no-sync` skips the LOCK step "
+        "along with the sync, so both lockfile flags buy literally nothing next "
+        "to it — measured, with the exit codes and the unchanged lockfile "
+        "digest, in scripts/orchestrator-autopilot-video.service above its "
+        "ExecStart. A flag that survives review by looking like it strengthens "
+        "the line while doing nothing is worse than no flag: `--frozen` is "
+        "exactly how this defect was introduced, because it READS as a venv "
+        "guarantee and is in fact a lockfile option. If loud failure on lockfile "
         "drift is ever genuinely wanted for a unit, it cannot be bought here — "
-        "it would mean dropping `--no-sync`, which reinstates the hazard. "
-        "Check the lockfile somewhere that is not a unit start."
+        "it would mean dropping `--no-sync`, which reinstates the hazard. Check "
+        "the lockfile somewhere that is not a unit start."
     )

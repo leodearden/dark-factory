@@ -128,20 +128,15 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the df config, no-sync"
-    # --no-sync: process start must NEVER install into the shared
-    # dark-factory/.venv. CORRECTION (task 5553): this assertion pinned
-    # --frozen from the 2026-05-29 ghost-venv fix until then, on the belief
-    # that a frozen start fails fast instead of bootstrapping the runtime
-    # interpreter. Measured false on uv 0.11.6 — --frozen is a LOCKFILE option
-    # and `uv run --frozen` reinstalled a package deleted from the venv;
-    # --no-sync is the flag that stops it. The flag must precede the command
-    # token, or uv never sees it. This is now the NAMED-UNIT half of a sweep,
-    # not the whole guard: tests/scripts/test_uv_run_venv_isolation.py enforces
-    # both arms (--no-sync present, no lockfile flag) fleet-wide.
-    assert "uv run --no-sync --project orchestrator" in content, (
-        "ExecStart must pass --no-sync as a RUN-LEVEL flag (before the command "
-        "token) so unit start never installs into the shared venv"
-    )
+    # --no-sync, and its position before the command token, are pinned by the
+    # contiguous substring above. CORRECTION (task 5553): this pinned --frozen
+    # from the 2026-05-29 ghost-venv fix until then, believing a frozen start
+    # could not bootstrap the runtime interpreter — measured false; --frozen is
+    # a lockfile option (scripts/orchestrator-autopilot-video.service holds the
+    # measurement). The INVARIANT now lives fleet-wide in
+    # tests/scripts/test_uv_run_venv_isolation.py, which checks both arms
+    # (--no-sync present, no lockfile flag) against every committed unit; what
+    # stays here is this unit's config path, which no sweep can know.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -219,13 +214,8 @@ def test_reify_orchestrator_service_structure() -> None:
         "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the reify config, no-sync"
-    # --no-sync: see the df structure test — unit start must never install
-    # into the shared dark-factory/.venv that the reify orchestrator also runs
-    # under, and --frozen (which this pinned until task 5553) does not do that.
-    assert "uv run --no-sync --project orchestrator" in content, (
-        "ExecStart must pass --no-sync as a RUN-LEVEL flag (before the command "
-        "token) so unit start never installs into the shared venv"
-    )
+    # --no-sync: see the df structure test above, and
+    # tests/scripts/test_uv_run_venv_isolation.py for the fleet-wide arm.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -395,7 +385,6 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
-    assert "uv run --no-sync --project orchestrator" in content
     assert "Restart=on-failure" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content

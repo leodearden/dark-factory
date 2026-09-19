@@ -375,9 +375,21 @@ fi
 # The orchestrator units run `uv run --no-sync ...`, so process start never
 # installs into the shared dark-factory/.venv. CORRECTION (task 5553): this note
 # said `--frozen` and said it was what stopped the re-sync. It is not — `--frozen`
-# is a LOCKFILE option ("run without updating the uv.lock file"), and a
-# `uv run --frozen` start was MEASURED on uv 0.11.6 reinstalling a package deleted
-# from the venv. `--no-sync` is the flag that actually stops it.
+# is a LOCKFILE option and a start synced anyway; `--no-sync` is the flag that
+# actually stops it. The measurement behind that is in
+# scripts/orchestrator-autopilot-video.service, above its ExecStart.
+#
+# PROPAGATING THAT FLAG CHANGE TO THIS HOST IS A DELIBERATE, ONE-TIME STEP.
+# check_orchestrator_unit_parity.py below compares parsed directives for FULL
+# symmetric equality, so every unit installed before task 5553 differs from its
+# committed copy on ExecStart, reports verdict `drift`, and is SKIPPED by the
+# per-unit install decision. Until an operator runs
+#   DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh
+#   systemctl --user daemon-reload && scripts/sync-orchestrator-env.sh
+# the running units keep `--frozen` and keep syncing into the shared venv, and
+# every setup-host run keeps reporting drift on all seven. The dashboard and
+# fused-memory units have their own gates and need the same treatment.
+#
 # After any dependency change (or a fresh checkout) run
 # scripts/sync-orchestrator-env.sh once to materialize the runtime venv on the
 # .python-version pin — it now runs `uv sync --all-packages`, the only form that

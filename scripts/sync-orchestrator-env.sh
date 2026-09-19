@@ -12,11 +12,11 @@
 #
 # CORRECTION (task 5553). This header said the units run `uv run --frozen` and that
 # THAT is what stops a start re-syncing. Both were false, and were believed from the
-# 2026-05-29 ghost-venv fix until 2026-09-19. `--frozen` is a LOCKFILE option ("run
-# without updating the uv.lock file"); measured on uv 0.11.6, `uv run --frozen`
-# REINSTALLED a package deleted from the venv ("Installed 1 package in 50ms") while
-# `--no-sync` left it untouched. So for four months the units were mutating the
-# shared venv at every start and this script's premise was wrong.
+# 2026-05-29 ghost-venv fix until 2026-09-19: `--frozen` is a LOCKFILE option, and
+# for four months the units were mutating the shared venv at every start while this
+# script's premise said they could not. `--no-sync` is the flag that stops it. The
+# measurement is in scripts/orchestrator-autopilot-video.service above its ExecStart
+# -- the one place it is written out, so a future uv upgrade has one line to falsify.
 #
 # That fix addressed two hazards. (a) A target's verify subprocess inheriting our
 # VIRTUAL_ENV and running `uv sync` into OUR venv — genuinely fixed, in verify.py's

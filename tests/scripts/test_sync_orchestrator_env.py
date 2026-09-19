@@ -1,12 +1,11 @@
 """Guards on scripts/sync-orchestrator-env.sh — now the venv's ONLY repair path.
 
 Until task 5553 the orchestrator units carried ``--frozen`` and, believing that
-stopped a start from touching the shared venv, treated this script as one
-repair path among several.  It was never that: ``uv run`` is an INEXACT sync
-that INSTALLS a member's missing closure at process start (measured on uv
-0.11.6), and ``--frozen`` — a LOCKFILE option — did not stop it.  So a
-half-synced venv healed itself on the next unit start, and the script's own
-drift was invisible.
+stopped a start from touching the shared venv, treated this script as one repair
+path among several.  It was never that — ``--frozen`` is a lockfile option and a
+start synced anyway, as measured in scripts/orchestrator-autopilot-video.service
+above its ExecStart — so a half-synced venv healed itself on the next unit start
+and the script's own drift was invisible.
 
 With ``--no-sync`` on every unit that self-repair is gone, deliberately: a unit
 now fails with ModuleNotFoundError rather than mutating the environment its
@@ -37,6 +36,44 @@ SYNC_SCRIPT = pathlib.Path(__file__).parents[2] / "scripts" / "sync-orchestrator
 _WATCHDOG_UNIT = "orchestrator-watchdog.service"
 
 
+def _logical_lines(script: str) -> list[str]:
+    """*script*'s lines with backslash continuations joined into one each.
+
+    A line-oriented scan reads ``"$UV" sync \\`` / ``  --all-packages`` as two
+    fragments and finds no invocation at all — the guard below then reports
+    "found 0", which is loud but names the wrong defect.  The shell joins those
+    two physical lines into one command, and so must anything claiming to read
+    the arguments the shell will see.
+
+    A trailing backslash on a COMMENT line does not continue it in shell (the
+    comment ends at the newline), so such a line is never joined onto the next.
+    Joining it would swallow a real command into a comment and drop it from the
+    scan silently — the one direction this helper must refuse.
+
+    Near-duplicate of tests/scripts/test_uv_run_venv_isolation.py::
+    logical_exec_start's continuation join, kept local only because the shared
+    home (tests/scripts/systemd_unit_invariants.py) is outside task 5553's
+    locks; hoisting both is filed as a follow-up.
+    """
+    joined: list[str] = []
+    pending = ""
+    for raw in script.splitlines():
+        line = raw.strip()
+        if pending:
+            line = f"{pending} {line}"
+            pending = ""
+        elif line.startswith("#"):
+            joined.append(line)
+            continue
+        if line.endswith("\\"):
+            pending = line[:-1].strip()
+            continue
+        joined.append(line)
+    if pending:
+        joined.append(pending)
+    return joined
+
+
 def _uv_sync_invocations(script: str) -> list[list[str]]:
     """Every ``uv sync ...`` command line in *script*, tokenised.
 
@@ -46,23 +83,27 @@ def _uv_sync_invocations(script: str) -> list[list[str]]:
     final path segment is ``uv`` or it is a shell parameter expansion naming a
     variable ending in ``UV``.
 
-    Comment lines are dropped BEFORE tokenising.  This script explains uv's
-    sync semantics in prose, so a scan that did not would match the explanation
-    and report on text that never runs — which is the same class of error as
-    the substring check this helper exists to replace.
-
     ``shlex`` rather than a regex because the assertions below are about
     ARGUMENTS: ``--all-packages`` present, ``--project``/``--package`` absent.
-    A regex over the raw line would have to re-derive quoting and word
-    splitting to answer that, and would answer it differently from the shell.
+    A regex over the raw line would have to re-derive quoting and word splitting
+    to answer that, and would answer it differently from the shell.
+
+    Comments are dropped by ``shlex`` itself rather than by a
+    line-starts-with-``#`` test, because the defect is the TRAILING one.  This
+    script explains uv's sync semantics in prose beside the very commands it
+    runs, and a scan that stopped at whole-line comments read ``"$UV" sync
+    --all-packages  # never --project`` as the six tokens ``['$UV', 'sync',
+    '--all-packages', '#', 'never', '--project']`` — then blamed the script for
+    scoping a sync it does not scope.  A guard that misdiagnoses the file it
+    guards is the same class of error as the substring check this helper exists
+    to replace.
     """
     invocations: list[list[str]] = []
-    for raw in script.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    for line in _logical_lines(script):
+        if not line:
             continue
         try:
-            tokens = shlex.split(line)
+            tokens = shlex.split(line, comments=True)
         except ValueError:
             # An unbalanced quote means the line is a fragment of something
             # larger; it cannot be a whole `uv sync` command on its own.
@@ -92,8 +133,8 @@ def test_sync_uses_all_packages() -> None:
     seven orchestrators, the dashboard, the load sampler and fused-memory all
     share.  ``--all-packages`` is the only form that does the job.
 
-    SETUP.md:549-554 already records this norm from the other direction — always
-    ``--all-packages``, never a bare ``uv sync``, because a bare one "exits 0
+    SETUP.md's "Always ``--all-packages``, never a bare ``uv sync``" bullet
+    already records this norm from the other direction: a bare one "exits 0
     while pruning the other members' console scripts — including the
     ``orchestrator`` entry point this host exists to expose (task 4539)".  That
     was observed at console-script granularity; the measurement above reproduces
@@ -165,7 +206,9 @@ def test_sync_stops_every_committed_orchestrator_unit() -> None:
 
     The expected set is DERIVED from ALL_ORCHESTRATOR_SERVICE_FILES (the glob
     over scripts/orchestrator-*.service, itself pinned against a known-basename
-    set by test_orchestrator_service_files.py:570-582) rather than hand-listed.
+    set by tests/scripts/test_orchestrator_service_files.py::
+    test_orchestrator_service_glob_covers_all_known_units) rather than
+    hand-listed.
     Hand-listing is what produced the drift being fixed: the script named three
     units while seven existed, and nothing could notice. Derived, an eighth
     orchestrator unit added next month turns this RED on its own.
