@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import re
 import subprocess
@@ -74,6 +75,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from shared.governed_exceptions import Debt, Disposition, Policy
     from shared.ratchet import Enumeration
+
+# The shared/src bootstrap, resolved from __file__ and inserted at sys.path[0] —
+# the idiom and the precedence argument of
+# scripts/scan_plan_decision_pairing.py. A run inside a task worktree must read
+# THAT checkout's disposition grammar and ratchet kernel, not whichever editable
+# install happens to be on the path; the editable install is an ordinary .pth
+# entry, so sys.path ORDER decides the winner. It sits BELOW every import in this
+# file rather than above them, which is the whole reason no import here needs a
+# suppression for E402: every `shared` name is fetched lazily through
+# :func:`_shared`, so there is no module-level import left to sit after this
+# statement.
+_SHARED_SRC = Path(__file__).resolve().parents[1] / 'shared' / 'src'
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
 
 
 class InstrumentFailure(Exception):
@@ -99,6 +114,38 @@ class InstrumentFailure(Exception):
 #: Generous, and not a performance assertion: `git ls-files` over this tree
 #: takes well under a second, so anything approaching this has hung.
 _GIT_TIMEOUT_SECS = 60
+
+def _shared(name: str) -> ModuleType:
+    """Import ``shared.<name>`` lazily, as exit 2 rather than exit 1.
+
+    THE ONLY PLACE THIS MODULE IMPORTS ``shared``, and the reason is the PRD
+    Contract: an ImportError must be 2, never 1.  A top-level ``from shared… import
+    …`` cannot satisfy that — it raises while this module is still executing, so
+    ``main`` is never defined, the ``__main__`` block never runs, and Python's own
+    uncaught-exception exit is 1, the exact code the ladder reserves for a FINDING.
+    A gate reporting a broken environment as an INV-12 breach sends an agent to
+    fix code that was never the problem.
+
+    Returning the module rather than the names is what keeps the conversion in one
+    place, following ``scripts/merge_lane_metrics.py::_import_complexipy``.  The
+    cost is measured and bounded: attributes come back as ``Any``, so a caller that
+    needs ``isinstance`` NARROWING binds the class through a ``type[X]``
+    annotation first (verified: ``isinstance(x, module.Debt)`` does not narrow,
+    ``debt_type: type[Debt] = module.Debt`` then ``isinstance(x, debt_type)``
+    does).  A caller that only needs the runtime class — an ``except`` clause, a
+    branch predicate — uses the attribute directly.
+    """
+    try:
+        return importlib.import_module(f'shared.{name}')
+    except ImportError as exc:
+        raise InstrumentFailure(
+            f'`shared.{name}` could not be imported, so this scanner has no disposition '
+            f'grammar and no ratchet kernel to work with -- {exc}. It is a workspace '
+            'member of this repository: run the scanner as `uv run --project shared '
+            'python scripts/inline_suppressions.py`, which is how the merge gate and '
+            'every declared check invoke it.'
+        ) from exc
+
 
 #: This checkout, resolved from ``__file__`` rather than from the working
 #: directory, so a run inside a task worktree measures THAT worktree's tracked
@@ -1139,11 +1186,7 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
     module, which is the one thing ``shared.governed_exceptions`` exists to
     prevent.
     """
-    from shared.governed_exceptions import (
-        INLINE_MARKER_FORMS,
-        MalformedDisposition,
-        parse_disposition_marker,
-    )
+    governed = _shared('governed_exceptions')
 
     classified: list[Classified] = []
     violations: list[Violation] = []
@@ -1151,8 +1194,8 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
 
     for comment in scan.comments:
         try:
-            disposition = parse_disposition_marker(comment.text)
-        except MalformedDisposition as exc:
+            disposition = governed.parse_disposition_marker(comment.text)
+        except governed.MalformedDisposition as exc:
             disposition = None
             violations.append(
                 Violation(
@@ -1164,7 +1207,7 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
                         f'the disposition marker in {comment.text!r} does not parse, so '
                         f'nothing here is dispositioned ({exc.__class__.__name__}).'
                     ),
-                    forms=INLINE_MARKER_FORMS,
+                    forms=governed.INLINE_MARKER_FORMS,
                 )
             )
         if disposition is not None and not comment.sites:
@@ -1203,8 +1246,6 @@ def _classify_site(
     site: Site, disposition: Disposition | None, model: ConsumerModel
 ) -> Classified:
     """One site, through the fixed order :func:`classify` documents."""
-    from shared.governed_exceptions import Debt
-
     consumer = model.consumer_for(site)
     if consumer is Consumer.NONE:
         return Classified(site=site, consumer=consumer, ownership=Ownership.UNOWNED)
@@ -1227,7 +1268,11 @@ def _classify_site(
     return Classified(
         site=site,
         consumer=consumer,
-        ownership=Ownership.DEBT if isinstance(disposition, Debt) else Ownership.POLICY,
+        ownership=(
+            Ownership.DEBT
+            if isinstance(disposition, _shared('governed_exceptions').Debt)
+            else Ownership.POLICY
+        ),
         disposition=disposition,
     )
 
@@ -1404,8 +1449,6 @@ def _violation_for(entry: Classified) -> Violation:
     recomputed, because the classification already resolved it — in the fixed
     order that made the site unowned in the first place.
     """
-    from shared.governed_exceptions import INLINE_MARKER_FORMS
-
     dead = entry.consumer is Consumer.NONE
     return Violation(
         path=entry.site.path,
@@ -1413,7 +1456,7 @@ def _violation_for(entry: Classified) -> Violation:
         kind=entry.site.kind,
         codes=entry.site.codes,
         reason=_DEAD_REASON if dead else _UNDISPOSED_REASON,
-        forms=() if dead else INLINE_MARKER_FORMS,
+        forms=() if dead else _shared('governed_exceptions').INLINE_MARKER_FORMS,
     )
 
 
@@ -1721,9 +1764,11 @@ def _owner(debt: Debt) -> str:
     vocabulary.  The two nouns come from the two ref TYPES rather than from a
     string test, which is why a ticket can never be reported as a task.
     """
-    from shared.governed_exceptions import TaskRef
-
-    noun = 'task' if isinstance(debt.owner, TaskRef) else 'ticket'
+    noun = (
+        'task'
+        if isinstance(debt.owner, _shared('governed_exceptions').TaskRef)
+        else 'ticket'
+    )
     return f'{noun} {debt.owner.id}'
 
 
@@ -1782,16 +1827,18 @@ def _owned_blocks(classification: Classification) -> dict[str, object]:
     sites to point at, and ``classes`` carries its own so a blanket ruling cannot
     quietly absorb a growing population.
     """
-    from shared.governed_exceptions import Debt, Policy
+    governed = _shared('governed_exceptions')
+    debt_type: type[Debt] = governed.Debt
+    policy_type: type[Policy] = governed.Policy
 
     debt: list[dict[str, object]] = []
     ratified: dict[str, list[dict[str, object]]] = {}
     classes: dict[str, list[dict[str, object]]] = {}
     for entry in classification.classified:
         record = _site_record(entry.site)
-        if isinstance(entry.disposition, Debt):
+        if isinstance(entry.disposition, debt_type):
             debt.append(record | {'owner': _owner(entry.disposition)})
-        elif isinstance(entry.disposition, Policy):
+        elif isinstance(entry.disposition, policy_type):
             ratified.setdefault(entry.disposition.ratified, []).append(record)
         if entry.suppression_class is not None:
             classes.setdefault(entry.suppression_class.render(), []).append(record)
@@ -1981,10 +2028,8 @@ def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """The 0/1/2 entry point, with every broken-instrument path landing on 2."""
     args = _build_parser().parse_args(argv)
-    from shared import ratchet
-
     try:
-        return _run(args, ratchet)
+        return _run(args, _shared('ratchet'))
     except InstrumentFailure as exc:
         return _refuse(exc)
 
