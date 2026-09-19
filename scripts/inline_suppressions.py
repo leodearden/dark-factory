@@ -420,14 +420,25 @@ def _comment_at(token: tokenize.TokenInfo, *, path: str) -> Comment:
     comments hold 6,047 sites), and a substring test is far cheaper than the
     five pattern searches it stands in front of.  One table, two granularities
     — not a second policy.
+
+    THE PHYSICAL LINE IS STRIPPED ONLY FOR A COMMENT THAT MATCHED, which is the
+    same economy one step further in.  The strip feeds nothing but a
+    :class:`Site`, so over this tree the ~134,000 marker-free comments would
+    otherwise each allocate a string that is discarded on the next line — paid
+    inside the one function the ten-second budget rests on.  The marker test
+    already decides whether it is wanted, so nothing new is being consulted.
     """
     line = token.start[0]
     text = token.string
-    stripped = token.line.strip()
-    sites = tuple(
-        Site(path=path, line=line, kind=kind, codes=spec.codes(match), text=stripped)
+    matched = [
+        (kind, spec.codes(match))
         for kind, spec in KIND_SPECS.items()
         if spec.marker in text and (match := spec.pattern.search(text)) is not None
+    ]
+    stripped = token.line.strip() if matched else ''
+    sites = tuple(
+        Site(path=path, line=line, kind=kind, codes=codes, text=stripped)
+        for kind, codes in matched
     )
     return Comment(path=path, line=line, text=text, sites=sites)
 
@@ -581,10 +592,27 @@ def scan_tree(root: Path, *, scope: tuple[str, ...] = ()) -> Scan:
     fewer files and says so in both counts, which is what makes it the cheap
     early-feedback run D12 keeps it for.  Every verb that a partial view could
     mislead refuses a scope outright rather than relying on this being noticed.
+
+    A SCOPE THAT SELECTS NOTHING IS REFUSED, for the reason
+    :func:`_tracked_python_files` refuses an empty corpus one step earlier —
+    and reaching it needs no broken git, only a mistyped path on the
+    early-feedback run.  The ``0 of 0`` the report line prints is a tell only a
+    reader who looks will catch, and this module chooses refusal over that.
+
+    Raises:
+        InstrumentFailure: the tracked corpus is empty, or *scope* selected
+            none of it.
     """
     tracked = _tracked_python_files(root)
     if scope:
         tracked = tuple(path for path in tracked if _within(path, scope))
+        if not tracked:
+            raise InstrumentFailure(
+                f'scope {", ".join(scope)} matched no tracked *.py file under {root}. '
+                'An empty scan and a clean scan are indistinguishable in a violation '
+                'count, and only one of them is good news -- the same argument '
+                '`_tracked_python_files` makes for an empty corpus.'
+            )
     comments: list[Comment] = []
     tokenized = 0
     for relative in tracked:
@@ -808,12 +836,20 @@ class RuffConfig:
 #: (`extend-ignore`, `per-file-ignores`) are tolerated and deliberately not
 #: modelled, because over-reading only grandfathers a dead marker.
 #:
+#: `extend` is in the list because config INHERITANCE widens in exactly that
+#: expensive direction: the inherited file carries its own `select` /
+#: `extend-select`, which this model does not follow, so the local list read
+#: here would be a subset of the rules ruff actually runs.  Nothing in this
+#: tree uses it today; completeness on the expensive side is the whole purpose
+#: of the list, so it is not left to be discovered by the first pyproject that
+#: does.
+#:
 #: An ABSENT `select` belongs in this family for the same reason and is
 #: enforced with it: ruff then applies its BUILT-IN default rule set, which is
 #: wider than the nothing this model would otherwise infer and which drifts
 #: with the ruff version.  All eight pyprojects here declare `select`
 #: explicitly, so nothing in this tree reaches that refusal.
-_WIDENING_KEYS: tuple[str, ...] = ('extend-select',)
+_WIDENING_KEYS: tuple[str, ...] = ('extend-select', 'extend')
 
 
 def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
@@ -824,6 +860,13 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
     such a manifest and keeps looking upward, so a packaging-only
     ``pyproject.toml`` must not shadow the config above it — stated in this
     repository's own root ``pyproject.toml``.
+
+    ``select`` AND ``ignore`` ARE RESOLVED INDEPENDENTLY, each from the last
+    table that declares it, because that is what ruff does: a deprecated
+    top-level lint key is honoured unless ``[tool.ruff.lint]`` declares that
+    same key.  Taking both off the one table that happened to declare
+    ``select`` would drop an ``ignore`` sitting beside it, and an ignored code
+    is precisely the dead marker :class:`RuffConfig` reads ``ignore`` to name.
     """
     try:
         raw = tomllib.loads(location.read_text(encoding='utf-8'))
@@ -840,19 +883,28 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
         return None
 
     lint = ruff.get('lint')
-    tables = [ruff] + ([lint] if isinstance(lint, dict) else [])
-    for table in tables:
+    tables = [('tool.ruff', ruff)]
+    if isinstance(lint, dict):
+        tables.append(('tool.ruff.lint', lint))
+    for name, table in tables:
         for key in _WIDENING_KEYS:
             if key in table:
                 raise InstrumentFailure(
-                    f'{relative}: [tool.ruff.lint] carries {key!r}, which this consumer '
+                    f'{relative}: [{name}] carries {key!r}, which this consumer '
                     'model does not implement and which could WIDEN the selected rule '
                     'set. Refusing to guess: under-reading the selected set would reject '
                     'a marker ruff genuinely honours.'
                 )
 
-    declaring = next((table for table in reversed(tables) if 'select' in table), None)
-    if declaring is None:
+    def declared(key: str) -> tuple[RuleCode, ...] | None:
+        """*key*'s parsed list from the last table declaring it, else ``None``."""
+        for _, table in reversed(tables):
+            if key in table:
+                return tuple(parse_rule_code(code) for code in table[key])
+        return None
+
+    select = declared('select')
+    if select is None:
         raise InstrumentFailure(
             f'{relative}: has a [tool.ruff] section but declares no `select`, so ruff '
             "applies its BUILT-IN default rule set. This consumer model does not "
@@ -861,11 +913,7 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
             'explicitly, as all eight pyprojects in this repository do.'
         )
 
-    return RuffConfig(
-        path=relative,
-        select=tuple(parse_rule_code(code) for code in declaring.get('select', ())),
-        ignore=tuple(parse_rule_code(code) for code in declaring.get('ignore', ())),
-    )
+    return RuffConfig(path=relative, select=select, ignore=declared('ignore') or ())
 
 
 #: The rule codes first-party checkers define, each mapped to the checker that

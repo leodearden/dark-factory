@@ -701,6 +701,35 @@ def test_type_ignore_and_pyright_ignore_resolve_to_pyright_whatever_the_code(tmp
             ), (kind, codes)
 
 
+def test_a_kind_with_no_row_in_the_consumer_model_is_an_instrument_failure(
+    tmp_path: Path, monkeypatch
+):
+    """The guard that stops a sixth kind inheriting ``noqa``'s behaviour by
+    omission.
+
+    ``_KIND_CONSUMERS`` is deliberately PARTIAL — ``noqa`` has no row because its
+    answer depends on the code and the config — so the read site cannot tell a
+    deliberate absence from a forgotten one by looking at the table alone.  A
+    kind added to ``KIND_SPECS`` and forgotten here would fall straight through
+    to the noqa path and be resolved against a ruff config that has never heard
+    of it, which is a wrong answer delivered confidently.  Exit 2 instead.
+
+    Emptied rather than extended, because :class:`Kind` is a closed enum and no
+    sixth member can be invented from outside: to the one read site, a kind with
+    no row is a kind with no row however the table came to lack it.
+    """
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': _RUFF_CONFIG})
+    monkeypatch.setattr(inline_suppressions, '_KIND_CONSUMERS', {})
+
+    with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
+        _consumer_of(
+            tmp_path, kind=inline_suppressions.Kind.TYPE_IGNORE, codes=('arg-type',)
+        )
+
+    assert 'type: ignore' in str(caught.value)
+    assert 'consumer model' in str(caught.value)
+
+
 def test_pragma_no_cover_and_nosec_resolve_to_no_consumer(tmp_path: Path):
     """D8's finding: nothing in this repository reads either one today.
 
@@ -784,6 +813,32 @@ def test_an_ignored_code_has_no_consumer_even_though_a_selector_matches(tmp_path
     assert _consumer_of(tmp_path, codes=('E501',)) is inline_suppressions.Consumer.NONE
 
 
+def test_ignore_is_read_from_its_own_table_when_select_is_declared_elsewhere(tmp_path: Path):
+    """Ruff honours a DEPRECATED top-level lint key unless ``[tool.ruff.lint]``
+    declares that same key, so the two resolve independently.
+
+    Taking both off whichever table happened to declare ``select`` errs in the
+    lenient direction and so is not a gate hole — but it defeats precisely the
+    case reading ``ignore`` exists for, telling an author to write a disposition
+    for a marker no tool will ever read.  No pyproject in this repository splits
+    the keys today, which is why the behaviour needs a fixture rather than the
+    live tree to hold it.
+
+    The second assertion is the other half: resolving ``ignore`` independently
+    must not cost the ``select`` beside it.
+    """
+    _write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': '[tool.ruff]\nignore = ["E402"]\n[tool.ruff.lint]\nselect = ["E"]\n',
+        },
+    )
+
+    assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.NONE
+    assert _consumer_of(tmp_path, codes=('E731',)) is inline_suppressions.Consumer.RUFF
+
+
 def test_a_bare_noqa_is_consumed_when_the_nearest_config_selects_anything(tmp_path: Path):
     """A bare ``# noqa`` silences whatever ruff would have said, so it is
     consumed exactly when ruff has something to say at all."""
@@ -851,8 +906,15 @@ def test_a_file_with_no_pyproject_above_it_has_no_ruff_consumer(tmp_path: Path):
     assert _consumer_of(tmp_path, codes=('E402',)) is inline_suppressions.Consumer.NONE
 
 
+@pytest.mark.parametrize(
+    ('key', 'config'),
+    [
+        ('extend-select', '[tool.ruff.lint]\nselect = ["E"]\nextend-select = ["ANN"]\n'),
+        ('extend', '[tool.ruff]\nextend = "../shared-ruff.toml"\n[tool.ruff.lint]\nselect = ["E"]\n'),
+    ],
+)
 def test_a_config_key_that_could_widen_the_selected_set_is_an_instrument_failure(
-    tmp_path: Path,
+    tmp_path: Path, key: str, config: str
 ):
     """THE SPLIT IS BY DIRECTION OF ERROR, which is the only thing that matters
     for a gate.
@@ -861,20 +923,20 @@ def test_a_config_key_that_could_widen_the_selected_set_is_an_instrument_failure
     genuinely honours — a false red on a legitimate suppression, the expensive
     failure — so it refuses to guess rather than proceeding on a config it does
     not fully model.  Exit 2, naming the file AND the key.
+
+    ``extend`` is the INHERITANCE case, and it widens by the same arithmetic
+    from another file: the inherited config carries its own ``select`` /
+    ``extend-select``, so the list read here is a subset of the rules ruff
+    actually runs.  Each key is written in the table it may legally appear in,
+    and the refusal names that table.
     """
-    _write_files(
-        tmp_path,
-        {
-            'pkg/mod.py': 'x = 1\n',
-            'pyproject.toml': '[tool.ruff.lint]\nselect = ["E"]\nextend-select = ["ANN"]\n',
-        },
-    )
+    _write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': config})
 
     with pytest.raises(inline_suppressions.InstrumentFailure) as caught:
         _consumer_of(tmp_path, codes=('E402',))
 
     assert 'pyproject.toml' in str(caught.value)
-    assert 'extend-select' in str(caught.value)
+    assert repr(key) in str(caught.value)
 
 
 def test_config_keys_that_only_ever_subtract_are_tolerated(tmp_path: Path):
@@ -1512,6 +1574,29 @@ def test_a_scoped_check_over_a_clean_scope_is_partial_and_ignores_the_rest(
     assert _check(tmp_path, baseline) == 1
 
 
+def test_a_scope_that_matches_no_tracked_file_is_refused(tmp_path: Path, capsys):
+    """The one way a scan reaches an empty corpus with nothing broken at all: a
+    mistyped path on the documented early-feedback run.
+
+    The corpus refusal one step earlier states the argument — an empty scan and
+    a clean scan are the same violation count, and only one of them is good news
+    — and narrowing a healthy corpus to nothing lands in exactly that state.  The
+    report line does print ``0 of 0``, which is a tell only a reader who looks
+    will catch; this module chooses the refusal over the tell.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path, {'pkg/m.py': 'a = 1  # type: ignore[arg-type]\n'}, baseline=True
+    )
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline, 'pkg_typo') == 2
+
+    report = capsys.readouterr()
+    assert 'pkg_typo' in report.err
+    assert 'clean' not in report.out
+    assert 'partial' not in report.out
+
+
 @pytest.mark.parametrize('damage', ['truncated', 'not-json', 'wrong-schema'])
 def test_a_baseline_that_exists_but_cannot_be_read_is_never_green(
     tmp_path: Path, capsys, damage: str
@@ -1545,6 +1630,42 @@ def test_a_baseline_that_exists_but_cannot_be_read_is_never_green(
     assert 'advisory' not in report.out
     assert 'clean' not in report.out
     assert str(baseline) in report.err
+
+
+def test_a_baseline_measured_under_other_params_is_refused_by_every_verb(
+    tmp_path: Path, capsys
+):
+    """The kernel's OTHER reachable refusal, and structurally unlike the three
+    damage cases above: this file is well-formed and loads cleanly, and the
+    refusal arrives later, out of ``excess``/``tighten``.
+
+    The params block is what makes two baselines two measurements of the same
+    thing, so changing the scanned kinds or the digest width makes every count a
+    count of something else — and the only way out is the re-seed the verbs
+    exist to stop anyone performing casually.  ``--tighten`` matters most here:
+    rewriting the file under the new params WOULD be that re-seed, performed by
+    accident and reported as a forward click, so the bytes are asserted
+    unchanged.  It is also the branch the next edit to ``KIND_SPECS`` or the
+    digest width will actually hit.
+    """
+    baseline = _write_fixture_tree(tmp_path, {'m.py': _grandfathered(2)}, baseline=True)
+    raw = json.loads(baseline.read_text(encoding='utf-8'))
+    raw['params']['digest_hex'] = 10
+    baseline.write_text(json.dumps(raw, indent=2, sort_keys=True), encoding='utf-8')
+    unchanged = baseline.read_bytes()
+    capsys.readouterr()
+
+    for verb in ('--check', '--json', '--tighten'):
+        code = inline_suppressions.main(
+            [verb, '--root', str(tmp_path), '--baseline', str(baseline)]
+        )
+        report = capsys.readouterr()
+
+        assert code == 2, (verb, report.out, report.err)
+        assert 'digest_hex' in report.err, verb
+        assert report.out == '', verb
+
+    assert baseline.read_bytes() == unchanged
 
 
 def _seed(root: Path, baseline_path: Path, *paths: str) -> int:
@@ -2056,13 +2177,21 @@ def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys)
     """The NON-VACUITY FLOOR, because "nothing was read" and "nothing was wrong"
     are otherwise the same output.
 
-    Four kinds are non-zero in this repository and the fifth is zero, and that
-    exact shape is the task's user-observable deliverable: pyright and ruff are
-    both declared gates here, no coverage gate is configured, and bandit is not
-    installed — so ``nosec`` reading 0 is a measurement about TOOLS rather than a
-    scanner that stopped looking.  Asserting the zero beside the four is what
-    makes a broken enumeration loud: a scan that silently read nothing would
-    satisfy the zero and fail every other assertion here.
+    Four kinds are non-zero in this repository, and that is the task's
+    user-observable deliverable: pyright and ruff are both declared gates here
+    and ``# type: ignore`` / ``# noqa`` / ``# pragma: no cover`` /
+    ``# pyright: ignore`` all appear, so a scan that silently read nothing fails
+    all four and is loud.
+
+    THE FIFTH KIND IS ASSERTED AS A KEY, NOT AS A ZERO.  ``nosec`` reads 0 only
+    because bandit is not installed, which is a fact about this corpus on this
+    day: the first legitimate ``# nosec`` anyone writes would turn an equality
+    here into a red pointing at this scanner's test rather than at the new
+    marker.  What is worth holding is ``_tally``'s contract that every kind gets
+    a row even at zero — a schema omitting ``nosec`` would make "no bandit
+    markers" and "the scanner stopped looking for them" the same output — and
+    that is a statement about the report's SHAPE, which no corpus can falsify.
+    The four assertions above already carry the whole non-vacuity floor.
     """
     report = _live_report(capsys)
 
@@ -2070,7 +2199,7 @@ def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys)
     assert report['sites'] >= 1000
     for kind in ('type: ignore', 'noqa', 'pragma: no cover', 'pyright: ignore'):
         assert report['kind_totals'][kind] > 0, kind
-    assert report['kind_totals']['nosec'] == 0
+    assert 'nosec' in report['kind_totals']
     assert report['consumers']['none'] > 0
     assert report['ruff_config'] != []
 
