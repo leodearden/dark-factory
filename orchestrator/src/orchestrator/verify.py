@@ -2006,6 +2006,125 @@ def _archive_attempt_log(
     return archived
 
 
+def _archive_attempt_artifact(
+    src: Path,
+    archive_root: 'Path | None',
+    task_id: 'str | None',
+    attempt_id: int,
+    kind: str,
+    *,
+    module_prefix: 'str | None' = None,
+) -> 'Path | None':
+    """Copy one finished-attempt artefact into the durable archive, GREEN OR RED.
+
+    Target: ``<archive_root>/<task_id>/attempt-{N}[.{safe_prefix}].{kind}-<utc_ts><suffix>``
+    — the filename grammar ``_archive_merge_verify_logs`` already writes, so
+    one prune policy and one naming convention cover every file in the tree.
+
+    Deliberately NOT gated on ``_should_archive_category`` the way
+    ``_archive_attempt_log`` is, and not on ``passed`` the way the merge-path
+    log archival is.  Those gates keep FAILURE triage material bounded; this
+    artefact answers "what did this leg cost", a question a red-only corpus
+    cannot answer at all — it is the sample that made two studies read
+    red-conditioned numbers as the population.
+
+    A *src* that does not exist is a normal, expected outcome (the junit
+    report is only written when something actually injected ``--junitxml``),
+    so it returns ``None`` quietly rather than warning.  Every other failure
+    warns and returns ``None``: observability may never fail a verify.
+    """
+    if archive_root is None or task_id is None or not src.is_file():
+        return None
+    target_dir = archive_root / task_id
+    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+    dest = (
+        target_dir
+        / f'attempt-{attempt_id}{_make_infix(module_prefix)}.{kind}-{utc_ts}{src.suffix}'
+    )
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    except OSError as exc:
+        logger.warning(
+            '_archive_attempt_artifact: could not copy %s → %s: %s', src, dest, exc,
+        )
+        return None
+    return dest
+
+
+def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
+    """Write *payload* to *path* as indented UTF-8 JSON, or warn and return None.
+
+    Creates the parent directory.  *caller* names the warning's origin, the
+    way the sibling persistence helpers already spell theirs.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8',
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning('%s: could not write %s: %s', caller, path, exc)
+        return None
+    return path
+
+
+def _persist_verify_plan(
+    plan_dict: 'dict | None',
+    worktree: Path,
+    *,
+    attempt_id: 'int | None',
+    task_id: 'str | None',
+    archive_root: 'Path | None',
+) -> list[Path]:
+    """Persist the derived verify plan as an attempt artefact, green or red.
+
+    ``PlannedRun.reason`` is the only record of WHY a leg ran full-suite
+    rather than file-scoped, and it reached nothing more durable than a
+    ``Verify plan:`` log line — so a later census of scope decisions depended
+    on syslog retention.  It now lands as
+    ``<worktree>/.task/verify/attempt-{N}.plan.json`` and, when the caller
+    archives, as ``<archive_root>/<task_id>/attempt-{N}.plan-<utc_ts>.json``.
+
+    The archive copy is written DIRECTLY rather than copied from the worktree,
+    for the reason ``_archive_merge_verify_logs`` gives: merge worktrees have
+    ``.task/`` scrubbed by design, so there is no worktree file to copy and a
+    copy-based path would archive nothing on exactly the lane whose worktree
+    is deleted minutes later.
+
+    ONE plan covers the whole scoped verify, so the filename carries no module
+    prefix — unlike the per-module ``attempt-{N}[.{prefix}].summary.json``
+    siblings :func:`_persist_attempt_logs` writes.
+
+    Call it where the plan is DECIDED, before the legs run: the plan is never
+    amended afterwards, and writing it up front means a leg killed mid-run
+    still leaves its scope decision on disk.
+
+    Returns the paths written (possibly empty).  Best-effort throughout: a
+    plan that cannot be written must never fail an otherwise-passing verify —
+    the rule ``_safe_derive_verify_plan_dict`` already states for deriving it.
+    """
+    if plan_dict is None or attempt_id is None:
+        return []
+    written: list[Path] = []
+    if (worktree / '.task').is_dir():
+        path = _write_json_artifact(
+            worktree / '.task' / 'verify' / f'attempt-{attempt_id}.plan.json',
+            plan_dict, '_persist_verify_plan',
+        )
+        if path is not None:
+            written.append(path)
+    if archive_root is not None and task_id is not None:
+        utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+        path = _write_json_artifact(
+            archive_root / task_id / f'attempt-{attempt_id}.plan-{utc_ts}.json',
+            plan_dict, '_persist_verify_plan',
+        )
+        if path is not None:
+            written.append(path)
+    return written
+
+
 def _archive_merge_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
@@ -2124,11 +2243,13 @@ def _prune_archive(
     cutoff = now - max_age_days * 86_400
 
     # Single rglob walk — collect all archivable files once, avoiding a second
-    # directory scan for the size-cap pass.  Both *.log and *.json are counted
-    # because _archive_merge_verify_logs emits summary.json files into the same
-    # tree and they would otherwise accumulate unbounded (never counted toward the
-    # size budget, never pruned).
-    _PRUNE_SUFFIXES = frozenset(('.log', '.json'))
+    # directory scan for the size-cap pass.  *.log, *.json and *.xml are all
+    # counted because _archive_merge_verify_logs emits summary.json and
+    # _archive_attempt_artifact emits junit .xml reports into the same tree, and
+    # an uncounted suffix accumulates unbounded (never counted toward the size
+    # budget, never pruned).  The junit reports are retained on GREEN runs too,
+    # so this budget is the only thing bounding them.
+    _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.xml'))
     all_entries: list[tuple[Path, float, int]] = []
     for path in archive_root.rglob('*'):
         if path.suffix not in _PRUNE_SUFFIXES:
@@ -6189,6 +6310,16 @@ async def run_verification(
     failing_test_ids: list[str] | None = None
     if junit_path is not None:
         failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
+        # The report carries this leg's per-test timings — the only per-test
+        # cost record the factory produces — and it lives inside a merge
+        # worktree that is deleted minutes later. Archive it whether the leg
+        # passed or failed: the merge-path LOG archival above is gated on
+        # `not passed`, and a cost corpus that holds only the red runs
+        # describes a different population from the one being measured.
+        _archive_attempt_artifact(
+            junit_path, archive_root, task_id, attempt_id or 1, 'junit',
+            module_prefix=module_prefix,
+        )
 
     result = VerifyResult(
         passed=attempt.passed,
@@ -7061,9 +7192,14 @@ async def run_scoped_verification(
                             'per-module full suite across %d registered module(s))',
                             len(registered_modules),
                         )
+                        plan_dict = plan.to_dict()
+                        _persist_verify_plan(
+                            plan_dict, worktree, attempt_id=attempt_id,
+                            task_id=task_id, archive_root=archive_root,
+                        )
                         results = await asyncio.gather(*(_verify_module(mc) for mc in scoped))
                         aggregated = _aggregate_results(list(results))
-                        aggregated.plan = plan.to_dict()
+                        aggregated.plan = plan_dict
                         return aggregated
                     logger.warning(
                         'Verification mode: workspace (merge_verify_breadth=full) found '
@@ -7262,6 +7398,10 @@ async def run_scoped_verification(
                 # for VerifyResult.plan rather than deriving a second time.
                 plan_dict = plan.to_dict()
                 logger.info('Verify plan: %s', plan_dict)
+                _persist_verify_plan(
+                    plan_dict, worktree, attempt_id=attempt_id,
+                    task_id=task_id, archive_root=archive_root,
+                )
                 # Reverse-dependency test widening (task 2607): the plan
                 # above is authoritative for file-classification scope (task
                 # κ, verify-scope-inversion-prd.md) over the task's OWN
@@ -7482,6 +7622,10 @@ async def run_scoped_verification(
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
+                _persist_verify_plan(
+                    plan_dict, worktree, attempt_id=attempt_id,
+                    task_id=task_id, archive_root=archive_root,
+                )
                 fallback_result = await run_verification(
                     worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
