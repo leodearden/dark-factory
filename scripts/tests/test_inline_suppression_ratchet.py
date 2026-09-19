@@ -1736,3 +1736,241 @@ def test_a_scoped_tighten_is_refused_and_leaves_the_baseline_alone(tmp_path: Pat
 
     assert baseline.read_bytes() == before
     assert 'scoped' in capsys.readouterr().err
+
+
+#: One tree exercising every block the report publishes: an unowned marker of
+#: each pyright spelling, a debt, a policy by inline ratification, both flavours
+#: of dead marker, and a file the prefilter drops.
+_REPORT_TREE = {
+    'pyproject.toml': _RUFF_CONFIG,
+    'plain.py': 'nothing = "here"\n',
+    'm.py': (
+        'a = 1  # type: ignore[arg-type]\n'
+        'b = 2  # noqa: E402  # debt: task 5601\n'
+        'c = 3  # noqa: F401  # ratified: inv12-day-one-test-doubles\n'
+        'd = 4  # pragma: no cover\n'
+        'e = 5  # noqa: PLC0415\n'
+        'g = 7  # pyright: ignore[reportArgumentType]\n'
+    ),
+}
+
+
+def _json_text(root: Path, baseline_path: Path, capsys, *paths: str) -> str:
+    """Run ``--json`` and return its raw stdout, asserting the exit code is 0."""
+    code = inline_suppressions.main(
+        ['--json', '--root', str(root), '--baseline', str(baseline_path), *paths]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    return captured.out
+
+
+def _json_report(root: Path, baseline_path: Path, capsys, *paths: str) -> dict:
+    """The parsed ``--json`` report."""
+    return json.loads(_json_text(root, baseline_path, capsys, *paths))
+
+
+def test_json_publishes_every_block_the_register_reads(tmp_path: Path, capsys):
+    """``--json`` is γ2's only data source, so nothing downstream re-scans.
+
+    The totals are asserted as WHOLE collections rather than by spot-checking a
+    key, because the failure this guards against is a block that quietly stops
+    being emitted — which a membership test passes right up until the consumer
+    reads a missing key.  Every kind appears even at zero, for the same reason:
+    ``nosec`` reading 0 is a measurement, and a schema where it vanishes makes
+    "no bandit markers" and "the scanner forgot bandit" the same output.
+    """
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['schema_version'] == SCHEMA_VERSION
+    assert set(report['params']) == {'kinds', 'key_scheme', 'digest_hex'}
+    assert report['status'] == 'advisory'
+    assert report['files_enumerated'] == 2
+    assert report['files_tokenized'] == 1
+    assert report['sites'] == 6
+    assert report['kind_totals'] == {
+        'noqa': 3,
+        'nosec': 0,
+        'pragma: no cover': 1,
+        'pyright: ignore': 1,
+        'type: ignore': 1,
+    }
+    assert report['consumers'] == {'first-party': 0, 'none': 2, 'pyright': 2, 'ruff': 2}
+    assert report['ownership'] == {'class': 0, 'debt': 1, 'policy': 1, 'unowned': 4}
+    assert report['by_kind_code'] == [
+        {'kind': 'noqa', 'code': 'E402', 'sites': 1},
+        {'kind': 'noqa', 'code': 'F401', 'sites': 1},
+        {'kind': 'noqa', 'code': 'PLC0415', 'sites': 1},
+        {'kind': 'pragma: no cover', 'code': None, 'sites': 1},
+        {'kind': 'pyright: ignore', 'code': 'reportArgumentType', 'sites': 1},
+        {'kind': 'type: ignore', 'code': 'arg-type', 'sites': 1},
+    ]
+
+
+def test_json_names_every_debt_owner_and_every_ratified_id_with_its_sites(
+    tmp_path: Path, capsys
+):
+    """The two blocks that exist for a CONSUMER rather than for a reader.
+
+    γ2's closed-world check asks whether every inline ``ratified:`` id names a
+    real ratification row, so it needs the ids AND the sites citing each one — an
+    id with no sites to point at is a finding it cannot report.  The debt block
+    is the same shape for the same reason: the owner has to be followable back to
+    a task or a ticket without re-scanning the tree.
+    """
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['debt'] == [
+        {'path': 'm.py', 'line': 2, 'kind': 'noqa', 'codes': ['E402'], 'owner': 'task 5601'}
+    ]
+    assert report['ratified'] == [
+        {
+            'id': 'inv12-day-one-test-doubles',
+            'sites': [{'path': 'm.py', 'line': 3, 'kind': 'noqa', 'codes': ['F401']}],
+        }
+    ]
+
+
+def test_json_publishes_the_resolved_ruff_lists_rather_than_the_params_block(
+    tmp_path: Path, capsys
+):
+    """Decision 3's audit trail, and decision 8's placement of it.
+
+    The consumer model's answer for a ``noqa`` depends entirely on these two
+    lists, so a reader has to be able to see what the model actually read —
+    including the known meta-prefix limit, which is only visible as an absence.
+    They are NOT in ``params``: a params mismatch is exit 2 whose only exit is
+    re-seeding, so putting them there would punish an ordinary reviewable
+    pyproject edit by demanding the one operation nobody should perform casually.
+    """
+    files = dict(_REPORT_TREE)
+    files['pkg/pyproject.toml'] = '[tool.ruff.lint]\nselect = ["F"]\nignore = []\n'
+    files['pkg/mod.py'] = 'h = 8  # noqa: F401\n'
+    baseline = _write_fixture_tree(tmp_path, files)
+
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['ruff_config'] == [
+        {'pyproject': 'pkg/pyproject.toml', 'select': ['F'], 'ignore': []},
+        {
+            'pyproject': 'pyproject.toml',
+            'select': ['E', 'F', 'UP', 'B', 'SIM', 'I'],
+            'ignore': ['E501'],
+        },
+    ]
+    assert 'select' not in report['params']
+
+
+def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsys, monkeypatch):
+    """BOUNDARY SCENARIO 10 in the report — blanket policy stays VISIBLE.
+
+    A class row moves sites out of the unowned multiset, which is exactly the
+    move that could hide a growing population behind one operator ruling.  So the
+    report counts them under the rendered class key, and D11's sweep can see how
+    much each row is carrying.
+    """
+    row = inline_suppressions.SuppressionClass(
+        kind=inline_suppressions.Kind.TYPE_IGNORE,
+        code='arg-type',
+        scope=inline_suppressions.Scope.ANY,
+    )
+    monkeypatch.setattr(
+        inline_suppressions, 'RATIFIED_SUPPRESSION_CLASSES', {row: Policy('inv12-day-one')}
+    )
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['classes'] == [
+        {
+            'class': 'type: ignore[arg-type]@any',
+            'sites': [{'path': 'm.py', 'line': 1, 'kind': 'type: ignore', 'codes': ['arg-type']}],
+        }
+    ]
+    assert report['ownership']['class'] == 1
+
+
+def test_json_carries_the_verdict_a_check_would_reach(tmp_path: Path, capsys):
+    """The report reader sees the gate's answer without running the gate.
+
+    Without this a consumer would have to invoke ``--check`` as well, and then
+    reconcile two scans of a tree that may have changed between them.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {
+            'm.py': _grandfathered(3),
+            'n.py': 'y = 8  # type: ignore[arg-type]  # debt: soon\n',
+        },
+        baseline=True,
+    )
+    _revise(tmp_path, {'m.py': _grandfathered(2) + 'z = 9  # type: ignore[no-any-return]\n'})
+
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['status'] == 'clean'
+    assert set(report['baseline']) == {'path', 'present', 'excess', 'slack'}
+    assert report['baseline']['path'] == str(baseline)
+    assert report['baseline']['present'] is True
+    assert list(report['baseline']['excess'].values()) == [1]
+    assert list(report['baseline']['slack'].values()) == [1]
+    located = [(entry['path'], entry['line']) for entry in report['violations']]
+    assert located == [('n.py', 1), ('m.py', 3)]
+
+
+def test_json_exits_zero_even_when_the_gate_would_be_red(tmp_path: Path, capsys):
+    """A REPORT verb, not a gate: a consumer parsing the report must not also be
+    gated by it.
+
+    Only a broken instrument makes ``--json`` non-zero, which is what lets γ2
+    read a tree that is currently in breach — the state it most needs to read.
+    """
+    baseline = _write_fixture_tree(tmp_path, {'m.py': 'a = 1\n'}, baseline=True)
+    _revise(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'})
+
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['violations'] != []
+    assert _check(tmp_path, baseline) == 1
+
+
+@pytest.mark.parametrize('verb', ['--seed', '--tighten'])
+def test_json_is_mutually_exclusive_with_the_writing_verbs(tmp_path: Path, capsys, verb: str):
+    """An argparse error rather than a silent precedence rule.
+
+    ``--json --seed`` has two defensible readings (report then write; write then
+    report) and no way for the caller to say which they meant, so the CLI refuses
+    instead of picking one.
+    """
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+
+    with pytest.raises(SystemExit) as raised:
+        inline_suppressions.main(
+            ['--json', verb, '--root', str(tmp_path), '--baseline', str(baseline)]
+        )
+
+    assert raised.value.code == 2
+    assert 'not allowed with' in capsys.readouterr().err
+
+
+def test_two_json_runs_over_one_tree_emit_identical_bytes(tmp_path: Path, capsys):
+    """Determinism, asserted on BYTES, plus the sort that makes it hold.
+
+    A report that reordered between runs would make every consumer's diff noise,
+    and the reason it cannot is structural: every mapping is dumped with sorted
+    keys and every list is sorted before it is dumped.
+    """
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+
+    first = _json_text(tmp_path, baseline, capsys)
+    second = _json_text(tmp_path, baseline, capsys)
+
+    assert first == second
+    report = json.loads(first)
+    assert list(report) == sorted(report)
+    assert list(report['kind_totals']) == sorted(report['kind_totals'])
+    assert report['by_kind_code'] == sorted(
+        report['by_kind_code'], key=lambda row: (row['kind'], row['code'] or '')
+    )
