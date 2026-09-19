@@ -69,19 +69,22 @@ _RULE_CODE = 'module-local-testclient'
 _EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_CODE)))
 
 
-def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
-    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
+def _is_exempted(lines: list[str], lineno: int) -> bool:
+    """Return True if the node at *lineno* (1-based) carries a valid exemption pragma.
 
     Walks upward from the line ABOVE *lineno* over blank lines to the nearest
-    non-blank line.  If that line matches the exemption regex the node is exempt.
+    non-blank line.  If that line matches ``_EXEMPT_RE`` the node is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
 
     Inline trailing exemption NOT honored: only the nearest *preceding* non-blank
     line is inspected.  A ``# noqa: ...`` comment on the same line as the node is
     intentionally ignored — same contract as ``check_bare_magicmock_config.py``.
+
+    Takes no rule-code argument: this script carries exactly ONE rule, so the
+    code is already baked into ``_EXEMPT_RE``.  ``check_bare_magicmock_config.py``
+    passes one because it genuinely dispatches over three rules; mirroring that
+    signature here would be a parameter with a single possible value.
     """
-    if code != _RULE_CODE:
-        return False
     # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
     idx = lineno - 2  # the line immediately above
     while idx >= 0:
@@ -290,7 +293,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 seen.add(id(child))
                 # Computed LAZILY — only after a construction has matched — so
                 # the upward line walk never runs on every call node in the body.
-                if _is_exempted(lines, child.lineno, _RULE_CODE):
+                if _is_exempted(lines, child.lineno):
                     continue
                 violations.append(
                     Violation(

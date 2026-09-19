@@ -14,7 +14,6 @@ import re
 import shutil
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -124,6 +123,55 @@ def _client():
 '''
         violations = find_violations(source, 'test_x.py')
         assert len(violations) == 1
+
+    def test_async_fixture_constructing_a_client_is_flagged(self):
+        """`@pytest_asyncio.fixture` + `async def` is an ast.AsyncFunctionDef, and counts.
+
+        The rule's cost argument — a second TestClient is a second app lifespan
+        per module — does not care whether the fixture is sync or async, and the
+        async shape is common enough in this repo that leaving it to the
+        `(FunctionDef, AsyncFunctionDef)` tuple untested would let a later edit
+        to the walk drop half the rule silently.
+        """
+        source = '''\
+import pytest_asyncio
+from starlette.testclient import TestClient
+
+
+@pytest_asyncio.fixture(scope='module')
+async def _client():
+    with TestClient(app) as c:
+        yield c
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1
+        assert violations[0].lineno == 7
+
+    def test_fixture_nested_inside_a_fixture_reports_the_construction_once(self):
+        """One construction reachable from two fixture bodies is still ONE violation.
+
+        The inner `def` is walked both as a statement of the outer fixture's
+        body and as a fixture in its own right, so without the identity-keyed
+        `seen` set the same call would be reported twice and the offender would
+        read as two separate defects.
+        """
+        source = '''\
+import pytest
+from starlette.testclient import TestClient
+
+
+@pytest.fixture
+def _outer():
+    @pytest.fixture
+    def _inner():
+        with TestClient(app) as c:
+            yield c
+
+    yield _inner
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1, f'expected one violation, got {violations}'
+        assert violations[0].lineno == 9
 
     def test_syntax_error_returns_no_violations(self):
         """An unparseable file is ruff's problem, not this checker's."""
@@ -558,7 +606,6 @@ class TestRealDashboardTestsDirectoryIsClean:
 
 _HOOKS_PATH = _REPO_ROOT / 'hooks' / 'project-checks'
 _DASHBOARD_YAML = _REPO_ROOT / 'dashboard' / 'orchestrator.yaml'
-_VERIFY_CMD_PATH = _REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'verify_cmd.py'
 
 
 def _live_dashboard_lint_command() -> str:
@@ -567,32 +614,33 @@ def _live_dashboard_lint_command() -> str:
     return config['lint_command']
 
 
-def _load_verify_cmd() -> types.ModuleType:
-    """Load orchestrator.verify_cmd by PATH.
+def _hook_staged_files_pathspec(content: str, var: str) -> str:
+    """The pathspec text of the hook's ``<var>="$( ... )"`` staged-files command substitution.
 
-    ``orchestrator`` is not installed in fused-memory's environment, but
-    verify_cmd.py's top-level imports are all stdlib (posixpath, re, shlex,
-    collections.abc, dataclasses, enum), so it loads standalone.  The module
-    must be registered in ``sys.modules`` BEFORE exec_module: its ``@dataclass``
-    decorators resolve ``cls.__module__`` through that table and raise
-    AttributeError otherwise.  ``load_script_module`` installs the key before
-    executing, so that constraint is satisfied by using it.
-
-    The explicit *mod_name* keeps the key off the file stem: ``verify_cmd`` is
-    the name the real ``orchestrator.verify_cmd`` would occupy if anything else
-    in the process imported the package.
-
-    Loading the REAL module (rather than skipping, or reimplementing the split)
-    is what keeps this assertion non-vacuous.
+    Slices from the assignment to the closing ``)"`` and strips comments, so a
+    caller asserts against ONE gate's own scan target rather than against any
+    line in the file.  Every gate in hooks/project-checks follows this shape and
+    several name the same directories, so a whole-file scan cannot distinguish
+    them and reports green for a pathspec that moved to another package.
     """
-    return load_script_module(_VERIFY_CMD_PATH, mod_name='_vc_for_4485')
+    _, marker, after = content.partition(f'{var}="$(')
+    assert marker, f'no {var}="$(...)" staged-files assignment in hooks/project-checks'
+    block, closer, _ = after.partition(')"')
+    assert closer, f'unterminated {var}="$(...)" command substitution'
+    return '\n'.join(line.split('#')[0] for line in block.splitlines())
 
 
 class TestWiring:
-    """The gate must actually be wired, in both places, in the shape verify can scope.
+    """The gate must actually be wired, in both places this suite owns.
 
     Mirrors TestHooksIntegration in test_check_asyncmock_assertion_style.py,
     including its comment-stripping and word-boundary technique.
+
+    Scope boundary: these tests assert that the wiring NAMES THIS SCRIPT and
+    points at dashboard/tests.  Whether the resulting chain survives verify's
+    scoper, and whether it matches the YAML byte for byte, belongs to the
+    orchestrator's own verify-config corpus and is asserted there — see
+    ``test_dashboard_lint_command_carries_a_leg_for_THIS_script``.
     """
 
     def test_hook_invokes_check_with_python3_not_uv_run(self):
@@ -603,6 +651,13 @@ class TestWiring:
         That excludes both full-line bash comments and inline trailing ones,
         either of which would otherwise land in invocation_lines and fail the
         python3/no-uv-run assertions on a benign edit.
+
+        The scoping half reads THIS gate's own pathspec block, not the whole
+        file. A whole-file scan for `dashboard/tests` is vacuous here: the
+        bare-magicmock gate two blocks up already lists `dashboard/tests` among
+        five pathspecs on a non-comment line, so rewriting this gate's pathspec
+        to another package left the assertion green — exactly the ships-green
+        failure mode this checker exists to close.
         """
         content = _HOOKS_PATH.read_text(encoding='utf-8')
         invocation_lines = [
@@ -612,9 +667,18 @@ class TestWiring:
         assert invocation_lines, (
             'No invocation of check_module_local_testclient.py found in hooks/project-checks'
         )
-        assert any(
-            'dashboard/tests' in line.split('#')[0] for line in content.splitlines()
-        ), 'Expected dashboard/tests scan target in non-comment code in hooks/project-checks'
+        assert all('staged_tc' in line for line in invocation_lines), (
+            f'The checker invocation must consume the staged_tc file list: {invocation_lines}'
+        )
+
+        pathspec = _hook_staged_files_pathspec(content, 'staged_tc')
+        assert 'dashboard/tests' in pathspec, (
+            f'staged_tc must collect dashboard/tests paths, got: {pathspec!r}'
+        )
+        for foreign in ('shared/tests', 'escalation/tests', 'fused-memory/tests', 'orchestrator/tests'):
+            assert foreign not in pathspec, (
+                f'This gate is dashboard-only; {foreign!r} must not be in its pathspec: {pathspec!r}'
+            )
 
         for line in invocation_lines:
             assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
@@ -624,38 +688,34 @@ class TestWiring:
                 f'Found uv run in the checker invocation (should use plain python3): {line!r}'
             )
 
-    def test_dashboard_lint_command_carries_the_checker_leg(self):
-        """Read through YAML, exactly as the orchestrator reads it — not grepped."""
+    def test_dashboard_lint_command_carries_a_leg_for_THIS_script(self):
+        """dashboard's lint_command must invoke this very script against dashboard/tests.
+
+        Deliberately narrow.  The chain's SHAPE — its ruff head, its exact
+        3-segment text, and its survival through verify's scoper with both
+        sibling checker legs verbatim — is pinned on the orchestrator side, by
+        ``orchestrator/tests/_verify_config_corpus.py::DASHBOARD_LINT_COMMAND``
+        (asserted byte-equal to the live YAML) and
+        ``orchestrator/tests/test_verify_plan.py::test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers``.
+        Re-asserting any of that here would be a second copy of one fact in a
+        second package, and the copy paying the module-boundary cost.
+
+        What is NOT pinned there, and is this suite's own business, is the link
+        between the checker and its wiring: the leg is derived from SCRIPT_PATH,
+        so renaming or deleting the script while quietly updating the YAML and
+        the orchestrator corpus in lockstep still goes red here.
+        """
         cmd = _live_dashboard_lint_command()
 
-        assert cmd.startswith('uv run --directory dashboard ruff check'), (
-            f'dashboard lint_command lost its ruff head: {cmd!r}'
-        )
         legs = [leg.strip() for leg in cmd.split('&&')]
-        checker_legs = [
-            leg for leg in legs if 'check_module_local_testclient.py' in leg
-        ]
-        assert len(checker_legs) == 1, f'Expected exactly one checker leg, got {checker_legs}'
+        checker_legs = [leg for leg in legs if SCRIPT_PATH.name in leg]
+        assert len(checker_legs) == 1, (
+            f'Expected exactly one {SCRIPT_PATH.name} leg in dashboard lint_command, '
+            f'got {checker_legs} from {cmd!r}'
+        )
         assert checker_legs[0].endswith('dashboard/tests'), (
             f'Checker leg must target dashboard/tests: {checker_legs[0]!r}'
         )
-        assert re.search(r'\bpython3(?:\.\d+)?\b', checker_legs[0]), checker_legs[0]
-
-    def test_split_chain_tail_preserves_both_checker_legs_verbatim(self):
-        """The 3-segment chain must survive verify's scoper with BOTH checker legs intact.
-
-        This is the property orchestrator/tests/test_verify_cmd.py already pins
-        for the 3-segment FM_LINT_COMMAND — the standing precedent that a second
-        `&& python3` leg survives scoping. Dashboard becomes the second such chain.
-        """
-        verify_cmd = _load_verify_cmd()
-        cmd = _live_dashboard_lint_command()
-
-        head, tail = verify_cmd.split_chain_tail(cmd, 'ruff check')
-        assert tail, f'split_chain_tail dropped the whole chain for {cmd!r}'
-        assert head + tail == cmd, 'split_chain_tail is not byte-exact on the dashboard chain'
-        assert 'check_bare_magicmock_config.py' in tail, 'the magicmock leg was dropped'
-        assert 'check_module_local_testclient.py' in tail, 'the new checker leg was dropped'
 
     def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
         """Running under `python3 -I -S` proves the script imports only stdlib.
