@@ -959,6 +959,28 @@ def _row_for(out: str, ruling_class: str) -> str:
     return rows[0]
 
 
+def _row_cells(out: str, ruling_class: str) -> dict[str, str]:
+    """The class row parsed into its columns, so a test can assert on VALUES.
+
+    A substring check against the formatted row is much weaker than it reads:
+    the column padding puts a lone digit in almost any row, and a digit that
+    happens to fall inside the rate defeats a "this count did not leak"
+    assertion. Every cell is whitespace-separated and every class slug is a
+    single token, so splitting recovers exactly the columns ``_ROW`` wrote.
+    """
+    cells = _row_for(out, ruling_class).split()
+    assert len(cells) == 6, f'expected the 6 columns _ROW writes, got {cells!r}'
+    cls, agreed, diverged, not_comparable, comparable, rate = cells
+    assert cls == ruling_class
+    return {
+        'agreed': agreed,
+        'diverged': diverged,
+        'not_comparable': not_comparable,
+        'comparable': comparable,
+        'rate': rate,
+    }
+
+
 class TestCliTable:
     def test_prints_a_row_per_class_with_counts_and_rate(self, tmp_path: Path, capsys):
         fixture = _Fixture(tmp_path)
@@ -974,9 +996,15 @@ class TestCliTable:
         ])
 
         assert code == 0
-        row = _row_for(capsys.readouterr().out, _BRANCH_BEHIND)
-        for field in ('3', '1', '4', '75'):
-            assert field in row, f'expected {field!r} in the class row: {row!r}'
+        # Every cell, by value: three agreements, the `resume` proposal against
+        # an observed `close_only` as the one divergence, the task-side
+        # `file_task` proposal outside the denominator, and the rate read off
+        # the comparable four. Asserting the digits as substrings would pass on
+        # a row that had them in the wrong columns.
+        assert _row_cells(capsys.readouterr().out, _BRANCH_BEHIND) == {
+            'agreed': '3', 'diverged': '1', 'not_comparable': '1',
+            'comparable': '4', 'rate': '75.0%',
+        }
 
     def test_prints_the_three_excluded_buckets(self, tmp_path: Path, capsys):
         fixture = _Fixture(tmp_path)
@@ -1024,10 +1052,14 @@ class TestCliTable:
         out = capsys.readouterr().out
         assert 'self_resolved=2' in out
         assert 'unresolved_lifetime=0' in out
-        row = _row_for(out, _BRANCH_BEHIND)
-        assert '2' not in row.replace(_BRANCH_BEHIND, ''), (
-            f'the two self-resolved records leaked into the class row: {row!r}'
-        )
+        # The one comparable record and nothing else. Pinning every cell shows
+        # the two self-resolved records reached neither a count nor the
+        # denominator; the `'2' not in row` check this replaces only held
+        # because the rate happened to render without a 2.
+        assert _row_cells(out, _BRANCH_BEHIND) == {
+            'agreed': '1', 'diverged': '0', 'not_comparable': '0',
+            'comparable': '1', 'rate': '100.0%',
+        }
 
     def test_an_unmeasurable_rate_is_not_printed_as_a_number(self, tmp_path: Path, capsys):
         fixture = _Fixture(tmp_path)
@@ -1205,6 +1237,51 @@ class TestCliDegradesLoudly:
         assert 'gated_stamps' not in captured.out, (
             'a misconfigured window must not print a table at all'
         )
+
+    def test_an_inverted_window_is_rejected_rather_than_reported_as_quiet(
+        self, tmp_path: Path, capsys,
+    ):
+        """`--since` after `--until` is the same class of misconfiguration as
+        an unparsable value, and it reaches the same exit path. Both bounds
+        parse, so nothing upstream catches it, yet the window can never match a
+        record: reported rather than rejected it prints `no shadow rulings in
+        window` with all-zero buckets, which is exactly what a genuinely quiet
+        week prints. A reader cannot tell those two apart, and that is the
+        confusion this module's loud-not-all-zero discipline exists to stop."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        code = main([
+            '--queue-dir', str(fixture.queue.queue_dir),
+            '--since', '2030-01-01', '--until', '2020-01-01',
+        ])
+
+        assert code == 2
+        captured = capsys.readouterr()
+        assert '2030-01-01' in captured.err and '2020-01-01' in captured.err, (
+            f'both bounds must be named so the operator sees the inversion: '
+            f'{captured.err!r}'
+        )
+        assert 'gated_stamps' not in captured.out, (
+            'an inverted window must not print a table at all'
+        )
+
+    def test_a_window_whose_bounds_are_equal_is_accepted(
+        self, tmp_path: Path, capsys,
+    ):
+        """The guard rejects INVERTED, not empty. A zero-width window is a
+        legitimate (if useless) query, and the boundary is where an
+        over-eager `>=` would start rejecting real ones."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+
+        code = main([
+            '--queue-dir', str(fixture.queue.queue_dir),
+            '--since', '2020-01-01', '--until', '2020-01-01',
+        ])
+
+        assert code == 0
+        assert 'no shadow rulings in window' in capsys.readouterr().out
 
 
 class TestCliJson:

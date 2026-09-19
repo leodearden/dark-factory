@@ -663,6 +663,20 @@ def main(argv: list[str] | None = None) -> int:
         print(bad, file=sys.stderr)
         return 2
 
+    # Same discipline, second failure mode: both bounds parsed, so nothing
+    # above catches this, but an inverted window matches no record by
+    # construction and so renders as `no shadow rulings in window` with
+    # all-zero buckets — byte-for-byte what a genuinely quiet week renders as.
+    # Rejected rather than reported, because a reader cannot tell those apart.
+    # INVERTED, not empty: `since == until` is a legitimate zero-width query.
+    if since > until:
+        print(
+            f'--since {since.isoformat()} is after --until {until.isoformat()}: '
+            'an inverted window matches no record',
+            file=sys.stderr,
+        )
+        return 2
+
     report = agreement_report(args.queue_dir, since=since, until=until)
     print(_as_json(report) if args.json else _as_table(report))
     return 0
