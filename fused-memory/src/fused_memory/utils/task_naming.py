@@ -15,6 +15,11 @@ disagree about what is a task node. The post-write normalization hook
 (MemoryService._normalize_task_node_names) needs both halves: the identity to
 key a family on and to probe the backend with, the name to rename onto.
 
+``group_task_node_families`` lifts the identity view to a BATCH of nodes,
+partitioning them into families. It is the one site both family consumers read
+— that same normalization hook, and maintenance/task_family_census — so
+neither has to re-decide what belongs together.
+
 This module owns NO pattern of its own. The task-label vocabulary lives in
 utils/canonical_labels.py, the single normative site (INV-5 / PRD decision 5),
 and this module is a thin adapter over its ``parse_node_name``. That is not
@@ -30,7 +35,15 @@ reconciliation sweep without import cycles.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+from typing import Any, TypeVar
+
 from fused_memory.utils.canonical_labels import Referent, parse_node_name
+
+#: Bound to Mapping rather than fixed to dict so grouping never narrows what a
+#: caller gets back: the node rows the backend hands in come out of
+#: ``group_task_node_families`` as the very same objects, same type.
+_NodeT = TypeVar('_NodeT', bound=Mapping[str, Any])
 
 
 def task_node_referent(name: str) -> Referent | None:
@@ -112,3 +125,49 @@ def canonicalize_task_node_name(name):
     """
     referent = task_node_referent(name)
     return referent.node_name if referent is not None else None
+
+
+def group_task_node_families(nodes: Iterable[_NodeT]) -> dict[Referent, list[_NodeT]]:
+    """Partition *nodes* into task families, dropping everything that is not one.
+
+    THE single site of the family-grouping rule, which is why a four-line loop
+    is a named function. Two consumers need exactly this operation and must
+    agree on it:
+
+    - ``MemoryService._normalize_task_node_names`` narrows a backend substring
+      probe down to one family with it. The probe is a deliberately dumb
+      ``CONTAINS`` match, so it also returns 'Task 6051', 'Task 1605' and
+      'reify:605'; this function is where that recall is turned back into
+      precision, using :func:`task_node_referent`'s one acceptance rule rather
+      than a second copy of the label vocabulary inside a Cypher predicate.
+    - ``maintenance/task_family_census`` partitions a whole graph with it to
+      count the families that are still fragmented.
+
+    Order is preserved twice over, and the second one is load-bearing rather
+    than incidental: families appear in first-seen order, and WITHIN a family
+    the nodes keep their input order, so the backend's survivor-first ordering
+    (most valid edges, then oldest, then uuid) reaches the normalizer intact
+    and ``members[0]`` is still the merge survivor.
+
+    A node with a missing, empty or non-task ``'name'`` is skipped rather than
+    raising: this runs on a best-effort post-commit path where one malformed
+    row must not abandon every other family in the batch.
+
+    Args:
+        nodes: Node mappings, each expected to carry a ``'name'`` key. The
+            mappings are returned as-is, never copied or rewritten.
+
+    Returns:
+        A dict keyed by the family's :class:`Referent`, each value the list of
+        member nodes in input order. Empty when no node names a task.
+    """
+    families: dict[Referent, list[_NodeT]] = {}
+    for node in nodes:
+        name = node.get('name')
+        if not name:
+            continue
+        referent = task_node_referent(name)
+        if referent is None:
+            continue
+        families.setdefault(referent, []).append(node)
+    return families
