@@ -52,7 +52,7 @@ Type=simple
 WorkingDirectory=/home/leo/src/dark-factory
 # Gate startup on fused-memory's MCP port (8002) being live. Pairs with Wants=.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/pump-web-ui/dark-factory-orchestrator.yaml
+ExecStart=/home/leo/.local/bin/uv run --no-sync --frozen --project orchestrator orchestrator run --config /home/leo/src/pump-web-ui/dark-factory-orchestrator.yaml
 # Replicate PATH so verify subprocesses find node/npm/uv (a user service gets a
 # minimal PATH). node/npm are in /usr/bin, uv in ~/.local/bin.
 Environment=PATH=/home/leo/.local/npm-global/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin

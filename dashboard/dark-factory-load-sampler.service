@@ -9,7 +9,7 @@ Type=oneshot
 # differs.  Alternatively set DARK_FACTORY_ROOT=<repo-root> in an
 # EnvironmentFile= to override the DB path without editing this unit.
 WorkingDirectory=%h/src/dark-factory
-ExecStart=%h/.local/bin/uv run --project sampler python -m sampler
+ExecStart=%h/.local/bin/uv run --no-sync --project sampler python -m sampler
 
 # Logging goes to journalctl --user -u dark-factory-load-sampler
 StandardOutput=journal
