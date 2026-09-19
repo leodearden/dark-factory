@@ -6019,11 +6019,18 @@ class Harness:
             action == RecoveryAction.CONVERT_TO_BLOCKED
             and not report_pins_blocked_recovery(report)
         ):
+            # Says what the clause ACTUALLY asked.  It used to name the records
+            # "merge-remediable", which was exact while the question WAS
+            # `_only_merge_remediable` — but the predicate now also clears a row
+            # pinned solely by a dead-filer L0 in a NON-remediable category (the
+            # consequence documented above), so that label would tell an
+            # operator the opposite of the truth about why the row was held.
+            # The `id:category` list speaks for itself instead.
             logger.info(
                 'Reconcile: task %s matches a convert_to_blocked row but is '
-                'pinned only by merge-remediable escalation(s) %s — holding '
-                'as before (a converted row would not be at rest: the '
-                'blocked-arm upgrade clauses would move it again next sweep)',
+                'held: the blocked-arm upgrade clauses would move a converted '
+                'row again next sweep, so it would not be at rest '
+                '(open record(s): %s)',
                 tid,
                 ', '.join(
                     f'{ref.id}:{ref.category}' for ref in report.open_escalations
@@ -13089,22 +13096,32 @@ class Harness:
             # Sited BELOW the age check on purpose: a `get_task` is paid only
             # for records that are BOTH aged out AND currently deferred, so the
             # common case (young, or nothing live) costs exactly what it did.
+            #
+            # `liveness_note` records WHICH arm cleared this record, because the
+            # promoted L1's summary and the dismissal note may only claim what
+            # that arm actually established — see the promotion site below.
+            liveness_note = 'no active workflow'
             if (
                 esc.task_id in self._escalation_events
                 or self.scheduler.is_actively_held(esc.task_id)
             ):
                 live_row = await _task_row()
+                live_run_id = (live_row or {}).get('claimant_run_id')
                 pins = classify_pins(
                     esc.task_id,
                     [esc],
                     live_claimant=True,
-                    live_claimant_id=(live_row or {}).get('claimant_run_id'),
+                    live_claimant_id=live_run_id,
                 )
                 if esc.id not in pins.dead_l0:
                     # Deferred, not dropped — exactly as before.  The next
                     # sweep re-checks and promotes once the filer is provably
                     # gone (or the record is consumed).
                     continue
+                liveness_note = (
+                    f'filing incarnation {esc.filing_claimant_run_id} is gone, '
+                    f'current claimant is {live_run_id}'
+                )
 
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
@@ -13219,6 +13236,16 @@ class Harness:
             # the orphan's worktree is ephemeral and likely reaped before a
             # human reads the promoted L1 (see workflow._durable_ref_suffix).
             branch = f'{self.config.git.branch_prefix}{esc.task_id}'
+            # Both strings below are branched on `liveness_note` (task 3541)
+            # rather than asserting "no active workflow" unconditionally.  That
+            # claim was true while the reaper skipped every task with a live
+            # signal; the filing-incarnation arm promotes precisely when a
+            # workflow IS live and only the FILER is gone, so the old wording
+            # would be false in exactly the case this arm adds.  It is not
+            # cosmetic: `TaskWorkflow._wait_for_resolution` polls `get_by_task`
+            # TASK-scoped, not incarnation-scoped, so this dismissal wakes the
+            # live run and its note is the resolution a live agent reads on
+            # resume.
             reesc = Escalation(
                 id=self._escalation_queue.make_id(esc.task_id),
                 task_id=esc.task_id,
@@ -13226,7 +13253,7 @@ class Harness:
                 severity=esc.severity,
                 category=esc.category,
                 summary=(
-                    f'Orphan L0 ({age_secs:.0f}s old, no active workflow): '
+                    f'Orphan L0 ({age_secs:.0f}s old, {liveness_note}): '
                     f'{esc.summary}'
                 ),
                 detail=(
@@ -13244,8 +13271,8 @@ class Harness:
             self._escalation_queue.resolve(
                 esc.id,
                 (
-                    'Auto-promoted to level 1 — orphan L0 (no active '
-                    f'workflow for task_id={esc.task_id})'
+                    f'Auto-promoted to level 1 — orphan L0 for '
+                    f'task_id={esc.task_id} ({liveness_note})'
                 ),
                 dismiss=True,
                 resolved_by='harness-orphan-reaper',
