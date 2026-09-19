@@ -2450,6 +2450,14 @@ def test_delegate_fleet_restart_swallows_missing_binary(monkeypatch: pytest.Monk
     assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
 
 
+# _delegate_fleet_restart's REGISTRATION-OUTCOME tests (task 4131, item 5) are
+# not here: they are parametrized over both delegates in "Part C: transient-unit
+# registration outcomes", which is where the measurement that decides them is
+# recorded. Written once rather than twice on purpose — the two delegates share
+# one registration helper precisely so they cannot drift, and two copies of the
+# pins would be free to drift even when the code could not.
+
+
 # ---------------------------------------------------------------------------
 # staleness_pass fleet-deploy clock gate tests (task 2396, fleet-redeploy β,
 # step 9)
@@ -6979,6 +6987,331 @@ def test_delegate_fm_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyP
     wdog._delegate_fm_restart()
 
     assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
+
+
+# ---------------------------------------------------------------------------
+# Part C: transient-unit registration outcomes (task 4131, task item 5)
+#
+# Both staleness delegates used to discard systemd-run's CompletedProcess
+# entirely, so a genuine registration failure was indistinguishable from the
+# benign in-flight collision their own docstrings describe — and a persistent
+# failure was invisible in the journal. These pin the classification.
+#
+# MEASURED ON THIS HOST, because the obvious reading of "check the exit code"
+# is FALSIFIED: `systemd-run --user --collect --no-block --unit=X` exits 1 for
+# a name collision ("Unit X was already loaded or has a fragment file"), 1 for
+# an unrecognised option, and 1 for a missing executable. The exit CODE alone
+# cannot carry the distinction, so a test asserting that it can would be
+# un-GREENable. The discriminator that WAS measured to work is a structured
+# state probe: during a live collision `systemctl --user is-active X` prints
+# "active" (rc=0); for a never-registered or already-collected unit it prints
+# "inactive" (rc=4). Everything below is written against that, and against
+# systemd's own ActiveState enum rather than any human-readable message.
+#
+# Parametrized over BOTH delegates so their symmetry is PINNED rather than
+# asserted in prose: they are documented line-for-line siblings, and the whole
+# point of the shared registration helper is that they cannot drift apart.
+# ---------------------------------------------------------------------------
+
+_REGISTRATION_DELEGATES = [
+    ("_delegate_fm_restart", "fm-staleness-redeploy.service"),
+    ("_delegate_fleet_restart", "orch-fleet-staleness-redeploy.service"),
+]
+
+# What an operator greps for. The in-flight line must NOT match it — that is
+# the entire deliverable of task item (5).
+_REGISTRATION_FAILURE_TOKEN = "fail"
+
+
+def _registration_run(
+    calls: list[list[str]],
+    *,
+    register_rc: int = 0,
+    register_stderr: str = "",
+    register_raises: BaseException | None = None,
+    probe_stdout: str = "inactive\n",
+    probe_rc: int = 4,
+    probe_raises: BaseException | None = None,
+):
+    """A subprocess.run stand-in dispatching on argv[0] (systemd-run vs systemctl).
+
+    Records every call into *calls* so a test can assert how many probes fired
+    as well as what was logged.
+    """
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        if cmd[0] == "systemd-run":
+            if register_raises is not None:
+                raise register_raises
+            return subprocess.CompletedProcess(
+                cmd, register_rc, stdout="", stderr=register_stderr
+            )
+        if cmd[0] == "systemctl":
+            if probe_raises is not None:
+                raise probe_raises
+            return subprocess.CompletedProcess(
+                cmd, probe_rc, stdout=probe_stdout, stderr=""
+            )
+        raise AssertionError(f"unexpected command in a registration test: {cmd}")
+
+    return fake_run
+
+
+def _probe_calls(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if c[0] == "systemctl"]
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_registration_happy_path_probes_nothing_and_reports_no_failure(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """Exit 0: ONE subprocess call, and systemd-run's banner survives capture.
+
+    The path that runs ~always must not grow a second subprocess call — that is
+    also the compatibility constraint the existing argv-shape tests encode
+    (`len(calls) == 1`). Capturing the banner rather than letting it reach the
+    journal raw is what makes the registration attributable to the watchdog's
+    own log prefix.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    banner = f"Running as unit: {unit}"
+    monkeypatch.setattr(
+        subprocess, "run", _registration_run(calls, register_rc=0, register_stderr=banner)
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()
+
+    assert len(calls) == 1, f"the happy path must make exactly one call: {calls}"
+    assert _probe_calls(calls) == [], "no state probe may fire on a successful registration"
+    assert not any(_REGISTRATION_FAILURE_TOKEN in m.lower() for m in log_messages), (
+        f"a successful registration must not read as a failure: {log_messages}"
+    )
+    assert any(banner in m for m in log_messages), (
+        f"systemd-run's captured banner must be surfaced, not swallowed: {log_messages}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_registration_collision_reports_the_redeploy_as_in_flight(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """Non-zero exit + an ACTIVE unit is the benign overlap, and must not read as a failure."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(calls, register_rc=1, probe_stdout="active\n", probe_rc=0),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()
+
+    assert len(_probe_calls(calls)) == 1, f"exactly one state probe must fire: {calls}"
+    assert unit in _probe_calls(calls)[0], f"the probe must name the unit: {calls}"
+    in_flight = [m for m in log_messages if unit in m and "in flight" in m.lower()]
+    assert in_flight, f"the collision must be reported as already in flight: {log_messages}"
+    assert not any(_REGISTRATION_FAILURE_TOKEN in m.lower() for m in log_messages), (
+        f"a benign collision must not read as a failure: {log_messages}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+@pytest.mark.parametrize("register_rc", [1, 203])
+def test_registration_failure_reports_the_exit_code_and_the_reason(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str, register_rc: int
+) -> None:
+    """Non-zero exit + an INACTIVE unit is a genuine failure, reported with its reason.
+
+    "The exit code is checked and logged" is the task's literal ask, so the
+    integer must appear — but a bare number is not actionable, which is why
+    systemd-run's own captured stderr rides along.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    reason = "Failed to find executable /nonexistent/binary: No such file or directory"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(
+            calls,
+            register_rc=register_rc,
+            register_stderr=reason,
+            probe_stdout="inactive\n",
+            probe_rc=4,
+        ),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()
+
+    assert len(_probe_calls(calls)) == 1, f"exactly one state probe must fire: {calls}"
+    loud = [m for m in log_messages if _REGISTRATION_FAILURE_TOKEN in m.lower()]
+    assert loud, f"a genuine registration failure must be reported loudly: {log_messages}"
+    assert any(unit in m for m in loud), f"the failure must name the unit: {loud}"
+    assert any(str(register_rc) in m for m in loud), (
+        f"the failure must carry systemd-run's exit code {register_rc}: {loud}"
+    )
+    assert any(reason in m for m in loud), (
+        f"the failure must carry systemd-run's captured stderr, not just a number: {loud}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_the_two_registration_outcomes_are_distinguishable(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """THE assertion the task exists to make true: same exit code, different line.
+
+    Both runs exit 1 — exactly as measured on this host — so the only thing
+    that separates them is the state probe. An operator grepping the journal
+    must be able to select one and not the other.
+    """
+    wdog = _load_watchdog()
+
+    def run_with(probe_stdout: str, probe_rc: int) -> list[str]:
+        messages: list[str] = []
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                subprocess,
+                "run",
+                _registration_run(
+                    [], register_rc=1, probe_stdout=probe_stdout, probe_rc=probe_rc
+                ),
+            )
+            mp.setattr(wdog, "log", lambda m: messages.append(m))
+            getattr(wdog, delegate)()
+        return messages
+
+    in_flight = run_with("active\n", 0)
+    failed = run_with("inactive\n", 4)
+
+    assert in_flight and failed, f"both outcomes must log: {in_flight} / {failed}"
+    assert in_flight != failed, (
+        f"an in-flight collision and a genuine failure must not log the same line: {failed}"
+    )
+    selected = [
+        m
+        for m in in_flight + failed
+        if _REGISTRATION_FAILURE_TOKEN in m.lower() and unit in m
+    ]
+    assert len(selected) == 1, (
+        f"one grep token must select exactly one of the two outcomes, got {selected}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+@pytest.mark.parametrize(
+    "probe_error",
+    [
+        FileNotFoundError(2, "No such file or directory", "systemctl"),
+        subprocess.TimeoutExpired("systemctl", 5),
+    ],
+    ids=["missing-binary", "timeout"],
+)
+def test_an_unclassifiable_registration_falls_loud(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str, probe_error: BaseException
+) -> None:
+    """A probe that cannot answer must NOT be excused as a benign collision.
+
+    no-silent-fail-soft: an outcome we cannot classify is reported as a
+    failure, never downgraded. The probe's own error must also not escape.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(calls, register_rc=1, probe_raises=probe_error),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()  # must not raise
+
+    assert len(_probe_calls(calls)) == 1, f"the probe must have been attempted: {calls}"
+    assert any(
+        _REGISTRATION_FAILURE_TOKEN in m.lower() and unit in m for m in log_messages
+    ), f"an unclassifiable registration must be reported loudly: {log_messages}"
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+@pytest.mark.parametrize(
+    "register_error",
+    [
+        FileNotFoundError(2, "No such file or directory", "systemd-run"),
+        subprocess.TimeoutExpired("systemd-run", 10),
+    ],
+    ids=["missing-binary", "timeout"],
+)
+def test_a_registration_that_never_ran_is_logged_and_never_probed(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str, register_error: BaseException
+) -> None:
+    """Fail-soft preserved, and no probe on a path where no unit was submitted.
+
+    The existing _swallows_timeout / _swallows_missing_binary tests cover the
+    not-raising half; this adds the half that keeps the new classification from
+    probing a unit name that was never registered.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        subprocess, "run", _registration_run(calls, register_raises=register_error)
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()  # must not raise
+
+    assert log_messages, "a registration that never ran must still be logged"
+    assert _probe_calls(calls) == [], (
+        f"nothing was registered, so there is nothing to classify: {calls}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_classification_never_rewrites_what_was_registered(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """Classification is strictly observational: the argv is byte-identical.
+
+    A non-zero exit must not retry, reshape or re-submit the command — only
+    report what happened to it.
+    """
+    wdog = _load_watchdog()
+
+    def argv_for(register_rc: int, probe_stdout: str, probe_rc: int) -> list[str]:
+        calls: list[list[str]] = []
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                subprocess,
+                "run",
+                _registration_run(
+                    calls,
+                    register_rc=register_rc,
+                    probe_stdout=probe_stdout,
+                    probe_rc=probe_rc,
+                ),
+            )
+            mp.setattr(wdog, "log", lambda m: None)
+            getattr(wdog, delegate)()
+        registrations = [c for c in calls if c[0] == "systemd-run"]
+        assert len(registrations) == 1, f"exactly one registration attempt: {calls}"
+        return registrations[0]
+
+    happy = argv_for(0, "inactive\n", 4)
+    collided = argv_for(1, "active\n", 0)
+    failed = argv_for(1, "inactive\n", 4)
+
+    assert collided == happy, f"a collision must not change the argv: {collided}"
+    assert failed == happy, f"a failure must not change the argv: {failed}"
+    assert f"--unit={unit}" in happy, f"argv must fire the fixed transient unit name: {happy}"
 
 
 # ---------------------------------------------------------------------------
