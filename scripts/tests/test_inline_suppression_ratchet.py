@@ -1300,3 +1300,139 @@ def test_a_clean_whole_tree_run_labels_its_green_clean(tmp_path: Path, capsys):
     report = capsys.readouterr().out
     assert 'clean' in report
     assert 'partial' not in report
+
+
+def _dead_marker_violation(tmp_path: Path, capsys, source: str) -> str:
+    """Seed a marker-free tree, add *source*, and return its one violation line."""
+    baseline = _write_fixture_tree(
+        tmp_path, {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1\n'}, baseline=True
+    )
+    _revise(tmp_path, {'m.py': source})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 1
+
+    (violation,) = capsys.readouterr().err.strip().splitlines()
+    return violation
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        'a = 1  # noqa: PLC0415\n',
+        'a = 1  # pragma: no cover\n',
+    ],
+)
+def test_a_new_marker_no_tool_reads_is_rejected_for_deletion(
+    tmp_path: Path, capsys, source: str
+):
+    """BOUNDARY SCENARIO 9 — D8's rejection arm.
+
+    Both halves of the population D8 names: a ``noqa`` whose code the nearest
+    config does not select (PLC0415 is the tree's largest such inflow) and a kind
+    no configured tool reads at all.  The remedy is DELETION, so the line says
+    so and publishes no disposition forms — offering an author a fix that does
+    not work is worse than offering none.
+    """
+    violation = _dead_marker_violation(tmp_path, capsys, source)
+
+    assert 'delete this marker' in violation
+    assert 'no tool reads it' in violation
+    for form in INLINE_MARKER_FORMS:
+        assert form not in violation
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        'a = 1  # noqa: PLC0415  # debt: task 5601\n',
+        'a = 1  # pragma: no cover  # debt: task 5601\n',
+    ],
+)
+def test_a_disposition_does_not_rescue_a_marker_no_tool_reads(
+    tmp_path: Path, capsys, source: str
+):
+    """BOUNDARY SCENARIO 9's sharp edge — D8 accepts NO disposition.
+
+    The exit code and the reason are both unchanged from the undispositioned
+    case, which is the whole content of the claim: a dead marker is not debt to
+    be owned, it is a line to be removed, and an author who dispositions one has
+    answered a question nobody asked.  This falls out of the fixed
+    consumer-first classification order rather than from a special case.
+    """
+    violation = _dead_marker_violation(tmp_path, capsys, source)
+
+    assert 'delete this marker' in violation
+    assert 'no tool reads it' in violation
+
+
+def test_a_ratified_class_does_not_rescue_a_marker_no_tool_reads(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """BOUNDARY SCENARIO 9 against D9's valve, which is the other thing that
+    could plausibly rescue a site and equally does not.
+
+    The operator's valve rules on suppressions a tool HONOURS; a row matching a
+    marker nothing reads would ratify a no-op, so the consumer check running
+    first makes the row inert rather than making it a widening.
+    """
+    monkeypatch.setattr(
+        inline_suppressions,
+        'RATIFIED_SUPPRESSION_CLASSES',
+        {
+            inline_suppressions.SuppressionClass(
+                kind=inline_suppressions.Kind.NOQA,
+                code='PLC0415',
+                scope=inline_suppressions.Scope.ANY,
+            ): Policy('inv12-day-one')
+        },
+    )
+
+    violation = _dead_marker_violation(tmp_path, capsys, 'a = 1  # noqa: PLC0415\n')
+
+    assert 'no tool reads it' in violation
+
+
+def test_a_grandfathered_dead_marker_is_green_and_still_counted(
+    tmp_path: Path, capsys
+):
+    """D8's "grandfathered dead markers stay counted" — the complement that
+    keeps the gate a RATCHET rather than a sweep.
+
+    Rejecting every dead marker outright would red the whole tree on the day the
+    gate lands, so the baseline holds the existing ones.  What must NOT happen is
+    that they vanish from the report: the population is the thing D11's sweep
+    tightens, and a number nobody can see never shrinks.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1  # noqa: PLC0415\n'},
+        baseline=True,
+    )
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 0
+
+    report = capsys.readouterr().out
+    assert '1 unowned in 1 keys' in report
+
+
+def test_a_second_copy_of_a_grandfathered_dead_line_is_in_excess(tmp_path: Path, capsys):
+    """The multiset is a multiset: the baseline permits ONE of that line.
+
+    Identical lines share one D7 key, so the only thing separating the
+    grandfathered copy from a new one is multiplicity — which is exactly what
+    ``excess`` measures, and why the key carries a count rather than a flag.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1  # noqa: PLC0415\n'},
+        baseline=True,
+    )
+    _revise(tmp_path, {'m.py': 'a = 1  # noqa: PLC0415\na = 1  # noqa: PLC0415\n'})
+    capsys.readouterr()
+
+    assert _check(tmp_path, baseline) == 1
+
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert [line.split(':')[1] for line in lines] == ['1', '2']
