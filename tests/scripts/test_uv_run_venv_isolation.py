@@ -366,3 +366,35 @@ def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
         "ModuleNotFoundError instead of repairing itself; the repair path is "
         "scripts/sync-orchestrator-env.sh (`uv sync --all-packages`)."
     )
+
+
+@pytest.mark.parametrize("rel_path", discover_uv_run_units(), ids=lambda p: p)
+def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
+    """Beside `--no-sync`, a run-level `--frozen`/`--locked` is a no-op — so forbid it.
+
+    Its own test rather than a second assert inside
+    test_uv_run_unit_passes_no_sync: the two arms fail for different reasons and
+    a reader of a failure should see which one fired, and the presence arm must
+    stay green independently of this one.
+    """
+    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+    flags = uv_run_level_flags(logical_exec_start(text, rel_path))
+    assert flags is not None
+    lockfile_flags = [f for f in flags if f in ("--frozen", "--locked")]
+    assert not lockfile_flags, (
+        f"{rel_path} carries run-level {lockfile_flags} beside `--no-sync` "
+        f"(run-level flags found: {flags}). Measured on uv 0.11.6: `--no-sync` "
+        "skips the LOCK step along with the sync, so both lockfile flags buy "
+        "literally nothing next to it. `uv run --locked` exits 2 on lockfile "
+        "drift, but `uv run --locked --no-sync` exits 0 SILENTLY; and "
+        "`uv run --frozen --no-sync` leaves uv.lock's sha256 byte-identical to "
+        "what `--no-sync` alone leaves it — the two invocations are "
+        "indistinguishable. A flag that survives review by looking like it "
+        "strengthens the line while doing nothing is worse than no flag: "
+        "`--frozen` is exactly how this defect was introduced, because it "
+        "READS as a venv guarantee and is in fact a lockfile option ('run "
+        "without updating the uv.lock file'). If loud failure on lockfile "
+        "drift is ever genuinely wanted for a unit, it cannot be bought here — "
+        "it would mean dropping `--no-sync`, which reinstates the hazard. "
+        "Check the lockfile somewhere that is not a unit start."
+    )
