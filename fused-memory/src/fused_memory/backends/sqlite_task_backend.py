@@ -2545,18 +2545,32 @@ class SqliteTaskBackend:
                     )
                 old_status = row['status']
                 row_candidate_key = row['candidate_key']
+                # SANITIZE the caller's audit fields FIRST: composition order
+                # alone is not an authority check. The original comment here
+                # claimed that merging audit fields before stamping meant a
+                # caller passing `pending_since` inside `audit_fields` "cannot
+                # bypass the transition table" — MEASURED FALSE on an
+                # ANCHORLESS row, which persisted {"reopen_reason": "x",
+                # "pending_since": "2000-01-01T00:00:00.000Z"}. The merge
+                # injects the key FIRST, so the helper below then sees it as
+                # already present and returns "unchanged". The claim held only
+                # for a row that already had an anchor. Stripping here is what
+                # makes it true for every row.
+                sanitized_audit = strip_machine_authored_metadata(
+                    audit_fields, project_root=project_root, tag=tag, task_id=tid,
+                )
                 new_metadata = _merge_metadata(
-                    row['metadata'], json.dumps(audit_fields),
+                    row['metadata'], json.dumps(sanitized_audit),
                     mode='merge',
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 # Wait anchor (task 3816, PRD §C1), composed audit-merge
                 # FIRST and anchor SECOND: the anchor is applied to the
                 # post-audit blob, so neither write can clobber the other,
-                # and a caller that ever passed `pending_since` inside
-                # `audit_fields` cannot bypass the transition table. This
-                # writer already emits the metadata column, so a stamp
-                # substitutes the value rather than widening the UPDATE.
+                # and the blob the helper reads now carries only
+                # machine-legitimate anchors. This writer already emits the
+                # metadata column, so a stamp substitutes the value rather
+                # than widening the UPDATE.
                 stamped = stamp_pending_since(
                     new_metadata,
                     old_status=old_status,
@@ -3079,6 +3093,27 @@ class SqliteTaskBackend:
                     parsed_metadata = None
             if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
                 raise DoneProvenanceWriteAuthorityError(task_id)
+            # Same floor family, different remedy (task 3816 review
+            # remediation): the wait-anchor keys are MACHINE-authored, so a
+            # caller-supplied value is STRIPPED rather than rejected — see
+            # strip_machine_authored_metadata on why ignoring beats raising
+            # for a key with a benign "ignore it" semantic on a writer
+            # reachable from blob round-trips. Without this, a default-mode
+            # merge moves a live anchor BACKWARD (measured
+            # 2026-09-19T06:29:11.384Z -> 2000-01-01T00:00:00.000Z), breaking
+            # the monotone-non-decreasing invariant in the over-age
+            # direction. metadata_mode='replace' still drops the stored
+            # anchor, unchanged (design decision 8).
+            #
+            # No dedup triple: this floor deliberately precedes tag
+            # normalization and _parse_task_id, so the warning is per-CALL
+            # here rather than per-task. That is the honest count for a
+            # forged WRITE (one caller, one attempt) — the dedup gate exists
+            # for the READ path, where _row_to_task runs once per row on
+            # every get_task(s) and would otherwise flood.
+            metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
+                metadata, project_root=project_root,
+            )
         # Third pre-connection floor, and the last one: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
         # after the two write-authority floors and BEFORE _resolve_metadata_mode
@@ -3382,8 +3417,17 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
+            # Same caller -> store metadata boundary as the three above, so the
+            # same sanitizer (task 3816 review remediation). Privileged and
+            # interceptor-only, so the stakes are lower than the public
+            # writers — applied anyway so the authority rule is UNIFORMLY
+            # enforced from one implementation rather than being a per-site
+            # judgement call.
+            sanitized_fields = strip_machine_authored_metadata(
+                fields, project_root=project_root, tag=tag, task_id=tid,
+            )
             new_metadata = _merge_metadata(
-                row['metadata'], json.dumps(fields),
+                row['metadata'], json.dumps(sanitized_fields),
                 mode='merge',
                 project_root=project_root, tag=tag, task_id=tid,
             )
