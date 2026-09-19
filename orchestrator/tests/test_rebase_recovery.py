@@ -34,12 +34,12 @@ is impossible at the git level even if the pre-flight is refactored away).
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import errno
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -1204,28 +1204,38 @@ class TestGitOpsAbortUniformity:
         Four sites route through one guard precisely so a future edit cannot
         fix three and miss the fourth.  A per-site spy cannot see that: it
         asserts about the sites it already knows, so a newly ADDED fifth
-        unguarded abort passes it silently.  Scanning the source closes that,
+        unguarded abort passes it silently.  Scanning the module closes that,
         and it is the only assertion here that gets stronger as the file grows.
 
-        The guard lives in ``rebase_recovery``, so git_ops should now spell an
-        abort ONLY as a call to it and carry no ``--abort`` literal of its own.
-        Both halves are asserted: a bare literal is the regression, and the
-        count of routed sites is what stops the scan passing vacuously if a
+        Scanned as a SYNTAX TREE, not as text.  git_ops discusses ``git rebase
+        --abort`` in prose, and a line-regex spares it only by the accident of
+        which delimiters that prose happens to use — so the text version failed
+        on documentation edits that broke nothing, and would have pressured a
+        future author to reword a comment to appease a test.  A ``Constant``
+        equal to ``'--abort'`` cannot be prose: comments are absent from the
+        tree entirely and a docstring is one long string, never that token.
+
+        The routed count is a FLOOR, not an equality.  A legitimate fifth
+        guarded site is the behaviour this test exists to encourage, and
+        equality turned it into a red suite reading as a regression.  The floor
+        still does the job equality was there for — it is what fails if a
         future edit deletes the calls rather than guarding them.
         """
-        source = Path(git_ops_module.__file__).read_text()
-        quoted_abort = re.compile(r"""['"]--abort['"]""")
+        tree = ast.parse(Path(git_ops_module.__file__).read_text())
+
         offenders = [
-            line.strip()
-            for line in source.splitlines()
-            if quoted_abort.search(line) and 'RECOVERY_GIT' not in line
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == '--abort'
         ]
-        assert offenders == []
+        assert [node.lineno for node in offenders] == []
+
         routed = [
-            line for line in source.splitlines()
-            if 'rebase_recovery.guarded_abort(' in line
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'guarded_abort'
         ]
-        assert len(routed) == 4, routed
+        assert len(routed) >= 4, [node.lineno for node in routed]
 
 
 # ---------------------------------------------------------------------------
