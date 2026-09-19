@@ -7,20 +7,16 @@ kind: a legibility-census finding (`metadata.source: legibility_census`)
 about a wasted agent turn, turned into a named prompt constant spliced into a
 machine-derived set of roles.
 
-The finding, reproduced first-hand: `Grep(pattern=r'config\\.(?!git|
-project_root|verify_env)[a-z_]+', ...)` is rejected with `error: look-around,
-including look-ahead and look-behind, is not supported` /
-`Consider enabling PCRE2 with the --pcre2 flag`. The search never runs, and
-the printed remedy is unreachable through the tool that printed it — `Grep`
-exposes no `--pcre2` parameter in any spelling, so no re-issue of that call
-can succeed.
-
-`Grep` is a Claude Code builtin: its CAUSE is upstream of this repository and
-is not addressed here at all. The full rationale for what is and is not in
-scope, which roles carry which variant, and the shell-shadowing measurements
-behind the escape hatch lives ONCE, in the comment block above
-`_GREP_ENGINE_LIMITS` in `orchestrator/src/orchestrator/agents/roles.py`.
-This module points there rather than restating it.
+Short version of the finding: `Grep` rejects a look-around pattern outright
+and prints a remedy naming a ripgrep CLI flag the tool exposes no parameter
+for. `Grep` is a Claude Code builtin, so the CAUSE is upstream of this
+repository and is not addressed here at all. The reproduced call, both error
+strings, the unreachable-remedy argument, what is and is not in scope, which
+roles carry which variant, and the shell measurements behind the escape hatch
+are recorded ONCE, next to the constants they constrain, in the comment block
+above `orchestrator/src/orchestrator/agents/roles.py::_GREP_ENGINE_LIMITS`.
+This module points there rather than carrying a second copy that would have to
+be re-corrected in step with the first.
 
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine regression — the repo sanctions
@@ -156,8 +152,21 @@ def test_the_two_recourse_halves_are_distinct():
     — and every containment test in this module would stay green, because both
     composed units would then be the same string.
 
-    Asserts INEQUALITY of two named constants, not the content of either:
-    rewording either half freely is a no-op here.
+    Inequality alone is a weak proxy for the invariant that actually matters,
+    so the second assertion pins that invariant directly: the Bash recourse
+    must not reach `judge` at all, by any route. A half built as
+    `'preamble' + _GREP_PCRE_BASH_RECOURSE` is unequal to the Bash half, keeps
+    both composed units non-empty and brace-free, leaves both role sets
+    matching their capabilities, and leaves composition and placement
+    unchanged — every other test in this module stays green while `judge` is
+    handed the `command grep -rP` escape hatch its `Bash(git:*)` grant would
+    refuse. `assert_no_other_role_carries` closes that hole only in the
+    arrangement where the Bash half happens to be a contiguous SUFFIX of the
+    composed unit, which is a property of today's concatenation order rather
+    than something any test pins.
+
+    Both assertions are against named constants — an inequality and a
+    containment — so rewording either half freely remains a no-op here.
     """
     assert _GREP_PCRE_BASH_RECOURSE != _GREP_PCRE_READ_ONLY_RECOURSE, (
         '_GREP_PCRE_BASH_RECOURSE and _GREP_PCRE_READ_ONLY_RECOURSE are '
@@ -165,6 +174,14 @@ def test_the_two_recourse_halves_are_distinct():
         "judge-specific recourse (it must not prescribe a shell command judge's "
         '`Bash(git:*)` grant would refuse), or collapse the split back to one '
         'unit over one role set.'
+    )
+    assert _GREP_PCRE_BASH_RECOURSE not in GREP_LOOKAROUND_GUIDANCE_READ_ONLY, (
+        'GREP_LOOKAROUND_GUIDANCE_READ_ONLY contains the whole of '
+        '_GREP_PCRE_BASH_RECOURSE, so the read-only variant prescribes the '
+        "`command grep -rP` escape hatch to `judge`, whose `Bash(git:*)` grant "
+        'would answer it with a permission denial rather than a result. Keep '
+        'the read-only recourse a genuinely separate sentence; do not build it '
+        'by wrapping or extending the Bash one.'
     )
 
 

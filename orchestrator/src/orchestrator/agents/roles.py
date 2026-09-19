@@ -911,6 +911,40 @@ that replacing all of them is what you wanted.
 #     command grep -rPoh --include='*.py' <the look-ahead pattern above> \
 #         orchestrator/src/orchestrator/verify.py
 #                              -> exit 0, the intended matches returned
+#
+# TWO MEASUREMENTS ADDED ON THE AMENDMENT PASS (2026-09-19), each correcting a
+# sentence that had generalized past what the 09-17 run above actually showed.
+#
+# (1) WHERE the `rg` shell function survives. `bash -c 'command -v rg'` tests
+# one thing only -- a nested shell PROCESS -- and an earlier revision of
+# _GREP_PCRE_BASH_RECOURSE read that as "never put `rg` in a script, a subshell
+# or any nested shell", which is false for a subshell. Re-measured directly on
+# `rg` rather than on a stand-in function:
+#     rg --pcre2 -o <the look-ahead pattern above> \
+#         orchestrator/src/orchestrator/verify.py | head -3
+#                                       -> matches returned; pipeline is fine
+#     echo "subst: $(rg --version)"     -> ripgrep 14.1.1
+#     ( rg --version )                  -> ripgrep 14.1.1
+#     bash -c 'rg --version'            -> rg: command not found
+#     bash <standalone script file>     -> rg: command not found
+# A pipeline, a command substitution and an explicit ( ... ) subshell all stay
+# inside the shell that defines the function; only a new shell PROCESS loses
+# it. The prose now draws the boundary there.
+#
+# (2) The IGNORE-FILE asymmetry the escape hatch silently dropped. `Grep`
+# (ripgrep) reads ignore files; GNU grep reads none, so `--include=` alone does
+# not reproduce `Grep`'s filtering:
+#     rg -l -g '*.py' 'config\.[a-z_]+' .                    -> 711 files
+#     command grep -rlP --include='*.py' 'config\.[a-z_]+' .  -> 1101 files
+# The 385-file difference is entirely under `.venv`, and `rg --no-ignore` is
+# what unlocks it -- the mechanism is `.venv/.gitignore`, a catch-all the
+# virtualenv writes inside ITSELF, which is why `git check-ignore .venv` exits
+# 1 (the directory is not ignored; its contents are) and why naming .gitignore
+# at the repo root alone would have mis-stated the cause. Hence the
+# `--exclude-dir=` flags and the scope-the-path sentence in the prose: without
+# them the prescribed recovery returns a wall of third-party matches, which is
+# the same wasted turn this constant exists to prevent.
+#
 # Those are the claims that were measured; nothing broader is asserted about
 # the environment. In particular the shadowed SET is NOT stable across time
 # or host: a 2026-08-11 project memory records `grep` ITSELF shadowed by a
@@ -980,9 +1014,22 @@ cannot express them, and a second pass over the matches can.
 # _GREP_ENGINE_LIMITS below -- never used alone.
 _GREP_PCRE_BASH_RECOURSE = """
 When look-around or a backreference is genuinely required, the escape hatch
-is `Bash`: `command grep -rP '<pattern>' <path>`, adding `--include='*.py'`
-for the glob filter `Grep` would have applied. `-P` is real PCRE, so the
-rejected pattern runs unchanged.
+is `Bash`:
+
+    command grep -rP --include='*.py' --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>
+
+`-P` is real PCRE, so the rejected pattern runs unchanged, and `--include=`
+is the glob filter `Grep` would have applied.
+
+The `--exclude-dir=` flags are not boilerplate: they stand in for a SECOND
+filter `Grep` applied for you and real grep does not. `Grep` reads ignore
+files — `.gitignore` at each level, including the catch-all one a virtualenv
+writes inside itself — while GNU grep reads none of them and walks straight
+into a vendored tree. Measured in this worktree, `--include='*.py'` ALONE
+still matched hundreds of third-party site-packages files under `.venv` for a
+pattern as ordinary as `config\\.[a-z_]+`, not one of which `Grep` would have
+returned. So point `<path>` at a source directory rather than the repo root,
+and if the rejected `Grep` call omitted `path`, do not simply substitute `.`.
 
 The `command` prefix is load-bearing, not decoration. The harness shell
 snapshot shadows some search commands with shell functions, and WHICH ones is
@@ -991,11 +1038,15 @@ not stable across sessions or hosts: one measured shadow wrapped `grep` in a
 a fast, confident, empty result. `command` reaches the real `/usr/bin/grep`
 either way.
 
-`rg --pcre2` also works, but only at the TOP LEVEL of a `Bash` call. `rg`
-here is currently a shell FUNCTION that re-execs the Claude Code bundle, not
-a binary on `PATH` — `which rg` finds nothing, and a nested `bash -c` cannot
-see it. Never put `rg` in a script, a subshell or any nested shell; use
-`command grep -rP` there.
+`rg --pcre2` also works, and needs none of those exclusions — `rg` IS the
+engine `Grep` wraps, so it honours the same ignore files. Its one limit is
+where it survives. `rg` here is currently a shell FUNCTION that re-execs the
+Claude Code bundle, not a binary on `PATH`, so it is lost in a nested shell
+PROCESS: a `bash -c` or `sh -c`, or a standalone script file you write and
+then run. It DOES survive a pipeline, a `$(...)` substitution and an explicit
+`( ... )` subshell in the top-level `Bash` call — those stay in the shell that
+defines it. `which rg` finds nothing either way, so do not use that to decide.
+Reach for `command grep -rP` when a nested shell process is involved.
 """
 
 
