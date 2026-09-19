@@ -377,6 +377,17 @@ class TestScanSeparatesAnAbsentStampFromAnUnreadableOne:
 
         assert scan_triage_note(f'{SHADOW_RULING_MARKER} {payload}').rejected is True
 
+    def test_a_note_that_is_not_a_string_at_all_is_an_absence(self):
+        """`Escalation.from_dict` passes JSON values straight into the
+        dataclass, so an externally written `"triage_note": null` arrives as
+        None despite the declared `str`. That is not a stamp — and it must not
+        be an AttributeError either, since this function's contract is that it
+        never raises."""
+        for note in (None, 7, ['x_shadow_ruling: {}']):
+            assert scan_triage_note(note) == NoteStamp(  # type: ignore[arg-type]
+                ruling=None, rejected=False,
+            ), f'a {type(note).__name__} note must read as an absence'
+
     def test_a_rejected_stamp_cannot_also_carry_a_ruling(self):
         """The invariant that keeps the three states three: ``rejected`` is the
         answer only when there is no ruling to report."""
@@ -633,6 +644,16 @@ class _Fixture:
             since=since or datetime(2000, 1, 1, tzinfo=UTC),
             until=until or datetime(2100, 1, 1, tzinfo=UTC),
         )
+
+
+def _path_of(fixture: _Fixture, escalation_id: str) -> Path:
+    """Where the sweep would find *escalation_id* — root or archive."""
+    paths = [
+        p for p in iter_all_escalation_paths(fixture.queue.queue_dir)
+        if p.stem == escalation_id
+    ]
+    assert len(paths) == 1, f'expected exactly one file for {escalation_id}, got {paths}'
+    return paths[0]
 
 
 class TestStampSurvivesIntoTheArchive:
@@ -1220,6 +1241,25 @@ class TestSweepRobustness:
         record = fixture.submit(resolution_action='close_only')
         fixture.resolve(record, by='interactive')
         assert fixture.report().classes == ()
+
+    def test_a_record_whose_note_is_null_costs_one_record_not_the_sweep(self, tmp_path: Path):
+        """`"triage_note": null` in a record file reaches `scan_triage_note`
+        as None, and the AttributeError that used to raise there is NOT in
+        `_SWEEP_PARSE_ERRORS` — it is raised after `read_escalation_for_scan`
+        returned, so it escaped `agreement_report` entirely and one
+        hand-written record cost the whole weekly measurement."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        nulled = fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        path = _path_of(fixture, nulled.id)
+        payload = json.loads(path.read_text())
+        payload['triage_note'] = None
+        path.write_text(json.dumps(payload))
+
+        klass = fixture.report().for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.agreed == 1, (
+            'the nulled record must cost its own sample, not the measurement'
+        )
 
     def test_the_report_and_its_class_rows_are_frozen(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)

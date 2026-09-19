@@ -310,9 +310,23 @@ def scan_triage_note(triage_note: str) -> NoteStamp:
     ``rejected`` rather than the stale ruling above it. An unusable line does
     not suppress a LATER valid one, which is the same rule read forwards.
 
-    It NEVER raises. The count sweeps every escalation in the queue and archive,
-    so an exception would turn one malformed note into a failed measurement.
+    It NEVER raises, INCLUDING on a note that is not a string at all. The count
+    sweeps every escalation in the queue and archive, so an exception would turn
+    one malformed record into a failed measurement.
     """
+    # A note arrives UNVALIDATED: ``models.py::Escalation.from_dict`` passes
+    # every JSON value straight into the dataclass, so a record carrying
+    # ``"triage_note": null`` reaches here as None despite the declared type,
+    # and ``.splitlines()`` raises an AttributeError absent from
+    # ``_SWEEP_PARSE_ERRORS`` and raised after the read returned — one
+    # hand-written record for the whole measurement. Type before use, as in
+    # ``ShadowRuling.__post_init__``.
+    if not isinstance(triage_note, str):
+        logger.warning(
+            'triage_note is %s, not a string; no stamp readable',
+            type(triage_note).__name__,
+        )
+        return NoteStamp(ruling=None, rejected=False)
     markers = [
         line for line in triage_note.splitlines()
         if line.startswith(SHADOW_RULING_MARKER)
