@@ -22,7 +22,19 @@ this file discusses the very commands it runs.
 import pathlib
 import shlex
 
+from systemd_unit_invariants import ALL_ORCHESTRATOR_SERVICE_FILES
+
 SYNC_SCRIPT = pathlib.Path(__file__).parents[2] / "scripts" / "sync-orchestrator-env.sh"
+
+# The one scripts/orchestrator-*.service file the script must NOT carry in
+# SERVICES, asserted explicitly below so it is a decision rather than an
+# accident of whichever names happened to be typed.  The watchdog is the PROBE,
+# not a supervised orchestrator: it runs a bare Python script (no uv, no shared
+# venv), and the script already stops and starts its TIMER separately — first
+# and last respectively, because a 60s probe would otherwise revive a unit
+# mid-sync.  Folding it into the services loop would stop the timer's unit
+# instead of the timer and break that ordering.
+_WATCHDOG_UNIT = "orchestrator-watchdog.service"
 
 
 def _uv_sync_invocations(script: str) -> list[list[str]]:
@@ -116,4 +128,82 @@ def test_sync_uses_all_packages() -> None:
         "ONE root .venv, so scoping the repair means repairing part of a shared "
         "environment and — because a plain `uv sync` is exact — pruning the rest "
         "of it. `--all-packages` must select the whole workspace."
+    )
+
+
+def _services_array(script: str) -> list[str]:
+    """The unit names in the script's ``SERVICES=( ... )`` array, tokenised.
+
+    Tokenised rather than regexed off one line, because the array spans several
+    physical lines and its entries are shell words: a line-oriented read would
+    have to re-derive where the array ends, and would answer differently from
+    the shell the moment an entry moved or a comment appeared inside it.  The
+    body between the parentheses is handed to shlex, which is what the script's
+    own expansion effectively does.
+    """
+    _, _, after = script.partition("SERVICES=(")
+    assert after != "", (
+        f"{SYNC_SCRIPT.name} has no `SERVICES=(` array. It is the single source "
+        "of the list of units to stop and restart around the sync; if it was "
+        "renamed or inlined, this guard must follow it rather than silently "
+        "stop checking which units are covered."
+    )
+    body, closed, _ = after.partition(")")
+    assert closed == ")", f"{SYNC_SCRIPT.name}'s SERVICES=( array is unterminated"
+    return shlex.split(body, comments=True)
+
+
+def test_sync_stops_every_committed_orchestrator_unit() -> None:
+    """SERVICES must name every committed orchestrator unit but the watchdog.
+
+    A stale list was TOLERABLE while a unit start could repair itself; with
+    ``--no-sync`` it is not, for two compounding reasons the script's own header
+    already argues. A unit left RUNNING through the sync is bound to an
+    interpreter being rebuilt underneath it. A unit never RESTARTED afterwards
+    keeps whatever it had — and can no longer pick the new environment up by
+    re-syncing at its next start, because that is precisely what was removed.
+
+    The expected set is DERIVED from ALL_ORCHESTRATOR_SERVICE_FILES (the glob
+    over scripts/orchestrator-*.service, itself pinned against a known-basename
+    set by test_orchestrator_service_files.py:570-582) rather than hand-listed.
+    Hand-listing is what produced the drift being fixed: the script named three
+    units while seven existed, and nothing could notice. Derived, an eighth
+    orchestrator unit added next month turns this RED on its own.
+    """
+    expected = {p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES} - {_WATCHDOG_UNIT}
+    assert expected, (
+        "ALL_ORCHESTRATOR_SERVICE_FILES yielded no units, so this guard would "
+        "compare two empty sets and pass vacuously. The glob is anchored at the "
+        "repo's scripts/ directory — check it resolved."
+    )
+
+    services = _services_array(SYNC_SCRIPT.read_text(encoding="utf-8"))
+
+    missing = expected - set(services)
+    assert not missing, (
+        f"{SYNC_SCRIPT.name}'s SERVICES array does not name {sorted(missing)}. "
+        "Every committed orchestrator unit runs out of the ONE shared .venv this "
+        "script rebuilds, so one left running through the sync is bound to an "
+        "interpreter being replaced underneath it, and one never restarted "
+        "afterwards keeps stale bytecode — which `--no-sync` means it can no "
+        "longer fix by re-syncing at its next start. Derive the list from the "
+        "committed units rather than extending it by hand."
+    )
+
+    extra = set(services) - expected
+    assert not extra, (
+        f"{SYNC_SCRIPT.name}'s SERVICES array names {sorted(extra)}, which is not "
+        "a committed scripts/orchestrator-*.service unit. A name with no "
+        "committed unit behind it is stopped with `|| true` and so fails "
+        "silently, leaving the array reading as if it covered something it does "
+        "not."
+    )
+
+    assert _WATCHDOG_UNIT not in services, (
+        f"{SYNC_SCRIPT.name}'s SERVICES array names {_WATCHDOG_UNIT}. The "
+        "watchdog is the PROBE, not a supervised orchestrator: it runs a bare "
+        "Python script that never touches the shared venv, and the script "
+        "already stops its TIMER first and starts it last precisely so a 60s "
+        "probe cannot revive a unit mid-sync. Stopping the service here would "
+        "not stop the timer and would break that ordering."
     )
