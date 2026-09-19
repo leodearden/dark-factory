@@ -2373,6 +2373,16 @@ def create_server(
         # between this scan and the response — the yield point moves, it is not
         # introduced.
         #
+        # It lands in asyncio's process-wide DEFAULT executor, shared with every
+        # other `asyncio.to_thread` caller in this process — merge-lane flock
+        # acquires park a worker there for up to 300 s
+        # (`git_ops.py::_acquire_lane_flock_off_thread`).  Acceptable here and
+        # deliberately not given its own pool: the path is read-only, ~13 ms,
+        # called at dashboard-poll rate, and nothing depends on WHEN it finishes
+        # — only that the loop is free meanwhile.  Wanting a latency FLOOR for
+        # the dashboard/watcher path is what would justify the
+        # `verify.py::_admission_executor` precedent, and that is a follow-up.
+        #
         # BOUNDARY, so the rest does not read as an oversight: the plain-`def`
         # tools here (`get_task_escalations` and friends) need nothing — FastMCP
         # threadpools sync tool functions (`FunctionTool.run` ->

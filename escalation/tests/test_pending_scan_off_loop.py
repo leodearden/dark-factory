@@ -1,29 +1,24 @@
 """``get_pending_escalations``' queue scan runs OFF the event loop (task 4391).
 
-This is the one ``async def`` tool in ``escalation/server.py`` that scans the
-queue root, and the loop it would block is not its own: the escalation MCP
-server has no process of its own — ``_start_escalation_server``
-(orchestrator/src/orchestrator/harness.py) runs it under
-``asyncio.create_task`` on the ORCHESTRATOR's event loop.  So an inline scan
-stalls the scheduler and the merge worker, not a dedicated server.
+WHY it must — this server shares the ORCHESTRATOR's loop, what the scan costs
+and why that cost only grows, and which scans are deliberately left inline —
+is stated ONCE, beside the production code it justifies: the rationale block
+above ``read_pending()`` in
+``escalation/src/escalation/server.py::create_server.get_pending_escalations``.
+Restating the figures here would give hard numbers a second home in a file
+nobody edits alongside that one.
 
-How long: 13.12 ms median, 30.92 ms p95, measured over 40 warm reps against
-the live queue root — 9,461 dirents serving 41 pending records.  The cost is
-DIRENT-dominated (a bare ``scandir`` of that root is already 6.45 ms) and the
-dirent population tracks LIFETIME escalation count, not the pending set, via
-the record-lock sidecars deliberately retained for archived records.  It only
-grows.  Every dashboard poll and every watcher drain pays it.
+What these tests pin, neither of them by TIMING the loop (racing a heartbeat
+against the scan would make the verdict depend on wall-clock scheduling on a
+loaded host):
 
-The property is pinned two ways, neither of which times the loop — a
-heartbeat-raced-against-the-scan test would make the verdict depend on
-wall-clock scheduling on a loaded host.  ``TestPendingScanThread`` asserts
-THREAD IDENTITY, which is exact: ``asyncio.to_thread`` always runs its
-callable on an executor worker, so the recorded id either equals the loop's
-or it does not.  ``TestLoopStaysLiveDuringScan`` asserts a happens-before
-ORDER — a fact, not a duration — and doubles as the answer to "does any
-caller depend on the scan being synchronous with respect to a concurrent
-submit?": it files one from the loop thread while the scan is in flight and
-checks the returned rows are still whole.
+- :class:`TestPendingScanThread` — thread identity, which is exact.
+  ``asyncio.to_thread`` always runs its callable on an executor worker, so the
+  recorded id either equals the loop thread's or it does not.  Both branches,
+  since both reach a scan of the queue root.
+- :class:`TestLoopStaysLiveDuringScan` — a happens-before ORDER, a fact rather
+  than a duration: the loop keeps running, and can still file, while the tool
+  is inside the scan.
 """
 
 from __future__ import annotations
