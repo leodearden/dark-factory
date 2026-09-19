@@ -1096,9 +1096,16 @@ class TestExclusionsAndWindow:
         )
 
         report = fixture.report()
-        assert report.for_class(_BRANCH_BEHIND) is None, (
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None, (
+            'the class must keep a row, or a class whose every sample a cascade '
+            'took reads exactly like a class nobody ever stamped'
+        )
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 0), (
             'a cascade close is not a human ruling and must not inflate the rate'
         )
+        assert (klass.comparable, klass.agreement_rate) == (0, None)
+        assert klass.non_human_resolver == 1
         assert report.resolver_tiers.get('cascade') == 1
 
     def test_a_sweep_resolver_is_reported_in_its_tier(self, tmp_path: Path):
@@ -1108,8 +1115,39 @@ class TestExclusionsAndWindow:
         )
 
         report = fixture.report()
-        assert report.for_class(_BRANCH_BEHIND) is None
+        klass = report.for_class(_BRANCH_BEHIND)
+        assert klass is not None and klass.non_human_resolver == 1
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (0, 0, 0)
         assert report.resolver_tiers.get('reaper-sweep') == 1
+
+    def test_the_tier_line_says_what_took_a_sample_and_the_row_says_who_paid(
+        self, tmp_path: Path,
+    ):
+        """`resolver_tiers` is aggregate, so `cascade=2` alone leaves an
+        operator unable to tell which shadowed class lost those two samples.
+        The per-class column is the other half of that reading — and it must
+        not move any rate: the one human-resolved record is still the whole
+        denominator."""
+        fixture = _Fixture(tmp_path)
+        fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
+        fixture.stamped_and_resolved(
+            _ruling(), observed_action='close_only', resolved_by='l2-cascade:esc-9-1',
+        )
+        fixture.stamped_and_resolved(
+            _ruling(_VETO_STREAK), observed_action='close_only',
+            resolved_by='l2-cascade:esc-9-2',
+        )
+
+        report = fixture.report()
+        assert report.resolver_tiers.get('cascade') == 2
+        behind = report.for_class(_BRANCH_BEHIND)
+        veto = report.for_class(_VETO_STREAK)
+        assert behind is not None and veto is not None
+        assert (behind.non_human_resolver, veto.non_human_resolver) == (1, 1)
+        assert (behind.agreed, behind.comparable) == (1, 1), (
+            'the excluded record must not reach the rate of the class that lost it'
+        )
+        assert (veto.agreed, veto.diverged, veto.comparable) == (0, 0, 0)
 
     def test_human_resolutions_are_reported_in_the_human_tier(self, tmp_path: Path):
         fixture = _Fixture(tmp_path)
@@ -1316,13 +1354,14 @@ def _row_cells(out: str, ruling_class: str) -> dict[str, str]:
     single token, so splitting recovers exactly the columns ``_ROW`` wrote.
     """
     cells = _row_for(out, ruling_class).split()
-    assert len(cells) == 6, f'expected the 6 columns _ROW writes, got {cells!r}'
-    cls, agreed, diverged, not_comparable, comparable, rate = cells
+    assert len(cells) == 7, f'expected the 7 columns _ROW writes, got {cells!r}'
+    cls, agreed, diverged, not_comparable, non_human, comparable, rate = cells
     assert cls == ruling_class
     return {
         'agreed': agreed,
         'diverged': diverged,
         'not_comparable': not_comparable,
+        'non_human': non_human,
         'comparable': comparable,
         'rate': rate,
     }
@@ -1350,7 +1389,7 @@ class TestCliTable:
         # a row that had them in the wrong columns.
         assert _row_cells(capsys.readouterr().out, _BRANCH_BEHIND) == {
             'agreed': '3', 'diverged': '1', 'not_comparable': '1',
-            'comparable': '4', 'rate': '75.0%',
+            'non_human': '0', 'comparable': '4', 'rate': '75.0%',
         }
 
     def test_prints_every_excluded_bucket(self, tmp_path: Path, capsys):
@@ -1409,8 +1448,29 @@ class TestCliTable:
         # because the rate happened to render without a 2.
         assert _row_cells(out, _BRANCH_BEHIND) == {
             'agreed': '1', 'diverged': '0', 'not_comparable': '0',
-            'comparable': '1', 'rate': '100.0%',
+            'non_human': '0', 'comparable': '1', 'rate': '100.0%',
         }
+
+    def test_a_class_whose_samples_a_cascade_took_still_gets_a_row(
+        self, tmp_path: Path, capsys,
+    ):
+        """Read from the pasted table alone: the class is present, its rate is
+        n/a rather than a number, and the column says the two samples went to a
+        resolver that was not a human — not that nobody stamped the class."""
+        fixture = _Fixture(tmp_path)
+        for i in range(2):
+            fixture.stamped_and_resolved(
+                _ruling(), observed_action='close_only',
+                resolved_by=f'l2-cascade:esc-9-{i}',
+            )
+
+        assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
+        out = capsys.readouterr().out
+        assert _row_cells(out, _BRANCH_BEHIND) == {
+            'agreed': '0', 'diverged': '0', 'not_comparable': '0',
+            'non_human': '2', 'comparable': '0', 'rate': 'n/a',
+        }
+        assert 'cascade=2' in out
 
     def test_an_unmeasurable_rate_is_not_printed_as_a_number(self, tmp_path: Path, capsys):
         fixture = _Fixture(tmp_path)
@@ -1657,6 +1717,7 @@ class TestCliJson:
         assert payload['rejected_stamps'] == 0
         row = next(c for c in payload['classes'] if c['class'] == _BRANCH_BEHIND)
         assert (row['agreed'], row['diverged'], row['not_comparable']) == (1, 1, 0)
+        assert row['non_human_resolver'] == 0
         assert row['comparable'] == 2
         assert row['agreement_rate'] == 0.5
         assert payload['since'] and payload['until']

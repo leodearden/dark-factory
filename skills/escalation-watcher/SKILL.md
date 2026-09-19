@@ -1577,7 +1577,9 @@ uv run --directory escalation python -m escalation.shadow_ruling \
 
 Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
 `not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
-against; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
+against; `non_human_resolver` for a record no human resolved at all — a cascade, a sweep, the
+steward — counted per class, because the aggregate `resolver_tiers` line says only which tier took
+the sample; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
 — those three are counted over the same window as the rate. A class whose records are mostly
 `self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
 `rejected_stamps` means the count could not read that many markers at all.

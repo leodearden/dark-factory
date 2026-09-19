@@ -211,6 +211,13 @@ lands in exactly one bucket:
   separately and never folded into either side: a class whose proposals are
   mostly task-side is visibly not yet measurable rather than falsely green, and
   missing data never reads as disagreement.
+- `non_human_resolver` — the record was resolved by no human at all: a
+  cascade, a reaper sweep, the steward. The proposal was never held against an
+  adjudication, so it reaches no rate. Counted per class for the same reason as
+  `not_comparable`: the report's aggregate `resolver_tiers` line says which
+  tier took the sample, and only the class row says which class paid for it —
+  a class whose every record went that way still gets a row rather than
+  disappearing from the table.
 - `gated_stamps`, `self_resolved`, `rejected_stamps` — records excluded from
   every rate, counted over the SAME window as `agreed`/`diverged`, so a small
   sample and a discarded one cannot look alike. `rejected_stamps` counts a
