@@ -8,21 +8,22 @@ the sole closer), and the watcher reads ``get_pending_escalations()`` — never
 already on the live queue.  This script re-derives the reap set LIVE and, with
 ``--apply``, closes it.
 
-Loaded via ``importlib.util.spec_from_file_location`` (the ``_load_module``
-helper copied from ``test_audit_duplicate_memories.py``) because ``scripts/``
-is not on ``PYTHONPATH``.
+Loaded through ``_fm_helpers.load_script_module`` because ``scripts/`` is not
+on ``PYTHONPATH``.  That shared reuse-aware loader is the one correct shape for
+loading a non-package script by path (task 3895), and
+``tests/test_script_loader_routing_guard.py`` holds the population of local
+forks at zero.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
 from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
 
@@ -43,29 +44,9 @@ DARK_ROOT = '/srv/dark-factory'
 PROJECT_ROOTS = {'dark_factory': DARK_ROOT}
 
 
-def _load_module() -> types.ModuleType:
-    """Load the script from its file path, registered in ``sys.modules``.
-
-    Registration is required so ``@dataclass`` and other reflection-based
-    decorators resolve ``cls.__module__``.
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'derive_orphaned_recon_escalations'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(
+    SCRIPT_PATH, mod_name='derive_orphaned_recon_escalations'
+)
 
 
 def _detail(project_id: str, task_id: str) -> str:
