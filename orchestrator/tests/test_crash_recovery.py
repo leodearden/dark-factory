@@ -230,6 +230,23 @@ def _install_escalation_queue(harness: Harness, queue):
     return queue
 
 
+def _storm_streak(harness: Harness) -> tuple[int, float | None]:
+    """The fallback-storm streak and its comparison stamp, read as ONE value.
+
+    They are one piece of state, not two: the stamp is only meaningful as the
+    chain point of the run the streak counts, and ``_run_slot`` writes, decays
+    and clears the pair together. Reading them as a pair keeps the joint shape
+    legible at the call site — ``(0, None)`` is "no run in progress", and a
+    streak with a cleared stamp is a state the code never produces — and gives
+    the pair one named seam, as ``_adopted_sessions``/``_stashed_config_dirs``
+    do for adoption's maps.
+    """
+    return (
+        harness._session_resume_fallback_streak,
+        harness._last_session_resume_fallback_at,
+    )
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -1194,13 +1211,16 @@ class TestAdoptFilesConfigDirAmbiguousL1:
 
         _adopt(harness, wt, '3464')
 
-        assert harness._session_resume_fallback_streak == 7
-        assert harness._last_session_resume_fallback_at == seeded_at
+        assert _storm_streak(harness) == (7, seeded_at)
+        # The positive form of "not filed under the storm sentinel": exactly
+        # one filing, under THIS sentinel. Test (a) proves the two differ, so
+        # this implies the negative while also pinning the count — and it reads
+        # the sentinel through the same seam every other test here uses.
         filed_under = [
             c.args[0].task_id
             for c in queue.submit.call_args_list
         ]
-        assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
+        assert filed_under == [_ambiguity_ids().sentinel]
 
     def test_no_queue_and_a_raising_submit_never_break_recovery(
         self, harness: Harness
@@ -3653,8 +3673,7 @@ class TestSessionResumeStorm:
             harness, 'rq-stale', self._stale_session('uuid-rq-stale'), config_dir=cfg,
         )
 
-        assert harness._session_resume_fallback_streak == 0
-        assert harness._last_session_resume_fallback_at is None
+        assert _storm_streak(harness) == (0, None)
         assert harness._escalation_queue.submit.call_count == 0
 
     async def test_by_design_dispatch_inside_the_window_decays_nothing(
