@@ -10,6 +10,127 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Task-node families now collapse regardless of arriving spelling, and the residue is counted (task 5264)
+
+**The write-path normalizer was keyed on the spelling that ARRIVED, not on the
+family it belongs to, and had two structural blind spots because of it.**
+`MemoryService._normalize_task_node_names` walked the nodes one episode's
+extraction happened to mint, canonicalized each name, and then probed
+`find_duplicate_entity_nodes` for exactly two exact names: the arriving variant
+and the canonical form. Blind spot (1): `if canonical is None or canonical ==
+name: continue` — when extraction happened to mint the already-canonical
+spelling, the pass returned without a single backend call, so an episode that
+DID touch a fragmented task could not heal it. Blind spot (2): even on the
+bad-name path only those two exact names were ever looked at, so a third
+spelling in the same family (`tasks 605`, `task #605`, `Task: 132`) was never
+seen and a three-way split collapsed to two at best, then re-split on the next
+differently-spelled extraction.
+
+**(1) was the decisive one.** (2) makes the repair incomplete; (1) makes it
+unreachable. A task whose canonical node already exists is exactly the task an
+active episode is most likely to mention, so the arrival most likely to be able
+to heal a family was the one guaranteed to do nothing. The old test suite pinned
+that as intended behaviour — `test_already_canonical_name_is_noop` asserted
+`find_duplicate_entity_nodes.assert_not_awaited()` — so the bug was encoded in
+the tests, and fixing it required inverting that assertion rather than adding
+one.
+
+**The pass is now keyed on the FAMILY.** Every touched node name is mapped
+through the new `task_naming.task_node_referent(name) -> Referent | None` and
+de-duplicated on the frozen `Referent`, so an episode carrying both `Task 605`
+and `task 605` probes once. Each family is probed by its VERBATIM DIGITS via the
+new `GraphitiBackend.find_entity_nodes_by_name_substring`, and the candidates
+that query returns are filtered back down to one family by
+`task_naming.group_task_node_families`. Digits are naturally case-free and
+highly selective, which is why no case-insensitive Cypher is needed; precision
+stays at the one normative site, so `Task 6051`, `Task 1605` and the
+cross-project `reify:605` are all rejected by the Python-side filter rather than
+by the query. The outcome no longer depends on which spelling extraction
+produced: the three-arrival test asserts the resulting rename/merge calls are
+IDENTICAL for `Task 605`, `task 605` and the pluralized-container `tasks 605`.
+
+**Survivor selection changed, and it changes which uuid survives.** The old
+policy had a special case — a canonically-named node wins regardless of edge
+count — whose only purpose was to avoid recreating the exact-name duplicate
+`_dedup_episode_nodes` resolves. What rules that hazard out now is the ORDER of
+the two writes, not family-keying: every other member is merged into the
+survivor FIRST and the survivor is renamed onto `Task N` LAST. Renaming first
+would leave the just-renamed survivor and the family's pre-existing canonical
+member both carrying that name between the two awaits, and the pass is
+best-effort by design — so a merge failing there would leave the exact-name pair
+behind. `_dedup_episode_nodes` has already run by then, earlier in
+`_reconcile_episode_identity`, and nothing later in the chain collapses it, so
+the pair would survive until some future episode mentions that task again —
+which for the fragmented families this repair exists for is exactly what may
+never happen. Merging first cannot mint a same-name twin, and a failed rename
+merely leaves one fully-collapsed node under a non-canonical name, which the
+next episode touching that task renames. With the hazard handled by ordering,
+one uniform rule replaces the two branches: the survivor is `family[0]` under
+the backend's existing survivor-first ordering (most valid edges, then oldest,
+then uuid), renamed onto the canonical name only if it is not already canonical,
+with every other member merged into it. It degenerates to the old behaviour
+whenever the canonical node genuinely is the best member. Where the two diverge
+is the low-edge-canonical/high-edge-variant pair: the old rule made the low-edge
+canonical node the survivor and dragged the variant's edges across, the new rule
+keeps the high-edge node and moves fewer edges, then renames it. Fewer edges moved is less write amplification on a best-effort post-commit
+pass. This is recorded explicitly because it is a change of surviving uuid, not
+an implementation detail — and it is the mechanism doing its job, not an
+adjudication of any specific family by hand.
+
+**The residue that fix can never reach is now countable, and was counted: 296
+fragmented families over 624 nodes.** No amount of correct write-path behaviour
+collapses a family belonging to a task no future episode will mention again,
+because nothing will ever trigger the write path for it — so
+`fused_memory/maintenance/task_family_census.py` goes and looks. Measured
+2026-09-19 against the live FalkorDB store with
+`python -m fused_memory.maintenance.task_family_census --json`: every one of 154
+graphs enumerated in full (`complete: true`, no per-graph failures, no
+unconfirmed families, exit 0, 8.2s). Only 5 graphs hold any residue at all —
+**reify 199** families over 421 nodes, **dark_factory 64** over 137,
+**know_live 25** over 50, **solar_challenge 5** over 10, **autopilot_video 3**
+over 6; the other 149 (test and probe leftovers) report 0. Of the 296, **235 are
+split across more than one spelling** — the shape the write-path fix addresses
+when such a task is next mentioned — and 61 are exact-name duplicate pairs only.
+268 families hold 2 nodes, 27 hold 3, and one (reify `Task 2923`) holds 7 across
+three spellings. **145 of the 296 have a survivor whose spelling is not the
+canonical one**, which is the population where the survivor-selection change
+above decides a different uuid than the old policy would have.
+
+The store is live, so these are a measurement rather than a constant: an
+earlier run the same day reported 297 over 626, and the difference is one
+`solar_challenge` family that collapsed in between.
+
+**The census is read-only by construction, and that is asserted rather than
+promised.** It calls only `enumerate_entity_nodes`,
+`find_entity_nodes_by_name_substring` and `list_graphs`, all `ro_query`-backed;
+its tests assert every mutating backend method is never awaited AND that a run
+through a real `GraphitiBackend` never touches the driver's writable `query`
+channel, and they enumerate the argparse surface to prove no flag could mutate
+anything. There is deliberately no `--dry-run`: `verify_zombie_edges.py` needs
+one because it can delete, whereas every census run is already a dry run and
+offering the flag would imply an unsafe mode exists. Completeness is carried
+rather than smoothed over — a truncated or failed graph forces
+`complete: false` and a non-zero exit, so a lower bound can never be mistaken
+for a total by a script reading the exit status.
+
+**The count is also guarded against its own two reads disagreeing.**
+Membership comes from `enumerate_entity_nodes`, whose `MATCH (n:Entity)` carries
+no `group_id` property predicate, while the per-family edge-count probe does —
+that predicate is what keeps task-2115's cross-graph leak out of a collapse. A
+leaked node therefore counts toward the "more than one node" threshold and then
+vanishes from the probe, and the store being live means a concurrent write-path
+collapse produces the same shortfall. A family that thins below two spellings in
+between is recorded as an `UnconfirmedFamily` — canonical name plus both
+membership counts — and excluded from the total, rather than reported as a
+fragmented family holding one node or none. It does not move `complete` or the
+exit code: the graph was read in full, and the count is honest precisely because
+that family was left out of it. The measured sweep above reported zero.
+
+Wiring the census into `_scan_duplicate_entity_names` and running an unattended
+collapse sweep were both explicitly out of scope, and no family — including the
+`Task 605` pair the task record names, present in `dark_factory` as `task 605`
+(1 edge) and `Task 605` (0 edges) — was adjudicated by hand.
+
 #### `merge_request` gained a `lane` parameter, and `merge_lane` is blessed into Tier-A (task 4888)
 
 **`metadata.merge_lane` was inert for every MCP-submitted merge.** Exactly one
