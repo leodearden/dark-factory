@@ -26,6 +26,7 @@ deselected by default (``addopts = -m 'not integration'``).
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Literal
@@ -1223,6 +1224,86 @@ def test_an_unparseable_reply_that_is_not_a_banner_is_an_ordinary_failure():
     assert out == prose, (
         f'returned verbatim so code_digest fails this digest normally on its '
         f'own parse; got {out!r}'
+    )
+
+
+def _module_rotations(caplog) -> list[str]:
+    """INFO records THIS module actually emitted — the rotation journal.
+
+    Filtered by ``r.name`` for the same reason ``_module_warnings`` is:
+    ``caplog.at_level(logger=...)`` only raises that logger's level, it does
+    NOT scope capture to it, and both ``UsageGate`` and ``legibility.coder``
+    log at INFO on these paths. An unfiltered ``caplog.records`` assertion
+    would pass on somebody else's line.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "INFO" and r.name == "legibility.account_pool"
+    ]
+
+
+def test_the_journal_names_which_cap_route_rotated(caplog):
+    """A rotation must say WHICH route caused it, or the route cannot be
+    counted.
+
+    This is behaviour, not decoration, and the task record is the evidence.
+    Its 2026-09-19 measurement over the journal's full retention (49 trickle
+    runs) could count the non-zero-exit route exactly — 46 firings on one
+    night — but could NOT establish whether the exit-0 route had EVER fired,
+    because both arms logged the same sentence and nothing in it named the
+    cause. So the route being closed here is of unmeasured frequency, and it
+    would have stayed unmeasurable. After this, one ``journalctl`` grep
+    answers it, which is the only way the next operator learns whether this
+    route is real weather or a theoretical one.
+
+    Both routes are driven in ONE test, because the property under test is a
+    relation between the two messages — that they can be told apart — and
+    asserting it across two tests would let both drift to the same wording
+    while each stayed green. The route substrings are asserted rather than
+    whole sentences, so the shared half of the wording stays free to change.
+    """
+    gate = _pool(('max-b', False), ('max-c', False), ('max-d', False))
+    invoke = _RecordingInvoke(
+        # reverse=True: max-d banners at a NON-ZERO exit, max-c banners at
+        # exit 0, then max-b answers.
+        raises={'tok-max-d': _cap_exhausted(stdout='Claude usage limit reached.')},
+        replies={
+            'tok-max-c': cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0],
+            'tok-max-b': '{"matches": [], "candidates": []}',
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger='legibility.account_pool'):
+        out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    assert out == '{"matches": [], "candidates": []}'
+    rotations = _module_rotations(caplog)
+    assert len(rotations) == 2, (
+        f'exactly one INFO record per rotation — two rotations happened; got '
+        f'{rotations}'
+    )
+
+    # Each record names the account it rotated AWAY from, in the order the
+    # rotations happened. Without the account name the line cannot be acted
+    # on at all; without the ORDER, two routes could both name one account.
+    nonzero, zero_exit = rotations
+    assert 'max-d' in nonzero, nonzero
+    assert 'max-c' in zero_exit, zero_exit
+
+    # And the two are DISTINGUISHABLE: each route's phrase appears in exactly
+    # one of them. Counting over both records rather than asserting one
+    # substring per line is what makes this a claim about telling the routes
+    # APART — a single shared sentence containing both phrases, or one
+    # phrase in both lines, fails here.
+    assert sum('non-zero' in r for r in rotations) == 1, (
+        f'exactly one rotation may name the non-zero-exit route; got {rotations}'
+    )
+    assert sum('exited 0' in r for r in rotations) == 1, (
+        f'exactly one rotation may name the exit-0 route; got {rotations}'
+    )
+    assert 'non-zero' in nonzero and 'exited 0' in zero_exit, (
+        f'and each must name ITS OWN route, not merely a different one; got '
+        f'{rotations}'
     )
 
 
