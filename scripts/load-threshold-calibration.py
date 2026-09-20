@@ -267,9 +267,16 @@ _STEM_SQL = (
 # only how MANY ticks the corpus holds, and TICK_METRIC is written on every
 # completed tick -- ~518k rows at the 30-day steady state this script's
 # docstring cites. Reading that series to take its `len()` materialised ~518k
-# (ts, value) tuples on every run, including the ε2 `--arm own_cpu_some_avg10`
-# cut and the four PSI arms -- none of which DECLARES the clock as its
-# readability metric, and none of which looks at the series at all.
+# (ts, value) tuples on every run.
+#
+# WHICH runs stop paying that: the ones that do NOT select the runqueue arm --
+# the ε2 `--arm own_cpu_some_avg10` cut, and a single-PSI-arm run. ε1
+# `--arm runqueue_ratio` and the default full run still materialise the clock,
+# because the runqueue arm DECLARES TICK_METRIC as its readability series and
+# computes its coverage row from those points; those two now also pay one extra
+# index-only COUNT over the same rows. That is the deliberate price of counting
+# uniformly: the denominator stays one fact about the CORPUS rather than
+# something derived from whichever arms a run happened to select.
 #
 # Measured in this worktree against the real schema: this statement plans as
 # `SEARCH samples USING COVERING INDEX idx_samples_metric_ts (metric=?)` --
@@ -798,9 +805,18 @@ def _value_metric_for(metric: str, specs: list[ArmSpec]) -> str | None:
     metric reached from either side computes an identical row.
 
     Needed because a series readable on NO tick writes no value row at all, so
-    the readability side is the only side it appears on. ``None`` for anything
-    no SELECTED spec claims, which is what keeps an ``--arm`` run reporting
-    only the arm it was asked about.
+    the readability side is the only side it appears on.
+
+    The ``None`` is a BACKSTOP, not the thing that scopes an ``--arm`` run.
+    That is done on the FETCH side: ``read_series`` asks for exactly the
+    selected specs' own ``readability`` values, and ``_fetch`` issues an exact
+    match and a ``<selector>:*`` GLOB — so every key reaching here is already
+    one of those values, with or without a ':' tail, and a spec always matches.
+    None is returned only for a caller passing *specs* that disagree with the
+    ones the dict was fetched under. Widen that fetch — a blanket
+    ``{TICK_METRIC} | ...`` union again, or every readability metric at once —
+    and this filter will NOT hold the line: an ``--arm runqueue_ratio`` run
+    would start reporting ``own_cpu_some10:<leaf>`` rows.
     """
     stem, separator, tail = metric.partition(':')
     for spec in specs:
@@ -930,6 +946,11 @@ def coverage_table(
     for metric in sorted(covered):
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
+        # Unreachable: `covered`'s series side was filtered on `_arm_for`, and
+        # every metric on its readability side was built from a SELECTED
+        # spec's own selector, so `_arm_for` resolves that too. Kept as a
+        # backstop because the alternative to skipping is an AttributeError
+        # below -- a traceback and a non-zero rc, an infra fault to ε1/ε2.
         if spec is None:
             continue
         if spec.readability is None:
@@ -944,22 +965,13 @@ def coverage_table(
             'ticks_in_corpus': ticks_in_corpus,
             'ticks_with_a_row': rows,
             'readable': readable,
-            # None, not 0.0, for three reasons that are all "this is not a
-            # ratio anyone knows". NO CLOCK is an unknown denominator. NO
-            # READABILITY ROW is no evidence about the series, and 0.0 would be
-            # the claim "we looked and it was never readable", so the floor
-            # check below would report absence of evidence as a verdict about
-            # the corpus — the same class of defect as the fabricated 1.0
-            # refused above. MORE ROWS THAN TICKS cannot happen at all: a
-            # readability row is written ON a tick and write_tick writes one
-            # whole tick in one transaction, so the clock is broken and every
-            # fraction resting on it is unknown.
-            #
-            # That third one is checked on the ROW COUNT rather than on whether
-            # the printed fraction exceeds 1, because the fraction above 1 is
-            # only the loudest symptom: the same broken clock with half the
-            # reads failing yields a plausible-looking 0.2 and a below-floor
-            # verdict, which is the same fault delivered quietly.
+            # None whenever the counts cannot yield a ratio anyone knows.
+            # Never 0.0: that would be the claim "we looked and it was never
+            # readable", and the floor check below would then report the
+            # absence of evidence as a verdict about the corpus — the same
+            # class of defect as the fabricated 1.0 refused above. WHICH
+            # reason the counts fail has one home, ``_unknown_cause``, which
+            # both report channels name it from.
             'readable_fraction': (
                 round(readable / ticks_in_corpus, 4)
                 if 0 < rows <= ticks_in_corpus else None
