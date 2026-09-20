@@ -158,6 +158,93 @@ its JSON report:
   sweep is unaffected: the probe is count-only and can never alter the
   delete set or abort a run.
 
+### `structural_floor`: which part of the backlog can never be drained
+
+A `--check --max-backlog N` violation renders as a plain `rc=1` whether it is
+transient (a drain clears it) or permanent (nothing ever will). Task 4436
+makes that distinction machine-readable. Every run emits:
+
+```json
+"structural_floor": {
+  "undated_kept_count": 1,
+  "undrainable_count": 2,
+  "undrainable_ids": ["u1", "m1"],
+  "max_backlog": 0,
+  "gate_unsatisfiable": true,
+  "gate_evaluated": true
+}
+```
+
+The floor is **the undated-and-undrained members UNION the protected ones** —
+NOT the raw `undated_kept_count`. The two arms differ in kind, and so do
+their remedies:
+
+- **Undated and undrained.** `find_stale_markers` fail-safe keeps a
+  missing/unparseable `created_at` at every `--max-age-days` including `0`,
+  so no age cutoff reaches these — but `--delete-ids` and `--terminal-drain`
+  still can. This arm is therefore **relative to the invocation**: a
+  `--check` without `--terminal-drain` counts terminal-referenced undated
+  markers as floor, which is the honest answer to "can THIS command's gate
+  ever pass". The logged remedy names the missing flag.
+- **Protected.** `cycle_summary` mirrors and `ledger_stamp` records are
+  refused unconditionally at the delete choke point, overriding even
+  `--delete-ids` (tasks 3041/4435). This arm is **absolute**: no flag of this
+  script drains it, so the remedy is the fused-memory MCP `delete_memory`
+  tool or a corrected `source` enumeration.
+
+`undated_kept_count` is repeated inside the block so the raw count and the
+true floor read side by side, because the two can differ in **both**
+directions:
+
+- an undated marker that is also a kind-orphan is deleted this run, so it
+  counts toward `undated_kept_count` and floors **nothing**;
+- a fully dated protected mirror contributes `0` to `undated_kept_count` and
+  floors the backlog **permanently**.
+
+Before task 4436 the WARNING was keyed on the raw count, so the first case
+told operators to raise `--max-backlog` when the true floor was 0.
+
+- **`gate_unsatisfiable: true`** — `undrainable_count > max_backlog`: no
+  re-run of this sweep can ever clear this gate. Computed on every run
+  against the effective `--max-backlog` (default `0`), so a nightly
+  `--apply --terminal-drain` records the fact in its journal JSON too.
+- **`gate_evaluated`** — mirrors `--check`, and is the discriminator between
+  the two things `gate_unsatisfiable` can mean. `true`: a gate really ran
+  and can never pass. `false`: no gate was configured, and this is what the
+  *default* ceiling would have done — the nightly service's shape, which is
+  why `gate_unsatisfiable: true` there is not a failing check. Without this
+  field the block would mix an evaluated verdict with a hypothetical one and
+  give a consumer no way to tell them apart. The matching ERROR is logged
+  only when `gate_evaluated` is `true`, so the nightly service gains no
+  spurious ERROR line for a gate it never runs.
+
+**Clearing the floor is NECESSARY, not sufficient.** `--check` resolves its
+verdict through `_resolve_check_exit_code`, which compares
+`after.total_source` on an `--apply` run and falls back to
+`before.total_source` otherwise — and
+`scripts/fused-memory-flag-marker-check.sh` hardcodes `--check` with no
+`--apply`, so **its** verdict compares the whole enumerated residual rather
+than the floor. Concretely: 10 enumerated members with a floor of 1 under
+`--check --max-backlog 0` reports `gate_unsatisfiable: true`, but raising
+the ceiling to 1 still exits 1, because the comparand is 10. Raise the
+ceiling to at least `undrainable_count` to make the gate *satisfiable at
+all*; raise it to the resolved residual to make *this* run pass. Both
+figures are in the emitted JSON (`structural_floor.undrainable_count` and
+`before.total_source` / `after.total_source`), and the ERROR names them.
+- **The exit code is unchanged by design.** `rc` is the sweep's own, and the
+  orchestrator's `before_done` path renders any `rc != 0` identically as a
+  predicate violation, so a distinct code would buy separability nowhere it
+  is consumed (the same ruling already adjudicated for the blind spot, in
+  `scripts/fused-memory-flag-marker-check.sh`'s header). A consumer that
+  needs to tell a permanent floor from a transient backlog reads
+  `structural_floor.gate_unsatisfiable`, exactly as it reads
+  `cross_check.blind_spot`.
+
+The floor is defined over the sweep's KEEP-sets rather than over an
+enumerated list of sources, so task 5129's pending second protected
+predicate (`is_protected_audit_record` / `PROTECTED_AUDIT_KINDS`) will widen
+this floor automatically once it joins the delete-set subtraction.
+
 **An observed blind spot fails `--check` BY DEFAULT (task 3923).** A verdict
 rendered from an enumeration that matched nothing must not read as a pass,
 so `--check` exits 1 on `blind_spot: true` with no flag required.
@@ -401,19 +488,32 @@ derivation, read by both consumers (`--list-known-projects` prints
 
 ## Why no `--check` in the recurring service
 
-The sweep's own docstring/WARNING (see `run()`'s `undated_kept_count`) notes
-that markers with a missing or unparseable `created_at` can never be
-drained by `find_stale_markers`, at any age cutoff — this sets a residual
-floor on the backlog. A recurring `--check --max-backlog 0` service would
-therefore enter systemd `failed` state on every run, forever, whenever any
-undated marker exists — a self-inflicted perpetual-failure footgun. Dropping
-`--check` from the recurring service lets each nightly drain exit 0 on a
-normal run.
+Part of the enumerated population can never be drained by any invocation of
+this sweep — see [`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained)
+above. A recurring `--check --max-backlog 0` service would therefore enter
+systemd `failed` state on every run, forever, whenever that floor is nonzero
+— a self-inflicted perpetual-failure footgun. Dropping `--check` from the
+recurring service lets each nightly drain exit 0 on a normal run.
+
+Since task 4436 this is a **checked constraint rather than an unenforced
+caveat**: the nightly run still computes and reports the floor and what a
+hypothetical default-ceiling gate would have done (marked
+`gate_evaluated: false`, so it is never mistaken for a failing check), and an
+invocation that *does* pass `--check` with a ceiling below the floor is told
+so with an ERROR naming the floor, the ceiling and the per-arm remedy,
+instead of failing indistinguishably from a transient over-backlog. Note the
+floor is not equal to `undated_kept_count`, which is why keying a gate on
+that count was itself a footgun — and that clearing the floor is necessary
+but not sufficient for a gate to pass, which is why the ERROR names the
+resolved residual as well.
 
 ## Backstop for residual backlog
 
-Persistent or undrainable residual (chiefly the undated-marker floor above)
-is already surfaced by the existing reconciliation Stage-1/2 re-flag net —
+"Undrainable residual" means precisely `structural_floor.undrainable_count`
+above — the undated-and-undrained members plus the protected ones — not the
+raw `undated_kept_count`, and not a backlog that is merely large. Persistent
+or undrainable residual is already surfaced by the existing reconciliation
+Stage-1/2 re-flag net —
 the very mechanism that filed tasks 2596 and 2693. No new escalation glue
 was added for this. A future enhancement could add a 2663-2666-style
 delayed-predicate born-at-L2 tripwire (e.g. "N days after this task lands,
@@ -446,8 +546,8 @@ mcp__fused-memory__count_memories_by_metadata(
 )
 ```
 
-A residual count near the undated-marker floor (see above) is expected and
-healthy; a count that isn't shrinking at all across multiple nightly runs
+A residual count near `structural_floor.undrainable_count` (see above) is
+expected and healthy — that is the floor no invocation can reach below; a count that isn't shrinking at all across multiple nightly runs
 means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.
