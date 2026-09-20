@@ -577,6 +577,46 @@ def test_an_unwritable_report_dir_is_a_named_degradation_not_a_traceback(
 # ── a hold fraction is meaningless without the coverage it was computed over ──
 
 
+def test_read_series_counts_the_tick_clock_rather_than_loading_it(tmp_path: Path):
+    """The corpus tick count is a COUNT(*), not a series fetched for its len().
+
+    Driven in-process because the fact under test is a property of
+    ``read_series``'s return value that the trailing JSON cannot show: the
+    payload reports the same count either way, and only the returned
+    readability dict says whether the clock's rows were MATERIALISED to get it.
+
+    The cost this defends is measured, not stylistic. ``runqueue_read_ok`` is
+    written on every completed tick, so at the 30-day steady state the script's
+    own docstring cites it is ~518k ``(ts, value)`` tuples — built into a list
+    purely so ``coverage_table`` could take its ``len()``. The ε2 cut
+    (``--arm own_cpu_some_avg10``) and the four PSI arms never read that series
+    at all, and none of them DECLARES the clock as its readability metric; the
+    runqueue arm still gets it as a series because it does. The count itself is
+    served index-only by ``idx_samples_metric_ts`` — measured plan against this
+    exact schema: ``SEARCH samples USING COVERING INDEX idx_samples_metric_ts
+    (metric=?)``, no temp B-tree.
+    """
+    module = load_script()
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 100,
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    read = module.read_series(db, 'own_cpu_some_avg10')
+
+    assert read.degradations == [], read.degradations
+    assert read.ticks_in_corpus == 100
+    assert module.TICK_METRIC not in read.readability, (
+        'the tick clock was materialised as a series for an arm that does not '
+        f'declare it as its readability metric: {sorted(read.readability)}'
+    )
+    # The evidence the arm DID ask for is still fetched, both halves of it.
+    assert len(read.readability['own_read_ok:leaf.service']) == 100
+    assert len(read.series['own_cpu_some10:leaf.service']) == 100
+
+
+
 def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: Path):
     """The denominator is SUCCESSFUL reads, not ticks, so coverage must ship too.
 
