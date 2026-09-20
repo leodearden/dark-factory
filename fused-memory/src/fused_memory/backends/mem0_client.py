@@ -423,6 +423,20 @@ class Mem0Backend:
                 higher-similarity memories belonging to other categories.
                 Single-category → ``{'category': 'name'}`` (equality).
                 Multi-category → ``{'category': {'in': [...]}}`` (OR match).
+
+        Raises:
+            TimeoutError: If the mem0 search exceeds ``_read_timeout`` —
+                PROPAGATED, never swallowed into an empty response.  This read
+                used to return ``{}`` on a timeout, which
+                ``MemoryService._search_mem0`` turned into ``[]`` without ever
+                raising, so ``MemoryService.search``'s per-task
+                ``except Exception`` never ran and the ``search`` MCP response
+                was a bare ``{'results': []}`` — byte-identical to a genuinely
+                empty store.  INV-11 ``no-silent-fail-soft``: a log is not a
+                return value.  The message is re-stated on the raised
+                exception because ``asyncio.wait_for``'s own ``TimeoutError``
+                stringifies EMPTY, and this text is what reaches
+                ``_store_failure_diagnostics['error']``.
         """
         instance = await self._get_instance(scope)
         # Build Qdrant payload filter for category scoping.
@@ -447,9 +461,8 @@ class Mem0Backend:
                 ),
                 timeout=self._read_timeout,
             )
-        except TimeoutError:
-            logger.warning(f'Mem0 search timed out after {self._read_timeout}s')
-            return {}
+        except TimeoutError as exc:
+            raise TimeoutError(f'Mem0 search timed out after {self._read_timeout}s') from exc
 
     async def get_all(
         self,

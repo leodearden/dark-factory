@@ -1631,12 +1631,31 @@ def _store_failure_diagnostics(
     """Build a structured failure-diagnostics dict for a degraded search() store.
 
     Called from search() for both root-cause variants a selected store can hit:
-    ``reason='exception'`` when the store's search task raised (any exception other
-    than the inner GraphitiBackend.search TimeoutError swallow — see search()'s
+    ``reason='exception'`` when the store's search task raised (see search()'s
     per-task except block), and ``reason='timeout'`` when the store's task was
     still pending when the OUTER ``search_timeout_seconds`` asyncio.wait deadline
     elapsed and was cancelled (there, *exc* is None — there is no exception object,
     only the fact of the timeout).
+
+    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  Since
+    task 5265 a mem0 BACKEND read timeout (``Mem0Backend.search`` exceeding
+    ``backend_read_timeout_seconds``) also arrives at the ``'exception'`` branch,
+    where it used to be swallowed into an empty response and never reach here at
+    all.  Both variants carry ``error_type='TimeoutError'``, so they are told
+    apart ONLY by ``reason``: inner backend read timeout → ``'exception'``;
+    outer fan-out deadline → ``'timeout'``.  The inner one additionally carries
+    a non-empty ``error`` naming the backend read timeout, because
+    ``Mem0Backend`` re-raises with that text rather than letting
+    ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
+
+    GraphitiBackend still swallows its own inner ``TimeoutError`` (at
+    ``search`` and several sibling reads), so a Graphiti backend read timeout
+    does NOT reach this function and leaves the search reported as clean.  That
+    asymmetry is deliberate and temporary: it is entangled with a second,
+    independent degrade mechanism in this module
+    (``_graphiti_classify_or_degrade`` / ``_graphiti_degraded_entity_result`` /
+    ``get_entity``'s fallback arms), so reversing it is design work on the
+    degrade contract and was explicitly held out of task 5265's scope.
 
     This is the diagnosability fix for task 2653: search()'s prior degraded-path
     WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no
