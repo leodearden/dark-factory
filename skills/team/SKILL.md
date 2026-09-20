@@ -85,7 +85,7 @@ The axes are orthogonal — don't couple them reflexively ("opus so high, sonnet
 
 1. the goal in one sentence, and why it matters to the whole (so the seat can tell a blocker from a detail);
 2. exact inputs — paths, symbols, commands, prior seats' outputs — never "the module we discussed";
-3. the deliverable's exact shape;
+3. the deliverable's exact shape — including, for each derived, normalised or aggregated figure in it, a field carrying the rule that figure was computed under: what was counted, what was excluded, over what population, one such field per figure rather than one for the seat;
 4. boundaries: what not to touch, and an instruction to report an under-specified brief or a blocker precisely and stop rather than guess or widen scope;
 5. the verification the seat must run before returning;
 6. cross-file references as `path/to/module.py::symbol`.
@@ -95,6 +95,8 @@ Seats receive the same CLAUDE.md files you did (built-in `Explore`/`Plan` except
 ## 4. Integrate and verify — you, not a seat
 
 A seat's output is evidence about what that seat saw, not truth. Read every result; spot-check anything that changes the answer; route correctness-critical claims through a skeptic seat or verify them inline yourself. A structured output that passed its schema can still be degenerate (empty evidence, placeholder text) — check it semantically before it feeds another seat, and re-run a degenerate seat once before dropping its lane and saying so.
+
+The errors that outlive that check live between seats rather than inside one. Before publishing a total, a ratio or an over/under verdict, do two things. Restate the rule behind each input and confirm it is the same rule — the shape to expect is not two seats disagreeing, but one seat that normalised part of its own slice and not the rest, so compare the rules figure by figure, not seat by seat. Then enumerate every component of whatever you are comparing against: a forecast line can be a sum of two, and matching the first term is not matching the total. A 2026-09-15 cross-project study's first draft made both mistakes at once and claimed a 5–9× human-time overrun — unattended `/escalation-watcher` loop hours excluded from "human time" for two of three projects and summed as attended for the third, set against the first of the forecast's two human lines — and its own critic seat caught both before publication; corrected, the work was at or under forecast. Neither fault is reachable from a producing seat: every slice was internally consistent and schema-valid, and the error lived only in the join — so give the join a reader of its own, yourself on a second pass or a critic seat handed the assembled draft.
 
 Large results (a Workflow return or a completion notification arrives truncated past a few hundred KB) go to the scratchpad and get digested with a small script — never ingested raw. Merge worktree seats' changes yourself and run the project's real verification (tests, lint, type-check) on the merged result, not on each seat's branch.
 
