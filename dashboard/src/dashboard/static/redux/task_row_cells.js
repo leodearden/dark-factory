@@ -3,7 +3,16 @@
 // Orchestrators tab (tabs.jsx):
 //
 //   1. the stranded badge (strandBadgeState), at three sites;
-//   2. the agent cell it sits beside (agentCellState), at two of them.
+//   2. the agent cell it sits beside (agentCellState), at two of them;
+//   3. the Locks cell of that same row (locksCellState), at one.
+//
+// THE THIRD ONE ARRIVED LAST AND FOR THE SAME REASON THE FIRST TWO DID. The
+// Locks column is a cell of the identical task row, and its decision was a
+// branch inside tabs.jsx — un-executable JSX, which is how its offline-
+// scheduler arm came to be un-asserted at all. Housing the row's three render
+// decisions together is what makes a change to the row visible in ONE diff,
+// the same argument agentCellState's note below makes for the first two. It
+// also keeps tabs.jsx (at its soft size ceiling) from growing a branch.
 //
 // NAMED FOR THE ROW, NOT FOR THE BADGE. The first spelling of this module was
 // task_strand_badge.js, which was a lie by omission: agentCellState decides
@@ -40,6 +49,24 @@
 // dashboard/tests/js/task_row_cells.test.mjs, so deleting a decision arm — or
 // keying the badge off `agent` instead of `stranded` — fails a named test
 // instead of nothing.
+
+// The Datum envelope's readers, destructured at module scope with no fallback
+// (the DF_SPARK_PATH convention: throw loudly at load rather than defer to a
+// TypeError inside a render). index.html loads datum.js before this file and
+// test_index_html.py pins that edge.
+//
+// RENAMED IN THE DESTRUCTURE, not bound under datum.js's own names. Classic
+// scripts share ONE global lexical scope, and each of these is already a
+// top-level declaration in datum.js — a same-named `const` here dies with
+// "Identifier 'x' has already been declared" before this file reaches its own
+// window.DF_TASK_ROW_CELLS assignment, which would break the top-level
+// destructures in tab_tasks.jsx and tabs.jsx. classic_script_scope.test.mjs
+// measures exactly that.
+const {
+  assertDatum: requireDatum,
+  datumView: viewOfDatum,
+  EM_DASH: DATUM_PLACEHOLDER,
+} = window.DF_DATUM;
 
 // ── The one true strand tooltip ──
 // Exported once because all three render sites (tab_tasks.jsx renderNode,
@@ -167,12 +194,58 @@ function agentCellState(task, opts) {
   };
 }
 
+// ── Does the Locks cell draw its chips, or a placeholder? ──
+// Returns `{placeholder, title}`: `placeholder` is the shared em-dash when
+// nothing is known about this task's locks and null when the caller should
+// render its chip list; `title` is the producer's reason as a tooltip, or null.
+//
+// WHAT IT FIXES. This cell's chips come from DF.SCHEDULER, so a project whose
+// scheduler is offline renders an EMPTY chip list — indistinguishable from a
+// task that genuinely holds no locks. "We don't know" and "nothing is held"
+// are opposite answers for an operator deciding whether a task is blocked, and
+// they rendered identically. With the datum, a blank cell means what it says
+// again and the em-dash carries its own reason (PRD decision 15).
+//
+// `lockInfo` IS A PARAMETER AND IS DELIBERATELY NEVER READ. It is here because
+// the caller holds it and a later reader will look for it, and the thing worth
+// knowing is that it is NOT an input: an unknown datum draws the placeholder
+// even when lock paths are sitting right there. Chips from a snapshot the
+// datum cannot vouch for are exactly the unprovenanced render this envelope
+// exists to remove, so "we don't know" has to win over "here is what we last
+// saw". task_row_cells.test.mjs pins that absence of a branch directly.
+//
+// THE TOOLTIP RULE IS NOT RE-DERIVED HERE. datumView already decides when a
+// reason is worth surfacing (a fresh value has nothing to explain, so a stray
+// reason on one is not shown), and asking it is what keeps this cell following
+// that rule if it ever changes. Its `text` is discarded and `format` returns
+// nothing on purpose: this cell has no text of its own — its value is a chip
+// LIST, which the caller renders — so the view is consulted for the tooltip
+// decision alone.
+//
+// `placeholder` is present-and-null on the known arms rather than an absent
+// key, for the reason agentCellState's `color` is: the call site BRANCHES on
+// it, so it must always be there to branch on.
+//
+// Unlike strandBadgeState, a non-Datum THROWS rather than rendering nothing.
+// The two differ because their inputs do: a task row legitimately arrives
+// before its strand verdict exists, whereas a caller that reaches this
+// function at all has been migrated to pass a Datum, so a bare value here is
+// a missed migration site and must fail by name in dev.
+function locksCellState(datum, lockInfo) {
+  requireDatum(datum, 'locksCellState');
+  const view = viewOfDatum(datum, { format: () => '' });
+  return {
+    placeholder: datum.state === 'unknown' ? DATUM_PLACEHOLDER : null,
+    title: view.title,
+  };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision
 // here would leave window.DF_TASK_ROW_CELLS undefined and break the
 // top-level destructures in tab_tasks.jsx and tabs.jsx.
-const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, STRAND_TITLE, MUTED_COLOR };
+const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, locksCellState, STRAND_TITLE, MUTED_COLOR };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASK_ROW_CELLS_API;

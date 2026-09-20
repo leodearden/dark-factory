@@ -1196,13 +1196,14 @@ def test_datum_js_has_cache_buster(index_html_body: str) -> None:
 _DATUM_ORDER_CASES = [
     (_ENDPOINT_STALENESS_PREFIX, 'endpoint_staleness.js', _DATUM_PREFIX, 'datum.js'),
     (_DATUM_PREFIX, 'datum.js', _DATA_JS_PREFIX, 'data.js'),
+    (_DATUM_PREFIX, 'datum.js', _TASK_ROW_CELLS_PREFIX, 'task_row_cells.js'),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label',
     _DATUM_ORDER_CASES,
-    ids=['staleness-before-datum', 'datum-before-data'],
+    ids=['staleness-before-datum', 'datum-before-data', 'datum-before-task-row-cells'],
 )
 def test_datum_js_load_order(
     index_html_body: str,
@@ -1216,10 +1217,17 @@ def test_datum_js_load_order(
     datum.js destructures {formatAge} from window.DF_ENDPOINT_STALENESS at
     module scope so the tile age badge and the endpoint staleness banner state
     an age in ONE format; data.js destructures window.DF_DATUM at module scope
-    to validate datum-kinded payloads before applying them. Neither destructure
-    has a `|| {}` fallback, by the DF_SPARK_PATH convention — a missing
-    dependency throws at load with a clear message rather than deferring to a
-    TypeError inside a render or silently degrading.
+    to validate datum-kinded payloads before applying them, and
+    task_row_cells.js destructures it for locksCellState's placeholder and
+    tooltip decision. None of these destructures has a `|| {}` fallback, by the
+    DF_SPARK_PATH convention — a missing dependency throws at load with a clear
+    message rather than deferring to a TypeError inside a render or silently
+    degrading.
+
+    The two datum.js -> consumer edges are separate cases rather than one,
+    because breaking either one breaks a different surface: data.js publishes
+    DF_DATA (so the whole dashboard goes), while task_row_cells.js publishes
+    DF_TASK_ROW_CELLS (so the task rows in tab_tasks.jsx and tabs.jsx go).
 
     Parametrized over both edges using the generic assert_script_loads_before
     helper (which also carries the defer/async/type=module false-pass guard)
