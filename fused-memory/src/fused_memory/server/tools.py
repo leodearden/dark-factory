@@ -168,6 +168,7 @@ from fused_memory.services.completion_claim_gate import (
 from fused_memory.services.consolidation_ops import (
     execute_retain_consolidation,
     patch_memory_metadata,
+    read_topic_closure,
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.read_telemetry import (
@@ -6194,6 +6195,28 @@ def create_mcp_server(
             if still_there:
                 survivors.append(supersede_id)
 
+        # (6) RE-READ THE CLOSURE, but only when there was a fold to see.
+        # The retain arm's listing is taken at MINT time, which is the only
+        # place it can be taken by a function that owns the mint; a call
+        # with a delete arm must report the POST-fold closure or it names a
+        # record as a live topic member in the same envelope that reports
+        # it `deleted` — and the flagship case, a supersede that already
+        # carries the topic, is the ordinary shape of a fold.
+        #
+        # Subtracting the confirmed-gone ids from the stale listing would
+        # replace a live read with an inference, which is the
+        # silent-fail-soft this op was built to end. So the retain-only arm
+        # — the gate-3200 default, and every call the auto-consolidation
+        # executor makes — keeps paying for exactly one scroll, and only
+        # the rarer delete path owes a second cheap deterministic read.
+        if supersedes_ids:
+            closure = await read_topic_closure(
+                memory_service, project_id=project_id, topic=topic, run_id=run_id
+            )
+            topic_members = closure.members
+            topic_members_total = closure.total
+            topic_members_truncated = closure.truncated
+            topic_members_available = closure.available
 
         # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
         # stamped HERE rather than from each delete's success branch as the
