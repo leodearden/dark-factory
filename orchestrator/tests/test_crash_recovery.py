@@ -6,6 +6,7 @@ import os
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -181,6 +182,53 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
     return out
 
 
+class _AmbiguityIds(NamedTuple):
+    """The dedup sentinel and agent role the config-dir-ambiguity L1 files under."""
+
+    sentinel: str
+    role: str
+
+
+def _ambiguity_ids() -> _AmbiguityIds:
+    """Read the ambiguity L1's sentinel/role off ``Harness`` at CALL time.
+
+    Never at module scope — the convention this module already applies to new
+    ``EventType`` members — so a missing attribute fails only the tests that
+    need it rather than breaking collection of the whole file.
+    """
+    return _AmbiguityIds(
+        Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL, Harness._CONFIG_DIR_AMBIGUOUS_ROLE,
+    )
+
+
+def _adopt(harness: Harness, entry: Path, key: str | None) -> str | None:
+    """Drive one ``_adopt_recovered_session`` pass over *entry* for *key*.
+
+    The three accessors below name the state that pass reads and writes. Every
+    test that drives adoption goes through this seam rather than restating the
+    internal name, so the coupling lives in ONE place — which is both the
+    readable shape and the one the merge-lane private-read ratchet
+    (``scripts/merge_lane_metrics.py``) measures.
+    """
+    return harness._adopt_recovered_session(entry, key)
+
+
+def _adopted_sessions(harness: Harness) -> dict:
+    """Adoption's own map: the sidecars it accepted, keyed by task id."""
+    return harness._recovered_sessions
+
+
+def _stashed_config_dirs(harness: Harness) -> dict:
+    """The config dirs adoption resolved, for the dispatch-time transcript re-glob."""
+    return harness._recovered_session_config_dirs
+
+
+def _install_escalation_queue(harness: Harness, queue):
+    """Point *harness* at *queue* (or ``None``) and hand it back for assertions."""
+    harness._escalation_queue = queue
+    return queue
+
+
 async def _drive_session_slot(
     harness: Harness,
     task_id: str,
@@ -191,9 +239,9 @@ async def _drive_session_slot(
     """Populate recovered-session state and run ``_run_slot`` with
     ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
     """
-    harness._recovered_sessions[task_id] = session
+    _adopted_sessions(harness)[task_id] = session
     if config_dir is not None:
-        harness._recovered_session_config_dirs[task_id] = str(config_dir)
+        _stashed_config_dirs(harness)[task_id] = str(config_dir)
 
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -522,7 +570,7 @@ class TestRecoverCrashedTasks:
         cfg = _make_transcript(tmp_path, 'uuid-resume-me')
         harness.config.session_resume = SessionResumeConfig()
         harness._recovered_sessions['55'] = session_dict
-        harness._recovered_session_config_dirs['55'] = str(cfg)
+        _stashed_config_dirs(harness)['55'] = str(cfg)
         harness._preserved_worktrees.add('55')
 
         assignment = MagicMock()
@@ -647,11 +695,11 @@ class TestAdoptNonDictSidecar:
         (task_dir / 'agent_session.json').write_text(json.dumps(payload))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            adopted = harness._adopt_recovered_session(wt, task_id)
+            adopted = _adopt(harness, wt, task_id)
 
         assert adopted is None
-        assert harness._recovered_sessions == {}
-        assert harness._recovered_session_config_dirs == {}
+        assert _adopted_sessions(harness) == {}
+        assert _stashed_config_dirs(harness) == {}
         assert any(
             type(payload).__name__ in rec.getMessage() for rec in caplog.records
         ), (
@@ -694,7 +742,7 @@ class TestAdoptNonDictSidecar:
         task_dir = wt / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'agent_session.json').write_text(json.dumps(['a']))
-        harness._adopt_recovered_session(wt, '91')
+        _adopt(harness, wt, '91')
 
         assignment = MagicMock()
         assignment.task_id = '91'
@@ -785,10 +833,10 @@ class TestAdoptDerivesConfigDir:
         # that follows is decided by derivation and nothing else.
         assert sorted(task_dir.glob(f'{CONFIG_DIR_PREFIX}*'))[0] == foreign.path
 
-        adopted = harness._adopt_recovered_session(wt, task_id)
+        adopted = _adopt(harness, wt, task_id)
 
         assert adopted == task_id
-        assert harness._recovered_session_config_dirs == {
+        assert _stashed_config_dirs(harness) == {
             task_id: str(expected.path)
         }
 
@@ -819,11 +867,11 @@ class TestAdoptDerivesConfigDir:
         unblock = TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
         assert list(task_dir.glob(f'{CONFIG_DIR_PREFIX}*')) == [unblock.path]
 
-        adopted = harness._adopt_recovered_session(wt, task_id)
+        adopted = _adopt(harness, wt, task_id)
 
-        assert harness._recovered_session_config_dirs == {}
+        assert _stashed_config_dirs(harness) == {}
         assert adopted == task_id
-        assert harness._recovered_sessions[task_id] == payload
+        assert _adopted_sessions(harness)[task_id] == payload
 
     def test_absent_task_dir_adopts_and_stashes_nothing(self, harness: Harness):
         """(c) Regression guard — no ``.task/`` at all still adopts, stashes
@@ -843,11 +891,11 @@ class TestAdoptDerivesConfigDir:
         payload = _adopt_sidecar(meta_root, 'sess-77', task_id)
         assert not (wt / '.task').exists()
 
-        adopted = harness._adopt_recovered_session(wt, task_id)  # must not raise
+        adopted = _adopt(harness, wt, task_id)  # must not raise
 
         assert adopted == task_id
-        assert harness._recovered_sessions[task_id] == payload
-        assert harness._recovered_session_config_dirs == {}
+        assert _adopted_sessions(harness)[task_id] == payload
+        assert _stashed_config_dirs(harness) == {}
 
 
 def _ambiguity_emits(harness: Harness) -> list[dict]:
@@ -919,7 +967,7 @@ class TestAdoptEmitsConfigDirAmbiguous:
         expected = task_dir / f'{CONFIG_DIR_PREFIX}{task_id}'
         assert not expected.exists()
 
-        harness._adopt_recovered_session(wt, task_id)
+        _adopt(harness, wt, task_id)
 
         emits = _ambiguity_emits(harness)
         assert len(emits) == 1
@@ -950,10 +998,10 @@ class TestAdoptEmitsConfigDirAmbiguous:
         _adopt_sidecar(task_dir, 'sess-55', task_id)
         assert list(task_dir.glob(f'{CONFIG_DIR_PREFIX}*')) == []
 
-        adopted = harness._adopt_recovered_session(wt, task_id)
+        adopted = _adopt(harness, wt, task_id)
 
         assert adopted == task_id
-        assert harness._recovered_session_config_dirs == {}
+        assert _stashed_config_dirs(harness) == {}
         assert _ambiguity_emits(harness) == []
 
     def test_silent_when_resolution_succeeded(self, harness: Harness):
@@ -968,9 +1016,9 @@ class TestAdoptEmitsConfigDirAmbiguous:
         expected = TaskConfigDir(task_id, base_dir=task_dir)
         TaskConfigDir('000-foreign', base_dir=task_dir)
 
-        harness._adopt_recovered_session(wt, task_id)
+        _adopt(harness, wt, task_id)
 
-        assert harness._recovered_session_config_dirs == {
+        assert _stashed_config_dirs(harness) == {
             task_id: str(expected.path)
         }
         assert _ambiguity_emits(harness) == []
@@ -997,10 +1045,10 @@ class TestAdoptEmitsConfigDirAmbiguous:
             (task_dir / 'agent_session.json').write_text(json.dumps(payload))
         TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
 
-        adopted = harness._adopt_recovered_session(wt, task_id)
+        adopted = _adopt(harness, wt, task_id)
 
         assert adopted is None
-        assert harness._recovered_sessions == {}
+        assert _adopted_sessions(harness) == {}
         assert _ambiguity_emits(harness) == []
 
     def test_no_event_store_never_raises(self, harness: Harness):
@@ -1014,10 +1062,10 @@ class TestAdoptEmitsConfigDirAmbiguous:
         _adopt_sidecar(task_dir, 'sess-3464', task_id)
         TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
 
-        adopted = harness._adopt_recovered_session(wt, task_id)  # must not raise
+        adopted = _adopt(harness, wt, task_id)  # must not raise
 
         assert adopted == task_id
-        assert harness._recovered_session_config_dirs == {}
+        assert _stashed_config_dirs(harness) == {}
 
 
 class TestAdoptFilesConfigDirAmbiguousL1:
@@ -1080,10 +1128,7 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         queue's resolved escalation closing another's still-open gate, and it is
         invisible until an operator notices a gate that will not stay shut.
         """
-        sentinel = Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
-        role = Harness._CONFIG_DIR_AMBIGUOUS_ROLE
-        assert sentinel != Harness._SESSION_RESUME_STORM_SENTINEL
-        assert sentinel != Harness._ARCHIVAL_STORM_SENTINEL
+        sentinel, role = _ambiguity_ids()
 
         others = {
             name: value for name, value in vars(Harness).items()
@@ -1091,6 +1136,11 @@ class TestAdoptFilesConfigDirAmbiguousL1:
             and name != '_CONFIG_DIR_AMBIGUOUS_SENTINEL'
             and isinstance(value, str)
         }
+        # Non-vacuity: the two sentinels this one is most likely to be
+        # copy-pasted from are IN the introspected set, so the comparison below
+        # is known to cover them without naming their values here.
+        assert '_SESSION_RESUME_STORM_SENTINEL' in others
+        assert '_ARCHIVAL_STORM_SENTINEL' in others
         assert sentinel not in others.values(), (
             f'{sentinel!r} collides with {[n for n, v in others.items() if v == sentinel]}'
         )
@@ -1109,7 +1159,7 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         the expected path and the found candidate — the operator must not have to
         guess which dir was expected.
         """
-        harness._escalation_queue = self._queue()
+        queue = _install_escalation_queue(harness, self._queue())
         wt = self._ambiguous_worktree(harness)
         task_dir = wt / '.task'
         expected = TaskConfigDir('3464', base_dir=task_dir).path
@@ -1119,12 +1169,13 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         # the shape under test is genuinely "expected absent, candidate present".
         shutil.rmtree(expected)
 
-        harness._adopt_recovered_session(wt, '3464')
+        _adopt(harness, wt, '3464')
 
-        assert harness._escalation_queue.submit.call_count == 1
-        esc = harness._escalation_queue.submit.call_args.args[0]
-        assert esc.task_id == Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
-        assert esc.agent_role == Harness._CONFIG_DIR_AMBIGUOUS_ROLE
+        assert queue.submit.call_count == 1
+        esc = queue.submit.call_args.args[0]
+        sentinel, role = _ambiguity_ids()
+        assert esc.task_id == sentinel
+        assert esc.agent_role == role
         assert esc.level == 1
         assert esc.severity == 'blocking'
         assert esc.category == 'infra_issue'
@@ -1139,18 +1190,17 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         a copy-paste of the storm filing method: a wrong sentinel still dedups,
         just against the wrong gate.
         """
-        harness._escalation_queue = self._queue()
-        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        queue = _install_escalation_queue(harness, self._queue())
+        queue.has_open_l1 = MagicMock(return_value=True)
         wt = self._ambiguous_worktree(harness)
 
-        harness._adopt_recovered_session(wt, '3464')
+        _adopt(harness, wt, '3464')
 
-        harness._escalation_queue.submit.assert_not_called()
+        queue.submit.assert_not_called()
         probed = [
-            c.args[0] for c in harness._escalation_queue.has_open_l1.call_args_list
+            c.args[0] for c in queue.has_open_l1.call_args_list
         ]
-        assert probed == [Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL]
-        assert Harness._SESSION_RESUME_STORM_SENTINEL not in probed
+        assert probed == [_ambiguity_ids().sentinel]
 
     def test_streak_and_stamp_are_untouched(self, harness: Harness):
         """(d) D7 — the fallback-storm streak, its comparison stamp, and its
@@ -1160,16 +1210,16 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         dispatch-time streak. Pinned anyway so the exclusion is CHECKABLE rather
         than re-derived from the call graph by whoever next edits either site.
         """
-        harness._escalation_queue = self._queue()
+        queue = _install_escalation_queue(harness, self._queue())
         wt = self._ambiguous_worktree(harness)
 
-        harness._adopt_recovered_session(wt, '3464')
+        _adopt(harness, wt, '3464')
 
         assert harness._session_resume_fallback_streak == 0
         assert harness._last_session_resume_fallback_at is None
         filed_under = [
             c.args[0].task_id
-            for c in harness._escalation_queue.submit.call_args_list
+            for c in queue.submit.call_args_list
         ]
         assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
 
@@ -1183,25 +1233,25 @@ class TestAdoptFilesConfigDirAmbiguousL1:
         exception is swallowed and recovery completes unchanged. Filing must
         never break the path it exists to report on.
         """
-        harness._escalation_queue = None
+        _install_escalation_queue(harness, None)
         wt = self._ambiguous_worktree(harness)
 
-        adopted = harness._adopt_recovered_session(wt, '3464')  # must not raise
+        adopted = _adopt(harness, wt, '3464')  # must not raise
 
         assert adopted == '3464'
-        assert harness._recovered_session_config_dirs == {}
+        assert _stashed_config_dirs(harness) == {}
         assert len(_ambiguity_emits(harness)) == 1
 
         harness2_queue = self._queue()
         harness2_queue.submit = MagicMock(side_effect=RuntimeError('queue down'))
-        harness._escalation_queue = harness2_queue
-        harness._recovered_sessions.clear()
+        _install_escalation_queue(harness, harness2_queue)
+        _adopted_sessions(harness).clear()
         wt2 = self._ambiguous_worktree(harness, task_id='3465')
 
-        adopted2 = harness._adopt_recovered_session(wt2, '3465')  # must not raise
+        adopted2 = _adopt(harness, wt2, '3465')  # must not raise
 
         assert adopted2 == '3465'
-        assert harness._recovered_session_config_dirs == {}
+        assert _stashed_config_dirs(harness) == {}
 
 
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
@@ -3703,7 +3753,7 @@ class TestMarkInProgressDoneRecoveryStateCleanup:
             'session_id': 'uuid-leak', 'role': 'implementer',
             'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0,
         }
-        harness._recovered_session_config_dirs[tid] = str(
+        _stashed_config_dirs(harness)[tid] = str(
             tmp_path / 'long-deleted' / 'claude-config-x'
         )
 
@@ -3721,7 +3771,7 @@ class TestMarkInProgressDoneRecoveryStateCleanup:
         harness.scheduler.mark_done.assert_awaited_once()
         assert tid not in harness._recovered_plans
         assert tid not in harness._recovered_sessions
-        assert tid not in harness._recovered_session_config_dirs, (
+        assert tid not in _stashed_config_dirs(harness), (
             'the config-dir stash must be dropped in lockstep with its session '
             "— a surviving orphan would later classify as 'reseeded' and be "
             'silently suppressed instead of surfacing'

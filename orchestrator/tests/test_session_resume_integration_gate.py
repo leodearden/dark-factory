@@ -318,6 +318,21 @@ async def _dispatch_capture(
     )
 
 
+def _adopt_side(harness: Harness, task_id: str) -> tuple[dict, str | None]:
+    """The ADOPT-side (β) state a B-family test reads back after recovery.
+
+    Asserts the session and its plan were recovered, and returns
+    ``(recovered_plan, stashed_config_dir)`` — the stash being ``None`` when
+    boot corroborated no transcript for *task_id*. One named seam for the three
+    internal maps the family reads, so joining the family costs no new coupling
+    (the merge-lane private-read ratchet measures exactly that).
+    """
+    plans = harness._recovered_plans
+    assert task_id in harness._recovered_sessions
+    assert task_id in plans
+    return plans[task_id], harness._recovered_session_config_dirs.get(task_id)
+
+
 def _seed_lane_record(
     lifecycle: LaneLifecycle, lane: Path, *, task_id: str, branch: str | None = None,
 ) -> None:
@@ -1417,10 +1432,8 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     await harness._recover_crashed_tasks()
 
     # ── ADOPT side (β): session + plan recovered; NO config-dir corroboration ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_plans
-    assert task_id not in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is None
 
     # ── INJECT side (γ): corroboration fails → fallback, plan kept ──
     cap = await _dispatch_capture(harness, task_id)
@@ -1461,14 +1474,13 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     await harness._recover_crashed_tasks()
 
     # ── ADOPT side (β): the transcript corroborated, so a config dir IS stashed ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is not None
 
     # The next acquire re-seeds the lane from base, wiping .task/ wholesale —
     # the stashed config dir now points at a path that no longer exists.
     shutil.rmtree(lane / '.task')
-    assert not Path(harness._recovered_session_config_dirs[task_id]).exists()
+    assert not Path(stashed).exists()
 
     # ── INJECT side (γ): expected fallback — event yes, escalation no ──
     cap = await _dispatch_capture(harness, task_id)
@@ -1534,15 +1546,13 @@ async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
     assert not expected_dir.exists()
 
     harness.config.session_resume = SessionResumeConfig()
-    harness._escalation_queue = _storm_queue()
+    queue = harness._escalation_queue = _storm_queue()
 
     await harness._recover_crashed_tasks()
 
     # ── ADOPT side (β): session adopted, but NOTHING stashed ──
-    assert task_id in harness._recovered_sessions
-    assert task_id in harness._recovered_plans
-    assert task_id not in harness._recovered_session_config_dirs
-    recovered_plan = harness._recovered_plans[task_id]
+    recovered_plan, stashed = _adopt_side(harness, task_id)
+    assert stashed is None
 
     # ── The signal that used to be missing ──
     # Read off event_store directly: `_session_resume_emits` filters to the
@@ -1556,8 +1566,8 @@ async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
     assert len(ambiguous) == 1
     assert ambiguous[0]['data']['expected'] == str(expected_dir)
     assert ambiguous[0]['data']['found'] == [str(unblock.path)]
-    assert harness._escalation_queue.submit.call_count == 1
-    filed = harness._escalation_queue.submit.call_args.args[0]
+    assert queue.submit.call_count == 1
+    filed = queue.submit.call_args.args[0]
     assert filed.task_id == Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
 
     # ── INJECT side (γ): the degradation still happens, now accounted for ──
@@ -1572,7 +1582,7 @@ async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
     # ── D7 end-to-end: the boot-time signal never feeds the dispatch streak ──
     assert harness._session_resume_fallback_streak == 0
     filed_under = [
-        c.args[0].task_id for c in harness._escalation_queue.submit.call_args_list
+        c.args[0].task_id for c in queue.submit.call_args_list
     ]
     assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
 
