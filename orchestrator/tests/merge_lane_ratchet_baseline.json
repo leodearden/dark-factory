@@ -1096,7 +1096,7 @@
     "orchestrator/tests/test_workflow_merge_blocked_surfacing.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_workflow_merge_gating_strand.py": {"patch_targets": [], "private_reads": 43},
     "orchestrator/tests/test_workflow_merge_phase_liveness.py": {"patch_targets": [], "private_reads": 59},
-    "orchestrator/tests/test_workflow_merge_provenance.py": {"patch_targets": [], "private_reads": 122},
+    "orchestrator/tests/test_workflow_merge_provenance.py": {"patch_targets": [], "private_reads": 100},
     "orchestrator/tests/test_workflow_merge_retry_pending.py": {"patch_targets": [], "private_reads": 54},
     "orchestrator/tests/test_workflow_merge_superseded.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_workflow_merge_thrash.py": {"patch_targets": [], "private_reads": 65},
