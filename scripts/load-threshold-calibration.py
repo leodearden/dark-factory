@@ -328,6 +328,13 @@ def read_series(db: Path, arm: str | None) -> CorpusRead:
     selected arms DECLARE and nothing else: ``TICK_METRIC`` appears there for
     the runqueue arm, which declares it, and for no other.
 
+    NO VALUE ROWS is still ``no_samples_in_window`` — the name is literally
+    true — but the readability series and the tick count are returned BESIDE
+    it rather than discarded, because they are what tells an absent sampler
+    apart from a present one that never got a reading, and those two call for
+    opposite next actions. An unreadable DATABASE still returns nothing:
+    there, nothing was read, so there is nothing to report.
+
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
     each kept as its OWN series — pooling them would average unrelated
@@ -365,17 +372,18 @@ def read_series(db: Path, arm: str | None) -> CorpusRead:
         )
         # Same connection and same guard as the fetches, so an unreadable
         # corpus still degrades by name instead of raising past the caller.
-        (ticks_in_corpus,) = con.execute(_COUNT_SQL, (TICK_METRIC,)).fetchone()
+        (tick_rows,) = con.execute(_COUNT_SQL, (TICK_METRIC,)).fetchone()
+        ticks_in_corpus = int(tick_rows)
     except sqlite3.Error as exc:
         return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
     finally:
         con.close()
 
     if not series:
-        return CorpusRead({}, {}, 0, [
+        return CorpusRead({}, readability, ticks_in_corpus, [
             f'no_samples_in_window: no rows for {sorted(selectors)} in {db}'
         ])
-    return CorpusRead(series, readability, int(ticks_in_corpus), [])
+    return CorpusRead(series, readability, ticks_in_corpus, [])
 
 
 def percentile_table(
