@@ -182,6 +182,11 @@ def _is_exempt(module_key, chain):
 def _unrouted_loader_lines(path):
     """The line of every non-exempt ``spec_from_file_location(...)`` call in *path*.
 
+    Naming the module comes first: ``_module_key`` is the only step that checks
+    the path's shape, and it does no I/O. Without that ordering a cwd-relative
+    path the text prefilter misses gets a clean ``[]`` — a false "forks no
+    loader" verdict about a file this guard never located under the tests root.
+
     A cheap text prefilter runs before any parse, the idiom
     ``test_falkor_index_barrier_guard.py`` established for a discovered scope:
     ``_ast_guard.parse_python_module`` memoises for the whole session, so
@@ -202,11 +207,11 @@ def _unrouted_loader_lines(path):
     hazard the barrier guard answers with a hand-verified floor set; here the
     shape of the parametrize answers it instead.
     """
+    module_key = _module_key(path)
     if LOADER_FACTORY not in path.read_text():
         return []
     tree = parse_python_module(path)
     chain_of = {id(node): chain for node, chain in _nodes_with_enclosing_scope(tree)}
-    module_key = _module_key(path)
     return sorted(
         call.lineno
         for call in calls_named(tree, LOADER_FACTORY)
