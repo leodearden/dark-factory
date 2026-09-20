@@ -53,6 +53,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'createPollState',
   'pollKey',
   'datumFor',
+  'requestOnDemand',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
@@ -1728,4 +1729,278 @@ test('receipts: __stale still advances on failure — the two maps are not one',
 
   assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 1);
   assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+});
+
+// ---------------------------------------------------------------------------
+// ON_DEMAND_KEYS / requestOnDemand — per-project parameterised keys
+//
+// The mechanism PRD leaf gamma3 fetches `?terminal=<project>` through. Two
+// properties carry the whole design.
+//
+// ONE NAME PER KEY. A declared row's key builder names BOTH what the response
+// body calls the value and what DF_DATA calls it — exactly the rule every
+// polled row already follows, where a row's key name is simultaneously the
+// body key and the DF_DATA key. The only difference here is that the name is
+// BUILT from a parameter instead of written as a literal, which is why the row
+// carries builders rather than strings, and why nothing re-derives either one
+// by string surgery at a call site.
+//
+// ISOLATION FROM THE POLL LOOP. pollKey strips the query string on purpose, so
+// an on-demand `/api/v2/dashboard/tasks?terminal=<p>` would otherwise land on
+// the POLLED `/api/v2/dashboard/tasks` flow-control entry: it would set that
+// endpoint's in-flight flag (so the poll loop skips the real tasks fetch for
+// as long as a user's terminal request runs), reset or escalate its backoff,
+// and write its __stale entry — corrupting the banner with a failure the
+// polled endpoint never had. A user action must not be able to blind a tab.
+// ---------------------------------------------------------------------------
+
+const TASKS_PATH = '/api/v2/dashboard/tasks';
+const TERMINAL_PROJECT = 'dark-factory';
+const TERMINAL_KEY = `TASKS_TERMINAL:${TERMINAL_PROJECT}`;
+// The flow-control/staleness key an on-demand request must use instead of the
+// polled path. Stated as a literal, not built from the row, so the separation
+// is pinned against an expectation rather than against itself.
+const TERMINAL_STATE_KEY = `${TASKS_PATH}#terminal:${TERMINAL_PROJECT}`;
+
+// A Datum as the terminal endpoint will serve one: a lower_bound, because a
+// terminal listing is truncated by construction.
+const SERVED_TERMINAL_DATUM = Object.freeze({
+  value: { rows: [{ id: '5588' }] },
+  as_of: '2026-09-20T09:00:00+00:00',
+  state: 'lower_bound',
+  reason: 'terminal window truncated at 200 rows',
+  freshness_bound_seconds: 30,
+});
+
+// Responds with the Datum under whatever key the request asked for, so the
+// fixture cannot accidentally hard-code the key the implementation is supposed
+// to build. `served_at` is present so the receipt has both halves.
+function terminalResponse(datum = SERVED_TERMINAL_DATUM, servedAt = '2026-09-20T09:00:01+00:00') {
+  return url => {
+    const project = decodeURIComponent((url.split('terminal=')[1] || '').split('&')[0]);
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ served_at: servedAt, [`TASKS_TERMINAL:${project}`]: datum }),
+    });
+  };
+}
+
+test('on-demand: the terminal row declares its url builder, its key builder and a datum spec', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.terminal;
+
+  assert.ok(row, 'ON_DEMAND_KEYS.terminal must be declared');
+  assert.equal(typeof row.url, 'function', 'the row must BUILD its url, not carry a template string');
+  assert.equal(typeof row.key, 'function', 'the row must BUILD its key, not carry a template string');
+  assert.equal(row.url(TERMINAL_PROJECT), `${TASKS_PATH}?terminal=${TERMINAL_PROJECT}`);
+  assert.equal(row.key(TERMINAL_PROJECT), TERMINAL_KEY);
+  assert.equal(row.spec.kind, 'datum', 'the terminal endpoint serves a Datum, unlike every polled row');
+});
+
+test('on-demand: one request, one fetch, and a validated Datum under the built key', async () => {
+  const { api, window: win } = loadDataJs();
+
+  const fetchUrls = [];
+  const inner = terminalResponse();
+  const deps = { fetchImpl: url => { fetchUrls.push(url); return inner(url); }, now: () => 4242 };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state: api.createPollState(), deps });
+
+  assert.deepEqual(fetchUrls, [`${TASKS_PATH}?terminal=${TERMINAL_PROJECT}`], 'exactly one fetch, to the built url');
+
+  const stored = win.DF_DATA[TERMINAL_KEY];
+  assert.ok(stored, `nothing was applied to DF_DATA['${TERMINAL_KEY}']`);
+  assert.equal(stored.state, 'lower_bound');
+  assert.deepEqual(stored.value, { rows: [{ id: '5588' }] });
+  assert.equal(stored._served_at, '2026-09-20T09:00:01+00:00', 'the receipt must come from the body');
+  assert.equal(stored._received_at, 4242, 'the receipt must come from the injected clock');
+  assert.notEqual(stored, SERVED_TERMINAL_DATUM, 'the wire payload must not be stored by reference');
+});
+
+test('on-demand: a non-Datum body is refused, so no unprovenanced value reaches a terminal key', async () => {
+  // Same guarantee applyKey gives every datum-kinded polled row; asserted here
+  // because this is the FIRST row declared datum-kinded, so it is the first
+  // path on which the refusal is reachable at all.
+  const { api, window: win } = loadDataJs();
+  const deps = {
+    fetchImpl: () => Promise.resolve({
+      ok: true,
+      json: async () => ({ served_at: null, [TERMINAL_KEY]: { rows: [] } }),
+    }),
+    now: () => 1,
+  };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state: api.createPollState(), deps });
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY], undefined, 'a bare payload was applied to a datum-kinded key');
+});
+
+test('on-demand: a second project gets its own key and leaves the first alone', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const deps = { fetchImpl: terminalResponse(), now: () => 10 };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  const first = win.DF_DATA[TERMINAL_KEY];
+
+  await api.requestOnDemand('terminal', 'other-project', {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 20 },
+  });
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY], first, "the first project's Datum was overwritten");
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 10);
+  assert.equal(win.DF_DATA['TASKS_TERMINAL:other-project']._received_at, 20);
+});
+
+test('on-demand: a project name needing escaping is URL-encoded in the url and left literal in the key', () => {
+  // The two halves diverge on purpose: the url must survive HTTP parsing, and
+  // the DF_DATA key must be the name a caller can look up with the project
+  // string it already holds — no call site should have to know which of the
+  // two is encoded.
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.terminal;
+  const messy = 'a b/c&d=e?f';
+
+  assert.equal(row.url(messy), `${TASKS_PATH}?terminal=${encodeURIComponent(messy)}`);
+  assert.ok(!/[ &?]/.test(row.url(messy).split('terminal=')[1]), 'the encoded param leaked a delimiter');
+  assert.equal(row.key(messy), `TASKS_TERMINAL:${messy}`);
+});
+
+test('on-demand: flow-control and staleness are recorded under the request\'s OWN key', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 77 },
+  });
+
+  assert.ok(state.get(TERMINAL_STATE_KEY), `no flow-control entry at ${TERMINAL_STATE_KEY}`);
+  assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
+  assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77 });
+  assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
+});
+
+test('on-demand: a poll of /tasks still runs while a terminal request is in flight', async () => {
+  // The isolation property stated as the operator sees it: a user opening a
+  // terminal must not stop the Tasks tab from updating. Shared `state` Map, so
+  // a collision would be real rather than hypothetical.
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  let releaseTerminal;
+  const terminalGate = new Promise(resolve => { releaseTerminal = resolve; });
+  const polledUrls = [];
+
+  const pending = api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: {
+      now: () => 100,
+      fetchImpl: () => terminalGate.then(() => ({
+        ok: true,
+        json: async () => ({ served_at: null, [TERMINAL_KEY]: SERVED_TERMINAL_DATUM }),
+      })),
+    },
+  });
+  await drain();
+
+  assert.equal(state.get(TERMINAL_STATE_KEY).inFlight, true, 'the held request should be in flight');
+  assert.notEqual(state.get(TASKS_PATH)?.inFlight, true, 'the POLLED tasks endpoint was marked in flight');
+
+  await api.refreshOne(TASKS_PATH, { ACTIVE_TASKS: PLAIN_SPEC }, state, {
+    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ ACTIVE_TASKS: [{ id: '1' }] }) }); },
+    now: () => 101,
+  });
+
+  assert.deepEqual(polledUrls, [TASKS_PATH], 'the polled tasks fetch was skipped while the terminal request ran');
+  assert.deepEqual(win.DF_DATA.ACTIVE_TASKS, [{ id: '1' }]);
+
+  releaseTerminal();
+  await pending;
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 100, 'the terminal Datum still landed afterwards');
+});
+
+test('on-demand: a failed request never escalates the polled tasks backoff', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 500 },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(state.get(TERMINAL_STATE_KEY).failures, 1, "the request's own entry should count the failure");
+  assert.equal(state.get(TASKS_PATH), undefined, 'a failed user action created backoff for the polled endpoint');
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, 'a failed user action reported the polled endpoint stale');
+});
+
+test('on-demand: a failed request leaves a previously applied terminal Datum untouched', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 300 },
+  });
+  const good = win.DF_DATA[TERMINAL_KEY];
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (const fetchImpl of [
+      () => Promise.reject(new Error('boom')),
+      () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+    ]) {
+      await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+        state,
+        deps: { fetchImpl, now: () => 900, ignoreBackoff: true },
+      });
+      assert.equal(win.DF_DATA[TERMINAL_KEY], good, 'a failed retry replaced the last good Datum');
+    }
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 300, 'the stored Datum must keep ageing from its own receipt');
+});
+
+test('on-demand: datumFor a terminal key is unknown/not yet fetched before the request', async () => {
+  const { api } = loadDataJs();
+
+  const before = api.datumFor(TERMINAL_KEY);
+  assert.equal(before.state, 'unknown');
+  assert.equal(before.reason, 'not yet fetched');
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 8 },
+  });
+
+  assert.equal(api.datumFor(TERMINAL_KEY).state, 'lower_bound');
+});
+
+test('on-demand: an undeclared name is refused loudly rather than fetched', async () => {
+  // Nothing re-derives a url or a key by string surgery at a call site, so an
+  // unrecognised name has no url to build. Failing loudly here is what keeps
+  // that true — a silent no-op would let a typo look like an empty result.
+  const { api } = loadDataJs();
+  const fetchUrls = [];
+
+  await assert.rejects(
+    () => api.requestOnDemand('termnial', TERMINAL_PROJECT, {
+      state: api.createPollState(),
+      deps: { fetchImpl: url => { fetchUrls.push(url); return terminalResponse()(url); }, now: () => 1 },
+    }),
+    /termnial/,
+  );
+  assert.deepEqual(fetchUrls, [], 'an undeclared name must not reach the network');
 });
