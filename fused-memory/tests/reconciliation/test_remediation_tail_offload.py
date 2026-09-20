@@ -43,15 +43,19 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation import escalation_archive
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import (
     _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     TierConfig,
+    _derive_affected_ids,
 )
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 pytest.importorskip('escalation.queue')
+from escalation.dedupe import compute_content_fingerprint  # noqa: E402
+from escalation.models import Escalation  # noqa: E402
 from escalation.queue import EscalationQueue  # noqa: E402
 
 PROJECT_ID = 'test-project'
@@ -587,6 +591,224 @@ class TestRoutedTargetGateUsesTheSameMemo:
         assert probed == ['901', '902'], (
             f'expected 902 to be probed once (as a cited id) and then served from '
             f'the memo to the routed-target gate, got {probed}'
+        )
+
+
+# ── SITE 3: _finding_recently_resolved's fallback arm ────────────────────────
+
+
+def _count_scans(monkeypatch, calls: list):
+    """Count archive scans while still performing them.
+
+    Delegates to the REAL helper so every verdict below is produced by the
+    production scan — only the call COUNT is observed, which is what the bound
+    is a claim about.
+    """
+    real = escalation_archive.scan_recently_resolved_fingerprints
+
+    def _wrapped(queue_dir, **kwargs):
+        calls.append(queue_dir)
+        return real(queue_dir, **kwargs)
+
+    monkeypatch.setattr(harness_module, 'scan_recently_resolved_fingerprints', _wrapped)
+
+
+def _seed_resolved(esc_queue, esc_id: str, fingerprint: str, *, age: timedelta) -> None:
+    """Seed one resolved escalation carrying *fingerprint*, resolved *age* ago."""
+    esc_queue.submit(Escalation(
+        id=esc_id,
+        task_id='recon-seed',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary=f'prior resolved finding {esc_id}',
+        status='resolved',
+        resolved_at=(datetime.now(UTC) - age).isoformat(),
+        dedupe_fingerprint=fingerprint,
+    ))
+
+
+def _fingerprint_of(finding: dict) -> str:
+    """The fingerprint `_escalate` will compute for *finding*."""
+    return compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding.get('category') or '',
+        _derive_affected_ids(finding),
+        finding.get('description') or '',
+    )
+
+
+@pytest.fixture
+def escalating_harness(journal, event_buffer, memory_service, tmp_path):
+    """A harness with a real EscalationQueue, for driving `_escalate` directly."""
+    harness = _make_harness(journal, event_buffer, memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    return harness
+
+
+class TestFallbackArmIsBoundedToOneScanPerRun:
+    """`_escalate` stays synchronous, so its archive scan is BOUNDED, not gone.
+
+    Task 5270 owns the full offload of `_escalate`; this task removes the
+    unbounded repetition by routing the fallback arm through a run-scoped memo,
+    so a run pays for at most one archive walk instead of one per call.
+    """
+
+    def test_three_escalates_sharing_a_run_id_scan_once(
+        self, escalating_harness, monkeypatch,
+    ):
+        """(a) BOUND — same run_id, no prebuilt set → one scan, not three."""
+        calls: list = []
+        _count_scans(monkeypatch, calls)
+
+        for i in range(3):
+            escalating_harness._escalate(
+                'recon_integrity_issue', 'run-aaaa1111',
+                f'Persistently unresolved: finding {i}',
+                finding=_finding_citing('901', description=f'finding {i}'),
+            )
+
+        assert len(calls) == 1, (
+            f'expected 1 archive scan for 3 escalations in one run, got {len(calls)}'
+        )
+
+    def test_a_different_run_id_rescans(self, escalating_harness, monkeypatch):
+        """(b) SCOPE — the memo must never serve a later run a stale snapshot."""
+        calls: list = []
+        _count_scans(monkeypatch, calls)
+
+        for run_id in ('run-aaaa1111', 'run-aaaa1111', 'run-bbbb2222'):
+            escalating_harness._escalate(
+                'recon_integrity_issue', run_id, f'Persistently unresolved: {run_id}',
+                finding=_finding_citing('901', description=f'finding for {run_id}'),
+            )
+
+        assert len(calls) == 2, (
+            f'expected a fresh scan for the second run_id, got {len(calls)} scans'
+        )
+
+    def test_the_direct_path_is_never_memoised(self, escalating_harness, monkeypatch):
+        """(c) `_finding_recently_resolved` with no scan key keeps today's behaviour.
+
+        Its docstring already promises this fallback for "direct / unit-test
+        use", and the four task-1669 tests depend on it, so the unmemoised path
+        must neither read nor write the slot.
+        """
+        calls: list = []
+        _count_scans(monkeypatch, calls)
+        now = datetime.now(UTC)
+
+        for _ in range(3):
+            escalating_harness._finding_recently_resolved(
+                'recon_integrity_issue', 'some-fingerprint', now=now,
+            )
+
+        assert len(calls) == 3, (
+            f'expected the direct path to scan every call, got {len(calls)}'
+        )
+        assert escalating_harness._resolved_fps_memo is None, (
+            'the direct path must not write the run-scoped memo slot'
+        )
+
+    def test_verdicts_are_unchanged_across_the_memo(
+        self, escalating_harness, monkeypatch, caplog,
+    ):
+        """(d) An in-window resolution still suppresses; an 8-day-old one re-fires.
+
+        Same corpus as tests/test_harness.py::test_finding_recently_resolved_respects_window,
+        asserted through `_escalate` so the memo is in the path.
+        """
+        calls: list = []
+        _count_scans(monkeypatch, calls)
+        esc_queue = escalating_harness._escalation_queue
+
+        suppressed_finding = _finding_citing('901', description='recently resolved')
+        refiring_finding = _finding_citing('902', description='resolved long ago')
+        fp_in = _fingerprint_of(suppressed_finding)
+        fp_out = _fingerprint_of(refiring_finding)
+        _seed_resolved(esc_queue, 'esc-in-window', fp_in, age=timedelta(seconds=60))
+        _seed_resolved(esc_queue, 'esc-out-of-window', fp_out, age=timedelta(days=8))
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            for finding in (suppressed_finding, refiring_finding):
+                escalating_harness._escalate(
+                    'recon_integrity_issue', 'run-cccc3333',
+                    f'Persistently unresolved: {finding["description"]}',
+                    finding=finding,
+                )
+
+        pending_fps = {e.dedupe_fingerprint for e in esc_queue.get_pending()}
+        assert fp_in not in pending_fps, (
+            'a finding resolved 60s ago must still be suppressed through the memo'
+        )
+        assert fp_out in pending_fps, (
+            'a finding resolved 8 days ago is outside the window and must re-fire'
+        )
+        assert [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.escalation_suppressed_recently_resolved'
+        ], 'the suppression must still be logged'
+        assert len(calls) == 1, (
+            f'both verdicts must come from ONE scan of the run, got {len(calls)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_pass_warm_up_primes_every_escalate_in_that_run(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """(e) THE PROPERTY THAT MOVES SITE 3 OFF THE LOOP.
+
+        Site 1's warm-up stores the slot under the pass's run_id before any
+        finding is escalated, so the whole pass costs ONE scan however many
+        findings it files — and a later `_escalate` carrying that same run_id
+        is served from the warm slot rather than walking the archive on the
+        loop thread.
+        """
+        calls: list = []
+        _count_scans(monkeypatch, calls)
+        _stub_probe(monkeypatch, [], block=0.0)
+        findings = [_finding_citing('901'), _finding_citing('902'),
+                    _finding_citing('903')]
+        harness, esc_queue, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=findings,
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902'),
+                         _in_progress_task('903')],
+        )
+
+        # Record the run_id the pass escalates under, without reaching into
+        # harness state — the argument is observable at the call.
+        pass_run_ids: list[str] = []
+        real_escalate = harness._escalate
+
+        def _spy(category, run_id, *args, **kwargs):
+            pass_run_ids.append(run_id)
+            return real_escalate(category, run_id, *args, **kwargs)
+
+        harness._escalate = _spy
+
+        with caplog_silent():
+            await run_pass()
+
+        assert len(esc_queue.get_pending()) >= len(findings), (
+            'the pass must actually file escalations, or this bound is vacuous'
+        )
+        assert len(calls) == 1, (
+            f'a {len(findings)}-finding pass must cost exactly one archive scan, '
+            f'got {len(calls)}'
+        )
+
+        # An _escalate inside that run, with NO prebuilt set, reads the warm slot.
+        real_escalate(
+            'recon_integrity_issue', pass_run_ids[0],
+            'Persistently unresolved: a later finding in the same run',
+            finding=_finding_citing('904', description='later finding'),
+        )
+
+        assert len(calls) == 1, (
+            f'an _escalate carrying the pass run_id must hit the warm slot, '
+            f'got {len(calls)} scans'
         )
 
 
