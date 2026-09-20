@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.server.consolidation import build_consolidation_result
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.topic_anchor import select_canonical_payload
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,42 @@ async def execute_retain_consolidation(
     of this function rather than a sibling, so the peer-tag loop below has
     exactly one home and cannot drift between the two.
     """
+    # AUTHORIZE FIRST, above every read and every write: an unauthorized
+    # caller is turned away before anything is done on its behalf and
+    # before it learns anything about the system.
+    #
+    # `content_amend=False` is load-bearing. This function writes new
+    # records and stamps metadata; it never rewrites an existing record's
+    # text. Requesting an arm it does not use would make the deliberately
+    # wider metadata bar a back door into a silent-rewrite primitive — the
+    # one thing the resolver's two-arm split exists to prevent.
+    #
+    # DUPLICATED with the tool's own gate, deliberately. The tool's call is
+    # unconditional because it also covers the child reparent and the
+    # supersedes narrowing, which are not this arm's patches; this one
+    # exists because the auto-consolidation executor has no tool boundary
+    # in front of it. Running it twice on the tool path costs nothing
+    # measurable — the resolver is pure, synchronous and three `getattr`
+    # hops — and the refusal shape is identical, so a caller reads one
+    # vocabulary whichever gate turned it away.
+    #
+    # The LIVE `memory_service` goes in, positionally. Binding
+    # `memory_service.config` or any leaf of it to a local would make the
+    # five green-tier `mem0_update.*` leaves restart-only in disguise
+    # (PRD C4).
+    decision = resolve_mem0_update_authorization(
+        memory_service,
+        agent_id=agent_id,
+        content_amend=False,
+        metadata_patch=True,
+    )
+    if not decision.allowed:
+        return {
+            'error': decision.error,
+            'error_type': decision.error_type,
+            'agent_id': agent_id,
+        }
+
     canonical_meta: dict[str, Any] = {}
     canonical_id: str | None = None
     if canonical_content is not None:
