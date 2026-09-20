@@ -263,6 +263,22 @@ _STEM_SQL = (
     'SELECT metric, ts, value FROM samples WHERE metric GLOB ? ORDER BY metric, ts'
 )
 
+# The corpus TICK COUNT, counted rather than fetched. ``coverage_table`` wants
+# only how MANY ticks the corpus holds, and TICK_METRIC is written on every
+# completed tick -- ~518k rows at the 30-day steady state this script's
+# docstring cites. Reading that series to take its `len()` materialised ~518k
+# (ts, value) tuples on every run, including the ε2 `--arm own_cpu_some_avg10`
+# cut and the four PSI arms -- none of which DECLARES the clock as its
+# readability metric, and none of which looks at the series at all.
+#
+# Measured in this worktree against the real schema: this statement plans as
+# `SEARCH samples USING COVERING INDEX idx_samples_metric_ts (metric=?)` --
+# index-only, no table access and no temp B-tree. The series fetch it replaces
+# plans as a NON-covering `SEARCH samples USING INDEX idx_samples_metric_ts
+# (metric=?)`, because it has to read `value` off the table for every row it
+# then discards.
+_COUNT_SQL = 'SELECT COUNT(*) FROM samples WHERE metric = ?'
+
 
 def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     """``{metric: [(ts, value) in ts order]}`` for every selector, one home.
@@ -281,18 +297,36 @@ def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     return series
 
 
-def read_series(
-    db: Path, arm: str | None
-) -> tuple[Series, Series, list[str]]:
-    """Return the value series, the READABILITY series, and any degradations.
+class CorpusRead(NamedTuple):
+    """One read of the corpus: the values, the evidence about them, the clock.
 
-    The two are returned apart and never merged: a ``*_read_ok`` row is
+    A named record rather than a four-slot tuple because two of those slots
+    are the same type: a caller that transposed ``series`` and ``readability``
+    would be silently wrong in both directions, and ``read.ticks_in_corpus``
+    says at the call site what a fourth position does not. ``ArmSpec`` is this
+    file's existing precedent for the shape, so this adds no new idiom, and a
+    NamedTuple still unpacks positionally for a caller that prefers it.
+    """
+
+    series: Series
+    readability: Series
+    ticks_in_corpus: int
+    degradations: list[str]
+
+
+def read_series(db: Path, arm: str | None) -> CorpusRead:
+    """Read one arm's values, the readability evidence about them, and the clock.
+
+    The first two are returned apart and never merged: a ``*_read_ok`` row is
     evidence ABOUT a series, not a sample of it, so pooling them would corrupt
-    the very percentiles and hold fractions it exists to qualify. The
-    readability series always carries ``TICK_METRIC``, whichever *arm* was
-    asked for, because it is the denominator of every coverage row
-    (``coverage_table``) — an ``--arm own_cpu_some_avg10`` run needs the corpus
-    tick count as much as a full one does.
+    the very percentiles and hold fractions it exists to qualify.
+
+    ``ticks_in_corpus`` is the corpus tick count — the denominator of every
+    coverage row (``coverage_table``), which an ``--arm own_cpu_some_avg10``
+    run needs as much as a full one does. It is COUNTED, not fetched (see
+    ``_COUNT_SQL``), so the readability dict carries exactly the metrics the
+    selected arms DECLARE and nothing else: ``TICK_METRIC`` appears there for
+    the runqueue arm, which declares it, and for no other.
 
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
@@ -322,23 +356,26 @@ def read_series(
     try:
         con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     except sqlite3.Error as exc:
-        return {}, {}, [f'db_unavailable: {db} ({exc})']
+        return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
 
     try:
         series = _fetch(con, selectors)
-        readability = _fetch(con, sorted(
-            {TICK_METRIC} | {spec.readability for spec in specs if spec.readability}
-        ))
+        readability = _fetch(
+            con, sorted({spec.readability for spec in specs if spec.readability})
+        )
+        # Same connection and same guard as the fetches, so an unreadable
+        # corpus still degrades by name instead of raising past the caller.
+        (ticks_in_corpus,) = con.execute(_COUNT_SQL, (TICK_METRIC,)).fetchone()
     except sqlite3.Error as exc:
-        return {}, {}, [f'db_unavailable: {db} ({exc})']
+        return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
     finally:
         con.close()
 
     if not series:
-        return {}, {}, [
+        return CorpusRead({}, {}, 0, [
             f'no_samples_in_window: no rows for {sorted(selectors)} in {db}'
-        ]
-    return series, readability, []
+        ])
+    return CorpusRead(series, readability, int(ticks_in_corpus), [])
 
 
 def percentile_table(
@@ -813,6 +850,8 @@ def coverage_table(
     series: Series,
     readability: Series,
     specs: list[ArmSpec],
+    *,
+    ticks_in_corpus: int,
 ) -> dict[str, Coverage | None]:
     """Per VALUE metric, the readable-tick coverage its numbers rest on.
 
@@ -822,13 +861,15 @@ def coverage_table(
     a fortnight or the 3% of it that was readable, and those are opposite
     verdicts for setting a dispatch threshold.
 
-    The fraction is readable ticks over the CORPUS tick count, ``TICK_METRIC``'s
-    row count — not over the row count of the arm's own ``*_read_ok`` metric.
-    The two agree only for a readability metric written on every tick, which
-    ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is not: that one is
-    written only on ticks its leaf was discovered, so a leaf present for 3 days
-    of a 14-day corpus has 3 days of rows, all readable, and dividing by its
-    own row count would call that full coverage.
+    The fraction is readable ticks over *ticks_in_corpus*, the corpus tick
+    count ``read_series`` counted — not over the row count of the arm's own
+    ``*_read_ok`` metric. The two agree only for a readability metric written
+    on every tick, which ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is
+    not: that one is written only on ticks its leaf was discovered, so a leaf
+    present for 3 days of a 14-day corpus has 3 days of rows, all readable, and
+    dividing by its own row count would call that full coverage. Taken as a
+    parameter rather than derived here, so the denominator is a fact about the
+    CORPUS and not about which arms this run happened to select.
 
     ``None`` for an arm whose collector emits no readability metric — the four
     host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
@@ -838,7 +879,6 @@ def coverage_table(
     unreadable while its siblings are fine, which is exactly the case worth
     seeing.
     """
-    ticks_in_corpus = len(readability.get(TICK_METRIC, []))
     out: dict[str, Coverage | None] = {}
     for metric in series:
         arm = _arm_for(metric, specs)
@@ -1071,14 +1111,17 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC)
     stamp = now.strftime('%Y-%m-%d')
 
-    series, readability, degradations = read_series(args.db, args.arm)
+    corpus = read_series(args.db, args.arm)
+    series = corpus.series
+    degradations = list(corpus.degradations)
     specs = (
         [ARM_METRIC_SELECTORS[args.arm]] if args.arm
         else list(ARM_METRIC_SELECTORS.values())
     )
     percentiles = percentile_table({m: [v for _, v in pts] for m, pts in series.items()})
     holds = hold_table(series, specs)
-    coverage = coverage_table(series, readability, specs)
+    coverage = coverage_table(
+        series, corpus.readability, specs, ticks_in_corpus=corpus.ticks_in_corpus)
     degradations += readability_degradations(coverage)
     local_block, local_degradations = load_psi_admission_block(args.config, 'local')
     peer_block, peer_degradations = load_psi_admission_block(args.peer_config, 'peer')
