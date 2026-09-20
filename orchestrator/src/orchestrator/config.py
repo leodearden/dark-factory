@@ -947,17 +947,11 @@ class SessionResumeConfig(BaseModel):
             'that lands on a tested path. Until then, watch the '
             'session_resume_fallback event rate directly. '
             'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
-            '(session_config_dir_ambiguous, filed by harness.py::Harness.'
-            '_file_config_dir_ambiguous_escalation under its OWN sentinel) '
-            'does NOT feed this streak, so raising or lowering this threshold '
-            'has no effect on it and an ambiguity L1 appearing alone is not '
-            'evidence of a resume storm. The exclusion is STRUCTURAL rather '
-            'than a carve-out: that L1 is filed at BOOT from crash-recovery '
-            'adoption, while this streak is only ever touched in the '
-            '_run_slot DISPATCH guard — unlike the by-design `capped` case '
-            'above, which sits inside that same guard block and therefore '
-            'does need an explicit branch. It is deduped one-open-at-a-time '
-            'via has_open_l1, not thresholded, so it has nothing to tune.'
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(

@@ -442,8 +442,17 @@ class EventType(StrEnum):
     #     FROM events WHERE event_type = 'session_config_dir_ambiguous'
     #    GROUP BY 1, 2;
     # A nonzero count is a definite lost resume with a definite cause, unlike a
-    # fallback census — which is why it also files a deduped L1 rather than
-    # being counted against a storm threshold.
+    # fallback census — which is why it also files a deduped L1 (one open at a
+    # time, under harness.py::Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL) rather
+    # than being counted against a storm threshold.
+    #
+    # It consequently does NOT feed the session-resume fallback-storm streak,
+    # and that exclusion is STRUCTURAL rather than a carve-out: this is
+    # detected at BOOT during adoption, while the streak is only ever touched
+    # in the _run_slot DISPATCH guard — unlike the by-design `capped` case,
+    # which sits inside that same guard block and therefore does need an
+    # explicit branch. So config.fallback_storm_threshold has no effect here
+    # and an ambiguity L1 appearing alone is not evidence of a resume storm.
     session_config_dir_ambiguous = 'session_config_dir_ambiguous'
 
     # session_resume_failed (task 3578) — a resume that was ADOPTED by the

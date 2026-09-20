@@ -3414,23 +3414,14 @@ class Harness:
         # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
         # cold worktree's dir name — all the same identity).
         #
-        # This replaces a wildcard ``glob('claude-config-*')`` + sort + take-[0]
-        # whose comment claimed the name "embeds the branch
-        # (``claude-config-<branch>``), not derivable from task_id". That was
-        # FALSE on two counts: the creator takes a task-id stem, and the full
-        # branch is ``task/<id>`` — TWO path components — so the name it
-        # described could not exist as one dir name. The glob was therefore
-        # strictly weaker than a derivation, and silently wrong whenever the
-        # lexically-first candidate was not this session's owner.
-        #
-        # Nothing else is EVER stashed. The one other creator,
+        # Nothing else is EVER stashed: the one other creator,
         # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
-        # deliberately produces ``claude-config-<task_id>-unblock`` — a
-        # legitimate non-owner of this session's transcript, which this
-        # derivation correctly refuses. Converting "no candidate" into "wrong
-        # candidate" buys nothing (both end at 'no_transcript' once the
-        # dispatch-time re-glob comes up empty) and only the second lies
-        # about it.
+        # deliberately produces ``claude-config-<task_id>-unblock``, a
+        # legitimate non-owner of this session's transcript.
+        #
+        # What the miss path signals, and the scoping it is emitted under, are
+        # stated once — at ``orchestrator/src/orchestrator/event_store.py::
+        # EventType.session_config_dir_ambiguous``. Read it there.
         #
         # Never raises: a missing .task simply leaves no stash, which the guard
         # treats as 'no_transcript' (fail-safe fresh dispatch, I3). ``.exists()``
@@ -3450,20 +3441,11 @@ class Harness:
                     str(p) for p in (entry / '.task').glob(f'{CONFIG_DIR_PREFIX}*')
                 )
                 if found:
-                    # Candidates exist but not the derived one, so this worktree
-                    # belongs to another owner and NO transcript here can
-                    # corroborate the session — the ensuing dispatch is a
-                    # guaranteed 'no_transcript' fallback. Loud-over-silent, and
-                    # STRUCTURED so it is queryable rather than grep-able.
-                    #
-                    # An EMPTY .task/ deliberately falls through silently: that
-                    # is absence, not ambiguity, and it is the dominant
-                    # recovered-session population (acquire re-seeds a lane from
-                    # base, wiping the transcript store — the by-design
-                    # `reseeded` fallback reason). Signalling there would fire on
-                    # nearly every recovered lane and mute this signal by
-                    # putting the most-expected outcome in the same bucket as a
-                    # genuine defect.
+                    # Candidates but not the derived one: another owner's
+                    # worktree, so nothing here can corroborate the session. An
+                    # EMPTY .task/ falls through silently — that is absence, not
+                    # ambiguity (scoping stated at the EventType member cited
+                    # above).
                     logger.warning(
                         'Recovery: %s holds %d config dir(s) %s but NOT the '
                         'derived %s for session %s — not stashing; the resume '
@@ -7332,13 +7314,10 @@ class Harness:
 
         Deduped rather than counted against a threshold: one ambiguous worktree
         is already a definite lost resume with a definite cause, so there is no
-        RUN to wait for and nothing to tune.
-
-        What is at stake: nothing is stashed, so the dispatch-time transcript
-        re-glob has nothing to corroborate and this session is a GUARANTEED
-        ``session_resume_fallback`` with ``no_transcript``.  Recovery degrades
-        SAFELY — this is a lost-resume/throughput signal, not a correctness
-        incident.
+        RUN to wait for and nothing to tune.  What is at stake — a GUARANTEED
+        ``no_transcript`` fallback, degrading safely — is stated normatively at
+        ``event_store.py::EventType.session_config_dir_ambiguous``, which the
+        ``detail`` below points an operator at rather than restating.
         """
         if not self._escalation_queue:        # bare-Harness unit tests stay green
             return
@@ -7387,18 +7366,14 @@ class Harness:
                     'claude-config-<task_id>-unblock, created by '
                     'orchestrator/src/orchestrator/dry_run_unblock.py, which '
                     'is a legitimate non-owner of this session\'s transcript.\n\n'
-                    'Census of the population, from runs.db:\n'
-                    "  SELECT json_extract(data, '$.expected'), "
-                    "json_extract(data, '$.found'), COUNT(*)\n"
-                    "    FROM events WHERE event_type = "
-                    "'session_config_dir_ambiguous'\n"
-                    '   GROUP BY 1, 2;\n\n'
-                    'This is NOT the session-resume fallback storm and shares '
-                    'none of its remediation: clock skew, warm-lane reseeds '
-                    'and the $.reasons census are all irrelevant here. It also '
-                    'does not feed that storm streak — it is detected at BOOT '
-                    'during adoption, while the streak is only touched at '
-                    'DISPATCH.'
+                    'To census the whole population from runs.db, use the SQL '
+                    'recorded with the event itself — orchestrator/src/'
+                    'orchestrator/event_store.py::EventType.'
+                    'session_config_dir_ambiguous.\n\n'
+                    'This is NOT the session-resume fallback storm, does not '
+                    'feed its streak, and shares none of its remediation: '
+                    'clock skew, warm-lane reseeds and the $.reasons census '
+                    'are all irrelevant here.'
                 ),
                 suggested_action=(
                     'Identify which process created the non-matching dir(s) '
