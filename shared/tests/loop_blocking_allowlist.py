@@ -545,56 +545,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        'c65b42126493',
-        'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
-        'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
-        'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
-        'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
-        'its Part 2 makes is_workflow_live_for_task async and '
-        'propagates that to every consumer, naming '
-        '_render_live_workflow_section, '
-        'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
-        'consumers still block but carry no row: task 4708 routed them '
-        'through getattr(self, section.renderer)() in '
-        '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        'a6c8a890e63e',
-        'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
-        'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
-        'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
-        'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
-        'its Part 2 makes is_workflow_live_for_task async and '
-        'propagates that to every consumer, naming '
-        '_render_live_workflow_section, '
-        'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
-        'consumers still block but carry no row: task 4708 routed them '
-        'through getattr(self, section.renderer)() in '
-        '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
         '58434c3060da',
         'filed',
         'ROOT CAUSE: _file_finding_task_escalation, the orchestrator-queue '
@@ -671,25 +621,29 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TaskKnowledgeSync.assemble_payload',
         '999e4ab43b34',
         'filed',
-        'ROOT CAUSE (one defect, 3 rows): the live-workflow git probes '
+        'ROOT CAUSE (one defect, 1 row): the live-workflow git probes '
         'in services/live_workflow_detector.py run sync '
-        'subprocess.run(git) per task, reached from these coroutines '
+        'subprocess.run(git) per task, reached from this coroutine '
         'with no hop. OWNED BY TASK 3778 -- do not file again; 3778 '
         'measured 29.2s (dark_factory) / 43.4s (reify) per render, and '
         'its Part 2 makes is_workflow_live_for_task async and '
         'propagates that to every consumer, naming '
         '_render_live_workflow_section, '
         'memory_consolidator._build_live_workflow_section and '
-        'harness\'s integrity-escalation suppression loop. In harness '
-        'that use is now the sync closure _task_is_live local to '
-        '_run_remediation_pass (task 4821), called twice -- the '
-        'cited-task gate and the routed-target gate -- so an async '
-        'probe forces both calls to await. memory_consolidator\'s '
+        'harness\'s integrity-escalation suppression loop. The cluster '
+        'was 3 rows until task 5550: the two harness rows '
+        '(c65b42126493, a6c8a890e63e) were the cited-task and '
+        'routed-target gates in _run_remediation_pass, and 5550 '
+        'offloaded BOTH with asyncio.to_thread (memoised per distinct '
+        'task id per pass), leaving the sync closure _task_is_live '
+        'itself unchanged as the thread body. Those two findings went '
+        'stale and the rows were deleted with that fix -- NOT because '
+        '3778 landed, which it has not. assemble_payload is therefore '
+        '3778\'s only remaining filed site. memory_consolidator\'s '
         'consumers still block but carry no row: task 4708 routed them '
         'through getattr(self, section.renderer)() in '
         '_render_required_sections, which the scanner cannot resolve. '
-        '3778 is in progress (deps 2964 and 3751 have landed); when it '
-        'lands these rows go stale.',
+        'When 3778 lands, this row goes stale too.',
     ),
 
     # ---- reconciliation/stale_priority_override_edge_sweep.py ----

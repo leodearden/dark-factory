@@ -5951,6 +5951,36 @@ class ReconciliationHarness:
                         )
                         return False
 
+                # Task 5550: `_task_is_live` reaches up to three
+                # `subprocess.run(['git', ...], timeout=10)` calls, so running
+                # it inline holds the event loop for up to ~30s per task —
+                # and the gate below re-asks per finding, so a pass over N
+                # findings citing the same task pays that N times.
+                #
+                # WHAT MAKES THE MEMO CORRECT, which is the part a reader
+                # cannot check from the code: liveness for a given task id is
+                # treated as CONSTANT across this gate loop — the same
+                # loop-constant assumption the pass already makes for
+                # `_sched_state` and `_orch_started`, hoisted immediately
+                # above for exactly the same reason.  A `False` verdict is
+                # memoised as deliberately as a `True` one: re-probing a
+                # not-live task once per finding is precisely the cost being
+                # removed, and the fail-safe direction is untouched (a
+                # detector error still reads as not-live, still biasing toward
+                # escalating rather than silencing).
+                #
+                # `_task_is_live` itself stays SYNC and unchanged: it is the
+                # thread body, and task 4821 extracted it so its two consumers
+                # could not drift apart.  Making the detector async instead is
+                # task 3778's Part 2 and spans consumers outside this pass.
+                _live_by_task: dict[str, bool] = {}
+
+                async def _task_is_live_async(tid: str) -> bool:
+                    """`_task_is_live`, off the loop thread and asked once per id."""
+                    if tid not in _live_by_task:
+                        _live_by_task[tid] = await asyncio.to_thread(_task_is_live, tid)
+                    return _live_by_task[tid]
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -6010,7 +6040,7 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
-                            if _task_is_live(tid):
+                            if await _task_is_live_async(tid):
                                 any_live = True
                                 break
                         if any_live:
@@ -6149,42 +6179,56 @@ class ReconciliationHarness:
                                         'finding_category': finding.get('category', ''),
                                     },
                                 )
-                            elif (
-                                routed_task_id not in cited_task_ids
-                                and _task_is_live(routed_task_id)
-                            ):
-                                logger.info(
-                                    'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
-                                    extra={
-                                        'project_id': project_id,
-                                        'run_id': run_id,
-                                        'task_id': routed_task_id,
-                                        'description': finding.get('description', ''),
-                                        'finding_category': finding.get('category', ''),
-                                    },
-                                )
                             else:
-                                # VOLUME PARITY: at most one orchestrator-queue
-                                # record per finding that already files one recon
-                                # escalation today, folded across later cycles by
-                                # the filer's own pending scan on
-                                # FINDING_TASK_ESCALATION_CATEGORY.
-                                #
-                                # That scan is deliberately level-BLIND (see the
-                                # dedupe comment in
-                                # `_file_finding_task_escalation`) so the fold
-                                # survives `orchestrator/harness.py::
-                                # _reap_orphan_l0_escalations` promoting the
-                                # record from L0 to L1.  Without that, promotion
-                                # broke the fold and the next cycle filed a fresh
-                                # L0 that the reaper then dismissed as a
-                                # duplicate — one born-and-dismissed record per
-                                # reconciliation cycle, forever, on a task
-                                # already represented by an open L1.
-                                self._file_finding_task_escalation(
-                                    project_id, run_id, finding, persistence,
-                                    task_id=routed_task_id,
-                                )
+                                # Task 5550: the routed-target probe is a
+                                # STATEMENT here rather than the second conjunct
+                                # of an `elif`.  `await` in a condition is legal,
+                                # but it leaves the short-circuit that decides
+                                # whether a multi-second git probe runs at all
+                                # both load-bearing and invisible; as a statement
+                                # the guard IS the control flow (heuristic 2).
+                                # Behaviour is unchanged — a routed id that is
+                                # already cited was probed by the gate above, so
+                                # it is still not asked a second time, and when
+                                # it was probed there the memo answers here.
+                                _routed_is_live = False
+                                if routed_task_id not in cited_task_ids:
+                                    _routed_is_live = await _task_is_live_async(
+                                        routed_task_id
+                                    )
+                                if _routed_is_live:
+                                    logger.info(
+                                        'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
+                                        extra={
+                                            'project_id': project_id,
+                                            'run_id': run_id,
+                                            'task_id': routed_task_id,
+                                            'description': finding.get('description', ''),
+                                            'finding_category': finding.get('category', ''),
+                                        },
+                                    )
+                                else:
+                                    # VOLUME PARITY: at most one orchestrator-queue
+                                    # record per finding that already files one recon
+                                    # escalation today, folded across later cycles by
+                                    # the filer's own pending scan on
+                                    # FINDING_TASK_ESCALATION_CATEGORY.
+                                    #
+                                    # That scan is deliberately level-BLIND (see the
+                                    # dedupe comment in
+                                    # `_file_finding_task_escalation`) so the fold
+                                    # survives `orchestrator/harness.py::
+                                    # _reap_orphan_l0_escalations` promoting the
+                                    # record from L0 to L1.  Without that, promotion
+                                    # broke the fold and the next cycle filed a fresh
+                                    # L0 that the reaper then dismissed as a
+                                    # duplicate — one born-and-dismissed record per
+                                    # reconciliation cycle, forever, on a task
+                                    # already represented by an open L1.
+                                    self._file_finding_task_escalation(
+                                        project_id, run_id, finding, persistence,
+                                        task_id=routed_task_id,
+                                    )
                     else:
                         logger.info(
                             'reconciliation.unresolved_after_remediation_suppressed',
