@@ -1089,6 +1089,38 @@ def test_absence_and_never_reading_are_two_independent_causes(tmp_path: Path):
     assert '20/100' in dark, dark
 
 
+def test_a_sampler_that_never_read_is_distinguishable_from_one_that_never_ran(
+    tmp_path: Path,
+):
+    """The two readings of an empty arm call for opposite next actions.
+
+    Measured before this change, a corpus holding 100 ``runqueue_read_ok`` =
+    0.0 rows and nothing else reported ``no_samples_in_window: no rows for
+    ['runqueue_ratio']`` with ``coverage == {}`` — which an operator reads as a
+    sampler that never ran, and goes to check the timer unit. It ran 100 times
+    and never got a /proc/stat reading, which is a host or collector fault.
+    The evidence that separates them was already fetched and then discarded by
+    ``read_series``'s no-value-rows early return.
+
+    ``no_samples_in_window`` keeps its name and text here: it is literally
+    true, there are no value rows in the window. What was missing is not a
+    different name but the readability evidence beside it.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_read_ok': [0.0] * 100})
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'no_samples_in_window' in payload['degradations'], payload['degradations']
+    assert payload['coverage']['runqueue_ratio'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'runqueue_read_ok',
+    }
+    assert 'never_readable' in payload['degradations'], payload['degradations']
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
