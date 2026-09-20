@@ -1121,6 +1121,53 @@ def test_a_sampler_that_never_read_is_distinguishable_from_one_that_never_ran(
     assert 'never_readable' in payload['degradations'], payload['degradations']
 
 
+def test_a_coverage_that_cannot_be_true_is_refused_rather_than_printed(
+    tmp_path: Path,
+):
+    """More readability rows than corpus ticks is a broken invariant, not a ratio.
+
+    Measured before this change, this corpus printed ``Coverage: readable on
+    100/50 corpus ticks (200.0%), present on 100/50`` with no degradation at
+    all. ``sampler/src/sampler/store.py::write_tick`` writes one whole tick in
+    ONE transaction, so no corpus the sampler wrote can produce it — it is the
+    hand-seeded or partly-restored one — which is exactly why it belongs in the
+    report as an invariant violation rather than folded into a shortfall cause.
+
+    The 200% is only the loudest symptom, and not the thing being guarded: the
+    SAME broken clock with half the reads failing yields a perfectly plausible
+    0.2 and a ``low_readability`` verdict — a wrong answer delivered quietly,
+    which is worse. So the check is on the row counts, not on the fraction.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 50,
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    assert coverage['readable_fraction'] is None, coverage
+    # The three counts stay reported verbatim: they are the evidence for the
+    # verdict, and without them a reader cannot see WHICH numbers are impossible.
+    assert (coverage['ticks_with_a_row'], coverage['readable'],
+            coverage['ticks_in_corpus']) == (100, 100, 50), coverage
+    assert 'impossible_coverage' in payload['degradations'], payload['degradations']
+    for quiet in ('low_readability', 'partial_presence', 'unknown_readability'):
+        assert quiet not in payload['degradations'], payload['degradation_details']
+
+    [line] = [ln for ln in result.stdout.splitlines() if ln.startswith('Coverage:')]
+    assert 'UNKNOWN' in line, line
+    assert '%' not in line, (
+        'the report printed a coverage percentage it does not believe: ' + line)
+    # Both counts and both metric names, so the reader can see which two
+    # numbers cannot both be true and which series they were counted from.
+    assert '100' in line and '50' in line, line
+    assert 'own_read_ok:leaf.service' in line and 'runqueue_read_ok' in line, line
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
