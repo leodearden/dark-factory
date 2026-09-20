@@ -182,6 +182,34 @@ def _build_reason(progress_ok: bool, liveness_ok: bool, project_id: str) -> str:
     )
 
 
+def _unresolved_result(config_path) -> HealthResult:
+    """The verdict when no project id could be resolved AT ALL.
+
+    A THIRD outcome, not a fabricated probe failure, and worded distinctly
+    on purpose: an operator reading the journal must be able to tell a
+    MISCONFIGURED INVOCATION from a broken pipeline. ``_build_reason`` is
+    for the two-probe case, so this line is composed separately rather
+    than widening that function with a third state.
+
+    Non-zero because ``_invoke``'s own rule — a probe that cannot run is
+    not evidence of health — applies a fortiori to a probe that was never
+    invoked."""
+    return HealthResult(
+        exit_code=1,
+        progress_ok=False,
+        liveness_ok=False,
+        progress_output='',
+        liveness_output='',
+        escalated=False,
+        reason=(
+            f'legibility trickle health UNRESOLVED: no project id could be '
+            f'resolved from config {config_path} and none was given, so '
+            f'NEITHER probe ran. Pass --project-id, or point --config at a '
+            f'readable legibility.yaml.'
+        ),
+    )
+
+
 def run_health_check(
     *,
     project_id: str | None = None,
@@ -203,14 +231,43 @@ def run_health_check(
     ``run_nightly``'s "ONE escalation for the whole night, not one per
     record" rule.
 
+    RESOLUTION. The project id comes from *project_id* if given, else from
+    the config's own ``project_id``; *project_id* wins when both are
+    present. GAP 3's identity argument applies here too — a probe that
+    GUESSES at the project id reads a different state file than the writer
+    wrote, which is the same divergence class task 4514 closed at the path
+    layer. Measured before this resolution existed: ``--config`` alone sent
+    ``''`` to both probes, yielding a guaranteed DEGRADED verdict and a
+    spurious ``escalate_info`` for a perfectly healthy pipeline.
+
     *progress_runner* / *liveness_runner* are the dependency-injection
     seams, alongside *poster*. Each takes ``(project_id, **kwargs)`` and
     returns ``(returncode, output)``.
     """
+    # Resolved ONCE, here, so every use below is a plain `project_id` — the
+    # invariant is established at the boundary rather than re-defaulted at
+    # six call sites.
+    #
+    # CONDITIONAL, NOT UNCONDITIONAL, and a later reader's first instinct
+    # will be to "simplify" that away. The common production path is
+    # `--project-id %i` from legibility-trickle-health@.service; on it the
+    # config is needed only for `escalation_port`, and resolving it goes
+    # through `nightly.resolve_config_path`, which imports `nightly` and
+    # with it the whole trickle pipeline (census, codebook, coder, digest).
+    # That load stays where it was: lazy, after `_should_escalate`, and
+    # non-fatal. Only the `project_id is None` branch resolves early, and it
+    # reaches `config.load_config` directly without touching `nightly`.
+    cfg = None
+    if project_id is None:
+        cfg = _load_config(config_path=config_path, project_id=None)
+        if cfg is None:
+            return _unresolved_result(config_path)
+        project_id = cfg.project_id
+
     progress_ok, progress_output = _invoke(
         progress_runner if progress_runner is not None
         else _default_progress_runner,
-        project_id or '',
+        project_id,
         max_barren_runs=max_barren_runs,
         max_age_hours=max_age_hours,
         max_failed_runs=max_failed_runs,
@@ -218,7 +275,7 @@ def run_health_check(
     liveness_ok, liveness_output = _invoke(
         liveness_runner if liveness_runner is not None
         else _default_liveness_runner,
-        project_id or '',
+        project_id,
         hours=liveness_hours,
     )
 
@@ -229,22 +286,27 @@ def run_health_check(
         progress_output=progress_output,
         liveness_output=liveness_output,
         escalated=False,
-        reason=_build_reason(progress_ok, liveness_ok, project_id or ''),
+        reason=_build_reason(progress_ok, liveness_ok, project_id),
     )
 
     # The escalation outcome NEVER changes exit_code: the non-zero exit is
     # the authoritative loud signal whether or not the POST landed.
     if not _load_and_decide(project_id, progress_ok, max_barren_runs):
         return result
-    cfg = _load_config(config_path=config_path, project_id=project_id)
+    # SPOT: one load per invocation. On the `--config`-only path the yaml
+    # was already read above to resolve the project id; reuse it rather
+    # than paying for a second parse of the same file.
+    cfg = cfg if cfg is not None else _load_config(
+        config_path=config_path, project_id=project_id,
+    )
     if cfg is None:
         return result
     rerun = (
         progress_argv(
-            project_id or '', max_barren_runs=max_barren_runs,
+            project_id, max_barren_runs=max_barren_runs,
             max_age_hours=max_age_hours, max_failed_runs=max_failed_runs,
         ),
-        liveness_argv(project_id or '', hours=liveness_hours),
+        liveness_argv(project_id, hours=liveness_hours),
     )
     return replace(
         result,
@@ -421,12 +483,15 @@ def _load_config(*, config_path, project_id):
         return None
 
 
-def _load_and_decide(project_id, progress_ok: bool, max_barren_runs: int) -> bool:
+def _load_and_decide(
+    project_id: str, progress_ok: bool, max_barren_runs: int,
+) -> bool:
     """Read the recorded doc and apply :func:`_should_escalate` to it."""
     _status, doc = trickle_state.load_state(
-        trickle_state.trickle_state_path(project_id or '')
+        trickle_state.trickle_state_path(project_id)
     )
     return _should_escalate(progress_ok, doc, max_barren_runs)
+
 
 def build_parser() -> argparse.ArgumentParser:
     """The CLI surface, built separately so its DEFAULTS are assertable.
