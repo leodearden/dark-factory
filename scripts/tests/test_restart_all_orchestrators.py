@@ -341,6 +341,28 @@ def _read_poll_trace(path):
     return records
 
 
+def _assert_poll_ledger(polls, *, at_least, verdict, unit, too_few, context):
+    """Assert the poll ledger's COUNT and its VOCABULARY, as two assertions.
+
+    Never one fused assertion: a short ledger means the script was killed or
+    returned before polling that often, a wrong record means
+    drain_check_verdict wrote the wrong thing. Unrelated causes, so a fused
+    message describing only the first sends the next reader chasing a timeout
+    for a defect that has nothing to do with timing.
+    """
+    assert len(polls) >= at_least, (
+        f"drain poll ledger holds {len(polls)} record(s), expected >= "
+        f"{at_least}. {too_few} ledger={polls!r} {context}"
+    )
+    assert all(p == (verdict, unit) for p in polls), (
+        f"the ledger's COUNT is fine ({len(polls)} >= {at_least}); its "
+        f"vocabulary or field order is not. Every record must be "
+        f"({verdict!r}, {unit!r}) -- look at drain_check_verdict's trace "
+        f"write in restart-all-orchestrators.sh, NOT at any timeout. "
+        f"ledger={polls!r} {context}"
+    )
+
+
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     _df_fleet_dir_redirect, tmp_path_factory,
 ):
@@ -769,16 +791,13 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
     """ABSENT + BOUNDED: the unknown grace TERMINATES, and the restart follows.
 
     The complement of test_unknown_grace_withholds_restart_while_absent below,
-    which proves the wait is REAL by being killed inside it and therefore can
-    never observe its end. Nothing covered that end today: the only top-level
-    absent-path elapse test is test_absent_heartbeat_restarts_after_zero_grace
-    above, whose grace of 0 makes
-    scripts/restart-all-orchestrators.sh::drain_await_fresh break on its FIRST
-    elapsed-check -- the loop never sleeps, so there is no bound to have held.
-    Here the grace is a small NONZERO 3s and the run is allowed to COMPLETE:
-    the ledger catches the poll loop iterating, the proceed line shows the
-    grace elapsed, and the restart shows the gate opened anyway (I4
-    fail-toward-convergence).
+    which proves the wait is REAL by being killed inside it and so can never
+    observe its end. Nothing else covers that end: the only other top-level
+    absent elapse test uses a grace of 0, where drain_await_fresh breaks on
+    its FIRST elapsed-check and the loop never sleeps. Here the grace is a
+    small NONZERO 3s and the run COMPLETES -- >= 2 ledger polls catch the loop
+    iterating, the proceed line shows the grace elapsed, and the restart shows
+    the gate opened anyway (I4 fail-toward-convergence).
     """
     fleet_dir = tmp_path / "fleet"
     trace_path = tmp_path / "drain-poll-trace.tsv"
@@ -819,12 +838,15 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
         f"operator-visible evidence the bounded wait ended rather than never "
         f"having started. got stdout={result.stdout!r}"
     )
-    polls = _read_poll_trace(trace_path)
-    assert len(polls) >= 2 and all(p == ("absent", UNIT_R) for p in polls), (
-        f"the {unknown_grace}s grace must have been POLLED through rather "
-        f"than slept through in one shot -- >= 2 absent polls for {UNIT_R} is "
-        f"what proves drain_await_fresh's loop body ran. timeout={timeout}s "
-        f"ledger={polls!r} stdout={result.stdout!r}"
+    _assert_poll_ledger(
+        _read_poll_trace(trace_path),
+        at_least=2, verdict="absent", unit=UNIT_R,
+        too_few=(
+            f"the {unknown_grace}s grace must have been POLLED through rather "
+            f"than slept through in one shot: >= 2 polls is what proves "
+            f"drain_await_fresh's loop body ran."
+        ),
+        context=f"timeout={timeout}s stdout={result.stdout!r}",
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] in state["calls"], (
@@ -845,26 +867,15 @@ def test_an_unwritable_poll_trace_never_aborts_the_redeploy(tmp_path):
     fails the assignment and aborts the ENTIRE run. An operator who
     fat-fingers a path would lose the redeploy, not just the trace.
 
-    MEASURED on bash 5.2.21, all three configurations, because the middle one
-    is not what it looks like: the failed write LAST and unguarded exits 1;
-    the same write last and guarded with `|| true` does not; and a failed
-    write in the MIDDLE of the function -- today's shape, since the
-    contractual verdict printf follows it -- is swallowed by the command
-    substitution either way, the function's status being its last command's.
-
-    So what this pins is the OBSERVABLE property, not one spelling of the
-    guard: however drain_check_verdict is ordered internally, a mis-typed
-    path costs the operator the trace and nothing else. It therefore passes
-    both with and without the guard in today's ordering -- which is precisely
-    the argument FOR the guard, since without it the property rests on
-    statement order that nothing else pins.
+    What this pins is the OBSERVABLE property -- a mis-typed path costs the
+    operator the trace and nothing else -- not one spelling of the guard, so
+    it holds however drain_check_verdict is ordered internally.
 
     Fresh + IDLE heartbeat, so the run completes on drain_gate's shortest path
     -- which still makes drain_await_fresh's ONE opening drain_check_verdict
-    call, so the trace write IS exercised.
-
-    The knob points inside a directory that does not exist, which is the
-    likeliest operator typo and needs no permissions games to reproduce.
+    call, so the trace write IS exercised. The knob points inside a directory
+    that does not exist: the likeliest operator typo, and no permissions games
+    needed to reproduce it.
     """
     fleet_dir = tmp_path / "fleet"
     trace_path = tmp_path / "no-such-dir" / "drain-poll-trace.tsv"
@@ -907,6 +918,104 @@ def test_an_unwritable_poll_trace_never_aborts_the_redeploy(tmp_path):
     )
 
 
+def test_the_poll_ledger_records_idle_on_the_gate_fast_path(tmp_path):
+    """Pins the ledger's field ORDER, and a token other than "absent".
+
+    Every other ledger assertion drives the ABSENT path, where drain_check.py
+    prints the very token the gate acts on and the two fields never coincide
+    by accident but the vocabulary is never exercised beyond one word. An
+    idle unit takes drain_gate's shortest path: drain_await_fresh's one
+    opening poll reads idle, its `while` body is never entered, drain_gate
+    returns. So exactly one record, and the count pins that shape too.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    polls = _read_poll_trace(trace_path)
+    assert polls == [("idle", UNIT_R)], (
+        f"the fast path is exactly one poll, recorded <verdict>\\t<unit> in "
+        f"that order; got {polls!r} stdout={result.stdout!r}"
+    )
+
+
+def test_a_drain_check_that_cannot_run_is_traced_as_the_coerced_absent(tmp_path):
+    """The ledger records what the GATE acted on, not what drain_check.py said.
+
+    Here drain_check.py says nothing at all: ORCH_DRAIN_FRESH_WINDOW_SECS is
+    passed straight through to its --fresh-window, so a non-numeric value
+    makes argparse exit 2 with an empty stdout and drain_check_verdict's
+    `|| raw="absent"` fail-toward-convergence fallback supplies the verdict.
+    The heartbeat on disk is fresh and IDLE, so an "absent" in the ledger can
+    only have come from that coercion -- and the run must still complete and
+    restart, since an unreadable verdict is exactly the case the gate is
+    built to fail forward through.
+
+    This is the REACHABLE half of the coercion. The other arm -- exit 0 with
+    an unrecognized token -- cannot be driven from the script's public
+    surface: drain_check.py's main() prints one of four literals and returns
+    0, and this harness deliberately does not shim `python3` (a fake first on
+    bin_dir would also shadow the fake systemctl's own `#!/usr/bin/env
+    python3` shebang, see _heartbeat_timeline). It stays a defensive backstop
+    against a future drain_check.py change.
+    """
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bad_window = "not-a-number"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            # 0, so the grace breaks on its first elapsed-check: one poll.
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+            "ORCH_DRAIN_FRESH_WINDOW_SECS": bad_window,
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"a drain_check.py that cannot run must not abort the redeploy; got "
+        f"rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    polls = _read_poll_trace(trace_path)
+    assert polls == [("absent", UNIT_R)], (
+        f"the heartbeat is fresh and idle, so 'absent' here can only be the "
+        f"coerced verdict the gate acted on -- anything else means the "
+        f"ledger is recording drain_check.py's raw reading instead. got "
+        f"{polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert bad_window in result.stderr, (
+        f"drain_check_verdict leaves the subprocess's stderr unsuppressed so "
+        f"an unreadable verdict is not silent; expected {bad_window!r} in "
+        f"stderr. got stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"fail-toward-convergence: an unreadable verdict still restarts; got "
+        f"calls={state['calls']!r} stdout={result.stdout!r}"
+    )
+
+
 def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
     """STALE (I4 fail-toward-convergence): a unit whose heartbeat exists but
     is older than the freshness window still restarts once
@@ -944,20 +1053,13 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     in-flight merge), but unknown status still gets a bounded grace rather
     than restarting on the very first check.
 
-    WHAT PROVES WHAT (task 4486), because the negative assertion alone proves
-    nothing -- a subprocess killed before it ever reached the gate satisfies
-    it just as well. "Restarting 1 orchestrator unit(s)" is echoed by
-    scripts/restart-all-orchestrators.sh immediately BEFORE the per-unit
-    `drain_gate` loop, so it witnesses only bash start, script parse and the
-    fake systemctl's `list-units`: it says the subprocess reached the gate's
-    doorstep, not that it went in. The poll ledger says what happened inside.
-    ONE ledger entry would additionally prove the gate was ENTERED -- but one
-    poll is exactly what an instant fail-open (check once, return) produces,
-    so it cannot falsify the thing this test is named for. TWO prove
-    `drain_await_fresh`'s `while` body ran: sleep
-    ORCH_DRAIN_POLL_INTERVAL_SECS, then re-poll. That is the REAL bounded
-    wait, and the ledger witnesses it LOAD-INDEPENDENTLY -- it counts what the
-    script did, not how long the test's own clock happened to run.
+    The negative assertion alone proves nothing -- a subprocess killed before
+    it ever reached the gate satisfies it just as well -- and neither does one
+    poll, which is exactly what an instant fail-open (check once, return)
+    produces. TWO polls prove `drain_await_fresh`'s `while` body ran: sleep
+    ORCH_DRAIN_POLL_INTERVAL_SECS, then re-poll. The ledger witnesses that
+    LOAD-INDEPENDENTLY -- it counts what the script did, not how long the
+    test's own clock happened to run.
     """
     fleet_dir = tmp_path / "fleet"
     trace_path = tmp_path / "drain-poll-trace.tsv"
@@ -1017,22 +1119,31 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
         f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
     )
     # NON-VACUITY, part 2 of 2: INSIDE the gate (task 4486). The doorstep
-    # witness above is silent about everything past it -- one python3 spawn,
-    # one poll interval, another python3 spawn -- which is a large fraction of
-    # this budget on a loaded host, so a kill landing in that window still
-    # proves no bounded wait. The ledger closes it: >= 2 polls, see the
-    # docstring for why not 1.
-    polls = _read_poll_trace(trace_path)
-    assert len(polls) >= 2 and all(p == ("absent", UNIT_R) for p in polls), (
-        f"the script was killed without polling the drain gate twice, so "
-        f"'a REAL bounded wait, not an instant fail-open' is UNPROVEN: one "
-        f"poll (or none) is exactly what a fail-open produces. Raise nothing "
-        f"by hand: spawn_timeout={spawn_timeout}s is already load-scaled from "
-        f"base 3, so check whether it hit the "
-        f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS "
-        f"(={WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s) cap before touching a "
-        f"number. ledger={polls!r} stdout={stdout!r} "
-        f"stderr={_decode(exc_info.value.stderr)!r}"
+    # witness above is silent about everything past it -- a python3 spawn, a
+    # poll interval, another spawn -- so a kill landing there still proves no
+    # bounded wait. The ledger closes that window; >= 2 rather than 1 is
+    # argued in the docstring.
+    # HEADROOM, measured here over 3 runs at loadavg 579 on 32 cores (factor
+    # 18.1, so the budget sat at the 22s cap): poll 2 landed at 1.6 / 2.4 /
+    # 3.9s. Only the spawns scale with load -- ~1.0s of that is the fixed
+    # ORCH_DRAIN_POLL_INTERVAL_SECS below. So the thin end is a burst
+    # load_scaled_grace's 1-minute loadavg has not registered yet: factor 1.0
+    # budgets 3.0s, which the 3.9s run above would have missed.
+    _assert_poll_ledger(
+        _read_poll_trace(trace_path),
+        at_least=2, verdict="absent", unit=UNIT_R,
+        too_few=(
+            f"the script was killed without polling the drain gate twice, so "
+            f"'a REAL bounded wait, not an instant fail-open' is UNPROVEN: "
+            f"one poll (or none) is exactly what a fail-open produces. Raise "
+            f"nothing by hand -- spawn_timeout={spawn_timeout}s is already "
+            f"load-scaled from base 3, so check whether it hit the "
+            f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS "
+            f"(={WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s) cap first."
+        ),
+        context=(
+            f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
+        ),
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
