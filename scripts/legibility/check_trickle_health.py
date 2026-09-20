@@ -49,7 +49,7 @@ import logging
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # Self-bootstrap for a bare `ExecStart=... check_trickle_health.py` run: a
@@ -207,8 +207,6 @@ def run_health_check(
     seams, alongside *poster*. Each takes ``(project_id, **kwargs)`` and
     returns ``(returncode, output)``.
     """
-    del config_path, poster  # escalation wiring arrives in a later step
-
     progress_ok, progress_output = _invoke(
         progress_runner if progress_runner is not None
         else _default_progress_runner,
@@ -224,7 +222,7 @@ def run_health_check(
         hours=liveness_hours,
     )
 
-    return HealthResult(
+    result = HealthResult(
         exit_code=0 if (progress_ok and liveness_ok) else 1,
         progress_ok=progress_ok,
         liveness_ok=liveness_ok,
@@ -234,6 +232,201 @@ def run_health_check(
         reason=_build_reason(progress_ok, liveness_ok, project_id or ''),
     )
 
+    # The escalation outcome NEVER changes exit_code: the non-zero exit is
+    # the authoritative loud signal whether or not the POST landed.
+    if not _load_and_decide(project_id, progress_ok, max_barren_runs):
+        return result
+    cfg = _load_config(config_path=config_path, project_id=project_id)
+    if cfg is None:
+        return result
+    rerun = (
+        progress_argv(
+            project_id or '', max_barren_runs=max_barren_runs,
+            max_age_hours=max_age_hours, max_failed_runs=max_failed_runs,
+        ),
+        liveness_argv(project_id or '', hours=liveness_hours),
+    )
+    return replace(
+        result,
+        escalated=post_health_finding(cfg, result, rerun, poster=poster),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Escalation — a best-effort mirror, copied by CONVENTION not by import
+# ---------------------------------------------------------------------------
+#
+# The shape comes from
+# `scripts/legibility/check_transcript_persistence.py`, which is itself a
+# by-convention mirror of `scripts/legibility/nightly.py::post_escalation`.
+# `nightly` is deliberately NOT imported: it pulls the whole trickle
+# pipeline -- census, codebook, coder, digest -- at module load, which a
+# probe that runs every night at 04:30 has no business paying for.
+#
+# `census_trigger.post_mcp_envelope` IS imported rather than re-derived, so
+# the 400 -> `initialize` -> `notifications/initialized` handshake retry
+# stays single-sourced. Task 3644 added it after every legibility
+# escalation was being silently dropped by a stateful streamable-HTTP
+# server that rejects a session-less `tools/call` at the transport layer.
+
+_ESCALATION_TOOL_NAME = 'escalate_info'
+_ESCALATION_AGENT_ROLE = 'legibility-trickle-health'
+_ESCALATION_CATEGORY = 'infra_issue'
+_ESCALATION_SEVERITY = 'info'
+
+
+def _default_poster(url: str, envelope: dict) -> None:
+    """Post *envelope* to *url* over the MCP streamable-HTTP transport."""
+    from legibility import census_trigger  # lazy: keeps the probe path light
+
+    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
+
+
+def _build_escalation_arguments(cfg, result: HealthResult, rerun) -> dict:
+    """Build the ``escalate_info`` arguments for ONE invocation.
+
+    The ``task_id`` is synthetic (``legibility-trickle-health-<project_id>``)
+    because this is a timer-driven probe, not a Taskmaster task — the same
+    reasoning ``nightly.py`` and ``check_transcript_persistence.py`` already
+    record. It is deliberately DISTINCT from nightly's
+    ``legibility-trickle-<project_id>`` so the two escalation histories stay
+    separately readable.
+
+    ONE envelope for the whole invocation, never one per probe: both
+    probes' captured output goes into a single detail, because which probe
+    failed is rarely the interesting question — the pair is.
+
+    *rerun* is the ``(progress_argv, liveness_argv)`` pair THIS invocation
+    actually ran, so the commands in the detail reproduce this verdict
+    exactly rather than approximating it with stock thresholds."""
+    failed = [
+        name for name, ok in
+        (('progress', result.progress_ok), ('liveness', result.liveness_ok))
+        if not ok
+    ]
+    project_id = cfg.project_id
+    return {
+        'task_id': f'legibility-trickle-health-{project_id}',
+        'agent_role': _ESCALATION_AGENT_ROLE,
+        'category': _ESCALATION_CATEGORY,
+        'severity': _ESCALATION_SEVERITY,
+        'summary': (
+            f'legibility trickle health: {" and ".join(failed)} probe(s) '
+            f'FAILED for project {project_id}'
+        ),
+        'detail': (
+            f'{result.reason}\n\n'
+            f'--- check_trickle_progress.py output ---\n'
+            f'{result.progress_output.strip() or "(no output)"}\n\n'
+            f'--- check_trickle_liveness.sh output ---\n'
+            f'{result.liveness_output.strip() or "(no output)"}\n\n'
+            f'Re-run by hand (the exact commands this probe ran):\n'
+            f'  {" ".join(rerun[0])}\n'
+            f'  {" ".join(rerun[1])}'
+        ),
+    }
+
+
+def post_health_finding(cfg, result: HealthResult, rerun, *, poster=None) -> bool:
+    """Best-effort ``escalate_info`` POST. NEVER raises.
+
+    Any failure is logged as ONE warning and swallowed, returning
+    ``False``: a down escalation server must not mask the finding, because
+    :attr:`HealthResult.exit_code` is the authoritative loud signal
+    whether or not this POST landed."""
+    poster_fn = poster if poster is not None else _default_poster
+    try:
+        envelope = {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'tools/call',
+            'params': {
+                'name': _ESCALATION_TOOL_NAME,
+                'arguments': _build_escalation_arguments(cfg, result, rerun),
+            },
+        }
+        poster_fn(f'http://localhost:{cfg.escalation_port}/mcp', envelope)
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort, never propagate
+        logger.warning(
+            'legibility trickle health: escalation post failed (best-effort, '
+            'the run still exits non-zero): %s', exc,
+        )
+        return False
+
+
+def _should_escalate(progress_ok: bool, doc, max_barren_runs: int) -> bool:
+    """Decide whether this invocation POSTS, as opposed to merely exiting
+    non-zero. Narrower than the exit-code predicate, deliberately.
+
+    ``False`` WHEN ``progress_ok``. A liveness-only failure means the unit
+    RAN and FAILED, which is already owned twice for that run: by the
+    nightly's own decision-8 escalation, and by
+    ``check_trickle_liveness.sh``'s ``Result != success`` gate now that
+    something finally runs it. Posting here is the double-alarm this task
+    forbids. NO COVERAGE IS LOST, and the enumeration is what makes that
+    checkable rather than merely asserted — a unit that NEVER RAN leaves
+    the state ``missing``; one that STOPPED FIRING leaves ``recorded_at``
+    stale; one that FAILS REPEATEDLY becomes a ``consecutive_failed_runs``
+    streak. All three fail the PROGRESS probe and do post, and
+    ``DEFAULT_MAX_FAILED_RUNS = 2`` rather than 1 is exactly what keeps
+    night one out of the post set while night two is in it.
+
+    ``False`` WHEN the recorded doc shows ``outcome == barren`` and
+    ``consecutive_barren_runs == max_barren_runs``.
+    ``nightly::_escalate_barren_streak`` is EDGE-triggered by exact
+    equality and fired for THIS run; posting would duplicate it. At
+    ``> max_barren_runs`` the nightly is silent by design and this probe
+    takes over.
+
+    ``missing``/``malformed`` are POST-WORTHY verdicts, not suppression
+    grounds — that is the recorder itself having stopped.
+
+    This reads two FIELDS off the recorded document. It does not re-derive
+    either probe's verdict, so INV-5 stays intact."""
+    if progress_ok:
+        return False
+    if not isinstance(doc, dict):
+        return True
+    if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
+        return True
+    return doc.get('consecutive_barren_runs') != max_barren_runs
+
+
+def _load_config(*, config_path, project_id):
+    """Resolve the project's :class:`LegibilityConfig`, or ``None``.
+
+    An unreadable or absent ``legibility.yaml`` must never crash the probe
+    into a traceback: the verdict is already computed and already loud, and
+    losing only the ESCALATION to a config problem degrades strictly better
+    than losing the verdict too. ``nightly.resolve_config_path`` is imported
+    lazily so the common ``--config`` path never pulls the trickle
+    pipeline."""
+    from legibility import config as legibility_config
+
+    try:
+        if config_path is not None:
+            return legibility_config.load_config(config_path)
+        from legibility import nightly  # lazy: avoid pulling the pipeline
+
+        return legibility_config.load_config(
+            nightly.resolve_config_path(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — deliberately total
+        logger.warning(
+            'legibility trickle health: could not load config for project=%s '
+            '(%s: %s); the verdict stands, the escalation is skipped',
+            project_id, type(exc).__name__, exc,
+        )
+        return None
+
+
+def _load_and_decide(project_id, progress_ok: bool, max_barren_runs: int) -> bool:
+    """Read the recorded doc and apply :func:`_should_escalate` to it."""
+    _status, doc = trickle_state.load_state(
+        trickle_state.trickle_state_path(project_id or '')
+    )
+    return _should_escalate(progress_ok, doc, max_barren_runs)
 
 def build_parser() -> argparse.ArgumentParser:
     """The CLI surface, built separately so its DEFAULTS are assertable.
