@@ -956,6 +956,82 @@ def test_a_psi_arm_says_it_has_no_readability_metric_rather_than_inventing_one(
     assert 'low_readability' not in payload['degradations']
 
 
+def seed_a_leaf_that_never_reads(path: Path) -> Path:
+    """A 100-tick corpus with one healthy leaf and one discovered-but-dark one.
+
+    Exactly the shape ``collect_load_metrics`` writes for a cgroup leaf found
+    on every tick whose ``cpu.pressure`` never reads: ``own_read_ok:<leaf>`` =
+    0.0 on each of those ticks, and NO ``own_cpu_some10:<leaf>`` row at all,
+    because a failed read persists no value — persisting α's fail-open 0.0
+    would fabricate an idle cgroup.
+    """
+    return seed_db(path, {
+        'runqueue_read_ok': [1.0] * 100,
+        'own_read_ok:good.service': [1.0] * 100,
+        'own_cpu_some10:good.service': [30.0] * 100,
+        'own_read_ok:dark.service': [0.0] * 100,
+    })
+
+
+def test_a_leaf_discovered_every_tick_and_readable_on_none_is_still_reported(
+    tmp_path: Path,
+):
+    """The one case ``coverage_table``'s own rationale could not see.
+
+    It keys per leaf because "one cgroup can be unreadable while its siblings
+    are fine, which is exactly the case worth seeing" — and the FULLY
+    unreadable leaf was invisible, because the block iterated the VALUE series
+    and a leaf readable on no tick has no value rows to iterate. Measured
+    before this change: the coverage keys were the healthy sibling alone, the
+    degradations named nothing, and the string 'dark.service' appeared NOWHERE
+    in stdout. A leaf the sampler discovered 100 times and never once read was
+    reported identically to one that never existed, and those call for
+    opposite next actions.
+    """
+    db = seed_a_leaf_that_never_reads(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['own_cpu_some10:dark.service'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'own_read_ok:dark.service',
+    }
+    # The sibling is untouched: this is per leaf, not a stem-wide verdict.
+    assert payload['coverage']['own_cpu_some10:good.service'][
+        'readable_fraction'] == pytest.approx(1.0)
+    [dark] = [d for d in payload['degradation_details'] if 'dark.service' in d]
+    assert '100' in dark, dark
+
+
+def test_an_arm_readable_on_no_tick_is_reported_in_a_full_run(tmp_path: Path):
+    """A non-stem arm goes dark the same way, and hid in a FULL run too.
+
+    ``runqueue_read_ok`` = 0.0 on every tick is a sampler that ran 100 times
+    and got no /proc/stat reading, so it wrote no ``runqueue_ratio`` value row
+    at all. Measured before this change, with a healthy PSI arm in the same
+    corpus so the run was not empty: the only coverage key was that PSI arm's
+    ``None``, and the runqueue arm had no row and no degradation — "this arm
+    never read" and "this corpus has no such arm" printed identically.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [0.0] * 100,
+        'psi_mem_full_avg10': [5.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['runqueue_ratio'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'runqueue_read_ok',
+    }
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
