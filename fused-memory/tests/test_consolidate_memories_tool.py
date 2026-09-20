@@ -2391,3 +2391,103 @@ class TestASeedShortfallIsDisclosedNotFatal:
 
         assert result['status'] == 'consolidated'
         assert result['topic_cluster_seed'] == seed
+
+
+class TestTheEnvelopeSurvivesTheExtraction:
+    """Task β's before/after signal (PRD §10 β): the tool's envelope must be
+    identical across the extraction of its retain arm into
+    `services/consolidation_ops.py`.
+
+    This is a CHARACTERIZATION pin, GREEN at the commit that introduces it
+    by construction — both literals were captured from the unmodified tree
+    before any production edit, which is what makes them evidence of the
+    PRE-extraction behaviour rather than a rewritten expectation. A pure
+    refactor has no new behaviour to drive red-first, so its TDD signal is
+    INVARIANCE, and these two cases are what make that signal checkable by
+    a test rather than by a reviewer diffing two runs.
+
+    The comparison is whole-dict `==`, never a key subset: the property
+    under test is that no key appears, vanishes or changes value, and a
+    subset assertion is blind to exactly that.
+
+    The two cases are the op's two arms. The fixture cluster exercises the
+    delete arm alongside the retain arm; the retain-only shape is the
+    gate-3200 ratified default and the only shape the auto-consolidation
+    executor takes, so it is pinned in its own right rather than assumed to
+    be covered by the first.
+    """
+
+    #: The closure listing every member of this fixture's topic, as
+    #: `get_memories_by_metadata` lifts it (`created_at` flat, not nested).
+    _TOPIC_MEMBERS = [
+        {
+            'id': S1,
+            'content': f'record {S1}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+        {
+            'id': S2,
+            'content': f'record {S2}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+        {
+            'id': S3,
+            'content': f'record {S3}',
+            'created_at': CREATED_AT,
+            'metadata': {'topic': TOPIC},
+        },
+    ]
+
+    @pytest.mark.asyncio
+    async def test_the_fixture_cluster_envelope_is_pinned(self):
+        result = await call_consolidate(make_service(), known_projects=KNOWN_PROJECTS)
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [S1, S2, S3],
+            'deleted': [S1, S2, S3],
+            'failed_deletes': [],
+            'retained': [],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 3,
+            'tombstones_expected': 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_retain_only_envelope_is_pinned(self):
+        result = await call_consolidate(
+            make_service(), supersedes=[], retain=[RETAIN_1, RETAIN_2], run_id=None
+        )
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [],
+            'deleted': [],
+            'failed_deletes': [],
+            'retained': [RETAIN_1, RETAIN_2],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 0,
+            'tombstones_expected': 0,
+        }
