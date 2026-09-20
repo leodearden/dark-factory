@@ -999,7 +999,7 @@
     "orchestrator/tests/test_merge_queue_resolve_release.py": {"patch_targets": [], "private_reads": 62},
     "orchestrator/tests/test_merge_queue_resource_audit.py": {"patch_targets": [], "private_reads": 118},
     "orchestrator/tests/test_merge_queue_restart_hook.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_queue_single_writer_asserts.py": {"patch_targets": ["_DEBUG_ASSERTS", "run_scoped_verification"], "private_reads": 64},
+    "orchestrator/tests/test_merge_queue_single_writer_asserts.py": {"patch_targets": ["_DEBUG_ASSERTS"], "private_reads": 52},
     "orchestrator/tests/test_merge_queue_speculative_probe.py": {"patch_targets": ["_run_post_merge_verify"], "private_reads": 76},
     "orchestrator/tests/test_merge_queue_store.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_merge_queue_supervisor.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 86},
