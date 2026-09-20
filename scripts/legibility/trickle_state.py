@@ -43,6 +43,7 @@ import contextlib
 import json
 import logging
 import os
+import pwd
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
@@ -144,11 +145,63 @@ def classify_run(
 # trickle_state_path — where the record lives, and why not in the repo
 # ---------------------------------------------------------------------------
 
-def trickle_state_path(project_id: str) -> Path:
-    """Return the per-project run-state file path.
+STATE_ROOT_ENV = 'DARK_FACTORY_LEGIBILITY_STATE_ROOT'
+"""The ONE supported lever for relocating the legibility state root.
 
-    ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
-    <project_id>/trickle-state.json``.
+Deliberately a dedicated name rather than a general-purpose one. See
+:func:`trickle_state_path` for why that distinction is the whole fix."""
+
+
+def trickle_state_path(project_id: str) -> Path:
+    """Return the per-project run-state file path, resolved from the
+    ACCOUNT rather than from the calling process's environment.
+
+    ``<passwd home>/.local/state/dark-factory/legibility/<project_id>/
+    trickle-state.json``, overridable only via :data:`STATE_ROOT_ENV`.
+
+    WHAT THIS FILE IS. Its identity is "this host's legibility state for
+    this USER and this project" — not "this PROCESS's state dir". Two
+    processes that must agree on ONE file cannot each resolve it from
+    their own environment. The writer is
+    ``legibility-trickle@<project>.service`` under the ``systemd --user``
+    manager (user-record HOME, no shell rc). The reader is
+    ``legibility-trickle-health@<project>.service``, or an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Nothing pinned them
+    to agree, so before task 4514 they silently read and wrote different
+    files — and a probe that cannot find the file reports ``missing`` and
+    fails PERMANENTLY, which for a milestone binding is a born-at-L2
+    ``milestone_check_failed`` for a pipeline running perfectly.
+
+    WHY THE PASSWD ANCHOR. The home in the passwd database is a property
+    of the account that owns the pipeline, read from NSS, and is identical
+    for the same uid in every process environment. Measured 2026-09-19 on
+    this host: under ``env -i`` and under ``HOME=/tmp/otherhome``,
+    ``pwd.getpwuid(os.getuid()).pw_dir`` is unmoved while ``Path.home()``
+    follows ``HOME``. ``pwd`` is stdlib, so the module docstring's hard
+    stdlib-only constraint for the bare-``python3`` predicate path
+    survives.
+
+    WHY THE DEDICATED OVERRIDE IS NOT THE SAME BUG. ``XDG_STATE_HOME`` and
+    ``HOME`` are AMBIENT, GENERAL-PURPOSE variables that a login shell, a
+    ``systemd --user`` manager, a container and CI each set differently
+    for reasons having nothing to do with legibility — so writer and
+    reader diverged with nobody having intended to redirect anything.
+    ``DARK_FACTORY_LEGIBILITY_STATE_ROOT`` is never set incidentally; it
+    is set only by someone who means THIS file. The shipped systemd units
+    deliberately do not set it (pinned by
+    ``scripts/tests/test_install_trickle_health_timer.py``), so production
+    always takes the anchored branch.
+
+    WHAT THE DEGRADATION NOW MEANS. The old code fell through to
+    ``tempfile.gettempdir()`` whenever ``Path.home()`` raised — which a
+    stripped systemd environment with no ``HOME`` did reach. That wrote to
+    a path the nightly never reads, while logging to a logger the
+    bare-``python3`` predicate never configures, so the divergence was
+    invisible. That case now resolves correctly. The tempdir fallback
+    survives only for a genuinely absent passwd entry (an arbitrary-uid
+    container), preserving the never-raise property this helper needs on
+    the nightly run's unconditional path.
 
     NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
     there and looking like the local precedent. That file is git-TRACKED
@@ -159,43 +212,44 @@ def trickle_state_path(project_id: str) -> Path:
     warm-lane GC, the exact pollution class task 2439 fixed — or force a
     nightly commit, which would make "the repo has a commit today" a valid
     liveness signal and thereby CONTRADICT PRD decision 7 outright.
-    XDG-rooted host state is what this actually is: a record of what the
-    local timer did. It also needs no ``.gitignore`` entry, because the
-    path is outside every checkout.
+    Host-local state outside every checkout is what this actually is: a
+    record of what the local timer did. It also needs no ``.gitignore``
+    entry.
 
-    RE-DERIVED, NOT REUSED. The rooting scheme and the ``Path.home()`` ->
-    ``RuntimeError`` -> ``tempfile.gettempdir()`` degradation mirror
-    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``
-    (mcp_lifecycle.py, task 2439) verbatim in shape, but that function is
-    deliberately NOT imported: the ``orchestrator`` package is not
+    RE-DERIVED, NOT REUSED — AND NO LONGER THE SAME SHAPE. This used to
+    mirror ``orchestrator/src/orchestrator/mcp_lifecycle.py::
+    managed_runtime_data_dirs`` (task 2439) verbatim, and that claim is now
+    false: that function still resolves ``${XDG_STATE_HOME:-~/.local/state}``
+    from its own environment. That is CORRECT there, because a single
+    orchestrator process both creates and consumes those dirs, and WRONG
+    here, because two independently-launched processes must agree. The
+    rooting convention (``dark-factory/`` under a state root) is still
+    shared; the resolution of the root is deliberately not. That function
+    stays un-imported regardless: the ``orchestrator`` package is not
     importable under the bare-``python3`` predicate path this module must
-    survive (see the module docstring). Cited here so the two stay
-    recognizably ONE convention rather than drifting into two.
+    survive.
 
-    ONE DELIBERATE DIVERGENCE from that scheme: an extra ``legibility/``
-    segment between ``dark-factory/`` and ``<project_id>/`` (mcp_lifecycle
-    uses ``dark-factory/<project_id>/queue|reconciliation``). This keeps
-    legibility state from colliding with the managed fused-memory runtime
-    dirs for the same project id.
+    ONE DELIBERATE DIVERGENCE from that convention: an extra
+    ``legibility/`` segment between ``dark-factory/`` and ``<project_id>/``
+    (mcp_lifecycle uses ``dark-factory/<project_id>/queue|reconciliation``).
+    This keeps legibility state from colliding with the managed
+    fused-memory runtime dirs for the same project id.
     """
-    xdg_state_home = os.environ.get('XDG_STATE_HOME')
-    if xdg_state_home:
-        base = Path(xdg_state_home)
+    override = os.environ.get(STATE_ROOT_ENV)
+    if override:
+        base = Path(override)
     else:
         try:
-            base = Path.home() / '.local' / 'state'
-        except RuntimeError:
-            # Stripped daemon/CI environment: no HOME and no pwd entry.
-            # This helper is on the nightly run's unconditional path and on
-            # the predicate's, so an unguarded raise would turn an
-            # observability write into a new failure mode. Degrade loudly
-            # instead (task 2439 amendment's identical choice).
+            base = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
+        except (KeyError, OSError):
             logger.warning(
-                'trickle_state_path: could not resolve a home directory '
-                '(HOME unset?); falling back to the OS temp dir for '
-                'project_id=%s — the recorded streak will not survive a '
-                'reboot',
+                'trickle_state_path: no passwd entry for uid %s; falling '
+                'back to the OS temp dir for project_id=%s — the recorded '
+                'streak will not survive a reboot. Set %s to a durable '
+                'path.',
+                os.getuid(),
                 project_id,
+                STATE_ROOT_ENV,
             )
             base = Path(tempfile.gettempdir())
 

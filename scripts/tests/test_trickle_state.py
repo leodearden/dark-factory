@@ -462,8 +462,8 @@ class TestRecordRun:
     """The writer: streak arithmetic, carried-forward fields, atomicity."""
 
     @pytest.fixture(autouse=True)
-    def _xdg(self, tmp_path, monkeypatch):
-        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
 
     def test_first_call_creates_parents_and_writes_every_field(self, tmp_path):
         doc = _record(day=1, selected_count=2, zero_signal_dropped=4,

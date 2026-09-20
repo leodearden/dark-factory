@@ -42,7 +42,7 @@ from legibility.config import load_config
 
 @pytest.fixture(autouse=True)
 def _isolate_trickle_state(tmp_path, monkeypatch):
-    """Point XDG_STATE_HOME at tmp_path for EVERY test in this module.
+    """Point the legibility state root at tmp_path for EVERY test here.
 
     ``run_nightly`` records run state through ``trickle_state.record_run``
     on every exit path (task 3340), so without this an ordinary test run
@@ -53,8 +53,12 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
     reaches the recorder — including the ones that assert on this module's
     WARNING records, which a failed real-home write would otherwise
     pollute.
+
+    The lever was ``XDG_STATE_HOME`` until task 4514 made
+    ``trickle_state.trickle_state_path`` environment-independent; this is
+    now the only variable it reads.
     """
-    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg-state'))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / 'legibility-state'))
 
 
 def _write_config(

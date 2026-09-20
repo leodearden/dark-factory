@@ -2,7 +2,8 @@
 predicate ("did signal flow?"), sibling to check_trickle_liveness.sh's
 LIVENESS predicate ("did the unit run?").
 
-Driven by SUBPROCESS with ``XDG_STATE_HOME`` pointed at tmp_path and a
+Driven by SUBPROCESS with ``trickle_state.STATE_ROOT_ENV`` pointed at
+tmp_path and a
 FAKE ``git`` shimmed onto PATH that only leaves a marker if ever invoked
 — lifted from scripts/tests/test_check_trickle_liveness.py (COPIED, not
 imported, matching how that file itself copies the fake-`systemctl`
@@ -51,13 +52,14 @@ def _bin_dir(tmp_path):
 
 
 def _run_probe(tmp_path, *args, extra_env=None, cwd=None):
-    """Run the probe by subprocess with XDG_STATE_HOME at tmp_path and the
-    fake git on PATH. Returns (CompletedProcess, git_marker_path)."""
+    """Run the probe by subprocess with the legibility state root at
+    tmp_path and the fake git on PATH. Returns (CompletedProcess,
+    git_marker_path)."""
     bin_dir, git_marker = _bin_dir(tmp_path)
 
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
-    env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    env[trickle_state.STATE_ROOT_ENV] = str(tmp_path / "state")
     env["FAKE_GIT_CALLED_MARKER"] = str(git_marker)
     if extra_env:
         env.update(extra_env)
@@ -75,7 +77,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     *outcomes* (one of 'productive' / 'quiet' / 'barren-budget' /
     'barren-cut'). The LAST entry's recorded_at is *recorded_at* (default:
     now), so freshness is exercised against the real writer."""
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
     doc = None
@@ -103,7 +105,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             exit_code=exit_code,
             **full,
         )
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
     return doc
 
 
@@ -143,7 +145,10 @@ def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
     pipeline that is running perfectly — the outcome the 2026-09-14
     triage predicted would arrive the moment the probe was bound.
     """
-    state_root = tmp_path / "shared-state"
+    # The root _run_probe pins into the CHILD env; the writer below is
+    # pointed at the same one, so the only thing left disagreeing between
+    # the two sides is the ambient environment.
+    state_root = tmp_path / "state"
     monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(state_root))
 
     # The writer's ambient environment.
@@ -158,10 +163,10 @@ def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
         below_sampling_cut=0, budget_skipped=0, selected_count=2,
     )
 
-    # Asserted, not assumed: _run_probe builds the child env from
-    # os.environ, so the shared override has to be visible HERE for the
-    # subprocess to inherit it -- and that inheritance is the only thing
-    # keeping this test off the operator's real state file.
+    # Asserted, not assumed: both sides must land on ONE tmp root. That is
+    # the only thing keeping this test off the operator's real state file,
+    # and a silent disagreement here would make the assertion below pass or
+    # fail for the wrong reason.
     assert os.environ[trickle_state.STATE_ROOT_ENV] == str(state_root)
 
     # The reader's ambient environment, disagreeing on both levers.
@@ -285,9 +290,9 @@ def test_missing_state_file_is_its_own_verdict(tmp_path):
 
 def test_corrupt_state_file_is_its_own_verdict(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, outcomes=["productive"])
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     trickle_state.trickle_state_path("dark_factory").write_text("{corrupt")
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
