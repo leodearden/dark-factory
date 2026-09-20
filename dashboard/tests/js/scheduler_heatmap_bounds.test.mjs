@@ -354,3 +354,127 @@ test('row totals report the INPUT size and the flag is false when nothing droppe
   assert.equal(out.rowsTotal, 2);
   assert.equal(out.rowsTruncated, false);
 });
+
+// ---------------------------------------------------------------------------
+// THE BOUND — a structural cap on rendered cell count at production scale
+// ---------------------------------------------------------------------------
+//
+// This is the regression the task exists for. The 2026-09-20 live snapshot is
+// 2,991 rows x 4,302 modules = 12,867,282 cells, each rendering a <td> wrapping
+// a <div>; the browser renderer dies before it finishes. What must be proven is
+// a bound on the RENDERED cell count given a fixture at that scale — not merely
+// that the module returns something.
+//
+// The bound's achievability basis is `Array.prototype.slice(0, N)` returning at
+// most N elements (ECMA-262 23.1.3.28), not a tuned threshold. That matters for
+// what the PATHOLOGICAL case below is for.
+
+const LIVE_ROWS = 2991;
+const LIVE_MODULES = 4302;
+
+// Built once and shared — the dense variant is ~12.9M lock_set entries if
+// materialised naively, so both variants share one path list and the dense rows
+// share ONE lock_set array reference rather than 2,991 copies of it.
+function makeFixture({ nRows, nModules, dense }) {
+  const paths = Array.from({ length: nModules }, (_, i) => `src/pkg${i % 97}/mod${i}.py`);
+
+  const modules = paths.map((path, i) =>
+    // Realistic: ~43% of modules sit at contention > 1, matching the live
+    // snapshot. Pathological: every module is hotly contended, so the column
+    // filter removes NOTHING.
+    makeModule(path, dense ? 99 : (i % 7 < 3 ? 2 + (i % 5) : i % 2)),
+  );
+
+  // Pathological rows all share this one array: every row touches every module,
+  // so the row filter removes nothing either.
+  const everyPath = dense ? paths : null;
+
+  const rows = Array.from({ length: nRows }, (_, r) => {
+    if (dense) return makeRow(`T-${r}`, everyPath);
+    // Realistic: mean lock_set of 4.41 paths, spread across the module list.
+    const size = 4 + (r % 2);
+    const lockSet = Array.from({ length: size }, (_, k) => paths[(r * 7 + k * 131) % nModules]);
+    return makeRow(`T-${r}`, lockSet);
+  });
+
+  return { rows, modules };
+}
+
+let realisticFixture = null;
+let pathologicalFixture = null;
+
+test('BOUND: a realistic production-scale snapshot renders at most MAX_HEATMAP_CELLS', () => {
+  realisticFixture = realisticFixture
+    || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
+  const out = boundHeatmapAxes(realisticFixture);
+
+  assert.ok(
+    out.rows.length <= MAX_HEATMAP_ROWS,
+    `rendered ${out.rows.length} rows, cap is ${MAX_HEATMAP_ROWS}`,
+  );
+  assert.ok(
+    out.modules.length <= MAX_HEATMAP_COLS,
+    `rendered ${out.modules.length} columns, cap is ${MAX_HEATMAP_COLS}`,
+  );
+  assert.ok(
+    out.rows.length * out.modules.length <= MAX_HEATMAP_CELLS,
+    `rendered ${out.rows.length * out.modules.length} cells, cap is ${MAX_HEATMAP_CELLS}`,
+  );
+
+  assert.equal(out.rowsTotal, LIVE_ROWS);
+  assert.equal(out.modulesTotal, LIVE_MODULES);
+  assert.equal(out.rowsTruncated, true);
+  assert.equal(out.modulesTruncated, true);
+});
+
+test('BOUND: a PATHOLOGICAL snapshot where neither filter removes anything is still bounded', () => {
+  // The case that proves the bound is STRUCTURAL rather than an artifact of
+  // real data being sparse. Every module is at contention 99 and every row's
+  // lock_set contains every module path, so the contention filter and the
+  // touch filter both keep 100% of their input and ONLY the hard slice is
+  // load-bearing. A future regression that re-introduces an uncapped axis —
+  // say by trusting the filters to be enough — passes the realistic case above
+  // and fails here.
+  pathologicalFixture = pathologicalFixture
+    || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: true });
+  const out = boundHeatmapAxes(pathologicalFixture);
+
+  assert.ok(
+    out.rows.length <= MAX_HEATMAP_ROWS,
+    `rendered ${out.rows.length} rows, cap is ${MAX_HEATMAP_ROWS}`,
+  );
+  assert.ok(
+    out.modules.length <= MAX_HEATMAP_COLS,
+    `rendered ${out.modules.length} columns, cap is ${MAX_HEATMAP_COLS}`,
+  );
+  assert.ok(
+    out.rows.length * out.modules.length <= MAX_HEATMAP_CELLS,
+    `rendered ${out.rows.length * out.modules.length} cells, cap is ${MAX_HEATMAP_CELLS} — ` +
+      'neither axis filter removed anything here, so the hard cap is the only ' +
+      'thing standing between the browser and a 12.9M-cell DOM',
+  );
+
+  assert.equal(out.rowsTotal, LIVE_ROWS);
+  assert.equal(out.modulesTotal, LIVE_MODULES);
+  assert.equal(out.rowsTruncated, true);
+  assert.equal(out.modulesTruncated, true);
+});
+
+test('BOUND: rows are selected against the columns that will ACTUALLY render', () => {
+  // Ordering inside boundHeatmapAxes, asserted behaviourally. If rows were
+  // chosen before the column slice, a row touching only column 61 — real
+  // contention, but past the cap — would survive and then render as 60 blank
+  // cells. Here `beyondCap` is the 61st surviving column and the row that only
+  // touches it must go with it.
+  const modules = Array.from({ length: MAX_HEATMAP_COLS + 1 }, (_, i) =>
+    makeModule(`src/wide/mod${i}.py`, 5),
+  );
+  const beyondCap = modules[MAX_HEATMAP_COLS];
+  const out = boundHeatmapAxes({
+    rows: [makeRow('T-keep', [modules[0].path]), makeRow('T-orphan', [beyondCap.path])],
+    modules,
+  });
+
+  assert.equal(out.modules.length, MAX_HEATMAP_COLS);
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-keep']);
+});
