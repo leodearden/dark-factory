@@ -33,7 +33,7 @@ EnvironmentFile=/home/leo/src/dark-factory/.env
 # Load-bearing: the CLI prefers an API key over the OAuth token, and the .env
 # above defines one.
 UnsetEnvironment=ANTHROPIC_API_KEY
-ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal
 

@@ -71,6 +71,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'pins_recovery.js': 'DF_PINS_RECOVERY',
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
   'recon_status.js': 'DF_RECON_STATUS',
+  'task_vocab.js': 'DF_TASK_VOCAB',
 };
 
 function readIndexHtml() {
