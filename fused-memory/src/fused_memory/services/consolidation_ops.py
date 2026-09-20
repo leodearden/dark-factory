@@ -1,4 +1,46 @@
-"""The retain arm of a consolidation, as one op with no server around it."""
+"""The RETAIN ARM of a consolidation — mint, peer tag, closure — as one op.
+
+What lives here is the half of ``consolidate_memories`` that ADDS: write
+the canonical, stamp the topic onto the peers that are kept in place, and
+list the topic's resulting closure. The delete arm — supersedes, child
+reparenting, corroboration, tombstones — stays in the tool. They are two
+mechanisms with independent axes of change, and separating them is what
+lets the retain arm be reached without the delete arm's machinery.
+
+Reached without a server, a tool closure, or an event-loop-bound
+``mcp.tool()`` registration, which is the whole point: the auto-
+consolidation executor has no MCP boundary in front of it and must run
+the SAME code ``server/tools.py::consolidate_memories`` runs, not a
+second implementation of it.
+
+ONE LOOP, ONE CLASSIFIER, ONE SCROLL (INV-5). Tag-only is a MODE of
+:func:`execute_retain_consolidation` — chosen by ``canonical_content is
+None`` — never a sibling function, so the peer-tag loop has exactly one
+home and the two paths cannot drift. :func:`patch_memory_metadata` is
+likewise the single home of ``update_memory``'s split contract — a
+refusal is RETURNED, every other failure is RAISED — for all three of
+the op's patch sites: the retain tag here, and the child reparent and
+supersedes narrowing the tool keeps. :func:`read_topic_closure` is the
+single home of the closure scroll, exposed separately only so each
+caller can place it where its own ordering requires; a caller with a
+delete arm must re-read it AFTER the fold.
+
+THE MINT DELIBERATELY BYPASSES THE TOOL-LEVEL WRITE GUARDS. It goes
+through ``MemoryService.add_memory``, so it never meets the near-
+duplicate or topic-cluster guards in ``server/near_duplicate_guard.py``,
+which are reached only from the ``add_memory`` TOOL body. That is correct
+by construction — a canonical is near its peers by definition, and a
+topic under consolidation is the very cluster shape the topic guard
+bounces, so routing the mint through the tool would make the ratified
+index canonical unwritable. Pinned by
+``tests/test_consolidation_ops.py::TestTheMintBypassesTheToolLevelGuards``
+so the tool path cannot be quietly reintroduced.
+
+IMPORT RULE: this module must NEVER import ``fused_memory.server.tools``.
+That module imports this one, so the reverse edge is a cycle. It is also
+why ``TOPIC_MEMBER_LIMIT`` and :func:`patch_memory_metadata` live here
+and are imported BY the tool rather than the other way round.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +53,14 @@ from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorizat
 from fused_memory.services.topic_anchor import select_canonical_payload
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    'TOPIC_MEMBER_LIMIT',
+    'TopicClosure',
+    'execute_retain_consolidation',
+    'patch_memory_metadata',
+    'read_topic_closure',
+]
 
 #: How many topic members ``consolidate_memories`` lists back as the
 #: post-consolidation closure.
