@@ -133,7 +133,7 @@ class VerifyPort(Protocol):
 
 
 class ClockPort(Protocol):
-    """The worker's two clocks, its sleep, and its merge-worktree progress probe."""
+    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probe."""
 
     def now(self) -> float: ...
 
@@ -142,6 +142,21 @@ class ClockPort(Protocol):
     def newest_content_mtime(self, root: Path) -> float | None: ...
 
     async def sleep(self, secs: float) -> None: ...
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        """Wait up to *timeout* for any of *aws* to finish; the DONE set, never a raise.
+
+        A lane wait belongs on this port iff it sits in a REPEATING loop
+        whose elapsed time is measured against this same clock -- that
+        pairing is what makes the loop's budget reachable under an injected
+        clock. A one-shot join or a race for an event edge does not qualify,
+        however much it looks like this one to a grep.
+
+        *aws* must be non-empty (``asyncio.wait`` rejects an empty set).
+        Only the done half is returned because no caller uses the pending
+        half.
+        """
+        ...
 
 
 class EscalationPort(Protocol):
@@ -212,6 +227,10 @@ class ProductionClock:
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        done, _ = await asyncio.wait(aws, timeout=timeout)
+        return done
 
 
 @dataclasses.dataclass(frozen=True)
