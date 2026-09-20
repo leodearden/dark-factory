@@ -77,6 +77,7 @@ def make_service(
     update_errors=None,
     update_raises=None,
     scroll_error=None,
+    scroll_rows=None,
     minted_ids=(CANONICAL,),
     topic_total=None,
 ):
@@ -95,7 +96,9 @@ def make_service(
     RE-RAISES. Both must collapse to the same per-id verdict.
 
     *minted_ids* is what the canonical write reports back; `()` models a
-    write that landed nothing while raising nothing.
+    write that landed nothing while raising nothing. *scroll_rows*
+    replaces the closure listing wholesale, for the shapes *members*
+    cannot express — a topic naming no canonical, or naming two.
     """
     members = [M1, M2] if members is None else members
     canonical_peers = set(canonical_peers)
@@ -111,13 +114,19 @@ def make_service(
 
     svc.add_memory = AsyncMock(side_effect=_add)
 
+    # Patches LAND, so a read-back is a real question about the world
+    # rather than a restatement of the row the shaper built. That is what
+    # makes "the incumbent was not touched" checkable: a demotion would
+    # merge `canonical: False` into its payload and the read-back would
+    # see it.
+    landed: dict[str, dict] = {}
+
     async def _get(project_id=None, memory_id=None, **_):
         assert isinstance(memory_id, str), 'the arm must name the id it reads'
         if memory_id in read_errors:
             raise read_errors[memory_id]
-        if memory_id in canonical_peers:
-            return _point_row(memory_id, canonical=True)
-        return _point_row(memory_id)
+        canonical = {'canonical': True} if memory_id in canonical_peers else {}
+        return _point_row(memory_id, **canonical, **landed.get(memory_id, {}))
 
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
 
@@ -127,6 +136,9 @@ def make_service(
             raise update_raises[memory_id]
         if memory_id in update_errors:
             return update_errors[memory_id]
+        # A server-side Qdrant payload MERGE, never a replace — the shape
+        # that lets a peer KEEP a `canonical: True` it already carried.
+        landed.setdefault(memory_id, {}).update(kwargs.get('metadata_patch') or {})
         return {
             'status': 'updated',
             'store': 'mem0',
@@ -139,6 +151,8 @@ def make_service(
     async def _scroll(**kwargs):
         if scroll_error is not None:
             raise scroll_error
+        if scroll_rows is not None:
+            return list(scroll_rows)
         return [
             _scroll_row(m, **({'canonical': True} if m in canonical_peers else {}))
             for m in members
@@ -413,3 +427,113 @@ class TestTheEnvelopeIsTheSharedBuilders:
         result = await call_execute(svc)
 
         assert result['status'] == 'partial'
+
+
+class TestTagOnlyTouchesNothingOnTheIncumbent:
+    """PRD D14: a topic that ALREADY has a canonical does not need another
+    one. `canonical_content=None` skips the mint entirely and stamps the
+    topic onto the unstamped members, which is the whole job when the
+    incumbent's claim is still correct.
+
+    Minting anyway would be the +1-per-pass ratchet the op exists to end,
+    reached by the most natural reading of "consolidate this topic".
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_incumbent_is_resolved_and_nothing_is_minted(self):
+        svc = make_service(members=[INCUMBENT, M1, M2], canonical_peers=[INCUMBENT])
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['canonical_id'] == INCUMBENT
+        svc.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_incumbent_is_not_patched_and_reads_back_unchanged(self):
+        """`content_amend=False` is load-bearing: this arm stamps metadata
+        and writes new records, and refreshing the incumbent's text would
+        make the deliberately wider metadata bar a route to a silent
+        rewrite. Nothing is refreshed on it at all — not its content, not
+        its metadata, not its `canonical` claim."""
+        svc = make_service(members=[INCUMBENT, M1, M2], canonical_peers=[INCUMBENT])
+        before = await svc.get_memory_by_id(
+            project_id=PROJECT_ID, memory_id=INCUMBENT
+        )
+
+        await call_execute(svc, canonical_content=None)
+
+        assert set(_patched_ids(svc)) == {M1, M2}
+        assert INCUMBENT not in _patched_ids(svc)
+        after = await svc.get_memory_by_id(
+            project_id=PROJECT_ID, memory_id=INCUMBENT
+        )
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_the_envelope_reports_a_clean_tag_only_fold(self):
+        svc = make_service(members=[INCUMBENT, M1, M2], canonical_peers=[INCUMBENT])
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['status'] == 'consolidated'
+        assert result['retained'] == [M1, M2]
+
+    @pytest.mark.asyncio
+    async def test_an_incumbent_passed_in_retain_is_refused_not_demoted(self):
+        """The caller's predicate is meant to strip it and disclose the
+        strip. When one slips through, the loop's existing
+        `RetainedPeerIsCanonical` branch is what catches it — refusing a
+        peer it cannot prove non-canonical, rather than quietly patching
+        `canonical: False` onto a claim it was not asked to touch."""
+        svc = make_service(members=[INCUMBENT, M1, M2], canonical_peers=[INCUMBENT])
+
+        result = await call_execute(
+            svc, canonical_content=None, retain_ids=[INCUMBENT, M1, M2]
+        )
+
+        assert [f['error_type'] for f in result['retain_failures']] == [
+            'RetainedPeerIsCanonical'
+        ]
+        assert result['retain_failures'][0]['id'] == INCUMBENT
+        assert INCUMBENT not in _patched_ids(svc)
+        assert result['canonical_id'] == INCUMBENT
+
+    @pytest.mark.asyncio
+    async def test_the_most_recent_canonical_wins_when_two_exist(self):
+        """More than one canonical per (project, topic) is REACHABLE, not
+        theoretical: uniqueness ships in warn mode, so duplicates land
+        through ordinary writes. The pick is `select_canonical_payload`'s
+        total order — most recent, then lowest id — never an arbitrary
+        scroll position."""
+        older = dict(_scroll_row(M1, canonical=True), created_at='2026-01-01T00:00:00+00:00')
+        newer = dict(_scroll_row(M2, canonical=True), created_at='2026-06-01T00:00:00+00:00')
+        svc = make_service(scroll_rows=[older, newer])
+
+        result = await call_execute(svc, canonical_content=None, retain_ids=[])
+
+        assert result['canonical_id'] == M2
+
+    @pytest.mark.asyncio
+    async def test_a_topic_naming_no_canonical_fails_closed(self):
+        """Never an envelope with a null `canonical_id`:
+        `build_consolidation_result` types it `str`, and a result claiming
+        a canonical that does not exist is the silent-fail-soft this op
+        exists to surface."""
+        svc = make_service(scroll_rows=[_scroll_row(M1), _scroll_row(M2)])
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['error_type'] == 'TagOnlyIncumbentNotFound'
+        assert result['topic'] == TOPIC
+        assert 'canonical_id' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_closure_fails_closed_too(self):
+        """A scroll that did not ANSWER cannot show the topic has no
+        canonical — the same fail-closed posture the peer check takes."""
+        svc = make_service(scroll_error=TimeoutError('qdrant timeout'))
+
+        result = await call_execute(svc, canonical_content=None)
+
+        assert result['error_type'] == 'TagOnlyIncumbentNotFound'
+        assert result['topic'] == TOPIC
