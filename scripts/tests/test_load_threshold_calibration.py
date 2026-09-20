@@ -1032,6 +1032,63 @@ def test_an_arm_readable_on_no_tick_is_reported_in_a_full_run(tmp_path: Path):
     }
 
 
+def test_a_never_readable_series_is_named_apart_from_a_flaky_one(tmp_path: Path):
+    """Zero reads is its own finding, not the extreme of a low read rate.
+
+    The operator reading differs, which is the whole reason this vocabulary is
+    enumerated. ``low_readability`` ends "read its hold fractions against that
+    coverage" — but a series readable on NO tick HAS no hold fractions and no
+    candidate-threshold section at all, because a tick with no readable value
+    writes no value row. Naming it apart is what tells the reader that the
+    series' absence from the ladder sections is failed reads rather than a
+    leaf that was never discovered — the confusion the whole fix is about.
+    """
+    db = seed_a_leaf_that_never_reads(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'never_readable' in payload['degradations'], payload['degradations']
+    assert 'low_readability' not in payload['degradations'], (
+        f'zero reads was folded into the flaky-read cause: '
+        f'{payload["degradation_details"]}'
+    )
+    # It was discovered on every tick, so its presence is not a finding.
+    assert 'partial_presence' not in payload['degradations'], payload['degradations']
+    [dark] = details(payload, 'never_readable')
+    assert 'own_cpu_some10:dark.service' in dark and '100/100' in dark, dark
+    assert not [d for d in payload['degradation_details'] if 'good.service' in d], (
+        'the healthy sibling raised a degradation of its own'
+    )
+
+
+def test_absence_and_never_reading_are_two_independent_causes(tmp_path: Path):
+    """Ordered exclusivity would hide half of a leaf that arrived late AND read never.
+
+    ``partial_presence`` is rows over corpus ticks and ``never_readable`` is a
+    zero numerator over rows; they are judged on different bases, so a leaf
+    discovered for the last fifth of the corpus and readable on none of those
+    20 ticks is BOTH. Only ``low_readability`` is displaced — the two are the
+    same ratio, reported at a different name.
+    """
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite', readable=0)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    fired = [cause for cause in
+             ('partial_presence', 'low_readability', 'never_readable')
+             if cause in payload['degradations']]
+    assert fired == ['partial_presence', 'never_readable'], (
+        payload['degradation_details'])
+    [absent] = details(payload, 'partial_presence')
+    [dark] = details(payload, 'never_readable')
+    assert '20/100' in absent, absent
+    assert '20/100' in dark, dark
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
