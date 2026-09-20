@@ -18,6 +18,7 @@ from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
+from fused_memory.middleware.done_provenance_authz import DETERMINISTIC_PROVENANCE_KINDS
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -5087,6 +5088,281 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
         assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
         assert resolved is not None, f'kind={kind!r} resolved to None with no error'
         assert resolved['kind'] == kind
+
+
+# ── Task 5241: the `deterministic-*` caller bar (PRD C5 / D11) ──────────
+#
+# Two factors, evaluated in this order at BOTH validator seams (the fresh
+# `done` transition and the same-status repair): a `recon-stage-` caller is
+# refused UNCONDITIONALLY — config-free, so no operator edit can grant it —
+# and every other caller must match a prefix in
+# `reconciliation.deterministic_provenance_allowed_agent_prefixes`
+# (default `['orchestrator']`, an EMPTY list being the kill switch). Both
+# refusals carry `error_type='DeterministicProvenanceCallerNotPermitted'`.
+#
+# Driven end-to-end through `interceptor.set_task_status(...)`, which is
+# where the contract is phrased: the sibling `operational-verified` recon
+# refusal is covered only by direct `_validate_done_provenance` calls, so
+# nothing previously proved the bar actually holds at the MCP-facing seam.
+#
+# The identity is SELF-REPORTED (`server/tools.py::_resolve_identity` falls
+# back to clientInfo.name), so this is a misuse deterrent, not a boundary —
+# see `middleware/done_provenance_authz.py`'s docstring.
+
+_DETERMINISTIC_KINDS = sorted(DETERMINISTIC_PROVENANCE_KINDS)
+
+
+def _gate_provenance(**overrides) -> dict:
+    """A minimal VALID `deterministic-gate` blob from the runner's own shape."""
+    return {
+        'kind': 'deterministic-gate',
+        'note': 'pure gate resolved',
+        'escalation_id': 'esc-5241-1',
+        **overrides,
+    }
+
+
+def _assert_caller_refusal(result: dict) -> None:
+    """The shared shape of both caller refusals (one error_type, two reasons)."""
+    assert result.get('error') == 'done_provenance_invalid', result
+    assert result.get('error_type') == 'DeterministicProvenanceCallerNotPermitted', result
+
+
+class TestDeterministicProvenanceCallerBar:
+    """PRD C5 / D11 at the `set_task_status` seam."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', _DETERMINISTIC_KINDS)
+    async def test_recon_stage_caller_is_refused_for_every_deterministic_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path, kind,
+    ):
+        """The exact incident-5156 shape: reconciliation Stage 2 self-authorizing
+        a runner-stamped close. No write of any kind may be attempted."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(kind=kind),
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        _assert_caller_refusal(result)
+        assert 'recon' in result['reason'].lower(), result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+        taskmaster.set_task_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_is_still_refused_when_the_prefix_is_granted(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """D11: the recon-stage branch is CONFIG-FREE. Granting `recon-stage-`
+        on the allowlist must not defeat it — the two factors catch different
+        failure classes and the incident's class must not be buyable."""
+        cfg = FusedMemoryConfig()
+        cfg.reconciliation.deterministic_provenance_allowed_agent_prefixes = ['recon-stage-']
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        _assert_caller_refusal(result)
+        assert 'recon' in result['reason'].lower(), result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unlisted_client_is_refused_and_told_the_bar(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """'dashboard' is a real MCP client's advertised clientInfo — the
+        omitted-agent_id / wrong-client class the allowlist catches."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+
+        _assert_caller_refusal(result)
+        assert "'orchestrator'" in result['reason'], result
+        assert 'deterministic_provenance_allowed_agent_prefixes' in result['reason'], result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_is_accepted_and_the_blob_survives(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+        persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs[
+            'audit_fields'
+        ]['done_provenance']
+        assert persisted['kind'] == 'deterministic-gate'
+        assert persisted['note'] == 'pure gate resolved'
+        assert persisted['escalation_id'] == 'esc-5241-1'
+
+    @pytest.mark.asyncio
+    async def test_empty_allowlist_denies_even_the_orchestrator(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The operator's live kill switch for the whole provenance family."""
+        cfg = FusedMemoryConfig()
+        cfg.reconciliation.deterministic_provenance_allowed_agent_prefixes = []
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_real_reload_flips_the_bar_with_no_reconstruction(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Green-tier end to end, not merely at the diff layer: the REAL
+        `apply_reload` mutates the very config object the interceptor holds,
+        and the next identical call is accepted."""
+        from fused_memory.config.reload import apply_reload
+
+        cfg = FusedMemoryConfig()
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        refused = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+        _assert_caller_refusal(refused)
+
+        fresh = FusedMemoryConfig()
+        fresh.reconciliation.deterministic_provenance_allowed_agent_prefixes = [
+            'orchestrator', 'dashboard',
+        ]
+        report = apply_reload(cfg, fresh)
+        assert report['reloaded'] is True, report
+        assert (
+            'reconciliation.deterministic_provenance_allowed_agent_prefixes'
+            in report['applied']
+        ), report
+
+        accepted = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+        assert 'error' not in accepted, accepted
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_interceptor_with_no_config_denies(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """DENY-ON-MISSING includes the config object itself: a construction
+        path that forgets `config=` must not quietly evaporate the bar."""
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_is_not_a_bypass(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Already-`done` task: the sanctioned same-status repair seam must
+        close against the same caller, exactly as it already does for
+        `operational-verified`."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='recon-stage-2',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.stamp_audit_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_accepts_an_allowlisted_caller(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        assert result.get('done_provenance_repaired') is True, result
+        taskmaster.stamp_audit_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_deterministic_kinds_are_untouched_by_the_bar(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Regression fence: the new bar is scoped to the deterministic family.
+        `merged` / `found_on_main` / `operational-verified` still clear it with
+        no allowlist entry for their callers."""
+        sha = _init_git_repo(tmp_path)
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        for provenance in (
+            {'kind': 'merged', 'commit': sha},
+            {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+            {
+                'kind': 'operational-verified',
+                'escalation_id': 'esc-123',
+                'note': 'restarted fused-memory',
+            },
+        ):
+            taskmaster.set_status_and_stamp_audit.reset_mock()
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=provenance,
+                agent_id='claude-interactive',
+            )
+            assert 'error' not in result, (provenance, result)
+            taskmaster.set_status_and_stamp_audit.assert_called_once()
 
 
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
