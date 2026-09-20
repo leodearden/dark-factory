@@ -1781,23 +1781,19 @@ class TestRepairFingerprintProvenance:
     ):
         """The RAW Qdrant payload, deliberately not ``MemoryService.get_memory``.
 
-        ``get_memory`` is the primitive ``cite_memory`` uses, so matching it
-        would make a repaired citation byte-identical to an in-run one — but
-        matching it would also reproduce a defect. mem0's ``AsyncMemory.get``
-        lifts its ``promoted_payload_keys`` (``agent_id`` among them) to the TOP
-        level and EXCLUDES them from ``metadata``, while every other payload key
-        — ``category`` included — stays INSIDE ``metadata``; ``get_memory``
-        reads ``category`` off the top level and ``agent_id`` out of
-        ``metadata``, i.e. neither where mem0 put it. Its mem0 fingerprint is
-        therefore structurally ``{category: None, agent_id: None, created_at:
-        <real>}``.
+        The repair reads the replacement's fingerprint straight off
+        ``get_memory_by_id``'s full unprocessed payload, where all three fields
+        sit at one level. Since task 5265 ``get_memory`` reads the SAME VALUES
+        out of mem0's processed record, this is no longer a choice between a
+        correct source and a broken one. The source is still pinned,
+        because a durable audit record should name where its provenance came
+        from rather than acquire it through whichever primitive happens to be
+        equivalent today.
 
-        ``get_memory_by_id`` returns the full unprocessed payload, where all
-        three genuinely live. A durable audit record is the wrong place to
-        reproduce a known-broken read for the sake of agreeing with it, so this
-        pins BOTH halves: the real values are recorded, and ``get_memory`` is
-        not called at all. (Convergence belongs in ``get_memory``; that module
-        is outside this task's scope and the fix is filed separately.)
+        Both halves stay asserted: the real values are recorded, and
+        ``get_memory`` is not called at all. The two extractions'
+        value-agreement is a separate claim, pinned by
+        ``TestFingerprintExtractionConvergence`` below.
         """
 
         class RecordingLookup(FakeMemoryLookup):
@@ -1811,9 +1807,11 @@ class TestRepairFingerprintProvenance:
                 self, memory_id: str, store: str, project_id: str
             ) -> dict[str, Any]:
                 self.get_memory_calls.append((memory_id, store, project_id))
-                # What the real one returns for a mem0 id: two fields always
-                # None. Recording it makes the fingerprint assertion below fail
-                # too, so switching the source breaks this test twice over.
+                # Deliberately NOT what the real get_memory returns today —
+                # this arm must never be reached, and returning a distinguishable
+                # wrong answer makes the fingerprint assertion below fail too, so
+                # switching the source breaks this test twice over rather than
+                # once.
                 return {
                     'category': None,
                     'agent_id': None,

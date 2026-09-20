@@ -343,29 +343,36 @@ def build_citation_repair_record(
 def _fingerprint_from_record(record: Any) -> dict[str, Any]:
     """The mem0 ``metadata_fingerprint`` triple, read off a ``get_memory_by_id`` record.
 
-    Same ``{category, agent_id, created_at}`` SHAPE ``MemoryService.get_memory``
-    returns for a mem0 citation, deliberately NOT the same extraction — and the
-    divergence is on purpose, not an oversight, so do not "unify" these two
-    without fixing ``get_memory`` first:
-
-    ``get_memory`` reads ``category`` and ``created_at`` off the TOP LEVEL of
-    mem0's ``AsyncMemory.get`` record and ``agent_id`` out of its nested
-    ``metadata``. mem0 puts none of ``category``/``agent_id`` where that reads:
-    ``get``'s ``promoted_payload_keys`` (``user_id``, ``agent_id``, ``run_id``,
-    ``actor_id``, ``role``) are lifted to the TOP level and EXCLUDED from
-    ``metadata``, while every other payload key — ``category`` included — stays
-    INSIDE ``metadata``. So ``get_memory``'s mem0 fingerprint is
-    ``{category: None, agent_id: None, created_at: <real>}``: two of its three
-    fields are structurally always None, and every citation ``cite_memory`` has
-    ever written carries that.
+    Same ``{category, agent_id, created_at}`` SHAPE and now the same VALUES as
+    ``MemoryService.get_memory`` returns for a mem0 citation, but deliberately
+    NOT the same extraction — so do not "unify" these two without first
+    checking what each one is actually handed:
 
     ``get_memory_by_id`` returns the FULL unprocessed Qdrant payload under
-    ``metadata``, where all three genuinely live — so reading them here yields
-    the REAL values, from the record the corroboration read already fetched.
-    A durable audit record is the wrong place to reproduce a known-broken read
-    for the sake of matching it. Convergence belongs in ``get_memory`` (one fix
-    there repairs ``cite_memory`` corpus-wide and this path with it), which is
-    outside this task's module scope and is filed as follow-up work.
+    ``metadata``, so all three fields sit at ONE level and are read from there.
+    ``get_memory`` consumes mem0's PROCESSED record instead, where
+    ``AsyncMemory.get``'s ``promoted_payload_keys`` (``user_id``, ``agent_id``,
+    ``run_id``, ``actor_id``, ``role``) are lifted to the TOP level and
+    EXCLUDED from ``metadata``, while every other payload key — ``category``
+    included — stays INSIDE ``metadata``.  Two different readings because two
+    different INPUT SHAPES; that is the whole of the remaining divergence.
+
+    ``get_memory`` used to read ``category`` off the top level and ``agent_id``
+    out of ``metadata``, i.e. neither where mem0 puts it, which made its mem0
+    fingerprint's first two fields None for every record. Task 5265 fixed that
+    at the source, so this function is no longer reading around a broken
+    sibling and the two now agree on values. The agreement is pinned
+    executably by
+    ``tests/reconciliation/test_citation_repair.py::TestFingerprintExtractionConvergence``,
+    which derives both record shapes from ONE stored payload — extend that test
+    rather than re-deriving the relationship by hand.
+
+    ``created_at`` is the one field the two can still legitimately SPELL
+    differently: ``get_memory`` receives it through mem0's
+    ``_normalize_iso_timestamp_to_utc`` while the raw payload read here is
+    unnormalised, so a record stored with a non-UTC offset yields the same
+    instant in two spellings. That, and not the extraction, is why this
+    function is not simply replaced by a call to ``get_memory``.
     """
     payload = (record or {}).get('metadata') or {}
     return {
