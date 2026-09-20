@@ -805,3 +805,48 @@ class TestRecordRunFailedStreak:
             trickle_state.DEFAULT_MAX_FAILED_RUNS
             < trickle_state.DEFAULT_MAX_BARREN_RUNS
         )
+
+
+class TestRecordedAgeHours:
+    """``recorded_age_hours(doc)`` — the freshness helper SHARED by
+    ``check_trickle_progress.py``'s staleness branch and
+    ``check_trickle_health.py``'s barren-edge suppression.
+
+    It exists so those two cannot drift into two readings of "fresh"; the
+    three-valued contract below is what lets each caller keep its own
+    distinct wording for an input it cannot assess."""
+
+    def test_a_document_stamped_n_hours_ago_reports_approximately_n(self):
+        stamp = datetime.now(UTC) - timedelta(hours=30)
+        age = trickle_state.recorded_age_hours({'recorded_at': stamp.isoformat()})
+
+        assert age is not None
+        # A tolerance, not equality: the wall clock advances between the
+        # write above and the read inside the helper.
+        assert abs(age - 30) < 0.5
+
+    def test_a_naive_recorded_at_is_read_as_utc(self):
+        """Matches the normalization ``check_trickle_progress.py``'s
+        staleness branch already did, so the refactor onto this helper is
+        provably behaviour-preserving on the one input shape most likely
+        to differ."""
+        naive = (datetime.now(UTC) - timedelta(hours=10)).replace(tzinfo=None)
+        age = trickle_state.recorded_age_hours({'recorded_at': naive.isoformat()})
+
+        assert age is not None
+        assert abs(age - 10) < 0.5
+
+    @pytest.mark.parametrize('doc', [
+        pytest.param({}, id='recorded_at-absent'),
+        pytest.param({'recorded_at': 'not-a-timestamp'}, id='unparseable'),
+        pytest.param({'recorded_at': None}, id='recorded_at-None'),
+        pytest.param(None, id='not-a-dict'),
+        pytest.param('a string', id='a-string'),
+    ])
+    def test_what_cannot_be_assessed_is_none(self, doc):
+        """``None`` means "freshness cannot be assessed" — deliberately NOT
+        "old" and NOT "fresh". Each caller decides what that means, which
+        is exactly what lets the progress probe keep its own unparseable
+        verdict while the health probe treats the same input as
+        post-worthy."""
+        assert trickle_state.recorded_age_hours(doc) is None

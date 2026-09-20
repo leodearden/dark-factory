@@ -17,6 +17,7 @@ hand-rolled fixture that could drift from it.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -340,6 +341,38 @@ def test_just_inside_the_freshness_window_exits_zero(tmp_path, monkeypatch):
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    _assert_no_git(git_marker)
+
+
+def test_unparseable_recorded_at_is_its_own_verdict(tmp_path, monkeypatch):
+    """Freshness that CANNOT BE ASSESSED is a third thing, distinct from
+    fresh and from stale, and it names its own remedy.
+
+    Covers the branch the shared ``trickle_state.recorded_age_hours``
+    refactor routes through: ``test_stale_recorder_exits_nonzero`` and
+    ``test_just_inside_the_freshness_window_exits_zero`` already pin the
+    age boundary, so this closes the one gap in that refactor's regression
+    net."""
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
+    path = trickle_state.trickle_state_path("dark_factory")
+    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["recorded_at"] = "not-a-timestamp"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    lowered = result.stderr.lower()
+    assert "recorded_at" in lowered, "must name the field it could not read"
+    assert "freshness" in lowered and "cannot be assessed" in lowered
+    # This file's contract: every failure verdict is DISTINCT and names its
+    # OWN remedy, so an operator is never sent to the wrong one.
+    assert "barren" not in lowered
+    assert "consecutive_failed_runs" not in lowered
     _assert_no_git(git_marker)
 
 

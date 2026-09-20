@@ -16,9 +16,11 @@ the backstop if one ever slips.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -254,17 +256,24 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
     return config_path
 
 
-def _seed_state(project_id, *, outcomes):
+def _seed_state(project_id, *, outcomes, last_recorded_at=None):
     """Seed real state through the REAL writer, one night per entry, so the
-    suppression rule is exercised against genuine recorder output."""
-    from datetime import UTC, date, datetime, timedelta
+    suppression rule is exercised against genuine recorder output.
+
+    *last_recorded_at* is the stamp the LAST seeded night carries,
+    defaulting to now — which is every pre-existing caller's behaviour,
+    byte for byte. Passing an older stamp is how a FROZEN document (a
+    recorder that stopped) is seeded without hand-writing one: keeping the
+    real writer in the loop is why these tests cannot drift from recorder
+    output."""
+    from datetime import date
 
     counters = {
         'productive': (0, dict(selected_count=2)),
         'barren': (0, dict(budget_skipped=4)),
         'failed': (1, dict(selected_count=1)),
     }
-    now = datetime.now(UTC)
+    now = last_recorded_at if last_recorded_at is not None else datetime.now(UTC)
     doc = None
     for i, outcome in enumerate(outcomes):
         exit_code, extra = counters[outcome]
@@ -389,6 +398,103 @@ class TestEscalation:
         assert result.exit_code == 1
         assert result.escalated is False
         assert envelopes == []
+
+    def test_a_frozen_threshold_document_does_not_suppress_forever(
+        self, tmp_path
+    ):
+        """THE regression test.
+
+        The suppression used to be a predicate over the recorded document
+        ALONE, with no freshness condition. Measured in this worktree: a
+        ``['barren'] * 3`` document stamped 30 days ago gives
+        ``exit_code=1, escalated=False, 0 envelopes`` — and since the
+        document is frozen, that repeats EVERY NIGHT indefinitely. A
+        recorder that dies on a night landing exactly on the threshold
+        (timer disabled, unit 203/EXEC, recorder crash) then fails the
+        progress probe's STALENESS branch forever while never once
+        posting: the journal stays loud, and the only interrupt an
+        operator actually receives is permanently suppressed."""
+        _seed_state(
+            'dark_factory', outcomes=['barren'] * 3,
+            last_recorded_at=datetime.now(UTC) - timedelta(days=30),
+        )
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: stale recorder'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
+
+    def test_the_suppression_still_holds_for_a_fresh_threshold_document(
+        self, tmp_path
+    ):
+        """The behaviour the suppression EXISTS for, pinned alongside the
+        fix so the fix cannot be over-applied into the very double-alarm
+        with ``nightly::_escalate_barren_streak`` it was built to avoid."""
+        _seed_state(
+            'dark_factory', outcomes=['barren'] * 3,
+            last_recorded_at=datetime.now(UTC),
+        )
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert envelopes == []
+
+    @pytest.mark.parametrize('offset_hours, expected_envelopes', [
+        pytest.param(71, 0, id='inside-the-window-suppressed'),
+        pytest.param(73, 1, id='outside-the-window-posts'),
+    ])
+    def test_the_suppression_window_is_the_freshness_window(
+        self, tmp_path, offset_hours, expected_envelopes
+    ):
+        """The boundary, asserted as a RELATION to ``max_age_hours`` rather
+        than as a literal.
+
+        The suppression can never outlive the nightly's edge-trigger: the
+        moment a record is stale enough for the progress probe to call it
+        stale, it is also too stale to be evidence that anyone alarmed."""
+        _seed_state(
+            'dark_factory', outcomes=['barren'] * 3,
+            last_recorded_at=datetime.now(UTC) - timedelta(hours=offset_hours),
+        )
+
+        _result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+            max_age_hours=72,
+        )
+
+        assert len(envelopes) == expected_envelopes
+
+    def test_an_unparseable_recorded_at_is_post_worthy_not_suppression_grounds(
+        self, tmp_path
+    ):
+        """Consistent with the existing posture that ``missing`` and
+        ``malformed`` are VERDICTS rather than suppression grounds: a
+        document whose freshness cannot be assessed must never be treated
+        as fresh."""
+        _seed_state('dark_factory', outcomes=['barren'] * 3)
+        path = trickle_state.trickle_state_path('dark_factory')
+        doc = json.loads(path.read_text(encoding='utf-8'))
+        doc['recorded_at'] = 'not-a-timestamp'
+        path.write_text(json.dumps(doc), encoding='utf-8')
+
+        _result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: unparseable recorded_at'),
+            max_barren_runs=3,
+        )
+
+        assert len(envelopes) == 1
 
     def test_posts_once_the_nightly_has_gone_silent(self, tmp_path):
         """At ``> max_barren_runs`` the nightly is edge-triggered and
