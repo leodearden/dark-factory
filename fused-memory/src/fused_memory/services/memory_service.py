@@ -7781,6 +7781,45 @@ class MemoryService:
           {category, agent_id, created_at} for mem0;
           {name, fact_snippet} for graphiti.
 
+        WHERE EACH MEM0 FIELD LIVES, and why it is not obvious.  mem0's
+        ``Memory.get`` / ``AsyncMemory.get`` (verified against installed mem0
+        1.0.11, ``mem0/memory/main.py``) do not hand back the stored Qdrant
+        payload as-is.  They LIFT ``promoted_payload_keys`` — ``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role`` — to the record's TOP
+        LEVEL, and EXCLUDE those same keys from ``metadata`` via
+        ``core_and_promoted_keys``.  Every other payload key, ``category``
+        among them, stays INSIDE ``metadata``.  So the correct reads are
+        split across two levels, and reading either field at the other one
+        yields ``None`` for every record ever stored — which is the defect
+        task 5265 fixed, after 5/5 real ``cite_memory`` calls came back with
+        ``category`` and ``agent_id`` null against payloads that carried both.
+
+        TWO TRAPS the reads below must survive, both measured against the
+        installed package:
+          * ``metadata`` can be literally ``None``, not merely absent:
+            ``MemoryItem.model_dump()`` always emits ``metadata: None`` and
+            ``result_item['metadata']`` is overwritten only ``if
+            additional_metadata:``.  The ``or {}`` is load-bearing.
+          * a promoted key is copied only ``if key in memory.payload``, so
+            ``agent_id`` can be absent from the record entirely — hence
+            ``.get()``, never a subscript.
+
+        AUDIT OF THE REMAINING PROMOTED KEYS.  ``agent_id`` is the only one
+        this fingerprint touches.  ``user_id`` / ``run_id`` / ``actor_id`` /
+        ``role`` are equally available at the top level and are deliberately
+        NOT added: the three-key shape is a contract with
+        ``ReconReportState.cite_memory``, ``reconciliation/prompts/__init__``
+        and ``cli_stage_runner``'s JSON schema.
+
+        This read is deliberately NOT re-routed through
+        ``Mem0Backend.get_point_by_id`` to share
+        ``reconciliation/citation_repair.py::_fingerprint_from_record``'s
+        extraction: that would read ``created_at`` off the unnormalised raw
+        payload instead of mem0's ``_normalize_iso_timestamp_to_utc`` value,
+        regressing the one field that was always correct.  The two extractions
+        agree on VALUES while still reading different SHAPES; that agreement
+        is pinned by a test rather than by unifying the call path.
+
         Raises:
             EdgeNotFoundError: graphiti path, edge absent.
             MemoryNotFoundError: mem0 path, the id genuinely does not exist.
@@ -7807,8 +7846,8 @@ class MemoryService:
             raise MemoryNotFoundError(memory_id)
         metadata = rec.get('metadata') or {}
         return {
-            'category': rec.get('category'),
-            'agent_id': metadata.get('agent_id'),
+            'category': metadata.get('category'),
+            'agent_id': rec.get('agent_id'),
             'created_at': rec.get('created_at'),
         }
 
