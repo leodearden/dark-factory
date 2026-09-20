@@ -9,10 +9,14 @@ predicates on tasks 2587/2615 — both ``done``, and a completed milestone
 predicate never runs again. So the tests that matter most here are the
 ones pinning that this module EXECUTES the sibling scripts by path.
 
-Every test injects BOTH probe runners. None may shell out to a real
-``systemctl`` or run the real progress probe against the operator's live
-state; ``scripts/tests/conftest.py::_isolate_legibility_trickle_state`` is
-the backstop if one ever slips.
+Almost every test injects BOTH probe runners, and none may shell out to a
+real ``systemctl``; ``scripts/tests/conftest.py::
+_isolate_legibility_trickle_state`` is the backstop if one ever slips.
+The exception is :class:`TestTheDefaultRunnersReallyExecute`, which runs
+the REAL progress probe against seeded state under that same tmp root —
+without it ``_run`` and both default runners would be dead code here, and
+the module's central claim (it EXECUTES the probes) would be pinned only
+as a string.
 """
 from __future__ import annotations
 
@@ -128,7 +132,10 @@ class TestAggregateVerdict:
 class TestTheProbesItActuallyTargets:
     """THE GAP-2 regression tests. The defect was that nothing referenced
     either probe, so pinning the argv BY CONSTRUCTION is what keeps a
-    rename from silently orphaning one again."""
+    rename from silently orphaning one again.
+
+    These pin the argv as a STRING. :class:`TestTheDefaultRunnersReallyExecute`
+    pins that the string runs."""
 
     def test_progress_argv_targets_the_sibling_script(self):
         argv = check_trickle_health.progress_argv(
@@ -680,6 +687,47 @@ class TestProjectIdResolution:
         assert progress_calls == ['dark_factory']
         assert liveness_calls == ['dark_factory']
 
+    def test_the_envelope_names_the_project_that_was_actually_probed(
+        self, tmp_path
+    ):
+        """The precedence rule must hold for the ESCALATION too, not only
+        for the probes.
+
+        MEASURED before this test was written:
+        ``_build_escalation_arguments`` derived its project id from
+        ``cfg.project_id`` while both probes ran with the RESOLVED one, so
+        ``--project-id dark_factory --config <reify yaml>`` probed
+        dark_factory and filed
+        ``task_id=legibility-trickle-health-reify`` — an alarm
+        misattributed to a project that was never probed. Same
+        identity-divergence class GAP 3 closed at the path layer, one
+        layer up: the id that names the finding must be the id that
+        produced it."""
+        envelopes = []
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        result = check_trickle_health.run_health_check(
+            project_id='dark_factory',
+            config_path=config_path,
+            progress_runner=_fails('ERROR: never recorded a run'),
+            liveness_runner=_ok,
+            poster=lambda url, envelope: envelopes.append(envelope),
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
+        arguments = envelopes[0]['params']['arguments']
+        assert arguments['task_id'] == 'legibility-trickle-health-dark_factory'
+        assert 'proj_a' not in arguments['task_id']
+        assert 'proj_a' not in arguments['summary'], (
+            'the summary must name the project that was probed, not the '
+            'one whose yaml happened to supply the escalation port'
+        )
+        assert 'dark_factory' in arguments['summary']
+        # The re-run commands must reproduce THIS verdict, so they carry
+        # the probed id too.
+        assert 'proj_a' not in arguments['detail']
+
     def test_an_unresolvable_config_without_a_project_id_runs_neither_probe(
         self, tmp_path
     ):
@@ -732,3 +780,118 @@ class TestProjectIdResolution:
         assert arguments['task_id'] == 'legibility-trickle-health-proj_a'
         assert 'for :' not in arguments['summary']
         assert 'for :' not in arguments['detail']
+
+
+class TestTheDefaultRunnersReallyExecute:
+    """The module's whole claim is that it EXECUTES the two probes rather
+    than re-deriving their verdicts — and every other test in this file
+    injects both runners, which leaves ``_run``, ``_default_progress_runner``
+    and ``_default_liveness_runner`` unexecuted under pytest.
+
+    That gap has the exact shape of the defect this task exists to close.
+    ``TestTheProbesItActuallyTargets`` asserts the argv STRING; an arity
+    change in ``check_trickle_progress.py`` (which gained a 4th positional
+    in this same task) or a rename of a probe script would leave every one
+    of those assertions green while the 04:30 timer failed nightly in
+    production — shipped, bound, and quietly broken.
+
+    Only the PROGRESS probe is executed for real. It reads one JSON file
+    and never shells out, so ``conftest.py::_isolate_legibility_trickle_state``
+    is sufficient isolation and the subprocess inherits that same root. The
+    liveness probe runs ``systemctl``, which no test in this directory may
+    touch.
+    """
+
+    _THRESHOLDS = dict(max_barren_runs=3, max_age_hours=72, max_failed_runs=2)
+
+    def test_the_default_progress_runner_executes_the_real_probe(self):
+        """The built argv is ACCEPTED by the probe's own arity guard and
+        produces its healthy verdict — the assertion an arity change would
+        break."""
+        _seed_state('proj_defaults_ok', outcomes=['productive'])
+
+        returncode, output = check_trickle_health._default_progress_runner(
+            'proj_defaults_ok', **self._THRESHOLDS,
+        )
+
+        assert returncode == 0, output
+        assert 'OK:' in output
+        assert 'productive' in output
+        assert 'usage:' not in output, (
+            'a usage line means the arity contract drifted, not that the '
+            'pipeline is unhealthy'
+        )
+
+    def test_the_default_progress_runner_conveys_a_real_failure(self):
+        """The other direction: a genuine barren streak reaches the caller
+        as a non-zero returncode carrying the probe's own words."""
+        _seed_state('proj_defaults_barren', outcomes=['barren'] * 3)
+
+        returncode, output = check_trickle_health._default_progress_runner(
+            'proj_defaults_barren', **self._THRESHOLDS,
+        )
+
+        assert returncode != 0
+        assert 'barren' in output
+        assert 'max_daily_digest_bytes' in output, (
+            "the door-specific remedy must survive the subprocess boundary "
+            "intact — this module forwards the probe's verdict, never its "
+            "own summary of it"
+        )
+
+    def test_run_health_check_defaults_to_the_real_progress_probe(
+        self, tmp_path
+    ):
+        """End to end through the aggregate, with only the LIVENESS runner
+        injected. Nothing else in this file proves the default runner is
+        actually WIRED to ``run_health_check`` rather than merely
+        importable."""
+        _seed_state('proj_defaults_e2e', outcomes=['productive'])
+
+        result = check_trickle_health.run_health_check(
+            project_id='proj_defaults_e2e',
+            config_path=tmp_path / 'absent' / 'legibility.yaml',
+            liveness_runner=_ok,
+            poster=lambda url, envelope: None,
+        )
+
+        assert result.exit_code == 0
+        assert result.progress_ok is True
+        assert 'OK:' in result.progress_output
+        assert 'proj_defaults_e2e' in result.progress_output
+
+    def test_a_renamed_probe_script_is_a_FAILED_verdict(
+        self, tmp_path, monkeypatch
+    ):
+        """The rename regression, made executable. GAP 2 was a probe
+        nothing invoked; a probe invoked at a path that no longer exists is
+        the same absence with a unit around it, so it must be LOUD."""
+        monkeypatch.setattr(
+            check_trickle_health, 'PROGRESS_SCRIPT',
+            tmp_path / 'renamed_away.py',
+        )
+
+        returncode, output = check_trickle_health._default_progress_runner(
+            'proj_defaults_ok', **self._THRESHOLDS,
+        )
+
+        assert returncode != 0
+        assert 'renamed_away.py' in output, (
+            'the output must name the path it could not find, so the '
+            'journal line says what to fix'
+        )
+
+    def test_a_probe_binary_that_cannot_be_EXECUTED_is_a_FAILED_verdict(
+        self, tmp_path
+    ):
+        """``_run``'s ``OSError`` branch, unreachable through the two
+        default argvs (their argv[0] is ``sys.executable`` and ``bash``).
+        A probe that cannot run is not evidence of health — never a
+        traceback out of the unit, never a pass."""
+        returncode, output = check_trickle_health._run(
+            [str(tmp_path / 'no-such-binary'), 'dark_factory'],
+        )
+
+        assert returncode == 1
+        assert 'no-such-binary' in output
+        assert 'not evidence of health' in output

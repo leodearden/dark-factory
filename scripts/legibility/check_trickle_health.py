@@ -312,7 +312,9 @@ def run_health_check(
     )
     return replace(
         result,
-        escalated=post_health_finding(cfg, result, rerun, poster=poster),
+        escalated=post_health_finding(
+            cfg, result, rerun, project_id=project_id, poster=poster,
+        ),
     )
 
 
@@ -346,8 +348,24 @@ def _default_poster(url: str, envelope: dict) -> None:
     census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
 
 
-def _build_escalation_arguments(cfg, result: HealthResult, rerun) -> dict:
+def _build_escalation_arguments(
+    project_id: str, result: HealthResult, rerun,
+) -> dict:
     """Build the ``escalate_info`` arguments for ONE invocation.
+
+    *project_id* is the RESOLVED one — the id both probes were actually
+    run with — and never ``cfg.project_id``. The two differ whenever
+    ``--project-id`` and ``--config`` name different projects, and
+    ``run_health_check``'s resolution rule says the flag wins. Measured
+    before this parameter existed: ``--project-id dark_factory --config
+    <reify yaml>`` probed dark_factory and filed
+    ``task_id=legibility-trickle-health-reify``, an alarm misattributed to
+    a project that was never probed. That is the identity-divergence class
+    GAP 3 closed at the path layer, one layer up — the id that NAMES a
+    finding must be the id that PRODUCED it. Taking the id as a parameter
+    rather than reading it back off the config is also what makes the
+    config unnecessary here at all: this function needs no
+    :class:`LegibilityConfig`, only the port-holder above it does.
 
     The ``task_id`` is synthetic (``legibility-trickle-health-<project_id>``)
     because this is a timer-driven probe, not a Taskmaster task — the same
@@ -368,7 +386,6 @@ def _build_escalation_arguments(cfg, result: HealthResult, rerun) -> dict:
         (('progress', result.progress_ok), ('liveness', result.liveness_ok))
         if not ok
     ]
-    project_id = cfg.project_id
     return {
         'task_id': f'legibility-trickle-health-{project_id}',
         'agent_role': _ESCALATION_AGENT_ROLE,
@@ -391,8 +408,15 @@ def _build_escalation_arguments(cfg, result: HealthResult, rerun) -> dict:
     }
 
 
-def post_health_finding(cfg, result: HealthResult, rerun, *, poster=None) -> bool:
+def post_health_finding(
+    cfg, result: HealthResult, rerun, *, project_id: str, poster=None,
+) -> bool:
     """Best-effort ``escalate_info`` POST. NEVER raises.
+
+    *cfg* is consulted for ONE thing, the escalation port. The finding's
+    identity comes from *project_id* — see
+    :func:`_build_escalation_arguments` for why the two must not be
+    conflated.
 
     Any failure is logged as ONE warning and swallowed, returning
     ``False``: a down escalation server must not mask the finding, because
@@ -406,7 +430,9 @@ def post_health_finding(cfg, result: HealthResult, rerun, *, poster=None) -> boo
             'method': 'tools/call',
             'params': {
                 'name': _ESCALATION_TOOL_NAME,
-                'arguments': _build_escalation_arguments(cfg, result, rerun),
+                'arguments': _build_escalation_arguments(
+                    project_id, result, rerun,
+                ),
             },
         }
         poster_fn(f'http://localhost:{cfg.escalation_port}/mcp', envelope)
