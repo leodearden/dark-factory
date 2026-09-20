@@ -339,9 +339,11 @@ Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
   the bare `git rebase --abort`: with rerere disabled git never opens `MERGE_RR`, which is what
   makes the abort survive both failure modes.
 - `blocked` → **ABORT** the skill without running the abort, copying the payload's `unrepaired`
-  entries verbatim into your `reason`. `blocked` means something the preflight declined to touch —
-  typically a lock file a live process still holds open — and deciding what that process is, is a
-  human's call, not this skill's.
+  entries verbatim into your `reason`. `blocked` means either something the preflight declined to
+  touch — typically a lock file a live process still holds open, and deciding what that process
+  is, is a human's call, not this skill's — or a worktree it could not resolve at all
+  (`resolved: false`), where it inspected nothing, so the empty `dangling`/`locks_*` lists report
+  an absence of looking rather than an absence of damage. Check the path you passed.
 
 Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
 and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.

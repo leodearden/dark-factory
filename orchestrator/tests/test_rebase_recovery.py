@@ -1192,7 +1192,7 @@ class TestPreflightRepairsOnlyTheWorktreeItWasGiven:
         result = rebase_recovery.preflight_rebase_recovery(nested)
 
         assert result.resolved is False
-        assert result.verdict == 'clean'
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
         assert result.merge_rr_backup is None
         assert result.locks_removed == ()
         self._assert_outer_untouched(repo)
@@ -1497,13 +1497,18 @@ class TestVanishedWorktreeKeepsTheTypedException:
     def test_preflight_on_a_vanished_worktree_reports_unresolved(
         self, tmp_path: Path,
     ) -> None:
-        """The unit arm: an unspawnable cwd degrades, it does not raise."""
+        """The unit arm: an unspawnable cwd degrades, it does not raise.
+
+        Degrading is not the same as reporting health — nothing here was
+        inspected, so the verdict says ``blocked`` while the abort above still
+        runs and still raises the typed exception this class exists for.
+        """
         vanished = tmp_path / 'deleted-out-of-band'
 
         result = rebase_recovery.preflight_rebase_recovery(vanished)
 
         assert result.resolved is False
-        assert result.verdict == rebase_recovery.VERDICT_CLEAN
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
 
 def _quarantine_move_fails(monkeypatch, error: OSError) -> None:
     """Make the quarantine's MOVE of MERGE_RR fail with a chosen errno.
@@ -1532,6 +1537,30 @@ def _quarantine_move_fails(monkeypatch, error: OSError) -> None:
         return real_link(src, dst, **kwargs)
 
     monkeypatch.setattr(os, 'link', link)
+
+
+def _quarantine_removal_fails(monkeypatch, error: OSError) -> None:
+    """Make the quarantine's REMOVAL of the original MERGE_RR fail.
+
+    The other half of the link-then-unlink :func:`_quarantine_move_fails`
+    covers.  Both halves have to be reachable independently, because they leave
+    DIFFERENT states behind: a failed claim leaves one file, a failed removal
+    leaves two — the evidence and the damage.
+
+    Scoped to the MERGE_RR name for the reasons given above, and here that
+    scoping is load-bearing rather than merely tidy: ``Path.unlink`` is how
+    ``sweep_stale_locks`` clears a lock and how pytest tears its own temporary
+    files down, so an unscoped patch would fail the sweep in the same breath
+    and the case would no longer be about the quarantine at all.
+    """
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self.name == 'MERGE_RR':
+            raise error
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', unlink)
 
 
 class TestQuarantineFailureDoesNotSwallowTheAbort:
@@ -1603,6 +1632,42 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
         assert merge_rr.exists()
         logged = '\n'.join(r.getMessage() for r in caplog.records)
         assert str(merge_rr) in logged
+
+    def test_a_copy_the_original_outlived_is_not_a_repair(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """Half a move is no move: the damage is still on disk, so say so.
+
+        The move's SECOND half failing is the tempting one to call a success —
+        the evidence is safely copied, and the abort ahead deletes the original
+        anyway.  Calling it one would hand a caller ``repaired`` for a worktree
+        whose suspect MERGE_RR never went anywhere, which is precisely the
+        report-only dishonesty ``verdict``'s own docstring rules out, and the
+        skills branch on that word alone.  ``blocked`` costs nothing here: the
+        guarded abort proceeds on any verdict.
+        """
+        repo, conflict_id = build_mid_rebase_repo(tmp_path)
+        _make_dangling(repo, conflict_id)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        _quarantine_removal_fails(
+            monkeypatch, PermissionError(errno.EACCES, 'Permission denied'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            result = rebase_recovery.preflight_rebase_recovery(repo)
+
+        assert result.verdict == rebase_recovery.VERDICT_BLOCKED
+        assert result.merge_rr_backup is None
+        assert conflict_id in ' '.join(result.unrepaired)
+        assert merge_rr.read_bytes() == original, 'the damage is still in place'
+
+        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        assert [b.read_bytes() for b in backups] == [original], (
+            'the copy the first half made is evidence, and it must survive'
+        )
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(backups[0]) in logged, 'an unnamed copy is a copy no one finds'
 
 def _merge_rr_read_fails(monkeypatch, error: OSError) -> None:
     """Make reading MERGE_RR fail with a chosen errno, by the same means as above.
@@ -1681,8 +1746,8 @@ class TestPreflightIsTotal:
     """The fail-safe contract is an INVARIANT over the entry point, not two patches.
 
     Both docstrings in the module already assert it — ``guarded_abort``'s "It
-    never raises", ``preflight_rebase_recovery``'s "returns an
-    unresolved-but-clean result rather than raising" — and what review found is
+    never raises", ``preflight_rebase_recovery``'s "no filesystem state makes
+    this raise" — and what review found is
     that the contract did not hold.  The two defects it named were instances;
     pinning only those leaves the defect class live, and leaves the prose
     untrue for the next reader who relies on it.
@@ -1866,7 +1931,12 @@ class TestPreflightCli:
     def test_an_unresolvable_worktree_does_not_crash_the_cli(
         self, tmp_path: Path, capsys,
     ) -> None:
-        """Fail-safe all the way out: this decorates recovery, never blocks it."""
+        """Fail-safe all the way out: exit 0 with an honest verdict, never a crash.
+
+        Exit code and verdict answer different questions, and the CLI's whole
+        contract is that the first never carries the second: a non-zero exit
+        would make a skill treat a completed inspection as a failed command.
+        """
         not_a_repo = tmp_path / 'plain'
         not_a_repo.mkdir()
 
@@ -1876,7 +1946,28 @@ class TestPreflightCli:
 
         assert code == 0
         assert payload['resolved'] is False
-        assert payload['verdict'] == 'clean'
+
+    def test_a_worktree_that_could_not_be_resolved_is_never_called_clean(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Nothing inspected is the least known state there is, not the healthiest.
+
+        The enum is the only thing either skill branches on — both read
+        `verdict`, neither reads `resolved` — so a `clean` here tells a caller
+        to proceed on a worktree no one looked at, and with a live lock present
+        that abort then fails rc 128 with no prior warning.  The sibling
+        contract is already pinned for a MERGE_RR that could not be READ; a
+        worktree that was never opened at all cannot be the healthier answer.
+        """
+        not_a_repo = tmp_path / 'plain'
+        not_a_repo.mkdir()
+
+        _, payload = self._run_cli(
+            capsys, 'preflight', '--worktree', str(not_a_repo),
+        )
+
+        assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
+        assert str(not_a_repo) in ' '.join(payload['unrepaired'])
 
     def test_report_only_never_calls_detected_damage_clean(
         self, tmp_path: Path, capsys,

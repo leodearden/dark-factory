@@ -279,6 +279,16 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
     ``blocked``.  Degrading this way is the whole point of the module: an abort
     that must still run cannot be blocked by a repair that could not, and it is
     the same shape :func:`sweep_stale_locks` uses for a lock it cannot unlink.
+
+    A returned path means MOVED, never merely COPIED, and the link-then-unlink
+    has two halves that fail separately.  A failed claim leaves nothing behind;
+    a failed unlink leaves the evidence safe at the backup and the suspect file
+    exactly where git put it.  Only the second is tempting to call a success,
+    and it is not one: answering with the backup there would make ``unrepaired``
+    skip the MERGE_RR arm and verdict a worktree ``repaired`` whose damage is
+    still on disk, which is the one direction this module must never fail in.
+    Both halves therefore answer ``None``, and both name the backup in the log
+    so nothing this run wrote is lost to the reader.
     """
     if not scan.suspect:
         return None
@@ -310,11 +320,13 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
         scan.merge_rr_path.unlink()
     except OSError as exc:
         logger.warning(
-            'Quarantined %s to %s but could not remove the original: %s. The '
-            'evidence is preserved; the next guarded abort will quarantine it '
-            'again.',
+            'Copied suspect MERGE_RR %s to %s but could not remove the '
+            'original: %s. The evidence is preserved at the copy; the suspect '
+            'file is STILL IN PLACE, so this run reports it un-repaired and '
+            'the next guarded abort will quarantine it again.',
             scan.merge_rr_path, backup, exc,
         )
+        return None
     logger.warning(
         'Quarantined suspect MERGE_RR to %s — %s. Evidence preserved; the '
         'abort that follows would have deleted it.',
@@ -603,9 +615,13 @@ def sweep_stale_locks(
 
 
 #: Verdicts the CLI and the skills branch on.  ``blocked`` is the only one
-#: that means "do not proceed": something still holds a lock open, so the abort
+#: that means "do not proceed", and it covers two shapes.  Damage this run did
+#: not repair — typically a lock something still holds open, so the abort ahead
 #: will hit git's "Another git process seems to be running" and a human has to
-#: decide what that process is.
+#: decide what that process is.  And a worktree that could not be RESOLVED, so
+#: nothing was inspected at all: ``clean`` there would be a claim about files
+#: no one read, and "nothing inspected" is strictly less known than the
+#: unreadable MERGE_RR that already refuses to be called clean.
 VERDICT_CLEAN = 'clean'   # nothing needs attention
 VERDICT_REPAIRED = 'repaired'  # damage found and fixed; proceed
 VERDICT_BLOCKED = 'blocked'  # damage this run did not fix; do not proceed
@@ -629,15 +645,28 @@ class PreflightResult:
     def unrepaired(self) -> tuple[str, ...]:
         """Findings this run did NOT fix — the reason a caller must not proceed.
 
-        Two sources.  A retained lock is judged by
-        :func:`_retained_lock_reason`, against the same threshold that decided
-        the sweep — carried on :attr:`lock_stale_after_seconds` precisely so
-        the report-only path cannot answer a different question from the
-        repairing one.  A suspect MERGE_RR with no backup means the damage is
-        still in place — the ``report_only`` case, where leaving it is the
-        whole point, and also a quarantine that failed.
+        Three sources.  An UNRESOLVED worktree comes first because it subsumes
+        the other two: nothing was inspected, so every other field is empty for
+        want of a look rather than for want of damage, and a caller branching
+        on the verdict alone would read that emptiness as a licence to proceed.
+        A retained lock is judged by :func:`_retained_lock_reason`, against the
+        same threshold that decided the sweep — carried on
+        :attr:`lock_stale_after_seconds` precisely so the report-only path
+        cannot answer a different question from the repairing one.  A suspect
+        MERGE_RR with no backup means the damage is still in place — the
+        ``report_only`` case, where leaving it is the whole point, and also a
+        quarantine that failed.
+
+        ``resolved`` is reported as a field too, but the ENUM is what every
+        consumer branches on — both skills read ``verdict`` and neither reads
+        ``resolved`` — so a distinction that lives only in the field is a
+        distinction the consumer contract does not carry.
         """
         reasons = [
+            f'worktree {self.worktree} could not be resolved — nothing was '
+            f'inspected, so neither MERGE_RR nor the locks are known'
+        ] if not self.resolved else []
+        reasons += [
             reason
             for finding in self.locks_retained
             if (reason := _retained_lock_reason(
@@ -762,13 +791,12 @@ def resolve_git_dirs(worktree: Path) -> tuple[Path, Path] | None:
     exit code exists, and a probe that never answers within
     :data:`_PROBE_TIMEOUT_SECONDS` raises ``TimeoutExpired``.  Both are
     answered with ``None``, the same as a non-zero exit and the same as a
-    foreign repository, so the caller takes the one unresolved-but-clean branch
-    instead of branches that differ only in how the worktree failed to be the
-    worktree.  It also keeps the vanished-worktree
-    case reaching ``git_ops._run``, whose own pre-flight raises the typed
-    ``WorktreeMissing`` its consumers match on; raising that here instead is
-    impossible without an import cycle (see :data:`AbortRunner`) and would
-    duplicate the class besides.
+    foreign repository, so the caller takes the one unresolved branch instead
+    of branches that differ only in how the worktree failed to be the worktree.
+    It also keeps the vanished-worktree case reaching ``git_ops._run``, whose
+    own pre-flight raises the typed ``WorktreeMissing`` its consumers match on;
+    raising that here instead is impossible without an import cycle (see
+    :data:`AbortRunner`) and would duplicate the class besides.
     """
     try:
         resolved_worktree = worktree.resolve()
@@ -848,7 +876,7 @@ def preflight_rebase_recovery(
     if dirs is None:
         logger.warning(
             'Rebase-recovery preflight could not resolve git dirs for %s; '
-            'proceeding unguarded.', worktree,
+            'nothing was inspected, and the verdict says so.', worktree,
         )
         return PreflightResult(
             worktree=worktree, dangling=(), unparsable=(), merge_rr_backup=None,

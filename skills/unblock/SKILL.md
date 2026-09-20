@@ -827,8 +827,11 @@ Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
   `git -C <worktree> -c rerere.enabled=false rebase --abort` (or `... merge --abort`). With rerere
   disabled git never opens `MERGE_RR`, which is what makes the abort survive both failure modes.
 - `blocked` → do not abort. Report the payload's `unrepaired` entries to the human verbatim.
-  It means something the preflight declined to touch, typically a lock a live process still holds
-  open, and deciding what that process is, is a human's call.
+  It means either something the preflight declined to touch — typically a lock a live process
+  still holds open, and deciding what that process is, is a human's call — or a worktree it could
+  not resolve at all (`resolved: false`), where it inspected nothing and the other fields are
+  empty for want of a look rather than for want of damage. Check the path you passed before
+  reading anything else in the payload.
 
 The preflight moves a suspect `MERGE_RR` aside to a `MERGE_RR.quarantined-<timestamp>` sibling —
 **moved, never deleted**. A *successful* abort deletes that file, and it is the only record of
