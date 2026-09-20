@@ -1854,6 +1854,134 @@ class TestRepairFingerprintProvenance:
             await journal.close()
 
 
+class TestFingerprintExtractionConvergence:
+    """The two `{category, agent_id, created_at}` extractions must agree on VALUES.
+
+    ``citation_repair._fingerprint_from_record`` and
+    ``MemoryService.get_memory`` produce the same SHAPE from the same stored
+    memory by two different readings, because they consume two different INPUT
+    SHAPES:
+
+      * ``_fingerprint_from_record`` consumes ``get_memory_by_id``'s record,
+        whose ``metadata`` is the FULL unprocessed Qdrant payload — all three
+        fields at ONE level;
+      * ``get_memory`` consumes mem0's PROCESSED record, where
+        ``promoted_payload_keys`` (``agent_id`` among them) are lifted to the
+        top level and EXCLUDED from ``metadata``, while ``category`` stays
+        inside it.
+
+    Before task 5265 they disagreed: ``get_memory`` read both of the first two
+    at the wrong level and returned ``None`` for each.  This is the test that
+    would have caught that, and it is the executable form of the claim
+    ``_fingerprint_from_record``'s docstring makes.  Both record shapes are
+    DERIVED from one stored payload here, so the two cannot silently drift onto
+    different source data.
+    """
+
+    # mem0/memory/main.py::Memory.get / ::AsyncMemory.get, mem0 1.0.11.
+    _PROMOTED_PAYLOAD_KEYS = ('user_id', 'agent_id', 'run_id', 'actor_id', 'role')
+    _CORE_KEYS = ('data', 'hash', 'created_at', 'updated_at', 'id')
+
+    #: One stored Qdrant point payload — the single source of truth below.
+    _PAYLOAD = {
+        'data': 'the memory text',
+        'hash': 'abc123hash',
+        'created_at': '2026-07-26T04:34:05Z',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'recon-stage-memory_consolidator',
+        'category': 'procedural_knowledge',
+        'topic': 'citation-repair',
+    }
+
+    _UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    @classmethod
+    def _raw_record(cls) -> dict[str, Any]:
+        """What ``MemoryService.get_memory_by_id`` returns: the FULL payload."""
+        return {
+            'id': cls._UUID,
+            'content': cls._PAYLOAD['data'],
+            'metadata': dict(cls._PAYLOAD),
+        }
+
+    @classmethod
+    def _mem0_record(cls) -> dict[str, Any]:
+        """What mem0's ``get`` returns, derived from the SAME payload.
+
+        Applies mem0's own transformation rather than hand-writing a second
+        literal: core keys and promoted keys to the top level, everything else
+        left under ``metadata``.
+        """
+        core_and_promoted = {*cls._CORE_KEYS, *cls._PROMOTED_PAYLOAD_KEYS}
+        record: dict[str, Any] = {
+            'id': cls._UUID,
+            'memory': cls._PAYLOAD['data'],
+            'hash': cls._PAYLOAD['hash'],
+            'created_at': cls._PAYLOAD['created_at'],
+            'updated_at': cls._PAYLOAD['updated_at'],
+            'score': None,
+        }
+        for key in cls._PROMOTED_PAYLOAD_KEYS:
+            if key in cls._PAYLOAD:
+                record[key] = cls._PAYLOAD[key]
+        record['metadata'] = {
+            k: v for k, v in cls._PAYLOAD.items() if k not in core_and_promoted
+        }
+        return record
+
+    @pytest.mark.asyncio
+    async def test_both_extractions_agree_on_category_and_agent_id(self, mock_config):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        from_get_memory = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+        from_raw = citation_repair._fingerprint_from_record(self._raw_record())
+
+        assert from_get_memory['category'] == from_raw['category'] == 'procedural_knowledge'
+        assert (
+            from_get_memory['agent_id']
+            == from_raw['agent_id']
+            == 'recon-stage-memory_consolidator'
+        ), (
+            f'the two extractions disagree on agent_id: get_memory={from_get_memory!r}, '
+            f'_fingerprint_from_record={from_raw!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_created_at_is_non_none_in_both_but_equality_is_not_asserted(
+        self, mock_config
+    ):
+        """Both carry a real ``created_at`` — deliberately NOT asserted EQUAL.
+
+        mem0's ``get`` passes ``created_at`` through
+        ``_normalize_iso_timestamp_to_utc`` while the raw Qdrant payload is
+        unnormalised, so for a record stored with a non-UTC offset the two can
+        legitimately differ in SPELLING while naming the same instant.
+        Asserting equality here would pin an accident of this fixture's
+        already-UTC timestamp and would fail on real data the code handles
+        correctly.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        from_get_memory = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+        from_raw = citation_repair._fingerprint_from_record(self._raw_record())
+
+        assert from_get_memory['created_at'] is not None
+        assert from_raw['created_at'] is not None
+
+
 class TestRepairJournalIoErrors:
     """Journal I/O that RAISES is a structured refusal, never a traceback.
 

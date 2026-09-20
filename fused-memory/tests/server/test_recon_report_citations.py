@@ -2562,6 +2562,86 @@ class TestCiteMemory:
 # ---------------------------------------------------------------------------
 
 
+class TestCiteMemoryOverRealMemoryService:
+    """cite_memory over the REAL MemoryService — the end-to-end pin on the measured harm.
+
+    Every other cite_memory test in this file drives ``_FakeMemoryService``,
+    which returns a CANNED fingerprint and so never exercises the real read.
+    That is precisely why the defect survived: ``MemoryService.get_memory``
+    inverted the nesting of two of the fingerprint's three fields, and nothing
+    between it and a human ever looked at a real one.
+
+    THE CHAIN THIS GUARDS.  5/5 real ``cite_memory`` calls recorded
+    ``{category: null, agent_id: null, created_at: <real>}`` against records
+    whose raw payloads carried values for both.  A citation's ``agent_id`` is
+    what says WHO wrote the memory; with it null, authorship was INFERRED
+    rather than read, and that false uniform-authorship claim reached a
+    human-gated task's description.
+
+    Asserted off ``get_assembled_report``, not off the return value: what a
+    downstream reader consumes is the citation PERSISTED into the finding.
+    """
+
+    _UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+
+    @staticmethod
+    def _real_service(mock_config):
+        """A real MemoryService whose mem0 backend hands back a mem0-shaped record.
+
+        Only the BACKEND is mocked. ``get_memory`` — the function that held the
+        defect — runs for real.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        service = MemoryService(mock_config)
+        service.mem0 = MagicMock()
+        # Shaped exactly as installed mem0 1.0.11's AsyncMemory.get returns it:
+        # promoted_payload_keys at the TOP level and excluded from metadata,
+        # category left INSIDE metadata.
+        service.mem0.get = AsyncMock(return_value={
+            'id': TestCiteMemoryOverRealMemoryService._UUID,
+            'memory': 'some text',
+            'hash': 'h',
+            'created_at': '2026-09-09T12:00:00+00:00',
+            'updated_at': None,
+            'score': None,
+            'agent_id': 'claude-review-df-3200',
+            'user_id': 'dark_factory',
+            'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+            'metadata': {'category': 'observations_and_summaries', 'topic': 't'},
+        })
+        return service
+
+    @pytest.mark.asyncio
+    async def test_persisted_fingerprint_carries_real_category_and_agent_id(
+        self, mock_config
+    ):
+        service = self._real_service(mock_config)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=service)
+
+        await state.cite_memory(run_id, finding_id, self._UUID, 'mem0')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        memories = report['flagged_items'][0]['cited_memories']
+        assert len(memories) == 1, f'expected one citation, got {memories!r}'
+        fingerprint = memories[0]['metadata_fingerprint']
+
+        assert fingerprint['agent_id'] == 'claude-review-df-3200', (
+            'a null agent_id is what let authorship be INFERRED rather than read; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['category'] == 'observations_and_summaries', (
+            f'category lives inside mem0 metadata and must be read there; '
+            f'got fingerprint={fingerprint!r}'
+        )
+        assert fingerprint['created_at'] == '2026-09-09T12:00:00+00:00', (
+            'created_at was the one field always correct — it must stay correct'
+        )
+
+
 class TestCiteMemoryExceptionNarrowing:
     """Verifies that unexpected exceptions propagate rather than being misclassified as memory_not_found.
 
