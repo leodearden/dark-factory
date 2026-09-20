@@ -15,8 +15,10 @@ under any future refactor that keeps the loop free — including one that still
 calls ``to_thread`` but blocks either side of it.  The spy idiom is kept for
 claims that really are about a call COUNT.
 
-The floor each tick assertion clears is DERIVED from the stub's block time
-rather than hard-coded; ``_tick_floor`` carries the measurement that sets it.
+What the ticker reports is the WORST GAP between its turns, not how many turns
+it got: a wedge puts a hard floor under that gap, while a tick count also
+tracks machine speed and would red on a busy CI box.  ``_max_gap_ceiling``
+carries the measurements behind that choice.
 
 Harness scaffolding is re-created locally rather than imported from
 tests/test_harness.py — the convention set by tests/reconciliation/test_active_runs.py,
@@ -64,30 +66,41 @@ PROJECT_ROOT = '/tmp/test-project'
 TICK_SECONDS = 0.005
 
 #: How long each stubbed blocking primitive sleeps, in the thread it should be
-#: running in.  Sized so one call alone is ~50 ticks.
+#: running in.  Both are 250ms so the stall a wedge would produce is an order of
+#: magnitude clear of the worst scheduler hiccup measured here (see
+#: _max_gap_ceiling); the value is a margin, not a timing the code depends on.
 SCAN_BLOCK_SECONDS = 0.25
-PROBE_BLOCK_SECONDS = 0.15
+PROBE_BLOCK_SECONDS = 0.25
 
 
-def _tick_floor(blocked_seconds: float) -> int:
-    """Half the ticks *blocked_seconds* of OFFLOADED work leaves room for.
+def _max_gap_ceiling(blocked_seconds: float) -> float:
+    """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
-    The floor is derived, not a constant, so it states the claim structurally:
-    "the loop kept running for at least half the time the stub was blocking".
+    THE SIGNAL IS THE WORST GAP BETWEEN TICKS, NOT HOW MANY TICKS THERE WERE,
+    and that choice is the product of a measurement that refuted the count.
 
-    WHY HALF, AND NOT SOMETHING NEAR ZERO — this is measured, not guessed.  The
-    pass does real async journal/event-buffer I/O either side of the offloaded
-    call, and that I/O yields to the loop on its own: a fully WEDGED scan still
-    measured 2 ticks here, not 0.  A floor of 3 would therefore have sat one
-    tick from vacuous, and the wrong way round — a slower machine makes the
-    pass's own I/O yield MORE, so load would push a wedged loop over a low
-    floor and the guard would go quietly green while the defect was live.
-    Measured endpoints on this tree: 2 ticks inline, 51 offloaded.  Half the
-    theoretical floor (25 for a 250ms stub) sits ~12x above the inline
-    measurement and ~2x below the offloaded one — real margin in BOTH
-    directions, which is what the threshold is for.
+    A count conflates three things: how long the loop was held, how long the
+    whole pass took, and how fine the loop's timer granularity happens to be.
+    Only the first is the defect.  Measured here: the same passing test scored
+    37-89 ticks across ten UNLOADED runs, and dipped under a floor of 30 during
+    a full-suite run on a contended machine (that run took 747s; a quiet one
+    took 244s).  A guard that reds when the machine is busy is worse than no
+    guard, because it teaches its readers to ignore it.
+
+    The gap does not have that problem, because a wedge sets a HARD floor under
+    it: if the blocking call runs on the loop thread, no tick can fire for its
+    whole duration, so the worst gap is at least *blocked_seconds*.  That floor
+    is structural, not statistical.  Offloaded, the worst gap is only a
+    scheduler hiccup.
+
+    BOTH ENDS MEASURED on this tree, with the ceiling at 125ms:
+      - offloaded (passing):  11, 13, 21, 21, 23, 46 ms  -> up to 2.7x below
+      - wedged (hops removed): 258ms for the scan, 517ms for the two probes
+        back to back                                      -> 2.1-4.1x above
+    Neither end is close to the line, and they are separated by an order of
+    magnitude.
     """
-    return int(blocked_seconds / TICK_SECONDS / 2)
+    return blocked_seconds / 2
 
 
 # ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
@@ -229,28 +242,46 @@ def _in_progress_task(task_id: str) -> dict:
 # ── The loop-responsiveness probe ────────────────────────────────────────────
 
 
-async def _ticks_while(coro) -> int:
-    """Await *coro* while a 5ms ticker counts how often the loop got control.
+async def _worst_loop_stall(coro) -> tuple[int, float]:
+    """Await *coro* while a 5ms ticker watches the loop; return (ticks, worst gap).
 
-    Returns the tick count.  Zero means the loop was held by synchronous work
-    for the whole duration — the wedge this task removes.
+    The worst gap is the longest the event loop went without giving the ticker
+    control — see :func:`_max_gap_ceiling` for why that, and not the tick
+    count, is the signal.  The tick count comes back too, purely so a caller
+    can reject a vacuous measurement in which the ticker never ran at all.
+
+    The default thread-pool executor is warmed FIRST, deliberately.  Its
+    cold-start cost lands as a one-off ~100ms stall that has nothing to do with
+    whether the code under test offloads; measuring through it would price a
+    fixed startup into every threshold and eat most of the margin.
     """
+    await asyncio.to_thread(lambda: None)
+
     ticks = 0
+    worst = 0.0
+    last = time.monotonic()
 
     async def _tick() -> None:
-        nonlocal ticks
+        nonlocal ticks, worst, last
         while True:
             await asyncio.sleep(TICK_SECONDS)
+            now = time.monotonic()
+            worst = max(worst, now - last)
+            last = now
             ticks += 1
 
     ticker = asyncio.create_task(_tick())
+    last = time.monotonic()
     try:
         await coro
     finally:
         ticker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await ticker
-    return ticks
+    # A stall still open when the coroutine returned counts too: a wedge that
+    # runs right up to the end would otherwise never be closed by a tick.
+    worst = max(worst, time.monotonic() - last)
+    return ticks, worst
 
 
 # ── Driving the pass ─────────────────────────────────────────────────────────
@@ -365,12 +396,15 @@ class TestArchiveScanLeavesTheLoop:
             cited_tasks=[_in_progress_task('901')],
         )
 
-        ticks = await _ticks_while(run_pass())
+        ticks, worst = await _worst_loop_stall(run_pass())
 
         assert calls, 'the archive scan never ran — the test is not exercising site 1'
-        assert ticks >= _tick_floor(SCAN_BLOCK_SECONDS), (
-            f'event loop got control only {ticks} times while the pass ran; '
-            f'{SCAN_BLOCK_SECONDS}s of archive scan is still inline on the loop'
+        assert ticks, 'the ticker never ran — the measurement is vacuous'
+        assert worst < _max_gap_ceiling(SCAN_BLOCK_SECONDS), (
+            f'the event loop stalled for {worst * 1000:.0f}ms during the pass; '
+            f'{SCAN_BLOCK_SECONDS}s of archive scan is still inline on the loop '
+            f'(a stall at or above {SCAN_BLOCK_SECONDS * 1000:.0f}ms is the scan '
+            f'itself holding the loop thread)'
         )
 
     @pytest.mark.asyncio
@@ -443,12 +477,15 @@ class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
             cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
         )
 
-        ticks = await _ticks_while(run_pass())
+        ticks, worst = await _worst_loop_stall(run_pass())
 
         assert probed, 'the detector was never consulted — site 2 is not exercised'
-        assert ticks >= _tick_floor(PROBE_BLOCK_SECONDS * 2), (
-            f'event loop got control only {ticks} times while the pass ran; '
-            f'the live-workflow git probes are still inline on the loop'
+        assert ticks, 'the ticker never ran — the measurement is vacuous'
+        assert worst < _max_gap_ceiling(PROBE_BLOCK_SECONDS), (
+            f'the event loop stalled for {worst * 1000:.0f}ms during the pass; '
+            f'the live-workflow git probes are still inline on the loop '
+            f'(each probe blocks {PROBE_BLOCK_SECONDS * 1000:.0f}ms, so a stall '
+            f'at or above that is a probe holding the loop thread)'
         )
 
     @pytest.mark.asyncio
