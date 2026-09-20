@@ -18,12 +18,17 @@ precedent; the installer-behaviour half is driven via subprocess with a FAKE
 """
 from __future__ import annotations
 
+import json
 import os
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 from legibility import trickle_state
 
+SCRIPT = (Path(__file__).parent.parent
+          / 'legibility' / 'install-trickle-health-timer.sh')
 TEMPLATES_DIR = Path(__file__).parent.parent
 SERVICE_NAME = 'legibility-trickle-health@.service'
 TIMER_NAME = 'legibility-trickle-health@.timer'
@@ -349,3 +354,308 @@ def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd():
 def test_timer_is_installed_into_timers_target():
     assert _values(_directives(TIMER_NAME), 'Install', 'WantedBy') == [
         'timers.target']
+
+
+# ---------------------------------------------------------------------------
+# Installer behaviour
+# ---------------------------------------------------------------------------
+#
+# Driven via subprocess with a FAKE `systemctl` shimmed onto PATH (records
+# every invocation, minus `--user`, into a shared JSON state file) plus a REAL
+# invocation of `nightly.py resolve-config` -- no mock, because the whole point
+# of the installer delegating to it is that this script never re-implements the
+# project_id -> repo mapping. Real systemd is never touched.
+#
+# Ported from `test_install_trickle_timer.py`, keeping this directory's
+# deliberate copy-not-share convention for the fake-`systemctl` source string:
+# it is copy-pasted across ~11 files by design, so a change to one job's
+# install contract cannot silently re-point another's test. Do NOT extract a
+# shared helper here.
+#
+# `XDG_CONFIG_HOME` is still the right lever for the unit DIRECTORY and is
+# untouched by task 4514's state-path change -- that change scoped only the
+# legibility STATE root, and every sibling installer test honours
+# `XDG_CONFIG_HOME` the same way.
+
+_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
+"""Fake `systemctl` for testing install-trickle-health-timer.sh.
+
+Records every invocation (minus `--user`) into a JSON state file at
+$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
+enabled unit; `list-timers` echoes back one line per *.timer unit enabled so
+far THIS RUN, unless FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating a
+self-verify failure where `enable` nominally succeeded but the unit is
+absent from `list-timers`.
+"""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
+
+
+def _load():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def _save(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def main(argv):
+    args = [a for a in argv[1:] if a != "--user"]
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+
+    state = _load()
+    state.setdefault("calls", []).append(args)
+
+    if verb == "daemon-reload":
+        _save(state)
+        return 0
+
+    if verb == "enable":
+        units = [a for a in rest if not a.startswith("-")]
+        enabled = state.setdefault("enabled_timers", [])
+        for u in units:
+            if u not in enabled:
+                enabled.append(u)
+        _save(state)
+        return 0
+
+    if verb == "list-timers":
+        _save(state)
+        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
+            print("0 timers listed.")
+            return 0
+        enabled = state.get("enabled_timers", [])
+        for unit in enabled:
+            service = unit.replace(".timer", ".service")
+            print(f"Mon 2026-07-14 04:30:00 UTC 8h left n/a n/a {unit} {service}")
+        print(f"{len(enabled)} timers listed.")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+'''
+
+
+def _fake_systemctl(tmp_path):
+    """Write an executable fake `systemctl` into <tmp_path>/bin/systemctl and
+    its backing JSON state file. Returns (bin_dir, state_path)."""
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / 'systemctl'
+    fake.write_text(_FAKE_SYSTEMCTL_SRC)
+    fake.chmod(0o755)
+
+    state_path = tmp_path / 'systemctl_state.json'
+    state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
+    return bin_dir, state_path
+
+
+def _systemctl_calls(tmp_path):
+    state_path = tmp_path / 'systemctl_state.json'
+    if not state_path.is_file():
+        return []
+    return json.loads(state_path.read_text())['calls']
+
+
+def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
+    """Write a minimal valid legibility.yaml for *project_id* under a fresh
+    search root, returning that search root (the PARENT dir
+    resolve_config_path globs one level down from)."""
+    search_root = tmp_path / 'search-root'
+    project_root = search_root / project_id
+    legibility_dir = project_root / 'docs' / 'legibility'
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    config_path = legibility_dir / 'legibility.yaml'
+    config_path.write_text(
+        f'project_id: {project_id}\n'
+        f'project_root: {project_root}\n'
+        f'escalation_port: {escalation_port}\n'
+        f'cwd_prefixes:\n'
+        f' - {project_root}\n',
+        encoding='utf-8',
+    )
+    return search_root
+
+
+def _run_script(tmp_path, project_id, *, env=None):
+    """Run install-trickle-health-timer.sh <project_id> via subprocess.
+
+    Puts a fresh fake `systemctl` on PATH (state reset each call) and defaults
+    INSTALL_TRICKLE_HEALTH_TIMER_PYTHON=sys.executable so the script's
+    `nightly.py resolve-config` delegation runs the REAL resolver directly --
+    no `uv run`/`--frozen` needed in-test. Callers supply XDG_CONFIG_HOME and
+    LEGIBILITY_SEARCH_ROOTS via *env*; any ambient LEGIBILITY_SEARCH_ROOTS is
+    popped so a developer's shell cannot make this resolve the real projects.
+    """
+    bin_dir, state_path = _fake_systemctl(tmp_path)
+
+    full_env = dict(os.environ)
+    full_env['PATH'] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env['FAKE_SYSTEMCTL_STATE'] = str(state_path)
+    full_env['INSTALL_TRICKLE_HEALTH_TIMER_PYTHON'] = sys.executable
+    full_env.pop('LEGIBILITY_SEARCH_ROOTS', None)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ['bash', str(SCRIPT), project_id],
+        env=full_env, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_script_is_executable():
+    assert os.access(SCRIPT, os.X_OK), (
+        f'Expected {SCRIPT} to be executable (os.X_OK); it is not. '
+        f'Run: chmod +x {SCRIPT}'
+    )
+
+
+def test_install_copies_templates_and_enables_timer(tmp_path):
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+    xdg_config = tmp_path / 'xdg-config'
+
+    result = _run_script(
+        tmp_path, 'proj_a',
+        env={'XDG_CONFIG_HOME': str(xdg_config),
+             'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
+    )
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+
+    unit_dir = xdg_config / 'systemd' / 'user'
+    service_path = unit_dir / SERVICE_NAME
+    timer_path = unit_dir / TIMER_NAME
+    assert service_path.is_file(), f'Expected {service_path} after install'
+    assert timer_path.is_file(), f'Expected {timer_path} after install'
+    # BYTE-identical, not merely similar: systemd expands %i itself, so the
+    # templates are copied verbatim and never per-project edited. A copy that
+    # diverged would mean the committed file is no longer what runs.
+    assert service_path.read_bytes() == SERVICE.read_bytes()
+    assert timer_path.read_bytes() == TIMER.read_bytes()
+
+    calls = _systemctl_calls(tmp_path)
+    assert ['daemon-reload'] in calls, f'calls={calls!r}'
+    assert ['enable', '--now', 'legibility-trickle-health@proj_a.timer'] in calls, (
+        f'calls={calls!r}'
+    )
+    assert any(c[0] == 'list-timers' for c in calls), f'calls={calls!r}'
+
+
+def test_install_is_idempotent(tmp_path):
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+    xdg_config = tmp_path / 'xdg-config'
+    env = {'XDG_CONFIG_HOME': str(xdg_config),
+           'LEGIBILITY_SEARCH_ROOTS': str(search_root)}
+
+    result_1 = _run_script(tmp_path, 'proj_a', env=env)
+    assert result_1.returncode == 0, (
+        f'stdout={result_1.stdout!r} stderr={result_1.stderr!r}'
+    )
+
+    result_2 = _run_script(tmp_path, 'proj_a', env=env)
+    assert result_2.returncode == 0, (
+        f'Expected re-running the install to still exit 0; '
+        f'stdout={result_2.stdout!r} stderr={result_2.stderr!r}'
+    )
+
+
+def test_install_fails_when_self_verify_omits_timer(tmp_path):
+    """The guard that stops `enable --now` nominally succeeding while nothing
+    observable is installed.
+
+    That gap is exactly how a probe ends up shipped-but-unbound, which IS
+    GAP 2. An installer that reports success without confirming the timer is
+    in `list-timers` would let this whole task's fix be silently absent on the
+    host it was deployed to.
+    """
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+    xdg_config = tmp_path / 'xdg-config'
+
+    result = _run_script(
+        tmp_path, 'proj_a',
+        env={
+            'XDG_CONFIG_HOME': str(xdg_config),
+            'LEGIBILITY_SEARCH_ROOTS': str(search_root),
+            'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
+        },
+    )
+
+    assert result.returncode != 0, (
+        f'Expected a non-zero exit when list-timers omits the enabled timer '
+        f'(self-verify failure); stdout={result.stdout!r} '
+        f'stderr={result.stderr!r}'
+    )
+
+
+def test_install_fails_when_project_config_unresolvable(tmp_path):
+    """Config resolution happens FIRST, so an unresolvable project_id costs
+    nothing: no systemctl invocation and no unit file left behind to be
+    enabled by a later unrelated `daemon-reload`."""
+    xdg_config = tmp_path / 'xdg-config'
+    empty_search_root = tmp_path / 'empty-search-root'
+    empty_search_root.mkdir()
+
+    result = _run_script(
+        tmp_path, 'no_such_project',
+        env={'XDG_CONFIG_HOME': str(xdg_config),
+             'LEGIBILITY_SEARCH_ROOTS': str(empty_search_root)},
+    )
+
+    assert result.returncode != 0, (
+        f'Expected a non-zero exit for an unresolvable project_id; '
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert _systemctl_calls(tmp_path) == [], (
+        f'Expected NO systemctl invocation when config resolution fails '
+        f'first; calls={_systemctl_calls(tmp_path)!r}'
+    )
+    assert not (xdg_config / 'systemd' / 'user' / SERVICE_NAME).exists(), (
+        'Expected no unit file to be installed when config resolution fails'
+    )
+
+
+def test_installer_does_not_touch_the_trickle_units(tmp_path):
+    """This installer must never disturb the LIVE nightly timer.
+
+    The two jobs are siblings by design and their unit names differ by one
+    word, so a copy-paste slip in the installer would plausibly re-copy or
+    re-enable `legibility-trickle@.*` — and on the real host that unit is the
+    thing actually producing the digests. Installing the health probe must be
+    a strictly additive operation.
+    """
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+    xdg_config = tmp_path / 'xdg-config'
+
+    result = _run_script(
+        tmp_path, 'proj_a',
+        env={'XDG_CONFIG_HOME': str(xdg_config),
+             'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
+    )
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+
+    unit_dir = xdg_config / 'systemd' / 'user'
+    strays = sorted(p.name for p in unit_dir.glob('legibility-trickle@.*'))
+    assert strays == [], (
+        f'the health installer wrote the nightly trickle\'s units: {strays!r}'
+    )
+    touched = [
+        c for c in _systemctl_calls(tmp_path)
+        if any(TRICKLE_TIMER_NAME.replace('@.', '@') in a for a in c)
+    ]
+    assert touched == [], (
+        f'the health installer invoked systemctl on the nightly trickle timer: '
+        f'{touched!r}'
+    )
