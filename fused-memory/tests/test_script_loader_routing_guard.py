@@ -123,7 +123,28 @@ def _discovered_modules():
 
 
 def _module_key(path):
-    """*path* as the guard names it: relative to the tests root, POSIX-spelled."""
+    """*path* as the guard names it: relative to the tests root, POSIX-spelled.
+
+    Takes a ``pathlib.Path`` under ``TESTS_ROOT`` — the shape
+    ``_discovered_modules()`` yields — and refuses anything else rather than
+    coercing it, because a bare relative path's root is ambiguous and the
+    candidates disagree: the sighting's ``'tests/_scratch_guard_probe.py'``
+    names the right file against the ``fused-memory/`` cwd, names nothing
+    against the repo root, and under a ``TESTS_ROOT / path`` rule would resolve
+    to ``…/tests/tests/_scratch_guard_probe.py``. Any coercion rule picks one
+    of those and is wrong for the other two, trading a loud refusal for a
+    silently wrong key — and this key is what ``EXEMPT_CALL_SITES`` lookups and
+    parametrize ids are keyed on.
+    """
+    if not path.is_relative_to(TESTS_ROOT):
+        raise ValueError(
+            f'{str(path)!r} is not under the tests root {TESTS_ROOT}. _module_key names '
+            f'a module by its path relative to that root, so it takes the absolute path '
+            f"_discovered_modules() yields — build an ad-hoc one as TESTS_ROOT / 'sub/test_x.py'. "
+            f'A bare relative path is rejected rather than resolved because its root is '
+            f'ambiguous: the cwd, the fused-memory package root and the tests root each name '
+            f'a different file.'
+        )
     return path.relative_to(TESTS_ROOT).as_posix()
 
 
