@@ -326,7 +326,7 @@ async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
 @pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
-    db = journal._require_db()
+    db = journal._require_access().connection
     async with db.execute('PRAGMA table_info(runs)') as cursor:
         rows = await cursor.fetchall()
     colnames = {row['name'] for row in rows}
