@@ -8,6 +8,7 @@ fan-out path runs underneath and no private name is reached into.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -503,3 +504,258 @@ class TestAcquireSnapshotHappyPath:
             f'{snapshot.census.reason!r}'
         )
         assert snapshot.rows.state is DatumState.FRESH
+
+
+# ---------------------------------------------------------------------------
+# TestSnapshotDegradation — last-good, stale, unknown (step-5, sketch #13)
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotDegradation:
+    """A failed refresh serves the PREVIOUS value, aged and explained.
+
+    The fabricated zero is the failure this envelope exists to remove, so the
+    three outcomes are kept distinct at every step: a value measured now
+    (``fresh``), a value measured earlier and known to be old (``stale``), and
+    no value at all (``unknown``). None of them is ever a zero.
+    """
+
+    @staticmethod
+    async def _acquire(canned, client, config, root, *, now):
+        from dashboard.data.task_snapshot import acquire_snapshot
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return await acquire_snapshot(client, config, root, now=now)
+
+    @staticmethod
+    def _expire_unit(monkeypatch):
+        """Retire the cached unit without touching the last-good store."""
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+
+    async def test_a_cold_failure_is_unknown_and_never_a_zero_census(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """(a) Nothing was ever measured, so nothing is reported as measured."""
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        canned.fail_when = lambda call: True
+
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config,
+                                       project_root, now=NOW)
+
+        for half in (snapshot.census, snapshot.rows):
+            assert half.state is DatumState.UNKNOWN
+            assert half.value is None and half.as_of is None
+            assert (half.reason or '').strip(), 'an unknown datum must say why'
+        assert snapshot.skew_seconds is None
+        assert snapshot.in_progress_live is None
+        assert snapshot.in_progress_stranded is None
+
+    async def test_a_failed_map_serves_the_previous_census_as_stale(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """(b) The badge ages, the rows do not, and the reason is verbatim."""
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        good = await self._acquire(canned, dummy_client, dashboard_config,
+                                   project_root, now=NOW)
+
+        self._expire_unit(monkeypatch)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        later = NOW + timedelta(seconds=20)
+        degraded = await self._acquire(canned, dummy_client, dashboard_config,
+                                       project_root, now=later)
+
+        assert degraded.census.state is DatumState.STALE
+        assert degraded.census.value == good.census.value, 'the PREVIOUS census'
+        assert degraded.census.as_of == NOW, (
+            'a stale datum keeps the instant it was measured, so its badge ages'
+        )
+        assert 'ReadTimeout' in (degraded.census.reason or ''), (
+            'the fan-out\'s own marker text must cross verbatim, not a reworded '
+            f'copy: {degraded.census.reason!r}'
+        )
+        assert degraded.rows.state is DatumState.FRESH
+        assert degraded.rows.as_of == later
+        assert degraded.skew_seconds == 20, 'the real gap, now that there is one'
+
+    async def test_recovery_returns_the_census_to_fresh(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """(c) A stale badge is not a latch."""
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        await self._acquire(canned, dummy_client, dashboard_config,
+                            project_root, now=NOW)
+
+        self._expire_unit(monkeypatch)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        await self._acquire(canned, dummy_client, dashboard_config,
+                            project_root, now=NOW + timedelta(seconds=20))
+
+        canned.fail_when = lambda call: False
+        recovered_at = NOW + timedelta(seconds=40)
+        recovered = await self._acquire(canned, dummy_client, dashboard_config,
+                                        project_root, now=recovered_at)
+
+        assert recovered.census.state is DatumState.FRESH
+        assert recovered.census.as_of == recovered_at
+        assert recovered.census.reason is None
+        assert recovered.skew_seconds == 0
+
+    async def test_failed_rows_keep_their_split_judged_at_their_own_instant(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """(d) The mirror case — and the split ages with the rows, not the clock.
+
+        A heartbeat beating at the instant the rows were measured was LIVE at
+        that instant. Re-judging it against a later clock would manufacture a
+        strand that never happened; the rows' own ``as_of`` is what discloses
+        how old the claim is.
+        """
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree(
+            pairs=((1, 'in-progress'), (6, 'pending')),
+            overrides={1: {'claimant_run_id': 'run-1/sess-1/pid=42',
+                           'heartbeat_at': NOW.isoformat()}},
+        )
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        good = await self._acquire(canned, dummy_client, dashboard_config,
+                                   project_root, now=NOW)
+        assert (good.in_progress_live, good.in_progress_stranded) == (1, 0)
+
+        self._expire_unit(monkeypatch)
+        canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+        much_later = NOW + timedelta(hours=1)
+        degraded = await self._acquire(canned, dummy_client, dashboard_config,
+                                       project_root, now=much_later)
+
+        assert degraded.rows.state is DatumState.STALE
+        assert degraded.rows.value == good.rows.value
+        assert degraded.rows.as_of == NOW
+        assert degraded.census.state is DatumState.FRESH
+        assert (degraded.in_progress_live, degraded.in_progress_stranded) == (1, 0), (
+            'the split reports what the stale rows measured, never a zero and '
+            'never a strand invented by the passage of time'
+        )
+
+    async def test_the_last_good_store_does_not_rescue_another_root(
+        self, project_root, dashboard_config, dummy_client, tmp_path
+    ):
+        """(e) Both halves fail with no prior value FOR THIS ROOT."""
+        from dashboard.config import DashboardConfig
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        await self._acquire(canned, dummy_client, dashboard_config,
+                            project_root, now=NOW)
+
+        other = tmp_path / 'other-project'
+        other.mkdir(parents=True, exist_ok=True)
+        canned.fail_when = lambda call: call['args'].get('project_root') == str(other)
+        starved = await self._acquire(
+            canned, dummy_client, DashboardConfig(project_root=other), other, now=NOW,
+        )
+
+        for half in (starved.census, starved.rows):
+            assert half.state is DatumState.UNKNOWN, (
+                "one root's last good must never be served for another"
+            )
+            assert (half.reason or '').strip()
+
+    async def test_a_last_good_past_retention_degrades_to_unknown(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """(f) Staleness is bounded: past the bound it is no longer evidence."""
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import _RETENTION_BOUND_SECONDS
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        await self._acquire(canned, dummy_client, dashboard_config,
+                            project_root, now=NOW)
+
+        self._expire_unit(monkeypatch)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        past_retention = NOW + timedelta(seconds=_RETENTION_BOUND_SECONDS + 1)
+        expired = await self._acquire(canned, dummy_client, dashboard_config,
+                                      project_root, now=past_retention)
+
+        assert expired.census.state is DatumState.UNKNOWN
+        assert expired.census.value is None and expired.census.as_of is None
+        assert str(_RETENTION_BOUND_SECONDS) in (expired.census.reason or ''), (
+            'the reason must name the bound that disqualified the last good: '
+            f'{expired.census.reason!r}'
+        )
+
+    async def test_a_budget_expiry_and_a_read_failure_are_different_kinds(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """(g) Structured, so the banner routing never parses a message.
+
+        Offline means a read demonstrably failed; degraded means this process
+        ran out of budget and the server may be perfectly healthy. Rendering
+        them identically is what made the 2026-07-30 event get misdiagnosed.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotFailure
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+        unreachable = await self._acquire(canned, dummy_client, dashboard_config,
+                                          project_root, now=NOW)
+
+        assert unreachable.failure is SnapshotFailure.UNREACHABLE
+        assert unreachable.rows.state is not DatumState.FRESH
+
+        snapshot_mod._snapshot_cache_clear()
+        monkeypatch.setattr(snapshot_mod, 'PER_CALL_TIMEOUT', 0.01)
+        slow = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+
+        async def _slow_rows(client, url, tool, args, **kwargs):
+            if tool == 'get_tasks':
+                await asyncio.sleep(0.5)
+            return await slow(client, url, tool, args, **kwargs)
+
+        starved = await self._acquire(_slow_rows, dummy_client, dashboard_config,
+                                      project_root, now=NOW)
+
+        assert starved.failure is SnapshotFailure.BUDGET
+        assert starved.rows.state is not DatumState.FRESH
+        assert starved.failure is not unreachable.failure
+
+    async def test_a_failed_unit_is_itself_held_for_the_ttl(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """(h) Retry suppression, replacing the negative cache this path lost.
+
+        A wedged root costs one attempt per TTL rather than one per 3 s poll.
+        The price is up to a TTL of recovery latency, which is deliberate.
+        """
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        canned.fail_when = lambda call: True
+
+        first = await self._acquire(canned, dummy_client, dashboard_config,
+                                    project_root, now=NOW)
+        attempts = len(canned.calls)
+        second = await self._acquire(canned, dummy_client, dashboard_config,
+                                     project_root, now=NOW + timedelta(seconds=1))
+
+        assert second is first
+        assert len(canned.calls) == attempts, (
+            f'a failed unit must be held for the TTL, got '
+            f'{canned.calls[attempts:]}'
+        )
