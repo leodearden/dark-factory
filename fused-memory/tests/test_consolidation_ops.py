@@ -22,7 +22,7 @@ fake cannot re-cross what the real backends keep apart:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -617,3 +617,65 @@ class TestLiveRead:
 
         assert allowed['status'] == 'consolidated'
         assert 'error_type' not in allowed
+
+
+class TestTheMintBypassesTheToolLevelGuards:
+    """The canonical is written through `MemoryService.add_memory`, which
+    never meets the near-duplicate and topic-cluster guards — those are
+    reached only from the `add_memory` TOOL body.
+
+    That bypass is correct BY CONSTRUCTION: a canonical is near its peers
+    by definition, being the claim they all make, and a topic under
+    consolidation is exactly the "known-contradictory cluster" shape the
+    topic guard bounces. Routing the mint through the tool would make the
+    ratified index canonical unwritable.
+
+    The pin is what stops a later edit quietly reintroducing the tool path
+    and bouncing canonicals with
+    `ProceduralKnowledgeKnownTopicClusterWriteRejected`. The load-bearing
+    assertion is the call path — one await on the service method, with the
+    content asked for — and the three patches state the claim the path
+    implies.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_write_guard_is_consulted_for_the_canonical(self):
+        svc = make_service()
+        near_duplicate_of_its_peers = f'record {M1}'
+        guards = 'fused_memory.server.near_duplicate_guard'
+
+        with (
+            patch(f'{guards}.resolve_near_dup_guard_enabled') as enabled,
+            patch(f'{guards}.find_near_duplicate_memory') as near_dup,
+            patch(f'{guards}.find_matching_topic_cluster') as cluster,
+        ):
+            await call_execute(
+                svc,
+                canonical_content=near_duplicate_of_its_peers,
+                category='procedural_knowledge',
+            )
+
+        enabled.assert_not_called()
+        near_dup.assert_not_called()
+        cluster.assert_not_called()
+        svc.add_memory.assert_awaited_once()
+        assert (
+            svc.add_memory.await_args.kwargs['content']
+            == near_duplicate_of_its_peers
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_mint_asks_for_no_near_duplicate_override(self):
+        """`metadata={'allow_near_duplicate': True}` is the escape hatch a
+        caller of the TOOL uses. This arm does not need one and must not
+        learn to set one: an override travels into the record's durable
+        metadata, and it would start claiming that a guard which never ran
+        was deliberately waived."""
+        svc = make_service()
+
+        await call_execute(svc)
+
+        assert 'allow_near_duplicate' not in svc.add_memory.await_args.kwargs
+        assert 'allow_near_duplicate' not in (
+            svc.add_memory.await_args.kwargs['metadata'] or {}
+        )
