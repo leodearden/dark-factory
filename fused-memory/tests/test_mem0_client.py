@@ -82,6 +82,42 @@ class TestMem0BackendSearch:
             f'Expected filters={expected!r}, got {call_kwargs.get("filters")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """On TimeoutError the exception propagates — it is NOT swallowed into {}.
+
+        INV-11 `no-silent-fail-soft`: a log is not a return value.  Swallowing
+        the timeout made `{}` reach `MemoryService._search_mem0`, which reads
+        `response.get('results', [])` -> `[]`, so `search`'s per-task
+        `except Exception` never ran and the `search` MCP response was a bare
+        `{'results': []}` — byte-identical to a genuinely empty store.
+
+        The message must NAME the read timeout: `asyncio.wait_for`'s own
+        `TimeoutError` stringifies EMPTY, so a bare re-raise would land
+        `'error': ''` in `_store_failure_diagnostics` — propagating the fault
+        while discarding the one detail that makes it attributable.
+
+        Same propagate-don't-swallow shape as the deterministic Qdrant reads
+        (`scroll_by_metadata` / `count_by_metadata` / `get_point_by_id`).
+        """
+        mock_instance = MagicMock()
+        mock_instance.search = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
+            pytest.raises(TimeoutError) as excinfo,
+        ):
+            await backend.search(query='q', scope=Scope(project_id='p'), limit=5)
+
+        assert 'timed out' in str(excinfo.value), (
+            f'raised TimeoutError must name the read timeout so the text survives into '
+            f"_store_failure_diagnostics['error']; got {str(excinfo.value)!r}"
+        )
+        assert str(backend._read_timeout) in str(excinfo.value), (
+            f'raised TimeoutError must carry the configured read timeout '
+            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
+        )
+
 
 class TestMem0BackendScrollByMetadata:
     """scroll_by_metadata builds a Qdrant payload filter and returns normalised point dicts."""
