@@ -563,6 +563,7 @@ class TestRecordRun:
         assert doc['commit_made'] is True
         assert doc['budget_suppressed'] is False
         assert doc['consecutive_barren_runs'] == 0
+        assert doc['consecutive_failed_runs'] == 0
         assert doc['counters'] == {
             'total_records': 6,
             'zero_signal_dropped': 4,
@@ -676,3 +677,131 @@ class TestRecordRun:
         _record('dark_factory', day=2, budget_skipped=4)
         other = _record('reify', day=2, budget_skipped=4)
         assert other['consecutive_barren_runs'] == 1
+
+
+class TestRecordRunFailedStreak:
+    """The parallel ``failed`` streak, and what a failed run must NOT do to
+    the barren one."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_failed_run_records_the_real_counters(self):
+        """Nothing is hidden by classifying ``failed``: the counters still
+        say signal reached the digest stage, which is the question they
+        answer."""
+        doc = _record(day=1, exit_code=1, selected_count=6)
+
+        assert doc['outcome'] == OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] == 6
+
+    def test_a_failed_run_never_restamps_last_productive_at(self):
+        """The "forever green" scenario, at the writer. An operator reading
+        ``last_productive_at`` must see the last night that actually did
+        something, not the last night that merely started."""
+        prod = _record(day=1, selected_count=2)
+        stamp = prod['last_productive_at']
+        assert stamp == prod['recorded_at']
+
+        assert _record(day=2, exit_code=1, selected_count=6)[
+            'last_productive_at'] == stamp
+        assert _record(day=3, exit_code=1, selected_count=6)[
+            'last_productive_at'] == stamp
+
+    def test_last_productive_at_stays_none_when_the_first_run_fails(self):
+        doc = _record(day=1, exit_code=1, selected_count=6)
+        assert doc['last_productive_at'] is None
+        assert _record(day=2, exit_code=1, selected_count=6)[
+            'last_productive_at'] is None
+
+    def test_failed_streak_increments(self):
+        assert _record(day=1, exit_code=1)['consecutive_failed_runs'] == 1
+        assert _record(day=2, exit_code=2)['consecutive_failed_runs'] == 2
+        assert _record(day=3, exit_code=137)['consecutive_failed_runs'] == 3
+
+    @pytest.mark.parametrize('resetter', [
+        pytest.param(dict(selected_count=1), id='productive'),
+        pytest.param(dict(zero_signal_dropped=5), id='quiet'),
+        pytest.param(dict(budget_skipped=4), id='barren'),
+    ])
+    def test_any_completed_run_resets_the_failed_streak(self, resetter):
+        _record(day=1, exit_code=1)
+        _record(day=2, exit_code=1)
+
+        doc = _record(day=3, **resetter)
+        assert doc['outcome'] != OUTCOME_FAILED
+        assert doc['consecutive_failed_runs'] == 0
+
+    def test_failed_streak_rearms_after_a_reset(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+        assert _record(day=3, exit_code=1)['consecutive_failed_runs'] == 1
+
+    def test_a_failed_run_carries_the_barren_streak_forward(self):
+        """CARRY FORWARD, never reset and never increment. A run that
+        crashed is no evidence that signal started flowing again, so it
+        must not erase a real barren streak; and its counters describe an
+        unfinished night, so it must not attribute an absence the sampler
+        never observed either."""
+        assert _record(day=1, budget_skipped=4)['consecutive_barren_runs'] == 1
+        assert _record(day=2, budget_skipped=4)['consecutive_barren_runs'] == 2
+
+        crashed = _record(day=3, exit_code=1, selected_count=6)
+        assert crashed['outcome'] == OUTCOME_FAILED
+        assert crashed['consecutive_barren_runs'] == 2, (
+            'a crashed run is evidence about the RUN, not about whether '
+            'signal is flowing'
+        )
+
+        assert _record(day=4, budget_skipped=4)['consecutive_barren_runs'] == 3
+
+    def test_a_document_without_the_new_field_still_reads_ok(self, caplog):
+        """Backward compatibility with a pre-change document, which is what
+        every live state file is on the first post-deploy run. Mirrors the
+        existing degrade-to-under-reporting posture."""
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
+            'project_id': 'dark_factory',
+            'outcome': OUTCOME_PRODUCTIVE,
+            'consecutive_barren_runs': 0,
+            'last_productive_at': '2026-07-01T03:00:00+00:00',
+        }))
+
+        with caplog.at_level('WARNING'):
+            status, _ = trickle_state.load_state(path)
+            doc = _record(day=2, exit_code=1, selected_count=6)
+
+        assert status == 'ok', 'a missing additive field is not malformed'
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert doc['consecutive_failed_runs'] == 1
+
+    def test_schema_version_is_not_bumped_for_an_additive_field(self):
+        """Pins the no-bump decision so a later tidy-up bump has to argue
+        with a test. Bumping would make every live state file read
+        ``malformed`` on the first post-deploy probe — one guaranteed false
+        alarm per project, plus a reset streak — which is the degradation
+        this module exists to close."""
+        assert trickle_state.STATE_SCHEMA_VERSION == 1
+
+    def test_a_failed_document_round_trips_through_load_state(self):
+        doc = _record(day=1, exit_code=1, selected_count=6)
+        status, loaded = trickle_state.load_state(
+            trickle_state.trickle_state_path('dark_factory')
+        )
+        assert (status, loaded) == ('ok', doc)
+
+    def test_failed_threshold_is_tighter_than_the_barren_one(self):
+        """ONE failed night is already owned twice over — by the nightly's
+        own per-run escalation and by ``check_trickle_liveness.sh``'s
+        ``Result != success`` gate — so firing at 1 would only duplicate
+        them. TWO consecutive is the PERSISTENT shape neither per-run
+        signal can express."""
+        assert trickle_state.DEFAULT_MAX_FAILED_RUNS == 2
+        assert (
+            trickle_state.DEFAULT_MAX_FAILED_RUNS
+            < trickle_state.DEFAULT_MAX_BARREN_RUNS
+        )
