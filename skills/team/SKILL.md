@@ -85,7 +85,7 @@ The axes are orthogonal — don't couple them reflexively ("opus so high, sonnet
 
 1. the goal in one sentence, and why it matters to the whole (so the seat can tell a blocker from a detail);
 2. exact inputs — paths, symbols, commands, prior seats' outputs — never "the module we discussed";
-3. the deliverable's exact shape — and, for any derived, normalised or aggregated figure in it, the rule that figure was computed under: what was counted, what was excluded, over what population, per figure rather than once for the seat;
+3. the deliverable's exact shape — including, for each derived, normalised or aggregated figure in it, a field carrying the rule that figure was computed under: what was counted, what was excluded, over what population, one such field per figure rather than one for the seat;
 4. boundaries: what not to touch, and an instruction to report an under-specified brief or a blocker precisely and stop rather than guess or widen scope;
 5. the verification the seat must run before returning;
 6. cross-file references as `path/to/module.py::symbol`.
