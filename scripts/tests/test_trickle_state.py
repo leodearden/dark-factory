@@ -35,6 +35,7 @@ import pytest
 from legibility import trickle_state
 from legibility.trickle_state import (
     OUTCOME_BARREN,
+    OUTCOME_FAILED,
     OUTCOME_PRODUCTIVE,
     OUTCOME_QUIET,
     classify_run,
@@ -68,34 +69,43 @@ def _counters(
     )
 
 
+def _classify(exit_code=0, **counters):
+    """Call classify_run with a derived-total counter set and an explicit
+    exit code.
+
+    ``exit_code`` is a REQUIRED keyword-only parameter of ``classify_run``
+    (task 4514), so every call site must state it. It lives here rather
+    than in ``_counters`` because it is not a counter and must not be
+    folded into the conservation identity that helper exists to satisfy."""
+    return classify_run(exit_code=exit_code, **_counters(**counters))
+
+
 class TestClassifyRun:
     """The three-valued absence classifier."""
 
     def test_selected_is_productive(self):
-        assert classify_run(**_counters(selected_count=3)) == OUTCOME_PRODUCTIVE
+        assert _classify(selected_count=3) == OUTCOME_PRODUCTIVE
 
     def test_partially_truncated_night_is_still_productive(self):
         """A night that digested SOMETHING and skipped the rest on budget is
         the byte budget working as designed — never barren."""
-        result = classify_run(**_counters(selected_count=2, budget_skipped=9))
+        result = _classify(selected_count=2, budget_skipped=9)
         assert result == OUTCOME_PRODUCTIVE
 
     def test_selected_with_every_other_door_open_is_productive(self):
-        result = classify_run(
-            **_counters(
-                selected_count=1,
-                budget_skipped=4,
-                below_sampling_cut=7,
-                dedupe_collapsed=2,
-                zero_signal_dropped=5,
-            )
+        result = _classify(
+            selected_count=1,
+            budget_skipped=4,
+            below_sampling_cut=7,
+            dedupe_collapsed=2,
+            zero_signal_dropped=5,
         )
         assert result == OUTCOME_PRODUCTIVE
 
     def test_budget_door_is_barren(self):
         """Reproduction of the real 2026-07-16..29 incident: candidates
         existed, competed, and were ALL discarded on the byte budget."""
-        result = classify_run(**_counters(selected_count=0, budget_skipped=4))
+        result = _classify(selected_count=0, budget_skipped=4)
         assert result == OUTCOME_BARREN
 
     def test_sampling_cut_door_is_barren(self):
@@ -103,35 +113,37 @@ class TestClassifyRun:
         signal held back by the sampling cut, nothing digested. Different
         remedy (sampling.top_fraction/per_stratum_min, never
         budgets.max_daily_digest_bytes) — see SampleResult's docstring."""
-        result = classify_run(
-            **_counters(selected_count=0, below_sampling_cut=3, budget_skipped=0)
+        result = _classify(
+            selected_count=0, below_sampling_cut=3, budget_skipped=0
         )
         assert result == OUTCOME_BARREN
 
     def test_both_doors_open_is_barren(self):
-        result = classify_run(
-            **_counters(selected_count=0, below_sampling_cut=3, budget_skipped=4)
+        result = _classify(
+            selected_count=0, below_sampling_cut=3, budget_skipped=4
         )
         assert result == OUTCOME_BARREN
 
     def test_dormant_project_is_quiet(self):
         """All counters zero — nothing was even enumerated. A dormant
         project is a legitimate state, not a degradation."""
-        assert classify_run(**_counters()) == OUTCOME_QUIET
+        assert _classify() == OUTCOME_QUIET
 
     def test_all_zero_signal_is_quiet(self):
-        result = classify_run(**_counters(zero_signal_dropped=17))
+        result = _classify(zero_signal_dropped=17)
         assert result == OUTCOME_QUIET
 
     def test_zero_signal_plus_dedupe_only_is_quiet(self):
-        result = classify_run(
-            **_counters(zero_signal_dropped=6, dedupe_collapsed=3)
+        result = _classify(
+            zero_signal_dropped=6, dedupe_collapsed=3
         )
         assert result == OUTCOME_QUIET
 
     def test_outcome_constants_are_distinct_strings(self):
-        outcomes = {OUTCOME_PRODUCTIVE, OUTCOME_QUIET, OUTCOME_BARREN}
-        assert len(outcomes) == 3
+        outcomes = {
+            OUTCOME_PRODUCTIVE, OUTCOME_QUIET, OUTCOME_BARREN, OUTCOME_FAILED,
+        }
+        assert len(outcomes) == 4
         assert all(isinstance(o, str) and o for o in outcomes)
 
 
@@ -151,14 +163,13 @@ class TestQuietNightNeverBarren:
     ):
         """With BOTH cut counters at 0 and nothing selected, no combination
         of zero-signal/dedupe volume may ever classify barren."""
-        result = classify_run(
-            **_counters(
-                zero_signal_dropped=zero_signal_dropped,
-                dedupe_collapsed=dedupe_collapsed,
-                below_sampling_cut=0,
-                budget_skipped=0,
-                selected_count=0,
-            )
+        result = _classify(
+            exit_code=0,
+            zero_signal_dropped=zero_signal_dropped,
+            dedupe_collapsed=dedupe_collapsed,
+            below_sampling_cut=0,
+            budget_skipped=0,
+            selected_count=0,
         )
         assert result == OUTCOME_QUIET, (
             f"zero_signal_dropped={zero_signal_dropped} "
@@ -168,6 +179,73 @@ class TestQuietNightNeverBarren:
             f"protects and must never alarm."
         )
 
+
+class TestFailedOutcome:
+    """The fourth outcome and its PRIORITY over the other three.
+
+    A run that did not complete cannot be described by the sampler
+    counters: ``selected_count > 0`` proves signal reached the digest
+    stage, never that the night FINISHED. So ``exit_code != 0`` is read
+    first and wins outright.
+    """
+
+    def test_failed_constant_is_the_expected_string(self):
+        assert OUTCOME_FAILED == 'failed'
+
+    def test_failure_beats_productive(self):
+        """THE regression this task exists for. The 2026-08-18 reify run
+        selected six digests, exited 1, applied 0 and made no commit — and
+        recorded ``productive``. Generalised: a permanently broken coder
+        samples > 0, storms, exits 1, and records ``productive`` / streak
+        0 / a fresh ``last_productive_at`` every night forever."""
+        assert _classify(exit_code=1, selected_count=6) == OUTCOME_FAILED
+
+    def test_failure_beats_barren_at_the_budget_door(self):
+        assert _classify(exit_code=1, budget_skipped=4) == OUTCOME_FAILED
+
+    def test_failure_beats_barren_at_the_sampling_cut(self):
+        assert _classify(exit_code=1, below_sampling_cut=3) == OUTCOME_FAILED
+
+    def test_failure_beats_quiet(self):
+        assert _classify(exit_code=1) == OUTCOME_FAILED
+        assert _classify(exit_code=1, zero_signal_dropped=17) == OUTCOME_FAILED
+
+    @pytest.mark.parametrize('exit_code', [1, 2, 127, 137, -1])
+    def test_any_non_zero_code_is_failed(self, exit_code):
+        """Not just 1. 127 is a missing interpreter, 137 a SIGKILL/OOM, and
+        a negative code is how ``subprocess`` reports a signal — every one
+        of them is a night that did not finish."""
+        assert _classify(exit_code=exit_code, selected_count=6) == OUTCOME_FAILED
+
+    def test_a_clean_exit_still_classifies_by_the_counters(self):
+        """The no-false-alarm guarantee is unweakened BY CONSTRUCTION: the
+        new branch is gated purely on ``exit_code != 0``, so an
+        ``exit_code == 0`` night falls through to exactly the branches
+        that classified it before."""
+        assert _classify(exit_code=0) == OUTCOME_QUIET
+        assert _classify(exit_code=0, selected_count=3) == OUTCOME_PRODUCTIVE
+        assert _classify(exit_code=0, budget_skipped=4) == OUTCOME_BARREN
+
+    @pytest.mark.parametrize('zero_signal_dropped', range(0, 6))
+    @pytest.mark.parametrize('dedupe_collapsed', range(0, 6))
+    def test_a_quiet_night_that_exited_zero_is_still_never_barren(
+        self, zero_signal_dropped, dedupe_collapsed
+    ):
+        """``TestQuietNightNeverBarren``'s 36-case property RE-STATED with
+        an explicit ``exit_code=0`` rather than replaced, so PRD decision
+        7's guarantee stays MEASURED across the contract change. The proof
+        it rests on is ``trickle_state.py::classify_run``'s "WHY BRANCH 3
+        IS PROVABLY SAFE" derivation from the conservation identity — not
+        restated here."""
+        result = _classify(
+            exit_code=0,
+            zero_signal_dropped=zero_signal_dropped,
+            dedupe_collapsed=dedupe_collapsed,
+            below_sampling_cut=0,
+            budget_skipped=0,
+            selected_count=0,
+        )
+        assert result == OUTCOME_QUIET
 
 class TestTrickleStatePath:
     """Where the state file lives — and, just as load-bearing, WHY it is
