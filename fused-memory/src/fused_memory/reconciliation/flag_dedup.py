@@ -3029,7 +3029,7 @@ async def filter_terminal_metadata_flags(
     if not check_positions:
         return list(flags)
 
-    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
     # this filter classifies a lookup by whether a task body came back.
     lookup_results: list[Any] = await asyncio.gather(
         *[
@@ -3310,7 +3310,7 @@ async def filter_false_absence_flags(
     async def _safe_get_task_for_root(task_id: Any) -> Any:
         """Fetch task with normalised exception handling, for THIS filter's root.
 
-        Delegates to the module-level :func:`_safe_get_task`, binding the
+        Delegates to the module-level :func:`safe_get_task`, binding the
         single fixed *project_root* this filter was called with (that binding
         is the only reason it remains a closure — task 4381 amendment
         superseded the former "keep the two in sync" NOTE by extracting the
@@ -3318,7 +3318,7 @@ async def filter_false_absence_flags(
         ``confirm_task_absent`` classifies can no longer drift between call
         sites).
         """
-        return await _safe_get_task(taskmaster, task_id, project_root)
+        return await safe_get_task(taskmaster, task_id, project_root)
 
     # Split flags into those requiring a get_task lookup and pass-throughs.
     # Track original position so the output list preserves input order.
@@ -3550,7 +3550,7 @@ _ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
-async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
+async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
     """Fetch ONE task with normalised exception handling.
 
     Returns the raw ``taskmaster.get_task`` result on success, or a normalised
@@ -3579,6 +3579,16 @@ async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> An
     now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
     which binds one fixed ``project_root`` for a whole filter and delegates
     here so the normalised shape cannot drift.
+
+    PUBLIC (no leading underscore) as of task 3051: the corroboration pass
+    :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._corroborate_record_keys`
+    is a call site OUTSIDE this module, and one more private copy of the
+    normalised-exception shape is exactly what this helper exists to prevent.
+    Callers may rely on the contract pinned by
+    ``tests/test_flag_dedup.py::TestSafeGetTask``: the raw result through
+    untouched on success (task dict AND error dict alike), ANY exception
+    normalised to ``{'error': str(exc), 'error_type': type(exc).__name__}``,
+    and ``(task_id, project_root)`` forwarded positionally in that order.
     """
     try:
         return await taskmaster.get_task(task_id, project_root)
@@ -3595,7 +3605,7 @@ async def _safe_get_task_or_none(
 ) -> Any:
     """Fetch ONE task, failing SAFE to ``None`` and WARNing under *log_event*.
 
-    The sibling of :func:`_safe_get_task` for the filters that classify a
+    The sibling of :func:`safe_get_task` for the filters that classify a
     lookup by PRESENCE of a task body rather than by an error dict: a caller
     that cannot read a body cannot positively confirm anything, so it KEEPS the
     flag.  ``None`` says exactly that, where an ``{'error', 'error_type'}``
@@ -3843,11 +3853,11 @@ async def _resolve_live_cross_project_fix_task(
         pending[key] = (cited_task_id, root)
 
     if pending:
-        # PLAIN gather — _safe_get_task normalises every exception to an error
+        # PLAIN gather — safe_get_task normalises every exception to an error
         # dict (see tests/test_gather_convention_guard.py).
         fetched: list[Any] = await asyncio.gather(
             *(
-                _safe_get_task(taskmaster, cited_task_id, root)
+                safe_get_task(taskmaster, cited_task_id, root)
                 for cited_task_id, root in pending.values()
             )
         )
@@ -3996,7 +4006,7 @@ async def filter_false_phantom_task_creation_flags(
                 continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
             lookup_cited.append(cited)
-            lookup_coros.append(_safe_get_task(taskmaster, cited_task_id, root))
+            lookup_coros.append(safe_get_task(taskmaster, cited_task_id, root))
 
     if not lookup_coros:
         return list(flags)
@@ -4744,7 +4754,7 @@ async def _discover_foreign_fix_task_citations(
     not-found live-title read, and a missing/blank/non-``str`` live title all
     yield no citation for the affected candidate.
 
-    The live title is read back with :func:`_safe_get_task` rather than taken
+    The live title is read back with :func:`safe_get_task` rather than taken
     from the bulk listing, and a citation is only synthesised when that read
     positively confirms a titled record.  That is what makes a discovered
     citation corroborate BY CONSTRUCTION under
@@ -4915,7 +4925,7 @@ async def _discover_foreign_fix_task_citations(
             continue  # unresolvable project -> no citation (fail open)
         key = (str(match.project_id), str(match.task_id))
         if key not in get_task_cache:
-            get_task_cache[key] = await _safe_get_task(
+            get_task_cache[key] = await safe_get_task(
                 taskmaster, match.task_id, root,
             )
         live = get_task_cache[key]
@@ -5988,7 +5998,7 @@ async def filter_accounted_cluster_growth_flags(
                 seen_task_ids.add(tid)
                 wanted_task_ids.append(tid)
 
-    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
     # a task whose body is unreadable can neither confirm a drop nor veto one.
     lookup_results: list[Any] = await asyncio.gather(
         *[

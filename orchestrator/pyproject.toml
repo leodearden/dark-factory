@@ -172,14 +172,22 @@ filterwarnings = [
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
-# is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
+# is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
-# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
-# 300 is INTERIM and judgement-picked, not measured).
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
+# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
+# clock under real fleet load x the 8x headroom factor — and no longer
+# judgement-picked; see
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
 # that line used to imply it was. A marker OVERRIDES the budget in BOTH
 # directions rather than raising a floor under it, so any N below the
 # --timeout=300 verify passes silently TIGHTENS the run that gates your merge.
+# NOTE that CLI budget is now TIGHTER than this ini default rather than equal to
+# it: task 5442 raised the ini 300 -> 540 and deliberately left every verify
+# test_command's --timeout=300 alone, that knob being yaml rather than pyproject.
+# The band below is stated against the CLI budget, which is the one that
+# actually governs a merge-gating run.
 # That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
 # DELIBERATE tight bound, for a test asserting something happens FAST) or
 # @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
@@ -190,19 +198,19 @@ filterwarnings = [
 # was enabled here (matching fused-memory/pyproject.toml) the worker
 # subprocesses run pytest in a thread, so signal-based interruption is no
 # longer reliable inside the worker — switch to thread mode like fused-memory.
-# UNCHANGED by the 60→300 raise, deliberately: the raise attacks the trigger,
-# not the two safety mechanisms.
+# UNCHANGED by the 60→300 and 300→540 raises, deliberately: a raise attacks the
+# trigger, not the two safety mechanisms.
 # MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
 # this value with tomllib at runtime — edit the two together.
-timeout = 300
+timeout = 540
 timeout_method = "thread"
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
 # ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the 300s timeout above, pytest-timeout's thread method
+# ever exceeds the timeout above, pytest-timeout's thread method
 # os._exit()s the xdist worker. With restarts allowed, xdist spawns a
 # replacement node that
 # re-collects the full suite and re-dies → restart/re-collect/re-die loop that

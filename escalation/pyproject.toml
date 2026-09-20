@@ -52,14 +52,17 @@ orchestrator = { workspace = true }
 [tool.pytest.ini_options]
 # Default per-test timeout. Catches deadlocked lock implementations and
 # accidental hangs; slow tests opt out with @pytest.mark.timeout(N).
-# See shared/pyproject.toml for the full rationale, including why this is 300
-# rather than the former 60: the cap is WALL-CLOCK, so a healthy test starved
+# See shared/pyproject.toml for the full rationale, including why this is large
+# rather than the original 60: the cap is WALL-CLOCK, so a healthy test starved
 # of CPU on a loaded 32-core host trips it, and in the xdist packages that
-# reds a SHIFTING VICTIM rather than the starved test. 300 is INTERIM and
-# judgement-picked, not measured.
+# reds a SHIFTING VICTIM rather than the starved test. 540 is DERIVED FROM
+# MEASUREMENT (task 5442) — worst unmarked per-test wall clock under real fleet
+# load x the 8x headroom factor — and no longer judgement-picked; the corpus and
+# the arithmetic are in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # signal method is load-bearing: thread method can't interrupt a blocking
-# syscall in the main thread. UNCHANGED by the 60→300 raise, deliberately, and
-# UNCHANGED by task 5408's addopts below.
+# syscall in the main thread. UNCHANGED by the 60→300 and 300→540 raises,
+# deliberately, and UNCHANGED by task 5408's addopts below.
 # THE PREMISE THIS USED TO GIVE IS CORRECTED, not softened. It read "escalation
 # runs no pytest-xdist so signal is always safe here", and that was false twice
 # over. It was ALREADY false before 5408: verify.py injects
@@ -77,7 +80,7 @@ orchestrator = { workspace = true }
 # can deadlock waiting for a completion signal that never arrives). Changing it
 # on no measurement, inside a config-only task, would be unmeasured scope creep;
 # the open question is filed as residue 2 of task 5470.
-timeout = 300
+timeout = 540
 timeout_method = "signal"
 
 # PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy

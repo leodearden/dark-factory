@@ -2002,6 +2002,30 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Caller bar for `deterministic-*` done provenance (PRD C5, task 5237).
+    # Lives here rather than on ConsolidationAutoConfig because the bar governs
+    # every deterministic provenance kind, not only auto-consolidation's.
+    deterministic_provenance_allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['orchestrator'],
+        description=(
+            'Resolved-caller prefixes permitted to record a `deterministic-*` '
+            'done provenance (PRD C5). The orchestrator sends no agent_id, so '
+            'server/tools.py::_resolve_identity falls back to the '
+            'clientInfo.name that server/mcp_lifecycle.py::McpSession.initialize '
+            "advertises — the literal 'orchestrator', which is why that is the "
+            'sole default. DENY-ON-MISSING is the consumer contract: a caller '
+            'matching no prefix is refused, and an EMPTY list denies every '
+            'caller (the live kill switch for the provenance kind). The '
+            'finished one-shot scripts/cgl_eta_finalize_gate.py (clientInfo '
+            "'cgl-sched-gate') is deliberately NOT in the default — it has "
+            'already run, and shipping a retired caller in an allowlist is how '
+            'an allowlist stops meaning anything. NOTE: the identity this bar '
+            'reads is SELF-REPORTED, so it deters a cooperating caller rather '
+            'than enforcing a boundary. Green-tier hot-reloadable via '
+            'reload_config.'
+        ),
+    )
+
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
 
@@ -2835,6 +2859,237 @@ class EntityMintConfig(BaseModel):
     )
 
 
+def _default_consolidation_category_weights() -> dict[str, float]:
+    """Ranking weights for the three Mem0-primary categories (PRD §12 Q1).
+
+    ``models/enums.py::MEM0_PRIMARY`` is exactly these three, and the ranking
+    only ever scores Mem0 rows, so the Graphiti-primary categories carry no
+    weight here rather than a zero — an absent key means "not a candidate",
+    which is a different fact from "a candidate worth nothing".
+    """
+    return {
+        'procedural_knowledge': 1.0,
+        'preferences_and_norms': 1.0,
+        'observations_and_summaries': 0.7,
+    }
+
+
+class ConsolidationAutoConfig(BaseModel):
+    """Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237).
+
+    Decided by ``plans/memory-auto-consolidation-prd.md`` §7. Auto-consolidation
+    writes to the corpus with no human in the loop, so it ships OFF behind a
+    kill switch and a per-project staging list rather than open.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig, for the reason that model's own ownership note gives:
+    recon Stage 1 is this machinery's first sanctioned CALLER, not its owner.
+    The proposal tool, the executor and the provenance bar all live on the
+    server side, so nesting here would assume colocation implies subsystem
+    ownership. Same call the ``Mem0UpdateConfig`` and ``EntityMintConfig``
+    sections above made.
+
+    Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
+    config/reload.py's ``_iter_leaves`` descends into per-leaf paths. An
+    ``X | None`` submodel is compared whole and lands as a single
+    restart_required entry (esc-2718-1), which would cost EVERY leaf here its
+    green tier — including ``enabled``, and a restart-only kill switch is no
+    kill switch.
+
+    PRD D5: there is deliberately no ``canonical_max_chars`` leaf. The one
+    canonical shape this machinery writes comes from
+    ``reconciliation/consolidation_auto.py::build_auto_canonical``, whose
+    maximum is 464 characters with every input at its own cap (claim 200, slug
+    100, N 20, a 36-char uuid run id) — a runtime cap would be unreachable dead
+    code, and dead code that looks like a safety bound is worse than none. The
+    bound is a unit-test assertion in tests/test_consolidation_auto.py instead.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Kill switch for deterministic auto-consolidation. When false NO '
+            'cluster is auto-executed regardless of enabled_projects — the '
+            'single knob an operator flips to stop a mis-consolidating cycle '
+            'without a restart. Ships OFF, unlike the mem0_update and '
+            'entity_mint kill switches which ship ON: those two gate a TOOL '
+            'behind a narrow self-reported-agent allowlist that is the real '
+            'bar, whereas this machinery writes on its own initiative with no '
+            'caller-side bar at all, so the switch IS the bar until PRD §11 '
+            "supervised dry-run cycle has been read by a human. Green-tier "
+            'hot-reloadable via reload_config.'
+        ),
+    )
+    enabled_projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            'project_ids auto-consolidation may execute in. Empty means none, '
+            'so an operator stages one project at a time rather than flipping '
+            'the whole fleet (PRD D13; precedent summary_rebuild.projects and '
+            'reconciliation.backlog_hard_limit_overrides). Read together with '
+            'enabled: BOTH must admit the project. Reloads ATOMICALLY — the '
+            'list is replaced wholesale, never merged. Green-tier '
+            'hot-reloadable via reload_config.'
+        ),
+    )
+    predicate_version: str = Field(
+        default='1',
+        description=(
+            'Stamped onto every AutoVerdict and onto the provenance of every '
+            'auto-executed consolidation, so a corpus audit can tell which '
+            'rule set admitted a cluster. Bump it whenever the predicate rungs '
+            'in reconciliation/consolidation_auto.py change meaning; a verdict '
+            'tagged with the OLD version is then visibly not a claim about the '
+            'current rules. A string rather than an int because it is an '
+            'opaque label, never arithmetic. Green-tier hot-reloadable, and '
+            'read live per verdict so a reload retags subsequent verdicts.'
+        ),
+    )
+    member_min: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            'Fewest members a proposal may name. Below two there is no '
+            'duplication to consolidate, so a one-member proposal is a '
+            'mis-clustered singleton rather than a cheap win. Enforced at the '
+            'emit boundary by server/consolidation.py::validate_consolidate_args '
+            'proposal arm, which is where the LLM can still fix its own shape '
+            'in-turn. Green-tier hot-reloadable.'
+        ),
+    )
+    member_max: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'Most members a proposal may name. A cluster this large is more '
+            'likely a topic drifting than a duplicate set, and it is the point '
+            'where a human sitting reads better than an automatic write. Must '
+            'be >= member_min (enforced below). Green-tier hot-reloadable.'
+        ),
+    )
+    claim_max_chars: int = Field(
+        default=200,
+        gt=0,
+        description=(
+            'Cap on the LLM-supplied claim, which becomes the FIRST PARAGRAPH '
+            'of the canonical verbatim. A claim is one assertion, not a '
+            'summary: PRD §2 measured that a template canonical whose claim '
+            'leads the body retrieves within 0.015 cosine of a hand-written '
+            'one, and that property rests on the claim being short and '
+            'leading. The bound is INCLUSIVE — a claim of exactly this length '
+            'is accepted. Green-tier hot-reloadable.'
+        ),
+    )
+    max_auto_per_cycle: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            'Most clusters auto-executed in one reconciliation cycle. Bounds '
+            'the blast radius of a mis-calibrated predicate to three records '
+            'per cycle rather than a corpus-wide sweep. 0 is a LEGAL value and '
+            'the narrow off switch: it stops execution while leaving the rest '
+            'of the pipeline proposing and observing, which is exactly PRD §11 '
+            "supervised dry-run posture. Green-tier hot-reloadable."
+        ),
+    )
+    max_gate_filings_per_cycle: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            'Most human gates filed in one cycle for refused clusters. Without '
+            'it a systematically-refusing predicate would file a gate per '
+            'cluster per cycle and bury the human sitting it is meant to '
+            'serve. 0 is a legal off switch (refusals are still recorded, no '
+            'gate is filed). Green-tier hot-reloadable.'
+        ),
+    )
+    backlog_multiplier: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'How many candidate clusters the ranking considers per cycle, as a '
+            'multiple of max_auto_per_cycle. Greater than 1 so the cycle picks '
+            'the best few of a wider field rather than the first few it saw; '
+            'bounded so ranking cost stays proportional to what can actually '
+            'be executed. Green-tier hot-reloadable.'
+        ),
+    )
+    refusal_streak_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive refusals of the SAME topic before the machinery stops '
+            're-proposing it and hands it to a human. A predicate that refuses '
+            'a cluster for a reason no LLM re-emission can fix will otherwise '
+            'refuse it every cycle forever, which is cost with no information. '
+            'Green-tier hot-reloadable.'
+        ),
+    )
+    slug_collision_jaccard: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Token-Jaccard at or above which a proposed topic slug is treated '
+            'as colliding with an EXISTING canonical slug, refusing the '
+            'proposal rather than minting a near-twin topic that splits one '
+            'referent across two canonicals. Compared with >= (the fail-closed '
+            'reading of "above a threshold"), over hyphen-split slug tokens. A '
+            'slug EQUAL to the proposal topic is skipped rather than scored — '
+            'the topic already owns a canonical on every re-emission and self-'
+            'Jaccard is 1.0. Shipped at 0.6 as a starting point to be '
+            'calibrated during the supervised cycle (PRD §12 Q2), which is why '
+            'it must be read live rather than captured. Green-tier '
+            'hot-reloadable.'
+        ),
+    )
+    proposal_ttl_hours: int = Field(
+        default=168,
+        gt=0,
+        description=(
+            'How long a ledger proposal stays executable before it must be '
+            're-derived. The corpus moves under an aged proposal — members get '
+            'corrected, a canonical appears — so executing a week-old row on '
+            'its original facts would write against a world that no longer '
+            'exists. One week by default: long enough to survive a quiet '
+            'weekend, short enough that a stale row is re-checked. Green-tier '
+            'hot-reloadable.'
+        ),
+    )
+    category_weights: dict[str, float] = Field(
+        default_factory=_default_consolidation_category_weights,
+        description=(
+            'Per-category ranking weights over the three Mem0-primary '
+            'categories (PRD §12 Q1). observations_and_summaries is '
+            'down-weighted to 0.7 because that corpus is session-recap noise '
+            'far more often than it is a reusable norm, so a duplicate cluster '
+            'there is worth less to consolidate than one in '
+            'procedural_knowledge. An absent category is not a candidate — '
+            'which is a different fact from a zero weight, and why the '
+            'Graphiti-primary categories are absent rather than zeroed. '
+            'Reloads ATOMICALLY — the map is replaced wholesale, never merged, '
+            'so a half-applied ranking map can never gate a cycle. Green-tier '
+            'hot-reloadable.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _member_range_is_coherent(self):
+        """Reject a member range no proposal could ever satisfy.
+
+        With ``member_min > member_max`` every proposal refuses on member
+        count, and no LLM re-emission can fix it — the machinery would look
+        like a systematically-refusing predicate rather than a config typo.
+        Loud at load/reload rather than silently inert (no-silent-fail-soft).
+        """
+        if self.member_min > self.member_max:
+            raise ValueError(
+                f'consolidation_auto.member_min ({self.member_min}) must be <= '
+                f'member_max ({self.member_max}); an inverted range refuses '
+                'every proposal on member count with no value that could satisfy it.',
+            )
+        return self
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -2866,6 +3121,13 @@ class FusedMemoryConfig(BaseSettings):
     # Here nullability would additionally cost the KILL SWITCH its green tier,
     # and a restart-only kill switch is no kill switch.
     entity_mint: EntityMintConfig = Field(default_factory=EntityMintConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above,
+    # and for the same kill-switch reason as entity_mint: `enabled` and
+    # `enabled_projects` are the PRD §11 rollout levers, so both must stay
+    # green-tier.
+    consolidation_auto: ConsolidationAutoConfig = Field(
+        default_factory=ConsolidationAutoConfig,
+    )
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

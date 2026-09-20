@@ -42,6 +42,9 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_terminal_metadata_flags,
     maybe_escalate_suppression_storm,
 )
+from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
+    sweep_orphaned_recon_escalations,
+)
 from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
@@ -325,6 +328,22 @@ class MemoryConsolidator(BaseStage):
         report.stats['curator_gate_resolution_scanned'] = 0
         report.stats['curator_gate_resolution_flags_emitted'] = 0
         report.stats['curator_gate_resolution_errors'] = 0
+        # Same always-present contract for the orphaned-recon-escalation sweep
+        # (task 3052).  Zeroed HERE, above the remediation early-return, so a
+        # remediation pass — which never runs the sweep — still publishes the
+        # keys.  With all eight present a reader can distinguish a clean cycle
+        # that found nothing (scanned > 0, flags_emitted == 0, errors == 0)
+        # from a degraded one (errors > 0), from a registry gap
+        # (unresolvable > 0) and from a cross-tag id collision
+        # (ambiguous > 0), without a .get(..., 0) fallback.
+        report.stats['orphaned_recon_escalations_scanned'] = 0
+        report.stats['orphaned_recon_escalations_terminal'] = 0
+        report.stats['orphaned_recon_escalations_missing'] = 0
+        report.stats['orphaned_recon_escalations_live'] = 0
+        report.stats['orphaned_recon_escalations_ambiguous'] = 0
+        report.stats['orphaned_recon_escalations_unresolvable'] = 0
+        report.stats['orphaned_recon_escalations_errors'] = 0
+        report.stats['orphaned_recon_escalations_flags_emitted'] = 0
 
         # Always present (task 2896 γ): count of recon flags suppressed this cycle
         # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
@@ -513,6 +532,82 @@ class MemoryConsolidator(BaseStage):
                     gate_sweep['flags'],
                 )
                 report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
+
+        # ── Orphaned recon-escalation sweep (task 3052) ────────────────────────
+        # Flag pending L1 ``reconciliation_stale_*`` records whose subject task
+        # has gone terminal (done/cancelled) or vanished from its own project's
+        # task store.  Those records are filed only while the subject is
+        # ``status == 'blocked'``
+        # (stage1_stall_detector.py::extract_stalled_gate_backlog_task_ids), so
+        # they can never re-file, yet nothing closes them: the harness never
+        # resolves its own escalation queue (A7b), and the orchestrator's
+        # revalidation sweep reads a different queue and returns early on
+        # ``level != 2`` while every recon record is L1.
+        #
+        # DETECTION ONLY — the sweep never calls queue.resolve(); the port-8103
+        # watcher session is the sole closer, reached via
+        # skills/recon-escalation-watcher/SKILL.md.
+        #
+        # Placement mirrors the curator-gate block above, for the same two
+        # reasons: this sweep EMITS flags, so it must sit ABOVE dedup_flags so
+        # (1) each appended flag earns a stage1_flag_marker ledger row keyed on
+        # (task_id, flag_type) — cross-cycle recurrence tracking plus honoring
+        # explicit suppression, where appending below would re-emit unmarked
+        # forever — and (2) the ``if report.items_flagged:`` guard below can fire
+        # on a cycle where the LLM emitted no flags of its own.
+        #
+        # Unlike the curator-gate flags, these carry NO cited_memories at all, so
+        # the verify_cited_memories exemption reasoning above does not apply to
+        # them in either direction: there is no citation set for the verifier to
+        # miss.  Their evidence is the escalation record's own fields plus a
+        # status census read microseconds earlier in this same call.
+        #
+        # Best-effort: a whole-sweep failure must never abort the stage or leave
+        # items_flagged partially mutated — it is logged and swallowed, and all
+        # seven stats stay at their pre-early-return 0 for this cycle.
+        if self._escalation_queue is not None and self.taskmaster is not None:
+            try:
+                orphan_sweep = await sweep_orphaned_recon_escalations(
+                    self._escalation_queue,
+                    self.taskmaster,
+                    self.known_projects,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    'reconciliation.orphaned_recon_escalation_sweep_failed',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                    },
+                )
+            else:
+                report.items_flagged = (
+                    (report.items_flagged or []) + orphan_sweep['flags']
+                )
+                report.stats['orphaned_recon_escalations_scanned'] = orphan_sweep[
+                    'scanned'
+                ]
+                report.stats['orphaned_recon_escalations_terminal'] = orphan_sweep[
+                    'terminal'
+                ]
+                report.stats['orphaned_recon_escalations_missing'] = orphan_sweep[
+                    'missing'
+                ]
+                report.stats['orphaned_recon_escalations_live'] = orphan_sweep['live']
+                report.stats['orphaned_recon_escalations_ambiguous'] = orphan_sweep[
+                    'ambiguous'
+                ]
+                report.stats['orphaned_recon_escalations_unresolvable'] = orphan_sweep[
+                    'unresolvable'
+                ]
+                report.stats['orphaned_recon_escalations_errors'] = orphan_sweep[
+                    'errors'
+                ]
+                report.stats['orphaned_recon_escalations_flags_emitted'] = len(
+                    orphan_sweep['flags'],
+                )
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is

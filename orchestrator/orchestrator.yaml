@@ -43,27 +43,45 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # BASIS FOR 7200: ~1.6x headroom over the ~4400s loaded extrapolation from
 # task 4176's contended run.
 #
-# WARM-ONLY REMEDY, DELIBERATELY — do not read the value below as covering a
-# cold verify. Per verify._resolve_verify_timeout's cascade an unset module
-# cold knob does NOT inherit the warm budget: a COLD verify of this module
-# falls through to the repo-root verify_cold_command_timeout_secs, and pays
-# verify_cold_preprovision_command (`uv sync --all-packages && npm ci ...`)
-# and unwarmed caches on top of the warm cost this number sizes.
+# THE TASK/BACKGROUND COLD LANE IS NOW CLOSED HERE — see
+# verify_cold_command_timeout_secs at the bottom of this block. It was
+# deliberately left open until scope D', and this records why it is closed now
+# and on what basis.
 #
-# WHETHER THAT FALL-THROUGH IS ADEQUATE IS AN OPERATOR-TUNABLE QUESTION, and
-# the answer has already changed once. At the 5400s cold ceiling it was NOT:
-# 5400 is BELOW the 7200 declared here and only ~2% above the 5288s worst
-# observed green WARM run, on a path that is strictly costlier — so the
-# false-infra_timeout mode esc-4211-6 documents was LIVE ON THE COLD LANE.
-# Commit 36c4c71eb4 raised cold 5400 -> 10800, which clears both; under that
-# commit's own revert condition ("put these back to 3600/5400") the hazard
-# returns. NOT CLOSED HERE BY CHOICE, IN EITHER STATE — a cold budget is a
-# second number needing its own basis, and task 3353's scope D (the measured
-# distribution that refines this whole block) is where the cold lane belongs.
-# Assertion (f) of the guard named below pins the fall-through RELATION —
-# cold resolves to the repo-root cold ceiling, whatever the operator has set
-# it to, and never to this warm value — rather than either literal. It is
-# also the assertion to update if a cold budget is ever declared here.
+# THE COLD MERGE LANE IS NOT CLOSED, and saying otherwise was wrong. Measured
+# against the real configs with the real resolver (esc-3353-20):
+#   is_cold=True, is_merge_verify=False -> 10800   (the declaration below)
+#   is_cold=True, is_merge_verify=True  ->  7200   (defaults.yaml:105)
+# _resolve_verify_timeout's cold track tries merge_verify_cold_command_timeout_
+# secs FIRST, ahead of the module knob, so a COLD MERGE verify of this module
+# runs on 7200 — exactly EQUAL to its warm budget, on the path that pays the
+# cold preprovision command and unwarmed caches on top of everything the warm
+# run pays. That is the same hazard shape the declaration below exists to
+# prevent, still live on the merge lane.
+#
+# NOT FIXED HERE, DELIBERATELY. Closing it means raising a REPO-ROOT ceiling
+# (merge_verify_cold_command_timeout_secs), and ruling D17 puts root ceilings
+# out of scope for this task — "report it in the census; do not change it here
+# without an operator ruling" — under a standing constraint that a timeout is
+# never widened as a fix (commit 36c4c71eb4: "the next raise should be
+# refused"). So this is recorded as a measured FINDING for an operator, and
+# the census's MERGE GATE section reports the figure on every run.
+#
+# WHY IT COULD NOT STAY OPEN. Per verify._resolve_verify_timeout's cascade an
+# unset module cold knob does NOT inherit the warm budget: a COLD verify falls
+# through to the repo-root verify_cold_command_timeout_secs, and pays
+# verify_cold_preprovision_command (`uv sync --all-packages && npm ci ...`) and
+# unwarmed caches ON TOP of the warm cost 7200 sizes. Whether that fall-through
+# was adequate was an operator-tunable question whose answer had already
+# changed once: at the 5400s cold ceiling it was NOT — 5400 is BELOW the 7200
+# declared here and only ~2% above the then-recorded 5288s worst green WARM
+# run, on a strictly costlier path, so the false-infra_timeout mode esc-4211-6
+# documents was LIVE ON THE COLD LANE. Commit 36c4c71eb4 raised cold
+# 5400 -> 10800, which clears both, but that commit states its own revert
+# condition ("put these back to 3600/5400") — and a fall-through does not
+# survive it while a module declaration does. That is the whole argument for
+# declaring: the same argument the warm figure already carries, applied to the
+# lane the warm figure explicitly does not cover.
 #
 # COUNT THE RETRIES — the wall clock a genuine hang costs is a MULTIPLE of
 # 7200, not 7200. config.verify_timeout_retries defaults to 2
@@ -81,3 +99,45 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/"
 # GATED BY tests/scripts/test_module_verify_budgets.py::
 # test_module_carries_its_own_measured_verify_budget[orchestrator].
 verify_command_timeout_secs: 7200
+
+# Per-module COLD budget — ruled by D17 (2026-09-14, task 3353 scope D').
+#
+# INTERIM, AND DELIBERATELY NOT CENSUS-DERIVED — labelled exactly as 7200 was
+# labelled under D16', and for a reason that is measured rather than assumed. A
+# summary.json carries NO is-cold flag, and the only available inference
+# ("attempt-1 in a worktree with no prior verify dir is cold") cannot tell a
+# cold first verify from a warm re-verify of a RESET worktree: the
+# .task/verify_warmed marker is not part of the record and does not survive
+# into the archive. scripts/verify_budget_census.py reports that as an explicit
+# `cold_separable: false` finding with the count of records a guess would have
+# claimed, rather than making the guess. So there is no cold DISTRIBUTION to
+# derive from, and D17 rules the fallback for exactly this case: label the cold
+# value INTERIM with its basis.
+#
+# BASIS: the warm derivation (7200, itself now census-derived — see the block
+# above) PLUS the cold preprovision cost this lane additionally pays. 10800
+# allots 3600s to that increment, which is the fleet's own current allowance
+# for it (the repo-root verify_cold_command_timeout_secs, raised to 10800 by
+# commit 36c4c71eb4). This figure is therefore NOT a new measurement and must
+# not be read as one — it is the ruled, revert-surviving restatement of the
+# fleet's present cold allowance for this module.
+#
+# NOT REDUNDANT WHILE IT EQUALS THE ROOT CEILING, for the same reason the warm
+# figure is not: the ceiling is operator-tunable and this figure is RULED, so
+# the module keeps 10800 through commit 36c4c71eb4's revert condition instead
+# of falling back to 5400 with it — the state in which the cold false-timeout
+# hazard was LIVE. The guard therefore asserts at-or-above, not
+# strictly-above.
+#
+# REFINE IT by separating cold runs in the census, which needs an is-cold fact
+# IN the record — not by re-inferring it from attempt numbering.
+#
+# GATED BY the same guard, assertion (f)'s
+# RULED_COLD_BUDGET_DECLARATIONS branch, which additionally pins that a cold
+# budget may never sit BELOW the warm one (a cold verify pays strictly more)
+# and that the resolver returns this value ON THE TASK/BACKGROUND COLD LANE
+# (is_merge_verify=False) rather than the cascade shadowing it. On the COLD
+# MERGE lane the cascade DOES shadow it — see the finding at the top of this
+# block — and the guard pins that shadowing too, so the carve-out cannot be
+# closed or forgotten without a test going red.
+verify_cold_command_timeout_secs: 10800

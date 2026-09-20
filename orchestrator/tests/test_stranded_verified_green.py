@@ -29,12 +29,62 @@ from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.stranded_verified_green import (
     VerifiedGreenMatch,
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
 )
 from orchestrator.task_ground_truth import EscalationRef
+
+
+async def _reconcile_stranded(
+    harness: Harness, tid: str, status: str, *, mid_run: bool = False,
+    tally: RecoverySweepTally | None = None,
+) -> str | None:
+    """Drive ONE stranded-task reconciliation.
+
+    The suite's coupling to this private driver lives here and nowhere else,
+    so a signature change costs one edit instead of one per test.
+    """
+    return await harness._reconcile_one_stranded(
+        tid, status, mid_run=mid_run, tally=tally,
+    )
+
+
+def _arm_escalation_queue(
+    harness: Harness, tmp_path: Path, name: str,
+) -> EscalationQueue:
+    """Bind a real queue at ``esc_<name>`` and arm its resolve callback.
+
+    The suite's coupling to these four private attributes lives here and
+    nowhere else, so a rename costs one edit instead of one per test.
+    """
+    queue = EscalationQueue(tmp_path / f'esc_{name}')
+    harness._escalation_queue = queue
+    harness._loop = asyncio.get_running_loop()
+    queue.set_resolve_callback(harness._on_escalation_resolved)
+    harness._escalation_events.clear()
+    harness._workflow_cancel_at.clear()
+    return queue
+
+
+async def _drain_background(harness: Harness) -> None:
+    """Await everything a sweep scheduled onto the harness's background set.
+
+    The suite's coupling to that private set lives here and nowhere else,
+    so a rename costs one edit instead of one per test.
+    """
+    await asyncio.gather(*list(harness._background_tasks))
+
+
+def _merge_queue_depth(harness: Harness) -> int:
+    """Depth of the harness's private merge queue.
+
+    Ditto — this is the suite's most-repeated internal read, so it gets the
+    same single-site treatment rather than one coupling per assertion.
+    """
+    return harness._merge_queue.qsize()
 
 
 @pytest.fixture(autouse=True)
@@ -174,8 +224,7 @@ class _FakeGitOps:
     """Minimal stand-in exposing exactly the surface detect_verified_green uses."""
 
     def __init__(
-        self,
-        worktree_base: Path,
+        self, worktree_base: Path,
         records: dict[str, LaneRecord],
         branch_shas: dict[str, str],
         *,
@@ -367,8 +416,7 @@ class TestDetectVerifiedGreen:
         from orchestrator.stranded_verified_green import detect_verified_green
 
         git_ops, event_store, resolver, _ = _build_env(
-            tmp_path,
-            steps=[{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}],
+            tmp_path, steps=[{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}],
         )
         assert await detect_verified_green(
             _TID, git_ops=git_ops, event_store=event_store, worktree_resolver=resolver,
@@ -469,7 +517,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         req = harness._merge_queue.get_nowait()
         assert req.branch.bare_id == _TID
         assert req.snapshot_tip == _TIP
@@ -518,7 +566,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is False
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
 
     async def test_kill_switch_off_returns_false_without_detecting(
         self, harness: Harness, tmp_path: Path,
@@ -531,7 +579,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is False
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         detect.assert_not_awaited()
 
 
@@ -556,7 +604,7 @@ class TestStrandedVerifiedGreenRecordEscalation:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
         # Drain any coros scheduled by the resolve callback (there should be
         # none for the WORKFLOW_NONE/close_only path — mirrors the flip tests).
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         assert result is True
 
@@ -596,12 +644,7 @@ class TestReconcileStrandedDriverVerifiedGreen:
         self, harness: Harness, tmp_path: Path,
     ) -> None:
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_a')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'a')
         # git_ops mocks so recovery_for classifies the blocked task as
         # GONE_NO_MARKER → RE_FILE_ESCALATION (mirrors test_stranded_blocked_sweep).
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
@@ -615,10 +658,10 @@ class TestReconcileStrandedDriverVerifiedGreen:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # A MergeRequest was enqueued (merge-queue-direct submission).
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         # No pending stranded_blocked L1 remains — the record was auto-dismissed.
         assert queue.get_by_task(tid, status='pending') == []
         # The task was NOT re-pended.
@@ -651,7 +694,7 @@ class TestReconcileStrandedDriverVerifiedGreen:
         assert len(filed) == 1
         assert filed[0].category == 'stranded_blocked'
         assert filed[0].agent_role == 'harness-stranded-blocked-reaper'
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
 
 
 _OFF_MAIN_SHA = 'off' + 'a' * 37  # 40-char unmerged branch tip
@@ -707,12 +750,7 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         self, harness: Harness, tmp_path: Path,
     ) -> None:
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_d1')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'd1')
         _wire_exists_off_main(harness, tid)
         _seed_pending(queue, tid, 'stranded_blocked')
 
@@ -721,11 +759,11 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # The verified-green branch was submitted merge-queue-direct despite
         # the open stranded_blocked — the anti-synergy δ closes.
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         assert harness.event_store is not None
         rows = harness.event_store.fetch_events_by_type_all_runs(
             EventType.merge_queued, task_id=tid,
@@ -740,12 +778,7 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
     ) -> None:
         """A design_concern is NOT merge-remediable → LEAVE, unchanged."""
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_d2')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'd2')
         _wire_exists_off_main(harness, tid)
         seeded = _seed_pending(queue, tid, 'design_concern')
 
@@ -754,10 +787,10 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         # No auto-submit: the human-concern escalation holds the task.
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         _asserted_no_repend(harness, tid)
         pending = queue.get_by_task(tid, status='pending')
         assert [e.id for e in pending] == [seeded]
@@ -775,12 +808,7 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         already-open escalation for its handler instead.
         """
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_dedup')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'dedup')
         _wire_exists_off_main(harness, tid)
         seeded = _seed_pending(queue, tid, 'stranded_blocked')
 
@@ -789,9 +817,9 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 0
+        assert _merge_queue_depth(harness) == 0
         _asserted_no_repend(harness, tid)
         pending = queue.get_by_task(tid, status='pending')
         assert [e.id for e in pending] == [seeded], (
@@ -854,12 +882,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
         self, harness: Harness, tmp_path: Path,
     ) -> None:
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_ma')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'ma')
         _wire_on_main_mark_done(harness, tid, tmp_path)
         _seed_pending(queue, tid, 'stranded_blocked')
 
@@ -868,7 +891,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         prov = _done_provenance(harness, tid)
         assert prov is not None, 'landed branch must self-heal to done'
@@ -879,12 +902,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
     ) -> None:
         """A design_concern is NOT merge-remediable → the task stays blocked."""
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_mb')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'mb')
         _wire_on_main_mark_done(harness, tid, tmp_path)
         seeded = _seed_pending(queue, tid, 'design_concern')
 
@@ -893,7 +911,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         assert _done_provenance(harness, tid) is None, (
             'a human-concern escalation must still hold the task'
@@ -939,7 +957,7 @@ class TestStrandedVerifiedGreenIdempotency:
             result = await harness._maybe_submit_stranded_verified_green(_TID, {})
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
         call = harness.scheduler.update_task.await_args  # type: ignore[attr-defined]
         assert call.args[0] == _TID
@@ -970,7 +988,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 0  # NO additional MergeRequest
+        assert _merge_queue_depth(harness) == 0  # NO additional MergeRequest
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]  # no re-stamp
         # No new escalation filed (neither a pending L1 nor a dismissed record).
         assert queue.get_by_task(_TID, status='pending') == []
@@ -992,7 +1010,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1  # re-submit
+        assert _merge_queue_depth(harness) == 1  # re-submit
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]  # marker re-stamped
 
     async def test_advanced_lane_tip_resubmits(
@@ -1012,7 +1030,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1  # re-submit for the new tip
+        assert _merge_queue_depth(harness) == 1  # re-submit for the new tip
         req = harness._merge_queue.get_nowait()
         assert req.snapshot_tip == new_tip
 
@@ -1032,7 +1050,7 @@ class TestStrandedVerifiedGreenIdempotency:
             )
 
         assert result is True
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
 
     async def test_first_sweep_stamps_marker_via_driver(
         self, harness: Harness, tmp_path: Path,
@@ -1041,12 +1059,7 @@ class TestStrandedVerifiedGreenIdempotency:
         AND stamps the marker via scheduler.update_task (honours the two-sweep
         idempotency framing — the stamp is what a second sweep reads)."""
         tid = _TID
-        queue = EscalationQueue(tmp_path / 'esc_drv')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        _arm_escalation_queue(harness, tmp_path, 'drv')
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler.get_statuses = AsyncMock(
@@ -1058,9 +1071,9 @@ class TestStrandedVerifiedGreenIdempotency:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
         marker = harness.scheduler.update_task.await_args.args[1][  # type: ignore[attr-defined]
             'stranded_merge_request'
@@ -1187,7 +1200,7 @@ class TestStrandedMergeFailedL2:
         # add_done_callback fires via call_soon; sleep(0) lets it run and
         # schedule _file_stranded_merge_failed onto _background_tasks.
         await asyncio.sleep(0)
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
     @pytest.mark.parametrize('status', _DURABLE_FAILURE_STATUSES)
     async def test_durable_failure_files_born_at_l2(
@@ -1313,12 +1326,7 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
     ) -> None:
         tid = _TID
         advanced_sha = 'ad' * 20  # 40-hex on-main landing SHA
-        queue = EscalationQueue(tmp_path / 'esc_hp')
-        harness._escalation_queue = queue
-        harness._loop = asyncio.get_running_loop()
-        queue.set_resolve_callback(harness._on_escalation_resolved)
-        harness._escalation_events.clear()
-        harness._workflow_cancel_at.clear()
+        queue = _arm_escalation_queue(harness, tmp_path, 'hp')
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
 
@@ -1331,9 +1339,9 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             AsyncMock(return_value=_match(tmp_path)),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
-        assert harness._merge_queue.qsize() == 1
+        assert _merge_queue_depth(harness) == 1
         # Record auto-dismissed → NO pending escalation left to block the flip.
         assert queue.get_by_task(tid, status='pending') == []
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
@@ -1371,7 +1379,7 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             AsyncMock(return_value=None),
         ):
             await harness._reconcile_stranded_in_progress()
-        await asyncio.gather(*list(harness._background_tasks))
+        await _drain_background(harness)
 
         harness.scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
             tid, 'done',
@@ -1464,8 +1472,7 @@ class TestSubmitVerifiedGreenMergeRequest:
     """The shared build→callback→enqueue→stamp submit helper."""
 
     async def _submit(
-        self,
-        tmp_path: Path,
+        self, tmp_path: Path,
         *,
         source: str = 'architect-desync',
         marker_key: str = 'architect_merge_request',
@@ -1587,3 +1594,232 @@ class TestSubmitVerifiedGreenMergeRequest:
 
         assert queue.qsize() == 1
         assert req.request_id.startswith('mr-')
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the two blocked-arm clauses consume the SHARED predicate.
+#
+# Before eta both read `self._only_merge_remediable(report.open_escalations)` —
+# a CATEGORY judgement with no notion of pin class, so an `info` annotation in
+# a non-remediable category vetoed the self-heal exactly as loudly as a
+# blocking L1, and a blocking L0 whose filer was provably dead did too.  After
+# eta they read `not report_pins_blocked_recovery(report)`: the same category
+# relaxation, now composed with `escalation.pins`' pin class.
+#
+# `report_pins_blocked_recovery` is `pins and not only_merge_remediable(...)`,
+# in that order and over ALL records.  Both halves are asserted below, INCLUDING
+# the case where the two disagree: a NON-pinning info record in a
+# non-remediable category still defeats the relaxation, because
+# `only_merge_remediable` is an `all(...)` over `category` and does not filter
+# by pin class.  That is a deliberate, conservative preservation — it is
+# byte-identical to what `_only_merge_remediable` does today — and it is pinned
+# here so the ordering is a checked decision rather than an accident.
+# ---------------------------------------------------------------------------
+
+
+def _seed_info(queue: EscalationQueue, tid: str, category: str, *, level: int = 0) -> str:
+    """Seed one INFO-severity pending record of *category* for *tid*."""
+    esc_id = f'esc-info-{category}-{tid}'
+    queue.submit(Escalation(
+        id=esc_id, task_id=tid, agent_role='steward', severity='info',
+        category=category, summary=f'annotation {category}', level=level,
+    ))
+    return esc_id
+
+
+@pytest.mark.asyncio
+class TestBlockedArmConsumesTheSharedPinPredicate:
+    """The pin-CLASS half the blocked clauses could not see before task eta."""
+
+    @staticmethod
+    def _arm(harness: Harness, tmp_path: Path, tid: str, name: str) -> EscalationQueue:
+        return _arm_escalation_queue(harness, tmp_path, name)
+
+    async def test_info_only_pin_no_longer_vetoes_the_on_main_self_heal(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """An ANNOTATION must not hold a landed task blocked forever.
+
+        Today `_only_merge_remediable([info/task_failure])` is False — the
+        category is non-remediable — so the MARK_DONE upgrade never fires and
+        the task sits blocked behind a record that never pinned anything.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'info_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_info(queue, tid, 'task_failure')
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is not None
+
+    async def test_dead_l0_pin_still_vetoes_the_on_main_done_flip(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """PRD D3 / spec §6 demand 3 — the DONE-FLIP veto stays maximally
+        conservative: ANY non-info open record still vetoes MARK_DONE.
+
+        A dead-filer L0 does not pin RECOVERY — its handoff has no consumer
+        left, so conversion and re-dispatch proceed.  A done-flip is different
+        in kind: it is TERMINAL, and completing a task past an unconsumed
+        handoff is the phantom-done the already-landed dispatch gate closed at
+        the other end.  The record gets an owner later, when the orphan-L0
+        reaper promotes it; until then the task stays blocked and VISIBLE.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'deadl0_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        seeded = _seed_pending(queue, tid, 'task_failure', level=0)
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is None, (
+            'a dead-filer L0 must not be done-flipped past — D3 names the '
+            'done-flip veto as the half of the veto family that was always '
+            'right'
+        )
+        assert seeded in {e.id for e in queue.get_by_task(tid, status='pending')}
+
+    async def test_the_same_dead_l0_still_takes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """THE DELIBERATE ASYMMETRY between the two blocked-arm clauses.
+
+        Same record, same liveness — different clause, different question.
+        RE_FILE_ESCALATION is not a done-flip: it re-files or auto-merges, both
+        recoverable, so it correctly keeps the `pins` relaxation and the
+        dead-filer L0 does not hold it.  Pinned here so the split is a checked
+        decision rather than an artefact of which clause someone edited.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'deadl0_off_main')
+        _wire_exists_off_main(harness, tid)
+        _seed_pending(queue, tid, 'task_failure', level=0)
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await _drain_background(harness)
+
+        assert _merge_queue_depth(harness) == 1, (
+            'the off-main clause is not a done-flip, so it keeps the dead-L0 '
+            'relaxation'
+        )
+
+    async def test_human_concern_l1_still_vetoes_the_on_main_self_heal(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """The relaxation is preserved verbatim: an L1 is a live handoff."""
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'l1_on_main')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'task_failure', level=1)
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is None
+
+    async def test_info_only_pin_no_longer_vetoes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Same relaxation on the EXISTS_OFF_MAIN RE_FILE_ESCALATION clause."""
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'info_off_main')
+        _wire_exists_off_main(harness, tid)
+        seeded = _seed_info(queue, tid, 'task_failure')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await _drain_background(harness)
+
+        assert _merge_queue_depth(harness) == 1, (
+            'the upgrade must fire: an info record is not a handoff'
+        )
+        assert seeded in {e.id for e in queue.get_by_task(tid, status='pending')}
+
+    async def test_human_concern_l1_still_vetoes_the_off_main_upgrade(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'l1_off_main')
+        _wire_exists_off_main(harness, tid)
+        _seed_pending(queue, tid, 'task_failure', level=1)
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await _drain_background(harness)
+
+        assert _merge_queue_depth(harness) == 0
+        _asserted_no_repend(harness, tid)
+
+    async def test_a_remediable_pin_plus_an_info_of_the_same_class_still_relaxes(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Mixed severities within the remediable class: the relaxation holds.
+
+        `only_merge_remediable` is an `all(...)` over CATEGORY, so both records
+        are inside the set and the upgrade fires exactly as for the lone
+        `stranded_blocked` L1.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'mixed_same_class')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked', level=1)
+        _seed_info(queue, tid, 'stranded_blocked')
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is not None
+
+    async def test_a_remediable_pin_plus_a_foreign_class_info_still_vetoes(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """THE COMPOSITION ORDER, asserted rather than assumed.
+
+        `records_pin_blocked_recovery` narrows the pin answer by
+        `only_merge_remediable(records)` over ALL records, so a NON-pinning
+        info record in a foreign category still defeats the relaxation.  This
+        is byte-identical to today's `_only_merge_remediable`, i.e. the
+        conservative direction, and it is asserted here so a future reader
+        finds the ordering decided rather than incidental: relaxing it would
+        let an unrelated annotation authorise a merge, which is a widening no
+        measurement in this task supports.
+        """
+        tid = _TID
+        queue = self._arm(harness, tmp_path, tid, 'mixed_foreign_class')
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked', level=1)
+        _seed_info(queue, tid, 'design_concern')
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is None
+
+    async def test_an_unreadable_store_still_takes_the_upgrade_path(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """UNCHANGED on a store outage — the clauses never pass `records=None`.
+
+        With no queue bound, `_resolve_open_escalations` reports
+        `open_escalations=[]` plus `escalation_store_unavailable=True`.  The
+        clauses pass that LIST, so the store-unavailable non-fold is preserved
+        uniformly across the resolver AND its sweep-side clauses.  The
+        `records=None` -> always-pin arm is the SCHEDULER's contract and is
+        unit-tested in test_recovery_pins.py; it is not reached from here.
+        """
+        tid = _TID
+        harness._escalation_queue = None
+        harness._loop = asyncio.get_running_loop()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+
+        await _reconcile_stranded(harness, tid, 'blocked')
+
+        assert _done_provenance(harness, tid) is not None

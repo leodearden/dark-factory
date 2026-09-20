@@ -333,7 +333,11 @@ report ambiguous or missing data):
   that marker un-acknowledged (see `_acknowledge_resolved_stage1_markers`).
 - `stage1_mem0_flags_processed`: count of Mem0 `flag_for_stage2=true` markers that \
   you processed and deleted via FIX C during this cycle. Must equal \
-  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle.
+  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle. \
+  Like `stage1_analytical_findings_processed` below, this value is purely \
+  self-reported — the framework applies no cross-check or correction to it, and \
+  `flag_deleted_records` feeds only the Stage 1 marker acknowledgment described \
+  above, never a repair of this counter — so its accuracy is on you.
 - `stage1_analytical_findings_processed`: count of Stage 1's structured \
   `flagged_items` (analytical findings) that you reviewed this cycle. This equals \
   the number of items from the "Stage 1 Flagged Items" section that you acted on \
@@ -343,8 +347,11 @@ report ambiguous or missing data):
 - `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
   "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
   one per confirmed task creation (see `## Task-Creation Accounting` below). The \
-  framework treats this list as the ground-truth source for `tasks_created` and \
-  repairs the counter upward when the two disagree.
+  framework CORROBORATES each record before using it: it looks the `task_id` up \
+  via `get_task` against the root of the record's own `project_id`, and repairs \
+  `tasks_created` upward only to the number of records whose task is confirmed to \
+  exist. A record naming a task that cannot be confirmed will NOT raise the \
+  counter, so record only creations you actually made.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \

@@ -34,10 +34,16 @@ asyncio_mode = "strict"
 addopts = "-n auto --dist loadgroup -m 'not integration'"
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
-# is 300 rather than the former 60: the cap is WALL-CLOCK, so a healthy test
+# is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
-# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself.
-# 300 is INTERIM and judgement-picked, not measured).
+# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
+# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
+# clock under real fleet load x the 8x headroom factor — and no longer
+# judgement-picked. THE TWO SLOWEST UNMARKED TESTS IN THE WHOLE CORPUS ARE IN
+# THIS SUITE: tests/test_check_bare_magicmock_config.py's whole-tree scans, at
+# 61.52s and 54.52s. They carry no @pytest.mark.timeout, so this default is what
+# governs them, and they are what the value is derived from. See
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N).
 # thread method instead of signal: signal proved unreliable under pytest-xdist
 # workers in practice ("-n auto --dist loadgroup" above). See
@@ -51,9 +57,9 @@ addopts = "-n auto --dist loadgroup -m 'not integration'"
 # @pytest.mark.timeout(N) to opt up — otherwise a single slow run takes
 # down the whole suite. Fix the mock (shared.testing.make_gate_mock)
 # rather than leaning on this cap to recover from hangs.
-# thread method is UNCHANGED by the 60→300 raise, deliberately: the raise
-# attacks the trigger, not the two safety mechanisms.
-timeout = 300
+# thread method is UNCHANGED by the 60→300 and 300→540 raises, deliberately:
+# a raise attacks the trigger, not the two safety mechanisms.
+timeout = 540
 timeout_method = "thread"
 
 [tool.pyright]

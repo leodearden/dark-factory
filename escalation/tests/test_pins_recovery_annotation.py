@@ -27,67 +27,15 @@ import types
 from typing import Any
 
 import pytest
+from _pending_tool_fixtures import (
+    IN_PROGRESS,
+    _file,
+    _get_pending,
+    _harness,
+)
 
-from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-
-IN_PROGRESS = 'in-progress'
-
-
-def _file(queue: EscalationQueue, task_id: str, **kw: Any) -> Escalation:
-    """Submit one pending escalation and return it."""
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=kw.pop('agent_role', 'implementer'),
-        severity=kw.pop('severity', 'blocking'),
-        category=kw.pop('category', 'scope_violation'),
-        summary=kw.pop('summary', 'pins-recovery fixture'),
-        level=kw.pop('level', 1),
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
-
-
-class _Scheduler:
-    """Minimal stand-in for orchestrator.scheduler's status accessors.
-
-    ``get_statuses`` returns a ``(statuses, error)`` TUPLE — the real shape at
-    orchestrator/src/orchestrator/scheduler.py:2523, and the reason a caller
-    that assumes a bare dict silently treats an error as "no tasks".
-    """
-
-    def __init__(self, statuses: dict[str, str], error: Exception | None = None):
-        self._statuses = statuses
-        self._error = error
-        self.calls: list[Any] = []
-
-    async def get_statuses(self, ids: list[str] | None = None):
-        self.calls.append(ids)
-        if self._error is not None:
-            return {}, self._error
-        if ids is None:
-            return dict(self._statuses), None
-        return {i: self._statuses[i] for i in ids if i in self._statuses}, None
-
-
-def _harness(statuses: dict[str, str], *, live: set[str] | None = None, **kw: Any):
-    live_ids = live or set()
-    scheduler = _Scheduler(statuses, error=kw.pop('error', None))
-    return types.SimpleNamespace(
-        scheduler=scheduler,
-        is_workflow_active=lambda tid: tid in live_ids,
-        **kw,
-    )
-
-
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
-    """get_pending_escalations is an ASYNC def as of task 3543 — it awaits a
-    batched scheduler status read to compute pins_recovery."""
-    tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
 
 
 @pytest.mark.asyncio

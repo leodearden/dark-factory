@@ -13,6 +13,7 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
 
 from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
     CuratorConfig,
     EmbedderConfig,
     EntityMintConfig,
@@ -1128,6 +1129,260 @@ class TestReconciliationConfigStormKnobs:
     def test_storm_window_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
+
+
+class TestConsolidationAutoConfig:
+    """Deterministic auto-consolidation knobs (task 5237, PRD §7).
+
+    Shape copied from the ``TestMem0UpdateConfig`` / ``TestEntityMintConfig``
+    pair above — the same bare-submodel + kill-switch + green-tier posture, for
+    the same reason: auto-consolidation writes to the corpus without a human in
+    the loop, so an operator must be able to stop it and to stage it
+    per-project without a restart.
+
+    A TOP-LEVEL section rather than nested under ReconciliationConfig for the
+    reason that model's own ownership note gives: recon Stage 1 is this
+    machinery's first sanctioned CALLER, not its owner — the proposal tool, the
+    executor and the provenance bar all live on the server side.
+    """
+
+    # --- fail-safe defaults (PRD §7 / §12 Q1) ---
+
+    def test_default_enabled_is_false(self):
+        """Ships OFF, unlike its two sibling gates.
+
+        Mem0UpdateConfig.enabled and EntityMintConfig.enabled both default ON
+        because a narrow self-reported allowlist is the real bar there. Here
+        there is no caller-side bar at all — the machinery consolidates on its
+        own — so the kill switch IS the bar until PRD §11's supervised
+        dry-run cycle has been read by a human.
+        """
+        assert ConsolidationAutoConfig().enabled is False
+
+    def test_default_enabled_projects_is_empty(self):
+        """Empty means no project is staged in — the per-project rollout lever
+        (PRD D13, precedent ``summary_rebuild.projects``)."""
+        assert ConsolidationAutoConfig().enabled_projects == []
+
+    def test_default_predicate_version_is_1(self):
+        assert ConsolidationAutoConfig().predicate_version == '1'
+
+    def test_default_member_range_is_2_to_20(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.member_min == 2
+        assert cfg.member_max == 20
+
+    def test_default_claim_max_chars_is_200(self):
+        assert ConsolidationAutoConfig().claim_max_chars == 200
+
+    def test_default_per_cycle_caps_are_3(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.max_auto_per_cycle == 3
+        assert cfg.max_gate_filings_per_cycle == 3
+
+    def test_default_backlog_multiplier_is_5(self):
+        assert ConsolidationAutoConfig().backlog_multiplier == 5
+
+    def test_default_refusal_streak_threshold_is_5(self):
+        assert ConsolidationAutoConfig().refusal_streak_threshold == 5
+
+    def test_default_slug_collision_jaccard_is_0_6(self):
+        assert ConsolidationAutoConfig().slug_collision_jaccard == 0.6
+
+    def test_default_proposal_ttl_hours_is_one_week(self):
+        assert ConsolidationAutoConfig().proposal_ttl_hours == 168
+
+    def test_default_category_weights_are_the_three_mem0_primaries(self):
+        """PRD §12 Q1 — the three Mem0-primary categories, with
+        observations_and_summaries down-weighted because its corpus is
+        session-recap noise far more often than it is a reusable norm."""
+        assert ConsolidationAutoConfig().category_weights == {
+            'procedural_knowledge': 1.0,
+            'preferences_and_norms': 1.0,
+            'observations_and_summaries': 0.7,
+        }
+
+    # --- PRD D5: no runtime cap on canonical length ---
+
+    def test_no_canonical_max_chars_leaf_exists(self):
+        """PRD D5 — the builder's maximum is ~464 chars at every input at its
+        own cap, so a runtime cap would be unreachable dead code. The bound is
+        a unit-test assertion (tests/test_consolidation_auto.py) instead."""
+        assert 'canonical_max_chars' not in ConsolidationAutoConfig.model_fields
+
+    # --- defaults are per-instance, not shared mutables ---
+
+    def test_separate_instances_do_not_share_the_project_list(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.enabled_projects.append('dark_factory')
+        assert b.enabled_projects == []
+
+    def test_separate_instances_do_not_share_the_weight_map(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.category_weights['procedural_knowledge'] = 0.1
+        assert b.category_weights['procedural_knowledge'] == 1.0
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = ConsolidationAutoConfig(
+            enabled=True,
+            enabled_projects=['dark_factory'],
+            predicate_version='2',
+            member_min=3,
+            member_max=8,
+            claim_max_chars=120,
+            max_auto_per_cycle=1,
+            max_gate_filings_per_cycle=0,
+            backlog_multiplier=2,
+            refusal_streak_threshold=3,
+            slug_collision_jaccard=0.8,
+            proposal_ttl_hours=24,
+            category_weights={'procedural_knowledge': 0.5},
+        )
+        assert cfg.enabled is True
+        assert cfg.enabled_projects == ['dark_factory']
+        assert cfg.predicate_version == '2'
+        assert (cfg.member_min, cfg.member_max) == (3, 8)
+        assert cfg.claim_max_chars == 120
+        assert (cfg.max_auto_per_cycle, cfg.max_gate_filings_per_cycle) == (1, 0)
+        assert cfg.backlog_multiplier == 2
+        assert cfg.refusal_streak_threshold == 3
+        assert cfg.slug_collision_jaccard == 0.8
+        assert cfg.proposal_ttl_hours == 24
+        assert cfg.category_weights == {'procedural_knowledge': 0.5}
+
+    # --- validation bounds ---
+
+    def test_member_min_below_one_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(member_min=0)
+
+    def test_member_max_below_member_min_rejected(self):
+        """Cross-field: an incoherent range would make every proposal refuse
+        on member count with no configuration that could ever satisfy it."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(member_min=10, member_max=4)
+
+    def test_member_min_equal_to_member_max_accepted(self):
+        cfg = ConsolidationAutoConfig(member_min=4, member_max=4)
+        assert (cfg.member_min, cfg.member_max) == (4, 4)
+
+    def test_slug_collision_jaccard_above_one_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(slug_collision_jaccard=1.5)
+
+    def test_slug_collision_jaccard_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(slug_collision_jaccard=-0.1)
+
+    def test_slug_collision_jaccard_endpoints_accepted(self):
+        """0.0 (every slug collides) and 1.0 (only an identical token set
+        collides) are both coherent calibration extremes — PRD §12 Q2."""
+        assert ConsolidationAutoConfig(slug_collision_jaccard=0.0).slug_collision_jaccard == 0.0
+        assert ConsolidationAutoConfig(slug_collision_jaccard=1.0).slug_collision_jaccard == 1.0
+
+    def test_claim_max_chars_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(claim_max_chars=0)
+
+    def test_claim_max_chars_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(claim_max_chars=-1)
+
+    def test_proposal_ttl_hours_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=0)
+
+    def test_proposal_ttl_hours_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=-1)
+
+    def test_backlog_multiplier_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(backlog_multiplier=0)
+
+    def test_refusal_streak_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(refusal_streak_threshold=0)
+
+    def test_negative_per_cycle_caps_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_auto_per_cycle=-1)
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_gate_filings_per_cycle=-1)
+
+    def test_zero_per_cycle_caps_accepted_as_off_switches(self):
+        """0 is a LEGAL value on both caps, not a bounds violation: it is the
+        narrow off switch that stops auto-execution (or gate filing) while
+        leaving the rest of the pipeline observing."""
+        cfg = ConsolidationAutoConfig(max_auto_per_cycle=0, max_gate_filings_per_cycle=0)
+        assert cfg.max_auto_per_cycle == 0
+        assert cfg.max_gate_filings_per_cycle == 0
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the OFF default.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default.
+        """
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.consolidation_auto, ConsolidationAutoConfig)
+        assert cfg.consolidation_auto.enabled is False
+        assert cfg.consolidation_auto.enabled_projects == []
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost `enabled`
+        its green tier, and a restart-only kill switch is no kill switch."""
+        annotation = FusedMemoryConfig.model_fields['consolidation_auto'].annotation
+        assert annotation is ConsolidationAutoConfig, (
+            f'expected a bare ConsolidationAutoConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.consolidation_auto is not b.consolidation_auto
+
+
+class TestReconciliationDeterministicProvenancePrefixes:
+    """PRD C5's caller bar for `deterministic-*` done provenance (task 5237).
+
+    Consumed by task epsilon. Lives on ReconciliationConfig rather than on
+    ConsolidationAutoConfig because the bar governs every deterministic
+    provenance kind, not only auto-consolidation's.
+    """
+
+    def test_default_is_orchestrator_only(self):
+        """The orchestrator sends no agent_id, so tools.py::_resolve_identity
+        falls back to the clientInfo.name that mcp_lifecycle.py::
+        McpSession.initialize advertises — the literal 'orchestrator'."""
+        assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
+            'orchestrator',
+        ]
+
+    def test_field_is_a_list_of_str(self):
+        annotation = ReconciliationConfig.model_fields[
+            'deterministic_provenance_allowed_agent_prefixes'
+        ].annotation
+        assert annotation == list[str], f'got {annotation!r}'
+
+    def test_empty_list_accepted_as_deny_all(self):
+        """Deny-on-missing is task epsilon's consumer contract, so the
+        deny-every-caller value must be expressible."""
+        cfg = ReconciliationConfig(deterministic_provenance_allowed_agent_prefixes=[])
+        assert cfg.deterministic_provenance_allowed_agent_prefixes == []
+
+    def test_separate_instances_do_not_share_the_list(self):
+        a, b = ReconciliationConfig(), ReconciliationConfig()
+        a.deterministic_provenance_allowed_agent_prefixes.append('cgl-sched-gate')
+        assert b.deterministic_provenance_allowed_agent_prefixes == ['orchestrator']
 
 
 class TestReconciliationConfigResumeKnobs:

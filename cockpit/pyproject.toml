@@ -87,3 +87,18 @@ markers = [
 # exit 0.
 addopts = "-n auto --dist loadgroup -m 'not smoke'"
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` is chosen from existing evidence, not a new experiment, and the
+# signal-vs-thread trade is deliberately NOT reopened here: the addopts above are
+# the IDENTICAL flag set dashboard/ and escalation/pyproject.toml run, both of
+# which carry timeout_method = "signal" and record themselves measured green
+# under exactly those flags (task 5408). The argument for why flipping to
+# `thread` is a real trade rather than a free upgrade lives once, in
+# fused-memory/pyproject.toml's own timeout_method block.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 540
+timeout_method = "signal"

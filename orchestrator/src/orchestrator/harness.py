@@ -16,8 +16,9 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
+from escalation.pins import classify_pins
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -37,6 +38,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
+from orchestrator import recovery_pins
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -110,6 +112,7 @@ from orchestrator.recovery_emission import (
     should_emit_event,
     veto_signature,
 )
+from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -146,11 +149,14 @@ from orchestrator.systemd_inspect import (
 from orchestrator.task_ground_truth import (
     BranchStateKind,
     ClaimantSource,
-    EscalationRef,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_pins_blocked_done_flip,
+    report_pins_blocked_recovery,
+    report_pins_recovery,
+    report_would_duplicate_a_handoff,
 )
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
@@ -5805,51 +5811,18 @@ class Harness:
     # by omission (the callback never touches them).
     _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
-    # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
-    #
-    # The stranded-blocked reaper's own `stranded_blocked` L1 is filed to
-    # REQUEST exactly the remediation the verified-green auto-merge performs —
-    # so letting it veto that merge is an anti-synergy: the escalation asking
-    # for the merge blocks the merge.  Membership here means "an open
-    # escalation of this class does NOT veto the sweep-side self-heal", and
-    # nothing more: the merge is still gated by detect_verified_green's 3-part
-    # shape check and the merge queue's own re-verify (§2.2 "never bypasses").
-    #
-    # Deliberately MINIMAL — widen only with evidence:
-    #   * `stranded_merge_failed` is EXCLUDED on purpose.  It is the DURABLE
-    #     merge/verify-failure born-at-L2 (see _file_stranded_merge_failed): a
-    #     re-merge cannot remediate a branch that already failed the queue's
-    #     verify, so a task carrying only that escalation must keep vetoing or
-    #     the reaper would re-submit into the same failure.
-    #   * every human-concern class (design_concern / task_failure /
-    #     review_issues / operator-action / infra_issue / ...) is excluded by
-    #     omission — it names a problem a merge does not fix, and must keep
-    #     holding the task for its handler.
-    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
-        'stranded_blocked',
-    })
-
-    @staticmethod
-    def _only_merge_remediable(
-        open_escalations: Sequence[EscalationRef],
-    ) -> bool:
-        """Are *open_escalations* ALL of a merge-remediable class?
-
-        The single category authority for the relaxed verified-green veto
-        (INV-5): called at both sweep-side upgrade clauses in
-        :meth:`_reconcile_one_stranded` in place of the former
-        ``not report.open_escalations``.
-
-        Vacuously ``True`` for an empty list — so a task with no open
-        escalation classifies exactly as it does today.  ``False`` as soon as
-        ONE escalation falls outside :attr:`MERGE_REMEDIABLE_ESC_CATEGORIES`,
-        preserving the safety invariant that a human-concern escalation still
-        vetoes the self-heal.
-        """
-        return all(
-            ref.category in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
-            for ref in open_escalations
-        )
+    # The merge-remediable relaxation MOVED to `orchestrator.recovery_pins`
+    # (task 3541): the single authority for both the category set and the
+    # `all(...)` predicate now lives there, so `scheduler.py` — which cannot
+    # import this class — consumes the SAME relaxation instead of re-deriving a
+    # bare `bool(rows)`.  The two names below are DELEGATIONS, not a second
+    # copy: they exist only so existing call sites and the tests that assert on
+    # `Harness._only_merge_remediable(...)` directly keep their spelling.  The
+    # rationale for the set's membership is documented once, in recovery_pins.
+    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = (
+        recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES
+    )
+    _only_merge_remediable = staticmethod(recovery_pins.only_merge_remediable)
 
     def _on_stranded_merge_done(
         self, fut: asyncio.Future, *, tid: str,
@@ -6026,7 +5999,15 @@ class Harness:
         recovery write — caller handles failure counting + escalation.
 
         Early-return guards (return None without touching the worktree):
-          - open L1 escalation veto (~line 1598): human handoff in progress
+          - the escalation-pin veto in the guard tail: a handoff is in
+            progress.  Since task 3541 that veto is the RESOLVER'S OWN answer
+            (``report_pins_recovery`` -> ``escalation.pins.classify_pins``),
+            not a local ``bool(report.open_escalations)`` re-derivation, so
+            this applier and ``_shape`` cannot disagree about what pins
+            (E7/INV-5).  The two ``deploy_phase`` / ``is_actively_held``
+            guards beside it are NOT policy: they carry facts the
+            ``_RECOVERY`` table structurally cannot express, and are labelled
+            as such in-code.
           - merge-deferred guard (below): task is train-parked (PRD § 9.8);
             the worktree must survive intact for the train-merge worker.
             Mirrors the open-L1 veto pattern — explicit early-return as
@@ -6104,19 +6085,37 @@ class Harness:
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): a task whose branch landed
-        # while it was still blocked is often held by the reaper's OWN
-        # stranded_blocked — the escalation that ASKED for this landing — and
-        # letting it veto the self-heal pins the task blocked forever after its
-        # work is already on main.  Any non-remediable (human-concern)
-        # escalation still yields False and leaves the task alone, and an empty
-        # list is still True, so every other task classifies exactly as before.
+        # THIS CLAUSE ALONE ASKS THE DONE-FLIP QUESTION.  Its outcome is
+        # MARK_DONE_WITH_PROVENANCE — terminal — so it consumes
+        # `report_pins_blocked_done_flip`, built on
+        # `classify_pins(...).vetoes_done_flip`.  Its twin below
+        # (EXISTS_OFF_MAIN -> RE_FILE_ESCALATION), the CONVERT scoping clause
+        # and `Scheduler._phase_redispatch_stranded_blocked` all ask the OTHER
+        # question and share `report_pins_blocked_recovery` /
+        # `records_pin_blocked_recovery`.
+        #
+        # The two predicates carry the SAME merge-remediable relaxation and
+        # differ on exactly one input class — a dead-filer L0.  Recovery may
+        # proceed past one: its handoff has no consumer left, and conversion or
+        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
+        # completing a task past an unconsumed handoff is the phantom-done D4
+        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
+        # say so directly ("any non-info open record still vetoes MARK_DONE").
+        # The dead L0 is not stranded forever either — part 4 of this task, the
+        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
+        #
+        # The relaxation itself is unchanged and is why this clause exists at
+        # all (PRD leaf δ): a task whose branch landed while it was still
+        # blocked is usually held by the reaper's OWN stranded_blocked — the
+        # record that ASKED for this landing — and letting it veto the
+        # self-heal pins the task blocked forever after its work is on main.
+        # Any human-concern handoff still pins, and an empty list still
+        # relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_done_flip(report)
             and report.branch_state.kind in (
                 BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
@@ -6133,20 +6132,21 @@ class Harness:
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): this is the branch shape a
-        # verified-green-but-never-merged task is in, and the escalation
-        # holding it is usually the reaper's OWN stranded_blocked — filed to
-        # REQUEST exactly the merge the verified-green gate below performs.
-        # Letting that request veto its own remediation was the anti-synergy δ
-        # closes.  Any non-remediable (human-concern) escalation still yields
-        # False here and leaves the task alone, and an empty list is still
-        # True, so every other task classifies exactly as before.
+        # The RECOVERY predicate, NOT the done-flip one the clause above uses:
+        # a re-file or an auto-merge is recoverable, so a dead-filer L0 does not
+        # hold it (task 3541).  Otherwise identical in spirit: this is the branch
+        # shape a verified-green-but-never-merged task is in, and the
+        # escalation holding it is usually the reaper's OWN stranded_blocked —
+        # filed to REQUEST exactly the merge the verified-green gate below
+        # performs.  Letting that request veto its own remediation was the
+        # anti-synergy PRD leaf δ closes.  Any non-remediable (human-concern)
+        # handoff still pins here and leaves the task alone, and an empty list
+        # still relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
             and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
@@ -6184,26 +6184,39 @@ class Harness:
         # A PIN THAT `blocked` ACTUALLY HOLDS.
         #
         # The table cannot make this distinction and must not try: `_RECOVERY`
-        # keys on a BOOLEAN `has_open_escalation` and the module is
+        # keys on the CONSERVATIVE `vetoes_done_flip` answer and the module is
         # deliberately pure and config-free, while "which pin categories does
-        # the blocked arm treat as merge-remediable" is THIS class's policy
-        # (`MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping lives here, with
-        # the other two sweep-side adjustments.
+        # the blocked arm treat as merge-remediable" is orchestrator policy
+        # (`recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping
+        # lives here, with the other two sweep-side adjustments.
         #
         # WHY IT IS NEEDED.  `CONVERT_TO_BLOCKED`'s whole justification is that
         # `blocked` is a RESTING state for a pinned row: not dispatchable, and
         # `_RECOVERY`'s only BLOCKED row keys `has_open_escalation=False`, so a
         # converted row can never be recovered out of it by the table.  That
         # holds for a `task_failure` pin (the measured 3717 population) — but
-        # NOT for a pin the two clauses ABOVE deliberately relax on.  For a row
-        # pinned solely by `stranded_blocked`, `_only_merge_remediable` is
-        # True, so the very next sweep would see status='blocked', classify
-        # LEAVE, and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
+        # NOT for a pin the two clauses ABOVE deliberately relax on.  For such
+        # a row the very next sweep would see status='blocked', classify LEAVE,
+        # and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
         # RE_FILE_ESCALATION over an escalation that is already open).  That
         # would turn row (f)'s "never second-guess an open escalation, even
         # with on-main landing evidence" veto into a two-sweep auto-done, and
         # (j) into a possible duplicate filing — the exact hazards the rows
         # exist to avoid, arrived at by a route no one reviewed.
+        #
+        # This clause therefore asks the blocked arm's OWN question — "would
+        # those clauses move this row next sweep?" — by calling the SAME
+        # predicate they call (task 3541).  Before eta it asked with
+        # `_only_merge_remediable`, which WAS that predicate at the time;
+        # keeping the old spelling once the arm moved on would let the two
+        # drift, which is precisely how this hazard reopens.
+        #
+        # Consequence, deliberate: a CONVERT row pinned SOLELY by a dead-filer
+        # L0 in a non-remediable category now lands here instead of converting,
+        # because the blocked arm no longer vetoes on that record either.  Spec
+        # S6 assigns that row's visibility to the ORPHAN-L0 REAPER, which
+        # promotes the aged-out L0 to L1 — after which it is a genuine
+        # QUEUE_HANDOFF and converts on the next sweep.
         #
         # A merge-remediable-pinned strand therefore keeps EXACTLY its
         # pre-3539 disposition: a silent LEAVE, byte-identical emission
@@ -6216,13 +6229,20 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
         ):
+            # Says what the clause ACTUALLY asked.  It used to name the records
+            # "merge-remediable", which was exact while the question WAS
+            # `_only_merge_remediable` — but the predicate now also clears a row
+            # pinned solely by a dead-filer L0 in a NON-remediable category (the
+            # consequence documented above), so that label would tell an
+            # operator the opposite of the truth about why the row was held.
+            # The `id:category` list speaks for itself instead.
             logger.info(
                 'Reconcile: task %s matches a convert_to_blocked row but is '
-                'pinned only by merge-remediable escalation(s) %s — holding '
-                'as before (a converted row would not be at rest: the '
-                'blocked-arm upgrade clauses would move it again next sweep)',
+                'held: the blocked-arm upgrade clauses would move a converted '
+                'row again next sweep, so it would not be at rest '
+                '(open record(s): %s)',
                 tid,
                 ', '.join(
                     f'{ref.id}:{ref.category}' for ref in report.open_escalations
@@ -6308,22 +6328,25 @@ class Harness:
             #
             # CONVERSION IS NOT COMPLETION.  The converted row arrives in
             # `blocked` STILL CARRYING ITS PIN; its exit is a human or task
-            # 3541's `classify_pins` veto collapse, never an automatic
-            # self-heal.  No `done_provenance` is written and no escalation is
-            # filed — the task is already pinned, and a second record would be
+            # the shared `classify_pins` predicate ceasing to call its record
+            # pinning — a human resolves it, or the orphan-L0 reaper promotes a
+            # dead-filer L0 to L1 and a supervised consumer takes it.  Never an
+            # automatic self-heal.  No `done_provenance` is written and no
+            # escalation is filed — the task is already pinned, and a second record would be
             # the duplicate/competing-escalation hazard rows (g)/(h) exist to
             # avoid.
             #
             # That invariant is TRUE OF EVERY ROW THAT REACHES HERE because of
-            # the merge-remediable scoping clause above, not by luck: a pin
-            # inside `MERGE_REMEDIABLE_ESC_CATEGORIES` would be picked up again
-            # by the blocked-arm upgrade clauses on the next sweep, so those
-            # rows are held before they ever get here (review finding #3).
+            # the scoping clause above, not by luck: a row the blocked-arm
+            # upgrade clauses would move again next sweep is held before it
+            # ever gets here (review finding #3).  Since task 3541 that clause
+            # asks those clauses' OWN question, through the same shared
+            # predicate, so the two cannot drift apart.
             logger.warning(
                 'Reconcile: converting task %s in-progress -> blocked '
                 '(shape=%s, branch=%s, pinned by %s) — pinned and unclaimed, '
                 'so it can no longer be re-dispatched; it keeps its pin and '
-                'its exit is a human or task 3541, NOT a self-heal',
+                'its exit is a human or a resolved pin, NOT a self-heal',
                 tid,
                 recovery_shape_str(report),
                 report.branch_state.kind.value,
@@ -6581,20 +6604,57 @@ class Harness:
                 if await self._maybe_submit_stranded_verified_green(tid, metadata):
                     return None
 
-                # Dedup guard (PRD leaf δ): reaching here with an escalation
-                # ALREADY open means the relaxed veto let us through on a
-                # merge-remediable one (the two clauses above are the only way
-                # in: θ1's resolver rows all require an empty list, and the
-                # EXISTS_OFF_MAIN upgrade now requires _only_merge_remediable)
-                # — and the verified-green submit just declined (non-match).
-                # Re-filing would stack a SECOND stranded_blocked L1 on a task
-                # that already has one pending, so leave the existing
-                # escalation for its handler.  A plain truthiness check
-                # suffices: merge-remediable-ness is already established
-                # upstream, keeping _only_merge_remediable the sole category
-                # authority (INV-5).  The empty case — every task that reached
-                # here before δ — falls through to the unchanged re-file.
-                if report.open_escalations:
+                # DEDUP guard (PRD leaf δ) — "would filing another escalation
+                # stack a DUPLICATE?".  A third question, asked through the
+                # shared module like every other site (task 3541), not a bare
+                # truthiness test: `report_would_duplicate_a_handoff` reads the
+                # OWNED buckets of the same `classify_pins` classification the
+                # clauses above consume.
+                #
+                # THREE routes reach here, all legitimate:
+                #   * `_RECOVERY` row (g) — a stranded `blocked` task with no
+                #     record that vetoes a done-flip.  Since this task made
+                #     `_shape` pin-class-aware, an INFO-only strand takes this
+                #     route, which is precisely why a bare
+                #     `bool(report.open_escalations)` was wrong here: it
+                #     counted the annotation and swallowed the re-file the
+                #     table had just ordered, silently.
+                #   * the ON_MAIN blocked-arm clause, and
+                #   * the EXISTS_OFF_MAIN one — either of which may have
+                #     relaxed past a merge-remediable record, after which the
+                #     verified-green submit declined (non-match).
+                #
+                # An `info` record does NOT dedup: an annotation has no
+                # consumer, so re-filing over it stacks nothing.  A dead-filer
+                # L0 DOES, even though it does not pin recovery: it is still a
+                # record on the task and the orphan-L0 reaper promotes it, so a
+                # second L1 filed now would be the duplicate this guard exists
+                # to prevent.
+                #
+                # The hold SPEAKS (spec §7.3 — never a bare `return None`).
+                # The chokepoint above cannot cover it: `action` here is
+                # RE_FILE_ESCALATION, not LEAVE, so without this the operator
+                # gets no row at all for a task the sweep decided to hold.
+                # Mirrors the chokepoint's emission — INCLUDING `tally` —
+                # so the two cannot disagree about a log-mode hold.  The
+                # tally is not optional here: `_release_recovery_veto_streaks`
+                # pops every tracked entry whose task is absent from
+                # `tally.observed_task_ids`, so an emission that charges the
+                # tracker without folding into the tally is un-charged in the
+                # same pass (esc-3541-7) — the streak can never climb, and a
+                # previously-filed streak alarm is auto-resolved every sweep
+                # while the hold recurs.
+                if report_would_duplicate_a_handoff(report):
+                    if not emitted_recovery:
+                        self._emit_recovery_disposition(
+                            tid,
+                            site=RecoverySite.reconcile_sweep,
+                            reason=downgraded_reason or LeaveReason.escalation_pinned,
+                            shape=recovery_shape_str(report),
+                            records=report.open_escalations,
+                            store_unavailable=report.escalation_store_unavailable,
+                            tally=tally,
+                        )
                     return None
 
                 from escalation.models import Escalation
@@ -6646,9 +6706,17 @@ class Harness:
                 )
             return None
 
-        # Deploy-phase-tracked in-progress tasks are never auto-recovered by
-        # this generic reaper (review amendment, task 2243 W10-θ2
-        # reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
+        # THE GUARD TAIL.  Task 3541 (eta) separated the two kinds of check
+        # that used to sit here indistinguishably.  What was removed is the
+        # POLICY RE-DERIVATION (the `bool(report.open_escalations)` copy below,
+        # now the resolver's own shared answer — E7/INV-5).  What stays, and
+        # why, is stated on each survivor: both are facts the `_RECOVERY` table
+        # structurally CANNOT express, not second opinions about its output.
+        #
+        # BELT AND BRACES #1 — a deploy phase the table deliberately leaves
+        # unmapped.  Deploy-phase-tracked in-progress tasks are never
+        # auto-recovered by this generic reaper (review amendment, task 2243
+        # W10-θ2 reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
         # requires deploy_phase is None for EVERY MARK_DONE_WITH_PROVENANCE /
         # REVERT_TO_PENDING row (a/b/c/d) — so an in-progress task carrying a
         # deploy_phase can only reach this point via the LEAVE default
@@ -6670,21 +6738,32 @@ class Harness:
         if report.deploy_phase is not None:
             return None
 
-        # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own
-        # in-memory dispatch bookkeeping (dispatched / module-lock held /
-        # recent workflow-cancel stamp) — unambiguous, and not something the
-        # applier below independently re-derives (that was the now-deleted
-        # driver-level guard's job). Trust it directly rather than falling
-        # through.
+        # BELT AND BRACES #2 — the scheduler's IN-MEMORY dispatch bookkeeping,
+        # which no `TruthReport` field carries.  task 2243, W10-θ2 step-12:
+        # is_actively_held folds dispatched / module-lock held / recent
+        # workflow-cancel — unambiguous, and not something the applier below
+        # independently re-derives (that was the now-deleted driver-level
+        # guard's job). Trust it directly rather than falling through.
         if self.scheduler.is_actively_held(tid):
             return None
 
-        # An open escalation at ANY level (not just L1 — the resolver's row
-        # (f) folds every level) is the deliberate human/automation-handoff
-        # signal: don't reap it. Replaces the old has_open_l1(tid) veto
-        # (L1-only), which missed an L2-only open escalation and fell
-        # through to an incorrect revert.
-        if report.open_escalations:
+        # THE VETO — and no longer a local re-derivation of it (task 3541,
+        # E7/INV-5).  `report_pins_recovery` is the resolver's OWN
+        # `escalation.pins.classify_pins(...).pins` answer, so this applier and
+        # `_shape` can no longer disagree about whether a record pins: before
+        # the rewiring this read `bool(report.open_escalations)`, which held a
+        # strand on an info-severity ANNOTATION the resolver had already
+        # stopped counting (PRD boundary #8).
+        #
+        # `downgraded_reason is not None` is folded in and is NOT redundant.
+        # Task 3539's log mode (and its merge-remediable scoping clause) turn a
+        # CONVERT row into a LEAVE that must still HOLD, and both reach here.
+        # Without this disjunct a log-mode pinned strand — including a dead-L0
+        # one, which `pins` deliberately calls unpinned — would fall straight
+        # through to `_revert_in_progress_if_no_live_claimant` and be reverted
+        # underneath its responder: the precise demand-1 violation conversion
+        # exists to prevent.
+        if downgraded_reason is not None or report_pins_recovery(report):
             # Task 3535: the SAME hold the chokepoint above already described.
             # Emitting unguarded here would DOUBLE every boundary-#9 row — this
             # early-return and that chokepoint both see an on-main pinned
@@ -6703,9 +6782,14 @@ class Harness:
                     shape=recovery_shape_str(report),
                     records=report.open_escalations,
                     store_unavailable=report.escalation_store_unavailable,
+                    tally=tally,
                 )
             return None
 
+        # BELT AND BRACES #3 — R3, the applier-side fact `_shape` cannot
+        # carry.  `_shape` sees only `live_claimant is not None`; it cannot see
+        # that a PLAN_LOCK-sourced claimant proves nothing mid-run.
+        #
         # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
         # step-16 — this blanket check replaces the applier's own owner_pid
         # re-derivation, now retired), EXCEPT the R3 mid-run exception: a
@@ -11040,9 +11124,10 @@ class Harness:
           the healthy majority of every sweep, and emitting for it would bury
           the strands this mechanism exists to surface.
 
-        ``classify_pins`` is consulted ONLY to bucket ids for the payload; the
-        veto answer stays with the caller's own untouched predicate (rewiring
-        that is task eta / 3541).
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload.
+        Since task 3541 the veto answer is the caller's, taken from the SAME
+        classifier through ``orchestrator.recovery_pins`` before it ever
+        reaches this method — describing and deciding stay separate.
 
         ``task_id=None`` is a PROCESS-scoped notice with no single subject —
         "this whole site has no escalation queue to read".  With no subject
@@ -13451,19 +13536,31 @@ class Harness:
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
+    #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
+    #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
+    #: memo, whose whole point is that ONE record costs at most ONE task read.
+    _UNFETCHED: ClassVar[object] = object()
+
     async def _reap_orphan_l0_escalations(self) -> int:
         """Single pass: promote any overdue orphan L0 to L1.  Returns count.
 
         Extracted from the loop so tests can drive it deterministically.
-        An escalation is an orphan when its ``task_id`` is not in
-        ``_escalation_events`` (no running workflow) AND the scheduler does
-        not show it actively held (task 2878 — see the live-recheck note
-        below), and it is older than ``orphan_l0_timeout_secs``.
+        An escalation is an orphan when it is older than
+        ``orphan_l0_timeout_secs`` and the incarnation that FILED it is no
+        longer live — NOT merely when no workflow is running for its task.
+
+        That distinction is spec ``docs/task-escalation-state-spec.md`` S6 and
+        is what task 3541 changed: "a newer incarnation never keeps a prior
+        incarnation's unconsumed L0 alive".  Before it, ``esc.task_id in
+        _escalation_events`` / ``scheduler.is_actively_held`` deferred on ANY
+        live workflow, so a re-dispatched task's prior-incarnation L0 was
+        IMMORTAL — perpetually deferred, never promoted, never consumed.
 
         Async (task 2725): the done-step-commit orphan class needs to
         ``await self.scheduler.get_task(...)`` to check whether its
         subject task is terminal+merged (rebase-superseded false
-        positive) before promoting.
+        positive) before promoting.  Task 3541's liveness arm reuses that same
+        read rather than adding a second RPC.
         """
         if self._escalation_queue is None:
             return 0
@@ -13477,29 +13574,80 @@ class Harness:
         for esc in self._escalation_queue.get_pending():
             if esc.level != 0:
                 continue
-            if esc.task_id in self._escalation_events:
-                continue  # active workflow will handle it
-            # Task 2878: _escalation_events is a stale sweep-start snapshot
-            # — it's populated at dispatch and popped by the workflow
-            # slot's done-callback, so a task's id can vanish from it (slot
-            # rotation, a coordinated batch-redispatch tick) while a live
-            # or re-dispatched workflow is still actively holding exactly
-            # this task's metadata.files locks. That race produced false
-            # promotions for the plan.files/metadata.files divergence class
-            # (filed by TaskWorkflow._check_scope_invariant during genuine
-            # in-flight scope-reconciliation lag), which watchers then
-            # verified live and closed benign. Re-check live scheduler
-            # state at flag time via the same liveness signal the watchers
-            # use, and defer (not drop) promotion while it's live — the
-            # next sweep re-checks and promotes once genuinely idle.
-            if self.scheduler.is_actively_held(esc.task_id):
-                continue
             try:
                 age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
             except (ValueError, TypeError):
                 continue
             if age_secs < timeout:
                 continue
+
+            # The task row, fetched AT MOST ONCE per record and shared by the
+            # liveness arm below with the divergence / done-step-commit
+            # branches further down.  `_UNFETCHED` distinguishes "not read yet"
+            # from a genuine `get_task` -> None (no such row).
+            task: dict | None | object = self._UNFETCHED
+
+            async def _task_row(tid: str = esc.task_id) -> dict | None:
+                nonlocal task
+                if task is self._UNFETCHED:
+                    task = await self.scheduler.get_task(tid)
+                return cast('dict | None', task)
+
+            # LIVENESS — spec S6's filing-incarnation rule (task 3541).
+            #
+            # Both signals below answer "is SOME workflow live for this task?".
+            # Task 2878's note on the first one is still exact and still the
+            # reason the second exists: `_escalation_events` is a stale
+            # sweep-start snapshot — populated at dispatch and popped by the
+            # workflow slot's done-callback — so a task's id can vanish from it
+            # (slot rotation, a coordinated batch-redispatch tick) while a live
+            # or re-dispatched workflow is still actively holding exactly this
+            # task's metadata.files locks.  That race produced false promotions
+            # for the plan.files/metadata.files divergence class, which watchers
+            # verified live and closed benign.
+            #
+            # But "some workflow is live" is the WRONG QUESTION, and answering
+            # it is what made a prior incarnation's L0 immortal.  So a live
+            # signal now only means "ask the classifier", and the classifier
+            # judges the FILER: promotion proceeds ONLY when the record lands in
+            # `dead_l0`, i.e. when both identities are known and DIFFERENT.
+            # Every unprovable case — an unstamped legacy record, an
+            # `is_actively_held`-only IN_MEMORY holder with no identity, a
+            # non-`compose_claimant_run_id`-shaped value on either side — falls
+            # to QUEUE_HANDOFF and therefore to today's deferral.  The chain
+            # that decides this lives in `escalation/pins.py` (link 4) and is
+            # not restated here; inheriting it is what makes this arm strictly
+            # additive rather than a new liveness policy.
+            #
+            # Sited BELOW the age check on purpose: a `get_task` is paid only
+            # for records that are BOTH aged out AND currently deferred, so the
+            # common case (young, or nothing live) costs exactly what it did.
+            #
+            # `liveness_note` records WHICH arm cleared this record, because the
+            # promoted L1's summary and the dismissal note may only claim what
+            # that arm actually established — see the promotion site below.
+            liveness_note = 'no active workflow'
+            if (
+                esc.task_id in self._escalation_events
+                or self.scheduler.is_actively_held(esc.task_id)
+            ):
+                live_row = await _task_row()
+                live_run_id = (live_row or {}).get('claimant_run_id')
+                pins = classify_pins(
+                    esc.task_id,
+                    [esc],
+                    live_claimant=True,
+                    live_claimant_id=live_run_id,
+                )
+                if esc.id not in pins.dead_l0:
+                    # Deferred, not dropped — exactly as before.  The next
+                    # sweep re-checks and promotes once the filer is provably
+                    # gone (or the record is consumed).
+                    continue
+                liveness_note = (
+                    f'filing incarnation {esc.filing_claimant_run_id} is gone, '
+                    f'current claimant is {live_run_id}'
+                )
 
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
@@ -13536,9 +13684,11 @@ class Harness:
             # False -> still promoted (preserves task 2878's boundary guard).
             # Placed after the age check so only aged-out divergence orphans
             # pay the get_task cost; the divergence and done-step-commit
-            # classes are mutually exclusive, so at most one get_task fires.
+            # classes are mutually exclusive, and `_task_row` memoises, so at
+            # most ONE get_task fires per record even when the task 3541
+            # liveness arm above already needed the row.
             if _is_scope_divergence_orphan(esc):
-                task = await self.scheduler.get_task(esc.task_id)
+                task = await _task_row()
                 if _has_fresh_dispatch(
                     task, now, self.config.orphan_l0_dispatch_freshness_secs,
                 ):
@@ -13586,7 +13736,7 @@ class Harness:
             # content landed on main under a new SHA via the merge. Dismiss
             # rather than promote a duplicate manual-triage L1.
             if _is_done_step_commit_orphan(esc):
-                task = await self.scheduler.get_task(esc.task_id)
+                task = await _task_row()
                 if _is_terminal_merged(task):
                     self._escalation_queue.resolve(
                         esc.id,
@@ -13612,6 +13762,16 @@ class Harness:
             # the orphan's worktree is ephemeral and likely reaped before a
             # human reads the promoted L1 (see workflow._durable_ref_suffix).
             branch = f'{self.config.git.branch_prefix}{esc.task_id}'
+            # Both strings below are branched on `liveness_note` (task 3541)
+            # rather than asserting "no active workflow" unconditionally.  That
+            # claim was true while the reaper skipped every task with a live
+            # signal; the filing-incarnation arm promotes precisely when a
+            # workflow IS live and only the FILER is gone, so the old wording
+            # would be false in exactly the case this arm adds.  It is not
+            # cosmetic: `TaskWorkflow._wait_for_resolution` polls `get_by_task`
+            # TASK-scoped, not incarnation-scoped, so this dismissal wakes the
+            # live run and its note is the resolution a live agent reads on
+            # resume.
             reesc = Escalation(
                 id=self._escalation_queue.make_id(esc.task_id),
                 task_id=esc.task_id,
@@ -13619,7 +13779,7 @@ class Harness:
                 severity=esc.severity,
                 category=esc.category,
                 summary=(
-                    f'Orphan L0 ({age_secs:.0f}s old, no active workflow): '
+                    f'Orphan L0 ({age_secs:.0f}s old, {liveness_note}): '
                     f'{esc.summary}'
                 ),
                 detail=(
@@ -13637,8 +13797,8 @@ class Harness:
             self._escalation_queue.resolve(
                 esc.id,
                 (
-                    'Auto-promoted to level 1 — orphan L0 (no active '
-                    f'workflow for task_id={esc.task_id})'
+                    f'Auto-promoted to level 1 — orphan L0 for '
+                    f'task_id={esc.task_id} ({liveness_note})'
                 ),
                 dismiss=True,
                 resolved_by='harness-orphan-reaper',
@@ -14632,8 +14792,14 @@ class Harness:
     async def _recover_stranded_deterministic_task(
         self, tid: str, task: dict, metadata: dict,
         *, tally: RecoverySweepTally | None = None,
-    ) -> None:
+    ) -> bool:
         """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        Returns True iff an escalation was actually FILED.  The caller uses
+        that to gate its ``recovered_this_pass`` bookkeeping (task 3541): a
+        dedup skip must NOT mark the task recovered, or Source B would stop
+        re-validating its open record for a whole pass — which is exactly what
+        the deleted outer copy's ``continue`` used to achieve by not adding it.
 
         ``tally`` is the calling sweep's per-pass recovery accumulator, OPTIONAL
         and defaulted so every direct caller keeps working untouched (the same
@@ -14641,12 +14807,15 @@ class Harness:
         one gets this site's holds folded in, which is what lets the sweep
         release the streak alarms of tasks it no longer holds.
 
-        Dedup-guarded: skips when a pending escalation already exists for
+        Dedup-guarded: skips when a PINNING escalation is already open for
         *tid* — self-dedupes across sweep passes once filed.  That skip logs
         (unchanged) AND emits a structured ``recovery_vetoed`` naming the
-        pinning records (task 3535); the sweep's Source-A deploy branch
-        implements the same predicate and emits under its own site label, so
-        the duplication is measurable until task eta (3541) collapses it.
+        pinning records (task 3535).  This is now the SOLE copy of that guard:
+        task 3541 deleted the twin in ``_run_deterministic_recon_sweep``'s
+        Source-A deploy branch, which read the same queue and emitted the same
+        veto one line earlier.  THIS copy is the one that survived because the
+        method has direct callers that rely on it — deleting it would make the
+        method unsafe to call standalone.
         Re-validates live systemd health for the deploy's target unit and
         RE-FILES a single L1 escalation — this method NEVER calls
         ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
@@ -14667,24 +14836,36 @@ class Harness:
                 shape=render_shape(None, None, None, None, None),
                 store_unavailable=True,
             )
-            return
+            return False
         # The queue is present: re-arm this site's one-shot notice, exactly as
         # Scheduler._phase_redispatch_stranded_blocked re-arms its own latch.
         self._rearm_recovery_process_notice(RecoverySite.deterministic_recon_deploy)
         _dedup_rows = self._escalation_queue.get_by_task(tid, status='pending')
-        if _dedup_rows:
+        # The SHARED pin predicate (task 3541, INV-5), not a bare
+        # `bool(_dedup_rows)`.  `live_claimant=False` is honest here: the only
+        # production caller enumerates `blocked` tasks in the
+        # stranded-deterministic shape, so no incarnation holds them, and a
+        # direct caller invoking this method is by construction acting on a
+        # task nothing is running.  Under `classify_pins` link 4 that makes a
+        # plain L0 read DEAD_L0.
+        #
+        # Consequence, accepted and correct under spec S6: an info-severity
+        # record and a dead-filer L0 no longer suppress the re-file.  An
+        # annotation is not a handoff, and a dead L0 has no consumer left — in
+        # neither case is there an open handoff for this re-file to duplicate,
+        # which is the only thing this guard exists to prevent.
+        if records_pin_recovery(tid, _dedup_rows, live_claimant=False):
             logger.info(
                 'Deterministic-recon-sweep: task %s already has a pending '
                 'escalation — skipping strand recovery (dedup)',
                 tid,
             )
             # The log line above stays the HUMAN record and the event below is
-            # the machine-readable one; neither replaces the other.  This
-            # predicate is duplicated verbatim in _run_deterministic_recon_
-            # sweep's Source-A deploy branch, which emits under its own
-            # RecoverySite.deterministic_recon_sweep label — task eta (3541)
-            # owns collapsing the pair, and until then BOTH deliberately speak
-            # so the duplication is measurable rather than assumed.
+            # the machine-readable one; neither replaces the other.  Since task
+            # 3541 this is the ONLY emission for this hold: the twin under
+            # RecoverySite.deterministic_recon_sweep is gone, so one pass over
+            # one held task now produces exactly one row under exactly one
+            # site label.
             self._emit_recovery_disposition(
                 tid,
                 site=RecoverySite.deterministic_recon_deploy,
@@ -14696,7 +14877,7 @@ class Harness:
                 records=_dedup_rows,
                 tally=tally,
             )
-            return
+            return False
 
         verdict = await self._revalidate_deterministic_deploy_health(metadata)
         before_done = metadata.get('before_done') or {}
@@ -14766,6 +14947,7 @@ class Harness:
             'L1 %s (category=%s, suggested_action=%s, no status change)',
             tid, verdict, esc.id, category, suggested_action,
         )
+        return True
 
     async def _recover_stranded_deterministic_gate(
         self, tid: str, task: dict, metadata: dict,
@@ -15065,10 +15247,11 @@ class Harness:
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
         recovered_this_pass: set[str] = set()
-        # ONE tally across BOTH deterministic sites, deliberately: they are two
-        # halves of one duplicated predicate (task eta / 3541 collapses them)
-        # and the streak alarm they can file is keyed on task_id alone, so
-        # "held ANYWHERE in this pass" is exactly the right release granularity.
+        # ONE tally across BOTH deterministic sites, deliberately: the streak
+        # alarm they can file is keyed on task_id alone, so "held ANYWHERE in
+        # this pass" is exactly the right release granularity.  Since task 3541
+        # collapsed the duplicated predicate only the deploy site can still
+        # CHARGE, but the release below still names both — see there.
         # Bookkeeping only — this sweep has its own logging and does NOT log a
         # second summary line; part (2)'s unconditional summary belongs to the
         # reconcile sweep.
@@ -15099,33 +15282,28 @@ class Harness:
                 if _is_deploy:
                     # Deploy strand: dedup on the pending queue, then re-file an
                     # L1 whose category depends on live systemd unit health.
-                    _deploy_rows = self._escalation_queue.get_by_task(
-                        tid, status='pending',
-                    )
-                    if _deploy_rows:
-                        # Was a completely SILENT `continue`.  Twin of the
-                        # identical predicate at the head of
-                        # _recover_stranded_deterministic_task, which emits
-                        # under RecoverySite.deterministic_recon_deploy; task
-                        # eta (3541) owns collapsing the pair, and until then
-                        # BOTH deliberately emit so the duplication is
-                        # measurable rather than assumed.
-                        self._emit_recovery_disposition(
-                            tid,
-                            site=RecoverySite.deterministic_recon_sweep,
-                            reason=LeaveReason.escalation_pinned,
-                            shape=render_shape(
-                                'blocked', None, None, True,
-                                (metadata.get('deploy_state') or {}).get('phase'),
-                            ),
-                            records=_deploy_rows,
-                            tally=recovery_tally,
-                        )
-                        continue
-                    await self._recover_stranded_deterministic_task(
+                    #
+                    # BOTH of those live in _recover_stranded_deterministic_task
+                    # (task 3541).  This branch used to perform the SAME
+                    # `get_by_task(tid, status='pending')` read and the SAME
+                    # veto one line before calling it, emitting under a second
+                    # site label — so a recovered strand paid for two identical
+                    # reads per pass and a held one produced two rows for one
+                    # hold.  The inner copy is the one that survived because
+                    # the method has direct callers that rely on its own guard.
+                    #
+                    # The return value is what keeps this collapse
+                    # behaviour-preserving.  The deleted `continue` marked a
+                    # dedup-skipped task as NOT recovered_this_pass, so Source
+                    # B still re-validated its open record in the same pass;
+                    # calling through unconditionally and always adding the tid
+                    # would silently skip that re-validation for a whole pass.
+                    # Gating on "did it actually FILE?" reproduces the old
+                    # membership exactly.
+                    if await self._recover_stranded_deterministic_task(
                         tid, task, metadata, tally=recovery_tally,
-                    )
-                    recovered_this_pass.add(tid)
+                    ):
+                        recovered_this_pass.add(tid)
                 elif _is_gate:
                     # Gate strand: the discriminator is an archive-INCLUSIVE,
                     # role-scoped emptiness check (status=None scans queue root +
@@ -15142,6 +15320,25 @@ class Harness:
                     # predicates that stays separate and documented, so
                     # emitting here would blur a boundary drawn on purpose.
                     # Its silence is asserted by a test, not accidental.
+                    #
+                    # CARVE-OUT (task 3541): this check STAYS separate from the
+                    # shared pin predicate, and the reason is the question it
+                    # asks.  Every pin predicate reads only OPEN records and
+                    # asks "is a handoff still holding this task?".  This one
+                    # asks "did a human already ACT?", which is why `status` is
+                    # unset — the read is archive-INCLUSIVE, so a RESOLVED
+                    # record counts.  Narrowing it to `status='pending'` to
+                    # match the pin reads would make a human-resolved gate look
+                    # like a fresh strand and re-fire over it.
+                    #
+                    # PRD D3 names a SECOND carve-out,
+                    # `workflow.py::_is_gating_escalation`.  That one is
+                    # PRODUCER-side and task 3541 deliberately does not touch
+                    # it: task 5222 owns narrowing it (and the
+                    # `_wait_for_resolution` short-circuit) onto
+                    # `escalation.pins.is_queue_handoff` from task 5221, so a
+                    # comment there claiming permanence would be false on
+                    # arrival.  The boundary is recorded here instead.
                     if self._escalation_queue.get_by_task(
                         tid, agent_role=DETERMINISTIC_AGENT_ROLE,
                     ):
@@ -15157,8 +15354,13 @@ class Harness:
 
         # Source A is the only part of this pass that can CHARGE a veto streak,
         # so its end is this sweep's release point.  Both deterministic sites
-        # are named because this pass drives both; releasing only the one that
-        # happened to fire would leave the other's entry to grow forever.
+        # are still named even though task 3541 left only
+        # `deterministic_recon_deploy` able to charge: a pre-collapse
+        # orchestrator charged `deterministic_recon_sweep` too, and a streak
+        # entry under that label survives in the registry across the deploy
+        # that lands this change.  Releasing only the site that can still fire
+        # would leave those entries to grow forever, so the member and the
+        # two-site release both stay.
         # Deliberately after the loop rather than at method exit: the alarm it
         # may resolve is itself a pending record, and standing it down here
         # keeps Source B's re-globbed get_pending() from re-observing an

@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
+import gzip
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 if TYPE_CHECKING:
+    from shared.psi import PsiSample
+
     from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
@@ -60,6 +63,7 @@ from orchestrator.verify_classify import (
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
+    _PYTEST_VALUE_FLAGS,
     ChainSegment,
     ToolKind,
     VerifyCmd,
@@ -1729,6 +1733,13 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     the one structured record of which segments never ran, leaving those facts
     only as free text inside the aggregated ``output`` blob.
 
+    ``load`` (task 3353) rides here on identical terms, ``.get`` included, and
+    for the same reason: it is the host load the command ran under, and this
+    payload is the artifact the budget census reads. A field missing from the
+    whitelist would not FAIL — it would quietly produce a corpus with no load
+    column, which is the defect above repeated on the deliverable whose entire
+    purpose is that column.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -1761,6 +1772,7 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
                 'started_at': r['started_at'],
                 'duration_secs': r['duration_secs'],
                 'segments': r.get('segments'),
+                'load': r.get('load'),
             }
             for r in active_runs
         ],
@@ -1807,15 +1819,45 @@ def _prepare_junit_report_path(
 
     Reuses :func:`_make_infix` for the per-module sanitized filename infix
     (``pkg/sub`` -> ``.pkg_sub``) so a per-module fan-out never collides.
+
+    Computes and creates only — clearing a stale report belongs to
+    :func:`_clear_junit_report`, at the write.  The DIRECTORY is resolved
+    rather than the file, so the returned path is absolute (module commands
+    ``cd``, so a relative ``--junitxml`` would land in the wrong place) while
+    its final component stays unresolved: a symlink there must be unlinked as
+    a link, not followed to its target.
     """
     if not worktree.is_dir():
         return None
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
+        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}.xml'
     except OSError:
         return None
-    return (junit_dir / f'report{_make_infix(module_prefix)}.xml').resolve()
+    return report
+
+
+def _clear_junit_report(junit_path: Path) -> None:
+    """Remove any report left at *junit_path* by an earlier pytest invocation.
+
+    Belongs immediately before each test-leg run that injects ``--junitxml``,
+    NOT where the path is computed: pytest is invoked 1..N times inside one
+    ``run_verification`` (the pure-timeout retry loop, and the env-recovery
+    re-run, which fires regardless of ``max_retries`` and so is live on the
+    merge lane where every caller passes 0).  A pass killed before pytest
+    started would otherwise inherit its predecessor's report — read back as
+    THIS run's failing test ids and archived as THIS run's cost.
+
+    Siting it at the write also means a leg with no test command clears
+    nothing, so a type-only gate cannot delete a report it could never write.
+    """
+    try:
+        junit_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            '_clear_junit_report: could not remove %s: %s', junit_path, exc,
+        )
 
 
 def _write_run_log(
@@ -1942,14 +1984,10 @@ def _persist_attempt_logs(
     # Build summary.json via the shared helper (same shape as merge-path summary).
     summary_payload = _build_summary_payload(runs, category, cause_hint)
 
-    summary_path = verify_dir / f'attempt-{attempt_id}{infix}.summary.json'
-    try:
-        summary_path.write_text(
-            json.dumps(summary_payload, indent=2, ensure_ascii=False),
-            encoding='utf-8',
-        )
-    except OSError as exc:
-        logger.warning('_persist_attempt_logs: could not write %s: %s', summary_path, exc)
+    _write_json_artifact(
+        verify_dir / f'attempt-{attempt_id}{infix}.summary.json',
+        summary_payload, '_persist_attempt_logs',
+    )
 
     return written
 
@@ -2006,6 +2044,125 @@ def _archive_attempt_log(
     return archived
 
 
+def _archive_stamp() -> str:
+    """The microsecond UTC stamp every durable archive filename is keyed by.
+
+    Microsecond rather than second precision so back-to-back retries for one
+    task never overwrite each other; still lexicographically sortable.
+    """
+    return datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+
+
+def _archive_attempt_id(attempt_id: 'int | None') -> int:
+    """The attempt number a durable archive filename is stemmed with.
+
+    Merge verifies carry no ``attempt_id`` at all
+    (``verify_runner.LocalRunner.run_merge_verify`` passes none), so every
+    archive writer must agree on one fallback — otherwise a run's plan, logs
+    and junit stop sharing a stem and cannot be joined.
+
+    Tests ``is not None`` rather than truthiness so a real attempt 0 stems at
+    ``attempt-0``, matching the worktree copy beside it.
+    """
+    return attempt_id if attempt_id is not None else 1
+
+
+def _archive_junit_report(
+    junit_path: Path,
+    archive_root: 'Path | None',
+    task_id: 'str | None',
+    attempt_id: int,
+    *,
+    module_prefix: 'str | None' = None,
+) -> 'Path | None':
+    """Gzip one leg's junit report into the durable archive, GREEN OR RED.
+
+    Ungated on ``passed``: this is a COST record, and a red-only cost corpus
+    describes a different population from the one being measured.  Gzipped
+    because the greens are what make the volume bite against the shared
+    oldest-first ``_DEFAULT_ARCHIVE_MAX_BYTES`` cap, which would otherwise
+    start evicting the failure logs.  A missing report is normal — nothing
+    injected ``--junitxml`` — so it returns ``None`` quietly; every other
+    failure warns, because observability may not fail a verify.
+    """
+    dest: Path | None = None
+    try:
+        if archive_root is None or task_id is None or not junit_path.is_file():
+            return None
+        target_dir = archive_root / task_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest = target_dir / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}'
+            f'.junit-{_archive_stamp()}.xml.gz'
+        )
+        # compresslevel 6, not gzip's default 9: this runs synchronously on
+        # the event loop that also carries the scheduler, the MCP server and
+        # the merge worker, and 9 costs twice the wall-clock for half a
+        # percent of size (measured on a 6MB report: 0.429s vs 0.214s).
+        with junit_path.open('rb') as report, gzip.open(dest, 'wb', 6) as archived:
+            shutil.copyfileobj(report, archived)
+    except Exception:  # noqa: BLE001 — observability may not fail a verify
+        logger.warning(
+            '_archive_junit_report: could not archive %s → %s',
+            junit_path, dest, exc_info=True,
+        )
+        return None
+    return dest
+
+
+def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
+    """Write *payload* to *path* as indented UTF-8 JSON, or warn and return None."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8',
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning('%s: could not write %s: %s', caller, path, exc)
+        return None
+    return path
+
+
+def _persist_verify_plan(
+    plan_dict: 'dict | None',
+    worktree: Path,
+    *,
+    attempt_id: 'int | None',
+    task_id: 'str | None',
+    archive_root: 'Path | None',
+) -> None:
+    """Persist the derived verify plan as an attempt artefact, green or red.
+
+    ``PlannedRun.reason`` — why a leg ran full-suite rather than file-scoped —
+    otherwise reaches only the ``Verify plan:`` log line.  The archive copy is
+    written directly rather than copied, because merge worktrees have
+    ``.task/`` scrubbed and there is no worktree file to copy.  Call it where
+    the plan is DECIDED, before the legs run, so a killed leg still leaves its
+    scope decision behind.
+
+    Only the WORKTREE copy needs a real ``attempt_id``, because that is what
+    distinguishes one attempt's file from the next within a living worktree.
+    The archive copy is stamped and so cannot collide, and gating it on
+    ``attempt_id`` too would have silently skipped the entire MERGE lane —
+    the one this artefact exists for — which carries no attempt id.
+    """
+    if plan_dict is None:
+        return
+    if attempt_id is not None and (worktree / '.task').is_dir():
+        _write_json_artifact(
+            worktree / '.task' / 'verify' / f'attempt-{attempt_id}.plan.json',
+            plan_dict, '_persist_verify_plan',
+        )
+    if archive_root is not None and task_id is not None:
+        _write_json_artifact(
+            archive_root / task_id / (
+                f'attempt-{_archive_attempt_id(attempt_id)}'
+                f'.plan-{_archive_stamp()}.json'
+            ),
+            plan_dict, '_persist_verify_plan',
+        )
+
+
 def _archive_merge_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
@@ -2051,10 +2208,7 @@ def _archive_merge_verify_logs(
         return []
 
     infix = _make_infix(module_prefix)
-    # Use microsecond precision so rapid back-to-back merge-verify retries for
-    # the same task (same attempt_id=1 default, same second) never overwrite each
-    # other.  The format is still lexicographically sortable.
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+    utc_ts = _archive_stamp()
     ts_suffix = f'-{utc_ts}'
     archived: list[Path] = []
 
@@ -2070,18 +2224,13 @@ def _archive_merge_verify_logs(
             archived.append(path)
 
     # Write summary.json using the shared payload builder.
-    summary_path = target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json'
-    try:
-        summary_payload = _build_summary_payload(runs, category, cause_hint)
-        summary_path.write_text(
-            json.dumps(summary_payload, indent=2, ensure_ascii=False),
-            encoding='utf-8',
-        )
+    summary_path = _write_json_artifact(
+        target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json',
+        _build_summary_payload(runs, category, cause_hint),
+        '_archive_merge_verify_logs',
+    )
+    if summary_path is not None:
         archived.append(summary_path)
-    except OSError as exc:
-        logger.warning(
-            '_archive_merge_verify_logs: could not write %s: %s', summary_path, exc,
-        )
 
     return archived
 
@@ -2124,11 +2273,10 @@ def _prune_archive(
     cutoff = now - max_age_days * 86_400
 
     # Single rglob walk — collect all archivable files once, avoiding a second
-    # directory scan for the size-cap pass.  Both *.log and *.json are counted
-    # because _archive_merge_verify_logs emits summary.json files into the same
-    # tree and they would otherwise accumulate unbounded (never counted toward the
-    # size budget, never pruned).
-    _PRUNE_SUFFIXES = frozenset(('.log', '.json'))
+    # directory scan for the size-cap pass.  These suffixes are the ones
+    # counted and pruned; anything else in the tree (chronic_flake's
+    # flaky-ledger.jsonl) is deliberately neither.
+    _PRUNE_SUFFIXES = frozenset(('.log', '.json', '.gz'))
     all_entries: list[tuple[Path, float, int]] = []
     for path in archive_root.rglob('*'):
         if path.suffix not in _PRUNE_SUFFIXES:
@@ -3034,6 +3182,25 @@ class CheckRun:
     # with no segments" — an impossible state ``split_and_chain_segments``'
     # fewer-than-2 refusal already prevents.
     segments: 'list[dict] | None' = None
+    # The host load this check ran under (task 3353, ruling D17); ``None``
+    # when it ran no command. LAST field so every pre-3353 positional
+    # construction site stays valid — the same rule ``segments`` above
+    # documents, and the reason the two are adjacent.
+    #
+    # THE SHAPE, stated once and only here:
+    #     {'start': {cpu_some10, cpu_some60, runqueue_ratio},
+    #      'end':   {cpu_some10, cpu_some60, runqueue_ratio},
+    #      'xdist': {n_flag, auto_num_workers}}
+    # ``start``/``end`` are ``_load_sample()`` records taken around the
+    # command's own execution, and ``xdist`` is ``_xdist_workers()``. A null
+    # INSIDE those records means "not knowable", never "zero" — see
+    # ``_load_sample``, which owns that convention.
+    #
+    # A plain JSON-native dict rather than a nested dataclass, for the same
+    # reason the rest of this schema is flat: ``to_dict()``'s output is
+    # written straight into JSON, so anything needing its own serialisation
+    # step is a second place for the shape to drift.
+    load: 'dict | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -3051,8 +3218,8 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 8-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments), 7 of which were
+        (all take ``list[dict]``) — the exact 9-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load), 7 of which were
         previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
@@ -3066,6 +3233,11 @@ class CheckRun:
         segments" from "this run was not segmented" — reintroducing an
         absent-vs-null ambiguity in the very schema whose job is to make
         skipped-vs-passed unambiguous.
+
+        ``load`` (task 3353) is emitted on exactly the same terms, for exactly
+        that reason: the budget census's hardest records to classify are the
+        historical ones, and "absent" vs "null" is the distinction that tells
+        it whether a run predates load stamping or merely went unstamped.
         """
         return {
             'label': self.label,
@@ -3076,6 +3248,7 @@ class CheckRun:
             'started_at': self.started_at or '',
             'duration_secs': self.duration_secs,
             'segments': self.segments,
+            'load': self.load,
         }
 
 
@@ -5581,6 +5754,11 @@ async def run_verification(
         # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
         # parse_config_command can no longer see as pytest.
         if junit_path is not None and label == 'test':
+            # THE chokepoint: every test-leg invocation in this call reaches
+            # here — all three branches of the retry loop and the env-recovery
+            # re-run — so clearing here is once per pytest run, which is the
+            # granularity the report's ownership actually has.
+            _clear_junit_report(junit_path)
             cmd = _with_junitxml_str(cmd, str(junit_path))
             assert cmd is not None  # None only when the input is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
@@ -5625,6 +5803,15 @@ async def run_verification(
         if pytest_n_capped:
             cmd = _with_pytest_numprocesses_str(cmd, config.verify_admission_pytest_n)
             assert cmd is not None  # None only when the input is None; guarded above
+        # Load stamp (task 3353, ruling D17): read the xdist facts off the
+        # RENDERED command — post `-n` cap, post junitxml, PRE the governance
+        # wrap below. The SAME ordering constraint those two already document,
+        # for the same reason: once governed, cmd is an opaque outer `<exec> --
+        # /bin/bash -c '...'` string that parse_config_command can no longer
+        # see as pytest, so the flag would read as absent on every merge run.
+        # Resolved ONCE here rather than at the CheckRun below, where `cmd` is
+        # already governed.
+        xdist = _xdist_workers(cmd, verify_env)
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
@@ -5638,6 +5825,11 @@ async def run_verification(
         async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
+            # INSIDE the admission slot, beside the clock it belongs to: the
+            # recorded load must be the load the command RAN under, not the
+            # load while it queued for a slot — which on a busy host is a
+            # different number, and the more flattering one.
+            load_start = _load_sample()
             # Pass use_cgroup_scope only when enabled so the default-off call
             # signature stays byte-identical (test doubles stub the legacy kwargs).
             _scope_kw: _ScopeKw = (
@@ -5792,6 +5984,22 @@ async def run_verification(
                     **_scope_kw,
                     **_clock_kw,
                 )
+            # Both branches converge here, still INSIDE the slot and one
+            # statement after the command returned. The clock and the load
+            # window close at the SAME instant, so `duration_secs` and
+            # `load` describe the same interval — and that interval is the
+            # command's own, which is what `CheckRun.load` claims and what
+            # `load_start`'s placement above is for. Closing them at the
+            # `CheckRun` below instead put both ends past the slot release,
+            # and on a contended host the release is exactly when the next
+            # queued leg is admitted: the end reading would then include load
+            # this command did not run under, the same distortion `load_start`
+            # sits inside the slot to avoid, in the opposite direction. It
+            # also swept in the post-run DIAGNOSTICS below — a lint leg's
+            # `_report_ruff_config_escape` spawns a subprocess — which belong
+            # to no command's duration.
+            elapsed = time.monotonic() - t0
+            load_end = _load_sample()
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -5874,8 +6082,22 @@ async def run_verification(
             output=out,
             timed_out=timed_out_flag,
             started_at=started_at,
-            duration_secs=time.monotonic() - t0,
+            duration_secs=elapsed,
             segments=segment_dicts,
+            # Paired with `duration_secs` deliberately: the same instant that
+            # closes the clock closes the load window, so the two describe the
+            # same interval. Both are taken where the command returns, inside
+            # the slot — see the note at that site for why the pair may not
+            # close here.
+            #
+            # ONE assembly serves BOTH execution branches — unlike the `-n` cap
+            # above, which genuinely needs two sites. Not an oversight, and the
+            # difference is structural: the cap rewrites the COMMAND, and the
+            # segmented path builds its commands from `config_cmd` rather than
+            # `cmd`, so the rewrite misses them (the asymmetry task 3478
+            # removed). The stamp attaches to the CheckRun, and both branches
+            # return through this single construction.
+            load={'start': load_start, 'end': load_end, 'xdist': xdist},
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -6149,7 +6371,7 @@ async def run_verification(
         if archive_root is not None and task_id is not None and not passed:
             try:
                 arch_paths = _archive_merge_verify_logs(
-                    runs, archive_root, task_id, attempt_id or 1,
+                    runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
@@ -6189,6 +6411,12 @@ async def run_verification(
     failing_test_ids: list[str] | None = None
     if junit_path is not None:
         failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
+        # The report dies with the merge worktree; the LOG archival above is
+        # gated on `not passed`, this deliberately is not.
+        _archive_junit_report(
+            junit_path, archive_root, task_id, _archive_attempt_id(attempt_id),
+            module_prefix=module_prefix,
+        )
 
     result = VerifyResult(
         passed=attempt.passed,
@@ -7061,9 +7289,14 @@ async def run_scoped_verification(
                             'per-module full suite across %d registered module(s))',
                             len(registered_modules),
                         )
+                        plan_dict = plan.to_dict()
+                        _persist_verify_plan(
+                            plan_dict, worktree, attempt_id=attempt_id,
+                            task_id=task_id, archive_root=archive_root,
+                        )
                         results = await asyncio.gather(*(_verify_module(mc) for mc in scoped))
                         aggregated = _aggregate_results(list(results))
-                        aggregated.plan = plan.to_dict()
+                        aggregated.plan = plan_dict
                         return aggregated
                     logger.warning(
                         'Verification mode: workspace (merge_verify_breadth=full) found '
@@ -7262,6 +7495,10 @@ async def run_scoped_verification(
                 # for VerifyResult.plan rather than deriving a second time.
                 plan_dict = plan.to_dict()
                 logger.info('Verify plan: %s', plan_dict)
+                _persist_verify_plan(
+                    plan_dict, worktree, attempt_id=attempt_id,
+                    task_id=task_id, archive_root=archive_root,
+                )
                 # Reverse-dependency test widening (task 2607): the plan
                 # above is authoritative for file-classification scope (task
                 # κ, verify-scope-inversion-prd.md) over the task's OWN
@@ -7482,6 +7719,10 @@ async def run_scoped_verification(
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
+                _persist_verify_plan(
+                    plan_dict, worktree, attempt_id=attempt_id,
+                    task_id=task_id, archive_root=archive_root,
+                )
                 fallback_result = await run_verification(
                     worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
@@ -8847,6 +9088,174 @@ class _RerunPolicy:
     log_group_not_confirmed: Callable[[str, _RerunObservation], None] | None = None
 
 
+def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
+    """Host load at THIS instant, as one flat JSON-native record.
+
+    Ruling D17 (task 3353) stamps this on every verify command, at its start
+    and at its end, so the production corpus is itself the load-vs-duration
+    measurement rather than something to be reproduced later on a quiet host.
+
+    Three keys: the host CPU ``some`` pressure over 10 s and 60 s, and the
+    runqueue ratio. Flat rather than nested, because the value is written
+    STRAIGHT into summary.json — anything needing its own serialisation step
+    would be a second place for the shape to drift.
+
+    A degraded component reads ``None``, never ``0.0`` — the convention
+    ``_psi_cpu_some10_or_none`` below already establishes and the flake ledger
+    already records in SQL. ``0.0`` is a real and common reading (an idle
+    host), so fabricating it for a failed read would make "we could not tell"
+    indistinguishable from "the host was quiet", in the one record whose
+    purpose is telling those apart. The read_ok flags are therefore NOT carried
+    as separate fields: ``read_ok`` is exactly ``value is not None``, and two
+    spellings of one fact can disagree.
+
+    Degradation is PER COMPONENT, because ``shared.psi`` reads the components
+    independently: a host-PSI failure must not discard a runqueue reading that
+    succeeded (INV-11).
+
+    Never raises into a caller (INV-1: a telemetry read may not change a
+    gate's verdict). The reader already fails open by value, so reaching the
+    handler means the telemetry path broke in a way it does not itself model —
+    WARNING, not DEBUG, since a column going quietly null is the
+    silent-degradation shape the tree-wide gate exists to catch.
+    """
+    try:
+        sample = read()
+    except Exception:
+        logger.warning(
+            '_load_sample: PSI read failed; recording an all-null load record '
+            'for this command',
+            exc_info=True,
+        )
+        return {'cpu_some10': None, 'cpu_some60': None, 'runqueue_ratio': None}
+    return {
+        'cpu_some10': sample.cpu_some10 if sample.read_ok else None,
+        'cpu_some60': sample.cpu_some60 if sample.read_ok else None,
+        'runqueue_ratio': (
+            sample.runqueue_ratio if sample.runqueue_read_ok else None
+        ),
+    }
+
+
+# The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
+#
+# DELIBERATELY NARROWER than ``verify_cmd._XDIST_WORKER_FLAGS``, and not a
+# drifting copy of it: that set is the family a serial recovery must SHED, so it
+# also carries ``--dist`` (a distribution MODE) and ``--maxprocesses`` (a CAP).
+# Neither is a worker count, and reporting either one's value as ``n_flag``
+# would put a fabricated count in the corpus this stamp exists to make
+# trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
+# the pair-binding walk below needs no special case for them;
+# test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
+# stated choice rather than becoming drift the day either set moves.
+_XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
+
+
+def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
+    """The xdist worker facts for *cmd*, as two independently-nullable fields.
+
+    Ruling D17 (task 3353) asks for "the worker count actually in effect".
+    Measured, the dominant live case admits no single answer: the orchestrator
+    ``test_command`` carries no ``-n``, so the count is decided by pyproject
+    ``addopts``, which this path never reads. Reporting one resolved integer
+    would therefore mean guessing (hand back the env value with nothing asking
+    for it) or fabricating (hand back a default) — and a guessed worker count
+    inside a measurement corpus is indistinguishable from a measured one a
+    month later, which is the class of fabricated datum this stamp exists to
+    remove.
+
+    So two orthogonal facts, separately sourced:
+
+    - ``n_flag`` — the worker count the command NAMES, AS PARSED, or ``None``
+      when it names none. Read off the STRUCTURED ``base_flags``, never by
+      regex over the string: a regex would find the ``-n`` inside a
+      cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
+      this command's flag. ``_PYTEST_VALUE_FLAGS`` is read rather than
+      re-derived so the flag/value pairing has one home, which is also what
+      keeps a ``-k '-n'`` from being mistaken for a worker count.
+
+      SPELLINGS, tested rather than assumed equal to one literal: both ``-n 8``
+      and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
+      the attached one-token form (``--numprocesses=8``, ``-n=8`` — argparse
+      accepts both). A set that bound ``-n`` alone would report ``n_flag: null``
+      for a module config using the long spelling, which the census reads as
+      "no flag on argv, so addopts decided the count" — a wrong fact, silently,
+      in the corpus this deliverable exists to make trustworthy. No live config
+      uses the long spelling today, so that was latent rather than active.
+
+      The CONCATENATED short form (``-n8``) is deliberately reported as absent.
+      That is the grammar boundary ``verify_cmd._is_xdist_worker_flag`` — the
+      one home for "is this token a worker flag" — already draws for the serial
+      recovery's strip and refusal screen, and matching it keeps ONE answer in
+      the module: widening only the telemetry would leave the stamp claiming a
+      flag the strip would not shed.
+    - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
+      own subprocess will see it, or ``None`` when nothing sets it. Resolved by
+      asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
+      with — and NOT by reading *verify_env*, which is only the config OVERLAY
+      (``config.verify_env`` + the module's + ``DF_VERIFY_ROLE``). The child env
+      is ``os.environ`` minus the venv/``ORCH_`` scrub with that overlay applied
+      LAST, so an AMBIENT value is in effect for the command; reading the
+      overlay alone recorded ``null`` for it — "not set" about a variable that
+      was set, in the record whose whole purpose is saying what the run
+      experienced. This repo pins the key in top-level ``verify_env``, so the
+      live path agreed by luck; ``dark-factory-orchestrator.yaml`` sets it
+      ambiently at unit level too, and a targeted project that does not pin it
+      recorded a false null. Asking the builder also keeps the precedence and
+      the scrub unrestated here, so the stamp cannot drift from what the spawn
+      does.
+
+      Reported independently of ``n_flag``: a reader that wants the effective
+      count joins them itself, and can see when it cannot.
+
+    ``None`` for every non-pytest tool and for a raw-retained chain — the same
+    no-op guards ``apply_pytest_numprocesses`` documents, for the same reason:
+    a chain has no ONE invocation's flag to report.
+
+    Never raises (INV-1), like ``_load_sample`` above. The env is read BEFORE
+    the parse so an unparseable command still reports the fact that WAS
+    knowable, rather than nulling both.
+    """
+    n_flag: str | None = None
+    auto_num_workers: str | None = None
+    try:
+        auto_num_workers = _target_subprocess_env(
+            dict(verify_env) if verify_env else None,
+        ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
+        parsed = parse_config_command(cmd)
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
+            flags = parsed.base_flags
+            i = 0
+            while i < len(flags):
+                # One partition covers both spellings of "this flag's value":
+                # attached (`--numprocesses=8` -> sep is '=') or the adjacent
+                # token (`-n 8`), which `_PYTEST_VALUE_FLAGS` has already bound
+                # next to its flag. An attached form with an EMPTY value
+                # (`--numprocesses=`) names no count — pytest rejects that
+                # command outright — so it falls through and reports absent
+                # rather than recording `''` as a worker count.
+                head, sep, attached = flags[i].partition('=')
+                if head in _XDIST_N_FLAGS:
+                    if sep and attached:
+                        n_flag = attached
+                        break
+                    if not sep and i + 1 < len(flags):
+                        n_flag = flags[i + 1]
+                        break
+                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
+                    i += 2
+                else:
+                    i += 1
+    except Exception:
+        logger.warning(
+            '_xdist_workers: could not read the worker facts off %r; '
+            'recording nulls for this command',
+            cmd,
+            exc_info=True,
+        )
+    return {'n_flag': n_flag, 'auto_num_workers': auto_num_workers}
+
+
 def _psi_cpu_some10_or_none() -> float | None:
     """Host CPU pressure at observation, or ``None`` when it is not knowable.
 
@@ -8854,6 +9263,15 @@ def _psi_cpu_some10_or_none() -> float | None:
     maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
     The ``except`` is belt to that braces: a TELEMETRY read must never change
     a gate's verdict, so it may not raise into the discriminator.
+
+    Deliberately NOT refactored to read its value off ``_load_sample`` above
+    (task 3353). The two are the same two invariants over the same reader, so
+    the duplicated try/except is tempting to collapse — but this one feeds the
+    flake discriminator's ``psi_cpu_some10`` column, which is an idempotency-
+    adjacent value in §8.3's ledger, and the refactor would buy nothing except
+    putting a second caller's WARNING text on that path. One reader, two thin
+    wrappers, each with a single caller, is the cheaper place to leave the
+    duplication.
     """
     try:
         sample = read_psi_sample()

@@ -19,11 +19,22 @@ is one pure function: ``cap_markers.looks_like_blocking_banner``, the loose
 OR-substring DEFER GATE — the same matcher ``census.preflight_headroom``
 uses, and explicitly not the strict production cap detector
 (``usage_gate.detect_cap_hit``), whose combined prefix-AND-confirm policy is
-tuned for account failover. This module has nothing to fail over TO: the
-trickle unit runs under an interpreter where the orchestrator config, and
-therefore a multi-account ``UsageGate``, is unreachable. A defer gate is
-exactly the contract it needs, and ``cap_markers``' own docstring argues for
-that split (task 4736). The real LLM call lives behind
+tuned for account failover.
+
+BOTH MATCHERS ARE NOW LIVE IN THE TRICKLE, each doing its own job, and this
+paragraph used to claim otherwise: "the trickle unit runs under an
+interpreter where the orchestrator config, and therefore a multi-account
+``UsageGate``, is unreachable" was FALSE, and task 5488 retires it. Only the
+orchestrator YAML is unreachable; the gate needs nothing but the roster
+file. The loose matcher HERE keeps deciding whether an already-FAILED
+invocation is a per-digest DEFER (task 4736), while the strict detector —
+reached from ``account_pool.pool_invoke``, outside this module — decides
+whether an ACCOUNT is out and should be rotated away from. That is exactly
+the split ``cap_markers``' own docstring argues for, and having a real pool
+to fail over to VINDICATES it rather than weakening it: a loose false
+positive can still only re-label one digest, never burn an account.
+
+The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
 public function accepts as an ``invoke`` override. What no test ever does
 is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
@@ -106,7 +117,27 @@ class CoderInvocationError(Exception):
     with one plain cause was investigated as twenty causeless failures.
     A diagnostic the process EMITTED must never be dropped on the floor
     because it arrived on the less-expected stream.
+
+    The same two tails are ALSO carried as structured ``stdout``/``stderr``
+    attributes, beside the formatted message rather than only inside it.
+    ``account_pool``'s failover path feeds them to the gate's strict
+    detector, ``InvokeSlot.detect_cap_hit(stderr, result_text)``, which takes
+    the streams as two distinct arguments; recovering them by re-parsing
+    ``stdout={!r} stderr={!r}`` back out of the message would be an ad-hoc
+    parser over a meaningful string (docs/code-quality.md heuristic 12) and
+    would couple account failover to wording that exists for humans reading
+    journals. ``CoderCapExhausted.marker`` is the established precedent for
+    a typed attribute on this hierarchy. Both default to ``''`` -- the
+    timeout and never-started arms have no streams to carry -- so every
+    consumer can read them unconditionally instead of guarding with
+    ``hasattr``, which would silently read a regression as "no banner" and
+    never rotate the account.
     """
+
+    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class CoderCapExhausted(CoderInvocationError):
@@ -137,8 +168,10 @@ class CoderCapExhausted(CoderInvocationError):
     ``cap_exhausted:`` cell from a reported mean rather than scoring it 0.0.
     """
 
-    def __init__(self, message: str, *, marker: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, marker: str, stdout: str = "", stderr: str = "",
+    ) -> None:
+        super().__init__(message, stdout=stdout, stderr=stderr)
         self.marker = marker
 
 
@@ -364,6 +397,34 @@ diagnostic loss. Bounded because the text lands verbatim in journal lines,
 CLI's last words are its diagnostic ones."""
 
 
+def child_env(oauth_token):
+    """The environment a child process needs to authenticate as *oauth_token*,
+    or ``None`` to inherit the parent's unchanged.
+
+    A copy of ``os.environ`` with ``ANTHROPIC_API_KEY`` REMOVED and
+    ``CLAUDE_CODE_OAUTH_TOKEN`` set -- the same construction every other CLI
+    spawn in the fleet uses (``agents/invoke.py``, ``cli_invoke.py``,
+    ``usage_gate.py``). The removal is the load-bearing half, not tidiness:
+    the CLI prefers an API key over the OAuth token, so leaving one set
+    silently authenticates as the API key's identity and the account choice is
+    defeated while the failover still LOOKS like it worked.
+
+    An OVERLAY on the parent env rather than a replacement, because a child
+    still needs PATH, HOME and whatever the systemd unit exported.
+
+    Public and separate from ``_invoke_cli`` because the trickle spawns a
+    SECOND child that must make the same choice: ``account_pool.subprocess_env``
+    builds the env for the census subprocess (task 5488). One statement of the
+    policy, two spawn sites -- a second copy would be the fifth in the fleet
+    and the first that could drift from this one silently.
+    """
+    if not oauth_token:
+        return None
+    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+    return env
+
+
 def _invoke_cli(
     prompt: str,
     model: str,
@@ -371,6 +432,7 @@ def _invoke_cli(
     claude_bin: str | None = None,
     timeout: float = _DEFAULT_INVOKE_TIMEOUT_SECS,
     cwd: str | os.PathLike | None = None,
+    oauth_token: str | None = None,
 ) -> str:
     """Invoke the real headless ``claude -p --model <model>`` CLI exactly
     once, delivering *prompt* via stdin, and return its raw stdout.
@@ -379,6 +441,15 @@ def _invoke_cli(
     public function accepts an ``invoke`` override, and most tests inject
     a fake one. *claude_bin* resolves, in order: the explicit argument,
     the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
+
+    *oauth_token*, when given, is the ACCOUNT the caller chose -- the token
+    of a lease taken from the shared multi-account ``UsageGate`` (see
+    ``account_pool.pool_invoke``, which is what passes it). The child env it
+    produces, and why ``ANTHROPIC_API_KEY`` is stripped from it, is
+    :func:`child_env`'s. ``None`` (the default) passes ``env=None``, which is
+    subprocess's own "inherit the parent unchanged", so this parameter is
+    strictly additive: census's wiring (``preflight_headroom`` and
+    ``_build_stage_invokes``) spawns byte-identically to before it existed.
 
     THIS FUNCTION IS ITSELF UNDER TEST -- it is no longer true that "no
     test ever reaches it", and the resolution order above is exactly what
@@ -442,6 +513,8 @@ def _invoke_cli(
     """
     resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
 
+    env = child_env(oauth_token)
+
     try:
         proc = subprocess.run(
             [resolved_bin, "-p", "--model", model],
@@ -450,6 +523,7 @@ def _invoke_cli(
             capture_output=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise CoderInvocationError(
@@ -495,8 +569,10 @@ def _invoke_cli(
         # function and scan what comes BACK" -- working unchanged.
         marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
         if marker:
-            raise CoderCapExhausted(message, marker=marker)
-        raise CoderInvocationError(message)
+            raise CoderCapExhausted(
+                message, marker=marker, stdout=stdout_tail, stderr=stderr_tail,
+            )
+        raise CoderInvocationError(message, stdout=stdout_tail, stderr=stderr_tail)
 
     return proc.stdout
 

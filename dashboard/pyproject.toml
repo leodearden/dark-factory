@@ -92,18 +92,22 @@ addopts = "-n auto --dist loadgroup"
 # stall is unconfirmed (task 3431 flags it as an unverified hypothesis, not
 # established fact). Without this cap, a wedge like that hangs the whole
 # suite with no output instead of failing loud with a traceback.
-# 300s matches shared/escalation/orchestrator/fused-memory's default, so slow
-# tests can opt up individually with @pytest.mark.timeout(N) as those
-# configs document. Per-module merge/root verify test_commands already pass
-# --timeout=300 on the CLI (which overrides this ini value), so this default
-# instead governs bare local/agent invocations (`cd dashboard && uv run
-# pytest tests/`, the form CONTRIBUTING.md and the 3216 incident used).
-# Raised 60→300 on 2026-09-12; see shared/pyproject.toml for the full
-# rationale (the cap is WALL-CLOCK, so a healthy test starved of CPU on a
-# loaded 32-core host trips it, and in the xdist packages that reds a
-# SHIFTING VICTIM rather than the starved test). 300 is INTERIM and
-# judgement-picked, not measured.
-timeout = 300
+# The value matches every other config in the workspace, so slow tests can opt
+# up individually with @pytest.mark.timeout(N) as those configs document. Per-
+# module merge/root verify test_commands still pass --timeout=300 on the CLI
+# (which overrides this ini value), so this default instead governs bare
+# local/agent invocations (`cd dashboard && uv run pytest tests/`, the form
+# CONTRIBUTING.md and the 3216 incident used) — and since task 5442 raised the
+# ini past 300, those two budgets now DIFFER rather than coincide.
+# Raised 60→300 on 2026-09-12 and 300→540 on 2026-09-17; see
+# shared/pyproject.toml for the full rationale (the cap is WALL-CLOCK, so a
+# healthy test starved of CPU on a loaded 32-core host trips it, and in the
+# xdist packages that reds a SHIFTING VICTIM rather than the starved test).
+# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
+# clock under real fleet load x the 8x headroom factor — and no longer
+# judgement-picked; see
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+timeout = 540
 # signal is KEPT under xdist (task 5408), and the premise this comment used to
 # give for it — "dashboard runs no pytest-xdist, so signal is safe" — is
 # corrected rather than softened, because it is false twice over. It was
