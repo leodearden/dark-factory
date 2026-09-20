@@ -2,6 +2,10 @@
 const { useState, useEffect, useMemo, useRef } = React;
 const SP_SHELL = window.DF_CHARTS.Sparkline;
 const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
+// The badge-chip pip's type size, decided here rather than at each call site:
+// the four escalation-subsection pips each carried their own `fontSize: 9`, and
+// one of four drifting is how a summary row comes to have two type sizes.
+const PIP_BADGE_STYLE = Object.freeze({ fontSize: 9 });
 // The Datum render decision, at module scope with no fallback (the
 // DF_SPARK_PATH convention: throw loudly at load rather than defer to a
 // TypeError inside a render). Bound under datum.js's own name — this is a
@@ -463,21 +467,31 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
 // value + as_of + state would be a category error; gamma2/theta own those
 // surfaces.
 //
-// `label` is the trailing word ('p50', 'active', 'blocked'), kept a separate
+// `label` is the TRAILING word ('p50', 'active', 'blocked'), kept a separate
 // prop rather than folded into `format` so the formatter stays about the VALUE
 // and the space between the two is decided once here instead of at each site.
+// A LEADING label ('L1 · 3') goes through `format` instead: two sites want one,
+// and a second placement prop would be a second way to say the same thing.
 //
 // The age is a dim suffix rather than a badge of its own: a pip sits in a dense
 // flex summary row, and a second bordered element per pip would double that
 // row's width. It shares DATUM_AGE_STYLE with StatTile, so the dashboard states
 // an age in one shape as well as one format.
-function Pip({ datum, label, color, format }) {
+//
+// TWO LEADING GLYPHS, BECAUSE THE FRAGMENTS HAD TWO. A summary pip either
+// carries a coloured dot (the orchestrator/perf/merge/burndown rows) or renders
+// its reading inside a `.badge` chip (the escalation subsections' L1/L2 and
+// unreadable counts, where the chip's tone IS the level). Both are pre-existing
+// shared markup this component adopts unchanged rather than new variants it
+// invents; `color` and `badge` are each absent on the shape that does not use
+// it, so neither draws an empty 7px dot nor an untoned chip.
+function Pip({ datum, label, color, format, badge }) {
   const view = datumView(datum, { now: Date.now(), format });
+  const reading = <>{view.text}{label && ` ${label}`}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</>;
   return (
     <span className="pip" title={view.title || undefined}>
-      <span className="pip-dot" style={{ background: color }}></span>
-      {view.text}{label && ` ${label}`}
-      {view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}
+      {color && <span className="pip-dot" style={{ background: color }}></span>}
+      {badge ? <span className={`badge ${badge}`} style={PIP_BADGE_STYLE}>{reading}</span> : reading}
     </span>
   );
 }

@@ -10,10 +10,19 @@
  *             created by tabs.jsx; app.jsx destructures it last)
  */
 const { useState: uS, useEffect: uE } = React;
-const { ProjectGroup, taskId } = window.DF_SHELL;
+const { ProjectGroup, Pip, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 const { pinningSummary } = window.DF_PINS_RECOVERY;
+// The Datum wrapper, at module scope with no fallback — the DF_SPARK_PATH
+// convention index.html's load order backs: a missing or mis-ordered datum.js
+// throws here at load rather than inside a render.
+const { plainDatum } = window.DF_DATUM;
+
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ESCALATIONS = '/api/v2/dashboard/escalations';
 
 // ── Cross-tab focus helpers (module scope) ──
 //
@@ -356,31 +365,34 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
       <C.StatTile
         label="benign rate"
-        value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
+        datum={plainDatum(benignRate, EP_ESCALATIONS)}
+        format={rate => `${Math.round(rate * 100)}%`}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
-        spark={benignSpark}
+        history={benignSpark}
         sparkColor={C.PALETTE.ok}
       />
       <C.StatTile
         label="6h breaches"
-        value={breachCount}
+        datum={plainDatum(breachCount, EP_ESCALATIONS)}
         hint={`of ${openItems.length} pending`}
       />
       <C.StatTile
         label="esc / done"
-        value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
-        spark={epdSpark}
+        datum={plainDatum(escPerDone, EP_ESCALATIONS)}
+        format={ratio => ratio.toFixed(2)}
+        history={epdSpark}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
-        value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
-        spark={churnSpark}
+        datum={plainDatum(churnRate, EP_ESCALATIONS)}
+        format={rate => `${Math.round(rate * 100)}%`}
+        history={churnSpark}
         sparkColor={C.PALETTE.bad}
       />
       <C.StatTile
         label="pinning"
-        value={pinningCount}
+        datum={plainDatum(pinningCount, EP_ESCALATIONS)}
         hint={`blocking ${pinnedTaskCount} task${pinnedTaskCount === 1 ? '' : 's'}`}
       />
     </div>
@@ -583,15 +595,15 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
 
         const summary = (
           <>
-            <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
+            <Pip datum={plainDatum(secByStatus.pending, EP_ESCALATIONS)} label="pending" />
             {(secByLevel[1] || 0) > 0 && (
-              <span className="pip"><span className="badge warn" style={{ fontSize: 9 }}>L1 · {secByLevel[1]}</span></span>
+              <Pip datum={plainDatum(secByLevel[1], EP_ESCALATIONS)} badge="warn" format={n => `L1 · ${n}`} />
             )}
             {(secByLevel[2] || 0) > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+              <Pip datum={plainDatum(secByLevel[2], EP_ESCALATIONS)} badge="bad" format={n => `L2 · ${n}`} />
             )}
             {skipped.length > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>{skipped.length} unreadable</span></span>
+              <Pip datum={plainDatum(skipped.length, EP_ESCALATIONS)} badge="bad" label="unreadable" />
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>
