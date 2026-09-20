@@ -330,9 +330,9 @@ class TestLifespanWiresTheLimits:
                 'dashboard.app.DashboardConfig.from_env',
                 return_value=fleet_config,
             ),
-            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
-                'dashboard.app.collect_metrics_snapshot',
+                'dashboard.loops.collect_metrics_snapshot',
                 new=AsyncMock(return_value=None),
             ),
         ):
@@ -372,7 +372,7 @@ class TestEndpointBudgetsReachTheMcpLegs:
     def test_api_memory_hands_each_mcp_leg_the_endpoint_budget(self, client):
         from unittest.mock import AsyncMock, patch
 
-        from dashboard.app import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
+        from dashboard.api.memory import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
 
         status = AsyncMock(return_value={'offline': True, 'error': 'down'})
         queue = AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None})
