@@ -15,7 +15,7 @@ upgrade that moves that precedence invalidates one copy and not five.  The sole
 deliberate exception is :func:`test_no_new_inverting_timeout_marker`'s failure
 message, where the reader is looking at a traceback and not at the source.
 
-A RATCHET, NOT A SWEEP.  61 pre-existing in-band sites are grandfathered in
+A RATCHET, NOT A SWEEP.  52 pre-existing in-band sites are grandfathered in
 :data:`_GRANDFATHERED`; see its comment for why they were not migrated here and
 :func:`test_grandfather_allowlist_has_no_stale_entries` for what forces that
 list to shrink.
@@ -47,6 +47,7 @@ Task 5147.
 from __future__ import annotations
 
 import ast
+import asyncio
 import functools
 import math
 import re
@@ -60,6 +61,11 @@ import pytest
 import yaml
 from _orch_helpers import (
     DEEP_GATE_SCENE_TEST_TIMEOUT,
+    DEEP_LANDING_ADOPT_WAIT_SECS,
+    DEEP_LANDING_PARK_WAIT_SECS,
+    DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS,
+    DEEP_LANDING_SCENE_SPAWN_BUDGET,
+    DEEP_LANDING_SCENE_TEST_TIMEOUT,
     DELIBERATE_TIGHT_BOUND_CEILING,
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
@@ -114,6 +120,23 @@ _DEEP_GATE_SPELLINGS = frozenset({
 #: pass by finding nothing rather than by finding nothing wrong.
 _MIN_DEEP_GATE_MARKER_SITES = 8
 
+#: The module task 5582 sizes and ratchets: nine real-git classes that all
+#: carried an identical bare ``180`` -- inside the inversion band, so under
+#: verify's CLI budget they ran TIGHTER than the run gating the merge.  They
+#: were the largest single block in :data:`_GRANDFATHERED` until that task
+#: migrated them.
+_DEEP_LANDING_MODULE = 'test_merge_queue_deep_landing.py'
+
+#: How many timeout marker sites that module must carry -- an EQUALITY, argued
+#: at :meth:`TestDeepLandingModuleMarkers.test_the_census_is_not_vacuous`.
+_DEEP_LANDING_MARKER_SITES = 9
+
+#: The ONE module-level fixture those nine classes opt into to have their git
+#: spawns counted against DEEP_LANDING_SCENE_SPAWN_BUDGET.  Non-autouse by
+#: design -- the two classes in that module measured at ZERO spawns would hit
+#: the verdict's blind-seam branch and fail by construction.
+_SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
+
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
 #: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
@@ -154,6 +177,7 @@ _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
     'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
+    'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
 }
 
 #: Qualname suffix for a ``pytestmark`` binding inside a class body, and the
@@ -387,6 +411,81 @@ def _inverts(seconds: float | None) -> bool:
     )
 
 
+class _BoundedWait(NamedTuple):
+    """One ``asyncio.wait_for`` ceiling, as written and as resolved.
+
+    ``spelling`` is the source text of the ``timeout`` argument and
+    ``seconds`` its value, None when nothing static resolves it -- the same
+    written/resolved split :class:`_Site` makes for timeout markers, and for
+    the same reason: a bare literal and a named constant are both correct
+    numbers today and only one of them moves when the number is re-derived.
+    """
+
+    lineno: int
+    spelling: str
+    seconds: float | None
+
+
+def _bounded_waits(tree: ast.Module) -> tuple[_BoundedWait, ...]:
+    """Every ``wait_for(..., timeout=X)`` ceiling *tree* composes.
+
+    The instrument the spawn census cannot be: counting ``asyncio.sleep``
+    reports 0.00s for a bounded wait that is never approached, so a scene's
+    ``wait_for`` ceilings are visible only in its SOURCE.
+
+    Matched on the callee's trailing name, so both ``asyncio.wait_for`` and a
+    bare imported ``wait_for`` are seen.  The ceiling is read from the
+    ``timeout`` keyword or, failing that, the second positional argument --
+    ``wait_for``'s own signature.  Names resolve through :mod:`_orch_helpers`,
+    which is where a ceiling belongs once anything is derived FROM it.
+    """
+    waits: list[_BoundedWait] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not ast.unparse(node.func).endswith('wait_for'):
+            continue
+        ceiling = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == 'timeout'),
+            node.args[1] if len(node.args) > 1 else None,
+        )
+        if ceiling is not None:
+            waits.append(
+                _BoundedWait(node.lineno, ast.unparse(ceiling), _static_seconds(ceiling))
+            )
+    return tuple(waits)
+
+
+def _static_seconds(node: ast.expr) -> float | None:
+    """*node* as a number, resolving a bare name through :mod:`_orch_helpers`.
+
+    None means UNRESOLVABLE and never "zero": an expression this cannot read
+    is one no census here may claim to have measured.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        resolved = getattr(_orch_helpers, node.id, None)
+        if isinstance(resolved, int | float):
+            return float(resolved)
+    return None
+
+
+@functools.cache
+def _deep_landing_tree() -> ast.Module:
+    """test_merge_queue_deep_landing.py parsed ONCE for every pin that reads it.
+
+    Three pins here walk that file and it is ~4k lines; parsing dominates
+    each of them.  Cached at module scope for the same reason
+    :func:`_tree_scan` is -- a census is a read of the tree as it is on disk,
+    and re-reading it per test buys nothing but wall clock.
+    """
+    tree = _parse((_TESTS_DIR / _DEEP_LANDING_MODULE).read_text(encoding='utf-8'))
+    assert tree is not None, (
+        f'{_DEEP_LANDING_MODULE} did not parse, so every pin reading it would '
+        'otherwise pass vacuously.'
+    )
+    return tree
+
+
 def _class_def(tree: ast.Module, name: str) -> ast.ClassDef | None:
     """The top-level class *name*, or None if the module defines no such class.
 
@@ -425,6 +524,42 @@ def _autouse_fixtures(node: ast.ClassDef) -> tuple[ast.FunctionDef | ast.AsyncFu
             )
             for decorator in statement.decorator_list
         )
+    )
+
+
+def _usefixtures_names(node: ast.ClassDef) -> frozenset[str]:
+    """Fixture names *node*'s own ``usefixtures`` marks request.
+
+    BOTH SPELLINGS THAT BIND EXACTLY THIS CLASS: the
+    ``@pytest.mark.usefixtures(...)`` decorator, and a ``pytestmark`` assigned
+    in the class BODY.  Reading only the decorator would leave this census
+    disagreeing with the timeout census it is paired against, which honours
+    both (:func:`_timeout_marker_sites_in`) -- and a class opting in through
+    ``pytestmark`` would then be reported as marked-but-unbudgeted and told to
+    add a decorator it effectively already has.
+
+    Still never a walk and never a base class, for the same reason
+    :func:`_autouse_fixtures` reads only the class body: a mark reaching the
+    class from anywhere ELSE -- an inherited one, a module-level one -- covers
+    a different set of tests, and a pin that accepted one would pass while the
+    class it names went unguarded.
+
+    Only STRING-literal arguments are collected.  ``usefixtures`` takes
+    nothing else, so anything dynamic here is unresolvable rather than a
+    fixture this census may claim.
+    """
+    marks: list[ast.expr] = list(node.decorator_list)
+    for statement in node.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            marks.extend(_mark_elements(bound))
+
+    return frozenset(
+        argument.value
+        for mark in marks
+        if isinstance(mark, ast.Call) and _marker_name(mark) == 'usefixtures'
+        for argument in mark.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     )
 
 
@@ -1002,44 +1137,355 @@ class TestDeepGateSceneBudget:
             'raising this constant alone buys nothing.'
         )
 
-class TestSpawnBudgetVerdict:
-    """``deep_gate_spawn_budget_violation`` -- the budget check as a pure verdict.
 
-    Split out as a FUNCTION rather than written inline in the autouse fixture
-    that calls it, so the fixture stays a thin wire and every branch below is
+class TestDeepLandingSceneBudget:
+    """The three constants that size test_merge_queue_deep_landing.py (task 5582).
+
+    The DERIVATION -- the measured per-class spawn maxima, the bounded-wait
+    term, the headroom, the rounding, and the three ceilings it sits under --
+    has ONE home: the ``DEEP_LANDING_SCENE_TEST_TIMEOUT`` comment block in
+    _orch_helpers.py.  This class is that comment's EXECUTABLE link, exactly as
+    :class:`TestDeepGateSceneBudget` is for the Row 7 pair one anchor above.
+
+    THREE constants and not two, because unlike Row 7 this module really has
+    bounded waits.  A ``wait_for`` CEILING is invisible to the
+    ``asyncio.sleep`` instrument the spawn census reads, so it is measured from
+    source and priced as its own term rather than folded into the spawn count.
+    """
+
+    def test_the_budget_covers_the_measured_worst_case(self) -> None:
+        """The budget may never be tightened below what the module really costs.
+
+        A budget BELOW the measurement would fail every run, loaded or not.
+        The headroom above it is deliberate, and its size is argued in the
+        constant's comment rather than here.
+        """
+        budget = DEEP_LANDING_SCENE_SPAWN_BUDGET
+
+        assert budget >= 169, (
+            f'DEEP_LANDING_SCENE_SPAWN_BUDGET is {budget}, below the 169 git '
+            'spawns test_merge_queue_deep_landing.py\'s heaviest test '
+            '(TestDeepLandingEndToEnd::'
+            'test_flipping_the_cap_in_place_starts_landing_chains) was '
+            'MEASURED to make. Measured 2026-09-18 by counting '
+            'asyncio.create_subprocess_exec/_shell per test; the nine real-git '
+            'classes peak at 169/165/163/139/135/115/108/67/39 spawns, against '
+            '0.00s of summed asyncio.sleep in EVERY test in the module -- '
+            'which is what makes it spawn-bound rather than sleep- or '
+            'CPU-bound, so its wall clock is spawn count x per-spawn latency '
+            'and per-spawn latency is exactly what host oversubscription '
+            'inflates. A budget below the measurement fails every run, not '
+            'just a loaded one. Re-measure before lowering it, and re-derive '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT in the same commit.'
+        )
+
+    def test_the_bounded_wait_term_is_the_sum_of_its_two_named_ceilings(self) -> None:
+        """The term is composed, never copied.
+
+        Read from SOURCE rather than from the spawn census, which cannot see
+        it: instrumenting ``asyncio.sleep`` reports 0.00s for every test in
+        the module, and a ``wait_for`` ceiling consumes nothing until it is
+        approached.  Priced at the CEILING and not at the 0.00s actually
+        consumed, because a starved host is precisely when a bounded wait IS
+        approached.
+
+        A HAND-COPIED 180 could only catch someone LOWERING the term -- never
+        the case that matters, which is a source ceiling being RAISED out from
+        under it, leaving the term, the derived timeout and all nine markers
+        under-pricing the worst path while every other pin here stays green
+        re-deriving from the stale number (task 5582 reviewer amendment).
+        """
+        assert DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS == (
+            DEEP_LANDING_PARK_WAIT_SECS + DEEP_LANDING_ADOPT_WAIT_SECS
+        ), (
+            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS is '
+            f'{DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS}, not the sum of the two '
+            f'ceilings it prices ({DEEP_LANDING_PARK_WAIT_SECS} + '
+            f'{DEEP_LANDING_ADOPT_WAIT_SECS}). Restated as a literal it stops '
+            'tracking them, and a raised ceiling then goes unpriced in '
+            'silence. Compose it; do not copy it.'
+        )
+
+    def test_the_worst_paths_ceilings_are_spelled_as_the_named_constants(self) -> None:
+        """Both ceilings must reach their call sites by NAME.
+
+        The other half of composing the term: a bare literal back at either
+        call site re-opens the same gap from the opposite end -- the constant
+        here would no longer be what the scene actually waits on, and raising
+        the real ceiling would move nothing.
+
+        The two are on ONE TestAdoptedHeadLandsWithThePostVerifyWorktree path
+        and that is what makes their SUM the worst case; which waits share a
+        path is the part no AST can check, and is argued at
+        _orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT.
+        """
+        tree = _deep_landing_tree()
+        spellings = {wait.spelling for wait in _bounded_waits(tree)}
+
+        assert 'DEEP_LANDING_PARK_WAIT_SECS' in spellings, (
+            f'no asyncio.wait_for in {_DEEP_LANDING_MODULE} spells its '
+            'ceiling DEEP_LANDING_PARK_WAIT_SECS, so the constant the '
+            'bounded-wait term is composed from is not the one the park wait '
+            f'actually uses. Ceilings found: {sorted(spellings)}'
+        )
+
+        adopt = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == '_adopt_head_only'
+            ),
+            None,
+        )
+        assert adopt is not None, (
+            f'{_DEEP_LANDING_MODULE} defines no _adopt_head_only, whose '
+            'timeout default is half of DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS. '
+            'If the helper was renamed, re-read the worst path and re-derive '
+            'the term in the same commit.'
+        )
+        defaults = {
+            argument.arg: default
+            for argument, default in zip(adopt.args.kwonlyargs, adopt.args.kw_defaults, strict=True)
+            if default is not None
+        }
+        spelling = defaults.get('timeout')
+        assert spelling is not None and ast.unparse(spelling) == 'DEEP_LANDING_ADOPT_WAIT_SECS', (
+            "_adopt_head_only's timeout default is "
+            f'{ast.unparse(spelling) if spelling else "absent"}, not '
+            'DEEP_LANDING_ADOPT_WAIT_SECS. Spelled as anything else it stops '
+            'tracking the constant the term is composed from, and the 180s '
+            'this module is priced for stops being what it waits.'
+        )
+
+    def test_no_bounded_wait_exceeds_the_priced_term(self) -> None:
+        """No single wait may outlast the whole allowance priced for the path.
+
+        Turns "the module's other bounded waits are not on the worst path"
+        from an assumption into a checked one.  A ceiling ABOVE the term
+        cannot be off the worst path in any useful sense: on its own it
+        outlasts everything the timeout was derived to cover.
+
+        NOT exhaustive, and deliberately so: nothing static can tell which
+        waits compose on one path, so a new wait ADDED to the adopted-head
+        path still needs a human to re-derive the term.  What this catches is
+        the cheaper and commoner mistake -- a ceiling raised past the budget
+        that prices it.
+        """
+        waits = _bounded_waits(_deep_landing_tree())
+
+        assert waits, (
+            f'{_DEEP_LANDING_MODULE} composes no asyncio.wait_for at all, so '
+            'this pin passes VACUOUSLY and '
+            'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS prices a path that no '
+            'longer exists. Re-read the module and re-derive the term.'
+        )
+        over = [
+            wait
+            for wait in waits
+            if wait.seconds is not None and wait.seconds > DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS
+        ]
+        assert not over, (
+            f'{len(over)} bounded wait(s) in {_DEEP_LANDING_MODULE} exceed '
+            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS '
+            f'({DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS}s) on their own, so the '
+            'term no longer covers the worst path whatever else that path '
+            'composes. Re-read the ceilings, re-derive the term and '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT with it, in one commit.\n  '
+            + '\n  '.join(f'line {w.lineno}: {w.spelling} = {w.seconds}s' for w in over)
+        )
+
+    def test_the_timeout_is_the_budget_priced_and_rounded_to_the_grid(self) -> None:
+        """``ceil(required_timeout_secs(bounded, budget) / 60) * 60``, re-derived here.
+
+        Both inputs are the constants above, so neither literal can drift from
+        what it was derived from.
+
+        Sized against the BUDGET and not against the raw measurement, which is
+        what lets the per-class ``_within_spawn_budget`` fixture in
+        test_merge_queue_deep_landing.py keep the marker honest: the marker can
+        only be wrong if the budget is breached, and a breach fails loudly,
+        in-process, on the test that caused it.
+        """
+        budget = DEEP_LANDING_SCENE_SPAWN_BUDGET
+        bounded = float(DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS)
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+        required = _orch_helpers.required_timeout_secs(bounded, budget)
+        expected = math.ceil(required / 60) * 60
+
+        assert timeout == expected, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT is {timeout}, but '
+            f'{bounded}s of bounded wait plus DEEP_LANDING_SCENE_SPAWN_BUDGET '
+            f'({budget} spawns x '
+            f'{_orch_helpers.MEASURED_SPAWN_LATENCY_SECS}s) = {required}s '
+            f'rounds up the 60s pyproject grid to {expected}. The three '
+            'constants are a SET -- moving a budget without re-deriving the '
+            'timeout leaves the marker sized for a scene that no longer '
+            'exists, which is the exact failure this task was filed to fix.'
+        )
+
+    def test_the_timeout_never_inverts_the_verify_budget(self) -> None:
+        """A marker may only ever LOOSEN verify's per-test budget, never tighten it.
+
+        The general rule and its cost are argued at
+        ``VERIFY_CLI_PER_TEST_TIMEOUT`` in _orch_helpers.py.  Asserted here
+        directly rather than left to the tree sweep because this marker is
+        DERIVED: a future re-derivation could walk it back into the band
+        without anyone writing an in-band number by hand -- which is precisely
+        how the nine sites this constant replaces came to sit at 180.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+
+        assert timeout >= VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}) is below the verify '
+            f'CLI budget ({VERIFY_CLI_PER_TEST_TIMEOUT}), so the marker meant '
+            'to LOOSEN nine slow classes would instead TIGHTEN the run that '
+            'gates the merge. Re-derive the budget upward, or re-measure the '
+            'spawn latency -- do not simply clamp this constant.'
+        )
+
+    def test_the_timeout_never_narrows_the_ini_default(self) -> None:
+        """A marker meant as a FLOOR may not fall below the ambient ini default.
+
+        NOT a duplicate of the verify-budget pin above, and only stopped being
+        one on 2026-09-17: task 5442 raised ``PYPROJECT_DEFAULT_TIMEOUT``
+        300 -> 540 on measurement while deliberately leaving verify's
+        ``--timeout=300`` alone, so the two budgets no longer coincide and a
+        value can now clear one while narrowing the other.
+
+        That same commit made the never-narrow rule explicit in _orch_helpers.py
+        and, in the same breath, recorded a LATENT GAP where it had not been
+        applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300 and now sits
+        below the default it used to equal.  1080 clears 540 today, so this pin
+        changes no number; it exists so a future re-derivation cannot land
+        somewhere like 360 that satisfies the verify edge while silently
+        reproducing that gap.
+
+        :class:`TestDeepGateSceneBudget` pins only the verify edge because the
+        rule this honours postdates it.  That is out of scope here and is NOT
+        to be "fixed" in passing.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+
+        assert timeout >= PYPROJECT_DEFAULT_TIMEOUT, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}) is below the '
+            f'pyproject ini default ({PYPROJECT_DEFAULT_TIMEOUT}), so under a '
+            'bare local or agent run these nine classes would be TIGHTER than '
+            'every unmarked test around them -- a mark meant as a floor '
+            'narrowing its own module. The verify CLI edge '
+            f'({VERIFY_CLI_PER_TEST_TIMEOUT}) is a DIFFERENT and lower one: '
+            'the two stopped coinciding when task 5442 raised the ini default '
+            'to 540 on 2026-09-17, and clearing only the lower of them '
+            'reproduces the HEAVY_BARRIER_TEST_TIMEOUT gap that commit '
+            'recorded. Re-derive upward rather than clamping.'
+        )
+
+    def test_the_timeout_fits_inside_the_whole_verify_run_budget(self) -> None:
+        """A per-test backstop larger than the whole verify's budget is no backstop.
+
+        Read from the REAL orchestrator.yaml at runtime, through the same
+        :data:`_ORCH_YAML` and in the same shape
+        :class:`TestDeepGateSceneBudget` reads it -- so an operator retuning
+        the run budget down past this marker fails here loudly instead of
+        leaving a marker that can never fire.
+        """
+        timeout = DEEP_LANDING_SCENE_TEST_TIMEOUT
+        config = yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))
+        run_budget = config.get('verify_command_timeout_secs')
+
+        assert run_budget is not None, (
+            f'{_ORCH_YAML} carries no verify_command_timeout_secs, which '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT is bounded by. Without it this '
+            'pin checks nothing; restore the key or re-argue the bound.'
+        )
+        assert timeout <= run_budget, (
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT ({timeout}s) exceeds '
+            f'verify_command_timeout_secs ({run_budget}s) in {_ORCH_YAML}. A '
+            'per-test backstop larger than the budget for the WHOLE verify '
+            'run can never fire: verify kills the run first, and the classes '
+            'this marker protects go back to dying as unattributed worker '
+            'crashes. Shrink the scene or raise the run budget -- raising '
+            'this constant alone buys nothing.'
+        )
+
+
+#: The two scenes sized by an ENFORCED spawn budget, each paired with real
+#: per-test counts MEASURED for it -- task 5333's 234/113/113 for Row 7, task
+#: 5582's nine per-class maxima for the deep-landing module.  The counts are
+#: test INPUTS chosen to span the range those classes really occupy rather
+#: than three arbitrary numbers under the ceiling; nothing here asserts them,
+#: so they are not a second definition of a measurement.
+_SPAWN_BUDGET_SCENES: tuple[tuple[_orch_helpers.SpawnBudget, tuple[int, ...]], ...] = (
+    (_orch_helpers.DEEP_GATE_SCENE_BUDGET, (113, 234)),
+    (_orch_helpers.DEEP_LANDING_SCENE_BUDGET, (39, 108, 169)),
+)
+
+_SPAWN_BUDGETS = tuple(budget for budget, _ in _SPAWN_BUDGET_SCENES)
+_SPAWN_BUDGET_IDS = tuple(budget.spawns_constant for budget in _SPAWN_BUDGETS)
+
+
+class TestSpawnBudgetVerdict:
+    """``spawn_budget_violation`` -- the budget check as a pure verdict.
+
+    Split out as a FUNCTION rather than written inline in the fixtures that
+    call it, so those fixtures stay thin wires and every branch below is
     reachable from a test.  A budget check buried in a fixture teardown is
     exercised only when it PASSES; these are the cases that matter and they
     are the ones a fixture-only implementation would never run.
+
+    EXERCISED OVER BOTH DESCRIPTORS, because the function now has two callers.
+    The 5333 reviewer amendment that narrowed it to read
+    ``DEEP_GATE_SCENE_SPAWN_BUDGET`` rather than accept it was answering a real
+    defect -- a general signature whose MESSAGE still named one fixed pair
+    would tell a second caller to re-derive constants that have nothing to do
+    with it.  The requirement is that the parameters and the message agree
+    about width, not that the function stay single-caller, so the budget is
+    now a descriptor carrying the constant NAMES as well as their values, and
+    :meth:`test_each_descriptors_message_names_only_its_own_constants` is what
+    holds that agreement.
     """
 
-    def test_a_count_within_budget_is_no_violation(self) -> None:
-        """The ordinary case, across the range the class really spans."""
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-
-        for count in (1, 113, 234, budget):
-            assert _orch_helpers.deep_gate_spawn_budget_violation(count, 'm.py::t') is None, (
-                f'{count} spawns against a budget of {budget} was reported as '
-                'a violation. Only a count ABOVE the budget (or a zero count, '
-                'which means the counting seam saw no git at all) is one.'
+    @pytest.mark.parametrize(
+        ('budget', 'measured'), _SPAWN_BUDGET_SCENES, ids=_SPAWN_BUDGET_IDS
+    )
+    def test_a_count_within_budget_is_no_violation(
+        self, budget: _orch_helpers.SpawnBudget, measured: tuple[int, ...]
+    ) -> None:
+        """The ordinary case, across the range each scene really spans."""
+        for count in (1, *measured, budget.spawns):
+            assert (
+                _orch_helpers.spawn_budget_violation(count, 'm.py::t', budget=budget) is None
+            ), (
+                f'{count} spawns against {budget.spawns_constant} '
+                f'({budget.spawns}) was reported as a violation. Only a count '
+                'ABOVE the budget (or a zero count, which means the counting '
+                'seam saw no git at all) is one.'
             )
 
-    def test_the_budget_itself_is_inside_the_budget(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_the_budget_itself_is_inside_the_budget(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """``count == budget`` passes -- the boundary is inclusive.
 
         Called out separately from the range above because an off-by-one here
-        would fail a run that is exactly at the figure
-        DEEP_GATE_SCENE_TEST_TIMEOUT was derived from, which is the one count
-        the pair is guaranteed to be correctly sized for.
+        would fail a run that is exactly at the figure the paired timeout was
+        derived from, which is the one count the pair is guaranteed to be
+        correctly sized for.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-
-        assert _orch_helpers.deep_gate_spawn_budget_violation(budget, 'm.py::t') is None, (
-            f'a count of exactly {budget} -- the budget itself -- was reported '
-            'as a violation. DEEP_GATE_SCENE_TEST_TIMEOUT is derived from this '
-            'exact number, so it is the one count that must pass.'
+        assert (
+            _orch_helpers.spawn_budget_violation(budget.spawns, 'm.py::t', budget=budget)
+            is None
+        ), (
+            f'a count of exactly {budget.spawns} -- the budget itself -- was '
+            f'reported as a violation. {budget.timeout_constant} is derived '
+            'from this exact number, so it is the one count that must pass.'
         )
 
-    def test_going_over_budget_names_everything_the_reader_needs(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_going_over_budget_names_everything_the_reader_needs(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """The failure must say what got heavier, by how much, and what to re-derive.
 
         A bare "too many spawns" would leave the reader to discover on their
@@ -1047,22 +1493,21 @@ class TestSpawnBudgetVerdict:
         asserted individually so a message that drops one fails naming the
         fragment it dropped.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-        count = budget + 1
-        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+        count = budget.spawns + 1
+        nodeid = 'tests/test_a_deep_module.py::TestSomeScene::test_x'
 
-        message = _orch_helpers.deep_gate_spawn_budget_violation(count, nodeid)
+        message = _orch_helpers.spawn_budget_violation(count, nodeid, budget=budget)
 
         assert message is not None, (
-            f'{count} spawns against a budget of {budget} was not reported as '
-            'a violation. One spawn over is over.'
+            f'{count} spawns against a budget of {budget.spawns} was not '
+            'reported as a violation. One spawn over is over.'
         )
         for fragment, why in (
             (nodeid, 'the node id, so the reader knows WHICH test got heavier'),
             (str(count), 'the observed count'),
-            (str(budget), 'the budget it broke'),
+            (str(budget.spawns), 'the budget it broke'),
             (
-                'DEEP_GATE_SCENE_TEST_TIMEOUT',
+                budget.timeout_constant,
                 'the constant to re-derive -- the point of the check is that a '
                 'heavier scene needs a re-sized marker, not merely a raised budget',
             ),
@@ -1072,7 +1517,10 @@ class TestSpawnBudgetVerdict:
                 f'got: {message}'
             )
 
-    def test_a_zero_count_is_a_violation_although_it_is_within_budget(self) -> None:
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_a_zero_count_is_a_violation_although_it_is_within_budget(
+        self, budget: _orch_helpers.SpawnBudget
+    ) -> None:
         """Zero means the counting seam went blind, which is worse than over-budget.
 
         A guard that passes because it has been silently DISCONNECTED is worse
@@ -1080,10 +1528,9 @@ class TestSpawnBudgetVerdict:
         the budget it appears to enforce becomes vacuous.  Zero is inside any
         budget, so nothing else in the check would catch it.
         """
-        budget = _orch_helpers.DEEP_GATE_SCENE_SPAWN_BUDGET
-        nodeid = 'tests/test_merge_queue_deep_integration_gate.py::TestRow7::test_x'
+        nodeid = 'tests/test_a_deep_module.py::TestSomeScene::test_x'
 
-        message = _orch_helpers.deep_gate_spawn_budget_violation(0, nodeid)
+        message = _orch_helpers.spawn_budget_violation(0, nodeid, budget=budget)
 
         assert message is not None, (
             'a count of ZERO was accepted as within budget. It is arithmetically '
@@ -1094,13 +1541,192 @@ class TestSpawnBudgetVerdict:
         assert nodeid in message, (
             f'the zero-count message omits the node id.\n\ngot: {message}'
         )
-        assert message != _orch_helpers.deep_gate_spawn_budget_violation(budget + 1, nodeid), (
+        assert message != _orch_helpers.spawn_budget_violation(
+            budget.spawns + 1, nodeid, budget=budget
+        ), (
             'the zero-count message is identical to the over-budget message, so '
             'a reader cannot tell "this scene got heavier" (re-derive the '
             'constants) from "the counting seam broke" (fix the fixture). They '
             'are different failures with different remedies.'
         )
 
+    def test_each_descriptors_message_names_only_its_own_constants(self) -> None:
+        """A caller must be told to re-derive ITS OWN pair, never the other's.
+
+        THE REGRESSION THE DESCRIPTOR EXISTS TO PREVENT, and the one the 5333
+        amendment predicted: a shared message naming one fixed pair of
+        constants passes every other test in this class -- each still finds
+        its count, its budget and a plausible-looking constant name -- while
+        telling the deep-landing fixture to go and re-derive Row 7's numbers.
+        That is why the descriptor carries the constant NAMES and not just the
+        two values.
+
+        Read off the OVER-BUDGET message, the only one of the two branches
+        that names constants at all: the zero-count branch reports a broken
+        counting seam, whose remedy is to repair the fixture rather than to
+        re-derive anything.
+        """
+        count = max(budget.spawns for budget in _SPAWN_BUDGETS) + 1
+        messages = {
+            budget.spawns_constant: _orch_helpers.spawn_budget_violation(
+                count, 'm.py::t', budget=budget
+            )
+            for budget in _SPAWN_BUDGETS
+        }
+
+        for budget in _SPAWN_BUDGETS:
+            message = messages[budget.spawns_constant]
+            assert message is not None, (
+                f'{count} spawns is over every budget here, including '
+                f'{budget.spawns_constant} ({budget.spawns}), yet no violation '
+                'was reported.'
+            )
+            mine = (budget.spawns_constant, budget.timeout_constant)
+            theirs = [
+                name
+                for other in _SPAWN_BUDGETS
+                if other.spawns_constant != budget.spawns_constant
+                for name in (other.spawns_constant, other.timeout_constant)
+            ]
+            for name in mine:
+                assert name in message, (
+                    f'the over-budget message for {budget.spawns_constant} '
+                    f'omits {name!r}, so the caller is not told which of '
+                    f'its own constants to re-derive.\n\ngot: {message}'
+                )
+            for name in theirs:
+                assert name not in message, (
+                    f'the over-budget message for {budget.spawns_constant} '
+                    f'names {name!r}, which belongs to a DIFFERENT scene. A '
+                    'message that names a fixed pair regardless of the budget '
+                    'it was handed sends the reader to re-derive constants '
+                    'that have nothing to do with their failure -- exactly '
+                    'the defect the 5333 amendment narrowed this function to '
+                    'avoid, reintroduced by generalising the parameters '
+                    f'without generalising the prose.\n\ngot: {message}'
+                )
+
+
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_each_descriptors_constant_names_resolve_to_its_numbers(
+        self, budget: _orch_helpers.SpawnBudget,
+    ) -> None:
+        """The NAMES a verdict tells the reader to re-derive must still exist.
+
+        REFERENTIAL INTEGRITY, and the one thing the test above cannot see: it
+        reads the names from the descriptor, so a rename of the underlying
+        constant leaves it green while every over-budget failure sends its
+        reader after a constant the module no longer defines.  Resolving the
+        strings back through ``getattr`` is what converts that from a recorded
+        limitation into a caught one, and it survives any rewording of the
+        prose around it.
+
+        The VALUES are compared too and not just the names, because a
+        descriptor bundling the wrong scalar would name a real constant while
+        reporting a budget nothing is sized to -- a second reading of a figure
+        that is supposed to have exactly one.
+        """
+        for name, value, field in (
+            (budget.spawns_constant, budget.spawns, 'spawns'),
+            (budget.timeout_constant, budget.timeout_secs, 'timeout_secs'),
+        ):
+            resolved = getattr(_orch_helpers, name, None)
+            assert resolved is not None, (
+                f'SpawnBudget.{field} is described by {name!r}, which '
+                '_orch_helpers.py no longer defines. Every over-budget '
+                'failure for this scene now tells its reader to re-derive a '
+                'constant that does not exist. Rename the descriptor string '
+                'in the same commit as the constant it names.'
+            )
+            assert resolved == value, (
+                f'SpawnBudget.{field} is {value}, but the constant it names '
+                f'({name}) is {resolved}. The descriptor BUNDLES the '
+                'module-level scalars and never restates them, so a mismatch '
+                'means one figure now has two readings -- and the failure '
+                'message quotes the one nothing is sized to.'
+            )
+
+
+class TestCountGitSpawns:
+    """``count_git_spawns`` -- the budget fixtures' shared instrument.
+
+    Pinned as a unit because the instrument is the half that carries the real
+    failure modes, and the two fixtures wiring it exercise only the path where
+    nothing is wrong: a teardown assertion runs its interesting branches
+    never.  Which seams are counted is the specific thing that sat duplicated
+    in two modules before task 5582's amendment pass, and the specific thing
+    that would have drifted.
+
+    A FAKE is patched in FIRST and the instrument wraps that, so these tests
+    spawn no real subprocess: under pin is the wrapper's behaviour, not the
+    operating system's.
+    """
+
+    @staticmethod
+    def _fake_seams(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple, dict]]:
+        """Replace every seam with a recorder; return the shared call log."""
+        calls: list[tuple[str, tuple, dict]] = []
+
+        def recorder(seam: str):
+            async def record(*args, **kwargs):
+                calls.append((seam, args, kwargs))
+                return f'process-from-{seam}'
+
+            return record
+
+        for seam in _orch_helpers.GIT_SPAWN_SEAMS:
+            monkeypatch.setattr(asyncio, seam, recorder(seam))
+        return calls
+
+    def test_it_counts_every_seam_a_git_spawn_can_arrive_through(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both seams, because the measurement every budget came from counted both.
+
+        An instrument watching ``create_subprocess_exec`` alone undercounts
+        each test by its ``_shell`` calls and then budgets the scene against a
+        different number than its timeout was priced from -- silently, and in
+        the direction that looks safe.
+        """
+        self._fake_seams(monkeypatch)
+        spawns = _orch_helpers.count_git_spawns(monkeypatch)
+
+        assert spawns() == 0, 'nothing has spawned yet'
+        for seam in _orch_helpers.GIT_SPAWN_SEAMS:
+            asyncio.run(getattr(asyncio, seam)('git', 'status'))
+
+        assert spawns() == len(_orch_helpers.GIT_SPAWN_SEAMS), (
+            f'count_git_spawns reported {spawns()} after one call through '
+            f'each of {_orch_helpers.GIT_SPAWN_SEAMS}. A seam it does not '
+            'wrap is a seam every budget derived from a two-seam measurement '
+            'has gone blind to.'
+        )
+
+    def test_the_wrapper_awaits_the_real_call_and_returns_its_result(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The counting wrapper must be transparent to whoever spawns through it.
+
+        Handing back the real call's COROUTINE instead of awaiting it would
+        leave every caller holding an un-started object where it expected a
+        process -- and the count would still look right, so no budget
+        assertion would ever report it.
+        """
+        calls = self._fake_seams(monkeypatch)
+        _orch_helpers.count_git_spawns(monkeypatch)
+
+        result = asyncio.run(asyncio.create_subprocess_exec('git', 'log', cwd='/tmp'))
+
+        assert result == 'process-from-create_subprocess_exec', (
+            'the counting wrapper did not return what the real spawn '
+            f'returned; got {result!r}. It must await and pass through, not '
+            'intercept.'
+        )
+        assert calls == [('create_subprocess_exec', ('git', 'log'), {'cwd': '/tmp'})], (
+            'the counting wrapper did not forward its arguments unchanged: '
+            f'{calls}. An instrument that reshapes the call it measures '
+            'changes the thing being measured.'
+        )
 
 class TestRow7SceneIsGuarded:
     """What test_merge_queue_deep_integration_gate.py must carry for task 5333.
@@ -1188,7 +1814,7 @@ class TestRow7SceneIsGuarded:
             'measured cost and mean nothing detached from it.'
         )
 
-        verdict = 'deep_gate_spawn_budget_violation'
+        verdict = 'spawn_budget_violation'
         guarded = [
             fixture.name
             for fixture in _autouse_fixtures(row7)
@@ -1206,6 +1832,224 @@ class TestRow7SceneIsGuarded:
             'the measured decay behind it, are in _orch_helpers.py::'
             'DEEP_GATE_SCENE_TEST_TIMEOUT. Restore the fixture rather than '
             'widening the marker further.'
+        )
+
+
+class TestDeepLandingModuleMarkers:
+    """What test_merge_queue_deep_landing.py must carry for task 5582.
+
+    THE MODULE-WIDE TWIN of :class:`TestRow7SceneIsGuarded`, which pins one
+    class.  Here all NINE real-git classes share one derived constant, so the
+    census is stated over the module rather than per class: nine separate
+    single-class pins would be nine copies of one claim, and a tenth class
+    added later would join none of them.
+
+    Reads the memoised :func:`_tree_scan` rather than sweeping again -- one
+    pass is MEASURED at 15.03s loaded, and this module already pays for it.
+
+    The derivation these markers are sized by is NOT restated here; see
+    ``_orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT``.
+    """
+
+    def _sites(self) -> list[_Site]:
+        """Every ``timeout`` marker site in the deep-landing module."""
+        return [site for module, site in _tree_scan().sites if module == _DEEP_LANDING_MODULE]
+
+    def test_the_module_has_no_in_band_marker_sites(self) -> None:
+        """Not one marker here may sit in the inversion band.
+
+        Asserted at the MODULE rather than left to the tree-wide ratchet
+        because these nine sites were the largest grandfathered block in it:
+        the ratchet would keep passing over an entry someone re-added under an
+        allowlisted name, and this pin would not.
+        """
+        in_band = sorted(
+            (site for site in self._sites() if _inverts(site.seconds)),
+            key=lambda site: site.lineno,
+        )
+
+        assert not in_band, (
+            f'{len(in_band)} timeout marker(s) in {_DEEP_LANDING_MODULE} sit '
+            f'in the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING} < N < '
+            f'{VERIFY_CLI_PER_TEST_TIMEOUT}), so they run TIGHTER under '
+            "verify's CLI budget than the ambient run that gates the merge -- "
+            'and a breach there is not a red test but an os._exit()d xdist '
+            'worker.\n\n'
+            'Spell them as DEEP_LANDING_SCENE_TEST_TIMEOUT, imported from '
+            '_orch_helpers, which is derived from this module\'s MEASURED '
+            'spawn counts and bounded waits. Do not pick a new number by '
+            'hand, and do not re-add them to _GRANDFATHERED -- that census '
+            'may only ever shrink.\n'
+            + '\n'.join(
+                f'  {_DEEP_LANDING_MODULE}:{site.lineno} {site.qualname} '
+                f'({site.kind}) pins {site.seconds:g}s'
+                for site in in_band
+            )
+        )
+
+    def test_every_marker_site_is_spelled_as_the_named_constant(self) -> None:
+        """Both halves matter, and neither implies the other.
+
+        The ``seconds`` half is what proves the name is registered in
+        :data:`_SANCTIONED_TIMEOUT_NAMES`: an unregistered name resolves to
+        None -- "no opinion" -- which would quietly take these nine sites out
+        of the ratchet's view entirely rather than fail anything.
+
+        The ``spelling`` half is what stops a bare ``1080`` literal, which
+        resolves identically and would leave the constant and the markers as
+        ten independent copies of one figure that no re-derivation can reach.
+        That distinction is the whole reason :attr:`_Site.spelling` exists.
+        """
+        expected = float(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+        wrong = sorted(
+            (
+                site
+                for site in self._sites()
+                if site.spelling != 'DEEP_LANDING_SCENE_TEST_TIMEOUT'
+                or site.seconds != expected
+            ),
+            key=lambda site: site.lineno,
+        )
+
+        assert not wrong, (
+            f'{len(wrong)} timeout marker(s) in {_DEEP_LANDING_MODULE} do not '
+            'pin DEEP_LANDING_SCENE_TEST_TIMEOUT by name at its real value '
+            f'({expected:g}s).\n\n'
+            'A wrong SPELLING (a bare literal, or another constant) is a '
+            'second copy of the number that a re-derivation cannot move. A '
+            'wrong VALUE means _SANCTIONED_TIMEOUT_NAMES has no entry for the '
+            'name, or drifted from it -- an unresolved name reads as "no '
+            'opinion", so the ratchet would stop having any view of these '
+            'sites at all while staying green. Import the constant from '
+            '_orch_helpers, and register it in _SANCTIONED_TIMEOUT_NAMES.\n'
+            + '\n'.join(
+                f'  {_DEEP_LANDING_MODULE}:{site.lineno} {site.qualname} '
+                f'({site.kind}) pins {site.spelling or "<no argument>"} -> '
+                f'{site.seconds}'
+                for site in wrong
+            )
+        )
+
+    def test_the_census_is_not_vacuous(self) -> None:
+        """Exactly nine sites, so a sweep that sees nothing fails loudly.
+
+        An EQUALITY and not a floor, unlike
+        :data:`_MIN_DEEP_GATE_MARKER_SITES` next door.  That module's markers
+        are split across two sanctioned spellings and it is expected to grow
+        new classes at the verify budget; here all nine classes share ONE
+        derived constant, so a tenth marker is not ordinary growth -- it is a
+        class whose cost has not been measured joining a budget sized without
+        it.  Both directions are therefore findings: fewer means the sweep or
+        the markers broke, more means the derivation now covers a scene it was
+        never measured against.
+        """
+        sites = self._sites()
+
+        assert len(sites) == _DEEP_LANDING_MARKER_SITES, (
+            f'{len(sites)} timeout marker site(s) found in '
+            f'{_DEEP_LANDING_MODULE}, expected exactly '
+            f'{_DEEP_LANDING_MARKER_SITES}.\n\n'
+            'FEWER: the module was renamed (update _DEEP_LANDING_MODULE) or '
+            'its real-git classes lost their markers -- which is the '
+            'condition this sweep exists to prevent and would otherwise pass '
+            'here VACUOUSLY, green because it found nothing rather than '
+            'because it found nothing wrong.\n'
+            'MORE: a new class joined the shared budget. Measure its git '
+            'spawn count first and re-derive DEEP_LANDING_SCENE_SPAWN_BUDGET '
+            'and DEEP_LANDING_SCENE_TEST_TIMEOUT if it is heavier than the '
+            'worst already covered, then raise this count in the same commit.'
+        )
+
+    def test_every_widened_class_is_paired_with_its_spawn_budget(self) -> None:
+        """The marker and the budget it was sized from must travel together.
+
+        A marker sized against a budget decays the moment the budget stops
+        being checked, and that decay is MEASURED rather than feared: task
+        5333 watched Row 7's counts move 231/110/110 -> 234/113/113 in a
+        single day, in an unrelated lane, with nothing in the tree reporting
+        it.
+
+        BOTH DIRECTIONS, and neither is redundant.  A marked-but-unbudgeted
+        class is a number that goes stale in silence.  A budgeted-but-unmarked
+        class is the mirror: a budget enforcing a ceiling that nothing is
+        sized to, which reads as coverage while protecting a class still on
+        the ambient default.
+
+        ENFORCEMENT and not mention for the fixture itself -- it must CALL the
+        verdict and an ``assert`` must read the result (see
+        :func:`_assert_enforced_call_names`).  A fixture that computed the
+        verdict and dropped the assert would satisfy a bare name walk while
+        guarding nothing, which is a pin weaker than the claim it carries.
+
+        The two classes measured at ZERO git spawns are correctly outside both
+        halves: the verdict's blind-seam branch would fail them by
+        construction, which is that branch working as designed and exactly why
+        the fixture is not autouse at module scope.
+        """
+        tree = _deep_landing_tree()
+
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        marked = {
+            node.name
+            for node in classes
+            if any(
+                site.spelling == 'DEEP_LANDING_SCENE_TEST_TIMEOUT'
+                for site in _timeout_sites_in(node.decorator_list, node.name, 'class-decorator')
+            )
+        }
+        budgeted = {
+            node.name
+            for node in classes
+            if _SPAWN_BUDGET_FIXTURE in _usefixtures_names(node)
+        }
+
+        assert not marked - budgeted, (
+            f'{len(marked - budgeted)} class(es) in {_DEEP_LANDING_MODULE} '
+            'carry @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT) but '
+            f"do not request the '{_SPAWN_BUDGET_FIXTURE}' fixture, so the "
+            'budget that marker was DERIVED from is not enforced on them and '
+            'the number decays the next time the scene grows -- silently, and '
+            'reported as an unattributed xdist worker crash on someone '
+            "else's branch. Add @pytest.mark.usefixtures("
+            f"'{_SPAWN_BUDGET_FIXTURE}'). The coupling and the measured decay "
+            'behind it are argued at _orch_helpers.py::'
+            f'DEEP_LANDING_SCENE_TEST_TIMEOUT.\n  '
+            + '\n  '.join(sorted(marked - budgeted))
+        )
+        assert not budgeted - marked, (
+            f'{len(budgeted - marked)} class(es) in {_DEEP_LANDING_MODULE} '
+            f"request the '{_SPAWN_BUDGET_FIXTURE}' fixture but carry no "
+            '@pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT), so a '
+            'budget is enforcing a ceiling nothing is sized to -- the class '
+            'still runs at the ambient default while reading as covered. '
+            'Either add the marker or drop the fixture; the pair is the whole '
+            'mechanism, and _orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT '
+            'says why.\n  '
+            + '\n  '.join(sorted(budgeted - marked))
+        )
+
+        fixture = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == _SPAWN_BUDGET_FIXTURE
+            ),
+            None,
+        )
+        assert fixture is not None, (
+            f'{_DEEP_LANDING_MODULE} defines no module-level '
+            f"'{_SPAWN_BUDGET_FIXTURE}' fixture, so the usefixtures marks "
+            'above request something that does not exist. One definition '
+            'serves all nine classes; nine copies in nine class bodies would '
+            'be the SPOT violation this shape exists to avoid.'
+        )
+        assert 'spawn_budget_violation' in _assert_enforced_call_names(fixture), (
+            f"{_DEEP_LANDING_MODULE}'s '{_SPAWN_BUDGET_FIXTURE}' does not "
+            'CALL spawn_budget_violation with the result reaching an assert. '
+            'Computing a verdict and dropping it enforces nothing while still '
+            'mentioning the name, which is why this pin reads enforcement '
+            'rather than mention.'
         )
 
 
@@ -1304,6 +2148,81 @@ def test_enforced_rejects_a_call_reached_only_by_the_assert_message() -> None:
 def _sites(source: str) -> dict[str, float | None]:
     """``{qualname: seconds}`` for *source*, dedented so fixtures can be indented."""
     return {site.qualname: site.seconds for site in _timeout_marker_sites(textwrap.dedent(source))}
+
+# ---------------------------------------------------------------------------
+# _usefixtures_names(cls) -- inline-class unit tests.
+#
+# The OTHER half of the marker/budget pairing census, and the half whose
+# spelling coverage has to MATCH the timeout half's above: a class opting in
+# through `pytestmark` is as bound as one carrying a decorator, and a census
+# blind to it would fail that class for missing an opt-in it already has.
+# ---------------------------------------------------------------------------
+
+
+def _requested(source: str) -> frozenset[str]:
+    """``_usefixtures_names`` over the single class defined in *source*."""
+    tree = _parse(textwrap.dedent(source))
+    assert tree is not None
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    assert len(classes) == 1, 'these fixtures define exactly one class'
+    return _usefixtures_names(classes[0])
+
+
+def test_usefixtures_census_reads_a_class_decorator() -> None:
+    """The spelling all nine deep-landing classes actually use."""
+    assert _requested(
+        """
+        import pytest
+
+        @pytest.mark.usefixtures('_within_spawn_budget')
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+    ) == {'_within_spawn_budget'}
+
+
+def test_usefixtures_census_reads_class_level_pytestmark() -> None:
+    """``pytestmark`` in the class body -- same binding, different syntax.
+
+    Matches what the timeout census already honours
+    (``test_extractor_reads_class_level_pytestmark``).  Before task 5582's
+    amendment pass the two halves read different surfaces, so this spelling
+    made the pairing pin fail spuriously and tell its author to add a
+    decorator that would have changed nothing.
+    """
+    assert _requested(
+        """
+        import pytest
+
+        class TestThing:
+            pytestmark = [pytest.mark.usefixtures('_within_spawn_budget')]
+
+            def test_a(self) -> None:
+                pass
+        """
+    ) == {'_within_spawn_budget'}
+
+
+def test_usefixtures_census_ignores_a_mark_bound_somewhere_else() -> None:
+    """A MODULE-level ``pytestmark`` is not this class's own opt-in.
+
+    It covers every collected item in the file, including the two classes
+    measured at zero git spawns that the budget fixture must never reach, so
+    counting it here would report coverage the pairing does not have.
+    """
+    assert _requested(
+        """
+        import pytest
+
+        pytestmark = pytest.mark.usefixtures('_within_spawn_budget')
+
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+    ) == frozenset()
+
 
 
 def test_extractor_reads_a_bare_literal_function_decorator() -> None:
@@ -1566,10 +2485,13 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
-#: The pre-existing in-band sites, MEASURED at authorship time: 61 across 18
-#: modules, at 90/120/150/180s.  Entries may only ever be REMOVED, never added
-#: -- a new marker in the band is what this module exists to reject, and
-#: `test_no_new_inverting_timeout_marker`'s failure message says so outright.
+#: The pre-existing in-band sites: 61 across 18 modules at 90/120/150/180s
+#: when MEASURED at authorship time; 52 across 17 since task 5582 migrated
+#: test_merge_queue_deep_landing.py's nine off a grandfathered 180s onto a
+#: measured DEEP_LANDING_SCENE_TEST_TIMEOUT.  Entries may only ever be
+#: REMOVED, never added -- a new marker in the band is what this module exists
+#: to reject, and `test_no_new_inverting_timeout_marker`'s failure message
+#: says so outright.
 #:
 #: Not mechanically migrated in task 5147, deliberately: these are the hottest
 #: files in the repo (test_merge_queue.py and its deep_* siblings,
@@ -1578,7 +2500,8 @@ _MIN_EXPECTED_MARKER_SITES = 100
 #: and would itself have risked destabilising the very verify path the task
 #: existed to de-flake.  Stopping the bleeding is what prevents a fourth task
 #: being blamed; the migration is ordinary follow-up work, filed as
-#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY.
+#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY -- PARTIALLY
+#: DISCHARGED by task 5582, which took the nine deep-landing sites.
 #:
 #: Keyed on ``(module, qualname)`` -- *module* being the path RELATIVE to this
 #: directory (``test_cli.py``, and ``fixtures/x.py`` for anything nested), NOT
@@ -1636,16 +2559,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     ('test_merge_queue_deep_dispatch.py', 'TestRunInflightVerifyChainRedirect'),
     ('test_merge_queue_deep_dispatch.py', 'TestDeepTipVerifyNeverAdopts'),
     ('test_merge_queue_deep_dispatch.py', 'TestDeepDispatchRoundsIntegration'),
-    # test_merge_queue_deep_landing.py -- 9 sites at 180s
-    ('test_merge_queue_deep_landing.py', 'TestTipPassAdoptionSignal'),
-    ('test_merge_queue_deep_landing.py', 'TestInOrderCasWalk'),
-    ('test_merge_queue_deep_landing.py', 'TestStaleCasAbortLeavesTheRestAlone'),
-    ('test_merge_queue_deep_landing.py', 'TestContendedLeaseDeferInheritance'),
-    ('test_merge_queue_deep_landing.py', 'TestHeadCancelOnAdoption'),
-    ('test_merge_queue_deep_landing.py', 'TestHeadCancelLeavesTheLaneIdle'),
-    ('test_merge_queue_deep_landing.py', 'TestAdoptedHeadLandsWithThePostVerifyWorktree'),
-    ('test_merge_queue_deep_landing.py', 'TestChainWalkConsumesNoPermits'),
-    ('test_merge_queue_deep_landing.py', 'TestDeepLandingEndToEnd'),
     # test_merge_queue_request_liveness.py -- 1 site at 180s
     ('test_merge_queue_request_liveness.py', 'TestDeadVerifyAbortSelfHealsEndToEnd'),
     # test_merge_queue_restart_hook.py -- 1 site at 180s
@@ -1777,10 +2690,10 @@ def test_no_new_inverting_timeout_marker() -> None:
     worker.  Three tasks (4176, 4384, 4405) were failed that way by ONE such
     marker.
 
-    A RATCHET AND NOT A SWEEP, deliberately.  The 61 surviving in-band sites
-    span ~20 modules, most of them the hottest files in the repo
-    (test_merge_queue.py, test_merge_queue_deep_landing.py,
-    test_merge_queue_build_chain.py, test_crash_recovery.py).  Rewriting them
+    A RATCHET AND NOT A SWEEP, deliberately.  The 52 surviving in-band sites
+    span 17 modules, most of them the hottest files in the repo
+    (test_merge_queue.py, test_merge_queue_build_chain.py,
+    test_crash_recovery.py).  Rewriting them
     here would take a concurrency lock on nearly every file in-flight fleet
     tasks are editing, and would risk destabilising the very verify path this
     guard exists to de-flake.  Blocking NEW instances at commit time is what
