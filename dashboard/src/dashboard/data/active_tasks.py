@@ -817,15 +817,9 @@ async def _shape_one_project(
     # that path serves. done_count is the map's cheapest product, not its only
     # one.
     #
-    # Its COST is bounded by fetch_statuses' own 5 s TTL cache rather than by a
-    # gate here. That matters because BOTH /api/v2/dashboard/tasks and
-    # /api/v2/dashboard/scheduler reach this function (via
-    # collect_tasks_with_counts) on every 3 s data.js poll: uncached, one
-    # unconditional call per root became two full-population get_statuses reads
-    # per root per poll — trading wire bytes for backend queries, which is not
-    # the trade this change set out to make. Cached, the two endpoints share
-    # one read and consecutive polls collapse. See
-    # tasks._FETCH_STATUSES_TTL_SECONDS for why 5 s.
+    # Its COST is bounded by the enclosing per-project wait_for alone:
+    # fetch_statuses holds no cache of its own since task 5587, and the map is
+    # now walked in STATUSES_SAFE_PAGE_SIZE pages rather than read whole.
     #
     # Both carry the Tasks-tab-LOCAL _TASKS_PER_CALL_TIMEOUT rather than
     # tasks.DEFAULT_PER_CALL_TIMEOUT: this tab is the only caller that reads a

@@ -14,10 +14,10 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from test_task_snapshot import CannedMCP
 
 import dashboard.data.tasks as tasks_mod
 from dashboard.data.tasks import _shape_task
-from test_task_snapshot import CannedMCP
 
 # ---------------------------------------------------------------------------
 # updated_at preservation (step-1/step-2)

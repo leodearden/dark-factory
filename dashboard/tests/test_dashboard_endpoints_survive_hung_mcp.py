@@ -129,7 +129,6 @@ def hung_mcp(monkeypatch, tmp_path):
 
     # A warm entry would be served without ever reaching the hang.
     tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
@@ -161,7 +160,6 @@ def hung_mcp(monkeypatch, tmp_path):
 
     # Leave no hang-stubbed entry behind for the next test in the session.
     tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
