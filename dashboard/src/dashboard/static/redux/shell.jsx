@@ -1,6 +1,15 @@
 /* App shell: rail nav, topbar, toolbar (filters), live feed */
 const { useState, useEffect, useMemo, useRef } = React;
 const SP_SHELL = window.DF_CHARTS.Sparkline;
+const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
+// The Datum render decision, at module scope with no fallback (the
+// DF_SPARK_PATH convention: throw loudly at load rather than defer to a
+// TypeError inside a render). Bound under datum.js's own name — this is a
+// `type="text/babel"` tag, whose top-level bindings Babel-standalone downlevels
+// so they never join the classic-script global lexical scope that forces the
+// renames in data.js and task_row_cells.js. See classic_script_scope.test.mjs's
+// SCOPE note for the three measured witnesses.
+const { datumView } = window.DF_DATUM;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
 
@@ -436,6 +445,43 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
   );
 }
 
+// ── One pip of a project-group summary ──
+// The shared home the six caller-built pip fragments had none of. ProjectGroup
+// could not be it: it takes `summary` as an OPAQUE node, and the word "pip"
+// does not occur anywhere else in this file — every pip was a JSX fragment
+// hand-built at its call site, the six sharing only the CSS at
+// styles.css:381-384. So this is a NEW component placed beside ProjectGroup,
+// which is the closest honest reading of the PRD's "ProjectGroup pips".
+//
+// The markup is the fragments' own, unchanged, so `.proj-head .summary .pip`
+// and `.pip-dot` keep styling it — a new shape would have needed new CSS in a
+// file no leaf of this PRD owns.
+//
+// ONLY PIPS THAT RENDER A MEASURED NUMBER COME THROUGH HERE. The status-word
+// pips (running/completed, offline, state unknown) are derived FLAGS with no
+// measurement instant, and wrapping a boolean in an envelope whose contract is
+// value + as_of + state would be a category error; gamma2/theta own those
+// surfaces.
+//
+// `label` is the trailing word ('p50', 'active', 'blocked'), kept a separate
+// prop rather than folded into `format` so the formatter stays about the VALUE
+// and the space between the two is decided once here instead of at each site.
+//
+// The age is a dim suffix rather than a badge of its own: a pip sits in a dense
+// flex summary row, and a second bordered element per pip would double that
+// row's width. It shares DATUM_AGE_STYLE with StatTile, so the dashboard states
+// an age in one shape as well as one format.
+function Pip({ datum, label, color, format }) {
+  const view = datumView(datum, { now: Date.now(), format });
+  return (
+    <span className="pip" title={view.title || undefined}>
+      <span className="pip-dot" style={{ background: color }}></span>
+      {view.text}{label && ` ${label}`}
+      {view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}
+    </span>
+  );
+}
+
 // ── Segmented control ──
 function Segmented({ options, value, onChange }) {
   return (
@@ -451,4 +497,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };

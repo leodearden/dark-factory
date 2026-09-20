@@ -19,7 +19,14 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // a chart with no bands rather than fail. index.html's load order is the
 // enforced contract, pinned per-module by test_index_html.py: both scripts are
 // asserted served-200 and asserted to load before this file.
-const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
+const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
+// The Datum readers, at module scope with no fallback (the DF_SPARK_PATH
+// convention: throw loudly at load rather than defer to a TypeError inside a
+// render). Bound under datum.js's own names — this is a `type="text/babel"`
+// tag, whose top-level bindings Babel-standalone downlevels so they never join
+// the classic-script global lexical scope that forces the renames in data.js
+// and task_row_cells.js. See classic_script_scope.test.mjs's SCOPE note.
+const { plainDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 const { useState: uS, useEffect: uE } = React;
@@ -178,11 +185,26 @@ function DepsCell({ task }) {
   return <ChipList items={sorted} renderChip={(d) => <DepChip key={d.id} dep={d} />} maxInline={2} persistKey={`df.deps.${task.id}`} />;
 }
 
-function LocksCell({ task }) {
+// ── The Locks column of a task row ──
+// `datum` says whether anything is KNOWN about this task's locks. The chips come
+// from DF.SCHEDULER, so a project whose scheduler is offline produced an empty
+// lockSet — and ChipList renders an empty list as a bare em-dash, which is
+// exactly what a task holding no locks renders too. Two opposite answers, one
+// pixel-identical cell, for an operator deciding whether a task is blocked.
+//
+// THE DECISION IS NOT MADE HERE. locksCellState answers it in
+// task_row_cells.js, where the node suite can actually execute it; a
+// `state === 'unknown'` test in this JSX would be a second authority that no
+// harness in this repo can run. This function only draws the answer: the
+// placeholder carrying its reason, or the existing ChipList untouched.
+function LocksCell({ task, datum }) {
   const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
-  const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+  const lockInfo = buildSchedLockInfo
     ? buildSchedLockInfo(task, DF.SCHEDULER)
     : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
+  const cell = locksCellState(datum, lockInfo);
+  if (cell.placeholder) return <span className="chip-empty" title={cell.title || undefined}>{cell.placeholder}</span>;
+  const { rawTaskId, lockSet, moduleByPath } = lockInfo;
   const sorted = [...lockSet].sort((a, b) => {
     const ma = moduleByPath.get(a), mb = moduleByPath.get(b);
     const ha = ma && ma.holder, hb = mb && mb.holder;

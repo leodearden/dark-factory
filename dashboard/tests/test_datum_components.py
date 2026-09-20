@@ -81,7 +81,12 @@ def test_stat_tile_renders_through_datum_view(charts_jsx_body: str) -> None:
         "come from datumView's `text`, so the hole decision is made in one "
         'place instead of once per call site.'
     )
-    assert not re.search(r'\bspark\b', body), (
+    # An IDENTIFIER named spark, not the CSS class of the same name: the
+    # sparkline's container is `className="spark"` and always was, so a probe
+    # that swallowed the string literal too would be unsatisfiable by any
+    # correct source.  The lookarounds reject a quoted occurrence and nothing
+    # else — `{spark && ...}` and `values={spark}` both still match.
+    assert not re.search(r'''(?<!['"])\bspark\b(?!['"])''', body), (
         "charts.jsx::StatTile still references `spark`. The prop is renamed to "
         '`history` so the sparkline series is named for what it is and cannot be '
         'confused with the datum-backed value; a lingering `spark` read means '
