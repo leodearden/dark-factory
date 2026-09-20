@@ -337,10 +337,12 @@ PYTEST_USAGE_ERROR_OUTPUT = (
     '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
 )
 
-# The SAME rejection from the same binary launched as a module — measured
-# verbatim from `python -m pytest --timeout --junitxml /tmp/j.xml 300` in this
-# worktree (rc=4). argparse renders `basename(sys.argv[0])`, so the program
-# name is a fact about the launch, not about the error.
+# The SAME rejection from the same binary launched as a module — measured from
+# `python -m pytest --timeout --junitxml /tmp/j.xml 300` in this worktree
+# (rc=4). The two argparse lines are verbatim; the trailing inifile/rootdir
+# paths are normalized to match the sample above, which is the only difference.
+# argparse renders `basename(sys.argv[0])`, so the program name is a fact about
+# the launch, not about the error.
 _PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT = (
     'ERROR: usage: __main__.py [options] [file_or_dir] [file_or_dir] [...]\n'
     '__main__.py: error: argument --timeout: expected one argument\n'
