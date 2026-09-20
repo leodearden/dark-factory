@@ -42,8 +42,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'assertDatum',
   'withReceipt',
   'displayedAgeMs',
+  'datumView',
 ];
-const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'DATUM_STATES'];
+const EXPECTED_EXPORT_NAMES = [
+  ...EXPECTED_FUNCTION_NAMES,
+  'DATUM_STATES',
+  'EM_DASH',
+  'LOWER_BOUND_PREFIX',
+];
 
 // Loads datum.js fresh against a shimmed browser-ish global carrying the REAL
 // endpoint_staleness API, then busts the require cache so a later call
@@ -67,6 +73,7 @@ function loadDatumJs() {
 const { api: datum } = loadDatumJs();
 const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
+const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -351,4 +358,147 @@ test('displayedAgeMs: with no server served_at, degrades to the client gap — n
 test('displayedAgeMs: an unparseable instant yields null, not NaN', () => {
   const stamped = withReceipt({ ...STALE_WIRE, as_of: 'not an instant' }, RECEIPT);
   assert.equal(displayedAgeMs(stamped, NOW), null);
+});
+
+// ---------------------------------------------------------------------------
+// datumView — THE render decision. Every shared component delegates here and
+// holds no arm of its own, which is what makes "one datum, one path" a
+// checkable property rather than a slogan: a tile cannot invent a second rule
+// for holes, prefixes, tooltips or ages without the probe in
+// tests/test_datum_components.py noticing.
+// ---------------------------------------------------------------------------
+
+// A formatter that throws if it is ever called. HBarChart's valueText
+// hole-guard records why this matters: both its live call sites pass formatters
+// that throw on a missing value and would take the whole tab down with them, so
+// what is load-bearing is not the placeholder but that `format` is never
+// INVOKED on a hole.
+function explodingFormat(v) {
+  throw new Error(`format must never be invoked on a hole (got ${String(v)})`);
+}
+
+// The census's most common formatter shape, so the prefix/format ordering is
+// asserted against something a real call site actually passes.
+const money = v => `$${v.toFixed(2)}`;
+
+function stampedWire(overrides) {
+  return withReceipt({ ...STALE_WIRE, ...overrides }, RECEIPT);
+}
+
+test('datumView: an unknown datum renders an em-dash carrying its reason', () => {
+  const view = datumView(withReceipt(unknownDatum('scheduler offline'), RECEIPT), {
+    now: NOW,
+    format: explodingFormat,
+  });
+
+  assert.equal(view.text, EM_DASH);
+  assert.equal(view.title, 'scheduler offline');
+  assert.equal(view.age, null);
+});
+
+test('datumView: NEVER invokes format on a hole', () => {
+  // Asserted as "did not throw" above and restated here against the raw,
+  // unstamped unknown too — the pre-fetch shape every tile renders first.
+  assert.doesNotThrow(() =>
+    datumView(unknownDatum('not yet fetched'), { now: NOW, format: explodingFormat }),
+  );
+});
+
+test('datumView: the em-dash is the exported constant, not a per-site literal', () => {
+  // Exported for the same reason STRAND_TITLE is in task_row_cells.js: 43 call
+  // sites hand-spelling a placeholder is 43 chances to disagree about it.
+  assert.equal(EM_DASH, '—');
+  assert.equal(LOWER_BOUND_PREFIX, '≥');
+});
+
+test('datumView: a stale datum renders its value, its reason, and an age badge', () => {
+  const view = datumView(stampedWire({}), { now: NOW, format: money });
+
+  assert.equal(view.text, '$7.00');
+  assert.equal(view.title, 'ReadTimeout');
+  assert.ok(view.age, 'a stale datum must carry an age badge');
+});
+
+test('datumView: a lower_bound datum prefixes the FORMATTED value', () => {
+  // '≥$7.00', never '$≥7.00' and never '≥7' — the prefix is a statement about
+  // the rendered quantity, so it wraps the formatter's output.
+  const view = datumView(
+    stampedWire({ state: 'lower_bound', reason: 'window truncated at 500 rows' }),
+    { now: NOW, format: money },
+  );
+
+  assert.equal(view.text, `${LOWER_BOUND_PREFIX}$7.00`);
+  assert.equal(view.prefix, LOWER_BOUND_PREFIX);
+  assert.equal(view.title, 'window truncated at 500 rows');
+});
+
+test('datumView: no prefix on any other state', () => {
+  for (const state of ['fresh', 'stale', 'unknown']) {
+    const view = datumView(stampedWire({ state, reason: state === 'fresh' ? null : 'r' }), {
+      now: NOW,
+      format: String,
+    });
+    assert.equal(view.prefix, '', `state ${state} must carry no prefix`);
+  }
+});
+
+test('datumView: a fresh datum inside its bound gets neither badge nor tooltip', () => {
+  // Nothing to say: the server measured it, it is within the bound its producer
+  // declared, and it has not aged past that in this browser. A badge here would
+  // be noise on every healthy tile.
+  const view = datumView(
+    withReceipt({ ...FRESH_WIRE, as_of: SERVED_AT }, RECEIPT),
+    { now: NOW, format: String },
+  );
+
+  assert.equal(view.text, '42');
+  assert.equal(view.title, null);
+  assert.equal(view.age, null);
+});
+
+test('datumView: AGE BADGE WINS — a fresh datum aged past its bound badges anyway', () => {
+  // The server's verdict was true when it was served; it is the CLIENT-side
+  // gap that has since made it false. The operator reads the age rather than
+  // the stale verdict, which is the whole reason the age is computed on this
+  // side at all.
+  const fresh = withReceipt({ ...FRESH_WIRE, as_of: SERVED_AT }, RECEIPT);
+  const overBound = FRESH_WIRE.freshness_bound_seconds * 1000 + 1_000;
+  const view = datumView(fresh, { now: RECEIVED_AT + overBound, format: String });
+
+  assert.ok(view.age, 'a fresh datum aged past its bound must badge');
+  assert.equal(view.text, '42', 'the value still renders — the server said fresh');
+  assert.equal(view.title, null, 'the server gave no reason, so none is invented');
+});
+
+test('datumView: the badge is formatAge(displayedAgeMs(...)) exactly — one formatter', () => {
+  // Pins the single source. If datumView ever grows its own age spelling, the
+  // tile badge and the endpoint staleness banner start disagreeing about how
+  // long the same wedge has lasted.
+  const stamped = stampedWire({});
+  const view = datumView(stamped, { now: NOW, format: String });
+
+  assert.equal(view.age, staleness.formatAge(displayedAgeMs(stamped, NOW)));
+  assert.equal(view.age, '3h');
+});
+
+test('datumView: no badge when the age is unknowable, rather than a fabricated one', () => {
+  // An unstamped datum has no receipt, so displayedAgeMs is null. Rendering
+  // formatAge(null) would put the literal 'an unknown time' on a tile; showing
+  // no badge says the same thing without claiming to have measured anything.
+  const view = datumView(STALE_WIRE, { now: NOW, format: String });
+  assert.equal(view.age, null);
+  assert.equal(view.title, 'ReadTimeout', 'the reason still renders without a receipt');
+});
+
+test('datumView: a non-Datum throws via assertDatum, naming the component', () => {
+  // The pre-migration prop: a bare number where the envelope belongs.
+  assert.throws(
+    () => datumView(42, { now: NOW, format: String }),
+    err => err instanceof TypeError && err.message.includes('datumView'),
+  );
+});
+
+test('datumView: format defaults to String, and opts is optional entirely', () => {
+  assert.equal(datumView(stampedWire({}), { now: NOW }).text, '7');
+  assert.equal(datumView(stampedWire({})).text, '7');
 });
