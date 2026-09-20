@@ -1818,6 +1818,92 @@ legibility-trickle@<project>`):
   actually reported — a fleet-wide near-cap warning and a backend fault both
   land here.
 
+### Legibility trickle health probe (04:30)
+
+**What it does.** Runs both trickle probes once a night and files one
+escalation if the pipeline has stopped producing. Before task 4514 nothing
+ran either probe — every repo-wide reference to them was prose, a docstring,
+a test or PRD text, and the only bindings either ever had were the one-shot
+`before_done` milestone predicates on tasks 2587/2615 (both `done`; a
+completed milestone predicate never runs again). A probe nobody invokes is
+documentation.
+
+**Three artefacts, three different questions.** Do not merge them again:
+
+| Artefact | Answers |
+|---|---|
+| `scripts/legibility/check_trickle_liveness.sh` | Did the UNIT run? (reads `legibility-trickle@<project>.service`'s `Result`) |
+| `scripts/legibility/check_trickle_progress.py` | Did SIGNAL flow? (reads the recorded run state) |
+| `scripts/legibility/check_trickle_health.py` | Runs both on a timer and escalates |
+
+`check_trickle_health.py` **executes** the other two as subprocesses rather
+than re-deriving either verdict, so there is no lockstep duplication to keep
+in sync and `check_trickle_liveness.sh` stays byte-identical as its own
+header comment requires.
+
+**Run it by hand:**
+
+```bash
+uv run --project shared python scripts/legibility/check_trickle_health.py --project-id <project>
+```
+
+**Deploy it** — once per project, from the MAIN checkout after this change
+has landed on main (the unit templates hardcode
+`WorkingDirectory=/home/leo/src/dark-factory`, so a timer enabled against a
+checkout without `check_trickle_health.py` goes `Result=failed` nightly):
+
+```bash
+scripts/legibility/install-trickle-health-timer.sh <project_id>
+```
+
+**Reading the verdict.** Each door has its own remedy, and conflating them
+is how an operator ends up tuning the sampler for a crashed coder:
+
+- **`failed` streak** — the run did not complete. Signal may well have flowed
+  IN (the verdict reports `selected_count`); the pipeline broke downstream.
+  Read `journalctl --user -u legibility-trickle@<project>`. Raising
+  `budgets.max_daily_digest_bytes` or `sampling.top_fraction` will **not**
+  help.
+- **`barren` streak** — the run completed and the sampler's doors dropped
+  everything. Compare `budgets.max_daily_digest_bytes` against
+  `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
+  the records went out of.
+- **`missing` / `malformed` / stale** — the recorder itself stopped. The
+  nightly is not writing state at all, so neither streak means anything yet.
+- **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+
+**The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
+(deliberately distinct from the nightly's own
+`legibility-trickle-<project_id>`, so the two histories stay separately
+readable), `category=infra_issue`, `severity=info`. It stays **silent** in two
+cases: a liveness-only failure (a unit that ran and failed is already owned by
+the nightly's own escalation for that same run) and the exact night the
+nightly's edge-triggered barren-streak escalation fired. So it never doubles
+an alarm the nightly already raised. A non-zero exit is the authoritative
+signal whether or not the POST landed.
+
+**Where the state file lives.**
+
+```
+<passwd home>/.local/state/dark-factory/legibility/<project_id>/trickle-state.json
+```
+
+Resolved from the invoking user's **passwd entry**, and deliberately **not**
+from `XDG_STATE_HOME` or `HOME`. This looks like an XDG violation and is not:
+the file's identity is "this host's legibility state for this user and
+project", not "this process's state dir", and two processes that must agree on
+one file cannot each resolve it from their own environment. The writer is
+`legibility-trickle@<project>.service` under the `systemd --user` manager
+(user-record `HOME`, no shell rc); the reader is this timer, a dev shell, or a
+future orchestrator-exec'd `before_done` predicate inheriting whatever shell
+launched the orchestrator. Nothing pinned those to agree, and under the old
+resolution they silently read and wrote different files.
+
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` is the single supported relocation
+lever. **No shipped unit sets it** — production always takes the anchored
+branch — and if you do set it, set it for **both** units at once: pinning one
+half is exactly how the writer/reader divergence comes back.
+
 ### Nightly canonical/topic coverage census (05:00)
 
 **What it does.** Measures how much of the memory corpus actually carries
