@@ -111,7 +111,7 @@ states that a cold session performs these three posts, which is why its
 *timeout* bounds each request and not the operation.
 
 A named tuple rather than a literal ``3``, for the same reason
-``active_tasks._PER_PROJECT_MCP_CALLS`` is one: if the session handshake ever
+``task_snapshot.PER_PROJECT_MCP_CALLS`` is one: if the session handshake ever
 gains a fourth post, the structural invariant in
 ``tests/test_fetch_tasks_whole_operation_budget.py`` fails a test instead of
 silently overrunning in production.
@@ -707,6 +707,8 @@ async def _cached_fanout(
     read: _TasksRead,
     strategy: Callable[[str], Awaitable[list[dict]]],
     label: str,
+    *,
+    cached: bool = True,
 ) -> list[dict] | dict:
     """Fan out *strategy* across the configured urls, through BOTH task caches.
 
@@ -728,6 +730,13 @@ async def _cached_fanout(
     ``(log_label, url)``.  A shared literal would throttle both public reads as
     one stream and log either failure under the other's name — the operator
     debugging a page read would be told ``fetch_tasks`` had failed.
+
+    *cached* gates the two cache LOOKUPS and nothing else.  The fan-out, the
+    offline-marker policy and the copy isolation stay on the one path they
+    already live on, so a caller opting out of staleness does not also opt out
+    of everything else this layer decides.  A failed uncached read still
+    RECORDS its marker: knowing a root is down is shared knowledge worth
+    suppressing the next cached caller's retry with, whoever discovered it.
     """
     async def _refresh() -> list[dict] | dict:
         return await first_success(
@@ -750,12 +759,16 @@ async def _cached_fanout(
     # returns the same fresh entry this check just saw.  If it expires in the
     # gap the worst case is one extra attempt, which is strictly better than a
     # wrong answer.
-    suppressed = _fetch_tasks_negative_cache.get_fresh(read)
-    if suppressed is not None and _fetch_tasks_cache.get_fresh(read) is None:
-        return suppressed
+    if cached:
+        suppressed = _fetch_tasks_negative_cache.get_fresh(read)
+        if suppressed is not None and _fetch_tasks_cache.get_fresh(read) is None:
+            return suppressed
 
-    result = await _fetch_tasks_cache.get_or_refresh(
-        read, _refresh, cache_ok=lambda v: isinstance(v, list),
+    result = (
+        await _fetch_tasks_cache.get_or_refresh(
+            read, _refresh, cache_ok=lambda v: isinstance(v, list),
+        )
+        if cached else await _refresh()
     )
     if not isinstance(result, list):
         # Record the offline marker, under the SAME record the positive cache
@@ -892,6 +905,7 @@ async def fetch_tasks(
     statuses: list[str] | None = None,
     chunk_size: int | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+    cached: bool = True,
 ) -> list[dict] | dict:
     """Fetch the COMPLETE dashboard-shaped task set for *project_root* via MCP.
 
@@ -978,6 +992,14 @@ async def fetch_tasks(
     transient failure does not pin empty results for the TTL window.  The
     policy itself lives once, in :func:`_cached_fanout`; this section and
     the three below describe it for BOTH public reads.
+
+    Pass ``cached=False`` to bypass both cache LOOKUPS — everything else on
+    this path is unchanged, including the marker this read records on failure.
+    ``task_snapshot.acquire_snapshot`` is the caller that needs it: it stamps
+    the rows with an ``as_of`` at the present instant, and a cached read could
+    hand it rows up to a full TTL older than that stamp claims.  It pays no
+    duplicate-read cost for the bypass because it holds a longer TTL of its
+    own over the whole unit.
 
     **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
     every call, so list-level mutations (``result.clear()``, ``result.append()``)
@@ -1083,7 +1105,7 @@ async def fetch_tasks(
         # answer.  The envelope, if any, is irrelevant — nothing is being paged.
         return (await page_fn(None)).rows
 
-    return await _cached_fanout(config, read, _call, 'fetch_tasks')
+    return await _cached_fanout(config, read, _call, 'fetch_tasks', cached=cached)
 
 
 async def fetch_external_statuses(

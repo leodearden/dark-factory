@@ -73,6 +73,7 @@ from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
+from dashboard.data.task_snapshot import PER_CALL_TIMEOUT
 from dashboard.data.tasks import (
     fetch_external_statuses,
     fetch_statuses,
@@ -134,78 +135,30 @@ _MAX_CANCELLED_PER_PROJECT = 50
 # roster of the units, so ``tests/test_tasks_budget.py`` can machine-check
 # that the parts fit the whole instead of a human re-deriving the arithmetic
 # every time one of them moves.
-
-# The MCP calls ``_shape_one_project`` issues for ONE project root. A named
-# tuple rather than a literal ``3`` deliberately: the invariant then tracks
-# reality, so adding a fourth per-project call without raising the budget
-# fails the structural test rather than silently overrunning in production.
-_PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
-    'get_tasks[active]',
-    'get_statuses',
-    'get_tasks[terminal]',
-)
-
-# Per-HTTP-REQUEST budget for the Tasks tab's own MCP calls, threaded into
-# every call ``_shape_one_project`` issues.
 #
-# MEASURED 2026-09-07 against the live fused-memory (localhost:8002), 9
-# configured roots, caches cleared per root, per-call timeout temporarily
-# raised to 10.0 so a slow root reported its real latency instead of a
-# ReadTimeout: per-CALL max 2.696 s, per-ROOT wall max 2.876 s (dark-factory
-# 5128 tasks, reify 7279), p95 across roots 1.695 s. Everything else was
-# under 0.1 s — the distribution is two big trees and seven small ones, not a
-# uniform cost.
-#
-# 4.4 = 1.5 * the 2.876 s per-root wall max, rounded up to one decimal.
-#
-# WHY 2.0 IS TOO SMALL, on evidence rather than on principle: at
-# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` the same measurement's truly-cold render
-# marked dark-factory, reify AND autopilot-video OFFLINE and shipped 208 of
-# 3045 active rows — i.e. the Tasks tab reported the three largest projects
-# unreachable while fused-memory was serving them fine, which is what the
-# journal's ``fetch_tasks[reify] failed for http://localhost:8002:
-# ReadTimeout`` lines are. Offline is a claim that the read demonstrably
-# failed; a per-call budget below the honest service time turns that claim
-# into a lie on every cold render.
-#
-# WHY THE SERVER COST SCALES WITH TREE SIZE even though this read is
-# status-narrowed: there is no field projection at any layer and the backend
-# query is ``SELECT *`` feeding a fixed 14-key row — see ``fetch_tasks``'
-# docstring, which records the limitation, and task 4390, which is the open
-# follow-up to add projection. Until that lands, narrowing the STATUSES does
-# not narrow the WORK, so a 5 000-task tree costs what a 5 000-task tree
-# costs and the budget has to be sized for it.
-#
-# WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
-# ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
-# ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
-# ``orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET``,
-# ``merge_queue._TASK_TITLES_BUDGET`` and ``app._TASK_CARDS_BUDGET`` all bind
-# BY REFERENCE (task 4788). Raising the shared default to fix the Tasks tab
-# would silently widen three unrelated route budgets — none of which fetches
-# a 5 000-task tree, so none of which needs it.
-# ``test_tasks_budget.py`` assertion (e) pins both halves of this.
-_TASKS_PER_CALL_TIMEOUT = 4.4
+# The per-unit half of that pair lives in ``task_snapshot`` now, with the
+# reads it bounds: ``PER_CALL_TIMEOUT`` and the ``PER_PROJECT_MCP_CALLS``
+# roster. A per-read budget left behind in a module that no longer issues the
+# read would be a second copy waiting to drift.
 
 # Whole-operation bound for ONE project root, enforced by ``asyncio.wait_for``
 # in ``collect_tasks_with_counts``.
 #
-# ``_TASKS_PER_CALL_TIMEOUT`` (4.4) * 3 calls = 13.2 <= 14.0, leaving
-# 0.8 s of slack so this deadline is a real backstop for non-MCP overhead
-# (JSON decode, row shaping, event-loop scheduling) rather than coinciding
-# exactly with the sum of its parts — the same reasoning as healthz's
-# ``_DB_PROBE_TIMEOUT * 3 = 2.7 <= _HEALTHZ_TOTAL_BUDGET = 3.0``.
+# ``task_snapshot.PER_CALL_TIMEOUT`` (4.4) * 3 bounded operations = 13.2 <=
+# 14.0, leaving 0.8 s of slack so this deadline is a real backstop for non-MCP
+# overhead (JSON decode, row shaping, event-loop scheduling) rather than
+# coinciding exactly with the sum of its parts — the same reasoning as
+# healthz's ``_DB_PROBE_TIMEOUT * 3 = 2.7 <= _HEALTHZ_TOTAL_BUDGET = 3.0``.
 #
-# It moved 7.0 -> 14.0 only because ``_TASKS_PER_CALL_TIMEOUT`` moved 2.0 ->
-# 4.4: the parts-fit-the-whole shape is unchanged and the slack is still
-# named. It is NOT an independent widening, and must not be raised on its own.
+# It moved 7.0 -> 14.0 only because ``PER_CALL_TIMEOUT`` moved 2.0 -> 4.4: the
+# parts-fit-the-whole shape is unchanged and the slack is still named. It is
+# NOT an independent widening, and must not be raised on its own.
 #
-# What that sum does and does NOT claim: it bounds the sum of the
-# PER-HTTP-REQUEST budgets. It does NOT bound a cold MCP session, which
-# performs three posts (initialize, notifications/initialized, tools/call) and
-# so can reach ``3 * _TASKS_PER_CALL_TIMEOUT`` for a SINGLE tool call — the
-# TAB'S per-call term, not the shared default, since that is what every call
-# below threads. That
+# What that sum does and does NOT claim: it bounds the sum of the per-OPERATION
+# budgets. It does NOT bound a cold MCP session, which performs three posts
+# (initialize, notifications/initialized, tools/call) and so can reach
+# ``3 * PER_CALL_TIMEOUT`` for a SINGLE tool call — the TAB'S per-call term,
+# not the shared default, since that is what every call below threads. That
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
@@ -821,7 +774,7 @@ async def _shape_one_project(
     # fetch_statuses holds no cache of its own since task 5587, and the map is
     # now walked in STATUSES_SAFE_PAGE_SIZE pages rather than read whole.
     #
-    # Both carry the Tasks-tab-LOCAL _TASKS_PER_CALL_TIMEOUT rather than
+    # Both carry the Tasks-tab-LOCAL PER_CALL_TIMEOUT rather than
     # tasks.DEFAULT_PER_CALL_TIMEOUT: this tab is the only caller that reads a
     # 5 000-task tree, and at the shared 2.0 s default the measurement of
     # 2026-09-07 marked the three largest roots OFFLINE on a cold render. See
@@ -830,10 +783,10 @@ async def _shape_one_project(
         fetch_tasks(
             client, config, project_root,
             statuses=sorted(_ACTIVE_STATUSES),
-            timeout=_TASKS_PER_CALL_TIMEOUT,
+            timeout=PER_CALL_TIMEOUT,
         ),
         fetch_statuses(
-            client, config, project_root, timeout=_TASKS_PER_CALL_TIMEOUT,
+            client, config, project_root, timeout=PER_CALL_TIMEOUT,
         ),
     )
     if isinstance(fetched, dict) and fetched.get('offline'):
@@ -886,7 +839,7 @@ async def _shape_one_project(
             statuses=sorted(_TERMINAL_STATUSES),
             page_size=window,
             offset=max(0, n_terminal - window),
-            timeout=_TASKS_PER_CALL_TIMEOUT,
+            timeout=PER_CALL_TIMEOUT,
         )
         if isinstance(terminal, list):
             # DEDUP, not concatenate. The two fetches are separate cached
@@ -1111,7 +1064,8 @@ async def collect_tasks_with_counts(
     survives it, so do not rely on either:
 
     * per project this issues the 2-3 calls enumerated in
-      ``_PER_PROJECT_MCP_CALLS``, not half of what the two collectors cost;
+      ``task_snapshot.PER_PROJECT_MCP_CALLS``, not half of what the two
+      collectors cost;
     * DONE_COUNTS comes from the compact ``fetch_statuses`` map while the rows
       come from ``fetch_tasks``. Both are cached, at 5 s and 20 s
       respectively, so the count can be up to ~15 s NEWER than the rows it

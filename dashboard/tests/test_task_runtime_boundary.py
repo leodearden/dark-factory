@@ -75,7 +75,7 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
         return rows
 
     # ``timeout`` accepted-and-ignored by all three fakes: _shape_one_project
-    # threads active_tasks._TASKS_PER_CALL_TIMEOUT into every call it makes.
+    # threads task_snapshot.PER_CALL_TIMEOUT into every call it makes.
     async def _fake_fetch_tasks(
         client, config, project_root, *,
         statuses=None, chunk_size=None, timeout=None,

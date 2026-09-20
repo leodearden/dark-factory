@@ -3261,11 +3261,12 @@ class TestCachedFanoutCore:
         """
         seen: list[tasks_mod._TasksRead] = []
 
-        async def _fake(config, read, strategy, label):
+        async def _fake(config, read, strategy, label, *, cached=True):
             seen.append(read)
             assert config is dummy_config
             assert callable(strategy)
             assert label == 'fetch_tasks'
+            assert cached is True, 'the default read still rides the cache'
             return []
 
         monkeypatch.setattr(tasks_mod, '_cached_fanout', _fake)
@@ -3293,7 +3294,7 @@ class TestCachedFanoutCore:
         """
         labels: list[str] = []
 
-        async def _fake(config, read, strategy, label):
+        async def _fake(config, read, strategy, label, *, cached=True):
             labels.append(label)
             return []
 

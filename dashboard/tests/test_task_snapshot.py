@@ -218,10 +218,14 @@ ALL_NINE = (
 """One id per ``TaskStatus`` member, so every census bucket is exercised."""
 
 
-def _tree(pairs=ALL_NINE, **row_overrides):
-    """A ``(rows, status_map)`` pair agreeing with each other by construction."""
-    rows = [_raw_row(tid, status, **row_overrides.get(tid, {}))
-            for tid, status in pairs]
+def _tree(pairs=ALL_NINE, overrides=None):
+    """A ``(rows, status_map)`` pair agreeing with each other by construction.
+
+    *overrides* maps a task id to extra raw-row fields, for the claimant
+    columns the strand split reads.
+    """
+    extra = overrides or {}
+    rows = [_raw_row(tid, status, **extra.get(tid, {})) for tid, status in pairs]
     return rows, {tid: status for tid, status in pairs}
 
 
@@ -236,7 +240,6 @@ def project_root(tmp_path):
 def _isolate_caches():
     """Neither the unit cache nor the fetch_tasks cache may cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
-
     import dashboard.data.tasks as tasks_mod
 
     snapshot_mod._snapshot_cache_clear()
@@ -254,14 +257,14 @@ class TestAcquireSnapshotHappyPath:
     """
 
     @staticmethod
-    async def _acquire(canned, config, root, *, now):
+    async def _acquire(canned, client, config, root, *, now):
         from dashboard.data.task_snapshot import acquire_snapshot
 
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            return await acquire_snapshot(None, config, root, now=now)
+            return await acquire_snapshot(client, config, root, now=now)
 
     async def test_the_census_is_a_fresh_datum_stamped_with_the_injected_now(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(a) A ``Datum[TaskCensus]``, tz-aware, at the caller's own instant."""
         from dashboard.data.census import TaskView, build_census
@@ -269,26 +272,26 @@ class TestAcquireSnapshotHappyPath:
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         census = snapshot.census
         assert census.state is DatumState.FRESH
-        assert census.as_of == NOW and census.as_of.utcoffset() is not None
-        assert census.value == build_census(status_map)
-        assert len(census.value.counts) == 9, 'every bucket present, none absent'
-        assert sum(census.value.counts.values()) == census.value.total
-        assert sum(census.value.views.values()) == census.value.total
-        assert census.value.sub_views[TaskView.RUNNING] <= (
-            census.value.views[TaskView.IN_FLIGHT]
-        )
-        assert census.value.views[TaskView.IN_FLIGHT] == 5, (
+        assert census.as_of == NOW and NOW.utcoffset() is not None
+        tally = census.value
+        assert tally == build_census(status_map)
+        assert tally is not None
+        assert len(tally.counts) == 9, 'every bucket present, none absent'
+        assert sum(tally.counts.values()) == tally.total
+        assert sum(tally.views.values()) == tally.total
+        assert tally.sub_views[TaskView.RUNNING] <= tally.views[TaskView.IN_FLIGHT]
+        assert tally.views[TaskView.IN_FLIGHT] == 5, (
             'review and infra-hold belong to in_flight, which the retired '
-            f'five-member _ACTIVE_STATUSES omitted: {census.value.views}'
+            f'five-member _ACTIVE_STATUSES omitted: {tally.views}'
         )
 
     async def test_the_row_read_asks_for_every_active_status(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(b) All seven of ``shared.task_statuses.ACTIVE``, review and infra-hold included."""
         from shared.task_statuses import ACTIVE
@@ -297,7 +300,7 @@ class TestAcquireSnapshotHappyPath:
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         requested = [call['args'].get('statuses')
@@ -307,10 +310,11 @@ class TestAcquireSnapshotHappyPath:
         )
         assert len(sorted(ACTIVE)) == 7
         assert snapshot.rows.state is DatumState.FRESH
+        assert snapshot.rows.value is not None
         assert {row['id'] for row in snapshot.rows.value} == {1, 2, 3, 4, 5, 6, 7}
 
     async def test_the_live_stranded_split_counts_the_rows_not_the_census(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(c) Partitioned by ``tasks.task_is_stranded``, over the ROWS.
 
@@ -318,43 +322,54 @@ class TestAcquireSnapshotHappyPath:
         which only the rows carry. Deriving it from the census would have to
         invent them.
         """
-        live = NOW.isoformat()
+        from dashboard.data.census import TaskView
+
+        beating = NOW.isoformat()
         stale = (NOW - timedelta(hours=2)).isoformat()
         rows, status_map = _tree(
             pairs=((1, 'in-progress'), (2, 'in-progress'), (6, 'pending')),
-            **{
-                1: {'claimant_run_id': 'run-1/sess-1/pid=42', 'heartbeat_at': live},
+            overrides={
+                1: {'claimant_run_id': 'run-1/sess-1/pid=42', 'heartbeat_at': beating},
                 2: {'claimant_run_id': 'run-2/sess-2/pid=43', 'heartbeat_at': stale},
             },
         )
+        # A THIRD in-progress id the map knows about and the rows do not, so
+        # the split cannot pass by coincidentally agreeing with the census.
+        status_map[99] = 'in-progress'
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
-                                       now=NOW)
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config,
+                                       project_root, now=NOW)
 
-        assert (snapshot.in_progress_live, snapshot.in_progress_stranded) == (1, 1)
-        in_progress_rows = [r for r in snapshot.rows.value
-                            if r['status'] == 'in-progress']
-        assert (snapshot.in_progress_live + snapshot.in_progress_stranded
-                == len(in_progress_rows))
+        assert snapshot.in_progress_live == 1, 'the beating heartbeat'
+        assert snapshot.in_progress_stranded == 1, 'the two-hour-old one'
+        assert snapshot.rows.value is not None
+        assert len([r for r in snapshot.rows.value
+                    if r['status'] == 'in-progress']) == 2
+        assert snapshot.census.value is not None
+        assert snapshot.census.value.sub_views[TaskView.RUNNING] == 3, (
+            'the census counts a population the rows do not carry, which is '
+            'why the split may not be derived from it'
+        )
 
     async def test_skew_is_the_measured_gap_between_the_two_halves(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(d) A non-negative int, or None when a half was never measured."""
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
-        assert isinstance(snapshot.skew_seconds, int)
+        census_at, rows_at = snapshot.census.as_of, snapshot.rows.as_of
+        assert census_at is not None and rows_at is not None
         assert snapshot.skew_seconds == int(
-            abs((snapshot.census.as_of - snapshot.rows.as_of).total_seconds())
+            abs((census_at - rows_at).total_seconds())
         ) == 0, 'both halves share the one injected instant'
 
         canned.fail_when = lambda call: call['tool'] == 'get_statuses'
         import dashboard.data.task_snapshot as snapshot_mod
         snapshot_mod._snapshot_cache_clear()
-        degraded = await self._acquire(canned, dashboard_config, project_root,
+        degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         assert degraded.census.as_of is None
@@ -363,7 +378,7 @@ class TestAcquireSnapshotHappyPath:
         )
 
     async def test_both_halves_validate_against_a_served_at_inside_the_bound(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(e) Fresh up to the declared bound, and a contract error past it.
 
@@ -372,15 +387,14 @@ class TestAcquireSnapshotHappyPath:
         contract — a tighter bound would make the access layer raise on its
         own correct output.
         """
-        from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS, SNAPSHOT_TTL_SECONDS
-
         from dashboard.data.datum import DatumContractError, DatumInvariant, validate_datum
+        from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS, SNAPSHOT_TTL_SECONDS
 
         assert FRESHNESS_BOUND_SECONDS == 2 * SNAPSHOT_TTL_SECONDS
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         at_the_bound = NOW + timedelta(seconds=FRESHNESS_BOUND_SECONDS)
@@ -392,7 +406,7 @@ class TestAcquireSnapshotHappyPath:
         assert raised.value.invariant is DatumInvariant.FRESHNESS_BOUND
 
     async def test_to_wire_emits_the_contract_keys_and_not_the_raw_map(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(f) The map is the unit's raw material, not part of its wire shape.
 
@@ -402,7 +416,7 @@ class TestAcquireSnapshotHappyPath:
         """
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         wire = snapshot.to_wire()
@@ -413,15 +427,20 @@ class TestAcquireSnapshotHappyPath:
         assert snapshot.status_map == status_map, 'still reachable in-process'
         assert 'status_map' not in wire
 
-        rendered = wire['census']['value']
+        census_wire = wire['census']
+        assert isinstance(census_wire, dict)
+        rendered = census_wire['value']
+        assert isinstance(rendered, dict)
         assert set(rendered) == {'counts', 'total', 'views', 'sub_views'}
         assert rendered['counts']['infra-hold'] == 1, (
             f'plain-string keys, not enum members: {rendered["counts"]}'
         )
-        assert isinstance(wire['rows']['value'], list)
+        rows_wire = wire['rows']
+        assert isinstance(rows_wire, dict)
+        assert isinstance(rows_wire['value'], list)
 
     async def test_one_unit_one_ttl_and_an_uncached_row_read(
-        self, project_root, dashboard_config, monkeypatch
+        self, project_root, dashboard_config, dummy_client, monkeypatch
     ):
         """(g) The unit owns the only TTL on this path.
 
@@ -434,9 +453,9 @@ class TestAcquireSnapshotHappyPath:
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
 
-        first = await self._acquire(canned, dashboard_config, project_root, now=NOW)
+        first = await self._acquire(canned, dummy_client, dashboard_config, project_root, now=NOW)
         calls_after_first = len(canned.calls)
-        second = await self._acquire(canned, dashboard_config, project_root, now=NOW)
+        second = await self._acquire(canned, dummy_client, dashboard_config, project_root, now=NOW)
 
         assert second is first, 'the second acquisition must be the same unit'
         assert len(canned.calls) == calls_after_first, (
@@ -448,7 +467,7 @@ class TestAcquireSnapshotHappyPath:
         # the first acquisition's rows here.
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
         later = NOW + timedelta(seconds=16)
-        third = await self._acquire(canned, dashboard_config, project_root, now=later)
+        third = await self._acquire(canned, dummy_client, dashboard_config, project_root, now=later)
 
         assert third is not first
         assert third.rows.as_of == later and third.census.as_of == later
@@ -459,7 +478,7 @@ class TestAcquireSnapshotHappyPath:
         assert len(canned.calls_to('get_statuses')) == 2
 
     async def test_a_vocabulary_drift_degrades_the_census_and_spares_the_rows(
-        self, project_root, dashboard_config
+        self, project_root, dashboard_config, dummy_client
     ):
         """(h) The census carries the error verbatim; the rows stay measured.
 
@@ -473,7 +492,7 @@ class TestAcquireSnapshotHappyPath:
         rows, status_map = _tree()
         status_map[6] = 'not-a-status'
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
-        snapshot = await self._acquire(canned, dashboard_config, project_root,
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
         assert snapshot.census.state is not DatumState.FRESH

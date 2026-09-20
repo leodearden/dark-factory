@@ -227,7 +227,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
         return rows[offset:offset + page_size]
 
     # ``timeout`` is accepted-and-ignored: _shape_one_project threads
-    # active_tasks._TASKS_PER_CALL_TIMEOUT into all three of its calls, so a
+    # task_snapshot.PER_CALL_TIMEOUT into all three of its calls, so a
     # stub without the keyword raises TypeError instead of shaping rows.
     async def _statuses(client, config, project_root, *, timeout=None):
         rows = await fetch(client, config, project_root)
@@ -2363,7 +2363,7 @@ class TestShapeOneProjectNarrowing:
         """The budget ROSTER must describe the shipped calls, not merely count them.
 
         ``test_tasks_budget.py`` machine-checks
-        ``_TASKS_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
+        ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
         _TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
         ABOUT THIS SYSTEM if every enumerated call actually threads the term.
         ``fetch_statuses`` shipped without it, so one of the three ran on
@@ -2371,7 +2371,7 @@ class TestShapeOneProjectNarrowing:
         per-project budget the roster claims to bound — a constants-only test
         cannot see that, which is why this one asserts at the WIRE.
 
-        The term is the Tasks-tab-LOCAL ``_TASKS_PER_CALL_TIMEOUT`` (task
+        The term is the Tasks-tab-LOCAL ``PER_CALL_TIMEOUT`` (task
         4884), NOT ``tasks.DEFAULT_PER_CALL_TIMEOUT``.  Asserting the shared
         default here would be actively wrong in a way this test exists to
         catch: three route budgets bind the shared default by reference, so
@@ -2384,10 +2384,10 @@ class TestShapeOneProjectNarrowing:
         per-project call without the keyword fails here, rather than silently
         widening the budget.
         """
-        from dashboard.data.active_tasks import (
-            _PER_PROJECT_MCP_CALLS,
-            _TASKS_PER_CALL_TIMEOUT,
-            _shape_one_project,
+        from dashboard.data.active_tasks import _shape_one_project
+        from dashboard.data.task_snapshot import (
+            PER_CALL_TIMEOUT,
+            PER_PROJECT_MCP_CALLS,
         )
 
         rows = [_raw_row(1, 'in-progress')]
@@ -2402,16 +2402,16 @@ class TestShapeOneProjectNarrowing:
             max_done_per_project=50, max_cancelled_per_project=50,
         )
 
-        assert len(calls) == len(_PER_PROJECT_MCP_CALLS), (
-            f'the roster enumerates {len(_PER_PROJECT_MCP_CALLS)} per-project '
-            f'calls {_PER_PROJECT_MCP_CALLS} but {len(calls)} were issued: '
+        assert len(calls) == len(PER_PROJECT_MCP_CALLS), (
+            f'the roster enumerates {len(PER_PROJECT_MCP_CALLS)} per-project '
+            f'calls {PER_PROJECT_MCP_CALLS} but {len(calls)} were issued: '
             f'{[c["tool"] for c in calls]}'
         )
         for call in calls:
-            assert call['kwargs'].get('timeout') == _TASKS_PER_CALL_TIMEOUT, (
+            assert call['kwargs'].get('timeout') == PER_CALL_TIMEOUT, (
                 f"{call['tool']} was issued with timeout="
                 f"{call['kwargs'].get('timeout')!r}, not the Tasks tab's own "
-                f'_TASKS_PER_CALL_TIMEOUT ({_TASKS_PER_CALL_TIMEOUT}s) — with '
+                f'PER_CALL_TIMEOUT ({PER_CALL_TIMEOUT}s) — with '
                 "no keyword it falls back to mcp_tool_call's 10s default, and "
                 'with the SHARED default it silently under-budgets the '
                 '5 000-task trees this tab reads, so the per-project budget '
