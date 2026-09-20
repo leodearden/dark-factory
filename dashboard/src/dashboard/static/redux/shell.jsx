@@ -453,9 +453,9 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
 // The shared home the six caller-built pip fragments had none of. ProjectGroup
 // could not be it: it takes `summary` as an OPAQUE node, and the word "pip"
 // does not occur anywhere else in this file — every pip was a JSX fragment
-// hand-built at its call site, the six sharing only the CSS at
-// styles.css:381-384. So this is a NEW component placed beside ProjectGroup,
-// which is the closest honest reading of the PRD's "ProjectGroup pips".
+// hand-built at its call site, the six sharing only their CSS. So this is a NEW
+// component placed beside ProjectGroup, which is the closest honest reading of
+// the PRD's "ProjectGroup pips".
 //
 // The markup is the fragments' own, unchanged, so `.proj-head .summary .pip`
 // and `.pip-dot` keep styling it — a new shape would have needed new CSS in a
