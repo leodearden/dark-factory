@@ -188,6 +188,17 @@ class BriefingQuerySpec:
     stores: tuple[str, ...] = ()
     categories: tuple[str, ...] = ()
     limit: int = 5
+    wants_entity_block: bool = False
+    """Whether this section also asks the knowledge graph about the task.
+
+    A declared field rather than a slug comparison at the render site: "does
+    this section want the graph channel too" is a property of the question,
+    so it belongs beside the question, and a renderer that compares spec
+    identities would have to be edited every time the table gains a
+    task-scoped spec. The graph channel additionally needs a task id to name
+    — that is the renderer's own precondition, and the two gates stay
+    separate because they are separate facts.
+    """
 
 
 _CONVENTIONS_SECTION = 'Conventions & Gotchas'
@@ -221,12 +232,17 @@ TASK_SEMANTIC = BriefingQuerySpec(
     slug='briefing-task-semantic',
     section_title='Task Context',
     text='{title} {area}',
+    wants_entity_block=True,
 )
 """The task channel, phrased semantically — never as the bare task id.
 
 Store-unscoped on purpose, unlike the conventions channel: a task's context
 is as likely to be a Graphiti edge fact about a neighbouring task as a Mem0
 observation, and there is no category that names "about this work".
+
+The only spec wanting the graph channel (D3): "what memory reads like this
+task" and "what the graph records ABOUT this task" are two questions with
+two corpora, answered into one section.
 """
 
 QUERY_SPECS: tuple[BriefingQuerySpec, ...] = (

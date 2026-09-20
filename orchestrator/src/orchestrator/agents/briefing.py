@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from shared.briefing_queries import (
-    TASK_SEMANTIC,
     BriefingQuerySpec,
     BriefingScope,
     queries_for,
@@ -524,9 +523,14 @@ def render_entity_block(payload_text: str, expected_name: str) -> str:
         None,
     )
     if node is None:
-        logger.debug(
-            f'render_entity_block: no node named exactly {expected_name!r} '
-            'in the reply; nothing rendered'
+        # A degraded reply makes "no such node" unanswerable — the store that
+        # would have held it is the one that failed — so the same empty
+        # render means two different things and only the level separates them.
+        degraded = bool(payload.get('degraded'))
+        logger.log(
+            logging.WARNING if degraded else logging.DEBUG,
+            f'render_entity_block: no node named exactly {expected_name!r} in '
+            f'the reply; nothing rendered (degraded={degraded})',
         )
         return ''
 
@@ -558,9 +562,17 @@ MEMORY_FAILURE_MALFORMED = 'malformed'
 Three classes, because they call for three different operator responses: a
 timeout says the service is alive and slow, a transport failure says it is
 unreachable, and a malformed reply says it answered with something that is
-not a tool result. "The corpus holds nothing" is NOT one of them — that is
-an empty outcome carrying no failure at all, and conflating the two is the
-defect this vocabulary exists to end.
+not a USABLE tool result. "The corpus holds nothing" is NOT one of them —
+that is an empty outcome carrying no failure at all, and conflating the two
+is the defect this vocabulary exists to end.
+
+``malformed`` covers two reply shapes, because both leave the caller with no
+facts and send an operator to the same place — the server: a JSON-RPC error
+envelope (no ``result`` dict at all; see ``mcp_lifecycle._raw_call``) and a
+tool-level failure, which FastMCP returns as a well-formed envelope carrying
+``isError: True`` and the error prose in a text block. The second is the
+dangerous one: its text block reads exactly like a recalled result, so
+without the flag it renders into the prompt as remembered fact.
 """
 
 MEMORY_EMPTY_NOTICE = '_No memory context available._'
@@ -623,24 +635,35 @@ class MemoryQueryOutcome:
     failed_stores: tuple[str, ...] = ()
 
 
-def _section_notices(spec: BriefingQuerySpec, outcome: MemoryQueryOutcome) -> list[str]:
+def _section_notices(section: str, outcome: MemoryQueryOutcome) -> list[str]:
     """The lines a dispatch owes its reader about one query's health (D6).
 
-    Both notices name their section, because a reader looking at a block
+    Both notices name their *section*, because a reader looking at a block
     with one section missing needs to know WHICH question went unanswered —
     "memory degraded" alone leaves them unable to tell a missing convention
-    from a missing task history.
+    from a missing task history. Takes the title rather than the spec it
+    usually comes from: one section can be answered by more than one channel
+    (D3's dual-channel Task Context), and each channel names itself.
     """
     notices = []
     if outcome.failure:
         notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
-            section=spec.section_title, reason=outcome.failure,
+            section=section, reason=outcome.failure,
         ))
     if outcome.failed_stores:
         notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
-            section=spec.section_title, stores=', '.join(outcome.failed_stores),
+            section=section, stores=', '.join(outcome.failed_stores),
         ))
     return notices
+
+
+ENTITY_CHANNEL_SUFFIX = ' (knowledge graph)'
+"""Distinguishes D3's graph channel from the semantic one in a notice.
+
+Both answer the same SECTION, so an unqualified notice would name "Task
+Context" twice — identical prose, no way to tell which of the two corpora
+went missing, and a duplicated line when both fail together.
+"""
 
 
 def _failed_stores(payload_text: str) -> tuple[str, ...]:
@@ -667,6 +690,30 @@ def _failed_stores(payload_text: str) -> tuple[str, ...]:
     if not isinstance(stores, list):
         return ()
     return tuple(store for store in stores if isinstance(store, str) and store)
+
+
+def _tool_error_text(reply: dict) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
+
+    An MCP tool reports its own failure IN the response body rather than by
+    breaking the transport: FastMCP answers with a well-formed
+    ``{'isError': True, 'content': [{'type': 'text', 'text': 'Error: ...'}]}``.
+    Nothing about that envelope's SHAPE says it failed, so a reader that
+    checks only the shape extracts the error prose and renders it as recalled
+    memory — and, worse, counts it as a successful recall that resets the
+    outage streak.
+
+    Spelled as ``orchestrator/src/orchestrator/scheduler.py``'s reader of the
+    same envelope spells it (see its ``update_task`` call site and the
+    ``extract_rejection`` docstring), so the two cannot drift apart on what
+    "the tool errored" looks like on the wire.
+    """
+    if not reply.get('isError'):
+        return None
+    for block in reply.get('content', []) or []:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            return str(block.get('text', ''))
+    return ''
 
 
 MEMORY_CONTEXT_CAVEAT = (
@@ -756,6 +803,17 @@ class BriefingAssembler:
         Lives on the assembler because the harness holds exactly one for the
         life of the process and hands it to every workflow, so the count is
         per-process dispatch history — which is the thing INV-4 asks about.
+
+        "Consecutive" therefore means consecutive across INTERLEAVED
+        dispatches from up to ``max_concurrent_tasks`` unrelated workflows,
+        not consecutive within one task. That is deliberate — the question
+        INV-4 asks is about the SERVICE, which is shared — and it is
+        deliberately conservative in one direction: because any dispatch
+        that recalled something resets the count, a partial outage that
+        still lets some queries through stays below the threshold rather
+        than escalating. The escalation is a floor on how loud a TOTAL
+        outage gets, never a detector for a flaky one; the per-query WARNING
+        and the in-block notices are what report those, once per dispatch.
         """
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
@@ -1805,11 +1863,19 @@ Handle this escalation, then call `resolve_issue` with a summary.
                     caller_task_id=scope.task_id,
                 )
                 outcomes.append(outcome)
-                notices.extend(_section_notices(spec, outcome))
+                notices.extend(_section_notices(spec.section_title, outcome))
 
                 blocks = [render_memory_results(outcome.text)] if outcome.text else []
-                if spec.slug == TASK_SEMANTIC.slug and scope.task_id:
-                    blocks.append(await self._task_entity_block(scope.task_id))
+                if spec.wants_entity_block and scope.task_id:
+                    # The graph channel reports its own health but is kept out
+                    # of `outcomes`: that list answers "did the SEARCH table
+                    # work", which is what the outage streak and the drop
+                    # note's query arithmetic are both counting.
+                    entity = await self._task_entity_block(scope.task_id)
+                    notices.extend(_section_notices(
+                        spec.section_title + ENTITY_CHANNEL_SUFFIX, entity,
+                    ))
+                    blocks.append(entity.text or '')
                 body = '\n\n'.join(block for block in blocks if block)
                 if body:
                     recalled_sections.append(f'## {spec.section_title}\n\n{body}')
@@ -1936,7 +2002,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 'the streak began was assembled without it'
             )
 
-    async def _task_entity_block(self, task_id: str) -> str:
+    async def _task_entity_block(self, task_id: str) -> MemoryQueryOutcome:
         """The knowledge-graph half of D3's dual-channel task context.
 
         The semantic search answers "what memory reads like this task"; this
@@ -1944,13 +2010,33 @@ Handle this escalation, then call `resolve_issue` with a summary.
         different question and a different corpus. Asked only when there is a
         task id to name — an entity called ``Task None`` matches nothing, and
         the fuzzy fallback would answer that miss with a stranger.
+
+        Returns the RENDERED block as its ``text``, and carries the channel's
+        health in the same shape the search channel uses: ``get_entity``
+        answers a Graphiti fault with the very same fault-only
+        ``degraded``/``failed_stores`` keys
+        (``fused_memory/services/memory_service.py``), so a graph outage here
+        would otherwise be indistinguishable from "the graph holds nothing
+        about this task" — the exact defect the search half of D6 closes.
         """
         expected_name = f'Task {task_id}'
-        raw = await self._mcp_get_entity(expected_name)
-        return render_entity_block(raw, expected_name) if raw else ''
+        reply = await self._mcp_get_entity(expected_name)
+        if not reply.text:
+            return reply
+        return replace(
+            reply,
+            text=render_entity_block(reply.text, expected_name),
+            failed_stores=_failed_stores(reply.text),
+        )
 
-    async def _mcp_get_entity(self, name: str) -> str | None:
-        """Look one entity up over fused-memory's MCP HTTP endpoint."""
+    async def _mcp_get_entity(self, name: str) -> MemoryQueryOutcome:
+        """Look one entity up over fused-memory's MCP HTTP endpoint.
+
+        Named failures rather than a bare ``None``, for the reason
+        :meth:`_mcp_search` documents: this channel's reader cannot tell an
+        empty graph from an unreachable one, and only the caller can say so
+        in the prompt.
+        """
         try:
             result = await mcp_call(
                 f'{self.memory_url}/mcp',
@@ -1958,16 +2044,30 @@ Handle this escalation, then call `resolve_issue` with a summary.
                 {'name': 'get_entity', 'arguments': {'name': name, 'project_id': self.project_id}},
                 timeout=10,
             )
-            texts = [
-                block['text']
-                for block in result.get('result', {}).get('content', [])
-                if isinstance(block, dict) and block.get('type') == 'text'
-            ]
-            return '\n'.join(texts) if texts else None
-
         except Exception as e:
-            logger.warning(f'MCP get_entity failed for {name!r}: {e}')
-            return None
+            failure = (
+                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
+                else MEMORY_FAILURE_TRANSPORT
+            )
+            logger.warning(f'MCP get_entity failed for {name!r} ({failure}): {e}')
+            return MemoryQueryOutcome(failure=failure)
+
+        reply = result.get('result') if isinstance(result, dict) else None
+        if not isinstance(reply, dict):
+            logger.warning(f'MCP get_entity for {name!r} answered with no tool result: {result!r}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        error_text = _tool_error_text(reply)
+        if error_text is not None:
+            logger.warning(f'MCP get_entity for {name!r} returned a tool error: {error_text!r}')
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        texts = [
+            block['text']
+            for block in reply.get('content', [])
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        return MemoryQueryOutcome(text='\n'.join(texts) if texts else None)
 
     async def _scoped_search(
         self,
@@ -2070,6 +2170,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
         if not isinstance(reply, dict):
             logger.warning(
                 f'Memory search for {query!r} answered with no tool result: {result!r}'
+            )
+            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
+
+        error_text = _tool_error_text(reply)
+        if error_text is not None:
+            logger.warning(
+                f'Memory search for {query!r} returned a tool error: {error_text!r}'
             )
             return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
 

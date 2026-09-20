@@ -780,6 +780,32 @@ class TestDistilledRendering:
         assert '  - [amendment · undated · mem0] NATIVE AMENDMENT BODY' in context
         assert 'FOREIGN AMENDMENT BODY' not in context
 
+    async def test_a_native_matched_child_renders_as_a_nested_bullet(
+        self, briefing: BriefingAssembler,
+    ):
+        """The other half of ``GROUPED_CHILD_KEYS``, and the untested one.
+
+        ``matched_children`` is where a swallowed child's FULL body is pinned
+        so its text stays reachable, and it carries ``content`` where an
+        amendment digest carries ``digest``. The suite's only
+        ``matched_children`` fixture is tagged FOREIGN and so is filtered out
+        before rendering, which left dropping the key from the walk entirely
+        undetectable.
+        """
+        parent = _grouped_parent(grouped={
+            'matched_children': [
+                {'id': 's1', 'content': 'NATIVE SIGHTING BODY', 'created_at': None,
+                 'kind': 'sighting', 'matched': True,
+                 'metadata': {'project_id': 'dark_factory'}},
+            ],
+            'sighting_count': 1,
+        })
+
+        context = await self._render(briefing, [parent])
+
+        assert '- [uncategorized · undated · mem0] Native canonical.' in context
+        assert '  - [sighting · undated · mem0] NATIVE SIGHTING BODY' in context
+
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,
     ):
@@ -926,6 +952,137 @@ class TestTaskEntityChannel:
         assert 'Task 3609 landed as commit abc123.' in task_section
         assert 'Task 3609 is related to task 3212.' in task_section
 
+    async def test_a_graph_outage_is_named_not_rendered_as_an_empty_graph(
+        self, briefing: BriefingAssembler,
+    ):
+        """D6/INV-2 applied to the second channel.
+
+        ``get_entity`` answers a Graphiti fault with the SAME fault-only
+        ``degraded``/``failed_stores`` keys the search channel uses, and the
+        rendered result of a fault is byte-identical to the rendered result
+        of a graph that simply holds nothing about this task — the exact
+        indistinguishability the search half of this change exists to end.
+        """
+        from orchestrator.agents.briefing import (
+            ENTITY_CHANNEL_SUFFIX,
+            MEMORY_DEGRADED_STORES_NOTICE,
+        )
+
+        degraded = _entity_envelope(nodes=[], edges=[])
+        payload = json.loads(degraded['result']['content'][0]['text'])
+        payload.update({'degraded': True, 'failed_stores': ['graphiti']})
+        degraded['result']['content'][0]['text'] = json.dumps(payload)
+
+        context = await self._render(briefing, degraded)
+        healthy = await self._render(briefing, _entity_envelope(nodes=[], edges=[]))
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX, stores='graphiti',
+        ) in context
+        assert context != healthy, (
+            'a failed graph and an empty graph must not render identically'
+        )
+
+    async def test_an_unreachable_graph_names_its_channel_and_reason(
+        self, briefing: BriefingAssembler,
+    ):
+        """A raising ``get_entity`` used to return ``None`` with a bare
+        WARNING, so a total entity-channel outage reached neither the prompt
+        nor the section notices."""
+        from orchestrator.agents.briefing import (
+            ENTITY_CHANNEL_SUFFIX,
+            MEMORY_FAILURE_TRANSPORT,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        search_reply = _mcp_search_envelope([_result('1', 'A recalled fact.', source_store='mem0')])
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['name'] == 'get_entity':
+                raise ConnectionError('graph unreachable')
+            return search_reply
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(side_effect=dispatch)):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MEMORY_FAILURE_TRANSPORT,
+        ) in context
+        assert 'A recalled fact.' in context, 'the semantic channel still renders'
+
+    async def test_a_graph_tool_error_is_named_and_never_rendered(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The shared ``isError`` blind spot, on the channel that also has it."""
+        from orchestrator.agents.briefing import (
+            ENTITY_CHANNEL_SUFFIX,
+            MEMORY_FAILURE_MALFORMED,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            context = await self._render(briefing, {'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: graph unavailable'}],
+            }})
+
+        assert 'graph unavailable' not in context
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MEMORY_FAILURE_MALFORMED,
+        ) in context
+        assert any(
+            'graph unavailable' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
+
+    async def test_the_two_channels_of_one_section_name_themselves_apart(
+        self, briefing: BriefingAssembler,
+    ):
+        """Both answer ``## Task Context``, so an unqualified notice would
+        print the same sentence twice and name neither corpus."""
+        from orchestrator.agents.briefing import (
+            ENTITY_CHANNEL_SUFFIX,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(side_effect=ConnectionError('everything is down')),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        semantic = MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context', reason='transport',
+        )
+        graph = MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX, reason='transport',
+        )
+        assert semantic in context and graph in context
+        assert context.count(semantic) == 1, 'no duplicated, unattributable line'
+
+    async def test_the_graph_channel_is_gated_on_the_spec_field(
+        self, briefing: BriefingAssembler,
+    ):
+        """The loop asks ``wants_entity_block``, not "is this spec TASK_SEMANTIC".
+
+        A slug comparison couples two independent dimensions: which question
+        a spec asks, and which renderer the answer needs.
+        """
+        assert TASK_SEMANTIC.wants_entity_block
+        fired = [spec.wants_entity_block for spec, _text in queries_for(_task_scope())]
+        assert fired.count(True) == 1
+
+        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
+        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+            await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert len([
+            call for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]) == 1
+
     async def test_a_task_less_dispatch_asks_for_no_entity(
         self, briefing: BriefingAssembler,
     ):
@@ -1009,6 +1166,12 @@ class TestDegradationIsLoud:
         ):
             context = await briefing._get_memory_context(_task_scope(), 'implementer')
 
+        from orchestrator.agents.briefing import MEMORY_DEGRADED_STORES_NOTICE
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.split('{')[0] in context, (
+            'the store name alone could be incidental prose inside a recalled '
+            'memory; the notice is what this test exists to pin'
+        )
         assert 'graphiti' in context
         assert 'A recalled fact.' in context
         assert '{' not in context and '}' not in context
@@ -1143,6 +1306,105 @@ class TestDegradationIsLoud:
         )
 
 
+    async def test_a_reply_with_no_tool_result_is_named_malformed(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The JSON-RPC error envelope: ``_raw_call`` returns ``{'error': ...}``
+        with no ``result`` key at all, so nothing can be read out of it."""
+        from orchestrator.agents.briefing import (
+            MEMORY_FAILURE_MALFORMED,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with caplog.at_level(logging.DEBUG), patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'error': {'code': -32603, 'message': 'boom'}}),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        for section in ('Conventions & Gotchas', 'Task Context'):
+            assert MEMORY_SECTION_FAILURE_NOTICE.format(
+                section=section, reason=MEMORY_FAILURE_MALFORMED,
+            ) in context
+        assert all(
+            r.levelno >= logging.WARNING
+            for r in caplog.records if 'no tool result' in r.getMessage()
+        )
+
+    async def test_a_non_dict_tool_result_is_named_malformed(
+        self, briefing: BriefingAssembler,
+    ):
+        """Same class, different shape: ``result`` present but not a dict."""
+        from orchestrator.agents.briefing import (
+            MEMORY_FAILURE_MALFORMED,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'result': ['not', 'a', 'dict']}),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MEMORY_FAILURE_MALFORMED,
+        ) in context
+
+    async def test_a_malformed_dispatch_counts_toward_the_outage_streak(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """All three failure classes are outages; only the reason differs."""
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        with caplog.at_level(logging.ERROR), patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'error': {'code': -32603, 'message': 'boom'}}),
+        ):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1, errors
+
+    async def test_a_tool_error_is_a_failure_not_a_recalled_fact(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """FastMCP reports a tool-level failure IN the body, not by raising.
+
+        The envelope is well-formed and its text block reads exactly like a
+        result, so a reader that checks only the SHAPE renders ``Error: ...``
+        into the agent's prompt as remembered fact — and counts it as a
+        genuine recall, which resets the very outage streak this change adds.
+        """
+        from orchestrator.agents.briefing import (
+            MEMORY_FAILURE_MALFORMED,
+            MEMORY_SECTION_FAILURE_NOTICE,
+        )
+
+        with caplog.at_level(logging.DEBUG), patch(
+            'orchestrator.agents.briefing.mcp_call',
+            new=AsyncMock(return_value={'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: embeddings backend refused'}],
+            }}),
+        ):
+            context = await briefing._get_memory_context(_task_scope(), 'implementer')
+
+        assert 'embeddings backend refused' not in context, (
+            'the error prose must never render as recalled memory'
+        )
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MEMORY_FAILURE_MALFORMED,
+        ) in context
+        assert briefing._memory_outage_streak == 1, (
+            'a tool error recalled nothing, so it must not reset the streak'
+        )
+        assert any(
+            'embeddings backend refused' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), 'the error text is owed to the log even though it is kept out of the prompt'
+
+
 @pytest.mark.asyncio
 class TestOutageStreakEscape:
     """A sustained memory outage escalates once, above the per-dispatch noise.
@@ -1202,6 +1464,32 @@ class TestOutageStreakEscape:
         assert str(MEMORY_OUTAGE_STREAK_THRESHOLD) in errors[0], (
             f'the escalation must name the streak it is reporting, got {errors[0]!r}'
         )
+
+    async def test_a_permanent_outage_re_alarms_on_each_further_crossing(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """Runs twice the threshold, which is what separates the implemented
+        ``% THRESHOLD`` from ``== THRESHOLD`` and from ``>= THRESHOLD``.
+
+        A single run of exactly N dispatches cannot tell the three apart —
+        all emit one ERROR — so the re-alarm the docstring promises ("a
+        permanent outage must keep saying so ... without one line per
+        dispatch") is unpinned in BOTH directions: ``==`` goes permanently
+        silent after the first crossing and ``>=`` shouts once per dispatch
+        forever.
+        """
+        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
+
+        with caplog.at_level(logging.ERROR):
+            for _ in range(2 * MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await self._failing_dispatch(briefing)
+
+        errors = self._errors(caplog)
+        assert len(errors) == 2, (
+            f'one line per crossing — not one per dispatch, and not one ever: {errors}'
+        )
+        assert f' {MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in errors[0]
+        assert f' {2 * MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in errors[1]
 
     async def test_a_single_success_resets_the_streak(
         self, briefing: BriefingAssembler, caplog,

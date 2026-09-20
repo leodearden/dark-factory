@@ -238,6 +238,21 @@ class TestQuerySpecs:
         assert 'project overview architecture goals' not in rendered
         assert 'recent decisions and rationale' not in rendered
 
+    def test_exactly_one_spec_wants_the_knowledge_graph_channel(self):
+        """D3's dual-channel section is a property of the QUESTION, declared
+        here, not a spec-identity comparison at the render site."""
+        from shared.briefing_queries import QUERY_SPECS, TASK_SEMANTIC
+
+        wanting = [spec for spec in QUERY_SPECS if spec.wants_entity_block]
+        assert wanting == [TASK_SEMANTIC]
+
+    def test_the_graph_channel_is_off_by_default(self):
+        """A new spec joins the table without silently gaining a second
+        corpus it never asked for."""
+        from shared.briefing_queries import BriefingQuerySpec
+
+        assert not BriefingQuerySpec(slug='s', section_title='S', text='t').wants_entity_block
+
     def test_specs_are_immutable(self):
         from shared.briefing_queries import QUERY_SPECS, TASK_SEMANTIC
 
