@@ -232,3 +232,125 @@ test('column totals and the truncation flag report the INPUT size', () => {
     'nothing was dropped, so the affordance must not claim otherwise',
   );
 });
+
+// ---------------------------------------------------------------------------
+// rowTouchesModule — the cell-membership rule, single-sourced
+// ---------------------------------------------------------------------------
+//
+// This predicate answers "is this cell non-blank?", which is exactly the
+// project-scope + lock_set test cellStateFor performs in its first two
+// branches. Row selection needs the same answer, so cellStateFor delegates here
+// rather than the two restating it — otherwise the axis filter could drop a row
+// whose cells the renderer would have coloured. These are that rule's first
+// executable assertions; before this it was covered only by grep.
+
+function makeRow(taskId, lockSet, extra) {
+  return {
+    task_id: taskId,
+    project: 'dark_factory',
+    title: `task ${taskId}`,
+    lock_set: lockSet,
+    park_state: null,
+    skip_count: 0,
+    ...(extra || {}),
+  };
+}
+
+test('rowTouchesModule: true when the module path is in the row lock set', () => {
+  assert.equal(
+    rowTouchesModule(makeRow('T-1', ['src/a/hot.py']), makeModule('src/a/hot.py', 5)),
+    true,
+  );
+});
+
+test('rowTouchesModule: FALSE across projects even when the path matches exactly', () => {
+  // The cross-project rule cellStateFor documents. Modules are keyed by
+  // `(project, path)` on the server, and two projects can each have
+  // `src/utils.py` — a row from project B sharing a path with project A's
+  // module entry is NOT contending for project A's lock, so the cell stays
+  // blank and the row earns nothing from it. This is the trickiest branch in
+  // the classifier and the one a naive `lock_set.includes(path)` gets wrong.
+  assert.equal(
+    rowTouchesModule(
+      makeRow('T-1', ['src/utils.py'], { project: 'other_project' }),
+      makeModule('src/utils.py', 5),
+    ),
+    false,
+  );
+});
+
+test('rowTouchesModule: an untagged module skips the project check', () => {
+  // Falsy `module.project` is legacy/single-project mode; the same allowance
+  // cellStateFor makes.
+  assert.equal(
+    rowTouchesModule(
+      makeRow('T-1', ['src/a/hot.py'], { project: 'other_project' }),
+      makeModule('src/a/hot.py', 5, { project: null }),
+    ),
+    true,
+  );
+});
+
+test('rowTouchesModule: false for a missing or empty lock set', () => {
+  const module = makeModule('src/a/hot.py', 5);
+  assert.equal(rowTouchesModule(makeRow('T-1', []), module), false);
+  assert.equal(rowTouchesModule({ task_id: 'T-1', project: 'dark_factory' }, module), false);
+});
+
+// ---------------------------------------------------------------------------
+// ROW selection — which task rows earn a heatmap row
+// ---------------------------------------------------------------------------
+
+test('row selection keeps rows that touch a SURVIVING module', () => {
+  const out = boundHeatmapAxes({
+    rows: [makeRow('T-1', ['src/a/hot.py'])],
+    modules: COLUMN_FIXTURE,
+  });
+
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-1']);
+});
+
+test('row selection drops a row whose lock set only hits dropped columns', () => {
+  // The row would render as 60 blank cells — pure noise, and the dominant
+  // shape at production scale.
+  const out = boundHeatmapAxes({
+    rows: [makeRow('T-9', ['src/c/solo.py', 'src/d/idle.py'])],
+    modules: COLUMN_FIXTURE,
+  });
+
+  assert.deepEqual(out.rows, []);
+  assert.equal(out.rowsTotal, 1);
+  assert.equal(out.rowsTruncated, true);
+});
+
+test('row selection keeps a parked row even when it touches no surviving module', () => {
+  // A parked task is the most operationally interesting row on the tab — it is
+  // what the stranded-parks banner is pointing at — and the live snapshot has
+  // only 7 of them, so keeping them costs nothing against the cap.
+  const parked = makeRow('T-7', ['src/c/solo.py'], {
+    park_state: { modules: ['src/c/solo.py'] },
+  });
+  const out = boundHeatmapAxes({ rows: [parked], modules: COLUMN_FIXTURE });
+
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-7']);
+});
+
+test('row selection drops a row that reaches a surviving module only across projects', () => {
+  // The path collides but the lock does not. Same rule as the rowTouchesModule
+  // case above, asserted through boundHeatmapAxes so the axis filter is pinned
+  // to the predicate rather than merely to a compatible-looking one.
+  const out = boundHeatmapAxes({
+    rows: [makeRow('T-2', ['src/a/hot.py'], { project: 'other_project' })],
+    modules: COLUMN_FIXTURE,
+  });
+
+  assert.deepEqual(out.rows, []);
+});
+
+test('row totals report the INPUT size and the flag is false when nothing dropped', () => {
+  const rows = [makeRow('T-1', ['src/a/hot.py']), makeRow('T-2', ['src/b/warm.py'])];
+  const out = boundHeatmapAxes({ rows, modules: COLUMN_FIXTURE });
+
+  assert.equal(out.rowsTotal, 2);
+  assert.equal(out.rowsTruncated, false);
+});
