@@ -259,6 +259,14 @@ def _seed_state(project_id, *, outcomes):
             recorded_at=now - timedelta(days=(len(outcomes) - 1 - i)),
             exit_code=exit_code,
             total_records=sum(full.values()),
+            # Passed explicitly, not left to record_run's defaults: without
+            # them pyright matches this `**full` spread (a dict[str, int])
+            # against the bool-typed `commit_made`/`budget_suppressed`
+            # parameters and errors. Mirrors
+            # `test_trickle_state.py::_record`, which spreads a counter dict
+            # the same way and stays type-clean for exactly this reason.
+            commit_made=False,
+            budget_suppressed=False,
             **full,
         )
     return doc
