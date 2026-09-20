@@ -205,3 +205,249 @@ class TestCli:
         captured = capsys.readouterr()
         assert 'synthetic healthy reason' in captured.out
         assert 'synthetic healthy reason' not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Escalation, and the anti-double-alarm rule
+# ---------------------------------------------------------------------------
+
+def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
+    """Write a minimal valid legibility.yaml for *project_id* under a fresh
+    search root, returning the CONFIG PATH.
+
+    Copied in shape from ``test_install_trickle_timer.py::
+    _write_project_config``, per this directory's deliberate
+    copy-not-share convention, so ``cfg.escalation_port`` is a real
+    resolved value rather than a mock."""
+    project_root = tmp_path / 'search-root' / project_id
+    legibility_dir = project_root / 'docs' / 'legibility'
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    config_path = legibility_dir / 'legibility.yaml'
+    config_path.write_text(
+        f'project_id: {project_id}\n'
+        f'project_root: {project_root}\n'
+        f'escalation_port: {escalation_port}\n'
+        f'cwd_prefixes:\n'
+        f'  - {project_root}\n',
+        encoding='utf-8',
+    )
+    return config_path
+
+
+def _seed_state(project_id, *, outcomes):
+    """Seed real state through the REAL writer, one night per entry, so the
+    suppression rule is exercised against genuine recorder output."""
+    from datetime import UTC, date, datetime, timedelta
+
+    counters = {
+        'productive': (0, dict(selected_count=2)),
+        'barren': (0, dict(budget_skipped=4)),
+        'failed': (1, dict(selected_count=1)),
+    }
+    now = datetime.now(UTC)
+    doc = None
+    for i, outcome in enumerate(outcomes):
+        exit_code, extra = counters[outcome]
+        full = dict(
+            zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
+            budget_skipped=0, selected_count=0,
+        )
+        full.update(extra)
+        doc = trickle_state.record_run(
+            project_id,
+            target_date=date(2026, 7, 1),
+            recorded_at=now - timedelta(days=(len(outcomes) - 1 - i)),
+            exit_code=exit_code,
+            total_records=sum(full.values()),
+            **full,
+        )
+    return doc
+
+
+class TestEscalation:
+    """POST iff the PROGRESS probe failed — except on the exact run where
+    the nightly's own edge-triggered barren-streak escalation already
+    fired.
+
+    The escalation predicate is deliberately NARROWER than the exit-code
+    one: the exit code is a verdict an operator or predicate reads on
+    demand, while an escalation is an INTERRUPT.
+    """
+
+    def _posted(self, tmp_path, **kwargs):
+        envelopes = []
+        config_path = _write_project_config(tmp_path, project_id='dark_factory')
+        kwargs.setdefault('progress_runner', _ok)
+        kwargs.setdefault('liveness_runner', _ok)
+        result = check_trickle_health.run_health_check(
+            project_id='dark_factory',
+            config_path=config_path,
+            poster=lambda url, envelope: envelopes.append((url, envelope)),
+            **kwargs,
+        )
+        return result, envelopes
+
+    def test_a_failing_progress_probe_posts_exactly_one_envelope(self, tmp_path):
+        result, envelopes = self._posted(
+            tmp_path, progress_runner=_fails('ERROR: barren streak'),
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        assert len(envelopes) == 1, 'ONE envelope for the whole invocation'
+
+        _url, envelope = envelopes[0]
+        assert envelope['params']['name'] == 'escalate_info'
+        arguments = envelope['params']['arguments']
+        assert arguments['category'] == 'infra_issue'
+        assert arguments['severity'] == 'info'
+        assert arguments['agent_role'] == 'legibility-trickle-health'
+        assert arguments['task_id'] == 'legibility-trickle-health-dark_factory', (
+            "distinct from nightly's legibility-trickle-<project_id>, so the "
+            'two escalation histories stay separately readable'
+        )
+
+    def test_the_detail_carries_both_probes_output(self, tmp_path):
+        _result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('PROGRESS-MARKER barren streak'),
+            liveness_runner=_fails('LIVENESS-MARKER Result=failed'),
+        )
+
+        detail = envelopes[0][1]['params']['arguments']['detail']
+        assert 'PROGRESS-MARKER' in detail
+        assert 'LIVENESS-MARKER' in detail
+        assert 'check_trickle_progress.py' in detail, 'name the re-run command'
+        assert 'check_trickle_liveness.sh' in detail
+
+    def test_a_liveness_only_failure_posts_nothing(self, tmp_path):
+        """A unit that RAN and FAILED is already owned by the nightly's own
+        decision-8 escalation for that same run, and by
+        ``check_trickle_liveness.sh``'s ``Result != success`` gate now that
+        something finally runs it. Posting here would be exactly the
+        double-alarm this task forbids.
+
+        NO COVERAGE IS LOST, and the enumeration is what makes that
+        checkable: a unit that never ran leaves the state ``missing``; one
+        that stopped firing leaves ``recorded_at`` stale; one that fails
+        repeatedly becomes a ``consecutive_failed_runs`` streak — all three
+        fail the PROGRESS probe and do post."""
+        result, envelopes = self._posted(
+            tmp_path, liveness_runner=_fails('ERROR: Result=failed'),
+        )
+
+        assert result.exit_code == 1, 'still loud'
+        assert result.escalated is False
+        assert envelopes == []
+
+    def test_two_green_probes_post_nothing(self, tmp_path):
+        result, envelopes = self._posted(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.escalated is False
+        assert envelopes == []
+
+    def test_silent_on_the_exact_run_the_nightly_escalated(self, tmp_path):
+        """``nightly::_escalate_barren_streak`` is EDGE-triggered by exact
+        equality and fired for this very run; posting here duplicates it."""
+        _seed_state('dark_factory', outcomes=['barren'] * 3)
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is False
+        assert envelopes == []
+
+    def test_posts_once_the_nightly_has_gone_silent(self, tmp_path):
+        """At ``> max_barren_runs`` the nightly is edge-triggered and
+        silent by design, so this probe takes over."""
+        _seed_state('dark_factory', outcomes=['barren'] * 4)
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
+
+    def test_the_barren_edge_suppression_does_not_apply_to_a_failed_streak(
+        self, tmp_path
+    ):
+        """A failed streak is a different alarm with a different remedy;
+        the nightly never fires for it at all."""
+        _seed_state('dark_factory', outcomes=['failed', 'failed'])
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: failed streak'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
+
+    def test_a_missing_state_file_is_post_worthy_not_suppression_grounds(
+        self, tmp_path
+    ):
+        result, envelopes = self._posted(
+            tmp_path, progress_runner=_fails('ERROR: never recorded a run'),
+        )
+
+        assert len(envelopes) == 1
+
+    def test_a_raising_poster_is_swallowed_best_effort(self, tmp_path, caplog):
+        """Mirrors ``nightly::post_escalation``'s contract: a down
+        escalation server must never mask the verdict."""
+        def _boom(url, envelope):
+            raise RuntimeError('escalation server is down')
+
+        config_path = _write_project_config(tmp_path, project_id='dark_factory')
+
+        with caplog.at_level('WARNING'):
+            result = check_trickle_health.run_health_check(
+                project_id='dark_factory',
+                config_path=config_path,
+                progress_runner=_fails('ERROR: barren streak'),
+                liveness_runner=_ok,
+                poster=_boom,
+            )
+
+        assert result.exit_code == 1, 'the verdict is unchanged'
+        assert result.escalated is False
+        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
+
+    def test_an_absent_config_degrades_to_a_loud_verdict_not_a_traceback(
+        self, tmp_path
+    ):
+        result = check_trickle_health.run_health_check(
+            project_id='dark_factory',
+            config_path=tmp_path / 'nope' / 'legibility.yaml',
+            progress_runner=_fails('ERROR: barren streak'),
+            liveness_runner=_ok,
+            poster=lambda url, envelope: None,
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is False
+
+    def test_the_default_poster_is_not_reached_when_one_is_injected(
+        self, tmp_path, install_fake_httpx
+    ):
+        """Belt to the injection braces: no real POST to localhost may
+        escape even if the default poster is somehow reached."""
+        posts = []
+        install_fake_httpx(lambda *a, **kw: posts.append((a, kw)))
+
+        result, envelopes = self._posted(
+            tmp_path, progress_runner=_fails('ERROR: barren streak'),
+        )
+
+        assert len(envelopes) == 1
+        assert posts == [], 'the injected poster must be the only one used'
+        assert result.escalated is True
