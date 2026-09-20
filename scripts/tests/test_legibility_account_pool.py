@@ -480,12 +480,18 @@ def test_rotation_walks_the_whole_pool_before_giving_up():
             f'tok-{n}': _cap_exhausted(stdout=banner)
             for n in ('max-e', 'max-d', 'max-c')
         },
-        replies={'tok-max-b': 'the reply'},
+        # A reply that PARSES, like every other success payload in this file.
+        # Task 5637 offers an UNPARSEABLE exit-0 reply to the gate's cap
+        # detector, and FakeGate verdicts whatever it is scripted to verdict
+        # without reading the text — so a prose placeholder would rotate here
+        # while the real gate (which classifies non-banner prose as Failure)
+        # would not, failing this test for a reason production does not have.
+        replies={'tok-max-b': '{"matches": [], "candidates": []}'},
     )
 
     out = mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
-    assert out == 'the reply'
+    assert out == '{"matches": [], "candidates": []}'
     assert [c['oauth_token'] for c in invoke.calls] == [
         'tok-max-e', 'tok-max-d', 'tok-max-c', 'tok-max-b',
     ]
@@ -738,11 +744,13 @@ def test_the_genuine_cap_route_is_unchanged_by_the_bound():
     gate = _pool(('max-b', False), ('max-c', False))  # cap_verdict=True
     invoke = _NeverTwice(raises={
         'tok-max-c': _cap_exhausted(stdout='Claude usage limit reached.'),
-    }, replies={'tok-max-b': 'the reply'})
+        # Parseable, for the reason given in
+        # test_rotation_walks_the_whole_pool_before_giving_up.
+    }, replies={'tok-max-b': '{"matches": [], "candidates": []}'})
 
     out = mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
-    assert out == 'the reply'
+    assert out == '{"matches": [], "candidates": []}'
     assert gate.account_named('max-c').capped is True, (
         'a genuine cap hit must still mark the account capped'
     )

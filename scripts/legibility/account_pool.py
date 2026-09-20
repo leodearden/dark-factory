@@ -229,6 +229,44 @@ def _exhaustion_reason(gate, tried) -> str:
     )
 
 
+def _banner_instead_of_verdict(slot, reply) -> bool:
+    """Is this exit-0 *reply* a cap banner rather than a verdict?
+
+    Census's split-on-parse-success rule, adopted unchanged: a reply that
+    PARSES into a verdict IS a verdict, so only a reply the coder could not
+    use at all is offered to the gate. The rule is already cited at both of
+    ``coder``'s scan sites (``_invoke_cli`` and ``code_digest``); this module
+    inherits it rather than inventing a third policy.
+
+    HERE IT IS LOAD-BEARING, NOT STYLISTIC, and that is the difference from
+    the coder's two sites — both of which sit on already-FAILED paths where a
+    false positive can only re-label a digest that was failing anyway. This
+    one sits on a SUCCEEDING path, where a false positive costs an account.
+    The gate's strict detector matches a cap-hit prefix and a confirm keyword
+    ANYWHERE in the text, not anchored at the start: measured 2026-09-20, a
+    schema-valid verdict quoting ``REAL_CLI_CAP_HIT_MESSAGES[0]`` in its
+    ``evidence_quote`` classifies as CapHit. Since this repo's codebook is
+    dominated by usage-limit clusters, an unguarded scan would let one
+    cap-themed digest cap every account the rotation walked — for the night.
+
+    THE GATE STILL DECIDES WHETHER THIS IS A CAP. The parse decides only
+    whether to ASK, never what the answer is, so ``pool_invoke``'s "do not
+    re-classify streams here to decide anything the gate decides" holds: a
+    parse attempt answers "could the coder use this reply at all", the same
+    question ``code_digest`` asks one layer down.
+
+    AND THE GATE COSTS NO COVERAGE, because a real banner never parses: every
+    entry of ``REAL_CLI_CAP_HIT_MESSAGES`` and ``REAL_CLI_NEAR_CAP_MESSAGES``
+    raises ``CoderParseError`` (measured, and kept true by the parametrized
+    rotation test in ``scripts/tests/test_legibility_account_pool.py``).
+    """
+    try:
+        coder.parse_coder_output(reply)
+    except coder.CoderParseError:
+        return slot.detect_cap_hit("", reply)
+    return False
+
+
 def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     """Return a ``(prompt, model) -> str`` callable that runs each
     invocation as an account leased from *gate*.
@@ -314,15 +352,14 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             else:
                 # THE OTHER CAP ROUTE. The CLI can decline by PRINTING its
                 # banner and exiting 0, so a cap arrives as a RETURNED reply
-                # as readily as a raised one. Ask the SAME strict detector,
-                # handing it the reply as the OUTPUT stream and an empty
-                # stderr -- the two-distinct-arguments contract
-                # `CoderInvocationError`'s docstring already describes. On a
+                # as readily as a raised one. The SAME strict detector
+                # decides, reached through `_banner_instead_of_verdict` so
+                # that only a reply the coder cannot parse is put to it. On a
                 # True verdict, do NOT confirm (which would clear the gate's
                 # own near-cap annotation on an account that just refused to
                 # answer) and do NOT return: fall through to the next lease
                 # exactly as the arm above does, bounded by the same `tried`.
-                if not slot.detect_cap_hit("", reply):
+                if not _banner_instead_of_verdict(slot, reply):
                     slot.confirm()
                     return reply
                 logger.info(
