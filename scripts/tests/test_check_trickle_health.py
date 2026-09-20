@@ -172,6 +172,26 @@ class TestCli:
         assert defaults['max_failed_runs'] == trickle_state.DEFAULT_MAX_FAILED_RUNS
         assert defaults['max_age_hours'] == 72
 
+    def test_config_only_is_accepted_by_main(self, tmp_path, monkeypatch):
+        """``--config`` alone is a valid arity and stays one: the REVIEW
+        FIX 1 change is in project-id RESOLUTION, not in argument
+        validation."""
+        seen = {}
+        monkeypatch.setattr(
+            check_trickle_health, 'run_health_check',
+            lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
+                exit_code=0, progress_ok=True, liveness_ok=True,
+                progress_output='', liveness_output='', escalated=False,
+                reason='synthetic healthy reason',
+            ),
+        )
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        assert check_trickle_health.main(['--config', str(config_path)]) == 0
+
+        assert seen['project_id'] is None
+        assert seen['config_path'] == str(config_path)
+
     def test_the_reason_goes_to_stderr_on_a_non_zero_exit(
         self, capsys, monkeypatch
     ):
@@ -459,3 +479,150 @@ class TestEscalation:
         assert len(envelopes) == 1
         assert posts == [], 'the injected poster must be the only one used'
         assert result.escalated is True
+
+
+class TestProjectIdResolution:
+    """Which project id actually REACHES the two probes.
+
+    THE MEASURED DEFECT, reproduced in this worktree before these tests
+    were written: ``main()`` accepts ``--config`` without ``--project-id``,
+    and ``run_health_check`` then handed ``project_id or ''`` to both
+    probes. With a valid ``legibility.yaml`` for a HEALTHY project,
+    ``check_trickle_health.py --config <yaml>`` exits 1 with ``legibility
+    trickle health DEGRADED for : progress=FAILED liveness=FAILED`` — the
+    progress probe resolving ``.../legibility//trickle-state.json`` and
+    reporting ``missing``, the liveness probe interrogating the literal
+    TEMPLATE unit ``legibility-trickle@.service``. With a reachable server
+    it also POSTS one envelope stamped
+    ``task_id=legibility-trickle-health-<project>``: a fabricated alarm
+    attributed to a healthy project.
+
+    This is the same divergence class GAP 3 closed at the path layer — a
+    probe that guesses at the project id reads a different state file than
+    the writer wrote.
+    """
+
+    def _recorder(self, calls, *, returncode=0, output='OK: probe passed'):
+        """A runner that records the ``project_id`` positional it is handed."""
+        def _runner(project_id, **_kwargs):
+            calls.append(project_id)
+            return returncode, output
+        return _runner
+
+    def test_config_only_sends_the_configs_project_id_to_both_probes(
+        self, tmp_path
+    ):
+        """THE regression test."""
+        progress_calls, liveness_calls = [], []
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        check_trickle_health.run_health_check(
+            project_id=None,
+            config_path=config_path,
+            progress_runner=self._recorder(progress_calls),
+            liveness_runner=self._recorder(liveness_calls),
+            poster=lambda url, envelope: None,
+        )
+
+        assert progress_calls == ['proj_a']
+        assert liveness_calls == ['proj_a']
+        # Asserted separately and deliberately: '' is the sentinel this fix
+        # deletes, and asserting only the positive would still pass if a
+        # future change reintroduced a DIFFERENT falsy default.
+        assert '' not in progress_calls
+        assert '' not in liveness_calls
+
+    def test_config_only_on_a_healthy_project_is_quiet(self, tmp_path):
+        """The operator-visible consequence, end to end."""
+        envelopes = []
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        result = check_trickle_health.run_health_check(
+            project_id=None,
+            config_path=config_path,
+            progress_runner=_ok,
+            liveness_runner=_ok,
+            poster=lambda url, envelope: envelopes.append(envelope),
+        )
+
+        assert result.exit_code == 0
+        assert result.escalated is False
+        assert envelopes == []
+        assert 'proj_a' in result.reason
+        assert 'for :' not in result.reason, (
+            'the exact legibility artefact the empty project id produced'
+        )
+
+    def test_project_id_takes_precedence_over_the_configs(self, tmp_path):
+        """Pins the precedence DIRECTION.
+
+        ``scripts/legibility/check_transcript_persistence.py::_load_config``
+        resolves ``--config`` FIRST for the CONFIG, but never had to
+        arbitrate a project id — so the rule is stated here rather than
+        assumed from the sibling."""
+        progress_calls, liveness_calls = [], []
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        check_trickle_health.run_health_check(
+            project_id='dark_factory',
+            config_path=config_path,
+            progress_runner=self._recorder(progress_calls),
+            liveness_runner=self._recorder(liveness_calls),
+            poster=lambda url, envelope: None,
+        )
+
+        assert progress_calls == ['dark_factory']
+        assert liveness_calls == ['dark_factory']
+
+    def test_an_unresolvable_config_without_a_project_id_runs_neither_probe(
+        self, tmp_path
+    ):
+        """There is no project id to probe and no escalation port to post
+        to, so running the probes could only manufacture the same false
+        DEGRADED this fix removes.
+
+        Non-zero rather than 0 because ``_invoke``'s own rule — a probe
+        that cannot run is not evidence of health — applies a fortiori to a
+        probe that was never invoked."""
+        envelopes = []
+        progress_calls, liveness_calls = [], []
+        config_path = tmp_path / 'nope' / 'legibility.yaml'
+
+        result = check_trickle_health.run_health_check(
+            project_id=None,
+            config_path=config_path,
+            progress_runner=self._recorder(progress_calls),
+            liveness_runner=self._recorder(liveness_calls),
+            poster=lambda url, envelope: envelopes.append(envelope),
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is False
+        assert envelopes == []
+        assert progress_calls == [], 'the progress probe must never be invoked'
+        assert liveness_calls == [], 'the liveness probe must never be invoked'
+        assert str(config_path) in result.reason, (
+            'the journal line must distinguish a misconfigured invocation '
+            'from a genuine probe failure'
+        )
+
+    def test_the_escalation_path_never_sees_an_empty_project_id(self, tmp_path):
+        """The half of the defect that reaches an operator's inbox rather
+        than a journal."""
+        envelopes = []
+        config_path = _write_project_config(tmp_path, project_id='proj_a')
+
+        result = check_trickle_health.run_health_check(
+            project_id=None,
+            config_path=config_path,
+            progress_runner=_fails('ERROR: never recorded a run'),
+            liveness_runner=_ok,
+            poster=lambda url, envelope: envelopes.append(envelope),
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
+        arguments = envelopes[0]['params']['arguments']
+        assert arguments['task_id'] == 'legibility-trickle-health-proj_a'
+        assert 'for :' not in arguments['summary']
+        assert 'for :' not in arguments['detail']
