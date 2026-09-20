@@ -122,3 +122,113 @@ test('boundHeatmapAxes returns the full axis-selection shape', () => {
   assert.equal(typeof out.rowsTruncated, 'boolean');
   assert.equal(typeof out.modulesTruncated, 'boolean');
 });
+
+// ---------------------------------------------------------------------------
+// COLUMN selection — which lock modules earn a heatmap column
+// ---------------------------------------------------------------------------
+
+// Mirrors the real wire shape built at dashboard/src/dashboard/data/scheduler.py
+// (`result.append({...})`). `contention` is always an int there
+// (`counts.get(path, 0)`) and `park_stack` always a list, so the predicate needs
+// no None-handling beyond defensive defaults — but the fixture carries the full
+// field set anyway, so a future predicate reading `holder` or `has_dead_park`
+// has something real to read.
+function makeModule(path, contention, extra) {
+  return {
+    path,
+    project: 'dark_factory',
+    contention,
+    holder: null,
+    holder_project: null,
+    parked_by: null,
+    parked_by_project: null,
+    parked_owner_live: false,
+    park_stack: [],
+    has_dead_park: false,
+    ...(extra || {}),
+  };
+}
+
+// The server returns modules already `sorted(key=lambda m: (-contention, path))`
+// (scheduler.py:341), so every column fixture is built in that order.
+const COLUMN_FIXTURE = [
+  makeModule('src/a/hot.py', 5),
+  makeModule('src/b/warm.py', 2),
+  makeModule('src/c/solo.py', 1),
+  makeModule('src/d/idle.py', 0),
+];
+
+test('column selection keeps contended modules and drops uncontended ones', () => {
+  // `contention` counts LIVE WAITERS. A module held by exactly one task has no
+  // contention to show — it is a column of one coloured cell and 59 blanks,
+  // which is exactly the noise that made the grid unreadable at 4,302 columns.
+  const out = boundHeatmapAxes({ rows: [], modules: COLUMN_FIXTURE });
+
+  assert.deepEqual(
+    out.modules.map(m => m.path),
+    ['src/a/hot.py', 'src/b/warm.py'],
+  );
+});
+
+test('a fully-stranded module survives at contention 0 when it has a park stack', () => {
+  // NOT a nicety — scheduler.py:237 deliberately injects an entry for every
+  // park-stack key "even if it has no live waiters (contention: 0), so a fully
+  // stranded module still gets a module entry". A bare `contention > 1` filter
+  // would therefore hide exactly the stranded parks the surrounding UI already
+  // shouts about: tab_scheduler.jsx renders a red "N stranded parks" banner
+  // keyed on has_dead_park, and ParkStacksSection renders those very stacks.
+  const stranded = makeModule('src/e/stranded.py', 0, {
+    parked_by: 'T-900',
+    parked_owner_live: false,
+    park_stack: [{ owner: 'T-900', live: false }],
+    has_dead_park: true,
+  });
+  const out = boundHeatmapAxes({ rows: [], modules: [...COLUMN_FIXTURE, stranded] });
+
+  assert.ok(
+    out.modules.map(m => m.path).includes('src/e/stranded.py'),
+    'a contention-0 module with a non-empty park_stack must keep its column',
+  );
+});
+
+test('column selection preserves the input order, inheriting the server sort', () => {
+  // `filter` and `slice` are both order-preserving, so filtering the server's
+  // already `(-contention, path)`-sorted list yields a PREFIX of that order —
+  // the most-contended columns, for free. Re-sorting on the client would
+  // duplicate a rule the server owns and let the two drift.
+  const shuffledInput = [
+    makeModule('src/z/nine.py', 9),
+    makeModule('src/y/eight.py', 8),
+    makeModule('src/x/seven.py', 7),
+  ];
+  const out = boundHeatmapAxes({ rows: [], modules: shuffledInput });
+
+  assert.deepEqual(
+    out.modules.map(m => m.path),
+    ['src/z/nine.py', 'src/y/eight.py', 'src/x/seven.py'],
+  );
+});
+
+test('a module with a missing contention field is treated as 0, not thrown over', () => {
+  // Defensive: the heatmap renders against whatever the last poll returned, and
+  // throwing here blanks the whole Scheduler tab rather than one column.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [{ path: 'src/f/nofield.py', project: 'dark_factory' }],
+  });
+
+  assert.deepEqual(out.modules, []);
+  assert.equal(out.modulesTotal, 1);
+});
+
+test('column totals and the truncation flag report the INPUT size', () => {
+  const out = boundHeatmapAxes({ rows: [], modules: COLUMN_FIXTURE });
+
+  assert.equal(out.modulesTotal, 4);
+  assert.equal(out.modulesTruncated, true);
+  assert.equal(
+    boundHeatmapAxes({ rows: [], modules: COLUMN_FIXTURE.slice(0, 2) }).modulesTruncated,
+    false,
+    'nothing was dropped, so the affordance must not claim otherwise',
+  );
+});
