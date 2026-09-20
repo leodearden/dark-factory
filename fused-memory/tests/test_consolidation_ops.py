@@ -537,3 +537,83 @@ class TestTagOnlyTouchesNothingOnTheIncumbent:
 
         assert result['error_type'] == 'TagOnlyIncumbentNotFound'
         assert result['topic'] == TOPIC
+
+
+class TestAuthorizationIsFailClosedAndPreWrite:
+    """The arm authorizes ITSELF, above every read and every write.
+
+    The tool in front of it already runs the same gate, so on that path it
+    runs twice — which costs nothing measurable, the resolver being pure,
+    synchronous and three `getattr` hops. The duplication is the point: the
+    auto-consolidation executor calls this function with NO tool boundary
+    in front of it, and a service-level write primitive that trusts its
+    caller to have authorized is exactly the shape that leaks.
+
+    An unauthorized caller is turned away before anything is done on its
+    behalf and before it learns anything about the system.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_caller_off_the_bar_is_refused(self):
+        svc = make_service()
+
+        result = await call_execute(svc, agent_id='stranger-session')
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        assert result['agent_id'] == 'stranger-session'
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_reads_nothing_and_writes_nothing(self):
+        svc = make_service()
+
+        await call_execute(svc, agent_id='stranger-session')
+
+        svc.add_memory.assert_not_awaited()
+        svc.update_memory.assert_not_awaited()
+        svc.get_memory_by_id.assert_not_awaited()
+        svc.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_outranks_the_allowlist(self):
+        """One knob an operator can reliably use to stop an in-flight
+        incident, regardless of who is calling."""
+        svc = make_service()
+        svc.config.mem0_update.enabled = False
+
+        result = await call_execute(svc)
+
+        assert result['error_type'] == 'Mem0UpdateToolDisabled'
+        svc.add_memory.assert_not_awaited()
+        svc.update_memory.assert_not_awaited()
+
+
+class TestLiveRead:
+    """PRD C4: the arm must hold the LIVE `memory_service`, never a config
+    captured at call entry or at construction.
+
+    `mem0_update.*` is green-tier — hot-reloadable with no restart — and
+    `reload_config` delivers that by mutating the SHARED config object in
+    place. A helper that bound `memory_service.config`, or any leaf of it,
+    to a local would make all five leaves restart-only in disguise while
+    every other test in this file still passed.
+
+    Mirrors `tests/server/test_update_memory_authz_gate.py::TestLiveRead`,
+    reproduced at the new boundary rather than assumed to be covered by
+    the old one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_added_in_place_takes_effect_on_the_next_call(self):
+        svc = make_service()
+        refused = await call_execute(svc, agent_id='stranger-session')
+        assert refused['error_type'] == 'Mem0UpdateNotAuthorized'
+
+        # Exactly what reload_config does: mutate the shared object.
+        svc.config.mem0_update.metadata_patch_allowed_agent_prefixes.append(
+            'stranger-'
+        )
+
+        allowed = await call_execute(svc, agent_id='stranger-session')
+
+        assert allowed['status'] == 'consolidated'
+        assert 'error_type' not in allowed
