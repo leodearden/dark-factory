@@ -781,6 +781,26 @@ def _arm_for(metric: str, specs: list[ArmSpec]) -> str | None:
     return None
 
 
+def _value_metric_for(metric: str, specs: list[ArmSpec]) -> str | None:
+    """The VALUE series a ``*_read_ok`` metric is evidence ABOUT, or None.
+
+    The mirror image of the two lines ``coverage_table`` uses in the forward
+    direction, written against the same ArmSpec fields and the same ':'
+    partition — so the stem/non-stem rule is stated once per direction and a
+    metric reached from either side computes an identical row.
+
+    Needed because a series readable on NO tick writes no value row at all, so
+    the readability side is the only side it appears on. ``None`` for anything
+    no SELECTED spec claims, which is what keeps an ``--arm`` run reporting
+    only the arm it was asked about.
+    """
+    stem, separator, tail = metric.partition(':')
+    for spec in specs:
+        if spec.readability == stem:
+            return f'{spec.selector}:{tail}' if separator else spec.selector
+    return None
+
+
 def hold_table(
     series: dict[str, list[tuple[int, float]]],
     specs: list[ArmSpec],
@@ -877,10 +897,29 @@ def coverage_table(
 
     Keyed by the value metric so a ':' stem reports PER LEAF: one cgroup can be
     unreadable while its siblings are fine, which is exactly the case worth
-    seeing.
+    seeing. A series with READABILITY rows and no value rows gets a row too,
+    reached backwards through ``_value_metric_for`` — because the fully
+    unreadable leaf is precisely the one that writes no value row: the sampler
+    records ``own_read_ok:<leaf>`` = 0.0 on every tick it discovered the leaf
+    and nothing else. Iterating the value series alone therefore hid the exact
+    case this keying exists to expose.
     """
+    # The UNION of both sides, because each carries a case the other cannot.
+    # Without the readability side, a series readable on no tick is invisible
+    # (no value rows to iterate). Without the value side, the four PSI arms
+    # vanish — they declare no readability metric, so nothing reaches them
+    # backwards, and their coverage is a reported ``None`` rather than nothing.
+    # Sorted, so the JSON payload's key order does not depend on which side a
+    # metric arrived from.
+    covered = {
+        metric for metric in series if _arm_for(metric, specs) is not None
+    } | {
+        value_metric
+        for evidence in readability
+        if (value_metric := _value_metric_for(evidence, specs)) is not None
+    }
     out: dict[str, Coverage | None] = {}
-    for metric in series:
+    for metric in sorted(covered):
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
         if spec is None:
