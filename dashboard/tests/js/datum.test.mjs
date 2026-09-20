@@ -43,12 +43,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'withReceipt',
   'displayedAgeMs',
   'datumView',
+  'plainDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
   'DATUM_STATES',
   'EM_DASH',
   'LOWER_BOUND_PREFIX',
+  'PLAIN_DATUM_BOUND_SECONDS',
 ];
 
 // Loads datum.js fresh against a shimmed browser-ish global carrying the REAL
@@ -74,6 +76,7 @@ const { api: datum } = loadDatumJs();
 const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
+const { plainDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -501,4 +504,128 @@ test('datumView: a non-Datum throws via assertDatum, naming the component', () =
 test('datumView: format defaults to String, and opts is optional entirely', () => {
   assert.equal(datumView(stampedWire({}), { now: NOW }).text, '7');
   assert.equal(datumView(stampedWire({})).text, '7');
+});
+
+// ---------------------------------------------------------------------------
+// plainDatum — endpoint-granularity provenance for values not yet SERVED as a
+// Datum (PRD decision 7).
+//
+// No polled payload carries a Datum today: PRD leaf beta has not landed. Rather
+// than leave 43 tiles unprovenanced until it does, a plain value is wrapped
+// with what IS known about it — which endpoint it came from, and when that
+// endpoint last delivered. That is coarser than a server Datum (one instant per
+// endpoint, not per value) and the wrapper is confined to exactly this gap.
+// ---------------------------------------------------------------------------
+
+const TASKS_PATH = '/api/v2/dashboard/tasks';
+
+function receiptsFor(entry) {
+  return { [TASKS_PATH]: entry };
+}
+
+test('plainDatum: with a server served_at, as_of is that instant and the state is fresh', () => {
+  const wrapped = plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT));
+
+  assert.equal(isDatum(wrapped), true);
+  assert.equal(wrapped.value, 7);
+  assert.equal(wrapped.as_of, SERVED_AT);
+  assert.equal(wrapped.state, 'fresh');
+  assert.equal(wrapped._served_at, SERVED_AT);
+  assert.equal(wrapped._received_at, RECEIVED_AT);
+  assert.equal(wrapped.freshness_bound_seconds, PLAIN_DATUM_BOUND_SECONDS);
+});
+
+test('plainDatum: the measurement instant claimed is the SERVING instant, not a guess', () => {
+  // A plain value carries no measurement instant of its own — that is the whole
+  // difference between it and a served Datum. The strongest true statement
+  // available is "the server had this value when it served the payload", so
+  // as_of is served_at and the server-side gap is exactly zero. Inventing an
+  // earlier as_of would fabricate staleness; inventing a later one would hide
+  // it.
+  const wrapped = plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT));
+  assert.equal(displayedAgeMs(wrapped, NOW), CLIENT_GAP_MS);
+});
+
+test('plainDatum: with only a receivedAt — today\'s wire — the age still computes', () => {
+  // No payload carries a top-level served_at until beta lands, so every polled
+  // endpoint's receipt has servedAt null. The fallback is this browser's own
+  // arrival instant, which is a real instant rather than an absent one.
+  const wrapped = plainDatum(7, TASKS_PATH, receiptsFor({ servedAt: null, receivedAt: RECEIVED_AT }));
+
+  assert.equal(isDatum(wrapped), true);
+  assert.equal(Date.parse(wrapped.as_of), RECEIVED_AT);
+  const age = displayedAgeMs(wrapped, NOW);
+  assert.equal(age, CLIENT_GAP_MS);
+  assert.ok(Number.isFinite(age), 'a missing served_at must not produce NaN');
+});
+
+test('plainDatum: with no receipt yet, the tile shows an em-dash — not a seed zero', () => {
+  // The PRE-FETCH render, which every tile does before its first payload
+  // resolves. DF_DATA seeds most numeric keys to 0, and rendering that 0 is
+  // exactly the lie the envelope exists to remove: an operator cannot tell a
+  // measured zero from a not-yet-loaded one.
+  const wrapped = plainDatum(0, TASKS_PATH, {});
+
+  assert.equal(wrapped.state, 'unknown');
+  assert.equal(wrapped.value, null);
+  assert.equal(wrapped.reason, 'not yet fetched');
+  assert.equal(datumView(wrapped, { now: NOW, format: String }).text, EM_DASH);
+});
+
+test('plainDatum: an absent receipts map is the same as an empty one', () => {
+  assert.equal(plainDatum(0, TASKS_PATH, undefined).state, 'unknown');
+  assert.equal(plainDatum(0, TASKS_PATH, null).state, 'unknown');
+});
+
+test('plainDatum: NEVER consults DF_DATA.__stale — one staleness authority, not two', () => {
+  // __stale records ATTEMPT history and is endpoint_staleness.js's input; it is
+  // republished on FAILURE too, by design. __receipt records the PROVENANCE of
+  // the value currently in DF_DATA and must not advance on a failure, which is
+  // what makes a wedged endpoint's tiles keep ageing. Reading both here would
+  // make the tile a second staleness verdict fired at the same instant as the
+  // banner — precisely what PRD decisions 6/B4/B5 forbid.
+  const baseline = plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT));
+
+  globalThis.window.DF_DATA = {
+    __stale: { [TASKS_PATH]: { failures: 9, lastSuccessAt: RECEIVED_AT } },
+    __receipt: receiptsFor(RECEIPT),
+  };
+  try {
+    const withFailures = plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT));
+    assert.deepEqual(withFailures, baseline, 'a 9-failure __stale entry changed the datum');
+  } finally {
+    delete globalThis.window.DF_DATA;
+  }
+});
+
+test('plainDatum: reads window.DF_DATA.__receipt when no map is passed', () => {
+  // Browser call sites pass only (value, endpointKey); the third parameter
+  // exists so the node suite can drive it without a DF_DATA shim.
+  globalThis.window.DF_DATA = { __receipt: receiptsFor(RECEIPT) };
+  try {
+    assert.deepEqual(plainDatum(7, TASKS_PATH), plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT)));
+  } finally {
+    delete globalThis.window.DF_DATA;
+  }
+});
+
+test('plainDatum: a value aged past the plain bound badges through datumView', () => {
+  // Age-badge-wins applies to plain datums too: the wrapper's state is always
+  // 'fresh' (a polled value is whatever the endpoint last delivered), so the
+  // ONLY signal that the endpoint has stopped delivering is the badge.
+  const stale = plainDatum(7, TASKS_PATH, receiptsFor({ servedAt: null, receivedAt: RECEIVED_AT }));
+  const overBound = RECEIVED_AT + (PLAIN_DATUM_BOUND_SECONDS + 1) * 1000;
+
+  assert.ok(datumView(stale, { now: overBound, format: String }).age);
+  assert.equal(datumView(stale, { now: RECEIVED_AT + 1000, format: String }).age, null);
+});
+
+test('plainDatum: the bound is four poll intervals — fine, ahead of the coarse banner', () => {
+  // data.js polls every POLL_INTERVAL_MS=3000 with JITTER_MAX_MS=1500, so a
+  // healthy receipt is at most ~4.5s old; 12s is ~2.6x headroom and no twitch.
+  // endpoint_staleness.js calls an endpoint stale at 3 consecutive failures
+  // (~21s of backoff), so the tile badge is the first per-VALUE signal and the
+  // banner the later per-ENDPOINT explanation — deliberately ordered
+  // fine-then-coarse, one authority each.
+  assert.equal(PLAIN_DATUM_BOUND_SECONDS, 12);
 });
