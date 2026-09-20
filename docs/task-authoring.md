@@ -146,7 +146,7 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
-| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | — |
+| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
 
@@ -156,6 +156,34 @@ it is likewise exempt from the reopen-freshness gate (which only inspects
 callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
+
+The four `deterministic-*` kinds carry a caller bar of the same shape, with
+two factors (PRD `plans/memory-auto-consolidation-prd.md` C5/D11, where the
+rationale lives). They are accepted only from a caller whose resolved
+identity matches a prefix in
+`reconciliation.deterministic_provenance_allowed_agent_prefixes` — default
+`['orchestrator']`, green-tier hot-reloadable, and an **empty list denies
+every caller**, which is the incident kill switch. They are refused
+**unconditionally** from a `recon-stage-` caller regardless of that list, so
+granting the prefix cannot buy a recon stage the ability to self-authorize a
+runner-stamped close. Both refusals carry
+`error_type='DeterministicProvenanceCallerNotPermitted'`, on the fresh
+`done` transition and the same-status repair path alike.
+
+That identity is **self-reported**: a caller sending no `agent_id` falls
+back to the `clientInfo.name` it chose
+(`fused-memory/src/fused_memory/server/tools.py::_resolve_identity`). The
+bar therefore deters a cooperating caller; it is not a security boundary.
+The residual — a deliberate spoof — is made *visible* rather than
+prevented: every `done` write, accepted or refused, leaves a write-journal
+row carrying the resolved caller and the provenance kind.
+
+The one other historical producer,
+`fused-memory/scripts/cgl_eta_finalize_gate.py::_gate_done_provenance`
+(clientInfo `cgl-sched-gate`), is deliberately **not** allowlisted. It is a
+finished one-shot for the already-`done` task 2273; a re-run being refused
+is the correct outcome for a retired caller, and shipping one in an
+allowlist is how an allowlist stops meaning anything.
 
 #### `stamped_at` (server-written, `found_on_main` only)
 
@@ -718,6 +746,13 @@ author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
+
+A **pure-gate** close cites the resolving `milestone_gate` record via
+`done_provenance.escalation_id`, exactly as the curator-gate close already
+does (§8, "The human-curator-gate contract") — both go through one rule in
+`orchestrator/src/orchestrator/deterministic_runner.py::_cite_gate_escalation_id`.
+The two closes keep distinct `note` text, which is what makes a genuine
+curator closure distinguishable from a generic one in the audit trail.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
