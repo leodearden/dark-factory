@@ -1638,21 +1638,16 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
-# task 4892 (live-file guard) — both corrections landed through the sole
-# writer, and the committed registry still carries the committed record.
+# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687).
+# Each asserts that a committed §7.3 coding record and the merger-owned
+# registry still agree; the comparison itself is single-sourced here, so each
+# guard states only what is distinctive about its own correction and a fix to
+# the comparison lands once rather than once per guard.
 # ---------------------------------------------------------------------------
 
-_T4892_ENTRY_ID = "guards-assert-unverified-diagnoses"
-_T4892_ORIGINAL_SESSION = "e16af1c5-de98-4252-8504-ce5d13bee3d6"
-_T4892_CORRECTION_SESSION = "task-4892-resume-sysprompt-correction"
-_T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
-_T4892_RECORD_PATH = (
-    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-4892-corrections.jsonl"
-)
-
-# What apply_coding_record copies verbatim from a match/candidate payload into
-# the sighting it appends. The optional three are emitted only when truthy, so
-# a payload that omits one is compared as omitting it.
+# What apply_coding_record copies verbatim from a match/candidate/correction
+# payload into the sighting it appends. The optional three are emitted only
+# when truthy, so a payload that omits one is compared as omitting it.
 _SIGHTING_PAYLOAD_FIELDS = (
     "origin_phase",
     "manifested_phase",
@@ -1664,6 +1659,175 @@ _SIGHTING_PAYLOAD_FIELDS = (
 
 def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
+
+
+def _assert_correction_absorbed(
+    record_path: Path,
+    session: str,
+    entry_id: str,
+    *,
+    refuted_tokens: tuple[str, ...],
+    expected_status: str,
+    original_sightings: dict[str, str],
+) -> tuple[dict, dict, dict]:
+    """Assert the *session* correction committed in *record_path* is fully
+    absorbed by the committed registry, and hand back its
+    ``(record, correction, entry)`` triple for whatever else a caller pins.
+
+    A correction REWRITES merger-owned fields in place — the one op in the
+    §7.3 vocabulary that is not a pure append — so every guard over one needs
+    the same six properties, each invariant under every transition the system
+    is designed to make to these two files:
+
+    (0) WELL-FORMED — *record_path* is JSONL, exactly one of its records
+        carries *session*, it validates, and it holds exactly one
+        `corrections` op naming *entry_id*. Both counts are scoped BY
+        SESSION, not file-wide: the sanctioned way to re-correct an entry
+        later is a NEW session in the same file (task 4892's record holds
+        several ops across two), and a file-wide count would break the moment
+        anyone appends. Exactly-one matters because the merger admits one
+        sighting per (session, entry), so a second op for this entry in this
+        session would be counted in `correction_skipped` with its field
+        writes lost.
+    (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
+        sighting carries the record's payload field for field. This is the
+        in-place-rewrite detector for the merger-owned YAML, and it is what
+        proves the correction's full text is carried verbatim — which is why
+        no caller needs to pin cause or note prose.
+    (2) WITHDRAWN — no *refuted_tokens* member survives in the title, the one
+        field `scripts/legibility/coder.py::build_codebook_index` renders to
+        the nightly coder unconditionally.
+    (3) STATUS — the entry is *expected_status*, pinned so a later sweep can
+        neither retire a live defect nor reopen a settled one while leaving
+        the guard green.
+    (4) NEVER-DELETE and ORDER — every session in *original_sightings*
+        survives, still carrying its mapped date, and the correction's own
+        sighting follows all of them.
+    (5) NO-OP — re-applying the record changes nothing, which makes a rebase
+        onto a nightly-rewritten main resolvable by re-running one CLI command
+        instead of hand-editing 22k lines of generated YAML.
+
+    An entry's TOTAL sighting count is deliberately never pinned: the nightly
+    census may legitimately append more, to retired entries too (they stay in
+    the coder's index). Presence-of-each-original plus ORDER carries
+    never-delete without that coupling. Nor is any substring of a note's prose
+    pinned — (1) already proves it is carried verbatim — and schema shape
+    stays owned by `test_live_codebook_is_v2_and_validates_green`.
+    """
+    # (0) WELL-FORMED.
+    records = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mine = [r for r in records if r.get("session") == session]
+    assert len(mine) == 1, (
+        f"expected exactly one {session!r} record in {record_path}, found "
+        f"{len(mine)}; sessions present: "
+        f"{sorted({r.get('session') for r in records})}"
+    )
+    record = mine[0]
+    assert mod.validate_coding_record(record) == [], (
+        f"invalid §7.3 coding record for session {session!r}"
+    )
+    corrections = record.get("corrections") or []
+    assert len(corrections) == 1, (
+        f"expected exactly one correction in the {session!r} record, got "
+        f"{len(corrections)} — the merger admits one sighting per (session, "
+        "entry), so a second op for this entry in this session would be "
+        "dropped into `correction_skipped` with its field writes lost"
+    )
+    correction = corrections[0]
+    assert correction.get("entry_id") == entry_id
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
+    assert len(entries) == 1, f"expected exactly one {entry_id!r} entry"
+    entry = entries[0]
+
+    # (1) AGREEMENT — entry fields, then the provenance sighting.
+    field_drift = {
+        field: (correction[field], entry.get(field))
+        for field in ("title", "cause", "status")
+        if correction.get(field) and correction[field] != entry.get(field)
+    }
+    assert field_drift == {}, (
+        f"{entry_id!r} no longer carries the committed correction — a "
+        f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
+        f"{field_drift}"
+    )
+
+    carried = _sightings_for(entry, session)
+    assert len(carried) == 1, (
+        f"expected exactly one {session!r} sighting on {entry_id!r}, found "
+        f"{len(carried)}"
+    )
+    sighting_drift = {
+        field: (correction[field], carried[0].get(field))
+        for field in _SIGHTING_PAYLOAD_FIELDS
+        if correction.get(field) and correction[field] != carried[0].get(field)
+    }
+    assert sighting_drift == {}, (
+        f"the {session!r} sighting no longer matches the committed record "
+        f"{{field: (record, codebook)}}: {sighting_drift}"
+    )
+
+    # (2) WITHDRAWN — the refuted framing is gone from the one field
+    #     build_codebook_index renders unconditionally.
+    title_lower = entry["title"].lower()
+    still_asserted = [t for t in refuted_tokens if t.lower() in title_lower]
+    assert still_asserted == [], (
+        f"{entry_id!r} still asserts the refuted framing via {still_asserted} "
+        f"— build_codebook_index renders this title to the coder every night: "
+        f"{entry['title']!r}"
+    )
+
+    # (3) STATUS.
+    assert entry.get("status") == expected_status, (
+        f"{entry_id!r} is {entry.get('status')!r}, not {expected_status!r}"
+    )
+
+    # (4) NEVER-DELETE and ORDER.
+    sightings = entry.get("sightings") or []
+    order = {s.get("session"): i for i, s in enumerate(sightings)}
+    for original_session, date in original_sightings.items():
+        assert original_session in order, (
+            f"the {original_session!r} sighting was deleted from {entry_id!r} "
+            "— sightings are immutable dated observations, and a correction "
+            "annotates them rather than retracting them"
+        )
+        original = sightings[order[original_session]]
+        assert original.get("date") == date, (
+            f"the {original_session!r} sighting was re-dated to "
+            f"{original.get('date')!r} (was {date!r}) — a dated observation is "
+            "not editable"
+        )
+    assert order[session] > max(order[s] for s in original_sightings), (
+        f"the {session!r} sighting does not follow the sightings it annotates"
+    )
+
+    # (5) NO-OP — the committed YAML is exactly what the sole writer produces.
+    _, stats = mod.apply_coding_record(codebook, record)
+    assert stats == _NO_CHANGES, (
+        f"re-applying session {session!r} changed something — the committed "
+        f"codebook has not fully absorbed the record: {stats}"
+    )
+
+    return record, correction, entry
+
+
+# ---------------------------------------------------------------------------
+# task 4892 (live-file guard) — both corrections landed through the sole
+# writer, and the committed registry still carries the committed record.
+# ---------------------------------------------------------------------------
+
+_T4892_ENTRY_ID = "guards-assert-unverified-diagnoses"
+_T4892_ORIGINAL_SESSION = "e16af1c5-de98-4252-8504-ce5d13bee3d6"
+_T4892_CORRECTION_SESSION = "task-4892-resume-sysprompt-correction"
+_T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
+_T4892_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-4892-corrections.jsonl"
+)
 
 
 def _t4892_carriers(codebook: dict, record: dict):
@@ -1815,124 +1979,18 @@ def test_live_codebook_withdraws_the_refuted_task_5120_framing():
     `scripts/legibility/coder.py::build_codebook_index` renders one line per
     entry — `- {id}: {title} — {cause}` — and deliberately keeps retired
     entries in that index, so retirement alone would leave the refuted title
-    in front of the very loop esc-5120-2 diagnoses as self-ingesting. Six
-    properties:
-
-    (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
-        sighting carries the record's payload field for field. This is the
-        in-place-rewrite detector: a hand edit of the merger-owned YAML
-        surfaces here as drift between two committed artifacts.
-    (2) WITHDRAWN — the title no longer carries the distinctive token pair.
-    (3) RETIRED — status is 'retired'.
-    (4) NEVER-DELETE — all three original sightings survive, located by
-        session, still so dated.
-    (5) ORDER — the correction follows everything it annotates.
-    (6) NO-OP — re-applying the record changes nothing, which is what makes a
-        rebase onto a nightly-rewritten main resolvable by re-running one CLI
-        command instead of hand-editing 22k lines of generated YAML.
-
-    The entry's TOTAL sighting count is deliberately not pinned: retired
-    entries stay in the coder's index, so the nightly census can legitimately
-    append a fourth sighting after this amendment lands. Presence-of-each-
-    original plus (5) carries never-delete without that coupling. Nor is any
-    substring of the note's prose pinned — (1) already proves it is carried
-    verbatim — and schema shape stays owned by
-    `test_live_codebook_is_v2_and_validates_green`.
+    in front of the very loop esc-5120-2 diagnoses as self-ingesting. The
+    withdrawal therefore had to be a rewritten title AND a 'retired' status,
+    which is exactly the pair `_assert_correction_absorbed` pins; nothing
+    about this correction is distinctive enough to assert beyond it.
     """
-    records = [
-        json.loads(line)
-        for line in _T5198_RECORD_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    by_session = {r.get("session"): r for r in records}
-    assert _T5198_CORRECTION_SESSION in by_session, (
-        f"{_T5198_RECORD_PATH} no longer records the task-5198 correction: "
-        f"{sorted(by_session)}"
-    )
-    record = by_session[_T5198_CORRECTION_SESSION]
-    assert mod.validate_coding_record(record) == [], (
-        f"invalid §7.3 coding record for session {_T5198_CORRECTION_SESSION!r}"
-    )
-    corrections = record.get("corrections") or []
-    assert len(corrections) == 1, (
-        f"expected exactly one correction in {_T5198_RECORD_PATH}, got {len(corrections)}"
-    )
-    correction = corrections[0]
-    assert correction.get("entry_id") == _T5198_ENTRY_ID
-
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T5198_ENTRY_ID]
-    assert len(entries) == 1, f"expected exactly one {_T5198_ENTRY_ID!r} entry"
-    entry = entries[0]
-
-    # (1) AGREEMENT — entry fields, then the provenance sighting.
-    field_drift = {
-        field: (correction[field], entry.get(field))
-        for field in ("title", "cause", "status")
-        if correction.get(field) and correction[field] != entry.get(field)
-    }
-    assert field_drift == {}, (
-        f"{_T5198_ENTRY_ID!r} no longer carries the committed correction — a "
-        f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
-        f"{field_drift}"
-    )
-
-    carried = _sightings_for(entry, _T5198_CORRECTION_SESSION)
-    assert len(carried) == 1, (
-        f"expected exactly one {_T5198_CORRECTION_SESSION!r} sighting on "
-        f"{_T5198_ENTRY_ID!r}, found {len(carried)}"
-    )
-    sighting_drift = {
-        field: (correction[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if correction.get(field) and correction[field] != carried[0].get(field)
-    }
-    assert sighting_drift == {}, (
-        f"the {_T5198_CORRECTION_SESSION!r} sighting no longer matches the "
-        f"committed record {{field: (record, codebook)}}: {sighting_drift}"
-    )
-
-    # (2) WITHDRAWN — the framing the census kept re-ingesting is gone from the
-    #     one field build_codebook_index actually renders.
-    title_lower = entry["title"].lower()
-    still_asserted = [t for t in _T5198_REFUTED_TOKENS if t.lower() in title_lower]
-    assert still_asserted == [], (
-        f"{_T5198_ENTRY_ID!r} still asserts the refuted framing via "
-        f"{still_asserted} — build_codebook_index renders this title to the "
-        f"coder every night: {entry['title']!r}"
-    )
-
-    # (3) RETIRED.
-    assert entry.get("status") == "retired", (
-        f"{_T5198_ENTRY_ID!r} is {entry.get('status')!r}, not 'retired'"
-    )
-
-    # (4) NEVER-DELETE and (5) ORDER.
-    sightings = entry.get("sightings") or []
-    order = {s.get("session"): i for i, s in enumerate(sightings)}
-    for session, date in _T5198_ORIGINAL_SIGHTINGS.items():
-        assert session in order, (
-            f"the {session!r} sighting was deleted from {_T5198_ENTRY_ID!r} — "
-            "sightings are immutable dated observations, and the correction "
-            "annotates them rather than retracting them"
-        )
-        original = sightings[order[session]]
-        assert original.get("date") == date, (
-            f"the {session!r} sighting was re-dated to {original.get('date')!r} "
-            f"(was {date!r}) — a dated observation is not editable"
-        )
-    assert order[_T5198_CORRECTION_SESSION] > max(
-        order[s] for s in _T5198_ORIGINAL_SIGHTINGS
-    ), (
-        f"the {_T5198_CORRECTION_SESSION!r} sighting does not follow the "
-        "sightings it annotates"
-    )
-
-    # (6) NO-OP — the committed YAML is exactly what the sole writer produces.
-    _, stats = mod.apply_coding_record(codebook, record)
-    assert stats == _NO_CHANGES, (
-        f"re-applying session {_T5198_CORRECTION_SESSION!r} changed something — "
-        f"the committed codebook has not fully absorbed the record: {stats}"
+    _assert_correction_absorbed(
+        _T5198_RECORD_PATH,
+        _T5198_CORRECTION_SESSION,
+        _T5198_ENTRY_ID,
+        refuted_tokens=_T5198_REFUTED_TOKENS,
+        expected_status="retired",
+        original_sightings=_T5198_ORIGINAL_SIGHTINGS,
     )
 
 
@@ -1958,195 +2016,112 @@ _T5687_ORIGINAL_EVIDENCE_QUOTE = "SyntaxError: invalid character '—' (U+2014)"
 # The withdrawn framing, as WORD tokens only, all lowercase, compared against
 # lowercased text.
 #
+# `unicode` is deliberately BROADER than the two em-dash spellings and the
+# codepoint beside it. python3 reported the symptom as an `invalid character`,
+# so the refuted claim respells itself just as naturally as "a unicode
+# character in the pasted source breaks the script" — which the three narrow
+# tokens would let through unchallenged. The cost is bounded and visible: the
+# tuple is scanned against two short surfaces this correction owns (the title,
+# and the index line the coder reads), so a future re-framing that genuinely
+# needs the word can drop the token in the same commit that needs it.
+#
 # The bare U+2014 CHARACTER is deliberately NOT in this tuple; it is asserted
-# against the TITLE alone, by property (2). `build_codebook_index` renders
-# each entry as `- {id}: {title} — {cause}`, and that separator IS U+2014,
-# emitted exactly when the cause is non-empty. Banning the bare character from
-# the rendered line would therefore contradict property (3)'s demand for a
-# non-empty cause — no implementation could satisfy both. A title is a leaf
-# value the separator cannot contaminate, so the character check belongs
-# there. Do not "helpfully" add it back here.
+# against the TITLE alone, by (b) below. `build_codebook_index` renders each
+# entry as `- {id}: {title} — {cause}`, and that separator IS U+2014, emitted
+# exactly when the cause is non-empty. Banning the bare character from the
+# rendered line would therefore contradict (c)'s demand for a rendered cause —
+# no implementation could satisfy both. A title is a leaf value the separator
+# cannot contaminate, so the character check belongs there. Do not "helpfully"
+# add it back here.
 _T5687_REFUTED_TOKENS = ("em-dash", "em dash", "u+2014", "unicode")
+
+# How much of the entry's own collapsed cause must reach the rendered index
+# line. Short enough to survive `build_codebook_index`'s truncation under any
+# cap it may adopt, so this pins that the cause is carried, never how far.
+_T5687_RENDERED_CAUSE_PREFIX_LEN = 80
 
 
 def test_live_codebook_withdraws_the_refuted_em_dash_framing():
-    """The committed §7.3 record and the committed registry still agree, and
-    the refuted em-dash framing is no longer asserted to the coder.
+    """`_assert_correction_absorbed` pins the mechanics; this adds the three
+    things distinctive to withdrawing a refuted SYMPTOM from a still-open
+    entry.
 
-    The entry named a SYMPTOM, not a mechanism. Measured against the archived
+    The entry named a symptom, not a mechanism. Measured against the archived
     transcript, replacing every U+2014 in the failing script with an ASCII
     hyphen leaves it failing — with a different error — while escaping or
     deleting the one embedded `\"\"\"` fixes it with every U+2014 left in
     place. So the reported error string is unstable across recurrences of the
     same defect, and a title keyed to it gives the nightly coder nothing to
-    match on. Seven properties:
+    match on.
 
-    (0) WELL-FORMED — the record file is JSONL, exactly one of its records
-        carries this session, it validates, and it holds exactly one
-        `corrections` op naming this entry. Both counts are scoped BY SESSION,
-        not file-wide: the sanctioned way to re-correct an entry later is a
-        NEW session in the same file (task 5686's record holds five ops across
-        two), and a file-wide count would break the moment anyone appends.
-        Exactly-one matters because the merger admits one sighting per
-        (session, entry), so a second op for this entry in this session would
-        be counted in `correction_skipped` and its field writes would vanish.
-    (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
-        sighting carries the record's payload field for field. This is the
-        in-place-rewrite detector for the merger-owned YAML, and it is what
-        proves the full cause text is carried verbatim — which is why no later
-        property needs to pin cause prose.
-    (2) WITHDRAWN (TITLE) — no refuted word token, and no bare U+2014, in the
-        title. This is the assertion the task exists for.
-    (3) CODER-VISIBLE CAUSE — the cause is non-empty, and the 200-character
-        window `_one_line_cause` actually hands the coder carries no refuted
-        token. Checking the WINDOW rather than the whole cause is deliberate:
-        that window is all the coder ever reads, while the cause BODY must
-        stay free to name the em-dash in order to REFUTE it.
-    (4) STILL OPEN — this correction replaces an explanation; it does not
-        retire a live, unfixed defect. Pinned so a later sweep cannot quietly
-        retire the entry and keep this guard green. (Diverges deliberately
-        from the task-5198 guard above, which pins 'retired'.)
-    (5) NEVER-DELETE and ORDER — the founding 2026-09-19 sighting survives,
-        still so dated, still carrying its original quote, and the correction
-        follows it.
-    (6) NO-OP — re-applying the record changes nothing, which makes a rebase
-        onto a nightly-rewritten main resolvable by re-running one CLI command
-        instead of hand-editing 22k lines of generated YAML.
-
-    The entry's TOTAL sighting count is deliberately not pinned — the nightly
-    census may legitimately append more. Nor is any substring of the note's
-    prose: (1) already proves it is carried verbatim, and schema shape stays
-    owned by `test_live_codebook_is_v2_and_validates_green`.
+    (a) STILL OPEN, not retired — passed to the helper as the expected status.
+        This correction replaces an explanation; it does not retire a live,
+        unfixed defect, and pinning that stops a later sweep quietly retiring
+        the entry. (Diverges deliberately from the task-5198 guard above.)
+    (b) THE FOUNDING SIGHTING IS ANNOTATED, NOT RETRACTED. The helper pins
+        that it survives and keeps its date; its `evidence_quote` is the part
+        a later editor is most likely to mistake for the refuted claim and
+        "clean up", so the exact quote is pinned here. The symptom it records
+        was real — only the cause it was filed under was wrong.
+    (c) THE CODER'S VIEW carries the mechanism and none of the symptom. The
+        cause is non-empty and reaches the rendered index line, and no refuted
+        token survives anywhere in that line. Asserted through the PUBLIC
+        renderer over a one-entry codebook, whose output IS the single line
+        the coder reads: one scan then covers the title and the truncated
+        cause window together, a renderer change surfaces here instead of
+        being mirrored in a copy of its format string, and a regression to the
+        cause-less `- {id}: {title}` fallback — the very state this task
+        exists to end — cannot pass. The cause BODY stays free to name the
+        em-dash in order to REFUTE it; only what the coder actually reads is
+        policed.
     """
-    # (0) WELL-FORMED.
-    records = [
-        json.loads(line)
-        for line in _T5687_RECORD_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    mine = [r for r in records if r.get("session") == _T5687_CORRECTION_SESSION]
-    assert len(mine) == 1, (
-        f"expected exactly one {_T5687_CORRECTION_SESSION!r} record in "
-        f"{_T5687_RECORD_PATH}, found {len(mine)}; sessions present: "
-        f"{sorted({r.get('session') for r in records})}"
+    _, _, entry = _assert_correction_absorbed(
+        _T5687_RECORD_PATH,
+        _T5687_CORRECTION_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",  # (a)
+        original_sightings=_T5687_ORIGINAL_SIGHTING,
     )
-    record = mine[0]
-    assert mod.validate_coding_record(record) == [], (
-        f"invalid §7.3 coding record for session {_T5687_CORRECTION_SESSION!r}"
-    )
-    corrections = record.get("corrections") or []
-    assert len(corrections) == 1, (
-        f"expected exactly one correction in the {_T5687_CORRECTION_SESSION!r} "
-        f"record, got {len(corrections)} — the merger admits one sighting per "
-        "(session, entry), so a second op for this entry in this session would "
-        "be dropped into `correction_skipped` with its field writes lost"
-    )
-    correction = corrections[0]
-    assert correction.get("entry_id") == _T5687_ENTRY_ID
-
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T5687_ENTRY_ID]
-    assert len(entries) == 1, f"expected exactly one {_T5687_ENTRY_ID!r} entry"
-    entry = entries[0]
-
-    # (1) AGREEMENT — entry fields, then the provenance sighting.
-    field_drift = {
-        field: (correction[field], entry.get(field))
-        for field in ("title", "cause", "status")
-        if correction.get(field) and correction[field] != entry.get(field)
-    }
-    assert field_drift == {}, (
-        f"{_T5687_ENTRY_ID!r} no longer carries the committed correction — a "
-        f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
-        f"{field_drift}"
-    )
-
-    carried = _sightings_for(entry, _T5687_CORRECTION_SESSION)
-    assert len(carried) == 1, (
-        f"expected exactly one {_T5687_CORRECTION_SESSION!r} sighting on "
-        f"{_T5687_ENTRY_ID!r}, found {len(carried)}"
-    )
-    sighting_drift = {
-        field: (correction[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if correction.get(field) and correction[field] != carried[0].get(field)
-    }
-    assert sighting_drift == {}, (
-        f"the {_T5687_CORRECTION_SESSION!r} sighting no longer matches the "
-        f"committed record {{field: (record, codebook)}}: {sighting_drift}"
-    )
-
-    # (2) WITHDRAWN (TITLE) — the refuted symptom is gone from the one field
-    #     build_codebook_index renders unconditionally.
     title = entry["title"]
-    title_lower = title.lower()
-    still_asserted = [t for t in _T5687_REFUTED_TOKENS if t in title_lower]
-    assert still_asserted == [], (
-        f"{_T5687_ENTRY_ID!r} still asserts the refuted framing via "
-        f"{still_asserted} — build_codebook_index renders this title to the "
-        f"coder every night, and the symptom it names does not survive an "
-        f"ASCII-only recurrence of the same defect: {title!r}"
-    )
     assert "—" not in title, (
         f"{_T5687_ENTRY_ID!r} still spells the refuted character in its "
         f"title: {title!r}"
     )
 
-    # (3) CODER-VISIBLE CAUSE — asserted against the REAL renderer, never a
-    #     copy of its format string, so a change to either surfaces here.
+    # (b) THE FOUNDING SIGHTING IS ANNOTATED, NOT RETRACTED.
+    for session in _T5687_ORIGINAL_SIGHTING:
+        quotes = [s.get("evidence_quote") for s in _sightings_for(entry, session)]
+        assert quotes == [_T5687_ORIGINAL_EVIDENCE_QUOTE], (
+            f"the {session!r} sighting of {_T5687_ENTRY_ID!r} now carries "
+            f"{quotes!r} — the symptom it recorded was real, and is not what "
+            "the correction withdraws"
+        )
+
+    # (c) THE CODER'S VIEW.
     cause = entry.get("cause")
     assert cause, (
         f"{_T5687_ENTRY_ID!r} has no cause — with none, build_codebook_index "
         "shows the coder the title alone, which is the state this task exists "
         "to end"
     )
-    window = coder._one_line_cause(cause).lower()
-    still_rendered = [t for t in _T5687_REFUTED_TOKENS if t in window]
-    assert still_rendered == [], (
-        f"the {coder._INDEX_CAUSE_MAX_LEN}-character cause window the coder "
-        f"actually reads still carries {still_rendered}: {window!r}"
-    )
+    opening = " ".join(str(cause).split())[:_T5687_RENDERED_CAUSE_PREFIX_LEN]
     rendered = coder.build_codebook_index({"entries": [entry]})
-    assert _T5687_ENTRY_ID in rendered and title in rendered, (
-        f"build_codebook_index no longer renders this entry as expected: {rendered!r}"
-    )
-
-    # (4) STILL OPEN — the defect is live and unfixed; only its explanation
-    #     was wrong.
-    assert entry.get("status") == "open", (
-        f"{_T5687_ENTRY_ID!r} is {entry.get('status')!r}, not 'open' — this "
-        "correction replaces an explanation, it does not retire a live defect"
-    )
-
-    # (5) NEVER-DELETE and ORDER.
-    sightings = entry.get("sightings") or []
-    order = {s.get("session"): i for i, s in enumerate(sightings)}
-    for session, date in _T5687_ORIGINAL_SIGHTING.items():
-        assert session in order, (
-            f"the {session!r} sighting was deleted from {_T5687_ENTRY_ID!r} — "
-            "sightings are immutable dated observations, and the correction "
-            "annotates them rather than retracting them"
+    missing = [
+        part
+        for part, needle in (
+            ("id", _T5687_ENTRY_ID),
+            ("title", title),
+            ("cause", opening),
         )
-        original = sightings[order[session]]
-        assert original.get("date") == date, (
-            f"the {session!r} sighting was re-dated to {original.get('date')!r} "
-            f"(was {date!r}) — a dated observation is not editable"
-        )
-        assert original.get("evidence_quote") == _T5687_ORIGINAL_EVIDENCE_QUOTE, (
-            f"the {session!r} sighting's evidence_quote was rewritten to "
-            f"{original.get('evidence_quote')!r} — the symptom it recorded was "
-            "real and is not what the correction withdraws"
-        )
-    assert order[_T5687_CORRECTION_SESSION] > max(
-        order[s] for s in _T5687_ORIGINAL_SIGHTING
-    ), (
-        f"the {_T5687_CORRECTION_SESSION!r} sighting does not follow the "
-        "sighting it annotates"
+        if needle not in rendered
+    ]
+    assert missing == [], (
+        f"build_codebook_index left the {missing} of {_T5687_ENTRY_ID!r} out "
+        f"of the index line the nightly coder reads: {rendered!r}"
     )
-
-    # (6) NO-OP — the committed YAML is exactly what the sole writer produces.
-    _, stats = mod.apply_coding_record(codebook, record)
-    assert stats == _NO_CHANGES, (
-        f"re-applying session {_T5687_CORRECTION_SESSION!r} changed something — "
-        f"the committed codebook has not fully absorbed the record: {stats}"
+    still_rendered = [t for t in _T5687_REFUTED_TOKENS if t in rendered.lower()]
+    assert still_rendered == [], (
+        f"the index line the coder actually reads still asserts the refuted "
+        f"framing via {still_rendered}: {rendered!r}"
     )
