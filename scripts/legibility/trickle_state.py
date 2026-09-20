@@ -45,7 +45,7 @@ import logging
 import os
 import pwd
 import tempfile
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -364,6 +364,44 @@ def load_state(path: str | Path) -> tuple[str, dict | None]:
         return 'malformed', None
 
     return 'ok', data
+
+
+# ---------------------------------------------------------------------------
+# recorded_age_hours — the freshness reading BOTH probes share
+# ---------------------------------------------------------------------------
+
+def recorded_age_hours(doc) -> float | None:
+    """Hours elapsed since *doc*'s ``recorded_at``, or ``None``.
+
+    ``None`` means FRESHNESS CANNOT BE ASSESSED — deliberately not "old"
+    and deliberately not "fresh". Each caller decides what that means,
+    which is precisely what lets the two callers below disagree about it
+    without either re-deriving the arithmetic:
+
+    - ``check_trickle_progress.py`` reports its own distinct
+      unparseable-``recorded_at`` verdict, separate from its stale one,
+      because that file's contract is that every failure verdict names its
+      OWN remedy;
+    - ``check_trickle_health.py::_should_escalate`` treats it as
+      post-worthy, matching the posture it already takes toward
+      ``missing``/``malformed`` — a record whose freshness cannot be
+      established must never be trusted to prove someone else already
+      alarmed.
+
+    A NAIVE ``recorded_at`` is read as UTC, which is what the progress
+    probe's staleness branch did before this helper existed.
+
+    Stdlib-only, like the rest of this module: it is on the
+    bare-``python3`` predicate path (see the module docstring)."""
+    if not isinstance(doc, dict):
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(doc.get('recorded_at')))
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - stamp).total_seconds() / 3600.0
 
 
 # ---------------------------------------------------------------------------

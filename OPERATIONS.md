@@ -1878,9 +1878,13 @@ is how an operator ends up tuning the sampler for a crashed coder:
 readable), `category=infra_issue`, `severity=info`. It stays **silent** in two
 cases: a liveness-only failure (a unit that ran and failed is already owned by
 the nightly's own escalation for that same run) and the exact night the
-nightly's edge-triggered barren-streak escalation fired. So it never doubles
-an alarm the nightly already raised. A non-zero exit is the authoritative
-signal whether or not the POST landed.
+nightly's edge-triggered barren-streak escalation fired — **and, in that
+second case, only while that record is still fresh** (within the same
+`max_age_hours` window the progress probe uses). So it never doubles an alarm
+the nightly already raised, and no failure mode can silence it permanently: a
+recorder that stops on a night landing exactly on the barren threshold goes
+stale, and the probe takes over. A non-zero exit is the authoritative signal
+whether or not the POST landed.
 
 **Where the state file lives.**
 

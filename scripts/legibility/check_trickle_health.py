@@ -291,7 +291,9 @@ def run_health_check(
 
     # The escalation outcome NEVER changes exit_code: the non-zero exit is
     # the authoritative loud signal whether or not the POST landed.
-    if not _load_and_decide(project_id, progress_ok, max_barren_runs):
+    if not _load_and_decide(
+        project_id, progress_ok, max_barren_runs, max_age_hours,
+    ):
         return result
     # SPOT: one load per invocation. On the `--config`-only path the yaml
     # was already read above to resolve the project id; reuse it rather
@@ -417,7 +419,9 @@ def post_health_finding(cfg, result: HealthResult, rerun, *, poster=None) -> boo
         return False
 
 
-def _should_escalate(progress_ok: bool, doc, max_barren_runs: int) -> bool:
+def _should_escalate(
+    progress_ok: bool, doc, max_barren_runs: int, max_age_hours: int,
+) -> bool:
     """Decide whether this invocation POSTS, as opposed to merely exiting
     non-zero. Narrower than the exit-code predicate, deliberately.
 
@@ -434,25 +438,46 @@ def _should_escalate(progress_ok: bool, doc, max_barren_runs: int) -> bool:
     ``DEFAULT_MAX_FAILED_RUNS = 2`` rather than 1 is exactly what keeps
     night one out of the post set while night two is in it.
 
-    ``False`` WHEN the recorded doc shows ``outcome == barren`` and
-    ``consecutive_barren_runs == max_barren_runs``.
-    ``nightly::_escalate_barren_streak`` is EDGE-triggered by exact
+    ``False`` WHEN the recorded doc shows ``outcome == barren``,
+    ``consecutive_barren_runs == max_barren_runs``, AND THE RECORD IS
+    FRESH. ``nightly::_escalate_barren_streak`` is EDGE-triggered by exact
     equality and fired for THIS run; posting would duplicate it. At
     ``> max_barren_runs`` the nightly is silent by design and this probe
     takes over.
 
-    ``missing``/``malformed`` are POST-WORTHY verdicts, not suppression
-    grounds — that is the recorder itself having stopped.
+    THE FRESHNESS CLAUSE IS LOAD-BEARING, and it is where the defect
+    lived. The suppression's entire justification is "the nightly fired
+    for THIS run, so posting duplicates it" — and that justification holds
+    only while the recorded run IS this run. Unscoped, it suppressed on
+    the recorded document alone: measured, a ``['barren'] * 3`` document
+    frozen 30 days ago failed the progress probe's STALENESS branch every
+    night while never once posting, indefinitely. That is precisely the
+    stopped-firing case the paragraph above claims "fails the PROGRESS
+    probe and does post"; the enumeration was aspirational, and scoping
+    the suppression by freshness is what makes it true. ``max_age_hours``
+    is reused rather than given its own window BY DESIGN: it is already
+    the window the progress probe uses to decide a record still describes
+    a running pipeline, so the suppression becomes incapable of outliving
+    the nightly's edge-trigger by construction.
 
-    This reads two FIELDS off the recorded document. It does not re-derive
-    either probe's verdict, so INV-5 stays intact."""
+    ``missing``/``malformed`` are POST-WORTHY verdicts, not suppression
+    grounds — that is the recorder itself having stopped. An absent or
+    unparseable ``recorded_at`` (``age is None``) takes the same posture
+    and does NOT suppress: a record whose freshness cannot be assessed is
+    never evidence that anyone alarmed.
+
+    This reads three FIELDS off the recorded document. It does not
+    re-derive either probe's verdict, so INV-5 stays intact."""
     if progress_ok:
         return False
     if not isinstance(doc, dict):
         return True
     if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
         return True
-    return doc.get('consecutive_barren_runs') != max_barren_runs
+    if doc.get('consecutive_barren_runs') != max_barren_runs:
+        return True
+    age = trickle_state.recorded_age_hours(doc)
+    return age is None or age > max_age_hours
 
 
 def _load_config(*, config_path, project_id):
@@ -485,12 +510,15 @@ def _load_config(*, config_path, project_id):
 
 def _load_and_decide(
     project_id: str, progress_ok: bool, max_barren_runs: int,
+    max_age_hours: int,
 ) -> bool:
     """Read the recorded doc and apply :func:`_should_escalate` to it."""
     _status, doc = trickle_state.load_state(
         trickle_state.trickle_state_path(project_id)
     )
-    return _should_escalate(progress_ok, doc, max_barren_runs)
+    return _should_escalate(
+        progress_ok, doc, max_barren_runs, max_age_hours,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

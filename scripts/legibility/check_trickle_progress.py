@@ -49,7 +49,6 @@ night finish".
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 # The deterministic runner EXECs a bound predicate directly
@@ -123,21 +122,23 @@ def main(argv: list[str]) -> int:
     # 3. Stale recorder: the pipeline stopped writing state at all. The
     #    recorded outcome alone would still read healthy here, which is
     #    exactly why freshness is checked before the streak.
-    recorded_at = doc.get('recorded_at')
-    try:
-        stamp = datetime.fromisoformat(str(recorded_at))
-    except (TypeError, ValueError):
+    #
+    #    The arithmetic (and the naive-stamp-is-UTC normalization) lives in
+    #    `trickle_state.recorded_age_hours`, so this probe and
+    #    `check_trickle_health.py`'s suppression rule cannot drift into two
+    #    readings of "fresh". The VERDICTS stay here: `None` means
+    #    freshness cannot be assessed, and what that is worth is each
+    #    caller's decision, not the helper's.
+    age_hours = trickle_state.recorded_age_hours(doc)
+
+    if age_hours is None:
         print(
             f'ERROR: legibility trickle state for {project_id} has an '
-            f'unparseable recorded_at {recorded_at!r} at {path}; freshness '
-            f'cannot be assessed.',
+            f'unparseable recorded_at {doc.get("recorded_at")!r} at {path}; '
+            f'freshness cannot be assessed.',
             file=sys.stderr,
         )
         return 1
-
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=UTC)
-    age_hours = (datetime.now(UTC) - stamp).total_seconds() / 3600.0
 
     if age_hours > max_age_hours:
         print(
