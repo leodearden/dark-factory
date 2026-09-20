@@ -3,9 +3,17 @@
 Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
 otherwise-successful ``claude --print`` run ended its turn while a backgrounded
 Bash command was still pending (launched via ``Bash run_in_background=true``,
-never subsequently polled with ``BashOutput`` or killed with
-``KillShell``/``KillBash``), and downgrade ``success``→failure so existing
+never subsequently reaped), and downgrade ``success``→failure so existing
 non-success handling retries/resumes instead of proceeding on a half-done tree.
+
+A session reaps either by calling a background-management tool named in
+``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
+issuing any tool_use whose input references the task's id or output-file path.
+The tool names appearing in the fixtures below are test DATA standing in for
+whatever a CLI build might emit, not a claim that each is live: measured
+2026-09-20, only ``TaskStop`` is (task 5332).  Exercising the accept set's full
+membership is the coverage that should stay — see the comment on
+``_BACKGROUND_REAP_TOOLS`` for why membership is kept rather than resynced.
 
 RCA: Reify 5164's amender ended its turn (681s, 19 turns, subtype=success,
 timed_out=false) "to wait for the completion notification" while a 2700s
@@ -428,10 +436,16 @@ class TestForegroundBgLogReadIsAReap:
 
 
 class TestTaskToolReaps:
-    """``TaskOutput`` and ``TaskStop`` are reaps (task 3639) — the Task-tool
-    analogues of ``BashOutput``/``KillShell``: one collects a backgrounded
-    Task/subagent's result, the other terminates it.  Both are equally
-    conclusive evidence the session engaged with its pending work."""
+    """``TaskOutput`` and ``TaskStop`` are reaps (task 3639): one collects a
+    backgrounded Task/subagent's result, the other terminates it.  Both are
+    equally conclusive evidence the session engaged with its pending work.
+
+    Deliberately NOT described as the analogues of
+    ``BashOutput``/``KillShell``, as this docstring used to: that framing is
+    doubly wrong.  ``BashOutput`` was never live in this fleet, and
+    ``TaskOutput`` has since been removed from the registry too (measured
+    2026-09-20, task 5332).  Both remain in the accept set on purpose; these
+    cases pin that membership."""
 
     def test_task_output_after_launch_is_false(self) -> None:
         """TaskOutput collects a backgrounded task's result → reap → False."""
