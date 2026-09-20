@@ -1767,12 +1767,12 @@ class UsageGate:
             # all (true 401/403 token revocation).
             #
             # An UNPARSEABLE "resets" hint must persist NOTHING: whatever is
-            # stored here, dashboard/data/costs.py::_extract_resets_at surfaces
-            # verbatim as a real recovery ETA, so a fabricated value would put
-            # an invented recovery time on a revoked token. The parser returns
-            # None instead (PRD 7.1.a — an unknown reset time must be reported
-            # as explicitly unknown, never fabricated; the invariant is stated
-            # at invocation_outcome.py's _parse_resets_at).
+            # stored here, dashboard/src/dashboard/data/costs.py::_extract_resets_at
+            # surfaces verbatim as a real recovery ETA, so a fabricated value
+            # would put an invented recovery time on a revoked token. The parser
+            # returns None instead (PRD 7.1.a — an unknown reset time must be
+            # reported as explicitly unknown, never fabricated; the invariant is
+            # stated at invocation_outcome.py's _parse_resets_at).
             #
             # (The old comment here justified the branch by "HTTP 429 ... routed
             # through _handle_auth_failure", which was stale: classify_invocation

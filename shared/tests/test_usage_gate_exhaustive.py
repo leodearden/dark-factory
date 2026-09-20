@@ -1,8 +1,14 @@
 """Exhaustive unit tests for UsageGate.
 
-Covers: cap detection patterns, reset time parsing, cap message extraction,
-handle_cap_detected, refresh_capped_accounts, before_invoke, confirm_account_ok,
-on_agent_complete, shutdown, and all properties.
+Covers: cap detection patterns, handle_cap_detected, refresh_capped_accounts,
+before_invoke, confirm_account_ok, on_agent_complete, shutdown, and all
+properties.
+
+Reset-time parsing and cap-message extraction are deliberately NOT here: task
+4357 retired usage_gate.py's `_parse_resets_at` / `_extract_cap_message` forks,
+so both now live — and are tested — with their single surviving copy, in
+shared/tests/test_invocation_outcome.py::TestParseResetsAt and
+::TestExtractCapMessage.
 """
 
 from __future__ import annotations

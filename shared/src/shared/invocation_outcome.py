@@ -240,8 +240,9 @@ _MONTH_ABBR = {
 # ``now`` (PRD 7.1.a — an unknown reset time must be reported as explicitly
 # unknown, never fabricated, and tests need determinism). The retired fork
 # fabricated ``now + 1h`` instead, which is why it was deleted rather than
-# repaired: dashboard/data/costs.py::_extract_resets_at surfaces a persisted
-# reset time verbatim, so an invented one reads as a real recovery ETA.
+# repaired: dashboard/src/dashboard/data/costs.py::_extract_resets_at surfaces
+# a persisted reset time verbatim, so an invented one reads as a real recovery
+# ETA.
 #
 # Single ownership is now mechanically enforced, by
 # shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership — a

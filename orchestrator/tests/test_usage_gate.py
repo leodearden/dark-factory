@@ -1,4 +1,10 @@
-"""Tests for usage cap detection, gate lifecycle, and reset time parsing."""
+"""Tests for usage cap detection and gate lifecycle.
+
+Reset-time parsing is NOT here: task 4357 retired usage_gate.py's
+`_parse_resets_at` fork and the orchestrator re-export that kept it importable,
+so that coverage lives with the single surviving copy, in
+shared/tests/test_invocation_outcome.py::TestParseResetsAt.
+"""
 
 from __future__ import annotations
 

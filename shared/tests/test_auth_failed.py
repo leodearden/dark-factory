@@ -116,11 +116,11 @@ class TestAuthFailedPersistsResetsAt:
          ``usage_gate._parse_resets_at``, which returned ``now + 1h`` on parse
          failure (task 4042 moved the call site off it; task 4357 retired the
          fork itself). The dashboard
-         (``dashboard/data/costs.py::_extract_resets_at``) surfaces the
-         persisted value verbatim as a real reset ETA, so a fabricated one
-         would put an invented recovery time on a revoked token — violating
-         PRD 7.1.a ("an unknown reset time must be reported as explicitly
-         unknown, never fabricated").
+         (``dashboard/src/dashboard/data/costs.py::_extract_resets_at``)
+         surfaces the persisted value verbatim as a real reset ETA, so a
+         fabricated one would put an invented recovery time on a revoked token
+         — violating PRD 7.1.a ("an unknown reset time must be reported as
+         explicitly unknown, never fabricated").
     """
 
     def _capture_fired_details(self, gate: UsageGate) -> list[tuple[str, str, str]]:
