@@ -76,6 +76,28 @@ def is_external_kill_rc(rc: int) -> bool:
 # ---------------------------------------------------------------------------
 
 _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
+
+# pytest's argparse REJECTING the argv we built — the tool never ran a test,
+# so nothing in the output is a verdict about the code. Captured verbatim from
+# the real binary in this worktree (rc=4)::
+#
+#     ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]
+#     pytest: error: argument --timeout: expected one argument
+#
+# The LINE ANCHOR is the entire false-positive margin, and is why this is
+# matched rather than the `pytest: error:` line below it: pytest writes the
+# marker at column 0 before any test output, whereas a failing test that
+# merely QUOTES the text has it rendered indented behind assertion-diff
+# framing ('E   ...'). So a branch cannot forge the category by printing.
+#
+# Deliberately does NOT cover pytest's other rc=4 shape,
+# 'ERROR: file or directory not found: <x>': that one is branch-reachable in
+# the ordinary way (a diff deleting or renaming a test file produces it
+# legitimately), so reading it as "we could not re-run" would suppress a real
+# red — the one failure direction the flake discriminator's doctrine forbids.
+# If it ever shows up in the ledger it deserves its own adjudication with its
+# own evidence (task 5580).
+_PYTEST_USAGE_ERROR_RE = re.compile(r'^ERROR: usage: pytest\b', re.MULTILINE)
 _COMPILE_ERROR_RUSTC_CODE_RE = re.compile(r'error\[E\d+\]:', re.MULTILINE)
 _COMPILE_ERROR_STRING_RE = re.compile(r'compile error', re.MULTILINE | re.IGNORECASE)
 
@@ -1051,7 +1073,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # ---------------------------------------------------------------------------
 # ToolKind.PYTEST — env_transient (shared-venv-mutation signatures, task
 # 2048) is consulted FIRST and ONLY here (Invariant C1's structural win: no
-# other tool's table even references these patterns), then INTERNALERROR,
+# other tool's table even references these patterns), then the argv rejection
+# (pytest refused to start — task 5580), then INTERNALERROR,
 # then FAILED lines, then flock (the test leg is flock-admission-wrapped),
 # falling through to UNKNOWN_TEST_FAILURE — which also covers pytest rc=5
 # ("no tests ran", kept RED per task 1852 — see _classify_opaque's docstring
@@ -1152,10 +1175,14 @@ _ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
-# Order matters: INTERNALERROR before FAILED so a worker-death run (which has
-# both INTERNALERROR> lines and collateral FAILED lines from the dead worker)
-# classifies as pytest_internalerror, not test_failure.
+# Order matters, twice over. The usage error comes FIRST: pytest rejected the
+# command, so any FAILED line elsewhere in the same captured output belongs to
+# an earlier leg or is quoted text, and must not shadow the fact that this run
+# never started. Then INTERNALERROR before FAILED, so a worker-death run
+# (which has both INTERNALERROR> lines and collateral FAILED lines from the
+# dead worker) classifies as pytest_internalerror, not test_failure.
 _PYTEST_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
+    (_PYTEST_USAGE_ERROR_RE, FailureCategory.PYTEST_USAGE_ERROR),
     (_PYTEST_INTERNALERROR_RE, FailureCategory.PYTEST_INTERNALERROR),
     (_TEST_FAILURE_TRAILING_RE, FailureCategory.TEST_FAILURE),
     (_TEST_FAILURE_LEADING_RE, FailureCategory.TEST_FAILURE),
@@ -1166,7 +1193,13 @@ _PYTEST_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
 
 def _classify_pytest(output: str) -> FailureCategory:
     """The PYTEST table: env_transient FIRST (Invariant C1: ONLY here), then
-    INTERNALERROR/FAILED/flock, falling through to UNKNOWN_TEST_FAILURE.
+    the argv rejection, then INTERNALERROR/FAILED/flock, falling through to
+    UNKNOWN_TEST_FAILURE.
+
+    env_transient stays ahead of the rejection arm deliberately: a usage error
+    caused by the xdist plugin vanishing mid-run is a HOST condition that
+    retries, and must keep that verdict rather than being relabelled as a
+    command we built wrong.
     """
     for env_pattern in _ENV_TRANSIENT_PATTERNS:
         if env_pattern.search(output):
