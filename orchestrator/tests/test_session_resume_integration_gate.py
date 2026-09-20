@@ -324,8 +324,8 @@ def _adopt_side(harness: Harness, task_id: str) -> tuple[dict, str | None]:
     Asserts the session and its plan were recovered, and returns
     ``(recovered_plan, stashed_config_dir)`` — the stash being ``None`` when
     boot corroborated no transcript for *task_id*. One named seam for the three
-    internal maps the family reads, so joining the family costs no new coupling
-    (the merge-lane private-read ratchet measures exactly that).
+    internal maps the family reads, so a new member of the family restates none
+    of them and a change to that state has one place to follow.
     """
     plans = harness._recovered_plans
     assert task_id in harness._recovered_sessions
