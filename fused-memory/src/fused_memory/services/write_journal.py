@@ -407,6 +407,16 @@ class WriteJournal:
         OMITS ``terminal_status`` / ``terminal_at`` / ``terminal_error``, so the
         late producer completes that row instead of clobbering the outcome it
         was racing.
+
+        ``agent_id`` READS DIFFERENTLY ON ONE ROW KIND. Interceptor rows
+        normally carry the literal ``'task-interceptor'`` — the component that
+        wrote the row. On a ``set_task_status`` DONE row it is instead the
+        RESOLVED CALLER, and ``NULL`` when the caller supplied no identity
+        (task 5241, PRD C5): that row is the audit surface for who recorded a
+        task's completion, so naming the component there would assert a caller
+        that is really just the writer. Such a row also carries
+        ``params['done_provenance_kind']`` and lands for a REFUSED write too,
+        with ``success=0`` and the refusal in ``error``.
         """
         try:
             async with self._txn() as db:

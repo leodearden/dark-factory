@@ -795,12 +795,52 @@ class TaskInterceptor:
             message=verdict.message,
         )
 
+    async def _log_write_op_row(
+        self,
+        operation: str,
+        project_root: str | None,
+        params: dict[str, Any],
+        *,
+        agent_id: str | None,
+        success: bool = True,
+        error: str | None = None,
+    ) -> str:
+        """Mint a ``write_op_id`` and write the Layer-1 intent row for it.
+
+        THE single writer of that row. :meth:`_journal_around` calls it and
+        reuses the returned id for its ``backend_op`` rows; a REFUSED done
+        write calls it directly with ``success=False`` so the refusal leaves
+        exactly the same row shape rather than inventing a second row kind.
+
+        No-ops (but still returns a fresh id) when :meth:`set_write_journal`
+        was never called, and swallows-and-debug-logs a journal failure — the
+        audit trail must never be able to fail a write.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        ji = self._write_journal
+        if ji is not None:
+            try:
+                await ji.log_write_op(
+                    write_op_id=write_op_id,
+                    operation=operation,
+                    project_id=resolve_project_id(project_root) if project_root else None,
+                    agent_id=agent_id,
+                    params=params,
+                    success=success,
+                    error=error,
+                )
+            except Exception:
+                logger.debug('write_journal: log_write_op failed', exc_info=True)
+        return write_op_id
+
     async def _journal_around(
         self,
         operation: str,
         project_root: str | None,
         params: dict[str, Any],
         body,
+        *,
+        agent_id: str | None = 'task-interceptor',
     ) -> Any:
         """Wrap *body* (an awaitable) with write_op + backend_op journaling.
 
@@ -809,23 +849,19 @@ class TaskInterceptor:
         or failure with ``backend=`` resolved from the configured task
         backend.
 
+        ``agent_id`` defaults to the historical ``'task-interceptor'``
+        literal, so every call site that omits it is byte-identical. The done
+        write passes the RESOLVED CALLER instead (task 5241) — including an
+        explicit ``None``, which needs no sentinel because "the caller
+        supplied no identity" is itself the fact worth recording.
+
         No-ops when :meth:`set_write_journal` was never called.
         """
         ji = self._write_journal
-        write_op_id = str(uuid_mod.uuid4())
         backend_label = _resolve_backend_label(self.taskmaster)
-        project_id = resolve_project_id(project_root) if project_root else None
-        if ji is not None:
-            try:
-                await ji.log_write_op(
-                    write_op_id=write_op_id,
-                    operation=operation,
-                    project_id=project_id,
-                    agent_id='task-interceptor',
-                    params=params,
-                )
-            except Exception:
-                logger.debug('write_journal: log_write_op failed', exc_info=True)
+        write_op_id = await self._log_write_op_row(
+            operation, project_root, params, agent_id=agent_id,
+        )
         try:
             result = await body
         except BaseException as exc:
@@ -1261,9 +1297,27 @@ class TaskInterceptor:
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
 
+            # Task 5241: ONE params dict and ONE journal identity for every
+            # write_op row this method writes — the accepted write, the
+            # refused-provenance row, and the same-status repair row — so
+            # those three can never disagree about what was asked or who
+            # asked. Both extras are scoped to a DONE write: a non-done row's
+            # params and agent_id stay byte-identical to their pre-5241
+            # shape, so no existing consumer of the 'task-interceptor'
+            # literal changes meaning.
+            _journal_params: dict[str, Any] = {
+                'task_id': task_id,
+                'status': status,
+                'tag': tag,
+            }
+            _journal_agent_id = 'task-interceptor'
+            if status == 'done':
+                _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
+                _journal_agent_id = agent_id
+
             if status == old_status:
                 if status == 'done' and done_provenance:
-                    return await _repair_done_provenance_same_status(
+                    repair = await _repair_done_provenance_same_status(
                         tm,
                         task_id,
                         done_provenance,
@@ -1273,6 +1327,23 @@ class TaskInterceptor:
                         agent_id=agent_id,
                         config=self._config,
                     )
+                    # This seam had NO journal row at all before 5241: a
+                    # repair of an already-`done` task was invisible to the
+                    # audit trail, which is exactly where a hand-passed blob
+                    # would go to get re-stamped. Classified with the shared
+                    # `interceptor_write_succeeded` rather than a hand-rolled
+                    # `'error' in result` check, so the journal agrees with
+                    # every other internal consumer about what counts as a
+                    # successful write.
+                    await self._log_write_op_row(
+                        'set_task_status',
+                        project_root,
+                        _journal_params,
+                        agent_id=_journal_agent_id,
+                        success=interceptor_write_succeeded(repair),
+                        error=_journal_error_text(repair),
+                    )
+                    return repair
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
             # 2a-pre. Bulk-reset circuit-breaker (task 918, refined task 1016):
@@ -1377,6 +1448,24 @@ class TaskInterceptor:
                     config=self._config,
                 )
                 if validation_err is not None:
+                    # Task 5241: the done-provenance VERDICT is journaled with
+                    # the caller — this refusal, and the acceptance below.
+                    # SCOPE, deliberately: the other done-write refusals
+                    # (terminal-exit, phantom-done, bulk-reset, backlog policy,
+                    # pre-done hook) keep their own existing surfaces. PRD C5's
+                    # promise is about the PROVENANCE write, which is the one
+                    # seam where the caller identity was the missing fact
+                    # (incident 5156 recorded 'task-interceptor' and so lost
+                    # the caller); widening to six unrelated early returns
+                    # would add surface and no new fact.
+                    await self._log_write_op_row(
+                        'set_task_status',
+                        project_root,
+                        _journal_params,
+                        agent_id=_journal_agent_id,
+                        success=False,
+                        error=_journal_error_text(validation_err),
+                    )
                     return validation_err
 
                 # 2b-bis. Reopen-freshness gate (task 2674, PRD task alpha):
@@ -1536,8 +1625,9 @@ class TaskInterceptor:
                 return await self._journal_around(
                     'set_task_status',
                     project_root,
-                    {'task_id': task_id, 'status': status, 'tag': tag},
+                    _journal_params,
                     write_body,
+                    agent_id=_journal_agent_id,
                 )
 
             # Task 2624: code-enforced before/after live-task-write
@@ -5811,6 +5901,25 @@ class _AncestorCheckFailure(NamedTuple):
     detail: str
 
 
+def _provenance_kind(raw: object) -> str | None:
+    """The ``kind`` a raw ``done_provenance`` payload CLAIMS, for the journal.
+
+    Pure and total: a non-dict payload, a missing key, a non-``str`` value or
+    a blank one all read as ``None``. It reports the CLAIM, not a validated
+    kind — a refused write's row must still say what the caller asserted, and
+    an unreadable claim must not be able to skip the audit row by raising.
+
+    Shared by every journal site so an accepted and a refused row report the
+    kind identically (SPOT).
+    """
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get('kind')
+    if not isinstance(kind, str):
+        return None
+    return kind.strip() or None
+
+
 def _provenance_stamp_now() -> str:
     """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
 
@@ -6805,6 +6914,28 @@ def interceptor_write_succeeded(resp: object) -> bool:
         and bool(resp.get('success', True))
         and not resp.get('error')
     )
+
+
+def _journal_error_text(resp: object) -> str | None:
+    """The refusal text a ``write_ops`` row should carry for *resp*.
+
+    ``None`` when :func:`interceptor_write_succeeded` classifies *resp* as a
+    success — a successful row carries no error, matching
+    ``_journal_around``'s own success path.
+
+    Otherwise the structured ``error`` token PLUS the human-readable
+    ``reason``/``hint`` when one is present: the token alone says only
+    ``done_provenance_invalid``, which cannot tell an operator WHICH of that
+    error's many branches fired. Bounded at 500 chars, the same ceiling
+    ``log_backend_op``'s error column already uses.
+    """
+    if interceptor_write_succeeded(resp):
+        return None
+    if not isinstance(resp, dict):
+        return str(resp)[:500]
+    detail = resp.get('reason') or resp.get('hint')
+    error = resp.get('error')
+    return (f'{error}: {detail}' if detail else str(error))[:500]
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:
