@@ -1039,6 +1039,12 @@ entries:
     origin_phase: architect
     manifested_phase: review
     note: 'Task 5354 asserted causal diagnosis (dedupe_fingerprint field missing from MCP surface) based on 99%-empty measurement, but diagnosis was unverified. Architect review provided evidence showing diagnosis false: round-trip code is lossless (models.py field write/read sets identical by construction), field IS stamped by 12 emitters, issue is elsewhere (category gate + 600s window + pending-only parent scan). The prescribed ''minimal fix'' would be inert on intended path and hazardous on others.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a163237c-14e1-4b17-a03c-89e9788d3ddb
+    origin_phase: merge
+    manifested_phase: recon
+    note: 'Self-correction at turn 1385: the watcher had concluded train coalesce-4984-6bc78f36 was dead and drafted a rescue question, but it ''wasn''t dead after all'' — it had simply started 3h15m after formation once the merge queue drained. The dead-train conclusion was asserted from absence-of-recent-events rather than verifying current queue/slot state.'
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -1158,6 +1164,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Turn 798: `.venv/bin/python` not found (exit 127) in project_root. Turn 944: same binary succeeds, suggesting venv state was mutated between turns by machine processes (merge worker, orchestrator) operating on the shared main checkout.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: a163237c-14e1-4b17-a03c-89e9788d3ddb
+    origin_phase: merge
+    manifested_phase: recon
+    note: Spawned-workflow briefing (turn 175) on task 3669 traces the stranding to the 09-04 17:35 orchestrator restart, which 'dropped' the train event for coalesce-4413-8a61c7b4 mid-merge, leaving three tasks sitting in merge-deferred for weeks with no live escalation to retry them — restart-time destruction of in-flight merge-lane state on the machine-operated checkout.
 - id: investigator-context-and-budget
   title: 'Block-time investigators and retried planners launch cold and die silent: no feed-forward of prior analysis, no partial-output protocol, wrong default diff'
   severity: high
@@ -3155,6 +3167,12 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Agent attempted to read .task/iterations.jsonl which did not exist in worktree 3052. Turn 24 shows Bash attempting to cat this file; turn 38 confirms ls -la .task/ output contains plan.json but missing iterations.jsonl. No other diagnostic signal provided.
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 5650b341-547d-46f0-8956-f1c9993b376f
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated task 5283 tried to tail .worktrees/.task-meta/5283/iterations.jsonl twice (turns 39, 113) and got 'No such file or directory' both times — same boilerplate-assumes-iterations-log-exists failure as the matched candidate, just under .task-meta/<id>/ rather than .task/.
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -4542,6 +4560,24 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest for this recon-class session (score 0.0, all signal_counts 0, n_user_turns 0, size_bytes 372) contains no actual conversation content — only injected system-reminder boilerplate (Environment block, model-id block, deferred-tools list, agent-types list, MCP server instructions, skills list). The trickle-coder is handed this as 'session content' with nothing substantive to analyze, matching the known pattern of digest extraction collapsing to boilerplate.
+  - date: '2026-09-15'
+    project: dark_factory
+    session: 5c65ac18-f212-4051-83be-2e0281ff99a3
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Session 5c65ac18 (agent_class=watcher, n_user_turns=0, score=0.0, all signal_counts=0, size_bytes=374) has no actual conversational content in the captured digest — only system-reminder boilerplate (environment block, model-id block, deferred-tools list, agent-types list, MCP server instructions, skills list, total_tokens/date reminders). This is the same digest-extraction failure mode already logged: the pipeline collapsed a session down to its injected boilerplate reminders with zero extracted substance or signal, matching the existing candidate''s description exactly.'
+  - date: '2026-09-16'
+    project: dark_factory
+    session: 76a1b6df-952e-4300-b27f-b8a2b172c45d
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Session digest for a recon-class session (2026-09-16, 372 bytes, score 0.0, n_user_turns=0, all signal_counts 0) contains no actual task content — only the standard system-reminder preamble (environment block, model ID, deferred-tools list, agent-type list, MCP server instructions, skills list, today's-date reminder). No user turn, no assistant action, no tool calls are represented. Matches the known pattern of digest extraction collapsing a scored session down to system-reminder boilerplate with nothing substantive behind it.
+  - date: '2026-09-17'
+    project: dark_factory
+    session: 8c12e12b-5a75-46bc-a310-3368d8e51217
+    origin_phase: recon
+    manifested_phase: recon
+    note: 2026-09-17 recon-class session digest (372 bytes, n_user_turns=0, all signal_counts=0, score=0.0) contains nothing but the standard start-of-session system-reminder boilerplate — environment block, model-id block, deferred-tools list, agent-types list, MCP server instructions, skills list — with no actual task content or tool activity captured, matching the known pattern of the digest pipeline collapsing a session to boilerplate and discarding any real substance.
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -8298,6 +8334,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Three 'not_found' signals rendered as bare 'does not exist' templates (turns 71, 137, 142) without identifying what object/path was not found — evidence dropped from digest.
+  - date: '2026-09-17'
+    project: dark_factory
+    session: cd57b33e-1f65-44eb-a53f-4ab54c094206
+    origin_phase: ops
+    manifested_phase: ops
+    note: Watcher session's Guard Trips section shows only '(turn 4) blocked:' with no matched substring or guard name — the digest generator rendered a bare template and dropped whatever content actually triggered the df_guard signal, leaving no diagnostic value.
+  - date: '2026-09-18'
+    project: dark_factory
+    session: 162ab3ae-741f-4ac7-8864-530b663c8572
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's sole signal is a bare 'not_found' template — '(turn 101) does not exist' with no subject captured (what doesn't exist), matching the known bug where the digest generator renders guard/not-found signals as templates and drops the matched substring.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -14780,6 +14828,18 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Orchestrated task in worktree fires file/directory errors (exit codes 1, 2) with limited diagnostic signal during post-merge verification phase
+  - date: '2026-09-17'
+    project: dark_factory
+    session: 9907b4cd-7ad8-4d68-b006-870f9f108917
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated-task session in worktree 3778 fires four ''not found''/''does not exist''/''command not found'' signals (turns 49, 67, 79, 137) with every other signal_count at zero (no tool_error, self_correct, df_guard, interrupt, designed_outcome) — same signature as the prior entry: repeated not-found hits with no other diagnostic context to explain them.'
+  - date: '2026-09-18'
+    project: dark_factory
+    session: 5d7a2fc3-8cd4-4a7b-8f20-6c346dfb1e80
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated worktree task 5566, while auditing warm-lane-degenerate-ref-check.sh and its shellcheck source= directives, hit a bare 'no such file or directory' at turn 124 with no other diagnostic context attached — matches the recorded pattern of unexplained missing-file errors in orchestrated worktree sessions.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -28533,3 +28593,29 @@ candidates:
     origin_phase: review
     manifested_phase: recon
     evidence_quote: '''## User Corrections'' section contains ''Steward re-escalated to human'' with ''Steward lifetime budget exhausted'' and review feedback (''## [reviewer_comprehensive] correctness... Location: scripts/load-threshold-calibration.py:803... Issue: coverage_table docstring...'') — system responses mislabeled as user corrections'
+- id: cand-20260917-20
+  title: Implementer test pins cosmetic UI copy string instead of the behavioral property it's meant to guard
+  cause: An implementer-written test asserts that a UI hint string contains a specific English substring (e.g. 'all projects') as a proxy for 'this tile counts the unfiltered store-wide window', rather than asserting the executable property (which array/identifiers the value expression reads). Any synonymous rewording of the copy turns the suite red with no behavior change, while an actual regression that silently switches the tile to the filtered window while keeping the same wording leaves the suite green — the assertion never inspects which data source is used.
+  area: test-quality / dashboard tests
+  first_seen: '2026-09-17'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-17'
+    project: dark_factory
+    session: e0850f7d-8c41-4a77-a260-bc94128e872f
+    origin_phase: implement
+    manifested_phase: review
+    evidence_quote: test_each_run_derived_tile_declares_the_window_it_counts pins cosmetic UI COPY, not behaviour ... Rewording the hint to any synonym with identical meaning and identical behaviour ... turns the suite red, while a genuine regression (a tile silently switching to the FILTERED runs window while keeping the phrase) leaves it green, because the assertion never looks at which array the tile counts.
+- id: cand-20260917-21
+  title: Multi-line Bash command with backslash line-continuations flattens into one line and breaks the && chain
+  cause: A Bash tool call composed across multiple lines using trailing '\\' continuations gets executed via eval after its newlines are collapsed, but the literal backslash characters remain in place rather than being consumed as line joiners; the backslash-plus-space sequence is then read as an escaped space instead of a continuation, so the chained && commands become a malformed single line and the shell reports a syntax error even though the original multi-line script was valid.
+  area: tooling / Bash tool execution
+  first_seen: '2026-09-17'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-17'
+    project: dark_factory
+    session: e0850f7d-8c41-4a77-a260-bc94128e872f
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: '/bin/bash: eval: line 1: syntax error near unexpected token `cd''\n/bin/bash: eval: line 1: `cd /home/leo/src/dark-factory/.worktrees/5320 && \\ sed -i ... && \\ grep -n ... && \\ echo ... && \\ (cd dashboard && timeout 600 uv run pytest ...) ; \\ git checkout -- ... && \\ echo ... && grep -n ... && skim git status --porcelain'''
