@@ -125,17 +125,11 @@ def _discovered_modules():
 def _module_key(path):
     """*path* as the guard names it: relative to the tests root, POSIX-spelled.
 
-    Takes a ``pathlib.Path`` under ``TESTS_ROOT`` — the shape
-    ``_discovered_modules()`` yields — and refuses anything else rather than
-    coercing it, because a bare relative path's root is ambiguous and the
-    candidates disagree: the sighting's ``'tests/_scratch_guard_probe.py'``
-    names the right file against the ``fused-memory/`` cwd, names nothing
-    against the repo root, and under a ``TESTS_ROOT / path`` rule would resolve
-    to ``…/tests/tests/_scratch_guard_probe.py``. Any coercion rule picks one
-    of those and is wrong for the other two, trading a loud refusal for a
-    silently wrong key — and this key is what ``EXEMPT_CALL_SITES`` lookups and
-    parametrize ids are keyed on.
+    Precondition: *path* is under ``TESTS_ROOT`` — the shape
+    ``_discovered_modules()`` yields. Anything outside it is refused rather
+    than coerced to fit, for the reason the refusal itself gives.
     """
+    path = pathlib.Path(path)
     if not path.is_relative_to(TESTS_ROOT):
         raise ValueError(
             f'{str(path)!r} is not under the tests root {TESTS_ROOT}. _module_key names '
@@ -271,17 +265,24 @@ def test_every_exemption_names_one_live_loader_site(module_key, qualname):
 class TestModuleKeyNamesPathsUnderTheTestsRoot:
     """``_module_key`` takes a path under ``TESTS_ROOT``, and says so when it does not.
 
-    The guard names a module by its path relative to the tests root, so a path
-    from anywhere else has no key — and the stdlib's own refusal names no
-    remedy. Sighting: ``plans/confusion-census-2026-09-20.md`` §1.4 — an ad-hoc
-    probe of this guard passed ``pathlib.Path('tests/_scratch_guard_probe.py')``
-    and got ``'tests/_scratch_guard_probe.py' is not in the subpath of
-    '<root>'``, which states the offence and leaves the caller to rediscover the
-    spelling that works.
+    Sighting: ``plans/confusion-census-2026-09-20.md`` §1.4 — an ad-hoc probe
+    of this guard passed ``pathlib.Path('tests/_scratch_guard_probe.py')`` and
+    got the stdlib's ``is not in the subpath of`` refusal, which states the
+    offence and leaves the caller to rediscover the spelling that works.
     """
 
-    def test_a_path_outside_the_tests_root_names_the_spelling_that_works(self):
-        probe = pathlib.Path('tests/_scratch_guard_probe.py')
+    @pytest.mark.parametrize(
+        'probe',
+        ['tests/_scratch_guard_probe.py', pathlib.Path('tests/_scratch_guard_probe.py')],
+        ids=['str', 'Path'],
+    )
+    def test_a_path_outside_the_tests_root_names_the_spelling_that_works(self, probe):
+        """Both spellings an ad-hoc caller types reach the same informative refusal.
+
+        A bare ``str`` used to reach ``AttributeError: 'str' object has no
+        attribute 'is_relative_to'`` — the same remedy-less stdlib refusal,
+        through the other door.
+        """
         with pytest.raises(ValueError) as excinfo:
             _module_key(probe)
         message = str(excinfo.value)
@@ -294,8 +295,7 @@ class TestModuleKeyNamesPathsUnderTheTestsRoot:
         )
         assert 'TESTS_ROOT' in message, (
             'the refusal must name the module constant an ad-hoc caller types to build '
-            "a path that works (TESTS_ROOT / 'sub/test_x.py'). The stdlib message this "
-            'replaces names the offence and no remedy, which is the whole defect.'
+            "a path that works (TESTS_ROOT / 'sub/test_x.py')"
         )
 
     def test_a_path_under_the_tests_root_keys_on_its_posix_relative_spelling(self):
@@ -303,21 +303,21 @@ class TestModuleKeyNamesPathsUnderTheTestsRoot:
 
         The regression pin on the precondition check: the guard's own callers pass
         exactly this shape, and ``EXEMPT_CALL_SITES`` keys on the POSIX spelling.
+        The path is synthetic rather than a real sibling module: ``_module_key``
+        does pure path arithmetic, so naming one would couple this case to that
+        module's name, and ``sub/test_x.py`` is the spelling the refusal
+        advertises — the remedy and its pin stay in lockstep.
         """
-        path = TESTS_ROOT / 'reconciliation' / 'test_stage1_stall_detector.py'
-        assert _module_key(path) == 'reconciliation/test_stage1_stall_detector.py'
+        assert _module_key(TESTS_ROOT / 'sub' / 'test_x.py') == 'sub/test_x.py'
 
     def test_a_cwd_relative_path_is_refused_rather_than_read_against_the_cwd(
         self, tmp_path, monkeypatch
     ):
         """Naming the module comes before reading it, so a false clean is impossible.
 
-        ``path.read_text()`` resolves a relative path against the cwd, so without
-        that ordering a relative path to a file the text prefilter MISSES returns
-        a clean ``[]`` — the guard reporting "this module forks no loader" about a
-        file it never located under its own root. The probe below is deliberately
-        innocuous for exactly that reason: it must miss the prefilter, so the case
-        is about the ordering rather than about the refusal's wording.
+        The probe is deliberately innocuous so that it MISSES the text
+        prefilter: that is what makes the case about the ordering rather than
+        about the refusal's wording.
         """
         (tmp_path / 'probe.py').write_text('value = 1\n')
         monkeypatch.chdir(tmp_path)
