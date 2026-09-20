@@ -15545,7 +15545,7 @@ entries:
     note: 'CORRECTION (task 5686, amendment pass). Re-measured against skim 2.3.1 / skim-hook v2.1.0 on 2026-09-20 by feeding `skim rewrite --hook` PreToolUse JSON directly, 40 probe commands. This AMENDS the task-5686 correction landed earlier the same day, which stated the discriminator as "the command contains `git status`, `git log`, `cat <path>` or `head -N <path>`" and so OVER-PREDICTED in two directions now measured: the scan is first-line-only (`echo a\ngit status && echo b` -> EMPTY hook output, not rewritten), and cat/head key on file EXTENSION rather than on the path resolving (`cat zz-missing-file.md && echo x` -> rewritten though the file does not exist; `cat /etc/hostname && echo x` -> not rewritten though it does). A reviewer proposed the qualifier "cat/head only when the path resolves", carried from this task''s plan analysis; that reading is itself refuted by the two probes just quoted, so the measured extension rule is recorded instead. This ANNOTATES rather than retracts anything: every existing sighting remains a true observation of a real symptom, and the earlier correction''s mechanism was right -- only its discriminator was too wide. Status stays `open`: the defect is live and unfixed. Landed through the sole writer scripts/legibility/codebook.py::apply_coding_record; the codebook is never hand-edited. The cause also gains a routing pointer to the umbrella entry entry-cand-20260722-6, placed in the first 200 characters so it survives scripts/legibility/coder.py::_one_line_cause''s cap -- the only part of a cause the nightly coder ever sees. Title is left as landed: it already names the mechanism. Lifecycle is unchanged; this changes routing, not status.'
   cause: 'Umbrella entry for this family is entry-cand-20260722-6 -- file recurrences THERE, not here. Same mechanism: a host PreToolUse `skim rewrite` hook flattens a Bash command (every newline to a single space) when its FIRST LINE carries `git status`, `git log`, or `cat`/`head -N` on a source-file path, so a heredoc-quoted `git commit` sharing that line loses the newlines its heredoc needs and dies as `syntax error near unexpected token` at exit 127. A bare heredoc `git commit` is NOT affected -- the founding sighting broke only because the same first line also carried `git status` and `git log`. The chain is ~/.claude/settings.json PreToolUse matcher `Bash` -> ~/.claude/hooks/skim-rewrite.sh (skim-hook v2.1.0) -> `skim rewrite --hook`; re-measured against skim 2.3.1. Nothing is rejected and no static pre-check is involved -- the flattened one-liner is handed to the shell, which is why the symptom is an IndentationError, a `fatal: ambiguous argument`, or `syntax error near unexpected token` at exit 127, never a refusal. TWO QUALIFIERS an earlier framing of this cause omitted, both measured: (1) the target scan reads the FIRST LINE ONLY -- `echo a && git status\necho b` is flattened, but `echo a\ngit status && echo b` and `# comment\ngit status` are passed through byte-identical, so a multi-line script whose first line is plain is unaffected however many targets follow; (2) `git status`/`git log` match unconditionally, but `cat`/`head` match on the path''s EXTENSION and not on whether it exists -- a MISSING foo.md, foo.py, foo.rs, foo.ts, foo.json, foo.yaml or foo.toml is rewritten, while an EXISTING /etc/hostname and any .txt/.log/.sh/.csv/.xml/.html or extensionless path is not. Two further corollaries: the match is on the command WORD, not the text, so a quoted `echo "git status"` does NOT trigger it; and a TOP-LEVEL heredoc redirect (`python3 - <<''PY'' ... PY`) makes the hook decline the whole command even when a target IS present -- that is the safe way to pass a multi-line script. The cause is a third-party binary under the operator''s ~/.claude and is not fixable in this repository; the agent-facing rule is owned by task 5683.'
 - id: entry-cand-20260919-2
-  title: Python heredoc edit script hits a stray unicode em-dash outside its triple-quoted string, raising a SyntaxError
+  title: Python heredoc edit script pastes a docstring INCLUDING its own closing triple-quote, ending the script's own literal early and leaving the tail as bare code (SyntaxError)
   severity: medium
   status: open
   origin_phase: implement
@@ -15557,6 +15557,49 @@ entries:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: 'SyntaxError: invalid character ''—'' (U+2014)'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: task-5687-embedded-triple-quote-reproduction
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Replaces this entry''s title and supplies its first `cause`.
+
+
+      The previous title read "Python heredoc edit script hits a stray unicode em-dash outside its triple-quoted string, raising a SyntaxError". That framing is withdrawn as refuted by measurement rather than by opinion: control A strips every U+2014 from the failing script and it still fails, with a different error. With no `cause` on the entry, that title was the ENTIRE matching key `scripts/legibility/coder.py::build_codebook_index` rendered to the nightly coder, so a recurrence whose error string differed had nothing to match on and would arrive as a fresh candidate.
+
+
+      The 2026-09-19 `fbd7b22b-949a-4047-8087-6a719edb1dc2` sighting is ANNOTATED, not retracted. The symptom it recorded was real and its `evidence_quote` stays exactly as filed; only the explanation it was filed under was wrong.
+
+
+      `status` stays `open`. The defect is live and unfixed; this correction replaces an explanation, it does not retire an entry.
+
+
+      Reproduction: archived transcript records 616 (the Bash `tool_use`), 617 (the `is_error` result), and 621/622 (the +27s self-correction and its `ok`), 0-indexed into the 687-record session archive under task 5580. Four controls were run on CPython 3.13.9 at HEAD c800c2e1e7, each feeding the script to `python3 -` against a throwaway copy of the target file so no tracked file was written: REPRO verbatim (rc=1, stderr byte-identical to record 617); A, every U+2014 to ASCII `-` (rc=1, `unterminated string literal (detected at line 22)`); C, the embedded delimiter escaped (rc=0, `ok`); D, the embedded delimiter deleted (rc=0, `ok`). The control target was located by content and its index asserted to be 14 before perturbation.'
+  cause: 'A `python3` heredoc edit script pasted a docstring into its `old = """..."""` literal together with the docstring''s OWN closing `"""`, ending that literal early and leaving the script tail as bare top-level code.
+
+
+    REPRODUCED, not inferred (CPython 3.13.9, base c800c2e1e7, archived records 616/617 of session fbd7b22b-949a-4047-8087-6a719edb1dc2). Feeding the archived script back to `python3 -` verbatim reproduces the founding traceback byte for byte.
+
+
+    THE REPORTED SYMPTOM IS NOT THE CAUSE, AND IS NOT STABLE. Control A replaced all ten U+2014 characters in the script with ASCII hyphens and changed nothing else: it still fails, and it fails with a DIFFERENT message, `SyntaxError: unterminated string literal (detected at line 22)`. An ASCII-only recurrence of this exact defect therefore reports a different error string, and a title keyed to the original message would not match it. That is why this entry is no longer titled after the character the interpreter happened to name first.
+
+
+    THE EMBEDDED DELIMITER IS THE CAUSE. Two controls remove it by different routes, each leaving every U+2014 in place, and each returns rc=0 and prints `ok`: control C escapes the offending line to `\"\"\"`, control D deletes it outright.
+
+
+    THE DISCRIMINATOR. The same three characters appear twice in one 50-line Bash command (48 lines reach `python3` once the heredoc wrapper is stripped): RAW as `    """` at line 14, inside the `old` literal, and correctly ESCAPED as `    \"\"\"` at line 25, inside `new`. Eleven lines apart, same script, same author. The raw one is a verbatim copy of the closing delimiter of the docstring being replaced (the pasted excerpt runs to `orchestrator/src/orchestrator/verify.py`''s own `    """`). So the defect is a paste that took one line too many, NOT an author who did not know the escaping rule: the correct spelling is already present in the same script.
+
+
+    NOT THE SKIM-REWRITE UMBRELLA (`entry-cand-20260722-6`). That entry''s mechanism flattens a Bash command by collapsing every newline to a single space, so a SyntaxError under it could only ever be reported at line 1; this founding traceback reports `File "<stdin>", line 16`, and the archived command still carries its 50 real newlines. Separately, that umbrella''s own published discriminator requires the command''s FIRST LINE to carry `git status`, `git log`, or `cat`/`head -N` on a source path; this command''s first line is `python3 - <<''PYEOF''` and carries none of them. The entry fails the umbrella''s test on both limbs, so recurrences of THIS mechanism belong here and not there.
+
+
+    NOT THE HARNESS, THE HEREDOC OR THE DELIVERY PATH. The cause is agent-authored script text. The same bytes reach `python3` intact either way, which is exactly what the surviving newlines above establish.
+
+
+    COST. The agent self-corrected 27 seconds later (records 621/622), re-issuing the same edit with `''''''` delimiters over a narrowed excerpt that no longer reached the docstring''s closer, and it printed `ok`. The transcript changed both things at once, so it does not by itself isolate which one mattered; controls C and D do, and show that removing the embedded delimiter alone suffices. The cost here is turns, not outcomes.
+
+
+    SCOPE. No agent-facing prompt rule is filed from this entry: that surface is held by sibling task 5683.'
 - id: entry-cand-20260919-3
   title: add_memory fails twice with an opaque connectivity error inside a task worktree, threatening loss of a verified finding
   severity: medium
