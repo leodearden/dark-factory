@@ -11650,7 +11650,14 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
         statuses[tid] = kwargs.get('status', 'pending')
         return {'id': tid, 'title': kwargs.get('title') or 'untitled'}
 
-    async def fake_set_status(task_id, status, project_root, tag=None):
+    async def fake_set_status(
+        task_id, status, project_root, tag=None, *, pending_since_now=None,
+    ):
+        # `pending_since_now` is the one batch clock the CSV branch computes
+        # once and threads to every id (task 3816); this fake mirrors the real
+        # backend signature rather than swallowing it with **kwargs, so a
+        # future mis-spelled pass-through still fails here. Its VALUE is
+        # asserted against a real backend in test_pending_since_anchor.py.
         statuses[task_id] = status
         return {'success': True, 'task_id': task_id, 'status': status}
 

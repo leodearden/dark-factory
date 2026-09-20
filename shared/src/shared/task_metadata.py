@@ -1291,6 +1291,29 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # once, in `escalation/src/escalation/merge_lane_resolution.py`, on
         # the same one-place rule as the census figures above.
         'merge_lane',
+        # The scheduler's durable pending-wait anchor (task 3816, PRD
+        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1).
+        #
+        # `pending_since` is an ISO-8601 UTC wall-clock stamp in the same
+        # format `updated_at` uses, written by the fused-memory status
+        # chokepoint on every `* -> pending` landing -- writer
+        # `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::
+        # stamp_pending_since`, the one shared implementation called from
+        # `add_task`, `set_task_status` and `set_status_and_stamp_audit`. It
+        # is READ back by the orchestrator scheduler's age term (task beta)
+        # and the watchdog idle clock (task delta), so it is load-bearing on
+        # both sides -- the same machine-written-stamp profile as
+        # `last_blocked_at` and `files_tagged_at` above, and blessed on the
+        # same "Promoting a convention" grounds.
+        #
+        # `pending_since_backfilled` is the marker written ONLY by the
+        # one-shot v4 -> v5 migration, which anchors the legacy pending
+        # population from `updated_at`. That deliberately UNDER-ages those
+        # rows (PRD design decision 4: never over-ages, so it cannot
+        # manufacture a queue jump); the marker exists so the distortion
+        # stays countable instead of invisible.
+        'pending_since',
+        'pending_since_backfilled',
     }
 )
 

@@ -9398,6 +9398,16 @@ def create_mcp_server(
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
 
+        A ``pending`` commit stamps ONE shared ``metadata.pending_since``
+        across the whole batch (task 3816, PRD
+        ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §C1): the
+        flip is one atomic release, so every member reads as having started
+        waiting at the same instant, and intra-batch dispatch order therefore
+        falls through to CPM and then numeric id rather than to millisecond
+        commit sequence. The property is implemented in the interceptor's CSV
+        branch, so it holds for every comma-separated ``set_task_status``
+        caller, not just this tool.
+
         A ``pending`` commit also indexes the batch into the curator corpus
         (best-effort) so ``search_tasks``/dup-detection can see these
         planning_mode tasks immediately, instead of waiting on the one-shot

@@ -1077,7 +1077,7 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane
+execution_class, merge_lane, pending_since, pending_since_backfilled
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1177,6 +1177,31 @@ declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in
 `shared/src/shared/task_metadata.py`, per the one-place rule.
+
+`pending_since` and `pending_since_backfilled` are the list's only
+**machine-authored** entries: blessed so the schema recognises them on
+**read**, but **silently stripped from any caller-supplied metadata on
+write**. Do not set either one when filing or updating a task — a value you
+supply is dropped, not honoured, and the strip is logged under
+`task_metadata.machine_authored_key_stripped`.
+
+`pending_since` is the durable wall-clock anchor for how long a task has been
+waiting to be dispatched. It is written only by the fused-memory status
+chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
+`add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
+`* -> pending` landing, and read by the scheduler's age term and the watchdog
+idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+v5 migration, marking the rows it anchored from `updated_at` so that
+population stays countable.
+
+The strip is a write-**authority** rule, not a schema rule: the anchor is the
+scheduler's input, so a caller able to write it could price its own dispatch
+and jump the queue permanently. It is enforced at every caller -> store
+boundary from one implementation,
+`sqlite_task_backend.py::strip_machine_authored_metadata`. Note that
+`update_task(metadata_mode='replace')` still drops a stored anchor along with
+the rest of the blob — fail-safe, since the row then reads as anchorless
+(age 0) rather than pre-aged.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are
