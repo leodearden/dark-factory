@@ -1859,15 +1859,26 @@ scripts/legibility/install-trickle-health-timer.sh <project_id>
 **Reading the verdict.** Each door has its own remedy, and conflating them
 is how an operator ends up tuning the sampler for a crashed coder:
 
-- **`failed` streak** — the run did not complete. Signal may well have flowed
-  IN (the verdict reports `selected_count`); the pipeline broke downstream.
-  Read `journalctl --user -u legibility-trickle@<project>`. Raising
-  `budgets.max_daily_digest_bytes` or `sampling.top_fraction` will **not**
-  help.
+- **`failed` streak** — the run did not complete. Read `journalctl --user -u
+  legibility-trickle@<project>`. Raising `budgets.max_daily_digest_bytes` or
+  `sampling.top_fraction` will **not** help. The verdict reports
+  `selected_count` and says only what that counter supports: above zero,
+  signal DID reach the digest stage and the pipeline broke downstream of it;
+  at zero the night is simply unfinished and where signal stopped is
+  **unknown** (the nightly records its crash sentinel before the digest
+  stage, so a `failed` night with nothing selected is ordinary).
 - **`barren` streak** — the run completed and the sampler's doors dropped
   everything. Compare `budgets.max_daily_digest_bytes` against
   `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
   the records went out of.
+- **barren streak *carried forward*** — the streak is at threshold but the
+  last recorded run was `failed`, not `barren` (the recorder carries the
+  barren streak across a crash rather than advancing or resetting it). Both
+  findings are real and the crash is the one you can act on: clear it from
+  the journal first, then re-read the probe once a run has completed and
+  re-observed the doors. The verdict deliberately names **no** door — the
+  counters in that record belong to the crashed night, which legitimately
+  has none.
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.

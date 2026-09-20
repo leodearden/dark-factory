@@ -83,6 +83,13 @@ _SEED_OUTCOMES = {
     "barren-cut": (0, dict(below_sampling_cut=3)),
     # Signal in, run broke downstream -- the 2026-08-18 reify shape.
     "failed": (1, dict(selected_count=1)),
+    # Failed with NOTHING selected -- `run_nightly` pre-seeds
+    # `NightlyResult(exit_code=1, ...)` BEFORE the digest stage and records
+    # that sentinel when any later stage raises, so a night whose sampler
+    # selected nothing (a quiet night, a codebook/merge crash, an extractor
+    # crash) records `failed` with selected_count=0. Distinct seed entry
+    # because the verdict's claim about WHERE the pipeline broke differs.
+    "failed-early": (1, dict()),
 }
 
 
@@ -575,4 +582,132 @@ def test_non_integer_max_failed_prints_usage(tmp_path, monkeypatch):
 
     assert result.returncode != 0
     assert "usage" in result.stderr.lower()
+    _assert_no_git(git_marker)
+
+
+def test_a_failed_streak_that_selected_nothing_makes_no_downstream_claim(
+    tmp_path, monkeypatch
+):
+    """The failed verdict must not assert "signal DID reach the digest
+    stage" next to ``selected_count=0``.
+
+    MEASURED in this worktree before this test was written, seeding two
+    ``failed`` nights with empty counters::
+
+        ... has not COMPLETED for 2 consecutive runs (threshold 2); last
+        recorded exit_code=1. Signal DID reach the digest stage
+        (selected_count=0) and the pipeline broke DOWNSTREAM of it ...
+
+    A sentence that contradicts itself inside its own parenthesis, in the
+    one verdict whose whole job is to steer the remedy. ``run_nightly``
+    pre-seeds ``NightlyResult(exit_code=1, ...)`` before the digest stage
+    and records that sentinel when any later stage raises, so an empty
+    selection under a ``failed`` outcome is an ordinary production shape,
+    not a contrived one.
+    """
+    _seed(tmp_path, monkeypatch, outcomes=["failed-early", "failed-early"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    stderr = result.stderr
+    assert "Signal DID reach" not in stderr, (
+        "nothing was selected, so the probe cannot claim signal reached "
+        "the digest stage"
+    )
+    assert "selected_count=0" in stderr, "the counter is still reported"
+    assert "UNKNOWN" in stderr, (
+        "an unfinished night's counters do not say where signal stopped"
+    )
+    assert "journalctl" in stderr, "the remedy is still the journal"
+    assert "max_daily_digest_bytes" not in stderr
+    assert "top_fraction" not in stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_failed_streak_that_did_select_keeps_the_downstream_claim(
+    tmp_path, monkeypatch
+):
+    """The other half of the same conditional: when the counter IS
+    positive the claim is true and must survive verbatim, because it is
+    what steers the operator away from the sampler."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "Signal DID reach the digest stage (selected_count=1)" in result.stderr
+    assert "DOWNSTREAM" in result.stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_carried_forward_barren_streak_is_its_own_verdict(
+    tmp_path, monkeypatch
+):
+    """A barren streak CARRIED FORWARD under a ``failed`` last run must
+    not be reported in barren-door prose.
+
+    MEASURED in this worktree before this test was written, seeding
+    ``barren, barren, barren, failed`` (streak 3 carried forward,
+    failed streak 1, so the failed branch does not fire at the default
+    threshold of 2)::
+
+        ERROR: ... has been failed for 3 consecutive runs (threshold 3):
+        real signal reached the sampling/budget stage and nothing was
+        digested. Doors: below_sampling_cut=0 budget_skipped=0. Remedy:
+        inspect the recorded counters -- no door counter is set, which
+        should be impossible for a barren run.
+
+    Three lies in one line: the FAILED outcome interpolated into barren
+    prose, zero doors reported for a "barren" run, and a closing sentence
+    telling the operator the state they are in is impossible. The doors
+    come from the FAILED night, which legitimately has none.
+    """
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget"] * 3 + ["failed"],
+    )
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        "three unresolved barren nights do not stop being a finding "
+        "because the fourth night crashed"
+    )
+    stderr = result.stderr
+    assert "should be impossible" not in stderr, (
+        "the probe must never tell an operator their recorded state is "
+        "impossible when the writer produces it by design"
+    )
+    assert "has been failed for" not in stderr, (
+        "the FAILED outcome must never be interpolated into barren prose"
+    )
+    assert "carrying a barren streak" in stderr, (
+        "the carry-forward is the thing that actually happened; name it"
+    )
+    assert "'failed'" in stderr, "name the last recorded outcome"
+    assert "journalctl" in stderr, (
+        "the crashed run is what must be cleared first"
+    )
+    assert "max_daily_digest_bytes" not in stderr, (
+        "no door-specific remedy can be prescribed from a record whose "
+        "counters describe the failed night"
+    )
+    assert "top_fraction" not in stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_barren_streak_under_a_barren_run_keeps_the_door_verdict(
+    tmp_path, monkeypatch
+):
+    """The gate added for the carry-forward case must not silence the
+    ordinary barren streak — the verdict this probe exists for."""
+    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * 3)
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "max_daily_digest_bytes" in result.stderr
+    assert "carrying a barren streak" not in result.stderr, (
+        "the last run WAS barren; this is the door verdict, not the "
+        "carry-forward one"
+    )
     _assert_no_git(git_marker)

@@ -33,10 +33,14 @@ inferred-absent from a missing commit. Decision 7's rationale is
 satisfied, not circumvented.
 
 Every failure verdict is DISTINCT: never-recorded vs unreadable vs
-stale-recorder vs FAILED streak vs barren streak, and each names ITS OWN
-remedy — a barren streak the specific door it left by, a failed streak the
-journal. A probe that cannot say WHICH absence it found is the trap this
-script exists to close.
+stale-recorder vs FAILED streak vs barren streak vs a barren streak
+CARRIED FORWARD under a crashed run, and each names ITS OWN remedy — a
+barren streak the specific door it left by, a failed streak the journal, a
+carried-forward streak the journal first and no door at all. A probe that
+cannot say WHICH absence it found is the trap this script exists to close,
+and a verdict that reads the LAST night's door counters as though they
+described an EARLIER night's streak is that same trap wearing the right
+label.
 
 THE VOCABULARY GAINED ``failed`` IN TASK 4514, and the reason is that a
 run can flow signal IN and still break downstream. Before it, such a night
@@ -171,8 +175,34 @@ def main(argv: list[str]) -> int:
     failed_streak = failed_streak if isinstance(failed_streak, int) else 0
 
     if failed_streak >= max_failed_runs:
-        # The two barren-door config keys are named NOWHERE in this
-        # message, not even to say they do not apply. This verdict's whole
+        # WHERE the pipeline broke is CONDITIONAL on the recorded counter,
+        # never asserted. `nightly.run_nightly` pre-seeds
+        # `NightlyResult(exit_code=1, ...)` BEFORE the digest stage and
+        # records that sentinel whenever a later stage raises, so a night
+        # that selected nothing at all — a quiet night, a codebook/merge
+        # crash, an extractor crash — records `failed` with
+        # selected_count=0. Measured before this branch existed: two such
+        # nights printed "Signal DID reach the digest stage
+        # (selected_count=0)", a sentence contradicting itself inside its
+        # own parenthesis, in the one verdict whose whole job is to steer
+        # the remedy.
+        selected_count = counters.get('selected_count') or 0
+        if selected_count > 0:
+            flow = (
+                f'Signal DID reach the digest stage '
+                f'(selected_count={selected_count}) and the pipeline broke '
+                f'DOWNSTREAM of it, so this is NOT a budget or sampling-cut '
+                f'problem and the barren-streak remedies do not apply.'
+            )
+        else:
+            flow = (
+                'The run selected nothing (selected_count=0) AND did not '
+                'complete, so the recorded counters describe an UNFINISHED '
+                'night and where signal stopped is UNKNOWN — which is also '
+                'why no barren-streak remedy can be read off this record.'
+            )
+        # The two barren-door config keys are named NOWHERE in either
+        # wording, not even to say they do not apply. This verdict's whole
         # job is to steer an operator AWAY from them, and the sibling
         # door-specific tests discriminate which remedy was prescribed by
         # the PRESENCE of the key — so a negated mention here would read as
@@ -182,11 +212,7 @@ def main(argv: list[str]) -> int:
             f'ERROR: legibility trickle for {project_id} has not COMPLETED '
             f'for {failed_streak} consecutive runs (threshold '
             f'{max_failed_runs}); last recorded exit_code='
-            f'{doc.get("exit_code")}. Signal DID reach the digest stage '
-            f'(selected_count={counters.get("selected_count") or 0}) and the '
-            f'pipeline broke DOWNSTREAM of it, so this is NOT a budget or '
-            f'sampling-cut problem and the barren-streak remedies do not '
-            f'apply. Remedy: read '
+            f'{doc.get("exit_code")}. {flow} Remedy: read '
             f'journalctl --user -u legibility-trickle@{project_id} --since '
             f"'{failed_streak + 1} days ago'. "
             f'last_productive_at={doc.get("last_productive_at")}. '
@@ -195,39 +221,86 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    # 5. Barren streak: signal reached the sampling/budget stage and
-    #    NOTHING was digested, for max_barren_runs consecutive runs.
+    # 5. Barren streak at or over threshold. TWO verdicts, chosen by the
+    #    RECORDED OUTCOME rather than by the streak alone, because the
+    #    door counters belong to the LAST recorded night and only describe
+    #    the streak when that night was itself barren.
+    #
+    #    `record_run` CARRIES `consecutive_barren_runs` forward across a
+    #    failed run, so the history (barren, barren, barren, failed)
+    #    arrives here with streak=3 under outcome='failed' and
+    #    consecutive_failed_runs=1 — below the failed threshold of 2, so
+    #    branch 4 did not fire. Measured before this split existed, that
+    #    history printed: "has been failed for 3 consecutive runs
+    #    (threshold 3): real signal reached the sampling/budget stage and
+    #    nothing was digested. Doors: below_sampling_cut=0
+    #    budget_skipped=0. Remedy: inspect the recorded counters — no door
+    #    counter is set, which should be impossible for a barren run."
+    #    The failed outcome interpolated into barren prose, zero doors for
+    #    a "barren" run, and a closing sentence telling the operator that
+    #    the state the writer produces by design is impossible.
     if streak >= max_barren_runs:
-        # Door-SPECIFIC remedy. SampleResult's docstring is explicit that
-        # the two doors have different fixes: raising the byte budget
-        # recovers a budget_skipped record and does nothing whatever for a
-        # below_sampling_cut one. Never conflate them.
-        remedies = []
-        if budget_skipped > 0:
-            remedies.append(
-                'raise budgets.max_daily_digest_bytes (candidates competed '
-                'and were ALL discarded on the byte budget)'
+        if outcome == trickle_state.OUTCOME_BARREN:
+            # Door-SPECIFIC remedy. SampleResult's docstring is explicit
+            # that the two doors have different fixes: raising the byte
+            # budget recovers a budget_skipped record and does nothing
+            # whatever for a below_sampling_cut one. Never conflate them.
+            remedies = []
+            if budget_skipped > 0:
+                remedies.append(
+                    'raise budgets.max_daily_digest_bytes (candidates '
+                    'competed and were ALL discarded on the byte budget)'
+                )
+            if below_sampling_cut > 0:
+                remedies.append(
+                    'raise sampling.top_fraction / sampling.per_stratum_min '
+                    '(real signal ranked below its stratum cut and never '
+                    'reached the budget phase)'
+                )
+            remedy = '; '.join(remedies) or (
+                'inspect the recorded counters — no door counter is set, '
+                'which should be impossible for a barren run'
             )
-        if below_sampling_cut > 0:
-            remedies.append(
-                'raise sampling.top_fraction / sampling.per_stratum_min '
-                '(real signal ranked below its stratum cut and never '
-                'reached the budget phase)'
-            )
-        remedy = '; '.join(remedies) or (
-            'inspect the recorded counters — no door counter is set, which '
-            'should be impossible for a barren run'
-        )
 
-        print(
-            f'ERROR: legibility trickle for {project_id} has been {outcome} '
-            f'for {streak} consecutive runs (threshold {max_barren_runs}): '
-            f'real signal reached the sampling/budget stage and nothing was '
-            f'digested. Doors: below_sampling_cut={below_sampling_cut} '
-            f'budget_skipped={budget_skipped}. Remedy: {remedy}. '
-            f'State file: {path}',
-            file=sys.stderr,
-        )
+            message = (
+                f'ERROR: legibility trickle for {project_id} has been '
+                f'{outcome} for {streak} consecutive runs (threshold '
+                f'{max_barren_runs}): real signal reached the '
+                f'sampling/budget stage and nothing was digested. Doors: '
+                f'below_sampling_cut={below_sampling_cut} '
+                f'budget_skipped={budget_skipped}. Remedy: {remedy}. '
+                f'State file: {path}'
+            )
+        else:
+            # A barren streak CARRIED FORWARD under a last run that was
+            # not barren — in practice always `failed`, since `record_run`
+            # RESETS the streak on productive and quiet. Still loud: three
+            # unresolved barren nights do not stop being a finding because
+            # the fourth night crashed, and going silent here would be the
+            # permanent-suppression shape this probe exists to close. But
+            # it gets its OWN verdict, naming no door, because the doors
+            # in this record are the crashed night's and a crashed night
+            # legitimately has none.
+            message = (
+                f'ERROR: legibility trickle for {project_id} is carrying a '
+                f'barren streak of {streak} runs forward (threshold '
+                f'{max_barren_runs}) under a last recorded outcome of '
+                f'{outcome!r}: the barren streak is UNRESOLVED, and the '
+                f'recorded doors (below_sampling_cut={below_sampling_cut} '
+                f'budget_skipped={budget_skipped}) describe that '
+                f'{outcome} run rather than the barren ones, so no '
+                f'door-specific remedy can be read off this record. '
+                f'Clear the {outcome} run first — read journalctl --user '
+                f'-u legibility-trickle@{project_id} --since '
+                f"'{streak + failed_streak + 1} days ago' — then re-read "
+                f'this probe once a run has COMPLETED and re-observed the '
+                f'sampling/budget doors. consecutive_failed_runs='
+                f'{failed_streak} (threshold {max_failed_runs}). '
+                f'last_productive_at={doc.get("last_productive_at")}. '
+                f'State file: {path}'
+            )
+
+        print(message, file=sys.stderr)
         return 1
 
     # 6. Healthy. `outcome` is printed VERBATIM, which is what makes a
