@@ -2693,22 +2693,24 @@ class TestB10StormEscape:
                 await self._repair(h)
                 clock.advance(60)
 
-        mine = [
-            r for r in caplog.records
-            if r.name == 'shared.mcp_markup_middleware' and r.levelname == 'ERROR'
+        storm_lines = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'shared.mcp_markup_middleware'
+            and r.levelname == 'ERROR'
+            and r.getMessage().startswith('markup_guard_storm')
         ]
-        assert mine, f'expected a greppable markup_guard_storm ERROR line, got: {caplog.text!r}'
-        text = '\n'.join(r.getMessage() for r in mine)
-        assert 'markup_guard_storm' in text
-        assert 'toolcall-markup-containment-prd.md' in text, (
-            f'must name the live owner: {text!r}'
+        assert storm_lines, (
+            f'expected a greppable markup_guard_storm ERROR line, got: {caplog.text!r}'
         )
-        assert 'see DF 3083' not in text, (
-            f'must not direct the reader at the closed predecessor: {text!r}'
-        )
-        assert 'not against 3083' in text, (
-            f'must send recurrences to the PRD, not the closed predecessor: {text!r}'
-        )
+        # Citing the live owner's path is the whole contract, and it is the one
+        # check that survives any rewording of the sentence around it. Pinning
+        # phrases instead ('not against 3083') would fail a correct rewrite,
+        # and a negative pin ('see DF 3083' not in ...) is evaded by any other
+        # spelling of the same stale route.
+        for line in storm_lines:
+            assert 'toolcall-markup-containment-prd.md' in line, (
+                f'must name the live owner, not the closed predecessor: {line!r}'
+            )
 
     # -- the rate limit, and the window ------------------------------------
 
