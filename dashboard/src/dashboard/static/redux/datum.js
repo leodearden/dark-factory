@@ -300,11 +300,31 @@ const PLAIN_DATUM_BOUND_SECONDS = 12;
 // ageing). A tile that consulted both would be a second staleness verdict fired
 // at the same instant as the banner. The parameter takes the __receipt map
 // alone so that separation is structural rather than a promise.
+//
+// AN ABSENT VALUE IS A HOLE even once the endpoint HAS delivered, and saying so
+// here is what keeps this wrapper inside the envelope's own contract:
+// data/datum.py::validate_datum's UNKNOWN_TRIAD rule is that the state is
+// 'unknown' exactly when value and as_of are both absent. Stamping
+// `value: null, state: 'fresh'` would build client-side the one envelope the
+// server is forbidden to emit, and datumView would then hand that null to a
+// call site's `format` callback and badge the result with a real age — a
+// fabricated measurement, which is the defect this PRD exists to remove. It is
+// also what lets every call site DELETE its `x == null ? '—' : f(x)` sentinel
+// rather than move it into the formatter: `format` now only ever sees a value
+// that was actually measured.
+//
+// `== null` and never `!value`: a measured 0 (or '' or false) IS a measurement,
+// and reading it as absent is the very conflation the envelope removes.
+// `undefined` is in, because an optional-chained read (`x?.y`) is the commonest
+// way a missing payload field reaches a tile.
 function plainDatum(value, endpointKey, receipts) {
   const map = receipts === undefined || receipts === null ? plainDatumReceipts() : receipts;
   const receipt = map ? map[endpointKey] : undefined;
   if (!receipt || !Number.isFinite(Number(receipt.receivedAt))) {
     return unknownDatum('not yet fetched');
+  }
+  if (value === null || value === undefined) {
+    return unknownDatum('no value in the payload');
   }
 
   return withReceipt(

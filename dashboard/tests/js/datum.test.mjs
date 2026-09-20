@@ -577,6 +577,49 @@ test('plainDatum: an absent receipts map is the same as an empty one', () => {
   assert.equal(plainDatum(0, TASKS_PATH, null).state, 'unknown');
 });
 
+test('plainDatum: a delivered-but-absent value is a hole, per the UNKNOWN_TRIAD rule', () => {
+  // The endpoint HAS delivered; the field it should have carried is not there.
+  // data/datum.py::validate_datum's UNKNOWN_TRIAD invariant says the state is
+  // 'unknown' exactly when value and as_of are both absent, so a wrapper that
+  // stamped `value: null, state: 'fresh'` would build client-side the one
+  // envelope the server is forbidden to emit — and datumView would badge the
+  // result with a real age, which reads as a measurement that never happened.
+  //
+  // `undefined` is asserted beside `null` because an optional-chained read
+  // (`c.summary?.p95_run_cost`) is the commonest way a missing payload field
+  // reaches a tile, and it is absent in exactly the same sense.
+  for (const absent of [null, undefined]) {
+    const wrapped = plainDatum(absent, TASKS_PATH, receiptsFor(RECEIPT));
+
+    assert.equal(wrapped.state, 'unknown');
+    assert.equal(wrapped.value, null);
+    assert.equal(wrapped.as_of, null);
+    assert.equal(wrapped.reason, 'no value in the payload');
+    assert.equal(isDatum(wrapped), true);
+    assert.equal(datumView(wrapped, { now: NOW, format: String }).text, EM_DASH);
+  }
+});
+
+test('plainDatum: no receipt outranks an absent value — the reason names the first cause', () => {
+  // Both holes at once, pre-fetch. "not yet fetched" is the more actionable of
+  // the two readings (the endpoint has not answered; the field's absence is not
+  // yet evidence of anything), so the receipt check runs first.
+  assert.equal(plainDatum(null, TASKS_PATH, {}).reason, 'not yet fetched');
+});
+
+test('plainDatum: a measured 0 / empty string / false is NOT a hole', () => {
+  // The falsy-but-measured boundary. A `!value` guard here would re-introduce
+  // the exact conflation the envelope exists to remove — a measured zero
+  // rendering as "no data" — which is why the check above is `== null`.
+  for (const measured of [0, '', false]) {
+    const wrapped = plainDatum(measured, TASKS_PATH, receiptsFor(RECEIPT));
+
+    assert.equal(wrapped.state, 'fresh');
+    assert.equal(wrapped.value, measured);
+    assert.equal(datumView(wrapped, { now: NOW, format: String }).text, String(measured));
+  }
+});
+
 test('plainDatum: NEVER consults DF_DATA.__stale — one staleness authority, not two', () => {
   // __stale records ATTEMPT history and is endpoint_staleness.js's input; it is
   // republished on FAILURE too, by design. __receipt records the PROVENANCE of
