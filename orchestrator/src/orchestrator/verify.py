@@ -8424,9 +8424,10 @@ class _RerunOutcome(StrEnum):
 class _RerunObservation:
     """What ONE call-site engine actually saw re-running ONE subproject group.
 
-    Richer than a bare :class:`_RerunOutcome` because
-    ``confirm_isolated_rerun_verdict`` has to NAME why a re-run was
-    uninformative (``infra_transient_rerun:<category>``), and because the merge
+    Richer than a bare :class:`_RerunOutcome` because the ledger row has to
+    NAME why a re-run was uninformative — a reason
+    ``_unconfirmable_rerun_reason`` derives from the category recorded here,
+    and the ONE place that vocabulary is written — and because the merge
     gate's existing log line renders the observed ``category``/``passed`` pair
     verbatim.
     """
@@ -8483,8 +8484,8 @@ async def _run_isolated_confirm_group_observation(
     The source of truth for this family; ``_run_isolated_confirm_group`` is the
     one lossier shim over it, kept only because its single legacy caller wants
     a bool. This is also the ``main_probe`` call-site engine
-    (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY to name an
-    ``infra_transient_rerun:<category>`` reason.
+    (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY for
+    ``_unconfirmable_rerun_reason`` to name the reason from.
 
     Reports ``passed`` as soon as any attempt PASSES (that group is a confirmed
     flake). Otherwise ``failed`` if any attempt produced a genuine red — a real

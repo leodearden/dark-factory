@@ -111,6 +111,21 @@ DEFAULT_OCCURRENCE_READ_LIMIT = 20000
 # excluded.  That count is small and bounded by the merge lane's latency, whereas
 # pushing the cutoff past the fix would start discarding genuine reds, which is the one
 # direction the discriminator's doctrine forbids.
+#
+# SUNSET — 2026-09-27, one read window past the cutoff.  This whole cluster (the
+# constant, `_MERGE_GATE_SPLICE_DEFECT_END_AT`, `is_spliced_merge_gate_row`,
+# `FlakeLedgerReport.excluded_non_evidence`, `render_report`'s NOTE branch and
+# `TestSplicedMergeGateRowsAreNotEvidence`) is DELETABLE TOGETHER after that date, and
+# ticket tkt_0RTVQE7709R0J2GWDKAVWVWX53 asks for exactly that.  `build_report` windows
+# the occurrence read at `now - window_hours`, and its only production caller
+# (cli.py's `flake-ledger`) takes the DEFAULT_GATE_BLIND_WINDOW_HOURS=168h default — so
+# from 2026-09-27T01:24Z no report an operator can run reaches a row stamped at or
+# before the cutoff: the predicate can never return True again, the count is always 0
+# and the NOTE never renders.  Stated here rather than left to be inferred from the
+# window constant, because a filter whose horizon has silently passed is the same
+# not-quite-lying machinery this module exists to keep out of a report.  It is a DATE
+# and not an assert because a caller passing a wider `window_hours` can still reach
+# those rows, and for such a caller the exclusion is still correct.
 MERGE_GATE_SPLICE_DEFECT_END = '2026-09-20T01:24:27+00:00'
 
 
@@ -201,6 +216,14 @@ def _parse_stamp(raw: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+#: :data:`MERGE_GATE_SPLICE_DEFECT_END` parsed ONCE, at import.  The predicate below
+#: runs on every occurrence of every report and the row count is the ledger's, not
+#: ours, so the parse does not belong inside it.  ``None`` only if the constant itself
+#: were malformed, which the predicate reads as "exclude nothing" — the safe direction,
+#: since it keeps every row as evidence.
+_MERGE_GATE_SPLICE_DEFECT_END_AT = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
+
+
 def is_spliced_merge_gate_row(row: FlakeOccurrenceRow) -> bool:
     """True for an occurrence the merge-gate splice defect manufactured — see
     :data:`MERGE_GATE_SPLICE_DEFECT_END`.
@@ -223,7 +246,7 @@ def is_spliced_merge_gate_row(row: FlakeOccurrenceRow) -> bool:
     if row.verdict != FlakeVerdict.fails_in_isolation:
         return False
     observed = _parse_stamp(row.observed_at)
-    cutoff = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
+    cutoff = _MERGE_GATE_SPLICE_DEFECT_END_AT
     # INCLUSIVE at the bound: the cutoff is the authoring instant, so a row stamped
     # exactly at it still predates the fixed code.
     return observed is not None and cutoff is not None and observed <= cutoff
