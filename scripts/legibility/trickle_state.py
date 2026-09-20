@@ -76,6 +76,22 @@ OUTCOME_BARREN = 'barren'
 DID reach the sampling/budget stage. This is the absence mode that looks
 identical to a quiet night from outside the pipeline."""
 
+OUTCOME_FAILED = 'failed'
+"""The run did not COMPLETE (``exit_code != 0``), whatever the sampler
+counters say.
+
+Signal may well have flowed IN — the 2026-08-18 reify run selected six
+digests — but the pipeline broke downstream, so those counters describe a
+night whose work was never finished. The counters are still recorded, so
+the "was signal flowing" question stays answerable.
+
+THE VOCABULARY HOLE THIS CLOSES. Without a fourth outcome, a permanently
+broken coder samples > 0, storms, exits 1, and records ``productive`` /
+streak 0 / a fresh ``last_productive_at`` EVERY NIGHT FOREVER, while
+``check_trickle_progress.py`` prints "OK: last run was productive 0h ago"
+indefinitely. That is the 2026-07-16..29 silent-degradation shape (task
+3270) entering through a different door."""
+
 
 # ---------------------------------------------------------------------------
 # classify_run — the three-valued absence classifier
@@ -83,6 +99,7 @@ identical to a quiet night from outside the pipeline."""
 
 def classify_run(
     *,
+    exit_code: int,
     total_records: int,
     zero_signal_dropped: int,
     dedupe_collapsed: int,
@@ -90,7 +107,8 @@ def classify_run(
     budget_skipped: int,
     selected_count: int,
 ) -> str:
-    """Classify one nightly trickle run as productive / barren / quiet.
+    """Classify one nightly trickle run as failed / productive / barren /
+    quiet.
 
     DERIVED FROM, not tuned against, :class:`sampling.SampleResult`'s
     conservation identity::
@@ -99,13 +117,15 @@ def classify_run(
                          + below_sampling_cut + budget_skipped
                          + len(selected)
 
-    Three branches:
+    Four branches:
 
-    1. ``selected_count > 0``                                -> productive.
+    1. ``exit_code != 0``                                    -> failed.
+       The run did not finish. See below for why this is read FIRST.
+    2. ``selected_count > 0``                                -> productive.
        Digests were built. This deliberately INCLUDES a night that also
        skipped records on budget: a partially-truncated night is the byte
        budget working as designed, never an absence.
-    2. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
+    3. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
        Both are doors that only records with real, distinct,
        non-duplicate signal can leave by, so reaching this branch proves
        genuine signal existed and NOTHING was digested. The two doors are
@@ -114,18 +134,36 @@ def classify_run(
        ``sampling.top_fraction``/``per_stratum_min`` — SampleResult's own
        docstring is explicit that conflating them is wrong), but for the
        PRESENCE question they are one signal: real signal in, nothing out.
-    3. otherwise                                             -> quiet.
+    4. otherwise                                             -> quiet.
 
-    WHY BRANCH 3 IS PROVABLY SAFE — the no-false-alarm guarantee. Reaching
-    the ``else`` means ``selected_count == 0`` and both cut counters are
-    0, so by the identity ``total_records == zero_signal_dropped +
-    dedupe_collapsed``: every enumerated record left by the zero-signal or
-    dedupe door, or nothing was enumerated at all. That is EXACTLY the
-    "genuinely quiet night" PRD decision 7 protects, so a quiet or dormant
-    project can never be classified barren. This is a proof from the
-    invariant, not a threshold someone picked — which is what lets a
-    progress probe exist without re-opening decision 7's false-alarm
-    objection.
+    WHY ``failed`` TAKES PRIORITY. ``selected_count > 0`` proves signal
+    reached the digest stage; it does NOT prove the night FINISHED. When
+    both are true the operator needs to know the run BROKE — the counters
+    still answer "was signal flowing", and they are recorded either way,
+    so nothing is hidden by reading the exit code first.
+
+    ``exit_code`` IS A REQUIRED KEYWORD-ONLY PARAMETER WITH NO DEFAULT,
+    deliberately. A defaulted ``0`` is exactly how a future caller would
+    silently reintroduce the hole this branch closes, so the parameter is
+    impossible to forget.
+
+    ``exit_code`` is READ here and NEVER WRITTEN. Writing
+    ``result.exit_code`` from an observability path is the
+    permanent-false-alarm inversion ``scripts/legibility/nightly.py::
+    _escalate_barren_streak`` refuses in writing.
+
+    WHY BRANCH 4 IS PROVABLY SAFE — the no-false-alarm guarantee, and it
+    is UNWEAKENED BY CONSTRUCTION by the new first branch, which is gated
+    purely on ``exit_code != 0``: a night that exited 0 reaches the
+    remaining three branches untouched. Reaching the ``else`` means
+    ``selected_count == 0`` and both cut counters are 0, so by the
+    identity ``total_records == zero_signal_dropped + dedupe_collapsed``:
+    every enumerated record left by the zero-signal or dedupe door, or
+    nothing was enumerated at all. That is EXACTLY the "genuinely quiet
+    night" PRD decision 7 protects, so a quiet or dormant project can
+    never be classified barren. This is a proof from the invariant, not a
+    threshold someone picked — which is what lets a progress probe exist
+    without re-opening decision 7's false-alarm objection.
 
     ``total_records`` and ``zero_signal_dropped`` are accepted (and
     RECORDED by :func:`record_run`) but deliberately NOT consulted by the
@@ -134,6 +172,8 @@ def classify_run(
     auditable after the fact. Do not "simplify" them out of the signature
     or out of the recorded state.
     """
+    if exit_code != 0:
+        return OUTCOME_FAILED
     if selected_count > 0:
         return OUTCOME_PRODUCTIVE
     if (budget_skipped + below_sampling_cut) > 0:
@@ -379,6 +419,7 @@ def record_run(
             last_productive_at = raw_last
 
     outcome = classify_run(
+        exit_code=exit_code,
         total_records=total_records,
         zero_signal_dropped=zero_signal_dropped,
         dedupe_collapsed=dedupe_collapsed,
