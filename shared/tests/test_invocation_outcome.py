@@ -384,6 +384,28 @@ class TestExtractCapMessage:
         result = _extract_cap_message(text, "You've hit your")
         assert len(result) == 200
 
+    # --- Offset arithmetic, also ported from the fork suites (task 4357).
+    # Every case above puts the prefix at index 0, where `text.find('\n', idx)`
+    # and `min(idx + 200, len(text))` are indistinguishable from `text.find(
+    # '\n')`, `text[:end]` and `min(200, len(text))`. These two pin the `idx`
+    # in all three — measured to kill each of those mutants. ---
+
+    def test_prefix_after_a_preamble_line_returns_only_that_line(self):
+        """The line the prefix is ON, and nothing else: the preceding line is
+        not swallowed, and the newline that ends the extract is the one AFTER
+        the prefix rather than the earlier one that ends the preamble."""
+        text = "Some preamble\nYou've hit your usage limit for Claude.\nMore text"
+        result = _extract_cap_message(text, "You've hit your")
+        assert result == "You've hit your usage limit for Claude."
+
+    def test_char_bound_counts_from_the_prefix_not_the_text_start(self):
+        """With no newline AFTER the prefix the 200-char window opens at the
+        prefix, so a preamble must not eat into it."""
+        text = 'Some preamble\n' + "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert result.startswith("You've hit your ")
+        assert len(result) == 200
+
 
 class TestSingleSourceOwnership:
     """Guard that the six cap/error string tables live ONLY in
