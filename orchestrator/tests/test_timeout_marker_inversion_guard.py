@@ -47,6 +47,7 @@ Task 5147.
 from __future__ import annotations
 
 import ast
+import asyncio
 import functools
 import math
 import re
@@ -60,6 +61,8 @@ import pytest
 import yaml
 from _orch_helpers import (
     DEEP_GATE_SCENE_TEST_TIMEOUT,
+    DEEP_LANDING_ADOPT_WAIT_SECS,
+    DEEP_LANDING_PARK_WAIT_SECS,
     DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS,
     DEEP_LANDING_SCENE_SPAWN_BUDGET,
     DEEP_LANDING_SCENE_TEST_TIMEOUT,
@@ -408,6 +411,81 @@ def _inverts(seconds: float | None) -> bool:
     )
 
 
+class _BoundedWait(NamedTuple):
+    """One ``asyncio.wait_for`` ceiling, as written and as resolved.
+
+    ``spelling`` is the source text of the ``timeout`` argument and
+    ``seconds`` its value, None when nothing static resolves it -- the same
+    written/resolved split :class:`_Site` makes for timeout markers, and for
+    the same reason: a bare literal and a named constant are both correct
+    numbers today and only one of them moves when the number is re-derived.
+    """
+
+    lineno: int
+    spelling: str
+    seconds: float | None
+
+
+def _bounded_waits(tree: ast.Module) -> tuple[_BoundedWait, ...]:
+    """Every ``wait_for(..., timeout=X)`` ceiling *tree* composes.
+
+    The instrument the spawn census cannot be: counting ``asyncio.sleep``
+    reports 0.00s for a bounded wait that is never approached, so a scene's
+    ``wait_for`` ceilings are visible only in its SOURCE.
+
+    Matched on the callee's trailing name, so both ``asyncio.wait_for`` and a
+    bare imported ``wait_for`` are seen.  The ceiling is read from the
+    ``timeout`` keyword or, failing that, the second positional argument --
+    ``wait_for``'s own signature.  Names resolve through :mod:`_orch_helpers`,
+    which is where a ceiling belongs once anything is derived FROM it.
+    """
+    waits: list[_BoundedWait] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not ast.unparse(node.func).endswith('wait_for'):
+            continue
+        ceiling = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == 'timeout'),
+            node.args[1] if len(node.args) > 1 else None,
+        )
+        if ceiling is not None:
+            waits.append(
+                _BoundedWait(node.lineno, ast.unparse(ceiling), _static_seconds(ceiling))
+            )
+    return tuple(waits)
+
+
+def _static_seconds(node: ast.expr) -> float | None:
+    """*node* as a number, resolving a bare name through :mod:`_orch_helpers`.
+
+    None means UNRESOLVABLE and never "zero": an expression this cannot read
+    is one no census here may claim to have measured.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        resolved = getattr(_orch_helpers, node.id, None)
+        if isinstance(resolved, int | float):
+            return float(resolved)
+    return None
+
+
+@functools.cache
+def _deep_landing_tree() -> ast.Module:
+    """test_merge_queue_deep_landing.py parsed ONCE for every pin that reads it.
+
+    Three pins here walk that file and it is ~4k lines; parsing dominates
+    each of them.  Cached at module scope for the same reason
+    :func:`_tree_scan` is -- a census is a read of the tree as it is on disk,
+    and re-reading it per test buys nothing but wall clock.
+    """
+    tree = _parse((_TESTS_DIR / _DEEP_LANDING_MODULE).read_text(encoding='utf-8'))
+    assert tree is not None, (
+        f'{_DEEP_LANDING_MODULE} did not parse, so every pin reading it would '
+        'otherwise pass vacuously.'
+    )
+    return tree
+
+
 def _class_def(tree: ast.Module, name: str) -> ast.ClassDef | None:
     """The top-level class *name*, or None if the module defines no such class.
 
@@ -450,23 +528,37 @@ def _autouse_fixtures(node: ast.ClassDef) -> tuple[ast.FunctionDef | ast.AsyncFu
 
 
 def _usefixtures_names(node: ast.ClassDef) -> frozenset[str]:
-    """Fixture names *node*'s own ``@pytest.mark.usefixtures(...)`` marks request.
+    """Fixture names *node*'s own ``usefixtures`` marks request.
 
-    Its OWN decorator list only, never a walk and never a base class, for the
-    same reason :func:`_autouse_fixtures` reads only the class body: a mark
-    that reached the class from somewhere else covers a different set of
-    tests, and a pin that accepted one would pass while the class it names
-    went unguarded.
+    BOTH SPELLINGS THAT BIND EXACTLY THIS CLASS: the
+    ``@pytest.mark.usefixtures(...)`` decorator, and a ``pytestmark`` assigned
+    in the class BODY.  Reading only the decorator would leave this census
+    disagreeing with the timeout census it is paired against, which honours
+    both (:func:`_timeout_marker_sites_in`) -- and a class opting in through
+    ``pytestmark`` would then be reported as marked-but-unbudgeted and told to
+    add a decorator it effectively already has.
+
+    Still never a walk and never a base class, for the same reason
+    :func:`_autouse_fixtures` reads only the class body: a mark reaching the
+    class from anywhere ELSE -- an inherited one, a module-level one -- covers
+    a different set of tests, and a pin that accepted one would pass while the
+    class it names went unguarded.
 
     Only STRING-literal arguments are collected.  ``usefixtures`` takes
     nothing else, so anything dynamic here is unresolvable rather than a
     fixture this census may claim.
     """
+    marks: list[ast.expr] = list(node.decorator_list)
+    for statement in node.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            marks.extend(_mark_elements(bound))
+
     return frozenset(
         argument.value
-        for decorator in node.decorator_list
-        if isinstance(decorator, ast.Call) and _marker_name(decorator) == 'usefixtures'
-        for argument in decorator.args
+        for mark in marks
+        if isinstance(mark, ast.Call) and _marker_name(mark) == 'usefixtures'
+        for argument in mark.args
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     )
 
@@ -1087,28 +1179,120 @@ class TestDeepLandingSceneBudget:
             'DEEP_LANDING_SCENE_TEST_TIMEOUT in the same commit.'
         )
 
-    def test_the_bounded_wait_allowance_covers_the_worst_path(self) -> None:
-        """The bounded-wait term may never fall below the worst single-test path.
+    def test_the_bounded_wait_term_is_the_sum_of_its_two_named_ceilings(self) -> None:
+        """The term is composed, never copied.
 
         Read from SOURCE rather than from the spawn census, which cannot see
-        it: instrumenting ``asyncio.sleep`` reports 0.00s for every test here,
-        and a ``wait_for`` ceiling consumes nothing until it is approached.
-        Priced at the CEILING and not at the 0.00s actually consumed, because
-        a starved host is precisely when a bounded wait IS approached.
-        """
-        allowance = DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS
+        it: instrumenting ``asyncio.sleep`` reports 0.00s for every test in
+        the module, and a ``wait_for`` ceiling consumes nothing until it is
+        approached.  Priced at the CEILING and not at the 0.00s actually
+        consumed, because a starved host is precisely when a bounded wait IS
+        approached.
 
-        assert allowance >= 180, (
-            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS is {allowance}, below the '
-            '180s of bounded wait one TestAdoptedHeadLandsWithThePostVerify'
-            'Worktree path can compose: asyncio.wait_for(parked.wait(), '
-            'timeout=60) plus _adopt_head_only\'s `timeout: float = 120` '
-            'default, both in test_merge_queue_deep_landing.py. An allowance '
-            'below that leaves a test whose bounded waits alone exhaust its '
-            'own marker, with nothing left for the real-git spawns it also '
-            'makes -- which is the defect this pair was derived to fix. '
-            'Re-read those two ceilings before lowering it, and re-derive '
-            'DEEP_LANDING_SCENE_TEST_TIMEOUT in the same commit.'
+        A HAND-COPIED 180 could only catch someone LOWERING the term -- never
+        the case that matters, which is a source ceiling being RAISED out from
+        under it, leaving the term, the derived timeout and all nine markers
+        under-pricing the worst path while every other pin here stays green
+        re-deriving from the stale number (task 5582 reviewer amendment).
+        """
+        assert DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS == (
+            DEEP_LANDING_PARK_WAIT_SECS + DEEP_LANDING_ADOPT_WAIT_SECS
+        ), (
+            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS is '
+            f'{DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS}, not the sum of the two '
+            f'ceilings it prices ({DEEP_LANDING_PARK_WAIT_SECS} + '
+            f'{DEEP_LANDING_ADOPT_WAIT_SECS}). Restated as a literal it stops '
+            'tracking them, and a raised ceiling then goes unpriced in '
+            'silence. Compose it; do not copy it.'
+        )
+
+    def test_the_worst_paths_ceilings_are_spelled_as_the_named_constants(self) -> None:
+        """Both ceilings must reach their call sites by NAME.
+
+        The other half of composing the term: a bare literal back at either
+        call site re-opens the same gap from the opposite end -- the constant
+        here would no longer be what the scene actually waits on, and raising
+        the real ceiling would move nothing.
+
+        The two are on ONE TestAdoptedHeadLandsWithThePostVerifyWorktree path
+        and that is what makes their SUM the worst case; which waits share a
+        path is the part no AST can check, and is argued at
+        _orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT.
+        """
+        tree = _deep_landing_tree()
+        spellings = {wait.spelling for wait in _bounded_waits(tree)}
+
+        assert 'DEEP_LANDING_PARK_WAIT_SECS' in spellings, (
+            f'no asyncio.wait_for in {_DEEP_LANDING_MODULE} spells its '
+            'ceiling DEEP_LANDING_PARK_WAIT_SECS, so the constant the '
+            'bounded-wait term is composed from is not the one the park wait '
+            f'actually uses. Ceilings found: {sorted(spellings)}'
+        )
+
+        adopt = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == '_adopt_head_only'
+            ),
+            None,
+        )
+        assert adopt is not None, (
+            f'{_DEEP_LANDING_MODULE} defines no _adopt_head_only, whose '
+            'timeout default is half of DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS. '
+            'If the helper was renamed, re-read the worst path and re-derive '
+            'the term in the same commit.'
+        )
+        defaults = {
+            argument.arg: default
+            for argument, default in zip(adopt.args.kwonlyargs, adopt.args.kw_defaults, strict=True)
+            if default is not None
+        }
+        spelling = defaults.get('timeout')
+        assert spelling is not None and ast.unparse(spelling) == 'DEEP_LANDING_ADOPT_WAIT_SECS', (
+            "_adopt_head_only's timeout default is "
+            f'{ast.unparse(spelling) if spelling else "absent"}, not '
+            'DEEP_LANDING_ADOPT_WAIT_SECS. Spelled as anything else it stops '
+            'tracking the constant the term is composed from, and the 180s '
+            'this module is priced for stops being what it waits.'
+        )
+
+    def test_no_bounded_wait_exceeds_the_priced_term(self) -> None:
+        """No single wait may outlast the whole allowance priced for the path.
+
+        Turns "the module's other bounded waits are not on the worst path"
+        from an assumption into a checked one.  A ceiling ABOVE the term
+        cannot be off the worst path in any useful sense: on its own it
+        outlasts everything the timeout was derived to cover.
+
+        NOT exhaustive, and deliberately so: nothing static can tell which
+        waits compose on one path, so a new wait ADDED to the adopted-head
+        path still needs a human to re-derive the term.  What this catches is
+        the cheaper and commoner mistake -- a ceiling raised past the budget
+        that prices it.
+        """
+        waits = _bounded_waits(_deep_landing_tree())
+
+        assert waits, (
+            f'{_DEEP_LANDING_MODULE} composes no asyncio.wait_for at all, so '
+            'this pin passes VACUOUSLY and '
+            'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS prices a path that no '
+            'longer exists. Re-read the module and re-derive the term.'
+        )
+        over = [
+            wait
+            for wait in waits
+            if wait.seconds is not None and wait.seconds > DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS
+        ]
+        assert not over, (
+            f'{len(over)} bounded wait(s) in {_DEEP_LANDING_MODULE} exceed '
+            f'DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS '
+            f'({DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS}s) on their own, so the '
+            'term no longer covers the worst path whatever else that path '
+            'composes. Re-read the ceilings, re-derive the term and '
+            'DEEP_LANDING_SCENE_TEST_TIMEOUT with it, in one commit.\n  '
+            + '\n  '.join(f'line {w.lineno}: {w.spelling} = {w.seconds}s' for w in over)
         )
 
     def test_the_timeout_is_the_budget_priced_and_rounded_to_the_grid(self) -> None:
@@ -1423,6 +1607,127 @@ class TestSpawnBudgetVerdict:
                 )
 
 
+    @pytest.mark.parametrize('budget', _SPAWN_BUDGETS, ids=_SPAWN_BUDGET_IDS)
+    def test_each_descriptors_constant_names_resolve_to_its_numbers(
+        self, budget: _orch_helpers.SpawnBudget,
+    ) -> None:
+        """The NAMES a verdict tells the reader to re-derive must still exist.
+
+        REFERENTIAL INTEGRITY, and the one thing the test above cannot see: it
+        reads the names from the descriptor, so a rename of the underlying
+        constant leaves it green while every over-budget failure sends its
+        reader after a constant the module no longer defines.  Resolving the
+        strings back through ``getattr`` is what converts that from a recorded
+        limitation into a caught one, and it survives any rewording of the
+        prose around it.
+
+        The VALUES are compared too and not just the names, because a
+        descriptor bundling the wrong scalar would name a real constant while
+        reporting a budget nothing is sized to -- a second reading of a figure
+        that is supposed to have exactly one.
+        """
+        for name, value, field in (
+            (budget.spawns_constant, budget.spawns, 'spawns'),
+            (budget.timeout_constant, budget.timeout_secs, 'timeout_secs'),
+        ):
+            resolved = getattr(_orch_helpers, name, None)
+            assert resolved is not None, (
+                f'SpawnBudget.{field} is described by {name!r}, which '
+                '_orch_helpers.py no longer defines. Every over-budget '
+                'failure for this scene now tells its reader to re-derive a '
+                'constant that does not exist. Rename the descriptor string '
+                'in the same commit as the constant it names.'
+            )
+            assert resolved == value, (
+                f'SpawnBudget.{field} is {value}, but the constant it names '
+                f'({name}) is {resolved}. The descriptor BUNDLES the '
+                'module-level scalars and never restates them, so a mismatch '
+                'means one figure now has two readings -- and the failure '
+                'message quotes the one nothing is sized to.'
+            )
+
+
+class TestCountGitSpawns:
+    """``count_git_spawns`` -- the budget fixtures' shared instrument.
+
+    Pinned as a unit because the instrument is the half that carries the real
+    failure modes, and the two fixtures wiring it exercise only the path where
+    nothing is wrong: a teardown assertion runs its interesting branches
+    never.  Which seams are counted is the specific thing that sat duplicated
+    in two modules before task 5582's amendment pass, and the specific thing
+    that would have drifted.
+
+    A FAKE is patched in FIRST and the instrument wraps that, so these tests
+    spawn no real subprocess: under pin is the wrapper's behaviour, not the
+    operating system's.
+    """
+
+    @staticmethod
+    def _fake_seams(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple, dict]]:
+        """Replace every seam with a recorder; return the shared call log."""
+        calls: list[tuple[str, tuple, dict]] = []
+
+        def recorder(seam: str):
+            async def record(*args, **kwargs):
+                calls.append((seam, args, kwargs))
+                return f'process-from-{seam}'
+
+            return record
+
+        for seam in _orch_helpers.GIT_SPAWN_SEAMS:
+            monkeypatch.setattr(asyncio, seam, recorder(seam))
+        return calls
+
+    def test_it_counts_every_seam_a_git_spawn_can_arrive_through(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both seams, because the measurement every budget came from counted both.
+
+        An instrument watching ``create_subprocess_exec`` alone undercounts
+        each test by its ``_shell`` calls and then budgets the scene against a
+        different number than its timeout was priced from -- silently, and in
+        the direction that looks safe.
+        """
+        self._fake_seams(monkeypatch)
+        spawns = _orch_helpers.count_git_spawns(monkeypatch)
+
+        assert spawns() == 0, 'nothing has spawned yet'
+        for seam in _orch_helpers.GIT_SPAWN_SEAMS:
+            asyncio.run(getattr(asyncio, seam)('git', 'status'))
+
+        assert spawns() == len(_orch_helpers.GIT_SPAWN_SEAMS), (
+            f'count_git_spawns reported {spawns()} after one call through '
+            f'each of {_orch_helpers.GIT_SPAWN_SEAMS}. A seam it does not '
+            'wrap is a seam every budget derived from a two-seam measurement '
+            'has gone blind to.'
+        )
+
+    def test_the_wrapper_awaits_the_real_call_and_returns_its_result(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The counting wrapper must be transparent to whoever spawns through it.
+
+        Handing back the real call's COROUTINE instead of awaiting it would
+        leave every caller holding an un-started object where it expected a
+        process -- and the count would still look right, so no budget
+        assertion would ever report it.
+        """
+        calls = self._fake_seams(monkeypatch)
+        _orch_helpers.count_git_spawns(monkeypatch)
+
+        result = asyncio.run(asyncio.create_subprocess_exec('git', 'log', cwd='/tmp'))
+
+        assert result == 'process-from-create_subprocess_exec', (
+            'the counting wrapper did not return what the real spawn '
+            f'returned; got {result!r}. It must await and pass through, not '
+            'intercept.'
+        )
+        assert calls == [('create_subprocess_exec', ('git', 'log'), {'cwd': '/tmp'})], (
+            'the counting wrapper did not forward its arguments unchanged: '
+            f'{calls}. An instrument that reshapes the call it measures '
+            'changes the thing being measured.'
+        )
+
 class TestRow7SceneIsGuarded:
     """What test_merge_queue_deep_integration_gate.py must carry for task 5333.
 
@@ -1681,9 +1986,7 @@ class TestDeepLandingModuleMarkers:
         construction, which is that branch working as designed and exactly why
         the fixture is not autouse at module scope.
         """
-        path = _TESTS_DIR / _DEEP_LANDING_MODULE
-        tree = _parse(path.read_text(encoding='utf-8'))
-        assert tree is not None, f'{_DEEP_LANDING_MODULE} did not parse'
+        tree = _deep_landing_tree()
 
         classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
         marked = {
@@ -1845,6 +2148,81 @@ def test_enforced_rejects_a_call_reached_only_by_the_assert_message() -> None:
 def _sites(source: str) -> dict[str, float | None]:
     """``{qualname: seconds}`` for *source*, dedented so fixtures can be indented."""
     return {site.qualname: site.seconds for site in _timeout_marker_sites(textwrap.dedent(source))}
+
+# ---------------------------------------------------------------------------
+# _usefixtures_names(cls) -- inline-class unit tests.
+#
+# The OTHER half of the marker/budget pairing census, and the half whose
+# spelling coverage has to MATCH the timeout half's above: a class opting in
+# through `pytestmark` is as bound as one carrying a decorator, and a census
+# blind to it would fail that class for missing an opt-in it already has.
+# ---------------------------------------------------------------------------
+
+
+def _requested(source: str) -> frozenset[str]:
+    """``_usefixtures_names`` over the single class defined in *source*."""
+    tree = _parse(textwrap.dedent(source))
+    assert tree is not None
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    assert len(classes) == 1, 'these fixtures define exactly one class'
+    return _usefixtures_names(classes[0])
+
+
+def test_usefixtures_census_reads_a_class_decorator() -> None:
+    """The spelling all nine deep-landing classes actually use."""
+    assert _requested(
+        """
+        import pytest
+
+        @pytest.mark.usefixtures('_within_spawn_budget')
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+    ) == {'_within_spawn_budget'}
+
+
+def test_usefixtures_census_reads_class_level_pytestmark() -> None:
+    """``pytestmark`` in the class body -- same binding, different syntax.
+
+    Matches what the timeout census already honours
+    (``test_extractor_reads_class_level_pytestmark``).  Before task 5582's
+    amendment pass the two halves read different surfaces, so this spelling
+    made the pairing pin fail spuriously and tell its author to add a
+    decorator that would have changed nothing.
+    """
+    assert _requested(
+        """
+        import pytest
+
+        class TestThing:
+            pytestmark = [pytest.mark.usefixtures('_within_spawn_budget')]
+
+            def test_a(self) -> None:
+                pass
+        """
+    ) == {'_within_spawn_budget'}
+
+
+def test_usefixtures_census_ignores_a_mark_bound_somewhere_else() -> None:
+    """A MODULE-level ``pytestmark`` is not this class's own opt-in.
+
+    It covers every collected item in the file, including the two classes
+    measured at zero git spawns that the budget fixture must never reach, so
+    counting it here would report coverage the pairing does not have.
+    """
+    assert _requested(
+        """
+        import pytest
+
+        pytestmark = pytest.mark.usefixtures('_within_spawn_budget')
+
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+    ) == frozenset()
+
 
 
 def test_extractor_reads_a_bare_literal_function_decorator() -> None:

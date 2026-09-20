@@ -73,9 +73,16 @@ from _merge_lane_fakes import FakeVerifier, fails, passes
 # spawn census, the bounded-wait term, the rounding and the three ceilings it
 # sits under are in DEEP_LANDING_SCENE_TEST_TIMEOUT's comment in
 # _orch_helpers.py -- stated once there rather than nine times at the markers.
+# The two wait ceilings come from there too, and not from a literal at the
+# call site, because the term is their SUM: raising one here must move the
+# timeout derived from it, which it can only do if there is one home for the
+# figure.
 from _orch_helpers import (
+    DEEP_LANDING_ADOPT_WAIT_SECS,
+    DEEP_LANDING_PARK_WAIT_SECS,
     DEEP_LANDING_SCENE_BUDGET,
     DEEP_LANDING_SCENE_TEST_TIMEOUT,
+    count_git_spawns,
     spawn_budget_violation,
 )
 
@@ -174,32 +181,17 @@ def _within_spawn_budget(request, monkeypatch):
     test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
     the marker/fixture pairing in BOTH directions.
 
-    Counts BOTH asyncio spawn entry points, which is what the measurement
-    behind the constants counted.  ``create_subprocess_exec`` is the one
-    ``git_ops._run`` reaches and carries the bulk, but watching ``_exec``
-    alone would silently budget against a different number than the timeout
-    was priced from.
-
-    Per-test and IN-PROCESS by construction, never module state, so it stays
-    correct under ``--dist loadgroup`` where one class's tests can land on
-    several workers.  Patched through ``monkeypatch`` so both seams are
-    restored at teardown.
+    A WIRE between two shared parts and nothing else: ``count_git_spawns``
+    is the instrument and ``spawn_budget_violation`` the verdict, both in
+    _orch_helpers.py, both also used by this file's counterpart in
+    test_merge_queue_deep_integration_gate.py.  Which seams are counted, and
+    why both of them, is stated once at ``count_git_spawns``; a copy of that
+    instrument here is what would let the two budgets drift apart.
     """
-    spawns = 0
-
-    def counting(real):
-        async def counting_spawn(*args, **kwargs):
-            nonlocal spawns
-            spawns += 1
-            return await real(*args, **kwargs)
-
-        return counting_spawn
-
-    for seam in ('create_subprocess_exec', 'create_subprocess_shell'):
-        monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+    spawns = count_git_spawns(monkeypatch)
     yield
     violation = spawn_budget_violation(
-        spawns, request.node.nodeid, budget=DEEP_LANDING_SCENE_BUDGET,
+        spawns(), request.node.nodeid, budget=DEEP_LANDING_SCENE_BUDGET,
     )
     assert violation is None, violation
 
@@ -2965,7 +2957,7 @@ async def _adopted_warm_head_scene(
         )
         # Waiting for the PARK (not sleeping) is what makes the swap an
         # established fact before anything else in the scene runs.
-        await asyncio.wait_for(parked.wait(), timeout=60)
+        await asyncio.wait_for(parked.wait(), timeout=DEEP_LANDING_PARK_WAIT_SECS)
         return task
 
     s = await _head_and_prefix_scene(
@@ -2994,7 +2986,7 @@ async def _adopted_warm_head_scene(
     return s
 
 
-async def _adopt_head_only(s: dict, *, timeout: float = 120) -> dict:
+async def _adopt_head_only(s: dict, *, timeout: float = DEEP_LANDING_ADOPT_WAIT_SECS) -> dict:
     """Run the adopting exit, then finalize ONLY the head.
 
     :func:`_adopt_and_land` also finalizes the speculative entry, whose

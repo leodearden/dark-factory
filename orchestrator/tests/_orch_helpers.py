@@ -16,7 +16,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
@@ -407,13 +407,14 @@ class SpawnBudget(NamedTuple):
     descriptor cannot drift into three readings of one figure.  The constant
     names are spelled as strings because a name cannot refer to itself.
 
-    STATED LIMIT, recorded rather than engineered around: nothing resolves
-    those strings back to this module's attributes, so renaming a constant
-    without editing its descriptor leaves a stale name in a failure message.
-    What IS pinned is the property the message depends on -- that each
-    caller's verdict names ITS OWN pair and neither of the other's
+    THE STRINGS ARE RESOLVED BACK, so a rename cannot leave a stale name in a
+    failure message: every descriptor's two names are looked up on this module
+    and compared against the scalars it carries
     (test_timeout_marker_inversion_guard.py::TestSpawnBudgetVerdict::
-    test_each_descriptors_message_names_only_its_own_constants).
+    test_each_descriptors_constant_names_resolve_to_its_numbers).  Also pinned
+    there is the property the messages depend on -- that each caller's verdict
+    names ITS OWN pair and neither of the other's
+    (::test_each_descriptors_message_names_only_its_own_constants).
     """
 
     spawns: int
@@ -466,7 +467,11 @@ class SpawnBudget(NamedTuple):
 #     "worker 'gw2' crashed while running ...TestRow7KillSwitchByteIdentity::
 #     test_the_same_sequence_at_cap_six_moves_every_deep_field";
 #   * NO `+++ Timeout +++` banner anywhere in that log, which pytest-timeout
-#     writes before its `os._exit()`;
+#     writes before its `os._exit()`.  NOT EVIDENCE, measured after this block
+#     was written: under xdist the banner goes to the WORKER's own terminal,
+#     which the master never forwards, so a genuine timeout kill looks exactly
+#     like this.  See the falsifier paragraph under
+#     DEEP_LANDING_SCENE_TEST_TIMEOUT below;
 #   * the same suite at the same marker had passed 21216 tests, rc=0, in this
 #     lane's own verify attempt-1 (2026-09-14T21:25, 2445s).  So: one crash in
 #     two full-suite runs, not a reproducible failure;
@@ -476,8 +481,12 @@ class SpawnBudget(NamedTuple):
 # HYPOTHESIS (unproven, and now the LEADING one): the worker is not dying of
 # this timeout.  Reaching 1260s needs a ~150x slowdown on a test measured at
 # 8.28s, where the worst contention ever recorded here cost 2.8x, and no
-# timeout banner was emitted.  NOT INVESTIGATED: fd and memory ceilings at the
-# moment of death -- the next place to look, per the line above.
+# timeout banner was emitted.  ONE LEG OF THAT HAS SINCE BEEN KNOCKED OUT --
+# the missing banner carries no weight (see the bullet above) -- leaving the
+# ~150x slowdown as the whole of the argument.  The conclusion is left
+# standing because that leg alone may still carry it; what must not be
+# inherited is the banner premise.  NOT INVESTIGATED: fd and memory ceilings
+# at the moment of death -- the next place to look, per the line above.
 # WHAT THIS DOES NOT OVERTURN: the marker is still correctly sized for what it
 # covers, and it is genuinely in force under verify -- measured directly, a
 # `@pytest.mark.timeout` marker overrides verify's CLI `--timeout=300`
@@ -598,11 +607,12 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # because an unrelated change adding a few spawns must not fail the run --
 # only a change that makes a scene materially heavier should.
 #
-# BOUNDED WAITS = 60 + 120 = 180s, read from SOURCE rather than from the
-# census, and this is where the derivation departs from task 5333's Row 7 pair
-# above.  Row 7 could price `bounded_secs` at 0.0 because it composes no
-# `wait_for` at all; here `asyncio.wait_for(parked.wait(), timeout=60)` and
-# `_adopt_head_only`'s `timeout: float = 120` default sit on ONE
+# BOUNDED WAITS = DEEP_LANDING_PARK_WAIT_SECS + DEEP_LANDING_ADOPT_WAIT_SECS
+# = 180s, read from SOURCE rather than from the census, and this is where the
+# derivation departs from task 5333's Row 7 pair above.  Row 7 could price
+# `bounded_secs` at 0.0 because it composes no `wait_for` at all; here
+# `asyncio.wait_for(parked.wait(), timeout=...)` and `_adopt_head_only`'s
+# `timeout: float = ...` default sit on ONE
 # TestAdoptedHeadLandsWithThePostVerifyWorktree path.  The sleep instrument is
 # blind to a `wait_for` CEILING -- a bounded wait consumes nothing until it is
 # approached -- so a 0.0 term here would have hidden the defect instead of
@@ -611,6 +621,24 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # headroom for the 165 real-git spawns it also makes.  Priced at the CEILING
 # rather than at the 0.00s actually consumed, because a starved host is
 # precisely when a bounded wait IS approached.
+#
+# THE TWO CEILINGS ARE DEFINED HERE AND SPELLED AT THEIR CALL SITES (task 5582
+# reviewer amendment), so the term cannot go stale behind a raised ceiling.
+# Raising either constant moves the sum, which moves the required timeout,
+# which fails TestDeepLandingSceneBudget until DEEP_LANDING_SCENE_TEST_TIMEOUT
+# is re-derived in the same commit.  A hand-copied 180 could only ever catch
+# someone LOWERING the term -- never the case that matters, which is a source
+# ceiling being raised out from under it.
+#
+# THE MODULE'S OTHER BOUNDED WAITS, named so this census does not read as
+# exhaustive when it is not: `_finalize_inflight(...), timeout=60` in the δ
+# lease-inheritance scene and `started.wait(), timeout=30` in the head-cancel
+# scene.  Neither composes with the adopted-head path the term prices, so 180
+# stands; that both sit UNDER the term is checked rather than assumed
+# (TestDeepLandingSceneBudget::test_no_bounded_wait_exceeds_the_priced_term).
+# RESIDUAL, stated rather than engineered around: nothing can tell an AST
+# which waits share a path, so a NEW bounded wait added to the adopted-head
+# path would still need a human to re-derive the term.
 #
 # TIMEOUT = 180 + 190 x 4.71 = 1074.9s, rounded UP the 60s pyproject grid to
 # 1080 (the same rounding rule the offline lane's `@pytest.mark.timeout(120)`
@@ -681,8 +709,10 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # block argues at length and this one does not restate: the marker can only be
 # wrong if the budget is breached, and a breach fails loudly, in-process, on
 # the test that caused it.
+DEEP_LANDING_PARK_WAIT_SECS = 60
+DEEP_LANDING_ADOPT_WAIT_SECS = 120
 DEEP_LANDING_SCENE_SPAWN_BUDGET = 190
-DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS = 180
+DEEP_LANDING_SCENE_BOUNDED_WAIT_SECS = DEEP_LANDING_PARK_WAIT_SECS + DEEP_LANDING_ADOPT_WAIT_SECS
 DEEP_LANDING_SCENE_TEST_TIMEOUT = 1080
 DEEP_LANDING_SCENE_BUDGET = SpawnBudget(
     DEEP_LANDING_SCENE_SPAWN_BUDGET,
@@ -744,6 +774,51 @@ def spawn_budget_violation(count: int, nodeid: str, *, budget: SpawnBudget) -> s
             'Raising the budget alone leaves the marker under-sized.'
         )
     return None
+
+
+#: Every asyncio entry point a git spawn can arrive through.  BOTH of them,
+#: because the measurement behind every :class:`SpawnBudget` counted both:
+#: ``git_ops._run`` reaches ``create_subprocess_exec`` and carries the bulk,
+#: but watching ``_exec`` alone budgets a scene against a different number
+#: than its paired timeout was priced from.
+GIT_SPAWN_SEAMS = ('create_subprocess_exec', 'create_subprocess_shell')
+
+
+def count_git_spawns(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
+    """Count git spawns for *monkeypatch*'s scope; return a reader for the total.
+
+    THE INSTRUMENT; :func:`spawn_budget_violation` is the VERDICT.  One
+    definition of each, so a budget fixture is the two-line wire between them
+    rather than a second copy of the half that carries the real failure modes
+    -- which seams are patched, that the wrapper AWAITS the real call instead
+    of handing back its coroutine, and that every seam is restored at
+    teardown.  A copied instrument is what quietly starts budgeting against a
+    different number than its timeout was priced from the first time a seam is
+    added or ``git_ops`` moves spawn entry point, since only one copy gets
+    fixed (task 5582 reviewer amendment).
+
+    Patched through *monkeypatch*, so restoration is the calling fixture's
+    scope and never this function's business, and counted IN-PROCESS per call
+    so a total stays correct under ``--dist loadgroup``, where one class's
+    tests can land on several workers.
+
+    Returns a READER and not the number, because the number does not exist
+    until the test has run; a callable also cannot be rebound by a caller that
+    meant only to read it.
+    """
+    spawns = 0
+
+    def counting(real):
+        async def counting_spawn(*args, **kwargs):
+            nonlocal spawns
+            spawns += 1
+            return await real(*args, **kwargs)
+
+        return counting_spawn
+
+    for seam in GIT_SPAWN_SEAMS:
+        monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+    return lambda: spawns
 
 
 # task 3540: the claimant-liveness TTL the row builder below derives its
