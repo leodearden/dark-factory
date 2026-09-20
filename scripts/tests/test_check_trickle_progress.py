@@ -71,12 +71,26 @@ def _run_probe(tmp_path, *args, extra_env=None, cwd=None):
     return result, git_marker
 
 
+# Counters AND exit code per entry, so a failed streak can follow
+# productive nights in one seed. exit_code is per-ENTRY rather than
+# per-seed because that is the only shape that can express the history the
+# regression needs: productive nights, then a crash.
+_SEED_OUTCOMES = {
+    "productive": (0, dict(selected_count=2)),
+    "quiet": (0, dict(zero_signal_dropped=5)),
+    "barren-budget": (0, dict(budget_skipped=4)),
+    "barren-cut": (0, dict(below_sampling_cut=3)),
+    # Signal in, run broke downstream -- the 2026-08-18 reify shape.
+    "failed": (1, dict(selected_count=1)),
+}
+
+
 def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
-          recorded_at=None, exit_code=0):
+          recorded_at=None):
     """Build a real state file by driving record_run for each entry in
-    *outcomes* (one of 'productive' / 'quiet' / 'barren-budget' /
-    'barren-cut'). The LAST entry's recorded_at is *recorded_at* (default:
-    now), so freshness is exercised against the real writer."""
+    *outcomes* (a key of :data:`_SEED_OUTCOMES`). The LAST entry's
+    recorded_at is *recorded_at* (default: now), so freshness is exercised
+    against the real writer."""
     monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
@@ -84,12 +98,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     for i, outcome in enumerate(outcomes):
         # Space earlier runs a day apart, ending on `stamp`.
         at = stamp - timedelta(days=(len(outcomes) - 1 - i))
-        counters = {
-            "productive": dict(selected_count=2, total_records=2),
-            "quiet": dict(zero_signal_dropped=5, total_records=5),
-            "barren-budget": dict(budget_skipped=4, total_records=4),
-            "barren-cut": dict(below_sampling_cut=3, total_records=3),
-        }[outcome]
+        entry_exit_code, counters = _SEED_OUTCOMES[outcome]
         # Annotated: without it the counter values infer as a narrow union
         # that pyright then checks positionally against record_run's later
         # keyword parameters when splatted as **full.
@@ -97,12 +106,15 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
             budget_skipped=0, selected_count=0,
         )
+        # Derived, so every seeded night satisfies SampleResult's
+        # conservation identity by construction.
         full.update(counters)
+        full["total_records"] = sum(full.values())
         doc = trickle_state.record_run(
             project_id,
             target_date=at.date() if hasattr(at, "date") else date(2026, 7, 1),
             recorded_at=at,
-            exit_code=exit_code,
+            exit_code=entry_exit_code,
             **full,
         )
     monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
@@ -352,7 +364,12 @@ def test_wrong_arity_prints_usage(tmp_path):
 
 
 def test_too_many_args_prints_usage(tmp_path):
-    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, "extra")
+    """Arity widened from 2-3 to 2-4 in task 4514 (the new optional
+    ``[max_failed_runs]``), so the over-arity case moves from 4 args to 5.
+
+    Safe to change: tasks 2587/2615 bound only ``check_trickle_liveness.sh``,
+    so no ``done_provenance`` rests on THIS script's arity."""
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 2, "extra")
 
     assert result.returncode != 0
     assert "usage" in result.stderr.lower()
@@ -401,4 +418,128 @@ def test_probe_imports_only_stdlib_under_bare_python(tmp_path, monkeypatch):
         f"expected a verdict exit code; got {result.returncode} "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    _assert_no_git(git_marker)
+
+
+# ---------------------------------------------------------------------------
+# The `failed` verdict (task 4514)
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_streak_exits_nonzero(tmp_path, monkeypatch):
+    """THE regression. Before task 4514 this identical history recorded
+    ``outcome=productive``, ``consecutive_barren_runs=0`` and exited 0
+    FOREVER — a permanently broken coder reading as a healthy pipeline."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_the_failed_verdict_is_distinct_from_the_barren_one(
+    tmp_path, monkeypatch
+):
+    """This file's "every failure verdict is DISTINCT" contract. A probe
+    that cannot say WHICH absence it found is the trap it exists to close
+    — and here the barren doors' remedies are actively WRONG."""
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    stderr = result.stderr
+    assert "failed" in stderr, "must name the outcome"
+    assert "2" in stderr, "must name the consecutive count"
+    assert "exit_code" in stderr or "exit code" in stderr
+    assert "last_productive_at" in stderr
+    assert "journalctl" in stderr, "must name where to read the crash"
+
+    assert "max_daily_digest_bytes" not in stderr, (
+        "raising the byte budget does nothing for a run that crashed"
+    )
+    assert "top_fraction" not in stderr, (
+        "the sampling cut is not the problem when the pipeline broke "
+        "downstream of it"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_the_failed_verdict_takes_precedence_over_the_barren_one(
+    tmp_path, monkeypatch
+):
+    """record_run CARRIES the barren streak forward across failed runs, so
+    a barren streak read during a failure window is stale by construction.
+    Report the failure."""
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget", "barren-budget", "failed", "failed"],
+    )
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode != 0
+    assert "journalctl" in result.stderr, "the FAILED verdict must be the one"
+    assert "max_daily_digest_bytes" not in result.stderr
+    _assert_no_git(git_marker)
+
+
+def test_a_sub_threshold_failed_night_reads_honestly(tmp_path, monkeypatch):
+    """The "OK: last run was productive 0h ago" lie. Below the threshold
+    the probe still exits 0 — one crash is already owned elsewhere — but
+    it must not claim the last run was productive when it was not."""
+    _seed(tmp_path, monkeypatch, outcomes=["productive", "failed"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "failed" in result.stdout, "the last run's outcome, reported"
+    assert "consecutive_failed_runs=1" in result.stdout
+    assert "was productive" not in result.stdout, (
+        "the last run was NOT productive; reporting it as such is the "
+        "exact lie this task closes"
+    )
+    _assert_no_git(git_marker)
+
+
+def test_max_failed_runs_is_a_fourth_optional_positional(
+    tmp_path, monkeypatch
+):
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    loose, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 5)
+    assert loose.returncode == 0, (
+        f"stdout={loose.stdout!r} stderr={loose.stderr!r}"
+    )
+    _assert_no_git(git_marker)
+
+    _seed(tmp_path, monkeypatch, outcomes=["failed"])
+    tight, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, 1)
+    assert tight.returncode != 0
+    _assert_no_git(git_marker)
+
+
+def test_max_failed_runs_defaults_to_the_module_constant(
+    tmp_path, monkeypatch
+):
+    """Pins ``trickle_state.DEFAULT_MAX_FAILED_RUNS`` as the default under
+    BOTH shorter arities, so neither can drift from it."""
+    assert trickle_state.DEFAULT_MAX_FAILED_RUNS == 2
+
+    _seed(tmp_path, monkeypatch, outcomes=["failed", "failed"])
+    two_arg, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+    assert two_arg.returncode != 0
+    _assert_no_git(git_marker)
+
+    three_arg, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
+    assert three_arg.returncode != 0
+    _assert_no_git(git_marker)
+
+
+def test_non_integer_max_failed_prints_usage(tmp_path, monkeypatch):
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72, "twice")
+
+    assert result.returncode != 0
+    assert "usage" in result.stderr.lower()
     _assert_no_git(git_marker)
