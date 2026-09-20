@@ -26,9 +26,21 @@ const MAX_HEATMAP_COLS = 60
 // and a hand-written third number would drift the moment either axis moved.
 const MAX_HEATMAP_CELLS = MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS
 
-// Does this task row contend for this lock module?
+// Does this task row contend for this lock module — i.e. would its cell be
+// anything but blank?
+//
+// THE SINGLE SOURCE of that rule. scheduler_heatmap.jsx's cellStateFor
+// delegates here for its first two branches, and row selection below reaches
+// it through modulesByPath. Were the axis filter to restate the rule instead,
+// it could drop a row whose cells the renderer would have coloured.
+//
+// Modules are keyed by `(project, path)` on the server, so a path match is not
+// a lock match: two projects can each have `src/utils.py`, and a row from
+// project B is not contending for project A's lock. A falsy project on either
+// side is legacy/single-project mode and skips the check.
 function rowTouchesModule(row, module) {
   if (!row || !module) return false
+  if (module.project && row.project && module.project !== row.project) return false
   return (row.lock_set || []).includes(module.path)
 }
 
@@ -55,7 +67,36 @@ function boundHeatmapAxes({ rows, modules }) {
   // `filter` preserves relative order, so the server's `(-contention, path)`
   // sort is inherited rather than re-derived on the client.
   const keptModules = allModules.filter(moduleEarnsColumn)
-  const keptRows = allRows
+
+  // Index the surviving columns by path so a row is scanned against its own
+  // lock_set rather than against every column: O(rows x lock_set) probes
+  // (~13k on the live snapshot) instead of O(rows x modules) (~12.9M). A path
+  // can carry more than one module when two projects share it, which is why
+  // the value is a list and why the project rule still has to run per hit.
+  const keptModulesByPath = new Map()
+  for (const module of keptModules) {
+    const atPath = keptModulesByPath.get(module.path)
+    if (atPath) atPath.push(module)
+    else keptModulesByPath.set(module.path, [module])
+  }
+
+  // Deliberately reaches the exported predicate rather than reimplementing it
+  // against the index — the index accelerates the lookup and carries no copy
+  // of the membership rule.
+  function touchesAnyKeptModule(row) {
+    for (const path of (row.lock_set || [])) {
+      for (const module of keptModulesByPath.get(path) || []) {
+        if (rowTouchesModule(row, module)) return true
+      }
+    }
+    return false
+  }
+
+  // A parked row is kept whatever its columns do: it is what the Scheduler
+  // tab's stranded-parks banner is pointing at.
+  const keptRows = allRows.filter(
+    row => touchesAnyKeptModule(row) || ((row.park_state || {}).modules || []).length > 0
+  )
 
   return {
     rows: keptRows,
