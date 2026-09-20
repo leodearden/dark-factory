@@ -12460,6 +12460,232 @@ async def test_client_op_id_failure_result_not_pinned(
         await journal.close()
 
 
+# ── Task 5241: a done write's journal row names the CALLER ──────────────
+#
+# Incident 5156's row said agent_id='task-interceptor' — the component that
+# WROTE the row, not the caller that asked for the write — so the caller was
+# unrecoverable from the audit trail. On a DONE write the row now carries the
+# RESOLVED caller (NULL when none was supplied, which reads honestly as "the
+# caller supplied no identity") plus `params['done_provenance_kind']`, for
+# the accepted and the REFUSED write alike. The refused row is the load-
+# bearing one: it is the only surface on which a spoofing caller — the
+# residual the self-reported identity cannot prevent — becomes visible.
+#
+# Every non-done row keeps the literal and carries no `done_provenance_kind`
+# key, so no existing consumer changes meaning.
+#
+# Rows are read back through the PUBLIC readers. The `journal._db` sqlite
+# reads elsewhere in this file are the pattern to improve on, not to copy:
+# reaching a module's internals from a test is an interface smell.
+
+
+@contextlib.asynccontextmanager
+async def _wired_journal(interceptor, path):
+    """A real WriteJournal at *path*, wired into *interceptor* and closed."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(path)
+    await journal.initialize()
+    try:
+        interceptor.set_write_journal(journal)
+        yield journal
+    finally:
+        await journal.close()
+
+
+async def _only_row(journal, operation: str) -> dict:
+    """The single write_ops row for *operation*, via the public reader."""
+    rows = [
+        row for row in await journal.get_ops_since('1970-01-01')
+        if row['operation'] == operation
+    ]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+class TestDoneWriteJournalNamesTheCaller:
+    """PRD C5's audit half: the caller must be recoverable from the row alone."""
+
+    @pytest.mark.asyncio
+    async def test_refused_done_write_journals_the_caller_and_the_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The B11 signal, and the exact 5156 shape: a refused recon-stage gate
+        close leaves an intent row naming who asked."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_refused') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='recon-stage-task_knowledge_sync',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'recon-stage-task_knowledge_sync'
+            assert row['success'] == 0
+            assert row['error'], 'a refusal row must carry the refusal'
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+            # Nothing was attempted, so there is no backend row to explain.
+            assert await journal.get_backend_ops_for_write_op(row['id']) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('provenance', 'expected_kind'),
+        [
+            ({'kind': 'nonsense'}, 'nonsense'),
+            ('not-even-a-dict', None),
+            ({'note': 'no kind at all'}, None),
+        ],
+        ids=['unknown-kind', 'non-dict', 'kindless'],
+    )
+    async def test_a_malformed_claim_still_leaves_an_audit_row(
+        self, taskmaster, reconciler, event_buffer, tmp_path, provenance, expected_kind,
+    ):
+        """An unparseable claim must not silently skip the audit row — the row
+        records whatever the caller claimed, None when it is unreadable."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_malformed') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=provenance,
+                agent_id='dashboard',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'dashboard'
+            assert row['success'] == 0
+            assert json.loads(row['params'])['done_provenance_kind'] == expected_kind
+
+    @pytest.mark.asyncio
+    async def test_accepted_done_write_journals_the_caller_and_the_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_accepted') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='orchestrator',
+            )
+            assert 'error' not in result, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'orchestrator'
+            assert row['success'] == 1
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+            assert await journal.get_backend_ops_for_write_op(row['id']) != []
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_caller_reads_as_unknown_not_as_the_component(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """NULL, never the literal 'task-interceptor': recording the component
+        for an unknown caller is precisely the unrecoverability 5241 closes."""
+        sha = _init_git_repo(tmp_path)
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_anon') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance={'kind': 'merged', 'commit': sha},
+                agent_id=None,
+            )
+            assert 'error' not in result, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] is None
+            assert json.loads(row['params'])['done_provenance_kind'] == 'merged'
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_journals_its_caller(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """This seam had no journal row at all before — a repair of an
+        already-`done` task was invisible to the audit trail."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_repair') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='orchestrator',
+            )
+            assert result.get('done_provenance_repaired') is True, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'orchestrator'
+            assert row['success'] == 1
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_repair_journals_a_failure_row(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_repair_no') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='recon-stage-2',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'recon-stage-2'
+            assert row['success'] == 0
+            assert row['error']
+
+    @pytest.mark.asyncio
+    async def test_a_non_done_status_row_is_byte_unchanged(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The override is scoped to done writes: everything else keeps the
+        literal and carries no done_provenance_kind key."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_inprog') as journal:
+            await interceptor.set_task_status(
+                '1', 'in-progress', str(tmp_path), agent_id='dashboard',
+            )
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'task-interceptor'
+            assert 'done_provenance_kind' not in json.loads(row['params'])
+
+    @pytest.mark.asyncio
+    async def test_an_update_task_row_is_byte_unchanged(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_update') as journal:
+            await interceptor.update_task('1', str(tmp_path), prompt='tweak')
+
+            row = await _only_row(journal, 'update_task')
+            assert row['agent_id'] == 'task-interceptor'
+            assert 'done_provenance_kind' not in json.loads(row['params'])
+
+
 # ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────
 
 
