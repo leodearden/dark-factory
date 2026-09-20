@@ -98,7 +98,19 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     """Build a real state file by driving record_run for each entry in
     *outcomes* (a key of :data:`_SEED_OUTCOMES`). The LAST entry's
     recorded_at is *recorded_at* (default: now), so freshness is exercised
-    against the real writer."""
+    against the real writer.
+
+    The state root stays SET for the remainder of the test. It is the same
+    root ``_run_probe`` pins into the child env, so nothing needs it
+    unset — and unsetting it would drop
+    ``conftest.py::_isolate_legibility_trickle_state`` for every line
+    after the seed, aiming any later in-process ``record_run`` or
+    ``trickle_state_path`` call at the operator's live
+    ``~/.local/state/dark-factory/legibility/<project>/`` (this helper's
+    default project_id is the literal ``dark_factory``). That fixture's
+    own contract is that only a test deliberately exercising the
+    passwd-anchored DEFAULT may delenv, and must then assert on the
+    resolved path alone; seeding is not that test."""
     monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
@@ -125,7 +137,6 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             exit_code=entry_exit_code,
             **full,
         )
-    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
     return doc
 
 
@@ -310,9 +321,7 @@ def test_missing_state_file_is_its_own_verdict(tmp_path):
 
 def test_corrupt_state_file_is_its_own_verdict(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, outcomes=["productive"])
-    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     trickle_state.trickle_state_path("dark_factory").write_text("{corrupt")
-    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
@@ -361,9 +370,7 @@ def test_unparseable_recorded_at_is_its_own_verdict(tmp_path, monkeypatch):
     age boundary, so this closes the one gap in that refactor's regression
     net."""
     _seed(tmp_path, monkeypatch, outcomes=["productive"])
-    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     path = trickle_state.trickle_state_path("dark_factory")
-    monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
     doc = json.loads(path.read_text(encoding="utf-8"))
     doc["recorded_at"] = "not-a-timestamp"
     path.write_text(json.dumps(doc), encoding="utf-8")
