@@ -11087,6 +11087,124 @@ class TestStoreFailureDiagnosticsHelper:
         assert mem0_diag['error_type'] == 'RuntimeError'
 
 
+class TestGetMemoryMem0Fingerprint:
+    """MemoryService.get_memory must read each field from the level mem0 puts it at.
+
+    The record shapes below are not guessed — they are exactly what installed
+    mem0 1.0.11 builds in ``mem0/memory/main.py::Memory.get`` /
+    ``::AsyncMemory.get``:
+
+      * ``promoted_payload_keys`` (``user_id``, ``agent_id``, ``run_id``,
+        ``actor_id``, ``role``) are copied to the record's TOP LEVEL and are
+        EXCLUDED from ``metadata`` via ``core_and_promoted_keys``;
+      * every other payload key — ``category`` among them — STAYS inside
+        ``metadata``;
+      * ``created_at`` is top level, normalised through
+        ``_normalize_iso_timestamp_to_utc``.
+
+    The measured harm this pins: 5/5 real ``cite_memory`` calls returned
+    ``{category: None, agent_id: None, created_at: <real>}`` against records
+    whose raw payloads carried non-null values for both.
+    """
+
+    _UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    @staticmethod
+    def _mem0_record(**overrides) -> dict:
+        """A record shaped exactly as installed mem0 1.0.11's get() returns it."""
+        record = {
+            'id': TestGetMemoryMem0Fingerprint._UUID,
+            'memory': 'some text',
+            'hash': 'h',
+            'created_at': '2026-09-09T12:00:00+00:00',
+            'updated_at': None,
+            'score': None,
+            # promoted_payload_keys -> lifted to the TOP LEVEL, absent from metadata
+            'agent_id': 'claude-review-df-3200',
+            'user_id': 'dark_factory',
+            'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+            # everything else stays INSIDE metadata
+            'metadata': {'category': 'observations_and_summaries', 'topic': 't'},
+        }
+        record.update(overrides)
+        return record
+
+    @pytest.mark.asyncio
+    async def test_reads_every_field_from_the_level_mem0_puts_it_at(self, service):
+        """The fingerprint is fully populated — no field is structurally None."""
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result == {
+            'category': 'observations_and_summaries',
+            'agent_id': 'claude-review-df-3200',
+            'created_at': '2026-09-09T12:00:00+00:00',
+        }, (
+            f'category must be read out of metadata and agent_id off the top level '
+            f'(mem0 promotes it); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_literally_none_does_not_raise(self, service):
+        """mem0 emits ``metadata: None``, not an absent key — handle it.
+
+        ``MemoryItem.model_dump()`` ALWAYS emits ``metadata: None`` and
+        ``result_item['metadata']`` is overwritten only ``if
+        additional_metadata:``, so a record whose payload carried nothing but
+        core and promoted keys arrives with ``metadata`` literally ``None``.
+        This is why ``rec.get('metadata') or {}`` must be preserved over
+        ``rec['metadata']`` — the ``or {}`` is load-bearing, not defensive
+        decoration.
+        """
+        service.mem0.get = AsyncMock(return_value=self._mem0_record(metadata=None))
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result['category'] is None
+        assert result['agent_id'] == 'claude-review-df-3200', (
+            'a promoted key lives at the top level and must survive metadata being None'
+        )
+        assert result['created_at'] == '2026-09-09T12:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_absent_promoted_key_does_not_raise(self, service):
+        """mem0 copies a promoted key only ``if key in memory.payload``.
+
+        So ``agent_id`` can be absent from the record ENTIRELY — the read must
+        be ``.get()``, never a subscript.
+        """
+        record = self._mem0_record()
+        del record['agent_id']
+        service.mem0.get = AsyncMock(return_value=record)
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert result['agent_id'] is None
+        assert result['category'] == 'observations_and_summaries'
+        assert result['created_at'] == '2026-09-09T12:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_shape_is_not_widened(self, service):
+        """The returned keys are EXACTLY {category, agent_id, created_at}.
+
+        Contract guard.  The three-key shape is consumed by
+        ``ReconReportState.cite_memory``, ``reconciliation/prompts/__init__.py``
+        and ``cli_stage_runner``'s JSON schema.  The audit of mem0's
+        ``promoted_payload_keys`` shows ``user_id`` / ``run_id`` / ``actor_id``
+        / ``role`` also sit at the top level of the record, and ``agent_id`` is
+        the only one this fingerprint touches — availability is not a reason to
+        widen a downstream contract.
+        """
+        service.mem0.get = AsyncMock(return_value=self._mem0_record())
+
+        result = await service.get_memory(self._UUID, 'mem0', 'dark_factory')
+
+        assert set(result) == {'category', 'agent_id', 'created_at'}, (
+            f'fingerprint shape is a downstream contract; got keys {sorted(result)!r}'
+        )
+
+
 class TestGetMemoryTimeoutNotCoercedToNotFound:
     """MemoryService.get_memory must PROPAGATE a mem0 read timeout, never coerce it.
 
