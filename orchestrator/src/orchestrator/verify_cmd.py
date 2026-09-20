@@ -110,6 +110,29 @@ class VerifyCmd:
 # RECOGNISED-BUT-UNSTRUCTURABLE discussion).
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
+# The separate-token value flags THIS MODULE's own mutators emit —
+# `-p no:xdist -o addopts=` (serial_pytest), `-n <count>`
+# (apply_pytest_numprocesses), `--timeout <secs>` (with_pytest_timeout),
+# `--junitxml <path>` (with_junitxml). Folded into _PYTEST_VALUE_FLAGS below
+# so the EMIT side and the PARSE side are one declaration rather than two
+# lists that can drift, and asserted at the single emit site
+# (_append_value_flag), so a future mutator emitting an undeclared value flag
+# fails here rather than in the fleet.
+#
+# The drift it closes was real and costly. A merge-gate command is rewritten
+# as a STRING twice — confirm_isolated_rerun_verdict renders the scoped
+# re-run ending in `--timeout 300`, then run_verification RE-PARSES that
+# string to append `--junitxml` — and neither of those two self-emitted flags
+# was bound, so `300` came back as a test TARGET and the flag was stranded::
+#
+#     pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
+#     pytest: error: argument --timeout: expected one argument      (rc=4)
+#
+# Measured cost: every merge_gate observation in the flake ledger — 350
+# `fails_in_isolation`, ZERO `passes_in_isolation`, 2026-08-30 to 2026-09-17 —
+# recorded a rejected command as a real red (task 5580).
+_EMITTED_VALUE_FLAGS = frozenset({'-p', '-o', '-n', '--timeout', '--junitxml'})
+
 # Genuinely value-taking pytest flags that consume a SEPARATE following
 # token (as opposed to a boolean flag, or a `--flag=value` single token).
 # Used by _split_pytest_args to bind a value flag to its value as an
@@ -133,27 +156,39 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # for the worker count and its cap, and a set that binds `-n` but not `-n`'s
 # own long spelling is the same latent defect one config rename away.
 #
-# Task 5580 found the two remaining omissions, and they were the two flags
-# THIS MODULE ITSELF emits: `with_pytest_timeout` appends `--timeout <secs>`
-# and `with_junitxml` appends `--junitxml <path>`, and neither was bound. The
-# merge gate composes both — `confirm_isolated_rerun_verdict` renders the
-# scoped re-run as a STRING ending in `--timeout 300`, and `run_verification`
-# RE-PARSES that string to append `--junitxml` — so `300` came back as a test
-# TARGET and the flag was stranded::
-#
-#     pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
-#     pytest: error: argument --timeout: expected one argument      (rc=4)
-#
-# Measured cost: every merge_gate observation in the flake ledger — 350
-# `fails_in_isolation`, ZERO `passes_in_isolation`, 2026-08-30 to 2026-09-17 —
-# recorded a rejected command as a real red.
+# The last two omissions were flags no config had to contain, because this
+# module emits them itself — hence _EMITTED_VALUE_FLAGS above, which is
+# unioned in here rather than re-typed, and which task 5580's measurement
+# documents.
 _PYTEST_VALUE_FLAGS = frozenset({
-    '-k', '-m', '-p', '-o', '-c', '-n', '-W',
+    '-k', '-m', '-c', '-W',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
     '--dist', '--numprocesses', '--maxprocesses',
-    '--timeout', '--junitxml',
-})
+}) | _EMITTED_VALUE_FLAGS
+
+
+def _append_value_flag(cmd: VerifyCmd, flag: str, value: str) -> VerifyCmd:
+    """Append a ``<flag> <value>`` pair to *cmd*'s ``base_flags``.
+
+    THE single site that emits such a pair, so the emit side and the parse
+    side cannot disagree: a flag this module appends is, by construction, a
+    flag ``_split_pytest_args`` binds to its value when the rendered command
+    is re-parsed by the next rewrite. Without that, an unbound flag is
+    stranded and its value is admitted as a TEST TARGET — see
+    ``_EMITTED_VALUE_FLAGS``.
+
+    The assert is the same defensive, self-describing style as ``render``'s
+    P1/P3 invariant asserts: no current caller can reach it, and it is what a
+    future mutator emitting a new value flag trips on.
+    """
+    assert flag in _PYTEST_VALUE_FLAGS, (
+        f'{flag!r} is emitted as a value flag but is not in '
+        f'_PYTEST_VALUE_FLAGS, so re-parsing the rendered command would '
+        f'strand it and admit {value!r} as a test target — declare it in '
+        f'_EMITTED_VALUE_FLAGS'
+    )
+    return replace(cmd, base_flags=(*cmd.base_flags, flag, value))
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
 # CARGO_CLIPPY intentionally exclude this — cargo's rest-tokens are carried
@@ -1898,11 +1933,9 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(
-        cmd,
-        base_flags=(
-            *_strip_xdist_worker_flags(cmd.base_flags), '-p', 'no:xdist', '-o', 'addopts=',
-        ),
+    shed = replace(cmd, base_flags=_strip_xdist_worker_flags(cmd.base_flags))
+    return _append_value_flag(
+        _append_value_flag(shed, '-p', 'no:xdist'), '-o', 'addopts=',
     )
 
 
@@ -1971,7 +2004,7 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
+    return _append_value_flag(cmd, '-n', n)
 
 
 def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
@@ -2003,7 +2036,7 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--junitxml', junit_path))
+    return _append_value_flag(cmd, '--junitxml', junit_path)
 
 
 def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
@@ -2034,7 +2067,7 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--timeout', str(secs)))
+    return _append_value_flag(cmd, '--timeout', str(secs))
 
 
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
