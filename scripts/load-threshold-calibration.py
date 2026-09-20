@@ -957,9 +957,13 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     ratio. Presence is rows over corpus ticks: a tick with no ``*_read_ok`` row
     is a tick the series' leaf was not discovered on — a unit restarted, added,
     removed or renamed. Readability is readable ticks over the ticks the series
-    was present. A shortfall split between the two can leave both above the
-    floor while ``readable_fraction`` dips below it; that fraction is still
-    printed beside every hold ladder, but neither cause alone is a finding.
+    was present, and a ZERO numerator there is reported as its own cause rather
+    than as the extreme of that one: a series read on no tick has no hold
+    fractions to read against its coverage, which is the action
+    ``low_readability`` asks for. A shortfall split between the two can leave
+    both above the floor while ``readable_fraction`` dips below it; that
+    fraction is still printed beside every hold ladder, but neither cause alone
+    is a finding.
 
     An unknown coverage (either count zero) has no cause to name, so it yields
     nothing here rather than a division by zero — which would be a non-zero rc,
@@ -979,7 +983,16 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
             'was not discovered), so its hold fractions describe that span, not '
             'the whole corpus',
         ))
-    if readable / rows < D11_READABILITY_FLOOR:
+    if readable == 0:
+        out.append((
+            'never_readable',
+            f'was discovered on {rows}/{corpus} corpus ticks and readable on '
+            'none of them — a tick with no readable value writes no value row, '
+            'so this series has no candidate-threshold section above; its '
+            'absence there is failed reads, not a leaf that was never '
+            'discovered',
+        ))
+    elif readable / rows < D11_READABILITY_FLOOR:
         out.append((
             'low_readability',
             f'readable on {readable}/{rows} of the ticks it was present '
@@ -1019,10 +1032,13 @@ def readability_degradations(
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 
-    Three separate degradations, because they call for three different operator
+    Four separate degradations, because they call for four different operator
     readings: ``low_readability`` says the collector ran on the series and often
     failed, so read the hold fractions against that coverage;
-    ``partial_presence`` says the series existed for only part of the corpus,
+    ``never_readable`` says it failed EVERY time, so there are no hold
+    fractions to read at all and the series has no candidate-threshold section
+    above to read them in; ``partial_presence`` says the series existed for
+    only part of the corpus,
     so its hold fractions describe that span, not the whole window; and
     ``unknown_readability`` says the corpus carries no evidence either way,
     which usually means the collector never ran at all. Folding any one into
