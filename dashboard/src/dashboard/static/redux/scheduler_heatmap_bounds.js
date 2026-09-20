@@ -64,9 +64,14 @@ function boundHeatmapAxes({ rows, modules }) {
   const allRows = rows || []
   const allModules = modules || []
 
-  // `filter` preserves relative order, so the server's `(-contention, path)`
-  // sort is inherited rather than re-derived on the client.
-  const keptModules = allModules.filter(moduleEarnsColumn)
+  // `filter` and `slice` both preserve relative order, so the server's
+  // `(-contention, path)` sort is inherited rather than re-derived: the
+  // surviving columns are a PREFIX of it, i.e. the most contended ones.
+  //
+  // The slice lands BEFORE row selection so rows are chosen against the
+  // columns that will actually render — a row touching only a column past the
+  // cap would otherwise survive it and render as 60 blank cells.
+  const keptModules = allModules.filter(moduleEarnsColumn).slice(0, MAX_HEATMAP_COLS)
 
   // Index the surviving columns by path so a row is scanned against its own
   // lock_set rather than against every column: O(rows x lock_set) probes
@@ -94,9 +99,9 @@ function boundHeatmapAxes({ rows, modules }) {
 
   // A parked row is kept whatever its columns do: it is what the Scheduler
   // tab's stranded-parks banner is pointing at.
-  const keptRows = allRows.filter(
-    row => touchesAnyKeptModule(row) || ((row.park_state || {}).modules || []).length > 0
-  )
+  const keptRows = allRows
+    .filter(row => touchesAnyKeptModule(row) || ((row.park_state || {}).modules || []).length > 0)
+    .slice(0, MAX_HEATMAP_ROWS)
 
   return {
     rows: keptRows,
