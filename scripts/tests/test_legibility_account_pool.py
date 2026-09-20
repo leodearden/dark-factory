@@ -1115,6 +1115,109 @@ def test_a_zero_exit_banner_night_is_not_lost_end_to_end():
     assert gate.account_named('max-c').capped is True
 
 
+def test_a_verdict_that_quotes_a_banner_is_a_verdict():
+    """THE guard that keeps the new exit-0 scan from burning the pool.
+
+    MEASURED on this branch, 2026-09-20, against the REAL
+    ``shared.invocation_outcome.classify_invocation(..., strict_confirm=True)``
+    the gate delegates to: the reply built below — a schema-valid verdict
+    whose ``evidence_quote`` carries ``REAL_CLI_CAP_HIT_MESSAGES[0]``
+    verbatim — classifies as **CapHit**, and parses cleanly into a verdict.
+    "Strict" means a cap-hit PREFIX substring AND a confirm-keyword
+    substring; it is not anchored at the start of the reply, so quoting a
+    banner inside a field is enough to satisfy both.
+
+    That is why this test is load-bearing rather than decorative. Without
+    the parse gate, ONE cap-themed digest would have the gate's
+    ``_handle_cap_detected`` CAP every account the rotation walked —
+    persistently, for the rest of the night — reproducing the exact
+    night-loss task 5637 exists to remove, and breaching the hazard
+    ``pool_invoke``'s own docstring names: a loose false positive may
+    re-label one digest but must never burn the pool. ``evidence_quote`` is
+    a real field of ``codebook.py``'s schema and this repo's codebook is
+    dominated by usage-limit clusters, so the input is ordinary here rather
+    than exotic.
+
+    The gate is left at its DEFAULT ``cap_verdict=True``, which is what
+    makes ``detect_calls == []`` an assertion about the parse gate rather
+    than about the fake: this gate would verdict a cap if it were ever
+    asked. Mirrors ``test_a_loose_false_positive_propagates_unrotated``,
+    from the other side — there the gate was asked and said no; here it must
+    never be asked at all.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    verdict = json.dumps({
+        "matches": [{
+            "cluster_id": "usage-limit-stall",
+            "evidence_quote": cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0],
+        }],
+        "candidates": [],
+    })
+    invoke = _RecordingInvoke(replies={'tok-max-c': verdict})
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    assert len(invoke.calls) == 1, (
+        f'a reply that parses into a verdict must not rotate: no second '
+        f'account may be leased; got {[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert gate.detect_calls == [], (
+        f'the gate must never be ASKED about a reply that parses into a '
+        f'verdict — a reply that parses is a verdict, so there is no cap '
+        f'question to put; got {gate.detect_calls}'
+    )
+    assert gate.confirmed == ['tok-max-c'], (
+        f'the account answered, so it is confirmed healthy; got '
+        f'{gate.confirmed}'
+    )
+    assert gate.account_named('max-c').capped is False, (
+        'capping the account that produced a good verdict is the burn this '
+        'guard exists to prevent'
+    )
+    assert out == verdict, (
+        f'the verdict is returned VERBATIM so code_digest can code it; got '
+        f'{out!r}'
+    )
+
+
+def test_an_unparseable_reply_that_is_not_a_banner_is_an_ordinary_failure():
+    """The other side of the parse gate: it must not SWALLOW junk.
+
+    Gating the scan on parse failure is only safe if a reply the coder
+    cannot use is still offered to the gate — otherwise the gate's coverage
+    would shrink to nothing the moment the CLI wrapped its banner in
+    anything. Here the reply is unparseable AND not a banner, so the gate is
+    asked and says no: the account is healthy, this one digest is not, and
+    the prose goes back verbatim for ``coder.code_digest`` to fail on its
+    own parse — the same disposition it had before task 5637.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    gate.cap_verdict = False          # strict detector: not a cap
+    prose = 'I was unable to complete this analysis of the digest.'
+    invoke = _RecordingInvoke(replies={'tok-max-c': prose})
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    assert len(invoke.calls) == 1, (
+        f'the gate said this was not a cap, so no rotation; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert len(gate.detect_calls) == 1, (
+        f'the gate MUST be asked about a reply the coder could not parse — '
+        f'the parse gate decides whether to ask, never what the answer is; '
+        f'got {gate.detect_calls}'
+    )
+    assert gate.detect_calls[0]['output'] == prose
+    assert gate.confirmed == ['tok-max-c'], (
+        f'an unusable reply is not an unhealthy account; got {gate.confirmed}'
+    )
+    assert gate.account_named('max-c').capped is False
+    assert out == prose, (
+        f'returned verbatim so code_digest fails this digest normally on its '
+        f'own parse; got {out!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-15: build_pool() — a REAL UsageGate from nothing but an accounts file.
 #
