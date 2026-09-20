@@ -1363,6 +1363,52 @@ class TestMem0BackendScrollAllByMetadata:
             await agen.aclose()
 
 
+class TestMem0BackendGetAll:
+    """get_all lists a scope's memories through mem0's own AsyncMemory.get_all."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """On TimeoutError the exception propagates — it is NOT swallowed into {}.
+
+        ONLY a backend-level test is needed, and that is the point: both
+        consumers already handle a RAISED exception correctly, so propagation
+        was the whole missing link.
+
+          * ``reconciliation/stages/memory_consolidator.py::assemble_payload``
+            wraps this call in ``except Exception`` -> WARNING with exc_info ->
+            ``_fetch_degraded_sources.append('mem0')``, and that contract is
+            ALREADY covered by
+            ``tests/reconciliation/test_stage1.py::TestConsolidatorFetchDegradedSources
+            ::test_mem0_fetch_failure_tracks_degraded_source``.  Under the
+            swallow a timeout instead returned ``{}``, tripped the
+            "malformed/absent 'results' key" WARNING and did NOT mark mem0
+            degraded; after this, a real timeout takes the path that existing
+            test already asserts.  Duplicating its assertion here would be a
+            second copy of one claim, so it is cited by name instead.
+          * ``MemoryService.replay_from_store`` replayed 0 and reported 0
+            queued on a timeout; now the ``replay_to_graphiti`` MCP tool
+            surfaces the error rather than a false zero.
+
+        INV-11 ``no-silent-fail-soft``.
+        """
+        mock_instance = MagicMock()
+        mock_instance.get_all = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
+            pytest.raises(TimeoutError) as excinfo,
+        ):
+            await backend.get_all(Scope(project_id='p'), limit=10)
+
+        assert 'timed out' in str(excinfo.value), (
+            f'raised TimeoutError must name the read timeout; got {str(excinfo.value)!r}'
+        )
+        assert str(backend._read_timeout) in str(excinfo.value), (
+            f'raised TimeoutError must carry the configured read timeout '
+            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
+        )
+
+
 class TestMem0BackendGet:
     """get fetches a single memory by id through mem0's own AsyncMemory.get."""
 
