@@ -181,10 +181,18 @@ def _mock_stage_run(stage, items_flagged=None):
     stage.run = mock_run
 
 
-def _finding_citing(*task_ids: str, description: str | None = None) -> dict:
-    """An actionable stranded-work finding citing each of *task_ids*."""
+def _finding_citing(
+    *task_ids: str, description: str | None = None, routed_to: str | None = None,
+) -> dict:
+    """An actionable stranded-work finding citing each of *task_ids*.
+
+    *routed_to* sets the bare ``task_id`` field, which
+    ``resolve_finding_task_target`` prefers over ``cited_tasks`` — the way to
+    build a finding whose ROUTED target is not one of its cited ids, and so the
+    only way to reach the routed-target liveness gate.
+    """
     cited = ','.join(task_ids)
-    return {
+    finding = {
         'description': description or f'Implementation-complete but not merged: {cited}',
         'severity': 'urgent',
         'actionable': True,
@@ -194,6 +202,12 @@ def _finding_citing(*task_ids: str, description: str | None = None) -> dict:
         ],
         'suggested_action': 'Manual merge required',
     }
+    if routed_to is not None:
+        finding['task_id'] = routed_to
+        finding['description'] = description or (
+            f'Implementation-complete but not merged: {cited} (routed to {routed_to})'
+        )
+    return finding
 
 
 def _in_progress_task(task_id: str) -> dict:
@@ -381,6 +395,198 @@ class TestArchiveScanLeavesTheLoop:
 
         assert len(calls) == 1, (
             f'expected exactly 1 archive scan for a 3-finding pass, got {len(calls)}'
+        )
+
+
+# ── SITE 2: the live-workflow git probes ─────────────────────────────────────
+
+
+def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
+                block: float = PROBE_BLOCK_SECONDS):
+    """Replace the live-workflow detector with a blocking stub that records ids.
+
+    Stands in for ``is_workflow_live_for_task``, which shells out to up to three
+    ``subprocess.run(['git', ...], timeout=10)`` calls per task.
+    """
+
+    def _is_live(tid, _project_root, **_kw):
+        probed.append(str(tid))
+        time.sleep(block)
+        return str(tid) in live_ids
+
+    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _is_live)
+
+
+class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
+    """The git probes must run off-loop, and at most once per DISTINCT task id.
+
+    Today the gate re-probes per finding with no memo, so a pass over three
+    findings citing two tasks between them pays six probes of up to 30s each,
+    all of them on the event loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loop_keeps_ticking_while_the_git_probes_run(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901', '902'), _finding_citing('901'),
+                      _finding_citing('902')],
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        ticks = await _ticks_while(run_pass())
+
+        assert probed, 'the detector was never consulted — site 2 is not exercised'
+        assert ticks >= _tick_floor(PROBE_BLOCK_SECONDS * 2), (
+            f'event loop got control only {ticks} times while the pass ran; '
+            f'the live-workflow git probes are still inline on the loop'
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_distinct_cited_task_is_probed_exactly_once(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """Three findings, two distinct cited ids → two probes, not six.
+
+        Liveness is treated as constant for a task id across the gate loop —
+        the same loop-constant assumption the pass already makes for the
+        scheduler state and orchestrator start time hoisted just above it.
+        """
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed, block=0.0)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901', '902'), _finding_citing('901'),
+                      _finding_citing('902')],
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        with caplog_silent():
+            await run_pass()
+
+        assert probed == ['901', '902'], (
+            f'expected one probe per DISTINCT cited task id, got {probed}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_findings_still_escalate_when_nothing_is_live(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """VERDICT PARITY — memoising False must not silence an escalation."""
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed, block=0.0)
+        findings = [_finding_citing('901', '902'), _finding_citing('901'),
+                    _finding_citing('902')]
+        _, esc_queue, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=findings,
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        with caplog_silent():
+            await run_pass()
+
+        stranded = [
+            e for e in esc_queue.get_pending()
+            if e.category == 'recon_integrity_issue'
+            and 'Persistently unresolved' in e.summary
+        ]
+        assert len(stranded) == len(findings), (
+            f'expected all {len(findings)} findings to escalate with nothing live, '
+            f'got {len(stranded)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_findings_citing_a_live_task_are_suppressed(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """VERDICT PARITY — a live cited task still suppresses, and says so."""
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed, live_ids=frozenset({'901'}), block=0.0)
+        _, esc_queue, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901', '902'), _finding_citing('901'),
+                      _finding_citing('902')],
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            await run_pass()
+
+        suppressed = [
+            r for r in caplog.records
+            if r.getMessage()
+            == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+        ]
+        stranded = [
+            e for e in esc_queue.get_pending()
+            if e.category == 'recon_integrity_issue'
+            and 'Persistently unresolved' in e.summary
+        ]
+        assert len(suppressed) == 2, (
+            f'expected the two findings citing live task 901 to be suppressed, '
+            f'got {len(suppressed)} suppression records'
+        )
+        assert len(stranded) == 1, (
+            f'expected only the 902-citing finding to escalate, got {len(stranded)}'
+        )
+
+
+class TestRoutedTargetGateUsesTheSameMemo:
+    """The routed-target gate is the SECOND consumer of the probe and must
+    share the memo rather than re-probing a task the cited gate already asked
+    about."""
+
+    @pytest.mark.asyncio
+    async def test_routed_target_not_among_cited_ids_is_still_probed(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """A routed id the cited gate never saw must still consult the detector."""
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed, block=0.0)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901', routed_to='903')],
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('903')],
+        )
+
+        with caplog_silent():
+            await run_pass()
+
+        assert probed == ['901', '903'], (
+            f'expected the cited id then the routed id to be probed, got {probed}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_routed_target_already_probed_as_a_cited_id_hits_the_memo(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """Cross-gate memo: 902 is probed once, as a cited id, then served."""
+        probed: list[str] = []
+        _stub_probe(monkeypatch, probed, block=0.0)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901', '902'),
+                      _finding_citing('901', routed_to='902')],
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        with caplog_silent():
+            await run_pass()
+
+        assert probed == ['901', '902'], (
+            f'expected 902 to be probed once (as a cited id) and then served from '
+            f'the memo to the routed-target gate, got {probed}'
         )
 
 
