@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 
 @pytest.fixture(scope='module')
@@ -377,4 +378,150 @@ def test_styles_css_widens_scheduler_title_column(styles_css_body):
     # max-width may be absent (good) or >= 300px
     assert max_w is None or max_w >= 300, (
         f'.sched-row-title max-width is {max_w}px; expected >= 300px or absent'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5705: the heatmap renders BOUNDED axes, not the raw rows x modules
+# cross-product
+# ---------------------------------------------------------------------------
+#
+# WHY SOURCE TEXT. scheduler_heatmap.jsx is served as type="text/babel" and
+# transpiled in the browser; nothing in this project can import it. The bound
+# ITSELF is proven executably against a 2,991 x 4,302 fixture in
+# dashboard/tests/js/scheduler_heatmap_bounds.test.mjs — what that suite
+# structurally cannot see is whether the component actually CONSUMES it. That
+# is the whole difference between a structural cap and an advisory one, and it
+# is what these probes pin.
+#
+# Every probe is scoped with extract_function_body and comment-stripped. Both
+# properties are load-bearing: an unscoped substring probe would be satisfied
+# by prose or by a sibling function, and strip_js_comments is what stops a
+# comment describing the OLD expression from answering an ABSENCE assertion.
+# extract_function_body RAISES on a miss by design, so a rename fails loudly
+# instead of yielding an empty body over which every absence check passes
+# vacuously.
+
+
+@pytest.fixture(scope='module')
+def scheduler_heatmap_jsx_body(_client):
+    return _client.get('/static/redux/scheduler_heatmap.jsx').text
+
+
+def _heatmap_body(scheduler_heatmap_jsx_body: str) -> str:
+    """`SchedulerHeatmap`'s comment-stripped body."""
+    return strip_js_comments(
+        extract_function_body(scheduler_heatmap_jsx_body, 'SchedulerHeatmap')
+    )
+
+
+def test_scheduler_heatmap_consumes_the_shared_bound(scheduler_heatmap_jsx_body):
+    """SchedulerHeatmap must call boundHeatmapAxes to choose its axes.
+
+    Destructured at module scope from window.DF_SCHED_HEATMAP_BOUNDS — the
+    same contract tab_scheduler.jsx:15 relies on for window.DF_SCHED_HEATMAP,
+    and enforced by
+    test_index_html.py::test_scheduler_heatmap_bounds_js_loads_before_scheduler_heatmap.
+    """
+    src = strip_js_comments(scheduler_heatmap_jsx_body)
+    assert re.search(
+        r'const\s*\{[^}]*boundHeatmapAxes[^}]*\}\s*=\s*window\.DF_SCHED_HEATMAP_BOUNDS',
+        src,
+    ), (
+        'scheduler_heatmap.jsx must destructure boundHeatmapAxes from '
+        'window.DF_SCHED_HEATMAP_BOUNDS at module scope'
+    )
+    assert re.search(r'boundHeatmapAxes\s*\(', _heatmap_body(scheduler_heatmap_jsx_body)), (
+        'SchedulerHeatmap must CALL boundHeatmapAxes — importing the bound '
+        'without applying it leaves the cap advisory, which is the exact '
+        'failure mode task 5705 closes'
+    )
+
+
+def test_scheduler_heatmap_no_longer_iterates_the_raw_props(scheduler_heatmap_jsx_body):
+    """The two unbounded render iterations must be GONE.
+
+    This is the assertion that actually fails against the pre-5705 source and
+    the one that catches a regression. `rows.map(` built one <tr> per composed
+    task row and `enriched.map(` one <td><div> per module, in both the <thead>
+    and the <tbody> — 2,991 x 4,302 = 12,867,282 cells on the 2026-09-20 live
+    snapshot, which kills the browser renderer.
+
+    Asserted as an ABSENCE rather than "the bounded arrays are also iterated",
+    because adding a bounded iteration while LEAVING an unbounded one is
+    exactly the half-fix that would otherwise pass.
+    """
+    body = _heatmap_body(scheduler_heatmap_jsx_body)
+
+    assert 'rows.map(' not in body, (
+        'SchedulerHeatmap still iterates the raw `rows` prop — the row axis is '
+        'unbounded. Iterate the bounded selection instead.'
+    )
+    assert 'enriched.map(' not in body, (
+        'SchedulerHeatmap still iterates the unbounded `enriched` module list '
+        '— the column axis is unbounded. Enrich the BOUNDED modules instead.'
+    )
+
+
+def test_scheduler_heatmap_iterates_the_bounded_axes(scheduler_heatmap_jsx_body):
+    """Both axes of the grid come off the bounded selection.
+
+    The companion to the absence check above: together they pin that the grid
+    is built from `bounded.*` and from nothing else. Without this half, simply
+    deleting the render would pass.
+    """
+    body = _heatmap_body(scheduler_heatmap_jsx_body)
+
+    assert re.search(r'bounded\.rows\b', body), (
+        'the <tbody> must iterate the bounded rows'
+    )
+    assert re.search(r'bounded\.modules\b', body), (
+        'the <thead>/<tbody> columns must come from the bounded modules'
+    )
+
+
+def test_scheduler_heatmap_discloses_what_it_is_not_showing(scheduler_heatmap_jsx_body):
+    """A truncated grid must say so, naming the totals.
+
+    A silently-truncated heatmap is worse than a slow one: an operator reading
+    60 rows has no way to tell whether that is the whole picture or the top
+    2% of it. The affordance reads rowsTotal/modulesTotal — the INPUT sizes —
+    so it stays honest whether the shrinkage came from the contention filter
+    or from the hard cap.
+    """
+    body = _heatmap_body(scheduler_heatmap_jsx_body)
+
+    assert 'rowsTotal' in body and 'modulesTotal' in body, (
+        'SchedulerHeatmap must render the input totals so a truncated grid '
+        'discloses what it is hiding'
+    )
+    assert 'rowsTruncated' in body or 'modulesTruncated' in body, (
+        'the disclosure must be conditioned on the truncation flags rather '
+        'than shown unconditionally'
+    )
+
+
+def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatmap_jsx_body):
+    """cellStateFor must DELEGATE its membership check, not restate it.
+
+    SPOT (heuristic 11). Row selection and the cell renderer must answer "is
+    this cell non-blank?" identically; two copies of the project-scope +
+    lock_set pair would let the axis filter drift from the renderer, and the
+    filter could then drop a row whose cells the renderer would have coloured.
+    The cross-project branch is the subtle one — a path match is not a lock
+    match, because modules are keyed by (project, path) on the server.
+    """
+    body = strip_js_comments(extract_function_body(scheduler_heatmap_jsx_body, 'cellStateFor'))
+
+    assert re.search(r'rowTouchesModule\s*\(', body), (
+        'cellStateFor must call rowTouchesModule for its project-scope + '
+        'lock_set membership check'
+    )
+    assert not re.search(r'module\.project\s*!==\s*row\.project', body), (
+        'cellStateFor still restates the cross-project rule that '
+        'rowTouchesModule owns — the two copies will drift'
+    )
+    assert not re.search(r'lockSet\.includes\s*\(', body), (
+        'cellStateFor still restates the lock_set membership check that '
+        'rowTouchesModule owns'
     )
