@@ -1704,6 +1704,7 @@ cases, the same backing stores. **Check this table before adding a job** —
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
+| 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
@@ -1713,9 +1714,10 @@ caught up on next boot/login rather than silently skipped) and
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
 
-**04:30 is free.** The nightly reify closure-staleness sweep and its
-`consume_redispatch_requests` drain that used to hold that slot were retired by
-task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
+**04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
+trickle health probe (see below). The nightly reify closure-staleness sweep and
+its `consume_redispatch_requests` drain that used to hold that slot were retired
+by task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
 second, opposite-policy owner of the stranded-blocked population, and over the
 15 retained journal runs it cancelled 7 reify tasks as collateral. Its tracked
 units, wrapper, consumer and installer are deleted; the timer is **disabled**
@@ -1729,7 +1731,9 @@ names the deleted wrapper, so once this retirement is on main it fails
 `203/EXEC` nightly rather than sweeping anything. That population is now owned
 by the orchestrator scheduler's `_phase_redispatch_stranded_blocked`, the
 harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
-reconciliation.
+reconciliation. Those residual units do **not** collide with the new 04:30 job:
+they carry a different unit name, and a re-armed sweep would merely fail
+`203/EXEC` alongside it rather than contend for anything.
 
 ### Legibility trickle accounts (03:00)
 
