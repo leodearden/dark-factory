@@ -1363,6 +1363,57 @@ class TestMem0BackendScrollAllByMetadata:
             await agen.aclose()
 
 
+class TestMem0BackendGet:
+    """get fetches a single memory by id through mem0's own AsyncMemory.get."""
+
+    @pytest.mark.asyncio
+    async def test_returns_record(self, backend):
+        """A found record is returned verbatim, and mem0's get is called with the id."""
+        record = {'id': 'm1', 'memory': 'txt', 'metadata': {'category': 'x'}}
+        mock_instance = MagicMock()
+        mock_instance.get = AsyncMock(return_value=record)
+
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            result = await backend.get('m1', Scope(project_id='p'))
+
+        assert result == record
+        assert mock_instance.get.await_args.args == ('m1',)
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """On TimeoutError the exception propagates — it is NOT swallowed into None.
+
+        The harm here is worse than an empty search, and concrete: a swallowed
+        timeout reached ``MemoryService.get_memory`` as ``None``, which raises
+        ``MemoryNotFoundError``, which ``ReconReportState.cite_memory`` renders
+        as ``memory_not_found`` — and ``repair_memory_citation(reason=
+        'memory_not_found')`` DELETES citations on exactly that signal.  A
+        transient read blip could therefore destroy valid provenance.  INV-11
+        ``no-silent-fail-soft``: a timeout must never be reported as "this
+        memory does not exist".
+
+        The message must NAME the read timeout, for the same reason as
+        ``search``: ``asyncio.wait_for``'s own ``TimeoutError`` stringifies
+        EMPTY.
+        """
+        mock_instance = MagicMock()
+        mock_instance.get = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
+            pytest.raises(TimeoutError) as excinfo,
+        ):
+            await backend.get('m1', Scope(project_id='p'))
+
+        assert 'timed out' in str(excinfo.value), (
+            f'raised TimeoutError must name the read timeout; got {str(excinfo.value)!r}'
+        )
+        assert str(backend._read_timeout) in str(excinfo.value), (
+            f'raised TimeoutError must carry the configured read timeout '
+            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
+        )
+
+
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 

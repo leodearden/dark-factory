@@ -2635,6 +2635,31 @@ class TestCiteMemoryExceptionNarrowing:
         assert report is not None
         assert report['flagged_items'][0]['cited_memories'] == []
 
+    @pytest.mark.asyncio
+    async def test_read_timeout_propagates_not_reported_as_memory_not_found(self):
+        """A mem0 read TimeoutError must propagate — never render as memory_not_found.
+
+        The narrowness of cite_memory's `except (EdgeNotFoundError,
+        MemoryNotFoundError)` is LOAD-BEARING here, not incidental.
+        `repair_memory_citation(reason='memory_not_found')` DELETES citations on
+        that signal, so a transient read timeout rendered as "this memory does
+        not exist" would destroy valid provenance.  Since task 5265
+        `Mem0Backend.get` propagates its read timeout instead of swallowing it
+        into `None` (which `get_memory` then turned into `MemoryNotFoundError`),
+        so this is the first exception shape that can actually reach here from a
+        timed-out read.
+        """
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=TimeoutError('Mem0 get timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError):
+            await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
 
 # ---------------------------------------------------------------------------
 # task-2595 step-1: TestCiteRun — RED until step-2 adds cite_run to ReconReportState

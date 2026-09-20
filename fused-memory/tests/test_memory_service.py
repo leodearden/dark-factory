@@ -11087,6 +11087,43 @@ class TestStoreFailureDiagnosticsHelper:
         assert mem0_diag['error_type'] == 'RuntimeError'
 
 
+class TestGetMemoryTimeoutNotCoercedToNotFound:
+    """MemoryService.get_memory must PROPAGATE a mem0 read timeout, never coerce it.
+
+    ``get_memory`` distinguishes exactly two outcomes on the mem0 path: a
+    genuine miss (``rec is None`` -> ``MemoryNotFoundError``) and a fingerprint.
+    A read timeout is NEITHER, and conflating it with the miss is destructive
+    rather than merely lossy: ``ReconReportState.cite_memory`` renders
+    ``MemoryNotFoundError`` as ``memory_not_found``, and
+    ``repair_memory_citation(reason='memory_not_found')`` DELETES citations on
+    that signal — so a transient blip could erase valid provenance.
+
+    This is the pin that ``get_memory`` must never grow a ``try/except
+    TimeoutError`` of its own, now that ``Mem0Backend.get`` propagates instead
+    of returning ``None``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mem0_read_timeout_propagates(self, service):
+        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        service.mem0.get = AsyncMock(
+            side_effect=TimeoutError('Mem0 get timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await service.get_memory(uuid, 'mem0', 'dark_factory')
+
+        assert not isinstance(excinfo.value, MemoryNotFoundError), (
+            'a read timeout must never surface as MemoryNotFoundError — that is the '
+            'signal repair_memory_citation deletes citations on'
+        )
+        assert 'timed out' in str(excinfo.value), (
+            f'the backend message must survive to the caller; got {str(excinfo.value)!r}'
+        )
+
+
 class TestGetMemoryById:
     """MemoryService.get_memory_by_id: raw Mem0 point-id read (content + full payload).
 
