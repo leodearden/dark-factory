@@ -117,10 +117,7 @@ try:
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import (  # type: ignore[import-untyped]
-        EscalationQueue,
-        iter_all_escalation_paths,
-    )
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
@@ -938,36 +935,82 @@ class ReconciliationHarness:
         # would serve one queue's answer for another's.
         self._resolved_fps_memo: tuple[str, str, frozenset[str]] | None = None
 
+    def _scan_resolved_fingerprints(self, *, now: datetime) -> frozenset[str]:
+        """The archive scan, with this harness's window and category policy.
+
+        SPOT for the three arms that need it — the async accessor and the sync
+        twin's two — so the window and category gate they enforce cannot drift
+        apart.  SYNCHRONOUS AND UNBOUNDED: see the module docstring of
+        ``reconciliation/escalation_archive.py``.  Only reachable from a
+        coroutine through ``asyncio.to_thread``.
+        """
+        return scan_recently_resolved_fingerprints(
+            self._escalation_queue.queue_dir,  # type: ignore[union-attr]
+            now=now,
+            window=_RESOLVED_RECURRENCE_WINDOW,
+            categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
+        )
+
+    def _resolved_fps_slot(self, scan_key: str) -> frozenset[str] | None:
+        """The memo's fingerprints when its slot matches *scan_key*, else None."""
+        memo = self._resolved_fps_memo
+        if memo is None or memo[0] != scan_key:
+            return None
+        if memo[1] != str(self._escalation_queue.queue_dir):  # type: ignore[union-attr]
+            return None
+        return memo[2]
+
     async def _recently_resolved_fingerprints(
         self, scan_key: str, *, now: datetime,
     ) -> frozenset[str]:
         """In-window resolved/dismissed fingerprints, scanned at most once per *scan_key*.
 
-        THE `asyncio.to_thread` HOP IS LOAD-BEARING.  `scan_recently_resolved_fingerprints`
-        globs the queue root and rglobs a dated archive shared across 7+
-        projects, reading and parsing every hit — unbounded synchronous I/O.
-        Called inline from a coroutine it holds the event loop for the whole
-        walk, and the fused-memory process serves the `/alive` route the
-        orchestrator watchdog probes from that same loop, so a long scan reads
-        as a dead process (task 5550).
+        THE `asyncio.to_thread` HOP IS LOAD-BEARING.  The scan globs the queue
+        root and rglobs a dated archive shared across 7+ projects, reading and
+        parsing every hit — unbounded synchronous I/O.  Called inline from a
+        coroutine it holds the event loop for the whole walk, and the
+        fused-memory process serves the `/alive` route the orchestrator
+        watchdog probes from that same loop, so a long scan reads as a dead
+        process (task 5550).
 
-        This is the ONLY async entry to that scan; `_recently_resolved_fingerprints_blocking`
-        is its sync twin for the already-synchronous `_escalate` path, and the
-        two share the memo slot so a pass that warms it here spares every
-        `_escalate` inside that pass a second walk.
+        This is the ONLY async entry to that scan;
+        `_recently_resolved_fingerprints_blocking` is its sync twin for the
+        already-synchronous `_escalate` path, and the two share the memo slot —
+        so a pass that warms it here spares every `_escalate` in that pass a
+        second walk.
         """
-        queue_dir = self._escalation_queue.queue_dir  # type: ignore[union-attr]
-        memo = self._resolved_fps_memo
-        if memo is not None and memo[0] == scan_key and memo[1] == str(queue_dir):
-            return memo[2]
-        fingerprints = await asyncio.to_thread(
-            scan_recently_resolved_fingerprints,
-            queue_dir,
-            now=now,
-            window=_RESOLVED_RECURRENCE_WINDOW,
-            categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
+        cached = self._resolved_fps_slot(scan_key)
+        if cached is not None:
+            return cached
+        fingerprints = await asyncio.to_thread(self._scan_resolved_fingerprints, now=now)
+        self._resolved_fps_memo = (
+            scan_key, str(self._escalation_queue.queue_dir), fingerprints,  # type: ignore[union-attr]
         )
-        self._resolved_fps_memo = (scan_key, str(queue_dir), fingerprints)
+        return fingerprints
+
+    def _recently_resolved_fingerprints_blocking(
+        self, scan_key: str | None, *, now: datetime,
+    ) -> frozenset[str]:
+        """The sync twin of :meth:`_recently_resolved_fingerprints`.
+
+        BLOCKS ITS CALLER for the full archive walk whenever the memo slot
+        misses, so its only caller is the already-synchronous `_escalate` path.
+        A coroutine must use the async accessor instead.
+
+        `scan_key=None` scans on every call and neither reads nor writes the
+        slot — the direct / unit-test path `_finding_recently_resolved`'s
+        docstring documents, preserved here verbatim so callers that rely on it
+        see no behaviour change.
+        """
+        if scan_key is None:
+            return self._scan_resolved_fingerprints(now=now)
+        cached = self._resolved_fps_slot(scan_key)
+        if cached is not None:
+            return cached
+        fingerprints = self._scan_resolved_fingerprints(now=now)
+        self._resolved_fps_memo = (
+            scan_key, str(self._escalation_queue.queue_dir), fingerprints,  # type: ignore[union-attr]
+        )
         return fingerprints
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
@@ -2795,7 +2838,9 @@ class ReconciliationHarness:
                     [],
                     summary,
                 )
-            if self._finding_recently_resolved(category, fingerprint, resolved_fps=resolved_fps):
+            if self._finding_recently_resolved(
+                category, fingerprint, resolved_fps=resolved_fps, scan_key=run_id,
+            ):
                 logger.info(
                     'reconciliation.escalation_suppressed_recently_resolved',
                     extra={
@@ -5008,11 +5053,12 @@ class ReconciliationHarness:
         *,
         now=None,
         resolved_fps: frozenset[str] | None = None,
+        scan_key: str | None = None,
     ) -> bool:
         """Return True iff a recently-resolved escalation matches category + fingerprint.
 
         Mirrors _finding_has_open_escalation but scans resolved/dismissed escalations
-        in the full queue root + archive via iter_all_escalation_paths.  Used by
+        in the full queue root + archive via escalation_archive's scan.  Used by
         _escalate() to suppress re-firing of a finding whose matching escalation was
         resolved within _RESOLVED_RECURRENCE_WINDOW_SECONDS (task 1669).
 
@@ -5020,7 +5066,18 @@ class ReconciliationHarness:
         escalations within the recurrence window (filtered to recon categories by the
         caller).  When supplied (built once by _run_remediation_pass), the check is an
         O(1) set membership test — no archive scan.  Pass None to fall back to the full
-        iter_all_escalation_paths scan per-call (direct / unit-test use).
+        archive scan (direct / unit-test use).
+
+        scan_key: memo key for that fallback scan, which callers set to the run_id
+        (task 5550).  ONE scan per run_id, matching the per-pass snapshot semantics
+        resolved_fps has had since task 1669 rather than inventing a second, weaker
+        one.  _run_remediation_pass warms the same slot under its own run_id before
+        any finding is escalated, so an _escalate inside a pass reads the slot instead
+        of walking the archive.  The residual staleness is bounded and deliberate: an
+        escalation resolved mid-run is not seen until the next run, which costs at
+        most one extra escalation — the same fail-open direction as every other arm
+        here.  scan_key=None scans per call and touches no memo state, preserving the
+        direct / unit-test path above exactly.
 
         Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
         matching the category gate used by submit_or_dedupe.
@@ -5039,31 +5096,22 @@ class ReconciliationHarness:
             return fingerprint in resolved_fps
         try:
             effective_now = now if now is not None else datetime.now(UTC)
-            window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-            for path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                self._escalation_queue.queue_dir
-            ):
-                try:
-                    esc = Escalation.from_json(path.read_text())  # type: ignore[possibly-undefined]
-                except Exception:
-                    continue
-                if not (
-                    esc.status in ('resolved', 'dismissed')
-                    and esc.category == category
-                    and esc.dedupe_fingerprint == fingerprint
-                ):
-                    continue
-                if not esc.resolved_at:
-                    continue
-                try:
-                    resolved = datetime.fromisoformat(esc.resolved_at)
-                except (ValueError, TypeError):
-                    continue
-                if resolved.tzinfo is None:
-                    resolved = resolved.replace(tzinfo=UTC)
-                if effective_now - resolved <= window:
-                    return True
-            return False
+            # The scan filters by CATEGORY SET rather than this call's single
+            # category, which is why the result can be tested by fingerprint
+            # alone.  A fingerprint determines its own category: dedupe.py's
+            # compute_content_fingerprint hashes escalation_category as its
+            # FIRST field, so a fingerprint from another category cannot
+            # collide with this one.  Combined with the category gate above
+            # (only infra_dedupe_categories reach here, and the scan filters to
+            # exactly that set), `fingerprint in fps` and the old
+            # category-and-fingerprint match are the same predicate — and the
+            # set-shaped one is already the production semantics, since every
+            # per-finding _escalate in a remediation pass has taken the
+            # category-blind resolved_fps path since task 1669.
+            fps = self._recently_resolved_fingerprints_blocking(
+                scan_key, now=effective_now,
+            )
+            return fingerprint in fps
         except Exception as e:
             logger.warning(
                 'reconciliation.recently_resolved_check_failed',
