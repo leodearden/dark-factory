@@ -35,9 +35,12 @@ from orchestrator import verify
 from orchestrator.config import _discover_module_configs
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
+    _EMITTED_VALUE_FLAGS,
+    _PYTEST_VALUE_FLAGS,
     ChainSegment,
     ToolKind,
     VerifyCmd,
+    _append_value_flag,
     _has_unspliceable_pytest_invocation,
     _is_serial_forced,
     _segment_invokes_tool,
@@ -1752,6 +1755,104 @@ class TestSeparateTokenValueFlagBinding:
         cmd = parse_config_command(f'pytest {token} tests/')
         assert cmd.base_flags == (token,)
         assert cmd.targets == ('tests/',)
+
+
+class TestEmittedValueFlagsAreBound:
+    """Every value flag this module EMITS must be one the parser BINDS.
+
+    The class above pins the rule for one flag at a time, by listing it.
+    Listing is what failed twice: task 2727 wrote the list, task 5408 found
+    `--dist` missing from it, task 5580 found `--timeout` and `--junitxml`
+    missing — and those last two are flags the module emits ITSELF, from
+    ``with_pytest_timeout`` and ``with_junitxml``. A longer list cannot
+    enforce anything; a third omission is one new mutator away.
+
+    So the invariant is derived from BEHAVIOUR here rather than restated: run
+    each mutator, look at what it actually appended, and require the parser to
+    bind it. The table below names only WHICH mutators emit a pair — never
+    which flag each one emits, which is the fact that must be allowed to
+    change without this file changing with it.
+
+    The last test is the rung that makes the invariant structural rather than
+    merely measured: ``_append_value_flag`` is the ONE site that emits a
+    ``<flag> <value>`` pair, and it refuses a flag the parser would not bind.
+    """
+
+    #: (mutator, extra args) for every mutator that appends a `<flag> <value>`
+    #: pair to ``base_flags``. Deliberately not a flag list.
+    MUTATORS = [
+        (serial_pytest, ()),
+        (with_pytest_timeout, (300,)),
+        (with_junitxml, ('/tmp/j.xml',)),
+        (apply_pytest_numprocesses, ('4',)),
+    ]
+
+    @staticmethod
+    def _appended(mutator, extra):
+        """The tokens *mutator* appended to ``base_flags``, and the mutation."""
+        base = parse_config_command('pytest tests/')
+        mutated = mutator(base, *extra)
+        assert mutated is not base, (
+            f'{mutator.__name__} no-opped on a plain structured pytest '
+            f'command, so this test would assert nothing'
+        )
+        return mutated, mutated.base_flags[len(base.base_flags):]
+
+    @pytest.mark.parametrize(('mutator', 'extra'), MUTATORS)
+    def test_every_emitted_flag_is_bound_by_the_parser(self, mutator, extra):
+        _, added = self._appended(mutator, extra)
+        emitted_flags = set(added[0::2])
+        assert emitted_flags <= _EMITTED_VALUE_FLAGS, (
+            f'{mutator.__name__} emits {sorted(emitted_flags - _EMITTED_VALUE_FLAGS)}, '
+            f'which is not declared in _EMITTED_VALUE_FLAGS'
+        )
+        assert emitted_flags <= _PYTEST_VALUE_FLAGS, (
+            f'{mutator.__name__} emits {sorted(emitted_flags - _PYTEST_VALUE_FLAGS)}, '
+            f'which the parser does not bind — the next rewrite of this '
+            f'command will splice between the flag and its value'
+        )
+
+    @pytest.mark.parametrize(('mutator', 'extra'), MUTATORS)
+    def test_render_parse_round_trip_is_argv_identical_after_each_mutator(
+        self, mutator, extra,
+    ):
+        """The string seam BETWEEN two rewrites must be lossless.
+
+        verify.py's rewrite helpers each render to a string and the next one
+        re-parses it, so a mutator whose output does not survive a round trip
+        corrupts the command without anything in between noticing.
+        """
+        mutated, _ = self._appended(mutator, extra)
+        rendered = render(mutated)
+        assert shlex.split(render(parse_config_command(rendered))) == shlex.split(rendered)
+
+    @pytest.mark.parametrize(('mutator', 'extra'), MUTATORS)
+    def test_no_emitted_value_lands_in_targets(self, mutator, extra):
+        """An emitted VALUE is never admitted as a test target.
+
+        This is the defect's observable shape: `300` run as though it were a
+        test path, while `--timeout` sits bare and pytest exits rc=4.
+        """
+        mutated, added = self._appended(mutator, extra)
+        reparsed = parse_config_command(render(mutated))
+        for flag, value in zip(added[0::2], added[1::2], strict=True):
+            assert value not in reparsed.targets, (
+                f"{value!r} is {flag}'s value, not a test target, but "
+                f'{mutator.__name__} let it be re-parsed as one: '
+                f'targets={reparsed.targets}'
+            )
+            i = reparsed.base_flags.index(flag)
+            assert reparsed.base_flags[i + 1] == value
+
+    def test_append_value_flag_rejects_an_unbound_flag(self):
+        """The guard a future mutator trips on, rather than the fleet.
+
+        Stays meaningful no matter how long _PYTEST_VALUE_FLAGS grows: the
+        emit side cannot name a flag the parse side does not bind.
+        """
+        cmd = parse_config_command('pytest tests/')
+        with pytest.raises(AssertionError):
+            _append_value_flag(cmd, '--not-a-listed-flag', 'v')
 
 
 class TestGovernCpu:
