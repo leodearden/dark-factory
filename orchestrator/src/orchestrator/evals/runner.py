@@ -214,6 +214,43 @@ class _UnsetGate:
 _GATE_UNSET = _UnsetGate()
 
 
+# The `usage_gate=` parameter type shared by all three eval executors
+# (:func:`run_eval`, :func:`run_architect_eval`, :func:`run_end_to_end`). Named
+# so a reader of a public signature meets ONE concept with three readings
+# rather than a three-way union to decode at each site — and so the private
+# :class:`_UnsetGate` appears in exactly one place instead of three:
+#
+#   a ``UsageGate``  — a campaign owner handed its live gate down.
+#   ``None``         — a campaign owner that is deliberately UNGATED; run
+#                      without failover and do NOT build one.
+#   ``_GATE_UNSET``  — nobody supplied anything; build and own a gate.
+#
+# THE SHARED-OWNERSHIP CONTRACT (task 4427), stated once here because all three
+# executors obey it identically and three copies of the argument is the shape
+# that drifts: THE GATE IS TORN DOWN ONLY BY WHOEVER BUILT IT, i.e. by the
+# ``_GATE_UNSET`` reading alone. Each executor's ``finally`` spells that as
+# ``if owns_gate and usage_gate is not None``, where ``owns_gate`` is decided
+# from the CALLER's argument before any build can overwrite the parameter.
+#
+# Why an OWNED gate must come down: a campaign loops fixtures × candidates ×
+# trials in ONE process, so a gate left running leaks a live account-resume
+# probe loop firing real CLI probes for the rest of the campaign, and each new
+# gate steals the SIGHUP handler from predecessors kept alive by exactly those
+# background tasks. (469a2b5bd0 closed that leak for :func:`run_architect_eval`
+# only; :func:`run_eval` and :func:`run_end_to_end` leaked one gate per cell
+# until this task.)
+#
+# Why a BORROWED gate must NOT: it carries the one cap-state view every sibling
+# cell shares, so cell N+1 no longer re-leases the account cell N proved capped
+# — exactly the wasted invocation plus cooldown per cell the per-cell gate
+# cost. Shutting it down here would take failover from every sibling still to
+# run, including ones already in flight.
+#
+# Teardown is best-effort everywhere: the cell is already scored by then, so a
+# failing ``shutdown()`` must never turn it into a harness error.
+InjectedGate = UsageGate | None | _UnsetGate
+
+
 @asynccontextmanager
 async def campaign_usage_gate(
     base_config: OrchestratorConfig | None,
@@ -254,7 +291,28 @@ async def campaign_usage_gate(
     to cells as an explicit ``usage_gate=None``, never dropped: a cell reads a
     missing argument as "build your own" (see the ``_GATE_UNSET`` sentinel), so
     dropping a degraded ``None`` would silently restore the per-cell
-    construction this exists to remove.
+    construction this exists to remove. The cell's half of that bargain — who
+    may tear a gate down, and what breaks either way — is stated once at
+    :data:`InjectedGate`.
+
+    WHAT ELSE ONE GATE SHARES: THE SPEND TALLY. The equivalence argument above
+    is about CONSTRUCTION; sharing also makes the gate's RUNTIME state
+    campaign-scoped, and ``UsageGate._cumulative_cost`` is part of that state.
+    ``before_invoke`` raises ``SessionBudgetExhausted`` once the tally reaches
+    ``usage_cap.session_budget_usd``, and nothing resets it between cells — so
+    ONE gate means ONE cumulative tally and ONE session ceiling for the WHOLE
+    campaign, where a per-cell gate gave each cell a fresh budget. With the
+    ceiling set, a long campaign trips partway through
+    ``fixtures × candidates × trials`` and every remaining cell blocks or is
+    stamped ``harness_error`` — losses the report would attribute to the
+    CANDIDATE under test rather than to the campaign budget.
+
+    Latent, not live: ``session_budget_usd`` defaults to ``None`` and no config
+    in this repo sets it, and one process-wide ceiling is exactly the
+    :class:`~orchestrator.harness.Harness` shape this adopts. A campaign that
+    does want per-cell budgeting should build from a ``usage_cap`` copy with
+    ``session_budget_usd=None`` (``base_config.model_copy`` over that leaf) and
+    let each invocation's ``max_budget_usd`` bound it instead.
     """
     if base_config is None:
         yield None
@@ -536,7 +594,8 @@ async def run_eval(
     worktree_path: Path | None = None,
     memory_endpoint: str | None = None,
     judge_config: EvalConfig | None = None,
-    usage_gate: UsageGate | None | _UnsetGate = _GATE_UNSET,
+    *,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
@@ -626,12 +685,8 @@ async def run_eval(
         logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
     # 5b. Usage gate for account failover (judge hits Claude API, may cap).
-    #     Built here only when this cell OWNS the gate. A campaign owner
-    #     (:func:`campaign_usage_gate`, threaded by the μ stage functions and
-    #     cli._run_single_eval) hands its live gate down instead, so rebuilding
-    #     would fragment the very cap state the hoist exists to share — and an
-    #     explicit ``usage_gate=None`` from such an owner means "this campaign
-    #     is deliberately ungated", NOT "nothing was supplied".
+    #     Built only when this cell OWNS it — see :data:`InjectedGate` for the
+    #     three readings of the argument and who may tear the gate down.
     owns_gate = isinstance(usage_gate, _UnsetGate)
     usage_gate = (
         await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
@@ -706,23 +761,9 @@ async def run_eval(
         )
         return result
     finally:
-        # SHARED-OWNERSHIP CONTRACT (task 4427), identical to the one
-        # run_architect_eval documents at length: the gate is torn down only by
-        # whoever BUILT it.
-        #
-        # A cell that built its own must tear it down here — a stage loops
-        # fixtures × candidates × trials in ONE process, so a gate left running
-        # leaks a live account-resume probe loop firing real CLI probes for the
-        # rest of the campaign, and each new gate steals the SIGHUP handler from
-        # predecessors kept alive by exactly those background tasks. (This
-        # teardown is new: 469a2b5bd0 closed that leak for run_architect_eval
-        # only, and this path has been leaking one gate per cell ever since.)
-        #
-        # A gate handed DOWN by a campaign owner is NOT ours to shut down: it
-        # carries the one cap-state view every sibling cell shares.
-        #
-        # Best-effort — a teardown failure must never turn a scored cell into a
-        # harness error.
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
         if owns_gate and usage_gate is not None:
             try:
                 await usage_gate.shutdown()
@@ -773,7 +814,7 @@ async def run_architect_eval(
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
     *,
-    usage_gate: UsageGate | None | _UnsetGate = _GATE_UNSET,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
 
@@ -934,8 +975,7 @@ async def run_architect_eval(
     artifacts: TaskArtifacts | None = None
     # Ownership is decided by what the CALLER did, never by what a build
     # returned — so it is computed here, before anything can overwrite the
-    # parameter. A campaign owner (see :func:`campaign_usage_gate`) that passes
-    # an explicit ``None`` gets an ungated cell that still does not build one.
+    # parameter. See :data:`InjectedGate` for the three readings.
     owns_gate = isinstance(usage_gate, _UnsetGate)
     # Narrowed off the sentinel union so the invoke call site and the finally
     # below both see a plain ``UsageGate | None``. Pre-initialised for the SAME
@@ -1026,10 +1066,7 @@ async def run_architect_eval(
         #     points build the gate from ONE definition rather than three
         #     copies that can drift.
         #
-        #     Built only when this cell OWNS the gate. A campaign owner that
-        #     passed one down (task 4427) is handing over its live cap state,
-        #     so rebuilding here would both waste the construction and fragment
-        #     the very state the hoist exists to share.
+        #     Built only when this cell OWNS it — see :data:`InjectedGate`.
         if owns_gate:
             usage_gate = await _build_eval_usage_gate(orch_config)
 
@@ -1262,25 +1299,9 @@ async def run_architect_eval(
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
-        # SHARED-OWNERSHIP CONTRACT (task 4427): the gate is torn down only by
-        # whoever BUILT it. A cell that built its own (no ``usage_gate=``
-        # argument) must tear it down here — cli.py loops this coroutine over
-        # every config, and a campaign loops fixtures × trials in ONE process,
-        # so a gate left running leaks a live account-resume probe loop firing
-        # real CLI probes for the rest of the campaign, and each new gate steals
-        # the SIGHUP handler from predecessors kept alive by exactly those
-        # background tasks.
-        #
-        # A gate handed DOWN by a campaign owner (:func:`campaign_usage_gate`,
-        # threaded by the stage functions and cli._run_single_eval) is NOT ours
-        # to shut down: it keeps ONE cap-state view alive across every cell, so
-        # cell N+1 no longer re-leases the account cell N proved capped —
-        # exactly the wasted invocation plus cooldown per cell that the
-        # per-cell gate cost. Shutting it down here would take failover away
-        # from every sibling still to run.
-        #
-        # Best-effort: a teardown failure must never turn a scored cell into a
-        # harness error.
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
         if owns_gate and usage_gate is not None:
             try:
                 await usage_gate.shutdown()
@@ -1665,7 +1686,7 @@ async def run_end_to_end(
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
     *,
-    usage_gate: UsageGate | None | _UnsetGate = _GATE_UNSET,
+    usage_gate: InjectedGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
 
@@ -1722,8 +1743,7 @@ async def run_end_to_end(
     briefing = BriefingAssembler(orch_config)
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
-    # Owned only when the caller supplied nothing — see run_eval's twin comment
-    # and :func:`campaign_usage_gate` for the shared-ownership contract (4427).
+    # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
     owns_gate = isinstance(usage_gate, _UnsetGate)
     usage_gate = (
         await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
@@ -1789,23 +1809,9 @@ async def run_end_to_end(
         )
         return result
     finally:
-        # SHARED-OWNERSHIP CONTRACT (task 4427), identical to the one
-        # run_architect_eval documents at length: the gate is torn down only by
-        # whoever BUILT it.
-        #
-        # A cell that built its own must tear it down here — a stage loops
-        # fixtures × candidates × trials in ONE process, so a gate left running
-        # leaks a live account-resume probe loop firing real CLI probes for the
-        # rest of the campaign, and each new gate steals the SIGHUP handler from
-        # predecessors kept alive by exactly those background tasks. (This
-        # teardown is new: 469a2b5bd0 closed that leak for run_architect_eval
-        # only, and this path has been leaking one gate per cell ever since.)
-        #
-        # A gate handed DOWN by a campaign owner is NOT ours to shut down: it
-        # carries the one cap-state view every sibling cell shares.
-        #
-        # Best-effort — a teardown failure must never turn a scored cell into a
-        # harness error.
+        # Torn down only by whoever BUILT it — the shared-ownership contract
+        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
+        # turn an already-scored cell into a harness error.
         if owns_gate and usage_gate is not None:
             try:
                 await usage_gate.shutdown()
@@ -1867,21 +1873,14 @@ async def run_eval_matrix(
     configs = configs or EVAL_CONFIGS
 
     async with campaign_usage_gate(base_config) as gate:
-        # ONE gate for the WHOLE matrix (task 4427): every cell below shares
-        # this object, so cell N+1 inherits the cap knowledge cell N paid for
-        # instead of re-leasing an account already proved capped — the
-        # wall-clock win φ's failover was added for, which a per-cell gate
-        # forfeits. Sharing one gate across concurrent cells is the production
-        # shape, not a new one: :class:`orchestrator.harness.Harness` owns
-        # exactly one UsageGate for the whole process and shares it across every
-        # concurrent workflow.
+        # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate
+        # for why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
         #
-        # The `async with` spans the monitor loop AND its sibling-cancellation
-        # drain, so the gate outlives the cells it serves and campaign_usage_
-        # gate's `finally` tears it down on the way out — including on the
+        # Specific to this fan-out: the `async with` spans the monitor loop AND
+        # its sibling-cancellation drain, so the teardown also fires on the
         # CancelledError re-raise, where a leaked probe loop would otherwise
-        # survive the aborted campaign. `gate` may be None (deliberately
-        # ungated) and is threaded to cells AS SUCH.
+        # survive the aborted campaign.
 
         combos = [
             (task_path, config, t)
@@ -2057,15 +2056,9 @@ async def run_ofat_stage(
     logged and skipped via :func:`_bounded_fanout`.
     """
     async with campaign_usage_gate(base_config) as gate:
-        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
-        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
-        # of re-leasing an account already proved capped — the wall-clock win
-        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
-        # gate across concurrent cells is the production shape, not a new one:
-        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
-        # the whole process and shares it across every concurrent workflow.
-        # ``gate`` may be None (deliberately ungated) and is threaded to cells
-        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
         def _thunk(
             task_path: Path, candidate: EvalConfig, trial: int,
         ) -> Callable[[], Awaitable[EvalResult | None]]:
@@ -2124,15 +2117,9 @@ async def run_matrix_stage(
     flattened ``EvalResult`` list; a failed cell is logged and skipped.
     """
     async with campaign_usage_gate(base_config) as gate:
-        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
-        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
-        # of re-leasing an account already proved capped — the wall-clock win
-        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
-        # gate across concurrent cells is the production shape, not a new one:
-        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
-        # the whole process and shares it across every concurrent workflow.
-        # ``gate`` may be None (deliberately ungated) and is threaded to cells
-        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
         def _thunk(
             task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
         ) -> Callable[[], Awaitable[EvalResult | None]]:
@@ -2176,15 +2163,9 @@ async def run_confirm_stage(
     ``EvalResult`` list for the confirmation batch.
     """
     async with campaign_usage_gate(base_config) as gate:
-        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
-        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
-        # of re-leasing an account already proved capped — the wall-clock win
-        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
-        # gate across concurrent cells is the production shape, not a new one:
-        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
-        # the whole process and shares it across every concurrent workflow.
-        # ``gate`` may be None (deliberately ungated) and is threaded to cells
-        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        # ONE gate for the whole stage (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
         def _thunk(
             task_path: Path, trial: int,
         ) -> Callable[[], Awaitable[EvalResult | None]]:

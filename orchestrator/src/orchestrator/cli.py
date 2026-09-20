@@ -1363,15 +1363,12 @@ def _run_single_eval(
         configs = all_configs
 
     async def _run():
-        # ONE gate for the whole config loop (task 4427). This loop is a
-        # campaign in its own right — `eval --config all` walks every
-        # candidate in ONE process — and it is a campaign the μ stage
-        # functions never pass through, so it owns its own gate. Sharing it
-        # across BOTH dispatch branches is the point: cap state a config
-        # proved is inherited by every config after it, architect and
-        # implementer alike, instead of each re-leasing an account already
-        # known to be capped. `gate` may be None (deliberately ungated) and
-        # is threaded to the executors AS SUCH — see campaign_usage_gate.
+        # ONE gate for the whole config loop (task 4427) — see
+        # campaign_usage_gate for the argument. Specific to this site: the loop
+        # is a campaign the μ stage functions never pass through, so it owns a
+        # gate of its own, and BOTH dispatch branches share it so cap state a
+        # config proved is inherited by every config after it, architect and
+        # implementer alike.
         async with campaign_usage_gate(base_config) as gate:
             architect_results = []
             for cfg in configs:
