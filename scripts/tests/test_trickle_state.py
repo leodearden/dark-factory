@@ -25,6 +25,8 @@ The three outcomes:
 from __future__ import annotations
 
 import json
+import os
+import pwd
 import tempfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -168,76 +170,150 @@ class TestQuietNightNeverBarren:
 
 
 class TestTrickleStatePath:
-    """Where the state file lives — and, just as load-bearing, where it
-    does NOT.
+    """Where the state file lives — and, just as load-bearing, WHY it is
+    resolved from the account rather than from the process environment.
 
-    Rooted at ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
-    <project_id>/trickle-state.json``, re-deriving
-    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``'s scheme
-    (task 2439). Never under ``docs/legibility/``: that path is
-    git-TRACKED, and a file rewritten EVERY night on a tracked path would
-    either leave the machine-operated project_root checkout permanently
-    dirty or force a nightly commit — which would make "the repo has a
-    commit today" a valid liveness signal and CONTRADICT PRD decision 7
-    outright.
+    Rooted at ``<passwd home>/.local/state/dark-factory/legibility/
+    <project_id>/trickle-state.json``. Never under ``docs/legibility/``:
+    that path is git-TRACKED, and a file rewritten EVERY night on a
+    tracked path would either leave the machine-operated project_root
+    checkout permanently dirty or force a nightly commit — which would
+    make "the repo has a commit today" a valid liveness signal and
+    CONTRADICT PRD decision 7 outright.
+
+    ``test_uses_xdg_state_home_when_set``,
+    ``test_falls_back_under_home_local_state`` and
+    ``test_empty_xdg_state_home_is_treated_as_unset`` were REMOVED in task
+    4514. They pinned the behaviour that IS the defect: honouring two
+    ambient, general-purpose variables in a file that two independently
+    launched processes must agree on. The writer is
+    ``legibility-trickle@<project>.service`` under the ``systemd --user``
+    manager; the reader is the health timer, an orchestrator-EXEC'd
+    ``before_done`` predicate, or a dev shell. Nothing pinned their
+    environments to agree, so they silently read and wrote different
+    files. The surviving idea from the third — set-but-empty must be
+    treated as unset — is kept as
+    ``test_empty_override_is_treated_as_unset``.
     """
 
-    def test_uses_xdg_state_home_when_set(self, tmp_path, monkeypatch):
-        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+    def test_resolves_identically_under_divergent_ambient_environments(
+        self, tmp_path, monkeypatch
+    ):
+        """THE property the task exists for: two processes whose ambient
+        environments disagree on BOTH levers still resolve one file."""
+        monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
+
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'a'))
+        monkeypatch.setenv('HOME', str(tmp_path / 'home-a'))
+        writer_path = trickle_state.trickle_state_path('dark_factory')
+
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'b'))
+        monkeypatch.setenv('HOME', str(tmp_path / 'home-b'))
+        reader_path = trickle_state.trickle_state_path('dark_factory')
+
+        assert writer_path == reader_path
+        for root in ('a', 'b', 'home-a', 'home-b'):
+            assert tmp_path / root not in writer_path.parents, (
+                f'{writer_path} followed the ambient {root!r} root; the two '
+                f'processes would diverge again'
+            )
+
+    def test_ambient_home_alone_cannot_move_the_path(
+        self, tmp_path, monkeypatch
+    ):
+        """``HOME`` was the second, subtler lever: with ``XDG_STATE_HOME``
+        unset the old code called ``Path.home()``, which follows ``HOME``
+        while the passwd entry for the same uid does not."""
+        monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+
+        monkeypatch.setenv('HOME', str(tmp_path / 'home-a'))
+        first = trickle_state.trickle_state_path('dark_factory')
+
+        monkeypatch.setenv('HOME', str(tmp_path / 'home-b'))
+        second = trickle_state.trickle_state_path('dark_factory')
+
+        assert first == second
+        assert tmp_path not in first.parents
+
+    def test_default_root_is_anchored_to_the_passwd_home_not_the_environment(
+        self, monkeypatch
+    ):
+        """The anchor is a property of the ACCOUNT that owns the pipeline,
+        read from NSS, and so is identical in every process environment for
+        the same uid."""
+        monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
+
         result = trickle_state.trickle_state_path('dark_factory')
+
+        expected_root = (
+            Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
+        )
+        assert result == (
+            expected_root / 'dark-factory' / 'legibility' / 'dark_factory'
+            / 'trickle-state.json'
+        )
+
+    def test_dedicated_override_relocates_the_root(self, tmp_path, monkeypatch):
+        """The ONE deliberate seam. It is safe precisely because nothing
+        sets it incidentally: a shell, a systemd user manager, a container
+        and CI all set ``XDG_STATE_HOME``/``HOME`` for reasons unrelated to
+        legibility, but this name is only ever set by someone who means
+        this file."""
+        assert trickle_state.STATE_ROOT_ENV == 'DARK_FACTORY_LEGIBILITY_STATE_ROOT'
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+        result = trickle_state.trickle_state_path('dark_factory')
+
         assert result == (
             tmp_path / 'dark-factory' / 'legibility' / 'dark_factory'
             / 'trickle-state.json'
         )
 
-    def test_falls_back_under_home_local_state(self, tmp_path, monkeypatch):
-        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
-        fake_home = tmp_path / 'home' / 'someone'
-        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
+    def test_empty_override_is_treated_as_unset(self, monkeypatch):
+        """The classic systemd ``Environment=`` foot-gun: set-but-empty must
+        fall back to the anchored default, never resolve to the filesystem
+        root."""
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, '')
 
         result = trickle_state.trickle_state_path('dark_factory')
 
-        assert result == (
-            fake_home / '.local' / 'state' / 'dark-factory' / 'legibility'
-            / 'dark_factory' / 'trickle-state.json'
+        expected_root = (
+            Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
         )
-
-    def test_empty_xdg_state_home_is_treated_as_unset(self, tmp_path, monkeypatch):
-        """An empty env var is the classic systemd `Environment=` foot-gun:
-        `XDG_STATE_HOME=` set-but-empty must fall back, not resolve to the
-        filesystem root."""
-        monkeypatch.setenv('XDG_STATE_HOME', '')
-        fake_home = tmp_path / 'home' / 'someone'
-        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
-
-        result = trickle_state.trickle_state_path('dark_factory')
-
         assert result == (
-            fake_home / '.local' / 'state' / 'dark-factory' / 'legibility'
-            / 'dark_factory' / 'trickle-state.json'
+            expected_root / 'dark-factory' / 'legibility' / 'dark_factory'
+            / 'trickle-state.json'
         )
 
     def test_distinct_projects_never_collide(self, tmp_path, monkeypatch):
-        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
         a = trickle_state.trickle_state_path('dark_factory')
         b = trickle_state.trickle_state_path('reify')
         assert a != b
         assert a.parent != b.parent
 
-    def test_no_home_degrades_to_tempdir_instead_of_raising(
-        self, tmp_path, monkeypatch, caplog
+    def test_no_passwd_entry_degrades_to_tempdir_instead_of_raising(
+        self, monkeypatch, caplog
     ):
-        """A stripped daemon/CI environment with no HOME (and no pwd entry)
-        makes Path.home() raise RuntimeError. The probe must still produce
-        a verdict, never a traceback — mirroring
-        managed_runtime_data_dirs' identical degradation (task 2439
-        amendment)."""
-        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        """The trigger is no longer ``Path.home()`` raising — it is the
+        passwd lookup failing, which now means a genuinely absent passwd
+        entry (an arbitrary-uid container), not merely an unset ``HOME``.
 
-        def _no_home(cls):
-            raise RuntimeError('Could not determine home directory.')
+        This is the REPAIR of the finding's "worse variant". A stripped
+        systemd environment with no ``HOME`` used to land here: the old
+        code wrote to ``tempfile.gettempdir()`` — a path the nightly never
+        reads — while logging to a logger the bare-``python3`` predicate
+        never configures, so the divergence was invisible. That case now
+        resolves correctly. The degradation survives only so this helper
+        keeps its never-raise property on the nightly's unconditional
+        path."""
+        monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
 
-        monkeypatch.setattr(Path, 'home', classmethod(_no_home))
+        def _no_passwd_entry(uid):
+            raise KeyError(f'getpwuid(): uid not found: {uid}')
+
+        monkeypatch.setattr(pwd, 'getpwuid', _no_passwd_entry)
 
         with caplog.at_level('WARNING'):
             result = trickle_state.trickle_state_path('dark_factory')
@@ -246,17 +322,16 @@ class TestTrickleStatePath:
             Path(tempfile.gettempdir()) / 'dark-factory' / 'legibility'
             / 'dark_factory' / 'trickle-state.json'
         )
-        assert any(r.levelname == 'WARNING' for r in caplog.records), (
-            'the temp-dir degradation must be announced, not silent'
+        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1, (
+            'the temp-dir degradation must be announced exactly once, not '
+            'silent and not repeated'
         )
 
-    def test_state_path_is_outside_any_repo_checkout(self, tmp_path, monkeypatch):
+    def test_state_path_is_outside_any_repo_checkout(self, monkeypatch):
         """The location property that motivated the whole choice: the state
         file must never dirty a machine-operated checkout, and must never
         become a git signal."""
-        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
-        fake_home = tmp_path / 'home' / 'someone'
-        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
+        monkeypatch.delenv(trickle_state.STATE_ROOT_ENV, raising=False)
 
         result = trickle_state.trickle_state_path('dark_factory')
 

@@ -126,6 +126,63 @@ def test_script_is_executable():
         f"Run: chmod +x {SCRIPT}"
     )
 
+def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
+    tmp_path, monkeypatch
+):
+    """The writer and the reader are DIFFERENT PROCESSES with
+    independently-sourced environments; this pins that they still agree on
+    one file.
+
+    The writer is ``legibility-trickle@<project>.service`` under the
+    ``systemd --user`` manager. The reader is the health timer, an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Under the
+    pre-task-4514 code this exact shape returned ``('missing', None)``:
+    the probe took branch 1 and exited 1 PERMANENTLY, which for a
+    milestone binding is a born-at-L2 ``milestone_check_failed`` for a
+    pipeline that is running perfectly — the outcome the 2026-09-14
+    triage predicted would arrive the moment the probe was bound.
+    """
+    state_root = tmp_path / "shared-state"
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(state_root))
+
+    # The writer's ambient environment.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "writer-xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "writer-home"))
+    trickle_state.record_run(
+        "dark_factory",
+        target_date=date(2026, 7, 1),
+        recorded_at=datetime.now(UTC),
+        exit_code=0,
+        total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
+        below_sampling_cut=0, budget_skipped=0, selected_count=2,
+    )
+
+    # Asserted, not assumed: _run_probe builds the child env from
+    # os.environ, so the shared override has to be visible HERE for the
+    # subprocess to inherit it -- and that inheritance is the only thing
+    # keeping this test off the operator's real state file.
+    assert os.environ[trickle_state.STATE_ROOT_ENV] == str(state_root)
+
+    # The reader's ambient environment, disagreeing on both levers.
+    result, git_marker = _run_probe(
+        tmp_path, "dark_factory", 3,
+        extra_env={
+            "XDG_STATE_HOME": str(tmp_path / "reader-xdg"),
+            "HOME": str(tmp_path / "reader-home"),
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"the probe resolved a different file than the writer wrote; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "productive" in result.stdout, (
+        f"the probe must report the outcome the writer recorded; "
+        f"stdout={result.stdout!r}"
+    )
+    _assert_no_git(git_marker)
+
 
 def test_streak_below_threshold_exits_zero(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, outcomes=["productive", "barren-budget"])
