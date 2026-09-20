@@ -32,6 +32,18 @@ function rowTouchesModule(row, module) {
   return (row.lock_set || []).includes(module.path)
 }
 
+// Does this module earn a column?
+//
+// Two disjuncts, and the second is not a nicety. `contention` counts LIVE
+// WAITERS, so a module held by exactly one task has no contention to show. But
+// scheduler.py injects an entry for every park-stack key even with no live
+// waiters (contention: 0) so a fully-stranded module still gets one — and a
+// bare `contention > 1` would hide exactly the stranded parks the Scheduler
+// tab's red banner and ParkStacksSection already single out.
+function moduleEarnsColumn(module) {
+  return (module.contention || 0) > 1 || (module.park_stack || []).length > 0
+}
+
 // Choose the rows and columns the heatmap will actually render.
 //
 // Returns the selected axes alongside the INPUT totals and a per-axis
@@ -40,7 +52,9 @@ function boundHeatmapAxes({ rows, modules }) {
   const allRows = rows || []
   const allModules = modules || []
 
-  const keptModules = allModules
+  // `filter` preserves relative order, so the server's `(-contention, path)`
+  // sort is inherited rather than re-derived on the client.
+  const keptModules = allModules.filter(moduleEarnsColumn)
   const keptRows = allRows
 
   return {
