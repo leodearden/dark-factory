@@ -42,6 +42,7 @@ import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 const { staleNoticesForTab } = staleness;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
+const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 const EXPECTED_FUNCTION_NAMES = [
   'endpointsFor',
   'applyKey',
@@ -51,6 +52,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'startPolling',
   'createPollState',
   'pollKey',
+  'datumFor',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
@@ -69,6 +71,12 @@ const EXPECTED_DF_DATA_KEYS = [
   // first render happens before any fetch resolves, and a consumer reading
   // DF_DATA.__stale[path] must not have to guard the container itself.
   '__stale',
+  // Per-endpoint receipts, published by refreshOne on the SUCCESS path only
+  // (task 5588). Where __stale records ATTEMPT history, this records the
+  // PROVENANCE of the values now sitting in DF_DATA — which is exactly why it
+  // must NOT advance on a failure: that is what makes a wedged endpoint's
+  // tiles keep ageing on screen instead of resetting to "just received".
+  '__receipt',
 ];
 
 // Number of rows in endpointsFor() (data.js:16-34). Several tests below assert
@@ -79,6 +87,38 @@ const EXPECTED_DF_DATA_KEYS = [
 // test, because scattered copies is what went stale when the memory-evals
 // endpoint was added.
 const EXPECTED_ENDPOINT_COUNT = 14;
+
+// The two shared registry specs. Declared here as literals rather than read off
+// data.js so the reshape is pinned against a stated expectation instead of
+// against itself.
+const PLAIN_SPEC = { kind: 'plain' };
+const DATUM_SPEC = { kind: 'datum' };
+
+// Every DF_DATA key any endpoint row names, as one sorted list. The registry
+// reshape (array of key names -> object of key name to spec) is exactly the
+// kind of edit that can silently DROP a key — an object literal with a
+// duplicated or mistyped name loses a row with no error anywhere — and a
+// dropped key means a tab that simply stops updating. Stated as a literal
+// because deriving it from endpointsFor would be deriving the expectation from
+// the thing under test.
+const EXPECTED_ENDPOINT_KEYS = [
+  'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
+  'CURATOR_STATE', 'DONE_COUNTS', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
+  'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
+  'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
+  'PROJECTS', 'RECON_STATE', 'SCHEDULER', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+  'TASKS_DEGRADED_PROJECTS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_PROJECT_COUNT',
+];
+
+// A five-key wire envelope, as data/datum.py::Datum.to_wire() emits one.
+const SERVED_DATUM = Object.freeze({
+  value: { total: 9 },
+  as_of: '2026-09-20T09:00:00+00:00',
+  state: 'lower_bound',
+  reason: 'window truncated at 500 rows',
+  freshness_bound_seconds: 60,
+});
 
 // Loads data.js fresh against a shimmed browser-ish global. Installs
 // `globalThis.window` (a bare object recording dispatched events) and a
@@ -106,7 +146,13 @@ function loadDataJs({ fetchStub } = {}) {
   const events = [];
   const fetchCalls = [];
   const intervalCalls = [];
-  const win = { dispatchEvent: ev => events.push(ev) };
+  // DF_ENDPOINT_STALENESS is installed for datum.js, which destructures
+  // formatAge off it at module scope; datum.js is then loaded through the same
+  // shim so it can publish DF_DATUM, which data.js in turn destructures at
+  // module scope. index.html gives them exactly this order —
+  // endpoint_staleness.js -> datum.js -> data.js — and test_index_html.py pins
+  // both edges.
+  const win = { dispatchEvent: ev => events.push(ev), DF_ENDPOINT_STALENESS: staleness };
   globalThis.window = win;
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });
@@ -115,6 +161,9 @@ function loadDataJs({ fetchStub } = {}) {
   };
 
   const require = createRequire(import.meta.url);
+  const datumResolved = require.resolve(DATUM_MODULE_SPECIFIER);
+  delete require.cache[datumResolved];
+  require(DATUM_MODULE_SPECIFIER);
   const resolved = require.resolve(MODULE_SPECIFIER);
   delete require.cache[resolved];
 
@@ -947,7 +996,7 @@ test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value an
   try {
     const state = api.createPollState();
     const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
-    await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+    await api.refreshOne(FLAKY_ENDPOINT_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps);
   } finally {
     console.warn = originalWarn;
   }
@@ -969,7 +1018,7 @@ test('preserved behaviour: a non-ok (503) response also keeps the prior DF_DATA 
 
   const state = api.createPollState();
   const deps = { fetchImpl: () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }), now: () => 0 };
-  await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+  await api.refreshOne(FLAKY_ENDPOINT_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps);
 
   assert.deepEqual(
     win.DF_DATA.CURATOR_STATE,
@@ -1260,8 +1309,8 @@ test('staleness: applyKey cannot clobber __stale (or __loaded)', () => {
   //     server-side key that way.
   const { api, window: win } = loadDataJs();
 
-  for (const keys of Object.values(api.endpointsFor('24h'))) {
-    for (const k of keys) {
+  for (const keySpecs of Object.values(api.endpointsFor('24h'))) {
+    for (const k of Object.keys(keySpecs)) {
       assert.ok(!k.startsWith('__'), `endpointsFor names an internal key: ${k}`);
     }
   }
@@ -1300,7 +1349,7 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
   };
 
   for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
-    await api.refreshOne(CURATOR_PATH, [], state, deps);
+    await api.refreshOne(CURATOR_PATH, {}, state, deps);
     t = state.get(CURATOR_PATH).nextAllowedAt;
   }
 
@@ -1308,7 +1357,7 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
   assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
 
   const before = armed.length;
-  await api.refreshOne(CURATOR_PATH, [], state, deps);
+  await api.refreshOne(CURATOR_PATH, {}, state, deps);
   assert.equal(
     armed[before],
     STALE_TIMEOUT_MS,
@@ -1345,13 +1394,13 @@ test('staleness: an explicit deps.timeoutMs still wins over both defaults', asyn
   };
 
   for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
-    await api.refreshOne(CURATOR_PATH, [], state, deps);
+    await api.refreshOne(CURATOR_PATH, {}, state, deps);
     t = state.get(CURATOR_PATH).nextAllowedAt;
   }
   assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
 
   const before = armed.length;
-  await api.refreshOne(CURATOR_PATH, [], state, { ...deps, timeoutMs: 1234 });
+  await api.refreshOne(CURATOR_PATH, {}, state, { ...deps, timeoutMs: 1234 });
   assert.equal(
     armed[before], 1234,
     `an explicitly injected deps.timeoutMs must win even past the threshold; ` +
@@ -1477,4 +1526,203 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
       'unreachable in the browser and turns STALE_TIMEOUT_MS into dead code (measured: ' +
       '4 consecutive ~30000ms aborts in Chrome 151 with the banner already rendered)',
   );
+});
+
+// ---------------------------------------------------------------------------
+// The datum registry (task 5588, PRD leaf gamma1)
+//
+// endpointsFor's rows become endpoint -> {KEY: SPEC}, where a spec declares
+// whether the wire delivers that key as a bare value or as a Datum envelope.
+// Today every polled key is 'plain', which is the HONEST description of the
+// wire: PRD leaf beta has not landed, so no payload carries a Datum yet. The
+// registry is the single place a later leaf flips a row.
+// ---------------------------------------------------------------------------
+
+test('registry: every endpoint row maps key names to declared specs', () => {
+  const { api } = loadDataJs();
+  const rows = api.endpointsFor('24h');
+
+  assert.equal(Object.keys(rows).length, EXPECTED_ENDPOINT_COUNT);
+  for (const [url, keySpecs] of Object.entries(rows)) {
+    assert.ok(
+      keySpecs && typeof keySpecs === 'object' && !Array.isArray(keySpecs),
+      `${url} must map key names to specs, not list them`,
+    );
+    for (const [key, spec] of Object.entries(keySpecs)) {
+      assert.ok(spec && typeof spec === 'object', `${url}/${key} has no spec`);
+      assert.ok(['datum', 'plain'].includes(spec.kind), `${url}/${key} kind ${spec.kind}`);
+    }
+  }
+});
+
+test('registry: the reshape drops no key — the union is exactly today\'s set', () => {
+  const { api } = loadDataJs();
+  const seen = new Set();
+  for (const keySpecs of Object.values(api.endpointsFor('24h'))) {
+    for (const key of Object.keys(keySpecs)) seen.add(key);
+  }
+  assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
+});
+
+test('registry: every polled key is plain today, because no payload serves a Datum', () => {
+  // Not an aspiration — a description. Beta is what puts Datums on the wire;
+  // until it lands, declaring a polled row 'datum' would make applyKey refuse
+  // every real payload and freeze that tab at its seed values.
+  const { api } = loadDataJs();
+  for (const [url, keySpecs] of Object.entries(api.endpointsFor('24h'))) {
+    for (const [key, spec] of Object.entries(keySpecs)) {
+      assert.equal(spec.kind, 'plain', `${url}/${key} is declared datum-kinded`);
+    }
+  }
+});
+
+test('applyKey: a plain-kinded key still applies verbatim, in place for the stable arrays', () => {
+  const { api, window: win } = loadDataJs();
+  const projectsRef = win.DF_DATA.PROJECTS;
+
+  api.applyKey('PROJECTS', [{ id: 'p1' }], PLAIN_SPEC, { servedAt: null, receivedAt: 5 });
+  assert.equal(win.DF_DATA.PROJECTS, projectsRef, 'the captured array reference must survive');
+  assert.deepEqual(win.DF_DATA.PROJECTS, [{ id: 'p1' }]);
+
+  const costs = { summary: { total: 42 } };
+  api.applyKey('COSTS', costs, PLAIN_SPEC, { servedAt: null, receivedAt: 5 });
+  assert.equal(win.DF_DATA.COSTS, costs, 'a plain value is stored verbatim, receipt and all');
+});
+
+test('applyKey: a datum-kinded payload is stored as a COPY carrying its receipt', () => {
+  const { api, window: win } = loadDataJs();
+  const pristine = { ...SERVED_DATUM };
+
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 1234 });
+
+  const stored = win.DF_DATA.DONE_COUNTS;
+  assert.notEqual(stored, SERVED_DATUM, 'the wire payload must not be stored by reference');
+  assert.deepEqual(SERVED_DATUM, pristine, 'the wire payload was mutated');
+  assert.equal(stored._served_at, 'S');
+  assert.equal(stored._received_at, 1234);
+  assert.equal(stored.value.total, 9);
+  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, true);
+});
+
+test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior value kept', () => {
+  // The half that matters. A server regression that starts sending a bare
+  // number where a Datum was declared must leave the last good envelope on
+  // screen — with its age badge still growing — rather than replacing it with
+  // an unprovenanced number that renders as though freshly measured.
+  const { api, window: win } = loadDataJs();
+  const receipt = { servedAt: null, receivedAt: 1 };
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, receipt);
+  const good = win.DF_DATA.DONE_COUNTS;
+
+  for (const bad of [42, 'nine', [SERVED_DATUM], { value: 1, as_of: null, state: 'fresh', reason: null }]) {
+    api.applyKey('DONE_COUNTS', bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 });
+    assert.equal(win.DF_DATA.DONE_COUNTS, good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
+  }
+});
+
+test('applyKey: a refused datum payload does not flip the __loaded marker', () => {
+  const { api, window: win } = loadDataJs();
+  api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 });
+  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, undefined, '__loaded must mean a real value LANDED');
+});
+
+test('applyKey: __receipt is refused exactly like __loaded and __stale', () => {
+  const { api, window: win } = loadDataJs();
+  win.DF_DATA.__receipt[CURATOR_PATH] = { servedAt: null, receivedAt: 99 };
+  api.applyKey('__receipt', {});
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 99 });
+});
+
+test('datumFor: unknown before the first apply, the stored Datum after', () => {
+  const { api, window: win } = loadDataJs();
+
+  const before = api.datumFor('DONE_COUNTS');
+  assert.equal(before.state, 'unknown');
+  assert.equal(before.reason, 'not yet fetched');
+
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 7 });
+  assert.equal(api.datumFor('DONE_COUNTS'), win.DF_DATA.DONE_COUNTS);
+});
+
+// ---------------------------------------------------------------------------
+// __receipt — published on SUCCESS ONLY
+// ---------------------------------------------------------------------------
+
+function okResponse(body) {
+  return () => Promise.resolve({ ok: true, json: async () => body });
+}
+
+test('receipts: a successful refresh records servedAt from the body and receivedAt from the clock', async () => {
+  const { api, window: win } = loadDataJs();
+  const deps = { fetchImpl: okResponse({ served_at: '2026-09-20T12:00:00+00:00' }), now: () => 555 };
+
+  await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], {
+    servedAt: '2026-09-20T12:00:00+00:00',
+    receivedAt: 555,
+  });
+});
+
+test('receipts: a body with no served_at records null, never undefined', async () => {
+  // Today's wire for every endpoint. `null` is a stated absence that plainDatum
+  // can branch on; `undefined` would read as a malformed receipt.
+  const { api, window: win } = loadDataJs();
+  const deps = { fetchImpl: okResponse({ CURATOR_STATE: {} }), now: () => 42 };
+
+  await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42 });
+});
+
+test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {
+  // The single most important property of this map, and the reason it is not
+  // merged into __stale: publishStaleness runs in `finally` BY DESIGN, so a
+  // 503 counts exactly like a timeout. A receipt advanced on failure would
+  // reset every tile's age to zero on each failed poll — the dashboard would
+  // look freshest precisely while it was most wedged.
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+  ]) {
+    const { api, window: win } = loadDataJs();
+    const state = api.createPollState();
+    await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
+    const afterSuccess = win.DF_DATA.__receipt[CURATOR_PATH];
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900, ignoreBackoff: true });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], afterSuccess, 'the receipt advanced on a failure');
+    assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+  }
+});
+
+test('receipts: __stale still advances on failure — the two maps are not one', async () => {
+  // Stated alongside the test above so the asymmetry is visible in one place:
+  // __stale records ATTEMPT history (and must move), __receipt records the
+  // PROVENANCE of the values now in DF_DATA (and must not).
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await api.refreshOne(CURATOR_PATH, {}, state, {
+      fetchImpl: () => Promise.reject(new Error('boom')),
+      now: () => 900,
+      ignoreBackoff: true,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 1);
+  assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
 });
