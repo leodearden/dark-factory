@@ -202,10 +202,13 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
             captured['agent'] = self
             raise _ShapeCaptured
 
+    # No root is configured here: verify() takes ``codebase_root`` per call and
+    # does not read ``config.explore_codebase_root`` (verify.py::CodebaseVerifier
+    # __init__, PRD D3).  Setting the config field would look like it drove the
+    # captured shape while contributing nothing.
     config = ReconciliationConfig(
         agent_llm_provider='claude_cli',
         agent_llm_model='sonnet',
-        explore_codebase_root=str(codebase_root),
     )
     verifier = verify_mod.CodebaseVerifier(config=config)
     original = verify_mod.AgentLoop
@@ -216,6 +219,7 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
                 claim='AgentLoop caps a single assistant round-trip, not the conversation.',
                 context='Probe run; the verdict is irrelevant, only the invocation shape matters.',
                 scope_hints=['fused-memory/src/fused_memory/reconciliation/agent_loop.py'],
+                codebase_root=codebase_root,
             )
         )
     except _ShapeCaptured:
@@ -486,7 +490,7 @@ def main() -> int:
     parser.add_argument('--model', default='sonnet', help='Model to probe (default: sonnet).')
     parser.add_argument(
         '--codebase-root', default=str(_REPO_ROOT),
-        help='cwd for the invocation, mirroring explore_codebase_root.',
+        help='cwd for the invocation, and the root handed to verify().',
     )
     parser.add_argument(
         '--accounts-file', default=str(_DEFAULT_ACCOUNTS_FILE),
