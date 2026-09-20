@@ -453,11 +453,15 @@ def test_scheduler_heatmap_no_longer_iterates_the_raw_props(scheduler_heatmap_js
     """
     body = _heatmap_body(scheduler_heatmap_jsx_body)
 
-    assert 'rows.map(' not in body, (
+    # The leading `(?<![.\w])` is what makes these probes mean what they say:
+    # a bare substring test for `rows.map(` also matches `bounded.rows.map(`,
+    # i.e. it would reject the fix itself. Only an iteration over the RAW
+    # identifier is the defect; one reached through a qualifier is not.
+    assert not re.search(r'(?<![.\w])rows\.map\s*\(', body), (
         'SchedulerHeatmap still iterates the raw `rows` prop — the row axis is '
         'unbounded. Iterate the bounded selection instead.'
     )
-    assert 'enriched.map(' not in body, (
+    assert not re.search(r'(?<![.\w])enriched\.map\s*\(', body), (
         'SchedulerHeatmap still iterates the unbounded `enriched` module list '
         '— the column axis is unbounded. Enrich the BOUNDED modules instead.'
     )
