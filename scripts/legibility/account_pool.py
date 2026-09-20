@@ -229,6 +229,99 @@ def _exhaustion_reason(gate, tried) -> str:
     )
 
 
+_ROUTE_NONZERO_EXIT = "the CLI exited non-zero with a banner the gate confirmed"
+_ROUTE_ZERO_EXIT = "the CLI exited 0 with a banner instead of a verdict"
+"""The two ways the CLI declines, named so the journal can tell them apart.
+
+Structured constants rather than a phrase assembled at each call site
+(heuristic 12): "which route rotated" is a two-valued fact about the run, and
+the only reason it is ever rendered as text is that a journal line is the
+medium. The task record's 2026-09-19 measurement could count the non-zero
+route (46 firings on one night) but could not establish whether the exit-0
+route had ever fired, because both arms said the same thing — so these
+spellings are what make the route greppable.
+"""
+
+
+def _log_rotation(slot, route) -> None:
+    """Record that *slot*'s account did not complete this digest, naming
+    *route*.
+
+    ONE helper called from both arms, not two ``logger.info`` calls, so the
+    shared half of the wording cannot drift between the routes (heuristic 11)
+    while the route clause remains the only thing that differs. The sentence
+    itself is unchanged from the single route-blind line this replaces, so an
+    operator's existing greps and the 2026-09-19 measurement's baseline keep
+    working.
+
+    INFO, because a rotation is normal operating weather — the pool exists to
+    absorb exactly this — and that is how the line it replaces already treated
+    it. The escalation-worthy event is the pool running OUT, which
+    ``_exhaustion_reason`` reports on a raised ``CoderCapExhausted``.
+    """
+    logger.info(
+        "account %s did not complete this digest and the gate recorded a cap "
+        "signal against it (route: %s) — retrying this digest on the next "
+        "account in the pool", slot.account_name, route,
+    )
+
+
+def _banner_instead_of_verdict(slot, reply) -> bool:
+    """Is this exit-0 *reply* a cap banner rather than a verdict?
+
+    Census's split-on-parse-success rule, adopted unchanged: a reply that
+    PARSES into a verdict IS a verdict, so only a reply the coder could not
+    use at all is offered to the gate. The rule is already cited at both of
+    ``coder``'s scan sites (``_invoke_cli`` and ``code_digest``); this module
+    inherits it rather than inventing a third policy.
+
+    HERE IT IS LOAD-BEARING, NOT STYLISTIC, and that is the difference from
+    the coder's two sites — both of which sit on already-FAILED paths where a
+    false positive can only re-label a digest that was failing anyway. This
+    one sits on a SUCCEEDING path, where a false positive costs an account.
+    The gate's strict detector matches a cap-hit prefix and a confirm keyword
+    ANYWHERE in the text, not anchored at the start: measured 2026-09-20, a
+    schema-valid verdict quoting ``REAL_CLI_CAP_HIT_MESSAGES[0]`` in its
+    ``evidence_quote`` classifies as CapHit. Since this repo's codebook is
+    dominated by usage-limit clusters, an unguarded scan would let one
+    cap-themed digest cap every account the rotation walked — for the night.
+
+    THE GATE STILL DECIDES WHETHER THIS IS A CAP. The parse decides only
+    whether to ASK, never what the answer is, so ``pool_invoke``'s "do not
+    re-classify streams here to decide anything the gate decides" holds: a
+    parse attempt answers "could the coder use this reply at all", the same
+    question ``code_digest`` asks one layer down.
+
+    AND THE GATE COSTS NO COVERAGE, because a real banner never parses: every
+    entry of ``shared.cap_markers.REAL_CLI_CAP_MESSAGES`` — the union, so both
+    the cap-hit and the near-cap wordings — raises ``CoderParseError``
+    (measured 2026-09-20, and kept true by
+    ``scripts/tests/test_legibility_account_pool.py::test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door``,
+    which parametrizes over that same union: a future corpus entry that
+    happened to parse turns it red rather than silently losing this route).
+
+    KNOWN RESIDUAL, pinned rather than closed. "A real banner never parses"
+    holds in one direction only, and the converse does not: a reply that fails
+    to parse AND quotes a banner is read here as a banner. So a verdict
+    TRUNCATED mid-JSON after a cap-quoting ``evidence_quote`` caps a healthy
+    account — measured 2026-09-20, the schema-shaped prefix ``{"matches":
+    [{"cluster_id": "usage-limit-stall", "evidence_quote": "<banner>"`` with no
+    closing brace raises ``CoderParseError`` and classifies CapHit. The cost is
+    one account per occurrence, not the pool: the digest still completes on the
+    next lease, and the rotation stays bounded by ``tried``. It is left open
+    DELIBERATELY, because both remedies would give this module a cap policy of
+    its own — a second confirmation probe, or a "this looks like truncated
+    JSON" discriminator — and the paragraphs above are the argument that it has
+    none. Pinned by ``test_a_truncated_verdict_that_quotes_a_banner_costs_that_account``
+    so the disposition is a decision a reader can find, not an oversight.
+    """
+    try:
+        coder.parse_coder_output(reply)
+    except coder.CoderParseError:
+        return slot.detect_cap_hit("", reply)
+    return False
+
+
 def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     """Return a ``(prompt, model) -> str`` callable that runs each
     invocation as an account leased from *gate*.
@@ -258,7 +351,16 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     text, so a loose false positive may re-label one digest but must never
     burn the pool.
 
-    The exit-0 banner route is not rotated — see task 5637.
+    BOTH CAP ROUTES ROTATE, and they are the same rotation (task 5637). The
+    CLI declines two ways: a non-zero exit whose banner the gate confirms
+    (above), and an exit-0 reply that is a banner rather than a verdict. The
+    second arm asks the same strict detector — ``slot.detect_cap_hit("",
+    reply)``, the reply as the OUTPUT stream and no stderr — takes the same
+    next lease, and is bounded the same way. Which route the CLI takes is
+    the CLI's choice and not the pool's, so rotating on one and confirming
+    on the other left one bannering account able to lose a whole night.
+    ``_log_rotation`` names which of the two fired, so the journal can count
+    them separately.
 
     TERMINATION is bounded by the caller's ``tried`` set, passed as
     ``exclude=``, not by the gate's cap transitions: a near-cap verdict
@@ -289,8 +391,6 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
-                slot.confirm()
-                return reply
             except coder.CoderCapExhausted as exc:
                 # The loose per-digest gate fired. Ask the STRICT detector
                 # what the GATE makes of it; on any True verdict it settles
@@ -301,11 +401,21 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 # by an assumption about what just happened.
                 if not slot.detect_cap_hit(exc.stderr, exc.stdout):
                     raise
-                logger.info(
-                    "account %s did not complete this digest and the gate "
-                    "recorded a cap signal against it — retrying this digest "
-                    "on the next account in the pool", slot.account_name,
-                )
+                _log_rotation(slot, _ROUTE_NONZERO_EXIT)
+            else:
+                # THE OTHER CAP ROUTE. The CLI can decline by PRINTING its
+                # banner and exiting 0, so a cap arrives as a RETURNED reply
+                # as readily as a raised one. The SAME strict detector
+                # decides, reached through `_banner_instead_of_verdict` so
+                # that only a reply the coder cannot parse is put to it. On a
+                # True verdict, do NOT confirm (which would clear the gate's
+                # own near-cap annotation on an account that just refused to
+                # answer) and do NOT return: fall through to the next lease
+                # exactly as the arm above does, bounded by the same `tried`.
+                if not _banner_instead_of_verdict(slot, reply):
+                    slot.confirm()
+                    return reply
+                _log_rotation(slot, _ROUTE_ZERO_EXIT)
             finally:
                 gate.release_probe_slot(slot.token)
 

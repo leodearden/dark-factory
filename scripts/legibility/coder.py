@@ -343,6 +343,14 @@ def parse_coder_output(raw: str) -> dict:
     array-shaped output, which must instead raise). Output that never
     parses to a dict at all raises CoderParseError. Never returns a
     fabricated default.
+
+    A SECOND CONSUMER now depends on that raise, so it is load-bearing for
+    account rotation and not only for this module's never-fabricate path:
+    ``scripts/legibility/account_pool.py::_banner_instead_of_verdict``
+    (``pool_invoke``'s exit-0 arm) calls this function as its "is this reply
+    a verdict?" gate, and offers the reply to the usage gate's strict cap
+    detector only when it raises. Parsing something a caller meant as
+    unusable would therefore cost a rotation, not just a bad record.
     """
     primary_candidates = [raw]
     fence_match = _FENCE_RE.search(raw)
@@ -664,6 +672,14 @@ def code_digest(
         # false positive can only re-LABEL a digest that was failing anyway,
         # never launder a genuine verdict into a defer. The hazard the probe
         # exists to prevent does not exist here.
+        #
+        # NOT the only thing between an exit-0 banner and a lost night any
+        # more (task 5637): for a POOLED run that route rotates upstream in
+        # `scripts/legibility/account_pool.py::pool_invoke`, which is the only
+        # layer holding an account to rotate TO. This site remains the
+        # fallback for a caller with no pool -- census's own wiring, a
+        # single-account run -- and for the case where the whole pool is
+        # exhausted.
         marker = looks_like_blocking_banner(raw)
         if marker:
             return CodingResult(
