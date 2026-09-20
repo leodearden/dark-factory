@@ -57,7 +57,19 @@ STATE_SCHEMA_VERSION = 1
 """Version of the recorded document's shape. :func:`load_state` treats any
 OTHER value as ``malformed`` rather than guessing at unknown fields — a
 reader that silently accepts a shape it does not understand is exactly the
-silent-degradation mode this module exists to close."""
+silent-degradation mode this module exists to close.
+
+DELIBERATELY NOT BUMPED for ``consecutive_failed_runs`` (task 4514). That
+field is ADDITIVE and every reader fetches it via ``.get()`` with a 0
+fallback, so no reader can MIS-READ a document that lacks it. Bumping
+would make every live state file on every project read ``malformed`` on
+the first post-deploy probe — one guaranteed false alarm per project,
+plus a reset streak — which is precisely the degradation this module
+exists to close.
+
+THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
+OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
+is not that; changing the meaning or type of an existing field is."""
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +401,28 @@ def record_run(
     breakage, which is PRD decision 7's no-false-alarm guarantee expressed
     in the streak rather than only in the classifier.
 
+    ``failed`` is the exception: it neither increments nor resets
+    ``consecutive_barren_runs``, it CARRIES IT FORWARD. A crashed run is
+    evidence about the RUN, not about whether signal is flowing.
+    Resetting would let a permanently broken pipeline erase a real barren
+    streak — the same silent-degradation shape one layer up; incrementing
+    would attribute an absence the sampler never observed, since the run
+    did not finish and its counters describe an unfinished night.
+
+    ``failed`` gets its OWN counter rather than being folded into the
+    barren one because the two have genuinely DIFFERENT remedies — the
+    same reason ``SampleResult`` keeps ``budget_skipped`` and
+    ``below_sampling_cut`` separate. Barren means "fix the budget or
+    sampling config"; failed means "read ``journalctl --user -u
+    legibility-trickle@<project>``".
+
+    ``scripts/legibility/nightly.py::_escalate_barren_streak`` is
+    UNAFFECTED by either. It returns early unless ``outcome ==
+    OUTCOME_BARREN``, so a failed run cannot fire it; and it gates on
+    EXACT equality with the threshold, which a carried-forward streak
+    still passes through at most once, so the carry-forward cannot
+    double-fire it either.
+
     ``last_productive_at`` is stamped with ``recorded_at`` on a productive
     run and carried forward UNCHANGED across barren and quiet runs. It is
     the field an operator reads to answer "when did this pipeline last
@@ -409,11 +443,15 @@ def record_run(
 
     prev_status, prev = load_state(path)
     prev_streak = 0
+    prev_failed = 0
     last_productive_at = None
     if prev_status == 'ok' and prev is not None:
         raw_streak = prev.get('consecutive_barren_runs')
         if isinstance(raw_streak, int) and raw_streak >= 0:
             prev_streak = raw_streak
+        raw_failed = prev.get('consecutive_failed_runs')
+        if isinstance(raw_failed, int) and raw_failed >= 0:
+            prev_failed = raw_failed
         raw_last = prev.get('last_productive_at')
         if isinstance(raw_last, str):
             last_productive_at = raw_last
@@ -443,7 +481,12 @@ def record_run(
         'commit_made': bool(commit_made),
         'budget_suppressed': bool(budget_suppressed),
         'consecutive_barren_runs': (
-            prev_streak + 1 if outcome == OUTCOME_BARREN else 0
+            prev_streak + 1 if outcome == OUTCOME_BARREN
+            else prev_streak if outcome == OUTCOME_FAILED
+            else 0
+        ),
+        'consecutive_failed_runs': (
+            prev_failed + 1 if outcome == OUTCOME_FAILED else 0
         ),
         'last_productive_at': last_productive_at,
         'counters': {
@@ -489,4 +532,22 @@ that config would drag pydantic + PyYAML onto the bare-``python3``
 predicate path this module must survive (see the module docstring). The
 progress probe also takes the threshold as an argument, so a binding that
 wants a different window passes one rather than editing config.
+"""
+
+DEFAULT_MAX_FAILED_RUNS = 2
+"""Consecutive FAILED runs before ``check_trickle_progress.py`` fails.
+
+WHY 2, AND WHY TIGHTER THAN ``DEFAULT_MAX_BARREN_RUNS = 3``. One failed
+night is already owned TWICE OVER — by ``nightly.py``'s own fail-loud
+escalation for that run, and by ``check_trickle_liveness.sh``'s ``Result
+!= success`` gate — so firing at 1 would only duplicate them. TWO
+consecutive is the PERSISTENT shape neither per-run signal can express,
+and it is what the permanently-broken-coder scenario produces on night
+two. The barren threshold is looser because one barren night can be an
+ordinary bad day, whereas a night that did not finish is already an
+anomaly on its own.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its sibling above: reading that config would drag pydantic + PyYAML
+onto the bare-``python3`` predicate path this module must survive.
 """
