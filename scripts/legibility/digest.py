@@ -1008,10 +1008,14 @@ sub-blocks too. The corner this declines is the memory-UNAVAILABLE variant
 of ``BriefingAssembler.build_reviewer_prompt``, the one identity-less
 template that still has a context slot, which then shows only '# Context' +
 '# Action' -- a shape the pre-3610 all-of-three rule did not catch either,
-so nothing regresses. ``BriefingAssembler.build_merger_prompt`` declines
-the corner entirely: since task 3659 it carries no memory block at all, so
-it emits no '# Context' anchor to be corroborated (D7 -- the merger is
-mechanical and the generic block was never shown to help it)."""
+so nothing regresses. ``BriefingAssembler.build_merger_prompt`` is out of
+this rule's reach entirely: since task 3659 it carries no memory block at
+all, so it emits no '# Context' anchor to be corroborated (D7 -- the merger
+is mechanical and the generic block was never shown to help it). It is
+covered instead by its own :data:`MERGER_HEADINGS` set below, because
+losing it here would have been a REGRESSION, not a declined corner: before
+3659 the merger prompt opened with '# Context' and was classified by this
+very rule."""
 
 RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',
@@ -1039,9 +1043,36 @@ and (b) are one source class (harness injection) with two injectors
 (orchestrator briefing vs. judge prompt), which is why these headings live
 here rather than behind a separate 'pasted report' predicate."""
 
+MERGER_HEADINGS: tuple[str, ...] = (
+    '# task intent', '# merge conflicts', '# action',
+)
+"""Injected merge-resolution PROMPT heading literals
+(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_merger_prompt``,
+a single f-string emitting '# Task Intent', '# Merge Conflicts', '# Action').
+
+This set exists because task 3659 removed the merger's memory block, and
+with it the '# Context' anchor that had been the ONLY heading
+:data:`HARNESS_BRIEFING_HEADINGS` could recognise in a merger dispatch.
+Measured against the real builder: pre-3659 shape -> True (with recalled
+memory AND with the memory-unavailable notice alike), post-3659 shape ->
+False. Without this entry every merge-conflict dispatch -- the docstring
+measures 7 per 14 days -- would be mined as a genuine human turn and
+rendered in the digest's gold 'User Correction' section (PRD Sec 5).
+
+Strict all-of, like every non-briefing injector: the task-3610 relaxation
+was earned by forensics on the briefing shape alone. All three headings are
+'# '-level, which is exactly why the all-of match is required here and why
+these literals must NOT be folded into
+:data:`HARNESS_BRIEFING_SUBHEADINGS` -- a '# '-level corroborator would
+pair with the '# task' anchor and clear the >=2 threshold on its own, the
+false-positive the 3610 amendment pass removed '# action' to prevent. As a
+co-occurring triple they are not an ordinary human shape: '# Merge
+Conflicts' carries the discrimination."""
+
 HARNESS_HEADING_SETS: tuple[tuple[str, ...], ...] = (
     HARNESS_BRIEFING_HEADINGS,
     RECON_RUN_REVIEW_HEADINGS,
+    MERGER_HEADINGS,
 )
 """Every known harness-injected heading set, matched independently: a turn
 is harness-injected when ALL headings of ANY one set co-occur. Adding a

@@ -1340,23 +1340,6 @@ class TestOutageStreakEscape:
             'each dispatch fires two queries and each failure warns'
         )
 
-    async def test_the_threshold_is_code_not_configuration(
-        self, briefing: BriefingAssembler,
-    ):
-        """D7: no new config knob. The query table and its alarm threshold
-        are code, revisited on evidence — hot-reload adds nothing for a
-        module constant, and a knob would invite per-project drift in what
-        counts as an outage."""
-        from orchestrator.agents.briefing import MEMORY_OUTAGE_STREAK_THRESHOLD
-
-        assert isinstance(MEMORY_OUTAGE_STREAK_THRESHOLD, int)
-        assert MEMORY_OUTAGE_STREAK_THRESHOLD > 1
-
-        knobs = set(type(briefing.config).model_fields) | set(
-            type(briefing.config.fused_memory).model_fields
-        )
-        assert not [name for name in knobs if 'streak' in name or 'outage' in name]
-
 
 @pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:

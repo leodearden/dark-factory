@@ -21,6 +21,7 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -1938,6 +1939,34 @@ def _recalled_sections_with_trailing_unavailable_note():
     )
 
 
+def _merger_prompt(tmp_path):
+    """The real text ``BriefingAssembler.build_merger_prompt`` injects
+    (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
+    production builder rather than restating its headings here — the same
+    lockstep discipline ``test_resume_prompt_is_excluded_lockstep`` applies
+    to the cli_invoke resume constants.
+
+    The builder is async and touches no I/O and no config, so a throwaway
+    assembler over *tmp_path* and a plain ``asyncio.run`` suffice; this file
+    is otherwise synchronous and stays that way."""
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    assembler = BriefingAssembler(OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    ))
+    return asyncio.run(assembler.build_merger_prompt(
+        conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
+        task_intent='Rescope the briefing memory block.',
+    ))
+
+
 def _resume_and_context_block_records():
     """The confusion-census sighting shape (session b976febe), minus its
     one genuine correction: a turn-0 lone '# Context' memory block,
@@ -2151,6 +2180,41 @@ class TestHarnessInjectedTurnFilter:
         # coverage. One parametrize row per resume prompt -- a future
         # resume prompt is covered by adding one more row.
         assert mod.is_harness_injected_turn(resume_prompt) is True
+
+    def test_merger_prompt_is_excluded_lockstep(self, tmp_path):
+        # LOCKSTEP: built by the REAL prompt builder, not a hand-copied
+        # literal, the same way test_resume_prompt_is_excluded_lockstep
+        # pins the cli_invoke constants -- so a future merger-prompt
+        # rewording turns this red instead of silently dropping the role
+        # out of coverage.
+        #
+        # The merger is the one dispatched role with NO memory block
+        # (task 3659, D7), so it emits no '# Context' anchor and the
+        # briefing anchor+corroborator rule cannot see it at all. Before
+        # 3659 it was classified via that anchor; MERGER_HEADINGS is what
+        # keeps merge-conflict dispatches (7 per 14 days, measured) out of
+        # the digest's gold user_corrections section.
+        assert mod.is_harness_injected_turn(_merger_prompt(tmp_path)) is True
+
+    def test_merger_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
+        # The end-to-end consequence of the lockstep pin above: a merger
+        # dispatch transcript presents no user turn to mine.
+        records = [_user_text(_merger_prompt(tmp_path))]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_human_turn_with_one_merger_heading_is_retained(self, tmp_path):
+        # The all-of guard MERGER_HEADINGS is matched under: a human turn
+        # writing '# Action' (an ordinary spec-writing heading, emitted by
+        # every role template and deliberately NOT a briefing corroborator
+        # since task 3610) must stay gold.
+        human = (
+            '# Action\n\n'
+            'Please resolve the conflict in briefing.py by hand -- the '
+            'merge queue keeps picking the wrong side.\n'
+        )
+
+        assert mod.is_harness_injected_turn(human) is False
 
     def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
         # The sibling of the usage-limit resume prompt: same defect class
