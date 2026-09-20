@@ -486,16 +486,29 @@ class Mem0Backend:
             return {}
 
     async def get(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
-        """Get a single memory by ID."""
+        """Get a single memory by ID, or ``None`` when it genuinely does not exist.
+
+        Raises:
+            TimeoutError: If the mem0 read exceeds ``_read_timeout`` —
+                PROPAGATED, never swallowed into ``None``.  The swallow this
+                replaces was destructive, not merely lossy: ``None`` reaches
+                ``MemoryService.get_memory`` as a genuine miss and becomes
+                ``MemoryNotFoundError``, which ``ReconReportState.cite_memory``
+                renders as ``memory_not_found`` — and
+                ``repair_memory_citation(reason='memory_not_found')`` DELETES
+                citations on exactly that signal, so a transient read blip
+                could erase valid provenance.  INV-11 ``no-silent-fail-soft``.
+                The message is re-stated on the raised exception because
+                ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY.
+        """
         instance = await self._get_instance(scope)
         try:
             return await asyncio.wait_for(
                 instance.get(memory_id),
                 timeout=self._read_timeout,
             )
-        except TimeoutError:
-            logger.warning(f'Mem0 get timed out after {self._read_timeout}s')
-            return None
+        except TimeoutError as exc:
+            raise TimeoutError(f'Mem0 get timed out after {self._read_timeout}s') from exc
 
     async def update(
         self,
@@ -539,10 +552,9 @@ class Mem0Backend:
         what may be a purely cosmetic tag.
 
         A write timeout PROPAGATES (raises ``TimeoutError``) rather than being
-        swallowed into a falsy return — the posture of
-        :meth:`get_point_by_id` / :meth:`count_by_metadata`, in deliberate
-        contrast to :meth:`get`. A caller must never mistake an unreachable
-        Qdrant for a completed write (no-silent-fail invariant).
+        swallowed into a falsy return — the posture of every read and write on
+        this class. A caller must never mistake an unreachable Qdrant for a
+        completed write (no-silent-fail invariant).
 
         NOTE: Qdrant answers ``acknowledged``/``completed`` for an UNKNOWN point
         id — a no-op, not an error. Callers must confirm the point exists (see
@@ -1442,12 +1454,22 @@ class Mem0Backend:
         dict — bypassing both semantic ranking (``search``) and metadata-equality
         filtering (``count_by_metadata`` / ``scroll_by_metadata``).
 
-        Unlike :meth:`get` (mem0 ``AsyncMemory.get``, which swallows a read
-        timeout into ``None``), a Qdrant read-timeout is PROPAGATED (raises
-        ``TimeoutError``), never swallowed — mirroring ``count_by_metadata`` /
-        ``scroll_by_metadata`` so a timed-out read is never mistaken for a
-        genuine not-found (no-silent-fail invariant). That timeout-distinguishing
-        behaviour is the whole reason this bypasses ``get``.
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), never
+        swallowed, so a timed-out read is never mistaken for a genuine
+        not-found (no-silent-fail invariant) — the uniform posture of every
+        read on this class, no longer something that distinguishes this method
+        from :meth:`get`.
+
+        What DOES distinguish them, and the reason this bypasses ``get``, is
+        the SHAPE of what comes back: this returns the full RAW Qdrant payload
+        with every key at one level, whereas ``get`` returns mem0's PROCESSED
+        record, which lifts ``promoted_payload_keys`` (``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role``) to the record's top
+        level and excludes them from ``metadata``.  A caller that needs a
+        promoted key alongside the custom payload keys at one level wants this
+        method; a caller that wants mem0's normalisations (notably
+        ``created_at`` through ``_normalize_iso_timestamp_to_utc``) wants
+        ``get``.
 
         Returns the point's full raw payload dict, or ``None`` when the point is
         absent (empty ``retrieve`` result). A single-id ``retrieve`` returning

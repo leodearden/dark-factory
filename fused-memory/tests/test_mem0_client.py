@@ -1418,8 +1418,11 @@ class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 
     Direct-to-Qdrant point-fetch (retrieve by id), non-semantic — mirrors the
-    scroll_by_metadata / count_by_metadata timeout-propagation contract, which is
-    exactly why it bypasses the timeout-swallowing Mem0Backend.get.
+    scroll_by_metadata / count_by_metadata timeout-propagation contract, which
+    every read on this class now shares, Mem0Backend.get included (task 5265).
+    What it bypasses get FOR is the payload SHAPE: this returns the full raw
+    Qdrant payload with every key at one level, while get returns mem0's
+    processed record with promoted_payload_keys lifted out of metadata.
     """
 
     def _make_mock_point(self, point_id: str, payload: dict | None):
@@ -1473,8 +1476,9 @@ class TestMem0BackendGetPointById:
         Mirrors scroll_by_metadata/count_by_metadata's propagate-by-default
         contract (no try/except around asyncio.wait_for): a timed-out point-fetch
         must never be indistinguishable from a genuine not-found (no-silent-fail
-        invariant), which is exactly why this bypasses the timeout-swallowing
-        Mem0Backend.get.
+        invariant).  Mem0Backend.get holds the same contract since task 5265, so
+        this is the class-wide posture rather than a property unique to the
+        direct-to-Qdrant reads.
         """
         mock_client = AsyncMock()
         mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1654,8 +1658,8 @@ class TestMem0BackendPayloadPrimitives:
     )
     async def test_timeout_propagates(self, backend, method, args):
         """A write timeout must PROPAGATE, never be swallowed into a falsy return
-        — the house posture on this file (get_point_by_id), in deliberate
-        contrast to get() which does swallow."""
+        — the house posture on this file, shared by every read and write on the
+        class (task 5265 brought search/get_all/get into line)."""
         mock_client = AsyncMock()
         setattr(mock_client, method, AsyncMock(side_effect=TimeoutError))
 

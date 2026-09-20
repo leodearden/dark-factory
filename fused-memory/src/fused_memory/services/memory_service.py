@@ -7780,7 +7780,19 @@ class MemoryService:
         Returns a minimal metadata fingerprint dict:
           {category, agent_id, created_at} for mem0;
           {name, fact_snippet} for graphiti.
-        Raises EdgeNotFoundError (graphiti) or ValueError (mem0 not found).
+
+        Raises:
+            EdgeNotFoundError: graphiti path, edge absent.
+            MemoryNotFoundError: mem0 path, the id genuinely does not exist.
+            TimeoutError: PROPAGATED from the backend read, never converted.
+
+        A MISS and a TIMEOUT must never be conflated, in either direction.
+        ``ReconReportState.cite_memory`` renders MemoryNotFoundError as
+        ``memory_not_found``, and ``repair_memory_citation(reason=
+        'memory_not_found')`` DELETES citations on that signal — so reporting a
+        transient read timeout as a miss would erase valid provenance.  Do not
+        add a ``try/except TimeoutError`` here: ``Mem0Backend.get`` propagates
+        precisely so this function can tell the two apart.
         """
         if store == 'graphiti':
             name, fact = await self.graphiti.get_edge_text(memory_id, group_id=project_id)
