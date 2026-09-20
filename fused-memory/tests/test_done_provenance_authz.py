@@ -212,9 +212,11 @@ class TestDecisionIsAValue:
 
     def test_decision_is_a_frozen_dataclass(self):
         assert dataclasses.is_dataclass(DoneProvenanceAuthzDecision)
-        assert DoneProvenanceAuthzDecision.__dataclass_params__.frozen is True
 
         decision = resolve_deterministic_provenance_authorization(None, agent_id='x')
         assert isinstance(decision, DoneProvenanceAuthzDecision)
+        # FROZEN is proved behaviourally rather than by reading
+        # __dataclass_params__: the property that matters is that a verdict
+        # cannot be mutated after it has been handed to a caller.
         with pytest.raises(dataclasses.FrozenInstanceError):
             decision.allowed = True  # type: ignore[misc]
