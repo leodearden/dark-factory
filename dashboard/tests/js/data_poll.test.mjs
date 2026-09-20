@@ -1693,7 +1693,7 @@ test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep age
     const originalWarn = console.warn;
     console.warn = () => {};
     try {
-      await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900, ignoreBackoff: true });
+      await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900 });
     } finally {
       console.warn = originalWarn;
     }
@@ -1703,6 +1703,10 @@ test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep age
   }
 });
 
+// NOT forced with ignoreBackoff: recordFailure deliberately ignores a forced
+// attempt, so `failures` would never move and this test would assert nothing.
+// A plain second call is allowed anyway — the preceding success reset
+// nextAllowedAt to 0.
 test('receipts: __stale still advances on failure — the two maps are not one', async () => {
   // Stated alongside the test above so the asymmetry is visible in one place:
   // __stale records ATTEMPT history (and must move), __receipt records the
@@ -1717,7 +1721,6 @@ test('receipts: __stale still advances on failure — the two maps are not one',
     await api.refreshOne(CURATOR_PATH, {}, state, {
       fetchImpl: () => Promise.reject(new Error('boom')),
       now: () => 900,
-      ignoreBackoff: true,
     });
   } finally {
     console.warn = originalWarn;

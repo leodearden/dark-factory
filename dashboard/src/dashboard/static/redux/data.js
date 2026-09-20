@@ -11,27 +11,66 @@
  * render and can be replaced freely.
  */
 
-// Endpoint → DF_DATA keys map, parameterised on the active window chip.
+// The Datum envelope's readers, destructured at module scope with no fallback
+// (the DF_SPARK_PATH convention: throw loudly at load rather than defer to a
+// TypeError inside a poll). index.html loads datum.js immediately before this
+// file and test_index_html.py pins that edge.
+//
+// RENAMED IN THE DESTRUCTURE, not bound under datum.js's own names. Classic
+// scripts share ONE global lexical scope, and each of these is already a
+// top-level `function` declaration in datum.js — a same-named `const` here
+// dies with "Identifier 'x' has already been declared" before this file
+// reaches its own `window.DF_DATA = {...}`, which would take the entire
+// dashboard down. classic_script_scope.test.mjs measures exactly that.
+const {
+  isDatum: isDatumPayload,
+  withReceipt: stampWithReceipt,
+  unknownDatum: unknownDatumPlaceholder,
+} = window.DF_DATUM;
+
+// How the wire delivers a key: 'plain' is a bare value, 'datum' is the
+// five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
+// objects rather than a fresh literal per row — a spec is a declaration, not
+// per-row state, and freezing says so.
+//
+// EVERY POLLED KEY IS PLAIN TODAY, and that is a description rather than a
+// placeholder: PRD leaf beta is what puts Datums on the wire, and until it
+// lands, declaring a row datum-kinded would make applyKey refuse every real
+// payload and freeze that tab at its seed values. This registry is the ONE
+// place a later leaf flips a row.
+const PLAIN = Object.freeze({ kind: 'plain' });
+const DATUM = Object.freeze({ kind: 'datum' });
+
+// Endpoint → {DF_DATA key: spec} map, parameterised on the active window chip.
 // Only the four windowed endpoints append ?window=; the rest stay static.
+//
+// THE KEY NAMES ARE QUOTED, and must stay quoted. Four Python structural tests
+// — test_tab_curator.py, test_tab_escalations.py,
+// test_tab_escalation_analytics.py and test_tab_memory_evals.py — assert their
+// endpoint is registered here by searching this shipped source for `'KEY'` or
+// `"KEY"`. Unquoting them is silent: the registry still works and those four
+// tests fail with "add it as the mapped key", naming a key that is in fact
+// already present. Same reasoning as DEFAULT_TIMEOUT_MS further down, which
+// two other Python tests parse straight out of this file.
 function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
-    '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
-    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-                                                       'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
-                                                       'DONE_COUNTS'],
-    '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
-    '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
-    '/api/v2/dashboard/recon':                        ['RECON_STATE', 'AGENTS'],
-    [`/api/v2/dashboard/merge-queue?window=${w}`]:    ['MERGE_QUEUE'],
-    [`/api/v2/dashboard/costs?window=${w}`]:          ['COSTS'],
-    [`/api/v2/dashboard/performance?window=${w}`]:    ['PERFORMANCE'],
-    [`/api/v2/dashboard/burndown?window=${w}`]:       ['BURNDOWN', 'BURNDOWN_BY_PROJECT'],
-    '/api/v2/dashboard/curator':                      ['CURATOR_STATE'],
-    '/api/v2/dashboard/scheduler':                    ['SCHEDULER'],
-    '/api/v2/dashboard/escalations':                  ['ESCALATIONS'],
-    '/api/v2/dashboard/escalation-analytics':         ['ESCALATION_ANALYTICS'],
-    '/api/v2/dashboard/memory-evals':                 ['MEMORY_EVALS'],
+    '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
+    '/api/v2/dashboard/tasks':                        { 'ACTIVE_TASKS': PLAIN, 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'DONE_COUNTS': PLAIN },
+    '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
+    '/api/v2/dashboard/memory-graphs':                { 'MEMORY_TIMESERIES': PLAIN, 'MEMORY_OPS_BREAKDOWN': PLAIN },
+    '/api/v2/dashboard/recon':                        { 'RECON_STATE': PLAIN, 'AGENTS': PLAIN },
+    [`/api/v2/dashboard/merge-queue?window=${w}`]:    { 'MERGE_QUEUE': PLAIN },
+    [`/api/v2/dashboard/costs?window=${w}`]:          { 'COSTS': PLAIN },
+    [`/api/v2/dashboard/performance?window=${w}`]:    { 'PERFORMANCE': PLAIN },
+    [`/api/v2/dashboard/burndown?window=${w}`]:       { 'BURNDOWN': PLAIN, 'BURNDOWN_BY_PROJECT': PLAIN },
+    '/api/v2/dashboard/curator':                      { 'CURATOR_STATE': PLAIN },
+    '/api/v2/dashboard/scheduler':                    { 'SCHEDULER': PLAIN },
+    '/api/v2/dashboard/escalations':                  { 'ESCALATIONS': PLAIN },
+    '/api/v2/dashboard/escalation-analytics':         { 'ESCALATION_ANALYTICS': PLAIN },
+    '/api/v2/dashboard/memory-evals':                 { 'MEMORY_EVALS': PLAIN },
   };
 }
 
@@ -214,9 +253,42 @@ window.DF_DATA = {
   // it would report "current" for a payload that has not moved in hours.
   // Do not reintroduce it.
   __stale: {},
+  // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
+  // each entry is `{servedAt, receivedAt}`, published by refreshOne on the
+  // SUCCESS path only. datum.js::plainDatum reads this to give a value that
+  // is not yet served as a Datum the provenance it does have.
+  //
+  // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
+  // The two answer different questions and have different lifetimes. __stale
+  // records ATTEMPT history and is republished in refreshOne's `finally` by
+  // design, so a 503 counts exactly like a timeout; it is
+  // endpoint_staleness.js's input and the sole endpoint-freshness authority.
+  // __receipt records the PROVENANCE of the values currently sitting in
+  // DF_DATA, and must NOT advance on a failure — that is precisely what makes
+  // a wedged endpoint's tiles keep ageing on screen instead of looking
+  // freshest while the server is least reachable. `lastSuccessAt` and
+  // `receivedAt` coincide today BY CONSTRUCTION (refreshOne reads the clock
+  // once and uses it for both), which is worth this comment rather than a
+  // merge: merging would put a staleness verdict and a provenance stamp in one
+  // entity, and make "no second staleness decision" unenforceable.
+  //
+  // `__`-prefixed, so applyKey's existing refusal already protects it from a
+  // server payload key of the same name.
+  __receipt: {},
 };
 
-function applyKey(key, value) {
+// Apply one key of a response body to DF_DATA.
+//
+// `spec` declares how the wire delivers this key and defaults to PLAIN, so
+// every existing two-argument caller is unaffected. On a datum-kinded row the
+// payload is VALIDATED before it is applied: one that fails isDatum is
+// refused outright and the previous value is left exactly where it is, with
+// its own receipt intact and its age still growing. Refusing rather than
+// storing is the point — a server regression that starts sending a bare
+// number where a Datum was declared would otherwise replace a provenanced
+// value with an unprovenanced one that renders as though freshly measured,
+// which is the single failure this envelope exists to remove.
+function applyKey(key, value, spec, receipt) {
   if (value === undefined || value === null) return;
   // `__`-prefixed names are DF_DATA's internal namespace (__loaded, __stale)
   // — never endpoint keys, and never anything a server payload may write.
@@ -226,16 +298,35 @@ function applyKey(key, value) {
   // would flip every marker, and one named `__stale` would erase the very
   // record that reports the server is failing. Enforce it here instead.
   if (typeof key === 'string' && key.startsWith('__')) return;
-  if (STABLE_ARRAY_KEYS.has(key) && Array.isArray(window.DF_DATA[key]) && Array.isArray(value)) {
+  let applied = value;
+  if ((spec || PLAIN).kind === 'datum') {
+    if (!isDatumPayload(value)) return;
+    applied = stampWithReceipt(value, receipt);
+  }
+  if (STABLE_ARRAY_KEYS.has(key) && Array.isArray(window.DF_DATA[key]) && Array.isArray(applied)) {
     window.DF_DATA[key].length = 0;
-    window.DF_DATA[key].push(...value);
+    window.DF_DATA[key].push(...applied);
   } else {
-    window.DF_DATA[key] = value;
+    window.DF_DATA[key] = applied;
   }
   // Marked AFTER the apply, and only past the null/undefined guard above, so
   // the marker means "a real server value for this key has LANDED" — never
   // "a fetch was attempted" and never "the response omitted this key".
   window.DF_DATA.__loaded[key] = true;
+}
+
+// The Datum now sitting under *key*, or an unknown one saying nothing has
+// arrived yet.
+//
+// AN ACCESSOR RATHER THAN UNKNOWN-DATUM LITERALS IN THE SEED BLOCK ABOVE. A
+// seed literal per datum-kinded key would be a second copy of the unknown
+// Datum, free to drift from unknownDatum() (SPOT), and it could not express
+// the case that actually matters: the parameterised per-project keys
+// (TASKS_TERMINAL:<project>) are not statically enumerable, so there is no
+// place to seed them. One accessor answers both.
+function datumFor(key) {
+  const value = window.DF_DATA[key];
+  return isDatumPayload(value) ? value : unknownDatumPlaceholder('not yet fetched');
 }
 
 // Flow-control state is keyed by endpoint PATH (query string stripped): four
@@ -314,12 +405,20 @@ const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 // the socket back for the tabs that are still working.
 const STALE_TIMEOUT_MS = 5000;
 
-// Fallback for endpoint_staleness.js's threshold. data.js is the FIRST
-// classic script in index.html, so reading window.DF_ENDPOINT_STALENESS at
-// module scope would be a hard load-order dependency on a script that has
-// not run yet. Read it lazily instead, and fall back to this literal when
-// absent (the node --test harness, where no classic scripts load at all).
-// endpoint_staleness.test.mjs asserts the two values agree.
+// Fallback for endpoint_staleness.js's threshold, read LAZILY with this
+// literal as a fallback — deliberately unlike the DF_DATUM destructure at the
+// head of this file, which is module-scope and has no fallback at all.
+//
+// The two differ because their histories do. This one dates from when data.js
+// was the FIRST classic script in index.html, so a module-scope read would
+// have named a script that had not run yet; that is no longer true (task 5588
+// moved endpoint_staleness.js and datum.js ahead of this file, pinned in
+// test_index_html.py), but the lazy read is kept because changing it is not
+// this task's business and the fallback literal it carries is already pinned
+// against the real value by endpoint_staleness.test.mjs. Do NOT copy this
+// shape for a new dependency: it costs a duplicated constant plus a test to
+// keep the two copies agreeing, which is exactly the drift a module-scope
+// destructure removes.
 const STALE_FAILURE_THRESHOLD_FALLBACK = 3;
 
 function staleFailureThreshold() {
@@ -342,7 +441,15 @@ function publishStaleness(url, st) {
   };
 }
 
-async function refreshOne(url, keys, state, deps) {
+// Record the provenance of the values this response just delivered. Called on
+// the SUCCESS path ONLY — pointedly NOT from `finally`, where publishStaleness
+// lives. See the __receipt seed block for why the asymmetry is the whole point.
+function publishReceipt(stateKey, receipt) {
+  if (typeof window === 'undefined' || !window.DF_DATA) return;
+  window.DF_DATA.__receipt[stateKey] = receipt;
+}
+
+async function refreshOne(url, keySpecs, state, deps) {
   const st = stateFor(state, url);
   if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
   if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return; // still backed off
@@ -386,10 +493,15 @@ async function refreshOne(url, keys, state, deps) {
       return;
     }
     const body = await resp.json();
-    keys.forEach(k => applyKey(k, body[k]));
+    // ONE clock reading for the whole response, so every key it carries shares
+    // a single arrival instant — and so `lastSuccessAt` below cannot drift
+    // from `receivedAt` by however long the applies took.
+    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now() };
+    Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
     st.failures = 0;
     st.nextAllowedAt = 0;
-    st.lastSuccessAt = deps.now();
+    st.lastSuccessAt = receipt.receivedAt;
+    publishReceipt(pollKey(url), receipt);
   } catch (err) {
     recordFailure(st, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
@@ -460,9 +572,9 @@ async function refreshDFData(win, opts) {
     ...o.deps,
     jitterMaxMs: o.jitterMaxMs ?? JITTER_MAX_MS,
   };
-  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => {
+  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keySpecs]) => {
     const ignoreBackoff = !!(isChipChange && url.includes('?window='));
-    return refreshOne(url, keys, state, { ...baseDeps, ignoreBackoff });
+    return refreshOne(url, keySpecs, state, { ...baseDeps, ignoreBackoff });
   }));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
@@ -516,6 +628,7 @@ const DF_DATA_LOADER_API = {
   startPolling,
   createPollState,
   pollKey,
+  datumFor,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
