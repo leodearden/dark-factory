@@ -897,7 +897,7 @@ class TestIdempotentResumeAndQuiescence:
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        _seed_resolved_gate(queue, '100')
+        gate_esc = _seed_resolved_gate(queue, '100')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -905,13 +905,16 @@ class TestIdempotentResumeAndQuiescence:
 
         assert outcome == WorkflowOutcome.DONE
         # Pure-gate leg stamps deterministic-gate provenance (task 2331) so the
-        # done write passes require_done_provenance instead of churning forever.
+        # done write passes require_done_provenance instead of churning forever,
+        # and cites the resolving gate record (task 5241 — escalation_id is now
+        # REQUIRED for this kind server-side).
         scheduler.set_task_status.assert_awaited_once_with(
             '100',
             'done',
             done_provenance={
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
+                'escalation_id': gate_esc.id,
             },
         )
 
@@ -1059,7 +1062,7 @@ class TestIdempotentResumeAndQuiescence:
         task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        _seed_resolved_gate(queue, '99')  # resolved+archived — the true post-resume state
+        gate_esc = _seed_resolved_gate(queue, '99')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -1072,6 +1075,7 @@ class TestIdempotentResumeAndQuiescence:
             done_provenance={
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
+                'escalation_id': gate_esc.id,
             },
         )
 
@@ -1154,9 +1158,81 @@ class TestPureGateResumeHardening:
             done_provenance={
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
+                'escalation_id': existing.id,
             },
         )
 
+    async def test_pure_gate_resume_cites_the_gate_record_not_the_newest(
+        self, tmp_path: Path,
+    ):
+        """The pure arm inherits the curator arm's citation rule (task 5241).
+
+        Modelled on
+        ``test_curator_gate_remediation_round_trip_cites_the_gate_record``,
+        which pins the same rule for the CURATOR arm. Until 5241 the pure arm
+        cited nothing at all, so a "newest own record wins" implementation
+        would have looked correct against every single-record test above:
+        each seeds exactly one record, where newest and gate coincide.
+
+        Here two own-role records exist and the gate is the OLDER one. A
+        newest-wins selection would cite the unrelated infra_issue — a record
+        that proves nothing about the gate — quietly mis-aiming the audit
+        trail the citation exists to sharpen.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='5241', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        gate_esc = _seed_resolved_gate(queue, '5241')
+        newer = _seed_escalation(
+            queue, '5241', 'orchestrator-deterministic',
+            resolved=True, category='infra_issue',
+        )
+        assert newer.timestamp >= gate_esc.timestamp, (
+            'setup precondition: the non-gate record must be the newer one, '
+            'or this test cannot distinguish the two selection rules'
+        )
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        provenance = scheduler.set_task_status.await_args.kwargs['done_provenance']
+        assert provenance['escalation_id'] == gate_esc.id, (
+            'the pure-gate close must cite the milestone_gate record, not the '
+            f'newest own-role one (got {provenance["escalation_id"]!r}, '
+            f'newest={newer.id!r})'
+        )
+
+    async def test_pure_gate_close_never_omits_the_escalation_id(
+        self, tmp_path: Path,
+    ):
+        """A `deterministic-gate` blob with no `escalation_id` is refused
+        server-side (task 5241), so the runner must never emit one.
+
+        The zero-record case cannot reach the done write at all — it re-files
+        the gate and stays BLOCKED, which
+        ``test_pure_gate_resume_no_record_refiles_and_blocks`` above already
+        pins. That is WHY `own_records` is guaranteed non-empty on this path
+        and the citation helper can never return None here. This test pins
+        the other half: whenever the close DOES happen, the key is present.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='5242', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '5242')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.DONE
+
+        provenance = scheduler.set_task_status.await_args.kwargs['done_provenance']
+        assert provenance.get('escalation_id'), provenance
     async def test_always_escalates_gate_stamp_implies_queryable_escalation(self, tmp_path: Path):
         """Regression guard (task 2954, the explicitly-requested end-to-end
         deliverable): a fresh always_escalates pure-gate dispatch must yield a
@@ -1637,17 +1713,27 @@ class TestHumanCuratorGateAdjudicationGuard:
         )
         assert pending[0].level == 2
 
-    async def test_plain_pure_gate_resume_provenance_is_byte_unchanged(
+    async def test_plain_pure_gate_resume_provenance_is_exactly_the_plain_shape(
         self, tmp_path: Path,
     ):
-        """REGRESSION PIN: a pure gate WITHOUT the curator marker is untouched.
+        """REGRESSION PIN: a pure gate WITHOUT the curator marker gets the
+        PLAIN provenance — the generic note, and the gate record's id, and
+        nothing else.
+
+        This fence was written for task 3341 under the name
+        ``..._is_byte_unchanged``, pinning that the curator change must not
+        perturb the plain arm at all. PRD C5 supersedes that premise: it
+        perturbs the plain arm DELIBERATELY, adding ``escalation_id`` because
+        the server now requires it for ``kind='deterministic-gate'``. The
+        fence's PURPOSE is unchanged and still load-bearing — a future edit
+        widening the curator branch must not leak further keys or a changed
+        note onto every plain deterministic gate in the fleet — so it is
+        re-pointed at the new shape rather than deleted.
 
         Deliberately redundant with
         ``TestPureGateResumeHardening.test_pure_gate_resume_with_resolved_record_drives_to_done``.
-        It lives HERE, in the curator-guard class, so that a future edit widening
-        the curator provenance branch cannot silently leak new keys or a changed
-        note onto every plain deterministic gate in the fleet — the reviewer of
-        such an edit sees this fence in the same file region they are editing.
+        It lives HERE, in the curator-guard class, so the reviewer of such an
+        edit sees the fence in the same file region they are editing.
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
@@ -1656,7 +1742,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         assert 'human_curator_gate' not in task['metadata']
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        _seed_resolved_gate(queue, '99')
+        gate_esc = _seed_resolved_gate(queue, '99')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -1669,6 +1755,7 @@ class TestHumanCuratorGateAdjudicationGuard:
             done_provenance={
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
+                'escalation_id': gate_esc.id,
             },
         )
 
@@ -7360,7 +7447,10 @@ class TestDeterministicRunnerResolutionProofAliasing:
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         # Runner's own gate escalation: resolved.
-        _seed_escalation(queue, '801', 'orchestrator-deterministic', resolved=True, category='milestone_gate')
+        gate_esc = _seed_escalation(
+            queue, '801', 'orchestrator-deterministic',
+            resolved=True, category='milestone_gate',
+        )
         # Unrelated escalation for the SAME task: still pending.
         _seed_escalation(queue, '801', self._UNRELATED_ROLE)
         scheduler = _mock_scheduler(task)
@@ -7380,6 +7470,9 @@ class TestDeterministicRunnerResolutionProofAliasing:
             done_provenance={
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
+                # The runner's OWN gate record — the unrelated pending
+                # escalation is a different agent_role and never citable.
+                'escalation_id': gate_esc.id,
             },
         )
 
