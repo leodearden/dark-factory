@@ -919,7 +919,7 @@
     "orchestrator/tests/test_harness_interactive_reaper.py": {"patch_targets": [], "private_reads": 21},
     "orchestrator/tests/test_harness_merge_registry_wiring.py": {"patch_targets": ["SpeculativeMergeWorker", "enforce_merge_liveness_margin"], "private_reads": 22},
     "orchestrator/tests/test_harness_merge_store_wiring.py": {"patch_targets": ["SpeculativeMergeWorker", "enforce_merge_liveness_margin", "enforce_persistent_worktree_serial_lane"], "private_reads": 11},
-    "orchestrator/tests/test_harness_no_landings_breaker.py": {"patch_targets": [], "private_reads": 30},
+    "orchestrator/tests/test_harness_no_landings_breaker.py": {"patch_targets": [], "private_reads": 31},
     "orchestrator/tests/test_harness_offline_lane.py": {"patch_targets": [], "private_reads": 39},
     "orchestrator/tests/test_harness_orphan_merge_reaper_wiring.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_harness_plan_step_rederive.py": {"patch_targets": [], "private_reads": 12},
