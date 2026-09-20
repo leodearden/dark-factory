@@ -970,7 +970,7 @@ class TestSweepStaleLocks:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: the dangling-ref recovery this task exists for
+# End-to-end: the two recoveries this task exists for
 # ---------------------------------------------------------------------------
 
 def _make_dangling(repo: Path, conflict_id: str) -> None:
@@ -981,12 +981,21 @@ def _make_dangling(repo: Path, conflict_id: str) -> None:
 class TestPreflightEndToEnd:
     """The full guarded-recovery path against a real wedged repository.
 
-    What is deliberately NOT asserted: that an UNGUARDED ``git rebase --abort``
-    segfaults here.  It does on git 2.43.0 — measured rc 139 — but that is an
-    upstream ``rerere_clear()`` bug this task puts out of scope, and pinning it
-    would turn the day the host's git is patched into a red suite, with the fix
-    reading as the regression.  The guarded post-condition asserted instead is
-    version-independent and still fails loudly if the preflight regresses.
+    BOTH measured failure modes get a behavioural case here, because the module
+    carries a separate half for each and either half could rot green: the
+    dangling rr-cache ref that the quarantine answers, and the ``MERGE_RR.lock``
+    that the sweep and the guard answer between them.  Each has its negative
+    control beside it — a healthy fixture for the first, a lock too young to
+    sweep for the second.
+
+    What is deliberately NOT asserted: how an UNGUARDED abort fails.  On git
+    2.43.0 it segfaults on the dangling ref (measured rc 139) and dies rc 128
+    on the lock (measured, with the rebase state left intact) — but the first
+    is an upstream ``rerere_clear()`` bug this task puts out of scope, and
+    pinning either would turn the day the host's git changes into a red suite,
+    with the fix reading as the regression.  The guarded post-conditions
+    asserted instead are version-independent and still fail loudly if the
+    preflight regresses.
     """
 
     def test_dangling_ref_is_detected_quarantined_and_the_abort_recovers(
@@ -1034,6 +1043,90 @@ class TestPreflightEndToEnd:
         assert result.verdict == 'clean'
         assert (repo / '.git' / 'MERGE_RR').read_bytes() == original
         assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
+
+    def test_an_abandoned_lock_is_swept_and_the_abort_recovers(
+        self, tmp_path: Path,
+    ) -> None:
+        """The OTHER defect, end to end: intact rr-cache, abandoned lock, rc 0.
+
+        This mode is independent of the dangling ref — it reproduces with a
+        perfectly healthy rr-cache — and until now only its unit halves were
+        covered, against synthetic git dirs.  A lock left by a process that is
+        long gone is exactly the state incident 3517 left behind, and the
+        repair asserted here is the sweep's: the lock is named in
+        ``locks_removed`` and gone from disk.
+
+        The MERGE_RR assertions are the control that keeps the two halves
+        honest.  It is healthy, so it must be left exactly where git put it —
+        a sweep that dragged a healthy MERGE_RR into quarantine would satisfy
+        every other assertion in this case while destroying state on every
+        wedged rebase in the fleet.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        merge_rr = repo / '.git' / 'MERGE_RR'
+        original = merge_rr.read_bytes()
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE * 2)
+        pre_rebase_tip = _git_ok(repo, 'rev-parse', 'feature').strip()
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            repo, now=_NOW, lock_stale_after_seconds=_STALE,
+        )
+
+        assert [finding.path for finding in result.locks_removed] == [lock]
+        assert not lock.exists()
+        assert result.verdict == rebase_recovery.VERDICT_REPAIRED
+
+        assert result.dangling == ()
+        assert result.merge_rr_backup is None
+        assert merge_rr.read_bytes() == original
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert _git_ok(repo, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
+
+    def test_a_lock_too_young_to_sweep_is_recovered_by_the_guard_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """The control for ``RECOVERY_GIT`` itself, and the only one there is.
+
+        MEASURED on git 2.43.0: an abort refuses while ANY ``MERGE_RR.lock``
+        exists — rc 128, "Another git process seems to be running", rebase
+        state intact — and age is nothing to git.  Age is the SWEEP's concern,
+        and here it declines: a lock this young may still be live, and the
+        sweep will not guess.  So no repair happened, the verdict is ``clean``,
+        the lock is still on disk — and the abort below still returns 0.
+
+        Nothing but the ``rerere.enabled=false`` prefix can be carrying that.
+        MEASURED by reducing ``RECOVERY_GIT`` to a bare ``('git',)``: this is
+        the only BEHAVIOURAL case in the module that goes red — the two others
+        that fail assert the token itself, not a recovery.  Both end-to-end
+        cases above keep passing, because their own repair covers for the
+        missing prefix, the quarantine for the dangling ref and the sweep for
+        the abandoned lock.  That is the evidence for the module header's claim
+        that the guard and the repairs are independently load-bearing rather
+        than one of them dead weight.
+        """
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        lock = _plant_lock(repo / '.git', 'MERGE_RR.lock', age_seconds=_STALE / 2)
+
+        result = rebase_recovery.preflight_rebase_recovery(
+            repo, now=_NOW, lock_stale_after_seconds=_STALE,
+        )
+
+        assert result.locks_removed == ()
+        assert [finding.path for finding in result.locks_retained] == [lock]
+        assert result.verdict == 'clean'
+        assert lock.exists(), 'a lock young enough to be live is left alone'
+
+        abort = _run_argv(repo, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+
+        assert not (repo / '.git' / 'rebase-merge').exists()
+        assert _git_ok(repo, 'status', '--porcelain') == ''
+        assert lock.exists(), 'the guard recovers around the lock, not through it'
 
 
 class TestTheGitProbeIsBounded:
