@@ -1002,7 +1002,7 @@
     "orchestrator/tests/test_merge_queue_single_writer_asserts.py": {"patch_targets": ["_DEBUG_ASSERTS"], "private_reads": 52},
     "orchestrator/tests/test_merge_queue_speculative_probe.py": {"patch_targets": ["_run_post_merge_verify"], "private_reads": 76},
     "orchestrator/tests/test_merge_queue_store.py": {"patch_targets": [], "private_reads": 1},
-    "orchestrator/tests/test_merge_queue_supervisor.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 86},
+    "orchestrator/tests/test_merge_queue_supervisor.py": {"patch_targets": [], "private_reads": 74},
     "orchestrator/tests/test_merge_queue_train_attribution.py": {"patch_targets": ["_finalize_advanced_merge", "_run_post_merge_verify"], "private_reads": 8},
     "orchestrator/tests/test_merge_queue_two_layer_integration.py": {"patch_targets": [], "private_reads": 61},
     "orchestrator/tests/test_merge_queue_verifier_raw_cancel.py": {"patch_targets": [], "private_reads": 21},
