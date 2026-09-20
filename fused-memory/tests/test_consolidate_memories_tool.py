@@ -2491,3 +2491,51 @@ class TestTheEnvelopeSurvivesTheExtraction:
             'tombstones_written': 0,
             'tombstones_expected': 0,
         }
+
+
+class TestTheClosureListingIsReadAfterTheFold:
+    """The envelope must never report as a LIVE topic member an id it
+    reports in `deleted`.
+
+    The flagship case is not exotic: the ratchet this op exists to end is
+    "a cluster ends up containing the consolidator's own prior
+    canonicals", so a supersede that already carries the topic — the
+    incumbent being reaped — is the ordinary shape of a fold. A listing
+    taken before the deletes names it; a listing taken after does not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_reaped_topic_member_is_not_listed_as_live(self):
+        svc = make_service()
+        # Two ANSWERS to the same question, before and after the fold. The
+        # world's answer changes because the op changed it; modelling the
+        # scroll as a constant would make any placement of the read look
+        # correct.
+        svc.get_memories_by_metadata = AsyncMock(
+            side_effect=[
+                [_scroll_row(m) for m in (CANONICAL, RETAIN_1, RETAIN_2, S1)],
+                [_scroll_row(m) for m in (CANONICAL, RETAIN_1, RETAIN_2)],
+            ]
+        )
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        assert [m['id'] for m in result['topic_members']] == [
+            CANONICAL,
+            RETAIN_1,
+            RETAIN_2,
+        ]
+        assert S1 in result['deleted']
+
+    @pytest.mark.asyncio
+    async def test_the_retain_only_arm_pays_for_exactly_one_scroll(self):
+        """The ratified default (gate 3200), and the only shape the
+        auto-consolidation executor takes. With no delete arm there is no
+        fold for a second read to see, so owing one would be pure cost."""
+        svc = make_service()
+
+        await call_consolidate(
+            svc, supersedes=[], retain=[RETAIN_1, RETAIN_2], run_id=None
+        )
+
+        svc.get_memories_by_metadata.assert_awaited_once()
