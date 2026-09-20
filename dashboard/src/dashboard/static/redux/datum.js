@@ -195,6 +195,65 @@ function displayedAgeMs(datum, now) {
   return serverGap + clientGap;
 }
 
+// ── The one true placeholder, and the one true under-report prefix ──
+// Exported for the reason task_row_cells.js::STRAND_TITLE is: 43 StatTile call
+// sites hand-spelling a placeholder is 43 chances to disagree about it, and
+// this module is where the disagreement is settled. '≥' marks a `lower_bound`
+// value — measured, but known to under-report, so the number shown is a floor.
+const EM_DASH = '—';
+const LOWER_BOUND_PREFIX = '≥';
+
+// ── How should this datum be drawn? ──
+// Returns `{text, title, age, prefix}`:
+//   text   — what the value cell says, formatter and prefix already applied;
+//   title  — the producer's reason, as a tooltip, or null when there is none;
+//   age    — the humanised displayed age to badge, or null for no badge;
+//   prefix — '≥' or '', the same decision surfaced separately for a call site
+//            that wants to style the marker; `text` already carries it, so a
+//            caller rendering only `text` is complete.
+//
+// ONE DECISION, NO PER-CALLER BRANCHING. This is the entire point of the leaf:
+// a component asks what to draw and draws it. A tile that grew its own arm for
+// holes or its own age spelling would be a second authority on a question
+// answered here, which is how 43 tiles came to hand-roll 14 different null
+// guards in the first place.
+//
+// FORMAT IS NEVER INVOKED ON A HOLE. The unknown arm returns before `format` is
+// reached. charts.jsx::HBarChart already records why that, and not the
+// placeholder, is the load-bearing half: its live call sites pass formatters
+// that throw on a missing value, so invoking one on a hole takes down the whole
+// tab rather than blanking one cell. It is also what lets the migration DELETE
+// each site's `x == null ? '—' : f(x)` sentinel instead of keeping two hole
+// decisions per tile.
+//
+// THE AGE BADGE WINS OVER THE SERVER'S STATE. A datum served `fresh` was fresh
+// when it was served; if it has since aged past its producer's bound sitting in
+// this browser, the badge appears anyway. The value still renders and no reason
+// is invented — the server gave none — but the operator reads the age rather
+// than a verdict that has quietly expired. That client-side expiry is the only
+// thing the naive `now − as_of` age could never express.
+function datumView(datum, opts) {
+  assertDatum(datum, 'datumView');
+  const o = opts || {};
+  const format = o.format || String;
+  const now = o.now === undefined ? Date.now() : o.now;
+
+  if (datum.state === 'unknown') {
+    return { text: EM_DASH, title: datum.reason, age: null, prefix: '' };
+  }
+
+  const ageMs = displayedAgeMs(datum, now);
+  const overBound = ageMs !== null && ageMs > datum.freshness_bound_seconds * 1000;
+  const prefix = datum.state === 'lower_bound' ? LOWER_BOUND_PREFIX : '';
+
+  return {
+    text: prefix + format(datum.value),
+    title: datum.state === 'fresh' ? null : datum.reason,
+    age: ageMs !== null && (datum.state !== 'fresh' || overBound) ? formatAgeMs(ageMs) : null,
+    prefix,
+  };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision here
@@ -207,6 +266,9 @@ const DATUM_API = {
   assertDatum,
   withReceipt,
   displayedAgeMs,
+  datumView,
+  EM_DASH,
+  LOWER_BOUND_PREFIX,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
