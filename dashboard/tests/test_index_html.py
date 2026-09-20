@@ -623,6 +623,62 @@ _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
 _RECON_STATUS_PREFIX = '/static/redux/recon_status.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+_SCHED_HEATMAP_BOUNDS_PREFIX = '/static/redux/scheduler_heatmap_bounds.js'
+_SCHEDULER_HEATMAP_PREFIX = '/static/redux/scheduler_heatmap.jsx'
+
+
+def test_scheduler_heatmap_bounds_js_is_served(client) -> None:
+    """GET /static/redux/scheduler_heatmap_bounds.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s.  scheduler_heatmap.jsx destructures
+    window.DF_SCHED_HEATMAP_BOUNDS at top level with no `|| {}` fallback, so a
+    404 here throws at load and blanks the whole Scheduler tab.
+
+    The body check is what makes this more than a reachability probe: a 200
+    serving the wrong file (a stale mount, a path collision) would otherwise
+    pass.
+    """
+    resp = client.get(_SCHED_HEATMAP_BOUNDS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_SCHED_HEATMAP_BOUNDS_PREFIX}, got {resp.status_code} '
+        '— the module is registered in index.html but not reachable at runtime.'
+    )
+    assert 'boundHeatmapAxes' in resp.text, (
+        f'{_SCHED_HEATMAP_BOUNDS_PREFIX} was served but does not define '
+        'boundHeatmapAxes — the route resolves to the wrong file.'
+    )
+
+
+def test_scheduler_heatmap_bounds_js_loads_before_scheduler_heatmap(
+    index_html_body: str,
+) -> None:
+    """scheduler_heatmap_bounds.js must load BEFORE scheduler_heatmap.jsx.
+
+    scheduler_heatmap.jsx destructures {boundHeatmapAxes, rowTouchesModule}
+    from window.DF_SCHED_HEATMAP_BOUNDS at top-level execution time with no
+    fallback — a later (or missing) tag makes it throw at load, so the
+    Scheduler tab never renders.  The destructure is deliberate
+    (loud-over-silent degradation); this ordering guard keeps that loudness
+    out of a browser.
+
+    Satisfied structurally by the bounds module being a CLASSIC script: every
+    classic tag precedes the first type="text/babel" tag in index.html.  That
+    is the arrangement this asserts, not a coincidence to rely on.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _SCHED_HEATMAP_BOUNDS_PREFIX,
+        _SCHEDULER_HEATMAP_PREFIX,
+        before_label='scheduler_heatmap_bounds.js',
+        after_label='scheduler_heatmap.jsx',
+        consumer_note=(
+            'scheduler_heatmap.jsx destructures window.DF_SCHED_HEATMAP_BOUNDS '
+            'at top level; scheduler_heatmap_bounds.js must define it first.'
+        ),
+    )
 
 
 def test_task_row_cells_js_is_served(client) -> None:

@@ -72,6 +72,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
+  'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
 };
 
 function readIndexHtml() {
