@@ -29,7 +29,14 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 16-value output domain of ``verify_classify.classify_failure``."""
+    """The closed output domain of ``verify_classify.classify_failure``.
+
+    The CARDINALITY is deliberately not written down here or in any other
+    prose: it was hand-patched across five sites the last two times a
+    category was added, and drifted (task 5580). ``CATEGORY_POLICY``'s
+    import-time exhaustiveness check and ``test_verify_categories`` are the
+    only places that count the members.
+    """
 
     INFRA_TIMEOUT = 'infra_timeout'
     INFRA_KILL = 'infra_kill'
@@ -52,7 +59,7 @@ class FailureCategory(StrEnum):
 class RetryKind(Enum):
     """How ``run_verification`` recovers from a given category, if at all.
 
-    Populated for all 16 ``CATEGORY_POLICY`` rows per the PRD contract
+    Populated for EVERY ``CATEGORY_POLICY`` row per the PRD contract
     (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
     archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
     yet dispatched on. ``run_verification`` still decides retries via two
@@ -524,7 +531,7 @@ def should_archive(category: str) -> bool:
     """Return True when *category* warrants durable human-triage archival.
 
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
-    A category outside the known 16 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
+    A category outside the enum (e.g. a verify_runner UNSCOPED_TYPECHECK_*
     sentinel, or any other unrecognized string) defaults to False. See
     ``verify_classify.classify_failure``'s docstring for the closed-domain
     contract that keeps this default from silently misfiring on a future
@@ -544,7 +551,7 @@ def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
     an out-of-band sentinel namespace (e.g. verify_runner's
     UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
     but never produced by ``classify_failure``) is provably separate from
-    ``FailureCategory``'s closed 16-value output domain, so a future
+    ``FailureCategory``'s closed output domain, so a future
     accidental collision is caught fail-loud at import time instead of
     silently conflating a gate signal with a real classifier category.
     """

@@ -337,6 +337,34 @@ PYTEST_USAGE_ERROR_OUTPUT = (
     '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
 )
 
+# The SAME rejection from the same binary launched as a module — measured
+# verbatim from `python -m pytest --timeout --junitxml /tmp/j.xml 300` in this
+# worktree (rc=4). argparse renders `basename(sys.argv[0])`, so the program
+# name is a fact about the launch, not about the error.
+_PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT = (
+    'ERROR: usage: __main__.py [options] [file_or_dir] [file_or_dir] [...]\n'
+    '__main__.py: error: argument --timeout: expected one argument\n'
+    '  inifile: /home/leo/src/dark-factory/orchestrator/pyproject.toml\n'
+    '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
+)
+
+
+def _captured_stdout_section(printed: str) -> str:
+    """A pytest report whose captured-stdout section carries *printed*.
+
+    pytest renders `--- Captured stdout call ---` and the captured bytes
+    themselves at COLUMN 0, unindented — which is why a line anchor alone is
+    not the whole false-positive margin.
+    """
+    return (
+        '=================================== FAILURES ===================================\n'
+        '__________________________________ test_forge __________________________________\n'
+        'E   assert False\n'
+        '----------------------------- Captured stdout call -----------------------------\n'
+        f'{printed}'
+        '=========================== short test summary info ============================\n'
+    )
+
 
 class TestPytestUsageError:
     """pytest REJECTING our argv is its own category, not an unknown failure.
@@ -359,7 +387,7 @@ class TestPytestUsageError:
         )
 
     def test_the_marker_must_start_a_line(self):
-        """The line anchor IS the whole false-positive margin.
+        """The line anchor, the first of the three parts of the margin.
 
         pytest writes the marker at column 0 before any test output, but a
         FAILING TEST that merely quotes the text has it rendered indented
@@ -367,6 +395,10 @@ class TestPytestUsageError:
         forge the category by printing, and the discriminator would stop
         believing a genuine red — the one failure direction its doctrine
         forbids.
+
+        The anchor alone is NOT the whole margin, because pytest's own
+        captured-output sections are unindented — see the two tests below for
+        the parts that cover that.
         """
         quoted = ''.join(
             f'E   {line}\n' for line in PYTEST_USAGE_ERROR_OUTPUT.splitlines()
@@ -375,6 +407,56 @@ class TestPytestUsageError:
             _classify(ToolKind.PYTEST, quoted, 1, False)
             != FailureCategory.PYTEST_USAGE_ERROR
         )
+
+    def test_the_program_name_is_not_pinned(self):
+        """`python -m pytest` renders a different prog and the SAME error.
+
+        argparse's prog is `basename(sys.argv[0])`, so pinning `pytest` would
+        have left any target project whose module test_command is
+        `python -m pytest` recording a rejected argv as a real red — this
+        task's own defect, silently un-closed for that project.
+        """
+        assert (
+            _classify(ToolKind.PYTEST, _PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT, 4, False)
+            == FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_marker_line_alone_is_not_a_rejection(self):
+        """Part two of the margin: argparse's `<prog>: error:` continuation.
+
+        A captured-stdout section is rendered at column 0, so a test that
+        prints the usage line clears the line anchor. It does not clear the
+        adjacency requirement, which the real rejection meets on every
+        measured sample.
+        """
+        output = _captured_stdout_section(
+            'ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+        )
+        assert (
+            _classify(ToolKind.PYTEST, output, 1, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_rejection_beside_real_failures_stays_a_red(self):
+        """Part three: the arm is consulted AFTER the FAILED arms.
+
+        A test that prints the whole two-line rejection verbatim clears both
+        the anchor and the adjacency requirement — but a genuine rejection
+        never ran a test, so it never carries a FAILED line, and an output
+        that has one is a red that merely quotes the text. Ordering decides
+        it, and it stays a red.
+
+        The residual is stated rather than hidden: an output with no FAILED
+        line at all (a collection ERROR leg that prints the two lines) can
+        still forge the category. That direction is honest — the verdict
+        becomes `unconfirmable`, which suppresses nothing — whereas letting a
+        forgery outrank a real FAILED line would stop the discriminator
+        believing a genuine red.
+        """
+        output = _captured_stdout_section(PYTEST_USAGE_ERROR_OUTPUT) + (
+            'FAILED tests/test_forge.py::test_forge - assert False\n'
+        )
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
 
     def test_an_ordinary_pytest_failure_is_untouched(self):
         """The new pattern must not shadow the table it joins."""
