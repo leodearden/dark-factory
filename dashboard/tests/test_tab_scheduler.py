@@ -529,3 +529,68 @@ def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatm
         'cellStateFor still restates the lock_set membership check that '
         'rowTouchesModule owns'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5705: memoisation — what turns a one-off expensive render into a
+# skipped one
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_heatmap_export_is_memoised(scheduler_heatmap_jsx_body):
+    """The value exported as SchedulerHeatmap must be a React.memo result.
+
+    app.jsx runs `setInterval(() => setNow(new Date()), 1000)`, so the active
+    tab's subtree re-renders once a second whether or not any data changed.
+    Bounding the grid makes each render cheap; memoising it makes the 1 Hz tick
+    free, because `rows`/`modules` are referentially identical between ticks.
+
+    Asserted on the BINDING, not on the mere presence of the string
+    `React.memo` somewhere in the file — a memo applied to HeatmapCell while
+    SchedulerHeatmap stayed bare would otherwise pass while fixing nothing.
+    """
+    src = strip_js_comments(scheduler_heatmap_jsx_body)
+
+    assert re.search(r'const\s+SchedulerHeatmap\s*=\s*React\.memo\s*\(', src), (
+        'the SchedulerHeatmap binding must be a React.memo(...) result — '
+        'without it the 1 Hz clock tick re-renders the whole grid'
+    )
+    assert re.search(
+        r'window\.DF_SCHED_HEATMAP\s*=\s*\{[^}]*\bSchedulerHeatmap\b[^}]*\}', src
+    ), 'the memoised SchedulerHeatmap must be the value exported on window.DF_SCHED_HEATMAP'
+
+
+def test_scheduler_tab_memoises_the_props_it_feeds_the_heatmap(tab_scheduler_jsx_body):
+    """visibleRows and visibleModules must come from stUseMemo.
+
+    React.memo on the heatmap is inert without this half: whenever a chip
+    filter is active both are `.filter(...)` results computed inline, so they
+    are fresh array identities on EVERY render and the memo never hits. The two
+    changes only pay off together.
+    """
+    src = strip_js_comments(tab_scheduler_jsx_body)
+
+    for name in ('visibleRows', 'visibleModules'):
+        assert re.search(rf'const\s+{name}\s*=\s*stUseMemo\s*\(', src), (
+            f'{name} must be wrapped in stUseMemo — recomputed inline it is a '
+            'fresh array identity every render, and React.memo on '
+            'SchedulerHeatmap would never hit'
+        )
+
+
+def test_memoising_the_module_filter_preserved_its_predicate(tab_scheduler_jsx_body):
+    """Wrapping the modules filter in a memo must not paraphrase it.
+
+    Deliberately redundant with
+    test_scheduler_module_filter_is_consistent_with_rows above: that test pins
+    the predicate generally, this one pins it AT THE POINT OF CHANGE, where a
+    "while I'm in here" rewrite is most likely. The expressions move inside the
+    memo callback unchanged, or the chip filter silently widens.
+    """
+    assert not re.search(
+        r'm\.holder_project\s*&&\s*[^;]+includes\s*\(\s*m\.holder_project\s*\)',
+        tab_scheduler_jsx_body,
+    ), 'the holder_project widening keep-branch must stay absent after memoisation'
+    assert re.search(
+        r'effectiveSelected\.includes\s*\(\s*m\.project\s*\)', tab_scheduler_jsx_body
+    ), 'the strict per-project predicate must survive the memo wrap verbatim'
