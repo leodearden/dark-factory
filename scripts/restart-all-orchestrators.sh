@@ -392,33 +392,19 @@ drain_check_verdict() {
     # POLL LEDGER (task 4486), off unless ORCH_DRAIN_POLL_TRACE_FILE is set.
     # Written HERE because this function is the single funnel every `python3
     # drain_check.py` invocation passes through -- drain_await_fresh's opening
-    # poll, its in-loop re-polls, and drain_gate's busy poll loop all call it
-    # -- so this one write site yields a COMPLETE ledger of the poll loop.
-    # It records the COERCED verdict, not $raw, so the ledger's vocabulary is
-    # exactly the four tokens the gate branches on: a malformed or
-    # non-zero-exit reading appears as the "absent" the gate actually acted
-    # on, rather than as something no downstream comparison ever saw.
-    # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
-    # the latter returns non-zero when the knob is unset, which `set -e` would
-    # take as this function failing.
+    # poll, its in-loop re-polls, and drain_gate's busy poll loop -- so one
+    # write site yields a COMPLETE ledger. It records the COERCED verdict, not
+    # $raw, so the ledger's vocabulary is exactly the four tokens the gate
+    # branches on, and a reading the gate never acted on cannot appear in it.
     #
-    # FAIL-SOFT BUT LOUD, and each half looks like a defect without the other.
-    # `|| true`: this function is only ever called via command substitution
-    # assigned to a plain variable (drain_await_fresh's _DRAIN_VERDICT,
-    # drain_gate's verdict), so under `set -euo pipefail` a failed `>>` that
-    # lands as this function's LAST command fails that assignment and aborts
-    # the whole fleet redeploy. A mis-typed operator trace path must never be
-    # able to do that. Measured, bash 5.2.21: last+unguarded exits 1,
-    # last+guarded does not, and a failure HERE -- mid-function, with the
-    # verdict printf after it -- is swallowed by the command substitution
-    # either way. So today this guard is redundant with that ordering, and it
-    # is here so the property survives a reorder rather than resting on one.
-    # Covered by scripts/tests/test_restart_all_orchestrators.py::
-    # test_an_unwritable_poll_trace_never_aborts_the_redeploy, which pins the
-    # observable property and so passes under both spellings.
-    # NO `2>/dev/null`: bash's own redirection diagnostic stays on stderr, so
-    # an operator who set the knob and got no trace is told why. Swallowing it
-    # is the silent fail-soft this repo's design invariants forbid.
+    # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
+    # the latter returns non-zero when the knob is unset and `set -e` would
+    # read that as this function failing. `|| true` guards the same class of
+    # hazard one remove out -- this function is only ever called via command
+    # substitution assigned to a plain variable, so a failed `>>` must never
+    # be able to abort a whole fleet redeploy over a mis-typed operator path.
+    # NO `2>/dev/null`: bash's own diagnostic stays on stderr, so an operator
+    # who set the knob and got no trace is told why (no-silent-fail-soft).
     if [[ -n "$DRAIN_POLL_TRACE_FILE" ]]; then
         printf '%s\t%s\n' "$verdict" "$1" >> "$DRAIN_POLL_TRACE_FILE" || true
     fi
@@ -437,10 +423,10 @@ drain_await_fresh() {
     # returns 0, and prints nothing to stdout.
     #
     # That stdout silence is unchanged and load-bearing (see drain_gate's
-    # callers and test_idle_unit_restarts_transparently_with_no_defer_line):
-    # the poll loop's observability seam is drain_check_verdict's
-    # ORCH_DRAIN_POLL_TRACE_FILE ledger, which is a FILE precisely so this
-    # contract does not have to be traded away to see the loop iterate.
+    # callers and test_idle_unit_restarts_transparently_with_no_defer_line).
+    # The poll loop's observability seam is drain_check_verdict's
+    # ORCH_DRAIN_POLL_TRACE_FILE ledger, a FILE precisely so seeing the loop
+    # iterate costs this contract nothing.
     #
     # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
     # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
