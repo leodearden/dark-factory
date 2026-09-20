@@ -36,7 +36,13 @@ import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 
-const EXPECTED_FUNCTION_NAMES = ['isDatum', 'unknownDatum', 'assertDatum'];
+const EXPECTED_FUNCTION_NAMES = [
+  'isDatum',
+  'unknownDatum',
+  'assertDatum',
+  'withReceipt',
+  'displayedAgeMs',
+];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'DATUM_STATES'];
 
 // Loads datum.js fresh against a shimmed browser-ish global carrying the REAL
@@ -60,6 +66,7 @@ function loadDatumJs() {
 
 const { api: datum } = loadDatumJs();
 const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
+const { withReceipt, displayedAgeMs } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -215,4 +222,133 @@ test('assertDatum: throws unconditionally, not only under the test harness', () 
   // the silent degradation this repo's loud-over-silent norm rejects. The
   // module exposes no way to disable it — assert that by construction.
   assert.equal(Object.keys(datum).some(k => /debug|strict|enable/i.test(k)), false);
+});
+
+// ---------------------------------------------------------------------------
+// withReceipt / displayedAgeMs — the two-clock age arithmetic
+//
+// A displayed age spans two clocks and must never mix them. The SERVER-side
+// term (served_at − as_of) is how stale the measurement already was when the
+// server shaped the payload; the CLIENT-side term (now − received_at) is how
+// long that payload has been sitting in this browser. Each term subtracts two
+// readings of ONE clock, so the sum is exact even when the two clocks disagree
+// — which they routinely do, and which is why the naive `now − as_of` this
+// replaces reads a skewed browser's tile as hours stale or negative.
+// ---------------------------------------------------------------------------
+
+// A measurement taken three hours before the server served it, received by
+// this browser five seconds ago.
+const AS_OF = '2026-09-20T09:00:00+00:00';
+const SERVED_AT = '2026-09-20T12:00:00+00:00';
+const SERVER_GAP_MS = 3 * 60 * 60 * 1000;
+
+const RECEIVED_AT = 1_800_000_000_000;
+const CLIENT_GAP_MS = 5_000;
+const NOW = RECEIVED_AT + CLIENT_GAP_MS;
+
+const STALE_WIRE = Object.freeze({
+  value: 7,
+  as_of: AS_OF,
+  state: 'stale',
+  reason: 'ReadTimeout',
+  freshness_bound_seconds: 30,
+});
+
+const RECEIPT = Object.freeze({ servedAt: SERVED_AT, receivedAt: RECEIVED_AT });
+
+// Shifts an ISO instant by whole milliseconds, so a test can move ONE clock and
+// leave the other alone.
+function shiftIso(iso, ms) {
+  return new Date(Date.parse(iso) + ms).toISOString();
+}
+
+test('withReceipt: stamps provenance onto a COPY, leaving the wire payload untouched', () => {
+  // The poll loop holds the object the server sent; stamping through to it
+  // would mutate state other readers are already looking at. Heuristic 8 —
+  // prefer immutable data.
+  const pristine = { ...STALE_WIRE };
+  const stamped = withReceipt(STALE_WIRE, RECEIPT);
+
+  assert.notEqual(stamped, STALE_WIRE, 'withReceipt must not return its input');
+  assert.deepEqual(STALE_WIRE, pristine, 'the input payload was mutated');
+  assert.equal(stamped._served_at, SERVED_AT);
+  assert.equal(stamped._received_at, RECEIVED_AT);
+});
+
+test('withReceipt: the stamped copy is still a Datum, keys and values intact', () => {
+  const stamped = withReceipt(STALE_WIRE, RECEIPT);
+  assert.equal(isDatum(stamped), true);
+  for (const key of WIRE_KEYS) {
+    assert.deepEqual(stamped[key], STALE_WIRE[key], `${key} survived the stamp`);
+  }
+});
+
+test('displayedAgeMs: is the server-side gap plus the client-side gap', () => {
+  const stamped = withReceipt(STALE_WIRE, RECEIPT);
+  assert.equal(displayedAgeMs(stamped, NOW), SERVER_GAP_MS + CLIENT_GAP_MS);
+});
+
+test('displayedAgeMs: is unchanged when the SERVER clock is shifted wholesale', () => {
+  // A server an hour off UTC measures and serves on its own clock; the gap
+  // between its two readings is what the operator needs, and it is invariant.
+  const skewed = withReceipt(
+    { ...STALE_WIRE, as_of: shiftIso(AS_OF, 3600_000) },
+    { servedAt: shiftIso(SERVED_AT, 3600_000), receivedAt: RECEIVED_AT },
+  );
+  assert.equal(displayedAgeMs(skewed, NOW), SERVER_GAP_MS + CLIENT_GAP_MS);
+});
+
+test('displayedAgeMs: is unchanged when the CLIENT clock is shifted wholesale', () => {
+  const shift = 7 * 24 * 60 * 60 * 1000;
+  const stamped = withReceipt(STALE_WIRE, {
+    servedAt: SERVED_AT,
+    receivedAt: RECEIVED_AT + shift,
+  });
+  assert.equal(displayedAgeMs(stamped, NOW + shift), SERVER_GAP_MS + CLIENT_GAP_MS);
+});
+
+test('displayedAgeMs: GROWS in real time while no new payload arrives', () => {
+  // The headline behaviour of the whole leaf: a wedged endpoint's tile keeps
+  // ageing on screen instead of sitting at a reassuring constant. Asserted as
+  // an exact delta under a mocked clock, not as a "greater than".
+  const stamped = withReceipt(STALE_WIRE, RECEIPT);
+  const before = displayedAgeMs(stamped, NOW);
+  const after = displayedAgeMs(stamped, NOW + 60_000);
+  assert.equal(after - before, 60_000);
+});
+
+test('displayedAgeMs: null for an unknown datum — there is no measurement to age', () => {
+  // Not zero. A fabricated zero age is the `_minutes_since` mistake
+  // endpoint_staleness.js::noticeText documents: it manufactures reassurance
+  // during exactly the failure the indicator exists to surface.
+  const stamped = withReceipt(unknownDatum('scheduler offline'), RECEIPT);
+  assert.equal(displayedAgeMs(stamped, NOW), null);
+});
+
+test('displayedAgeMs: null for a datum carrying no receipt at all', () => {
+  assert.equal(displayedAgeMs(STALE_WIRE, NOW), null);
+  assert.equal(displayedAgeMs(withReceipt(STALE_WIRE, {}), NOW), null);
+});
+
+test('displayedAgeMs: null when `now` is not a usable clock reading', () => {
+  const stamped = withReceipt(STALE_WIRE, RECEIPT);
+  assert.equal(displayedAgeMs(stamped, undefined), null);
+  assert.equal(displayedAgeMs(stamped, NaN), null);
+});
+
+test('displayedAgeMs: with no server served_at, degrades to the client gap — never NaN', () => {
+  // Today's wire: no payload carries a top-level `served_at` until PRD leaf
+  // beta lands, so `receipt.servedAt` is null for every polled endpoint. The
+  // server-side term is then unknown, and an unknown term contributes nothing
+  // rather than poisoning the sum — the answer is a LOWER bound on the true
+  // age, which is the honest reading, and it still grows.
+  const stamped = withReceipt(STALE_WIRE, { servedAt: null, receivedAt: RECEIVED_AT });
+  const age = displayedAgeMs(stamped, NOW);
+  assert.equal(age, CLIENT_GAP_MS);
+  assert.ok(Number.isFinite(age), 'a missing served_at must not produce NaN');
+});
+
+test('displayedAgeMs: an unparseable instant yields null, not NaN', () => {
+  const stamped = withReceipt({ ...STALE_WIRE, as_of: 'not an instant' }, RECEIPT);
+  assert.equal(displayedAgeMs(stamped, NOW), null);
 });
