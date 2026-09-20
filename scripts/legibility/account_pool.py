@@ -293,9 +293,27 @@ def _banner_instead_of_verdict(slot, reply) -> bool:
     question ``code_digest`` asks one layer down.
 
     AND THE GATE COSTS NO COVERAGE, because a real banner never parses: every
-    entry of ``REAL_CLI_CAP_HIT_MESSAGES`` and ``REAL_CLI_NEAR_CAP_MESSAGES``
-    raises ``CoderParseError`` (measured, and kept true by the parametrized
-    rotation test in ``scripts/tests/test_legibility_account_pool.py``).
+    entry of ``shared.cap_markers.REAL_CLI_CAP_MESSAGES`` — the union, so both
+    the cap-hit and the near-cap wordings — raises ``CoderParseError``
+    (measured 2026-09-20, and kept true by
+    ``scripts/tests/test_legibility_account_pool.py::test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door``,
+    which parametrizes over that same union: a future corpus entry that
+    happened to parse turns it red rather than silently losing this route).
+
+    KNOWN RESIDUAL, pinned rather than closed. "A real banner never parses"
+    holds in one direction only, and the converse does not: a reply that fails
+    to parse AND quotes a banner is read here as a banner. So a verdict
+    TRUNCATED mid-JSON after a cap-quoting ``evidence_quote`` caps a healthy
+    account — measured 2026-09-20, the schema-shaped prefix ``{"matches":
+    [{"cluster_id": "usage-limit-stall", "evidence_quote": "<banner>"`` with no
+    closing brace raises ``CoderParseError`` and classifies CapHit. The cost is
+    one account per occurrence, not the pool: the digest still completes on the
+    next lease, and the rotation stays bounded by ``tried``. It is left open
+    DELIBERATELY, because both remedies would give this module a cap policy of
+    its own — a second confirmation probe, or a "this looks like truncated
+    JSON" discriminator — and the paragraphs above are the argument that it has
+    none. Pinned by ``test_a_truncated_verdict_that_quotes_a_banner_costs_that_account``
+    so the disposition is a decision a reader can find, not an oversight.
     """
     try:
         coder.parse_coder_output(reply)

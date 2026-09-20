@@ -1004,7 +1004,7 @@ def test_a_near_cap_pool_reads_as_a_cap_deferral_end_to_end():
 # `scripts/tests/test_legibility_census.py`.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('banner', cap_markers.REAL_CLI_CAP_HIT_MESSAGES)
+@pytest.mark.parametrize('banner', cap_markers.REAL_CLI_CAP_MESSAGES)
 def test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door(
     banner,
 ):
@@ -1016,6 +1016,20 @@ def test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door(
     used to be blind to. Everything else must hold identically: the gate
     decides, the account is capped, the same digest completes next door, and
     nothing is fabricated.
+
+    Parametrized over the UNION corpus, not over
+    ``REAL_CLI_CAP_HIT_MESSAGES`` alone, and the difference is what makes this
+    test the thing keeping ``_banner_instead_of_verdict``'s "a real banner
+    never parses" claim true. That claim covers both tuples, so pinning only
+    one of them would let a future near-cap wording — or merely a new entry in
+    that tuple — parse as a verdict and silently lose the exit-0 route for the
+    near-cap arm, with nothing turning red. What varies here is the REPLY the
+    pool must recognise as unusable; what the gate then decides about it does
+    not vary, because ``FakeGate``'s verdict is scripted rather than read off
+    the text. The real gate's cap-vs-annotate split on these two tuples is
+    another module's contract and is pinned in
+    ``shared/tests/test_capacity_skip.py``; its consequence for this arm is
+    pinned by ``test_a_zero_exit_near_cap_everywhere_still_terminates``.
     """
     gate = _pool(('max-b', False), ('max-c', False))
     invoke = _RecordingInvoke(replies={
@@ -1049,7 +1063,11 @@ def test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door(
         'from, never to whichever account is current'
     )
 
-    # (c) The account is now capped, so the rest of the night skips it.
+    # (c) The account took whatever transition the gate's verdict carries —
+    #     here the scripted CAP HIT, so the rest of the night skips it. WHICH
+    #     transition is the gate's to choose and not this module's, which is
+    #     why it does not vary with the parametrized banner: all the pool does
+    #     is not stand in the way of it by confirming the account instead.
     assert gate.account_named('max-c').capped is True
     assert gate.account_named('max-b').capped is False
 
@@ -1189,6 +1207,64 @@ def test_a_verdict_that_quotes_a_banner_is_a_verdict():
     )
 
 
+def test_a_truncated_verdict_that_quotes_a_banner_costs_that_account():
+    """THE KNOWN RESIDUAL of the parse gate, pinned as a decision.
+
+    "A real banner never parses" is true in one direction and the converse is
+    not, so the guard above closes the PARSEABLE false positive and leaves a
+    narrower one open: a reply that fails to parse AND quotes a banner is read
+    as a banner. The likely instance is exactly the one this repo's codebook
+    invites — a verdict for a usage-limit cluster, cut off mid-JSON after its
+    cap-quoting ``evidence_quote``.
+
+    THE PREMISES ARE CHECKED HERE AGAINST THE REAL CODE rather than asserted
+    in prose: the string below provably does not parse (``pytest.raises``
+    below, against the real ``coder.parse_coder_output``), and it classifies
+    CapHit under the real ``classify_invocation(..., strict_confirm=True)``
+    (measured 2026-09-20) — so this is what production does, not what the fake
+    gate is scripted to do.
+
+    WHY IT IS LEFT OPEN. Both remedies would give ``account_pool`` a cap
+    policy of its own — census's confirmation probe, or a "this looks like
+    truncated JSON" discriminator — and the module's whole argument is that it
+    has none: the gate decides, the parse decides only whether to ask. The
+    cost is bounded and that bound is the other half of what this test pins:
+    ONE account per occurrence, never the pool, because the digest still
+    completes on the next lease. Before task 5637 the same reply cost the
+    DIGEST instead (``code_digest``'s second scan site labelled it capped with
+    no rotation), so this is a changed price, not a new class of loss.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    truncated = (
+        '{"matches": [{"cluster_id": "usage-limit-stall", "evidence_quote": '
+        f'"{cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0]}"'
+    )
+    with pytest.raises(coder_mod.CoderParseError):
+        coder_mod.parse_coder_output(truncated)
+
+    invoke = _RecordingInvoke(replies={
+        'tok-max-c': truncated,
+        'tok-max-b': '{"matches": [], "candidates": []}',
+    })
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    assert len(gate.detect_calls) == 1, (
+        f'a reply the coder cannot parse IS offered to the gate, whatever it '
+        f'happens to quote; got {gate.detect_calls}'
+    )
+    assert gate.account_named('max-c').capped is True, (
+        'the residual, stated plainly: a healthy account pays for a truncated '
+        'reply that quoted a banner'
+    )
+
+    # And the bound. These three are what keep the residual a price rather
+    # than a night: the digest completes, on a live account, next door.
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-max-c', 'tok-max-b']
+    assert gate.account_named('max-b').capped is False
+    assert out == '{"matches": [], "candidates": []}'
+
+
 def test_an_unparseable_reply_that_is_not_a_banner_is_an_ordinary_failure():
     """The other side of the parse gate: it must not SWALLOW junk.
 
@@ -1224,6 +1300,80 @@ def test_an_unparseable_reply_that_is_not_a_banner_is_an_ordinary_failure():
     assert out == prose, (
         f'returned verbatim so code_digest fails this digest normally on its '
         f'own parse; got {out!r}'
+    )
+
+
+@pytest.mark.timeout(15)
+def test_the_zero_exit_route_walks_the_whole_pool_before_giving_up():
+    """The exit-0 twin of ``test_rotation_walks_the_whole_pool_before_giving_up``,
+    driven all the way to the END of the roster.
+
+    This arm is a SECOND ``continue`` into the same ``while True``, so it
+    needs its own exhaustion edge: the one above always had a live account to
+    land on, and a loop that never lands is not a wrong value — it is a unit
+    that never finishes. Every account banners at exit 0, so the walk must run
+    out and raise, carrying the POOL's marker rather than a banner phrase
+    (``_EXHAUSTED_MARKER`` is how the deferral reason says the exhaustion was
+    the gate's roster, not one CLI's text).
+    """
+    gate = _pool(('max-b', False), ('max-c', False), ('max-d', False))
+    invoke = _NeverTwice(default_reply=cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0])
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value.marker == mod._EXHAUSTED_MARKER, (
+        f'the pool ran out; the marker must say so rather than quote whatever '
+        f'banner the last account printed; got {excinfo.value.marker!r}'
+    )
+    assert len(invoke.calls) == gate.account_count == 3, (
+        f'exactly one try per account, then stop; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert all(a.capped for a in gate.accounts), (
+        'every account was capped through the GATE on the way out — which is '
+        'what makes "all 3 pool accounts capped" a true thing to report'
+    )
+
+
+@pytest.mark.timeout(15)
+def test_a_zero_exit_near_cap_everywhere_still_terminates():
+    """The same walk where the gate's verdict caps NOTHING — the exit-0 twin
+    of ``test_a_near_cap_verdict_everywhere_still_terminates``.
+
+    This is the harder half of the exhaustion edge and the reason the new arm
+    could not simply trust the gate to shrink the roster for it. A near-cap
+    verdict returns True and takes no phase transition, so the admissible set
+    is exactly as large after the rotation as before it; only the caller's
+    ``tried`` set bounds the walk. Both ``continue`` paths share that set, so
+    the bound holds here — but nothing OTHER than this test says so for the
+    exit-0 one.
+
+    The reason must also stay honest: nothing is capped, so the pool may not
+    report a capacity limit that would clear at the weekly reset.
+    """
+    gate = _near_cap_pool(('max-b', False), ('max-c', False), ('max-d', False))
+    invoke = _NeverTwice(default_reply=cap_markers.REAL_CLI_NEAR_CAP_MESSAGES[0])
+
+    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+        mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value.marker == mod._EXHAUSTED_MARKER
+    assert len(invoke.calls) == gate.account_count == 3, (
+        f'one try per account and no more, with nothing capped to stop it; '
+        f'got {[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert not any(a.capped for a in gate.accounts), (
+        'the premise: a near-cap verdict caps NOTHING, so the bound cannot '
+        'have come from the gate'
+    )
+    assert all(a.near_cap for a in gate.accounts), (
+        'the gate did record the signal on this route too — it simply is not '
+        'a cap'
+    )
+    assert 'capped' not in str(excinfo.value), (
+        f'no account is capped, so the reason must not send an operator to '
+        f'wait for a reset that will never come; got {excinfo.value}'
     )
 
 
