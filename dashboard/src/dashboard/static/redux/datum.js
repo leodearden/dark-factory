@@ -140,12 +140,74 @@ function describeNonDatum(x) {
   return 'an object with keys [' + Object.keys(x).join(', ') + ']';
 }
 
+// ── Provenance: when did THIS browser receive THIS payload? ──
+// Returns a COPY of *datum* carrying the two receipt fields. A copy, never a
+// write-through: the poll loop holds the object the server sent, and stamping
+// into it would mutate state other readers are already looking at.
+//
+// `_served_at` is the server's own serving instant (ISO-8601, or null until PRD
+// leaf beta puts a top-level `served_at` on the wire); `_received_at` is this
+// browser's clock at the moment the response resolved. They are underscored to
+// mark them as client-side annotations on a server payload rather than part of
+// the five-key wire contract — isDatum ignores them, as it must, because a
+// datum is equally valid before and after it is stamped.
+function withReceipt(datum, receipt) {
+  const r = receipt || {};
+  return { ...datum, _served_at: r.servedAt, _received_at: r.receivedAt };
+}
+
+// ── How old does this number look RIGHT NOW? ──
+//   (served_at − as_of)  +  (now − received_at)
+//     server-side gap         client-side gap
+//
+// TWO CLOCKS, NEVER MIXED. Each term subtracts two readings of ONE clock, so
+// the sum is exact even when the browser and the server disagree — the naive
+// `now − as_of` reads a skewed browser's perfectly fresh tile as hours stale,
+// or as negative. It is also the only formulation that GROWS: the client term
+// advances every time this is called, which is what makes a wedged endpoint's
+// tile visibly age instead of resting at a reassuring constant.
+//
+// RETURNS NULL, NOT ZERO AND NOT NaN, whenever a term is unavailable: an
+// unknown datum has no as_of to age, an unstamped one has no receipt. Rendering
+// an age of zero from a missing timestamp is the `_minutes_since` mistake
+// endpoint_staleness.js::noticeText already documents — it fabricates
+// reassurance during exactly the failure this signal exists to surface — and
+// NaN would reach the operator as 'an unknown time' via formatAgeMs, which says
+// the same thing far less clearly than showing no badge at all.
+//
+// A MISSING `_served_at` is the one absence that degrades rather than nulls,
+// because it is today's normal case: no polled payload carries a top-level
+// `served_at` yet, so the server-side gap is unknown rather than wrong.
+// Contributing zero for it makes the result a LOWER bound on the true age —
+// honest, and still growing — where nulling would leave every tile un-aged
+// until beta lands.
+function displayedAgeMs(datum, now) {
+  const d = datum || {};
+  const clientGap = Number(now) - Number(d._received_at);
+  if (!Number.isFinite(clientGap)) return null;
+
+  const measuredAt = Date.parse(d.as_of);
+  if (!Number.isFinite(measuredAt)) return null;
+
+  const servedAt = Date.parse(d._served_at);
+  const serverGap = Number.isFinite(servedAt) ? servedAt - measuredAt : 0;
+
+  return serverGap + clientGap;
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision here
 // would leave window.DF_DATUM undefined and break the top-level destructures in
 // data.js, task_row_cells.js, charts.jsx, shell.jsx and tabs.jsx.
-const DATUM_API = { DATUM_STATES, isDatum, unknownDatum, assertDatum };
+const DATUM_API = {
+  DATUM_STATES,
+  isDatum,
+  unknownDatum,
+  assertDatum,
+  withReceipt,
+  displayedAgeMs,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = DATUM_API;
