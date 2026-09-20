@@ -342,6 +342,17 @@ def _tag_end(source: str, index: int, site: str) -> int:
     RAISES rather than returning a best effort.  A span that runs off the end of
     the file means the walker lost the tag, and an absence assertion over a
     runaway span is a silent false GREEN.
+
+    A SIBLING COPY OF THIS WALK EXISTS at
+    ``test_tab_memory_evals.py::_jsx_open_tag_end``, written for the same
+    documented trap (mem0 b412a877/86bc64c0: a `[^<>]*` tag span is truncated by
+    a bare `<`/`>` inside an attribute expression, so an ordinary
+    ``format={n => …}`` turns a correct file red).  The two differ in contract —
+    that one returns ``-1`` on a miss, this one raises, because an absence probe
+    over a lost span is a false green here — but the scan is the same primitive
+    and belongs in ``_dashboard_helpers.py`` beside ``walk_balanced``.  Hoisting
+    it touches a module outside this task's scope; filed as follow-up work
+    rather than done inline.
     """
     depth = 0
     quote = None
