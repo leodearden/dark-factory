@@ -8,6 +8,8 @@ fan-out path runs underneath and no private name is reached into.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import httpx
 import pytest
 
@@ -49,9 +51,14 @@ class CannedMCP:
             smaller of the requested and the server cap, reporting the served
             size in ``pagination['page_size']``. Zero disables it.
 
-    Mutable after construction so one instance can change behaviour BETWEEN a
-    test's two acquisitions: add a tool name to :attr:`fail_tools` and the
-    next call to it raises ``httpx.ReadTimeout``.
+    Mutable after construction so one instance can change behaviour between a
+    test's two acquisitions. :attr:`fail_when` is a predicate over the
+    recorded call — ``{'tool', 'args', 'kwargs'}`` — and every call it accepts
+    raises ``httpx.ReadTimeout``. A predicate rather than a set of tool names
+    because the two failures worth injecting are not the same shape: "this
+    half is unreachable now" keys on the tool, while "the walk breaks at its
+    SECOND page" keys on the offset, and only the latter distinguishes an
+    offline marker from a silently short map.
     """
 
     def __init__(
@@ -66,7 +73,7 @@ class CannedMCP:
         self.status_map = dict(status_map or {})
         self.status_page_size = status_page_size
         self.short_page_by = short_page_by
-        self.fail_tools: set[str] = set()
+        self.fail_when: Callable[[dict], bool] = lambda call: False
         self.calls: list[dict] = []
 
     def calls_to(self, tool: str) -> list[dict]:
@@ -77,8 +84,9 @@ class CannedMCP:
         # ``kwargs`` is recorded too: the per-request budget rides as the
         # ``timeout=`` keyword and never inside ``args``, so it is only
         # assertable at the wire if it is kept.
-        self.calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
-        if tool in self.fail_tools:
+        call = {'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)}
+        self.calls.append(call)
+        if self.fail_when(call):
             raise httpx.ReadTimeout(f'canned {tool} read timeout')
         if tool == 'get_statuses':
             return self._statuses(args)
@@ -172,7 +180,7 @@ class TestCannedMCP:
 
     async def test_an_injected_failure_raises_read_timeout(self):
         canned = CannedMCP(status_map={1: 'done'})
-        canned.fail_tools.add('get_statuses')
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
 
         with pytest.raises(httpx.ReadTimeout):
             await canned(None, 'u', 'get_statuses', {'project_root': '/p'})
