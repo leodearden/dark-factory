@@ -88,6 +88,31 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
 
+# --- the merge-gate splice defect (task 5580) --------------------------------
+#
+# Until task 5580, `verify.confirm_isolated_rerun_verdict` built the merge gate's
+# isolated re-run as a STRING and a second rewrite re-parsed it, splicing `--junitxml`
+# between `--timeout` and its value.  pytest rejected the resulting argv
+# (rc=4, `argument --timeout: expected one argument`) before running a single test, and
+# the discriminator scored that rejection `fails_in_isolation`.  Such a row is a fact
+# about the command the gate rendered, not about the test it names.
+#
+# MEASURED on the live dark_factory ledger at 2026-09-20T01:24Z: the `merge_gate` call
+# site carried 357 `fails_in_isolation`, 4 `unconfirmable` and ZERO
+# `passes_in_isolation` over its entire history (2026-08-30T16:20Z -> 2026-09-19T20:43Z).
+# A gate that has never once cleared a test in three weeks was not discriminating.
+# (Task 5580's title says 350: that was the same population read 3 days earlier, still
+# growing because main runs the defective code until this lands.)
+#
+# The cutoff is the instant THIS FIX WAS AUTHORED.  What that buys is exact: no
+# observation stamped at or before it can have come from the fixed code, because the
+# fixed code did not exist yet.  The residual is real and is not papered over —
+# `merge_gate` rows observed between authoring and landing are still noise and are NOT
+# excluded.  That count is small and bounded by the merge lane's latency, whereas
+# pushing the cutoff past the fix would start discarding genuine reds, which is the one
+# direction the discriminator's doctrine forbids.
+MERGE_GATE_SPLICE_DEFECT_END = '2026-09-20T01:24:27+00:00'
+
 
 # --- ledger reachability -----------------------------------------------------
 #
@@ -174,6 +199,34 @@ def _parse_stamp(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def is_spliced_merge_gate_row(row: FlakeOccurrenceRow) -> bool:
+    """True for an occurrence the merge-gate splice defect manufactured — see
+    :data:`MERGE_GATE_SPLICE_DEFECT_END`.
+
+    The ONE place the rule is written, so the count an operator is shown and the rows
+    the counters never see can never be two different sets (INV-5).
+
+    Narrow on every axis, because each one is what the defect could actually reach.
+    ``main_probe`` is excluded on evidence, not caution: its engine passes
+    ``role='task'``, so no junit path was ever computed and the second rewrite never
+    happened there.  Only ``fails_in_isolation`` is excluded, because that is the
+    verdict a rejected command produced — the rejection classified as an unknown test
+    failure, which is not infra-transient, so it became a confirmed red.  And a row
+    whose ``observed_at`` will not parse is KEPT: an unreadable clock does not place a
+    row before the fix, and degrading a parse failure into a deletion is the silent
+    data loss this module exists to refuse.
+    """
+    if row.call_site != FlakeCallSite.merge_gate:
+        return False
+    if row.verdict != FlakeVerdict.fails_in_isolation:
+        return False
+    observed = _parse_stamp(row.observed_at)
+    cutoff = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
+    # INCLUSIVE at the bound: the cutoff is the authoring instant, so a row stamped
+    # exactly at it still predates the fixed code.
+    return observed is not None and cutoff is not None and observed <= cutoff
 
 
 def format_age(delta: timedelta | None) -> str:
@@ -608,6 +661,12 @@ class FlakeLedgerReport:
     should ask — including task θ, which must not act on counters that were never read.
     It defaults to :data:`LEDGER_OK` so a hand-built report (the render tests build them
     directly) means what it looks like it means.
+
+    ``excluded_non_evidence`` counts the rows :func:`is_spliced_merge_gate_row` kept out
+    of every counter below.  It is carried rather than discarded because an exclusion an
+    operator cannot see is a lie by omission — the same rule the ``truncated`` and
+    ``unparseable_opened_at`` caveats already follow.  It defaults to ``0`` for the same
+    reason ``db_status`` defaults: a hand-built report must mean what it looks like.
     """
 
     db_path: Path
@@ -620,6 +679,7 @@ class FlakeLedgerReport:
     non_convergence: NonConvergenceCounter
     systemic: SystemicCounter
     db_status: str = LEDGER_OK
+    excluded_non_evidence: int = 0
 
     @property
     def measured(self) -> bool:
@@ -749,8 +809,19 @@ def build_report(
 
     since = (now - timedelta(hours=window_hours)).isoformat()
     open_rows = list_open_debt(db_path)
-    occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
-    truncated = len(occurrences) >= occurrence_limit
+    read_rows = read_occurrences(db_path, since=since, limit=occurrence_limit)
+    # `truncated` is a property of the READ, so it is measured before the partition:
+    # a filled limit means the window is partial no matter what was later excluded.
+    truncated = len(read_rows) >= occurrence_limit
+
+    # Partitioned ONCE, here, so every counter downstream takes its input as given and
+    # not one of them learns about this defect (task 5580).  The rows stay in the
+    # ledger: `flake_occurrence` is append-only by contract and these rows are a TRUE
+    # record of what the gate emitted — including the only surviving evidence of the
+    # defect's reach.  What is false is reading them as verdicts about the code, and
+    # that is a reporting question, so it is answered in the reporting layer.
+    occurrences = [row for row in read_rows if not is_spliced_merge_gate_row(row)]
+    excluded_non_evidence = len(read_rows) - len(occurrences)
 
     # The chain build reads debt for every test in the universe, and it must cost a
     # CONSTANT number of ledger connections rather than one per test: each `read_debt`
@@ -806,6 +877,7 @@ def build_report(
             distinct_tests=systemic_distinct_tests,
             window_minutes=systemic_window_minutes,
         ),
+        excluded_non_evidence=excluded_non_evidence,
     )
 
 
@@ -854,6 +926,17 @@ def render_report(report: FlakeLedgerReport) -> str:
         lines.append(
             '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
             'below cover a PARTIAL window, not the full one.'
+        )
+    if report.excluded_non_evidence:
+        # Fixed position (with the other read caveats, ahead of section 1) so the render
+        # stays byte-deterministic, and silent for a zero count so no report that has
+        # nothing to declare grows a line.  Count, cutoff and CAUSE on one line: a count
+        # whose reason an operator has to go and look up is not actionable.
+        lines.append(
+            f'  NOTE: {report.excluded_non_evidence} merge_gate observation(s) stamped at '
+            f'or before {MERGE_GATE_SPLICE_DEFECT_END} are EXCLUDED from every counter '
+            'below — the isolated re-run died on a pytest usage error without running a '
+            'test, so they are not evidence about any test (task 5580).'
         )
 
     # --- section 1: open debt ---

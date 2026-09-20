@@ -672,9 +672,15 @@ class TestBuildReport:
             _seed_occurrence(db_path, test_id=UNKNOWN_TEST_ID,
                              observed_at=f'2026-08-09T0{i}:00:00+00:00',
                              verdict=FlakeVerdict.unconfirmable)
+        # main_probe, not the default merge_gate: this fixture's stamps predate
+        # MERGE_GATE_SPLICE_DEFECT_END, and a pre-cutoff merge_gate fails_in_isolation
+        # row is exactly what the task-5580 exclusion discards.  The row's purpose here
+        # is to be a CONFIRMED RED the counters see, and main_probe is where such a red
+        # was real in that period — its engine never took the spliced path.
         _seed_occurrence(db_path, test_id='tests/test_b.py::test_two',
                          observed_at='2026-08-09T20:00:00+00:00',
-                         verdict=FlakeVerdict.fails_in_isolation)
+                         verdict=FlakeVerdict.fails_in_isolation,
+                         call_site=FlakeCallSite.main_probe)
         return db_path
 
     def test_report_sees_the_db(self, tmp_path):
