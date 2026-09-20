@@ -50,6 +50,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
     recon_config_base_dir,
 )
+from fused_memory.reconciliation.escalation_archive import (
+    scan_recently_resolved_fingerprints,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
@@ -272,6 +275,11 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 # the exact constant is not load-bearing for tests (60s vs 8d test points sit
 # robustly inside/outside any reasonable 24h window).
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
+
+# Task 5550: the same policy as a timedelta, derived once.  Both accessors of
+# the escalation-archive scan — the async `_recently_resolved_fingerprints` and
+# its sync twin — pass this, so the window they enforce cannot drift apart.
+_RESOLVED_RECURRENCE_WINDOW = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
 
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
 # runaway Stage 3 that stops citing anything — i.e. a finding that was NEVER
@@ -911,6 +919,56 @@ class ReconciliationHarness:
         # still be re-filed.  Cleared when a graph recovers, so a later re-drift
         # is loud again.
         self._last_missing_indices: dict[str, tuple] = {}
+        # Task 5550: the single-slot cache behind both accessors of the
+        # escalation-archive scan, holding `(scan_key, str(queue_dir),
+        # fingerprints)`.  ONE slot, not a dict: a new scan_key evicts the old
+        # one, so the state is O(1) and self-evicting — nothing grows and
+        # nothing needs sweeping.
+        #
+        # SEMANTICS, because they are what a reader cannot infer: the scan
+        # happens at most ONCE PER scan_key, which callers set to the run_id.
+        # That is exactly the per-pass snapshot semantics `resolved_fps` has had
+        # since task 1669 ("built once per remediation pass, used for every
+        # finding") — reused verbatim rather than invented alongside it.  The
+        # residual staleness is real and bounded: an escalation resolved
+        # mid-run is not seen until the next run, which costs at most one extra
+        # escalation — the same fail-open direction every other arm of this
+        # check already takes.  queue_dir is part of the key because tests
+        # reassign `self._escalation_queue`, and a slot keyed on run_id alone
+        # would serve one queue's answer for another's.
+        self._resolved_fps_memo: tuple[str, str, frozenset[str]] | None = None
+
+    async def _recently_resolved_fingerprints(
+        self, scan_key: str, *, now: datetime,
+    ) -> frozenset[str]:
+        """In-window resolved/dismissed fingerprints, scanned at most once per *scan_key*.
+
+        THE `asyncio.to_thread` HOP IS LOAD-BEARING.  `scan_recently_resolved_fingerprints`
+        globs the queue root and rglobs a dated archive shared across 7+
+        projects, reading and parsing every hit — unbounded synchronous I/O.
+        Called inline from a coroutine it holds the event loop for the whole
+        walk, and the fused-memory process serves the `/alive` route the
+        orchestrator watchdog probes from that same loop, so a long scan reads
+        as a dead process (task 5550).
+
+        This is the ONLY async entry to that scan; `_recently_resolved_fingerprints_blocking`
+        is its sync twin for the already-synchronous `_escalate` path, and the
+        two share the memo slot so a pass that warms it here spares every
+        `_escalate` inside that pass a second walk.
+        """
+        queue_dir = self._escalation_queue.queue_dir  # type: ignore[union-attr]
+        memo = self._resolved_fps_memo
+        if memo is not None and memo[0] == scan_key and memo[1] == str(queue_dir):
+            return memo[2]
+        fingerprints = await asyncio.to_thread(
+            scan_recently_resolved_fingerprints,
+            queue_dir,
+            now=now,
+            window=_RESOLVED_RECURRENCE_WINDOW,
+            categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
+        )
+        self._resolved_fps_memo = (scan_key, str(queue_dir), fingerprints)
+        return fingerprints
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -5758,6 +5816,19 @@ class ReconciliationHarness:
                 # Fail-open: on any scan error, leave resolved_fps empty (no
                 # suppressions) and proceed with full escalation — same philosophy
                 # as the pending_fps build in _maybe_remediate.
+                #
+                # Task 5550: the scan itself now runs in a worker thread (see
+                # _recently_resolved_fingerprints) instead of holding the event
+                # loop for an unbounded archive walk.  This call is ALSO the
+                # warm-up that primes the run-scoped memo slot under `run_id`:
+                # every _escalate fired later in this pass reads that slot
+                # instead of walking the archive again.
+                #
+                # The try/except stays despite the helper's own per-record
+                # excepts, because `asyncio.to_thread` is a raise path the
+                # helper cannot cover (thread-pool failure or interpreter
+                # shutdown) — the same reasoning recorded at
+                # middleware/task_curator.py's to_thread sites.
                 resolved_fps: frozenset[str] = frozenset()
                 if (
                     HAS_ESCALATION
@@ -5765,32 +5836,9 @@ class ReconciliationHarness:
                     and _RECON_DEDUP_CONFIG is not None
                 ):
                     try:
-                        _now = datetime.now(UTC)
-                        _window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-                        _rfps: set[str] = set()
-                        for _path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                            self._escalation_queue.queue_dir
-                        ):
-                            try:
-                                _esc = Escalation.from_json(_path.read_text())  # type: ignore[possibly-undefined]
-                            except Exception:
-                                continue
-                            if not (
-                                _esc.status in ('resolved', 'dismissed')
-                                and _esc.category in _RECON_DEDUP_CONFIG.infra_dedupe_categories
-                                and _esc.dedupe_fingerprint
-                                and _esc.resolved_at
-                            ):
-                                continue
-                            try:
-                                _resolved = datetime.fromisoformat(_esc.resolved_at)
-                            except (ValueError, TypeError):
-                                continue
-                            if _resolved.tzinfo is None:
-                                _resolved = _resolved.replace(tzinfo=UTC)
-                            if _now - _resolved <= _window:
-                                _rfps.add(_esc.dedupe_fingerprint)
-                        resolved_fps = frozenset(_rfps)
+                        resolved_fps = await self._recently_resolved_fingerprints(
+                            run_id, now=datetime.now(UTC),
+                        )
                     except Exception as _rfps_err:
                         logger.warning(
                             'reconciliation.recently_resolved_check_failed',

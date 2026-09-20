@@ -11,10 +11,12 @@ process and the unit gets restarted mid-cycle.
 THESE TESTS ASSERT LOOP RESPONSIVENESS DIRECTLY rather than spying on
 ``asyncio.to_thread``.  A spy proves a particular call took a particular hop; a
 ticker proves the property the wedge is actually about, and stays meaningful
-under any future refactor that keeps the loop free.  It also discriminates
-sharply: 250ms of blocking against a 5ms tick is ~50 ticks when offloaded and
-exactly 0 when inline, so a threshold of 3 has two orders of magnitude of margin
-against CI jitter in both directions.
+under any future refactor that keeps the loop free — including one that still
+calls ``to_thread`` but blocks either side of it.  The spy idiom is kept for
+claims that really are about a call COUNT.
+
+The floor each tick assertion clears is DERIVED from the stub's block time
+rather than hard-coded; ``_tick_floor`` carries the measurement that sets it.
 
 Harness scaffolding is re-created locally rather than imported from
 tests/test_harness.py — the convention set by tests/reconciliation/test_active_runs.py,
@@ -55,15 +57,33 @@ from escalation.queue import EscalationQueue  # noqa: E402
 PROJECT_ID = 'test-project'
 PROJECT_ROOT = '/tmp/test-project'
 
-#: Ticker period and the floor a pass must clear.  See the module docstring for
-#: why 3 is both far below the offloaded floor (~50) and unreachable inline (0).
 TICK_SECONDS = 0.005
-MIN_TICKS = 3
 
 #: How long each stubbed blocking primitive sleeps, in the thread it should be
 #: running in.  Sized so one call alone is ~50 ticks.
 SCAN_BLOCK_SECONDS = 0.25
 PROBE_BLOCK_SECONDS = 0.15
+
+
+def _tick_floor(blocked_seconds: float) -> int:
+    """Half the ticks *blocked_seconds* of OFFLOADED work leaves room for.
+
+    The floor is derived, not a constant, so it states the claim structurally:
+    "the loop kept running for at least half the time the stub was blocking".
+
+    WHY HALF, AND NOT SOMETHING NEAR ZERO — this is measured, not guessed.  The
+    pass does real async journal/event-buffer I/O either side of the offloaded
+    call, and that I/O yields to the loop on its own: a fully WEDGED scan still
+    measured 2 ticks here, not 0.  A floor of 3 would therefore have sat one
+    tick from vacuous, and the wrong way round — a slower machine makes the
+    pass's own I/O yield MORE, so load would push a wedged loop over a low
+    floor and the guard would go quietly green while the defect was live.
+    Measured endpoints on this tree: 2 ticks inline, 51 offloaded.  Half the
+    theoretical floor (25 for a 250ms stub) sits ~12x above the inline
+    measurement and ~2x below the offloaded one — real margin in BOTH
+    directions, which is what the threshold is for.
+    """
+    return int(blocked_seconds / TICK_SECONDS / 2)
 
 
 # ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
@@ -330,7 +350,7 @@ class TestArchiveScanLeavesTheLoop:
         ticks = await _ticks_while(run_pass())
 
         assert calls, 'the archive scan never ran — the test is not exercising site 1'
-        assert ticks >= MIN_TICKS, (
+        assert ticks >= _tick_floor(SCAN_BLOCK_SECONDS), (
             f'event loop got control only {ticks} times while the pass ran; '
             f'{SCAN_BLOCK_SECONDS}s of archive scan is still inline on the loop'
         )

@@ -507,29 +507,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        'ae4cd95f45ad',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
-        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
         'c5a47e52ad4b',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
+        'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
+        'orchestrator state files inline on the loop thread '
+        '(read_scheduler_state -> read_bytes and orchestrator_started_at '
+        '-> read_text). Filesystem, the limb task 3778\'s subprocess-only '
+        'vocabulary omitted; distinct from the _escalate cluster in the '
+        'same file. Follow-up filed by task 4484 step-9. A third row '
+        '(ae4cd95f45ad) was counted here until task 5550 and did not '
+        'belong: the scanner placed it at the escalation-archive read_text '
+        'in the resolved_fps build, not at an orchestrator state file. '
+        '5550 offloaded that scan via asyncio.to_thread, the finding went '
+        'stale, and the row was deleted with the fix -- these two survive '
+        'unfixed.'
         ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
@@ -537,13 +528,18 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         '9e5ae6eb2503',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): _run_remediation_pass read_texts '
-        'the orchestrator state files inline on the loop thread (a direct '
-        'read_text, plus read_scheduler_state -> read_bytes and '
-        'orchestrator_started_at -> read_text). Filesystem, the limb task '
-        '3778\'s subprocess-only vocabulary omitted; distinct from the '
-        '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.'
+        'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
+        'orchestrator state files inline on the loop thread '
+        '(read_scheduler_state -> read_bytes and orchestrator_started_at '
+        '-> read_text). Filesystem, the limb task 3778\'s subprocess-only '
+        'vocabulary omitted; distinct from the _escalate cluster in the '
+        'same file. Follow-up filed by task 4484 step-9. A third row '
+        '(ae4cd95f45ad) was counted here until task 5550 and did not '
+        'belong: the scanner placed it at the escalation-archive read_text '
+        'in the resolved_fps build, not at an orchestrator state file. '
+        '5550 offloaded that scan via asyncio.to_thread, the finding went '
+        'stale, and the row was deleted with the fix -- these two survive '
+        'unfixed.'
         ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
