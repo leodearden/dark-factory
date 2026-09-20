@@ -74,7 +74,17 @@ function HeatmapCell({ state, holder }) {
 //   modules       list[dict]  — sorted module-contention list (from SCHEDULER.modules)
 //   onRowClick    fn(row)     — called when a task row is clicked
 //   selectedTaskId string     — task_id of the currently-selected row (or null)
-function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
+//
+// Memoised because app.jsx ticks a 1 Hz clock (`setInterval(() => setNow(...), 1000)`)
+// that re-renders the active tab's subtree whether or not data changed. This
+// component takes its data as PROPS, so between ticks they are referentially
+// identical and the whole grid is skipped; on a real 5s refresh
+// window.DF_DATA.SCHEDULER yields new array identities and it re-renders.
+//
+// The inner function stays NAMED — React DevTools keeps a useful label, and
+// the source-structure probes in test_tab_scheduler.py resolve it by name via
+// extract_function_body, which raises rather than passing vacuously on a miss.
+const SchedulerHeatmap = React.memo(function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
   const { useState, useMemo } = React;
 
   // Choose the axes that will actually render.  Memoised on the two props so
@@ -217,6 +227,6 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
       </table>
     </div>
   );
-}
+});
 
 window.DF_SCHED_HEATMAP = { SchedulerHeatmap, HeatmapCell, cellStateFor };
