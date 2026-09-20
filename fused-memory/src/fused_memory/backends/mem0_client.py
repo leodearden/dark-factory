@@ -209,7 +209,26 @@ _MEM0_DEFAULT_EMBEDDING_DIMS = 1536
 
 
 class Mem0Backend:
-    """Lazily creates AsyncMemory instances keyed by project_id."""
+    """Lazily creates AsyncMemory instances keyed by project_id.
+
+    TIMEOUT POSTURE, uniform across this class (task 5265).  EVERY read and
+    write here PROPAGATES a timeout as ``TimeoutError`` and never degrades it
+    into a falsy return — the semantic mem0-instance reads (``search``,
+    ``get_all``, ``get``) alongside the deterministic direct-to-Qdrant ones
+    (``count_by_metadata``, ``scroll_by_metadata``, ``get_point_by_id``, the
+    payload writes).  INV-11 ``no-silent-fail-soft``: a log is not a return
+    value, and a timed-out read that returns ``{}`` / ``None`` is
+    indistinguishable from a genuinely empty store or a genuine not-found.
+    Each method's own ``Raises:`` line names its specific consequence; this is
+    the only statement of the class-wide rule, so state it here and nowhere
+    else.
+
+    ``GraphitiBackend`` still swallows its own inner ``TimeoutError`` on
+    ``search`` and several sibling reads.  That asymmetry is deliberate, not an
+    oversight: it is entangled with a second, independent degrade mechanism in
+    ``services/memory_service.py``, so it was held out of scope here and is
+    tracked separately.
+    """
 
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
@@ -469,7 +488,19 @@ class Mem0Backend:
         scope: Scope,
         limit: int = 100,
     ) -> dict[str, Any]:
-        """Get all memories for a scope."""
+        """Get all memories for a scope.
+
+        Raises:
+            TimeoutError: If the mem0 listing exceeds ``_read_timeout`` —
+                PROPAGATED, never swallowed into an empty response.  INV-11
+                ``no-silent-fail-soft``.  Both consumers already act on a
+                raised exception and were only ever starved of one:
+                ``MemoryConsolidator.assemble_payload`` marks mem0 a degraded
+                fetch source, and ``MemoryService.replay_from_store`` stops
+                reporting a false "0 queued".  The message is re-stated on the
+                raised exception because ``asyncio.wait_for``'s own
+                ``TimeoutError`` stringifies EMPTY.
+        """
         instance = await self._get_instance(scope)
         try:
             return await asyncio.wait_for(
@@ -481,9 +512,8 @@ class Mem0Backend:
                 ),
                 timeout=self._read_timeout,
             )
-        except TimeoutError:
-            logger.warning(f'Mem0 get_all timed out after {self._read_timeout}s')
-            return {}
+        except TimeoutError as exc:
+            raise TimeoutError(f'Mem0 get_all timed out after {self._read_timeout}s') from exc
 
     async def get(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Get a single memory by ID, or ``None`` when it genuinely does not exist.
