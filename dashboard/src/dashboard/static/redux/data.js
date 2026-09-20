@@ -74,6 +74,32 @@ function endpointsFor(win) {
   };
 }
 
+// Keys fetched on a USER ACTION rather than by the poll loop, parameterised
+// per project. One declared row today: `terminal`, the mechanism PRD leaf
+// gamma3 fetches `?terminal=<project>` through.
+//
+// A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
+// one at a call site — a caller holds a project name and asks for the row, so
+// the url/key pair is constructed in exactly one place and cannot drift.
+//
+// `key(param)` names BOTH what the response body calls the value and what
+// DF_DATA calls it. That is the same rule endpointsFor's rows already follow,
+// where a row's key name is simultaneously the body key and the DF_DATA key;
+// the only difference here is that the name is BUILT from a parameter instead
+// of written as a literal, which is why these keys cannot be seeded in the
+// DF_DATA block above and why datumFor exists.
+//
+// Note which half is encoded: the url must survive HTTP parsing, and the key
+// must be the name a caller can look up with the project string it already
+// holds. No call site should have to know which is which.
+const ON_DEMAND_KEYS = {
+  terminal: {
+    url: project => `/api/v2/dashboard/tasks?terminal=${encodeURIComponent(project)}`,
+    key: project => `TASKS_TERMINAL:${project}`,
+    spec: DATUM,
+  },
+};
+
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
 // in place rather than reassigning, so cached references stay valid.
 const STABLE_ARRAY_KEYS = new Set(['PROJECTS', 'AGENTS']);
@@ -338,12 +364,15 @@ function pollKey(url) {
   return url.split('?')[0];
 }
 
-function stateFor(state, url) {
-  const key = pollKey(url);
-  let st = state.get(key);
+// Takes the resolved stateKey rather than the url, so the ONE decision of
+// "which flow-control entry does this request belong to" is made by refreshOne
+// and made once. Every polled caller still gets pollKey(url); an on-demand
+// request gets its own key, which is the whole point (see ON_DEMAND_KEYS).
+function stateFor(state, stateKey) {
+  let st = state.get(stateKey);
   if (!st) {
     st = { inFlight: false, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
-    state.set(key, st);
+    state.set(stateKey, st);
   }
   return st;
 }
@@ -433,9 +462,9 @@ function staleFailureThreshold() {
 // refreshOne's `finally`, so it covers the success path, the thrown-error
 // path AND the `!resp.ok` early return alike — an endpoint that 503s for an
 // hour is exactly as stale as one that times out for an hour.
-function publishStaleness(url, st) {
+function publishStaleness(stateKey, st) {
   if (typeof window === 'undefined' || !window.DF_DATA) return;
-  window.DF_DATA.__stale[pollKey(url)] = {
+  window.DF_DATA.__stale[stateKey] = {
     failures: st.failures,
     lastSuccessAt: st.lastSuccessAt,
   };
@@ -449,8 +478,12 @@ function publishReceipt(stateKey, receipt) {
   window.DF_DATA.__receipt[stateKey] = receipt;
 }
 
-async function refreshOne(url, keySpecs, state, deps) {
-  const st = stateFor(state, url);
+// `stateKey` names the flow-control, staleness and receipt entry this request
+// owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
+// and every existing direct caller keeps working. An on-demand request passes
+// its own key instead; see requestOnDemand for why it must.
+async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
+  const st = stateFor(state, stateKey);
   if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
   if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return; // still backed off
   st.inFlight = true;
@@ -501,7 +534,7 @@ async function refreshOne(url, keySpecs, state, deps) {
     st.failures = 0;
     st.nextAllowedAt = 0;
     st.lastSuccessAt = receipt.receivedAt;
-    publishReceipt(pollKey(url), receipt);
+    publishReceipt(stateKey, receipt);
   } catch (err) {
     recordFailure(st, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
@@ -512,7 +545,7 @@ async function refreshOne(url, keySpecs, state, deps) {
     st.inFlight = false;
     // In `finally` so the `!resp.ok` early return is covered too, not just
     // the success and thrown-error paths.
-    publishStaleness(url, st);
+    publishStaleness(stateKey, st);
   }
 }
 
@@ -579,6 +612,44 @@ async function refreshDFData(win, opts) {
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
 
+// Fetch one declared on-demand row for one parameter, through the SAME
+// refreshOne every polled endpoint uses — so the timeout/abort deadline, the
+// backoff, the in-flight guard and the receipt all come from one copy rather
+// than a second fetch path that would drift from it.
+//
+// WHY IT NEEDS ITS OWN stateKey. pollKey strips the query string on purpose
+// (the four ?window= endpoints must not get a fresh flow-control entry on
+// every chip click), so an on-demand `/api/v2/dashboard/tasks?terminal=<p>`
+// would otherwise land on the POLLED `/api/v2/dashboard/tasks` entry: it would
+// set that endpoint's in-flight flag — making the poll loop skip the real
+// tasks fetch for as long as a user's terminal request runs — reset or
+// escalate its backoff, and write its __stale entry, reporting an endpoint
+// stale that never failed. A user action must not be able to blind a tab.
+//
+// An unrecognised `name` throws rather than returning quietly: there is no url
+// to build for it, and a silent no-op would make a typo indistinguishable from
+// an empty result.
+//
+// NO JITTER. It exists to spread the 14 poll fetches across the interval; a
+// single user-triggered request has nothing to spread against, and delaying it
+// would only be latency the user sees.
+async function requestOnDemand(name, param, opts) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row) {
+    throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
+  }
+  const o = opts || {};
+  const url = row.url(param);
+  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps, jitterMaxMs: 0 };
+  await refreshOne(
+    url,
+    { [row.key(param)]: row.spec },
+    o.state || DF_POLL_STATE,
+    deps,
+    `${pollKey(url)}#${name}:${param}`,
+  );
+}
+
 window.DF_REFRESH = refreshDFData;
 window.__DF_PAUSE = false;
 
@@ -629,6 +700,8 @@ const DF_DATA_LOADER_API = {
   createPollState,
   pollKey,
   datumFor,
+  ON_DEMAND_KEYS,
+  requestOnDemand,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
