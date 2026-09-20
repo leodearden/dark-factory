@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import FakeVerifier
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -339,6 +340,34 @@ class TestAcquireWarmVerifyWorktree:
 # ---------------------------------------------------------------------------
 
 
+class _WorktreeRecordingVerifier(FakeVerifier):
+    """A passing ``VerifyPort`` that records which worktree each verify ran in.
+
+    Post-merge verify reaches the port through
+    ``verify_runner.py::LocalRunner``, which passes the merge worktree it was
+    built on as ``run_scoped``'s first positional argument -- so ``worktrees``
+    is the injected reading of the routing decision these tests are about.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.worktrees: list[Path] = []
+
+    async def run_scoped(  # type: ignore[override]
+        self,
+        worktree: Path,
+        config: object,
+        module_configs: list[object],
+        task_files: list[str] | None = None,
+        **options: object,
+    ):
+        self.worktrees.append(worktree)
+        return await super().run_scoped(
+            worktree, config, module_configs, task_files, **options,
+        )
+
+
+
 class TestPersistentWorktreeVerifyRouting:
     """Integration tests driving SpeculativeMergeWorker with real-git fixtures.
 
@@ -355,22 +384,14 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'warm-test', 'warm.py', 'x = 1\n')
         req = _make_merge_request('warm-test', 'warm-test', wt, cfg)
 
-        captured_merge_wt: list[Path] = []
-
-        async def _fake_run_post_merge_verify(git_ops_arg, req_arg, merge_wt_arg, **kwargs):
-            captured_merge_wt.append(merge_wt_arg)
-            return None  # PASS
+        verifier = _WorktreeRecordingVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
         worker_task = asyncio.create_task(worker.run())
 
-        with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            side_effect=_fake_run_post_merge_verify,
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
 
         await worker.stop()
         await worker_task
@@ -378,11 +399,11 @@ class TestPersistentWorktreeVerifyRouting:
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
         # The warm worktree must have been used for verify
-        assert len(captured_merge_wt) == 1, 'Expected exactly one verify call'
+        assert len(verifier.worktrees) == 1, 'Expected exactly one verify call'
         warm_path = git_ops.persistent_merge_worktree_path
-        assert captured_merge_wt[0].resolve() == warm_path.resolve(), (
+        assert verifier.worktrees[0].resolve() == warm_path.resolve(), (
             f'verify must run in warm worktree {warm_path}; '
-            f'got: {captured_merge_wt[0]}'
+            f'got: {verifier.worktrees[0]}'
         )
 
         # The warm worktree PERSISTS after a successful advance (cleanup is no-op on it)
@@ -403,22 +424,14 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'cold-test', 'cold.py', 'y = 2\n')
         req = _make_merge_request('cold-test', 'cold-test', wt, cfg)
 
-        captured_merge_wt: list[Path] = []
-
-        async def _fake_run_post_merge_verify(git_ops_arg, req_arg, merge_wt_arg, **kwargs):
-            captured_merge_wt.append(merge_wt_arg)
-            return None  # PASS
+        verifier = _WorktreeRecordingVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
         worker_task = asyncio.create_task(worker.run())
 
-        with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            side_effect=_fake_run_post_merge_verify,
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
 
         await worker.stop()
         await worker_task
@@ -426,13 +439,13 @@ class TestPersistentWorktreeVerifyRouting:
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
         # Verify ran in an ephemeral worktree (not _merge-verify)
-        assert len(captured_merge_wt) == 1, 'Expected exactly one verify call'
+        assert len(verifier.worktrees) == 1, 'Expected exactly one verify call'
         warm_path = git_ops.persistent_merge_worktree_path
-        assert captured_merge_wt[0].resolve() != warm_path.resolve(), (
+        assert verifier.worktrees[0].resolve() != warm_path.resolve(), (
             'knob OFF: verify must NOT run in the warm worktree'
         )
-        assert captured_merge_wt[0].name.startswith('_merge-'), (
-            f'expected ephemeral _merge-<uuid>; got: {captured_merge_wt[0].name}'
+        assert verifier.worktrees[0].name.startswith('_merge-'), (
+            f'expected ephemeral _merge-<uuid>; got: {verifier.worktrees[0].name}'
         )
 
         # No _merge-verify should have been created
@@ -535,22 +548,14 @@ class TestSafetyValveIntegration:
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)
 
-        captured_merge_wt: list[Path] = []
-
-        async def _fake_run_post_merge_verify(git_ops_arg, req_arg, merge_wt_arg, **kwargs):
-            captured_merge_wt.append(merge_wt_arg)
-            return None  # PASS
+        verifier = _WorktreeRecordingVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
         worker_task = asyncio.create_task(worker.run())
 
-        with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
-            side_effect=_fake_run_post_merge_verify,
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
 
         await worker.stop()
         await worker_task
@@ -559,9 +564,9 @@ class TestSafetyValveIntegration:
 
         # With safety_valve_every_n=1, the FIRST verifying attempt (count=1)
         # is due → must bypass the warm swap and use the ephemeral path.
-        assert len(captured_merge_wt) == 1
+        assert len(verifier.worktrees) == 1
         warm_path = git_ops.persistent_merge_worktree_path
-        assert captured_merge_wt[0].resolve() != warm_path.resolve(), (
+        assert verifier.worktrees[0].resolve() != warm_path.resolve(), (
             f'safety_valve_every_n=1: first attempt must use ephemeral, not warm; '
-            f'got: {captured_merge_wt[0]}'
+            f'got: {verifier.worktrees[0]}'
         )
