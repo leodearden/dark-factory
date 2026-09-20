@@ -2090,6 +2090,21 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2232,6 +2247,21 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
