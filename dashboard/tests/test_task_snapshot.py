@@ -9,9 +9,19 @@ fan-out path runs underneath and no private name is reached into.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import httpx
 import pytest
+
+NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
+"""The one injected instant every test stamps against.
+
+Resolved by the caller and threaded in, never read from a clock here: the
+whole point of the envelope is that ``as_of`` names the instant a payload was
+measured, and a test that cannot say what that instant is cannot check it.
+"""
 
 # ---------------------------------------------------------------------------
 # CannedMCP — the fused-memory substrate, emulated faithfully enough that a
@@ -193,3 +203,284 @@ class TestCannedMCP:
                              'page_size': 2, 'offset': 1})
 
         assert [row['id'] for row in page['tasks']] == ['3', '5']
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireSnapshotHappyPath — one unit, two halves, one TTL (step-3)
+# ---------------------------------------------------------------------------
+
+
+ALL_NINE = (
+    (1, 'in-progress'), (2, 'blocked'), (3, 'merge-deferred'), (4, 'review'),
+    (5, 'infra-hold'), (6, 'pending'), (7, 'deferred'), (8, 'done'),
+    (9, 'cancelled'),
+)
+"""One id per ``TaskStatus`` member, so every census bucket is exercised."""
+
+
+def _tree(pairs=ALL_NINE, **row_overrides):
+    """A ``(rows, status_map)`` pair agreeing with each other by construction."""
+    rows = [_raw_row(tid, status, **row_overrides.get(tid, {}))
+            for tid, status in pairs]
+    return rows, {tid: status for tid, status in pairs}
+
+
+@pytest.fixture()
+def project_root(tmp_path):
+    root = tmp_path / 'dark-factory'
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@pytest.fixture(autouse=True)
+def _isolate_caches():
+    """Neither the unit cache nor the fetch_tasks cache may cross a test."""
+    import dashboard.data.task_snapshot as snapshot_mod
+
+    import dashboard.data.tasks as tasks_mod
+
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+    yield
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+
+
+class TestAcquireSnapshotHappyPath:
+    """The unit measures both halves, stamps them, and tells you how they relate.
+
+    Driven end to end through ``mcp_tool_call``, so the real ``fetch_tasks`` /
+    ``fetch_statuses`` / fan-out path runs underneath every assertion.
+    """
+
+    @staticmethod
+    async def _acquire(canned, config, root, *, now):
+        from dashboard.data.task_snapshot import acquire_snapshot
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return await acquire_snapshot(None, config, root, now=now)
+
+    async def test_the_census_is_a_fresh_datum_stamped_with_the_injected_now(
+        self, project_root, dashboard_config
+    ):
+        """(a) A ``Datum[TaskCensus]``, tz-aware, at the caller's own instant."""
+        from dashboard.data.census import TaskView, build_census
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        census = snapshot.census
+        assert census.state is DatumState.FRESH
+        assert census.as_of == NOW and census.as_of.utcoffset() is not None
+        assert census.value == build_census(status_map)
+        assert len(census.value.counts) == 9, 'every bucket present, none absent'
+        assert sum(census.value.counts.values()) == census.value.total
+        assert sum(census.value.views.values()) == census.value.total
+        assert census.value.sub_views[TaskView.RUNNING] <= (
+            census.value.views[TaskView.IN_FLIGHT]
+        )
+        assert census.value.views[TaskView.IN_FLIGHT] == 5, (
+            'review and infra-hold belong to in_flight, which the retired '
+            f'five-member _ACTIVE_STATUSES omitted: {census.value.views}'
+        )
+
+    async def test_the_row_read_asks_for_every_active_status(
+        self, project_root, dashboard_config
+    ):
+        """(b) All seven of ``shared.task_statuses.ACTIVE``, review and infra-hold included."""
+        from shared.task_statuses import ACTIVE
+
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        requested = [call['args'].get('statuses')
+                     for call in canned.calls_to('get_tasks')]
+        assert requested == [sorted(ACTIVE)], (
+            f'the row read must ask for exactly the active vocabulary, got {requested}'
+        )
+        assert len(sorted(ACTIVE)) == 7
+        assert snapshot.rows.state is DatumState.FRESH
+        assert {row['id'] for row in snapshot.rows.value} == {1, 2, 3, 4, 5, 6, 7}
+
+    async def test_the_live_stranded_split_counts_the_rows_not_the_census(
+        self, project_root, dashboard_config
+    ):
+        """(c) Partitioned by ``tasks.task_is_stranded``, over the ROWS.
+
+        The census counts a POPULATION; the split needs the claimant columns,
+        which only the rows carry. Deriving it from the census would have to
+        invent them.
+        """
+        live = NOW.isoformat()
+        stale = (NOW - timedelta(hours=2)).isoformat()
+        rows, status_map = _tree(
+            pairs=((1, 'in-progress'), (2, 'in-progress'), (6, 'pending')),
+            **{
+                1: {'claimant_run_id': 'run-1/sess-1/pid=42', 'heartbeat_at': live},
+                2: {'claimant_run_id': 'run-2/sess-2/pid=43', 'heartbeat_at': stale},
+            },
+        )
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert (snapshot.in_progress_live, snapshot.in_progress_stranded) == (1, 1)
+        in_progress_rows = [r for r in snapshot.rows.value
+                            if r['status'] == 'in-progress']
+        assert (snapshot.in_progress_live + snapshot.in_progress_stranded
+                == len(in_progress_rows))
+
+    async def test_skew_is_the_measured_gap_between_the_two_halves(
+        self, project_root, dashboard_config
+    ):
+        """(d) A non-negative int, or None when a half was never measured."""
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert isinstance(snapshot.skew_seconds, int)
+        assert snapshot.skew_seconds == int(
+            abs((snapshot.census.as_of - snapshot.rows.as_of).total_seconds())
+        ) == 0, 'both halves share the one injected instant'
+
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        import dashboard.data.task_snapshot as snapshot_mod
+        snapshot_mod._snapshot_cache_clear()
+        degraded = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert degraded.census.as_of is None
+        assert degraded.skew_seconds is None, (
+            'a gap between one measured instant and no instant is not zero'
+        )
+
+    async def test_both_halves_validate_against_a_served_at_inside_the_bound(
+        self, project_root, dashboard_config
+    ):
+        """(e) Fresh up to the declared bound, and a contract error past it.
+
+        The bound is twice the unit's own refresh TTL, because a unit served
+        from that cache at age 14.9 s is legitimately fresh by its producer's
+        contract — a tighter bound would make the access layer raise on its
+        own correct output.
+        """
+        from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS, SNAPSHOT_TTL_SECONDS
+
+        from dashboard.data.datum import DatumContractError, DatumInvariant, validate_datum
+
+        assert FRESHNESS_BOUND_SECONDS == 2 * SNAPSHOT_TTL_SECONDS
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        at_the_bound = NOW + timedelta(seconds=FRESHNESS_BOUND_SECONDS)
+        validate_datum(snapshot.census, at_the_bound)
+        validate_datum(snapshot.rows, at_the_bound)
+
+        with pytest.raises(DatumContractError) as raised:
+            validate_datum(snapshot.census, at_the_bound + timedelta(seconds=1))
+        assert raised.value.invariant is DatumInvariant.FRESHNESS_BOUND
+
+    async def test_to_wire_emits_the_contract_keys_and_not_the_raw_map(
+        self, project_root, dashboard_config
+    ):
+        """(f) The map is the unit's raw material, not part of its wire shape.
+
+        ``_resolve_deps`` needs it in-process as its only bounded fallback for
+        a dependency outside the fetched rows, so it lives on the record and
+        stops at the wire.
+        """
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        wire = snapshot.to_wire()
+        assert set(wire) == {
+            'census', 'rows', 'in_progress_live', 'in_progress_stranded',
+            'skew_seconds',
+        }
+        assert snapshot.status_map == status_map, 'still reachable in-process'
+        assert 'status_map' not in wire
+
+        rendered = wire['census']['value']
+        assert set(rendered) == {'counts', 'total', 'views', 'sub_views'}
+        assert rendered['counts']['infra-hold'] == 1, (
+            f'plain-string keys, not enum members: {rendered["counts"]}'
+        )
+        assert isinstance(wire['rows']['value'], list)
+
+    async def test_one_unit_one_ttl_and_an_uncached_row_read(
+        self, project_root, dashboard_config, monkeypatch
+    ):
+        """(g) The unit owns the only TTL on this path.
+
+        Inside it, nothing is read at all. Past it, BOTH halves are — including
+        the rows, whose own 20 s cache would otherwise serve a value older than
+        the ``as_of`` this unit is about to stamp on it.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+
+        first = await self._acquire(canned, dashboard_config, project_root, now=NOW)
+        calls_after_first = len(canned.calls)
+        second = await self._acquire(canned, dashboard_config, project_root, now=NOW)
+
+        assert second is first, 'the second acquisition must be the same unit'
+        assert len(canned.calls) == calls_after_first, (
+            f'a warm unit issues no MCP call, got {canned.calls[calls_after_first:]}'
+        )
+
+        # Past the unit TTL. The fetch_tasks cache is NOT cleared and its 20 s
+        # window is still open in real time, so a cached row read would serve
+        # the first acquisition's rows here.
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        later = NOW + timedelta(seconds=16)
+        third = await self._acquire(canned, dashboard_config, project_root, now=later)
+
+        assert third is not first
+        assert third.rows.as_of == later and third.census.as_of == later
+        assert len(canned.calls_to('get_tasks')) == 2, (
+            'the row read must be uncached, so the unit never stamps an as_of '
+            'newer than the rows it stamps'
+        )
+        assert len(canned.calls_to('get_statuses')) == 2
+
+    async def test_a_vocabulary_drift_degrades_the_census_and_spares_the_rows(
+        self, project_root, dashboard_config
+    ):
+        """(h) The census carries the error verbatim; the rows stay measured.
+
+        ``build_census`` refuses an off-vocabulary value rather than dropping
+        the row, and this layer is where that refusal becomes visible instead
+        of fatal.
+        """
+        from dashboard.data.census import build_census
+        from dashboard.data.datum import DatumState
+
+        rows, status_map = _tree()
+        status_map[6] = 'not-a-status'
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert snapshot.census.state is not DatumState.FRESH
+        with pytest.raises(Exception) as raised:
+            build_census(status_map)
+        assert snapshot.census.reason == str(raised.value), (
+            'the producer\'s message must cross verbatim, not be reworded: '
+            f'{snapshot.census.reason!r}'
+        )
+        assert snapshot.rows.state is DatumState.FRESH
