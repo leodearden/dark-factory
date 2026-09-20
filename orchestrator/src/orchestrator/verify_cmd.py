@@ -132,11 +132,27 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # listed here: `--numprocesses`/`--maxprocesses` are xdist's long spellings
 # for the worker count and its cap, and a set that binds `-n` but not `-n`'s
 # own long spelling is the same latent defect one config rename away.
+#
+# Task 5580 found the two remaining omissions, and they were the two flags
+# THIS MODULE ITSELF emits: `with_pytest_timeout` appends `--timeout <secs>`
+# and `with_junitxml` appends `--junitxml <path>`, and neither was bound. The
+# merge gate composes both — `confirm_isolated_rerun_verdict` renders the
+# scoped re-run as a STRING ending in `--timeout 300`, and `run_verification`
+# RE-PARSES that string to append `--junitxml` — so `300` came back as a test
+# TARGET and the flag was stranded::
+#
+#     pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
+#     pytest: error: argument --timeout: expected one argument      (rc=4)
+#
+# Measured cost: every merge_gate observation in the flake ledger — 350
+# `fails_in_isolation`, ZERO `passes_in_isolation`, 2026-08-30 to 2026-09-17 —
+# recorded a rejected command as a real red.
 _PYTEST_VALUE_FLAGS = frozenset({
     '-k', '-m', '-p', '-o', '-c', '-n', '-W',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
     '--dist', '--numprocesses', '--maxprocesses',
+    '--timeout', '--junitxml',
 })
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
