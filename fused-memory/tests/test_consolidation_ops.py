@@ -25,10 +25,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
-from fused_memory.services.consolidation_ops import execute_retain_consolidation
 
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.services.consolidation_ops import execute_retain_consolidation
 
 PROJECT_ID = 'dark_factory'
 # On the default allowlist for both mem0_update arms, so no case here can

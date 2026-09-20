@@ -1042,10 +1042,10 @@ class TestClosureIsCorroboratedNeverClaimed:
     @pytest.mark.asyncio
     async def test_a_truncated_closure_listing_says_so(self):
         """(d) A capped listing must never read as the whole closure."""
-        from fused_memory.server.tools import _TOPIC_MEMBER_LIMIT
+        from fused_memory.services.consolidation_ops import TOPIC_MEMBER_LIMIT
 
         svc = make_service(
-            topic_members=[f'member-{i}' for i in range(_TOPIC_MEMBER_LIMIT)],
+            topic_members=[f'member-{i}' for i in range(TOPIC_MEMBER_LIMIT)],
             topic_total=512,
         )
 
@@ -1053,7 +1053,7 @@ class TestClosureIsCorroboratedNeverClaimed:
 
         assert result['topic_members_truncated'] is True
         assert result['topic_members_total'] == 512
-        assert len(result['topic_members']) == _TOPIC_MEMBER_LIMIT
+        assert len(result['topic_members']) == TOPIC_MEMBER_LIMIT
 
     @pytest.mark.asyncio
     async def test_the_common_path_pays_for_no_count(self):
