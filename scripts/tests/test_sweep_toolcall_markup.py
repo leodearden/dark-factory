@@ -1095,12 +1095,24 @@ def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
     The nested double-leak shape cancelled task 3654 classified. What actually
     happens is worth pinning precisely, because it is NOT "repaired twice":
 
-    ``_parse_tail`` refuses outright when a recovered item contains a further
-    mis-close (PRD boundary row B5 — the inner value's boundary would be a
-    guess), so a STRICTLY nested leak is a refusal, not a two-round repair. The
-    shape that DOES survive round one is the unterminated inner opener below:
-    it carries no closing tag, so B5 does not fire, and the recovered value
-    lands in its hole still tripping detect().
+    ``_parse_tail`` refuses when a recovered item contains a further mis-close
+    (PRD boundary row B5 — the inner value's boundary would be a guess), so a
+    STRICTLY nested leak is a refusal, not a two-round repair. It said "refuses
+    OUTRIGHT" until task **5620**, which is the pre-**4502** rule stated
+    unconditionally (scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS). Nothing this
+    test asserts changes: its inner value is a real mis-close, and only a
+    merely-QUOTED closing tag repairs now.
+
+    THE REST OF THIS PARAGRAPH IS UNAFFECTED, and deliberately so. The shape
+    that DOES survive round one is the unterminated inner opener below: it
+    carries no closing tag, so B5 does not fire, and the recovered value lands
+    in its hole still tripping detect(). Task 5620 added a rule blocking a
+    parameter OPENER inside a recovered value and this shape STILL survives,
+    because ``_parse_body``'s cheap prefilter only fires on a closing-tag
+    sequence, so the rule never sees it. That asymmetry is declared rather than
+    overlooked — task **5639** owns it — and
+    closing it would rewrite this convergence case rather than merely correct
+    its prose.
 
     Round two then REFUSES it (there is no qualifying mis-close to scan), so
     the residue is reported rather than silently left — and a second
@@ -1140,12 +1152,16 @@ def _never_converges(value, param, schema_params, supplied):
     non-converging document and they must drive the loop bound the SAME way,
     or "the sweep stalled" means something subtly different in each.
 
-    Stubbing ``repair`` rather than hand-building a document is deliberate.
-    With the real repairer no document can reach the bound — a recovered value
-    can never contain a further mis-close (B5 refuses the parse) — so the only
-    honest way to exercise the bound is at the seam. Only a value the per-field
-    ``detect_for`` gate already flagged ever gets here, so a clean document is
-    unaffected by the stub.
+    Stubbing ``repair`` rather than hand-building a document is deliberate and
+    STILL the only honest way to exercise the bound — but not for the reason
+    recorded here until task **5620**; see scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS for what
+    falsified it. What holds is weaker: no document in either live corpus has
+    been OBSERVED to reach the bound. Unreachable-by-construction would have
+    made a hand-built document merely hard to write; merely-unobserved makes it
+    UNRELIABLE — a document that reached the bound today would do so for
+    reasons no one has characterised. So the seam stays. Only a value the
+    per-field ``detect_for`` gate already flagged ever gets here, so a clean
+    document is unaffected by the stub.
     """
     return sweep.Repair(
         clean_value=value,
@@ -1732,10 +1748,14 @@ def test_non_convergence_is_counted_at_the_cli_and_forces_a_non_zero_exit(
     this task is measured by.
 
     Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`,
-    and for the same reason: no real document can reach the bound today (B5
-    refuses a nested parse). That is what makes the wiring worth testing NOW —
-    the outcome exists to be the tripwire for a future widening of ``repair()``,
-    and a tripwire connected to nothing is not a tripwire.
+    and for the reason :func:`_never_converges` records: the bound has never
+    been OBSERVED to be reached on either live corpus, which is weaker than the
+    unreachability this docstring asserted until task **5620**.
+
+    That makes the wiring MORE worth testing now, not less. The outcome was
+    written as a tripwire for a future widening of ``repair()``; two widenings
+    have since landed (4502 and 5620), and a tripwire connected to nothing is
+    not a tripwire.
     """
     def _never_converges(value, param, schema_params, supplied):
         return sweep.Repair(
@@ -2122,9 +2142,9 @@ def test_the_did_not_converge_path_does_not_duplicate_refusals(monkeypatch):
     keeping the duplicate-refusal bug on exactly the path that already means
     something has gone wrong.
 
-    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`
-    — no real document can reach the bound (B5 refuses a nested parse) — but
-    this stub also REFUSES one field, so the run has refusals to duplicate.
+    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`,
+    for the reason :func:`_never_converges` records — but this stub also
+    REFUSES one field, so the run has refusals to duplicate.
     """
     def _repairs_detail_only(value, param, schema_params, supplied):
         if param != 'detail':

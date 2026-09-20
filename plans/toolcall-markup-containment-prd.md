@@ -585,6 +585,69 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > (d) in `TestQuotedReportIsRepairable` pins the mirror; unlike controls (a)–(c) it is
 > not a both-ways control, and fails without this amendment.
 >
+> *Widened 2026-09-19 (task 5620) — B5 IS THREE BLOCKERS, NOT TWO.* Everything above
+> was correct when taken and both of its conditions still hold verbatim; what changed
+> is the rule's REACH, so it is rewritten rather than deleted. 4502 narrowed B5 off a
+> bare substring refusal but reasoned only about inner CLOSERS — this entry, the
+> implementation and its negative controls alike — so the OPENER half of the same
+> class stayed open. `_inner_markup_blocks` (renamed from `_inner_closer_blocks`,
+> whose name had stopped describing its rule) iterated over closers alone, so a well-formed
+> sibling parameter opener inside a recovered value was invisible to it: glued into
+> that value verbatim while the parameter it named was silently NOT recovered, which
+> is the no-silent-partial-repair failure of committed-corpus record 25 reached
+> through an opener instead of a closer. Measured across 4502 (`b88919ad25^` vs
+> `1b9fedeb97`), such a value went from `None` to a recovery — a regression 4502
+> introduced by omission. **As of 5620 a recovered item's value is blocked by ANY OF
+> THREE things:** **(i)** an inner closer naming the item itself in either dialect, or
+> `invoke`; **(ii)** a well-formed parameter OPENER in either dialect, anywhere in the
+> value; or **(iii)** an inner closer whose reading as this item's terminator also
+> yields a valid parse of the remainder. In code the original numbering is KEPT and
+> the opener clause is named as (i)'s mirror, so the many "condition (ii)" references
+> across docstrings and tests keep meaning the alternative-boundary probe.
+>
+> *Why the opener rule is stated categorically, and why not the probe.* Running the
+> ambiguity probe from each inner OPENER's position was the alternative, and it was
+> prototyped and rejected on measurement: it leaves the reported shape recovering,
+> because that shape's sibling text carries a trailing unrelated closing tag and the
+> probe's depth-1 bound then reads the remainder as "does not parse". It fixes only
+> sibling openers whose text carries no closing tag — a strict subset of the defect.
+> The opener rule refuses every measured variant instead, and costs one bounded regex
+> search at the prefilter's own level rather than up to `_MAX_CANDIDATES` extra probes
+> inside loops whose comment requires added work to be O(1) in the input length. Both
+> dialects are listed for the reason `parameter` is listed categorically above:
+> `_parse_body` tries the canonical opener first and falls back to the name-echoing
+> one, so both are shapes it would have opened a sibling item on — a property of the
+> parser, not of the opener.
+>
+> *Blast radius, re-measured at 5620.* The 504-record committed corpus stays
+> **444/60** and **no record changes outcome**; both `esc-3514` specimens, 4502's own
+> positive control (whose quoted literal is a CLOSER, not an opener) and the sweep
+> suite stay green. Negative controls (g) and (h) in `TestQuotedReportIsRepairable`
+> pin the canonical and name-echoing openers; like (d) they are not both-ways
+> controls. The pin that used to assert a RECOVERY of a sibling-opener shape,
+> `test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE`, is INVERTED in the
+> same task — its specimen differs from control (g) in one cell, both regressed
+> identically at 4502, and no rule can block one and spare the other.
+>
+> *Two residuals 5620 DECLARED rather than closed.* (1) A recovered value carrying a
+> sibling opener and NO closing tag anywhere is still swallowed — identically before
+> and after 4502, so not a 4502 regression. It never reaches the rule, because
+> `_parse_body`'s cheap prefilter only fires on a closing-tag sequence; closing it
+> means moving the test up beside that prefilter, which rewrites the sweep's
+> documented unterminated-inner-opener convergence case. **Task 5639** (filed as
+> `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
+> `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
+> so 5639 landing fails loudly here instead of silently contradicting this
+> paragraph. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> unreachable by construction (instrumented: 1 execution before, 0 after). It is
+> documented in place and kept, because deleting it removes a recursion bound 4502
+> landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
+> Named here so both stay greppable instead of being rediscovered as
+> inconsistencies — by TASK id, because a `tkt_…` is a transient submit_task
+> receipt: the first of these two resolved to status `combined` ("already pending in
+> the pool"), so following it alone lands a reader on a dropped duplicate rather
+> than on the open work.
+>
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and
 > it is non-negotiable: the C2 middleware forwards it as the repaired argument.
