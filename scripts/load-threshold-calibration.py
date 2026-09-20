@@ -1053,6 +1053,13 @@ def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
     transaction, so no corpus the sampler wrote can hold more readability rows
     than ticks. Only a hand-seeded or partly restored one can, and it says the
     CLOCK is wrong rather than the series.
+
+    ``rows > corpus`` is checked FIRST, which decides the one corpus both
+    names would otherwise fit: a ZERO clock with readability rows present.
+    That is the violation, not the absence — a readability row is written ON
+    a tick, so N of them mean at least N ticks happened, and a clock of 0
+    contradicts them exactly as any other too-small clock does.
+    ``unknown_readability`` is reached only when ``rows == 0``.
     """
     if stats['readable_fraction'] is not None:
         return None

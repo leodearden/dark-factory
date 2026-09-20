@@ -1168,6 +1168,50 @@ def test_a_coverage_that_cannot_be_true_is_refused_rather_than_printed(
     assert 'own_read_ok:leaf.service' in line and 'runqueue_read_ok' in line, line
 
 
+def test_a_zero_clock_with_readability_rows_is_impossible_not_unknown(
+    tmp_path: Path,
+):
+    """WHICH unknown cause a missing clock produces, with rows present. Pinned.
+
+    Both names fit this corpus on their face: the clock count is zero, which
+    reads as an absence, and the readability rows outnumber it, which reads as
+    the invariant violation. ``rows > corpus`` is tested first, so it is the
+    violation — and that is the right verdict, because a readability row is
+    written ON a tick: 100 of them mean at least 100 ticks happened, and a
+    clock of 0 contradicts them exactly as a clock of 50 would.
+
+    Neither existing zero-clock test pins it. ``..._reports_unknown_not_zero``
+    and ``..._is_unknown_even_when_the_clock_ran`` both seed ZERO readability
+    rows, so both reach ``unknown_readability`` under either precedence, and
+    the boundary between the two causes went untested. It is worth a test
+    because these are two of the five separate operator readings the coverage
+    path exists to keep apart, and they send the reader to opposite places:
+    ``unknown_readability`` to a collector that never ran,
+    ``impossible_coverage`` to a corpus restored or seeded by hand.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    assert (coverage['ticks_in_corpus'], coverage['ticks_with_a_row']) == (0, 100)
+    assert coverage['readable_fraction'] is None, coverage
+    assert 'impossible_coverage' in payload['degradations'], payload['degradations']
+    assert 'unknown_readability' not in payload['degradations'], (
+        'a clock contradicted by 100 readability rows was reported as an '
+        f'absence of evidence: {payload["degradation_details"]}'
+    )
+    # The missing side is named, so the reader is sent to the clock and not to
+    # the leaf whose rows are the only thing the corpus does have.
+    [detail] = details(payload, 'impossible_coverage')
+    assert 'runqueue_read_ok' in detail and 'own_read_ok:leaf.service' in detail, detail
+
+
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
     """`_` is a single-character LIKE wildcard, and every selector contains one.
 
