@@ -27,6 +27,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Shared campaign-gate scaffolding (task 4427), single-sourced across the three
+# files that pin this contract. _NO_INJECTED_GATE distinguishes "this case
+# passed no usage_gate at all" (the OWNED path, where run_architect_eval builds
+# and tears down its own) from "this case passed usage_gate=None" (deliberately
+# ungated by a campaign owner) — the same trap the production _GATE_UNSET
+# sentinel exists to avoid.
+from _campaign_gate_helpers import NO_INJECTED_GATE as _NO_INJECTED_GATE
+from _campaign_gate_helpers import eval_base_config
+
 from orchestrator.evals.metrics import EvalMetrics
 
 # ---------------------------------------------------------------------------
@@ -1590,14 +1599,6 @@ def _arch_task_no_reference() -> dict:
     task = _arch_task()
     task.pop('reference', None)
     return task
-
-
-# Distinguishes "this case passed no usage_gate at all" (the OWNED path, where
-# run_architect_eval builds and tears down its own) from "this case passed
-# usage_gate=None" (deliberately ungated by a campaign owner). A plain None
-# default could not tell those apart — which is the same trap the production
-# _GATE_UNSET sentinel exists to avoid.
-_NO_INJECTED_GATE = object()
 
 
 async def _run_architect_eval_hermetic(
@@ -4950,15 +4951,6 @@ class TestCampaignGatePremise:
     fails loudly instead.
     """
 
-    def _base(self, tmp_path: Path):
-        # Mirrors test_eval_driver._base_config: a minimal YAML setting only
-        # project_root, layered over the packaged defaults through the REAL
-        # production config-load entry point (never a hand-built config).
-        from orchestrator.config import load_config
-
-        cfg_path = tmp_path / 'orchestrator.yaml'
-        cfg_path.write_text(f'project_root: {tmp_path}\n')
-        return load_config(cfg_path)
 
     @pytest.mark.parametrize('role', ['architect', 'implementer'])
     def test_cell_orch_config_inherits_base_usage_cap_verbatim(
@@ -4967,7 +4959,7 @@ class TestCampaignGatePremise:
         from orchestrator.evals.configs import EvalConfig
         from orchestrator.evals.runner import build_eval_orch_config
 
-        base = self._base(tmp_path)
+        base = eval_base_config(tmp_path)
         cfg = EvalConfig(f'{role}-sonnet-high', 'claude', 'sonnet', 'high', role=role)
         task = {'id': 'df_task_4427', 'project_root': str(tmp_path)}
 
@@ -4986,12 +4978,6 @@ class TestCampaignUsageGate:
     fan-out, a cell that exploded) can never leak the probe loop.
     """
 
-    def _base(self, tmp_path: Path):
-        from orchestrator.config import load_config
-
-        cfg_path = tmp_path / 'orchestrator.yaml'
-        cfg_path.write_text(f'project_root: {tmp_path}\n')
-        return load_config(cfg_path)
 
     async def test_yields_the_built_gate_and_builds_exactly_once(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -5003,7 +4989,7 @@ class TestCampaignUsageGate:
         gate = make_gate_mock()
         build = AsyncMock(return_value=gate)
         monkeypatch.setattr(runner, '_build_eval_usage_gate', build)
-        base = self._base(tmp_path)
+        base = eval_base_config(tmp_path)
 
         async with runner.campaign_usage_gate(base) as yielded:
             assert yielded is gate
@@ -5024,7 +5010,7 @@ class TestCampaignUsageGate:
             runner, '_build_eval_usage_gate', AsyncMock(return_value=gate),
         )
 
-        async with runner.campaign_usage_gate(self._base(tmp_path)):
+        async with runner.campaign_usage_gate(eval_base_config(tmp_path)):
             gate.shutdown.assert_not_awaited()
 
         gate.shutdown.assert_awaited_once()
@@ -5048,7 +5034,7 @@ class TestCampaignUsageGate:
         )
 
         with pytest.raises(RuntimeError, match='campaign exploded'):
-            async with runner.campaign_usage_gate(self._base(tmp_path)):
+            async with runner.campaign_usage_gate(eval_base_config(tmp_path)):
                 raise RuntimeError('campaign exploded')
 
         gate.shutdown.assert_awaited_once()
@@ -5067,7 +5053,7 @@ class TestCampaignUsageGate:
             runner, '_build_eval_usage_gate', AsyncMock(return_value=None),
         )
 
-        async with runner.campaign_usage_gate(self._base(tmp_path)) as gate:
+        async with runner.campaign_usage_gate(eval_base_config(tmp_path)) as gate:
             assert gate is None
 
     async def test_none_base_config_yields_none_without_building(
@@ -5109,7 +5095,7 @@ class TestCampaignUsageGate:
             runner, '_build_eval_usage_gate', AsyncMock(return_value=gate),
         )
 
-        async with runner.campaign_usage_gate(self._base(tmp_path)) as yielded:
+        async with runner.campaign_usage_gate(eval_base_config(tmp_path)) as yielded:
             assert yielded is gate
 
         assert 'shutdown failed' in caplog.text
