@@ -229,6 +229,43 @@ def _exhaustion_reason(gate, tried) -> str:
     )
 
 
+_ROUTE_NONZERO_EXIT = "the CLI exited non-zero with a banner the gate confirmed"
+_ROUTE_ZERO_EXIT = "the CLI exited 0 with a banner instead of a verdict"
+"""The two ways the CLI declines, named so the journal can tell them apart.
+
+Structured constants rather than a phrase assembled at each call site
+(heuristic 12): "which route rotated" is a two-valued fact about the run, and
+the only reason it is ever rendered as text is that a journal line is the
+medium. The task record's 2026-09-19 measurement could count the non-zero
+route (46 firings on one night) but could not establish whether the exit-0
+route had ever fired, because both arms said the same thing — so these
+spellings are what make the route greppable.
+"""
+
+
+def _log_rotation(slot, route) -> None:
+    """Record that *slot*'s account did not complete this digest, naming
+    *route*.
+
+    ONE helper called from both arms, not two ``logger.info`` calls, so the
+    shared half of the wording cannot drift between the routes (heuristic 11)
+    while the route clause remains the only thing that differs. The sentence
+    itself is unchanged from the single route-blind line this replaces, so an
+    operator's existing greps and the 2026-09-19 measurement's baseline keep
+    working.
+
+    INFO, because a rotation is normal operating weather — the pool exists to
+    absorb exactly this — and that is how the line it replaces already treated
+    it. The escalation-worthy event is the pool running OUT, which
+    ``_exhaustion_reason`` reports on a raised ``CoderCapExhausted``.
+    """
+    logger.info(
+        "account %s did not complete this digest and the gate recorded a cap "
+        "signal against it (route: %s) — retrying this digest on the next "
+        "account in the pool", slot.account_name, route,
+    )
+
+
 def _banner_instead_of_verdict(slot, reply) -> bool:
     """Is this exit-0 *reply* a cap banner rather than a verdict?
 
@@ -304,6 +341,8 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     next lease, and is bounded the same way. Which route the CLI takes is
     the CLI's choice and not the pool's, so rotating on one and confirming
     on the other left one bannering account able to lose a whole night.
+    ``_log_rotation`` names which of the two fired, so the journal can count
+    them separately.
 
     TERMINATION is bounded by the caller's ``tried`` set, passed as
     ``exclude=``, not by the gate's cap transitions: a near-cap verdict
@@ -344,11 +383,7 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 # by an assumption about what just happened.
                 if not slot.detect_cap_hit(exc.stderr, exc.stdout):
                     raise
-                logger.info(
-                    "account %s did not complete this digest and the gate "
-                    "recorded a cap signal against it — retrying this digest "
-                    "on the next account in the pool", slot.account_name,
-                )
+                _log_rotation(slot, _ROUTE_NONZERO_EXIT)
             else:
                 # THE OTHER CAP ROUTE. The CLI can decline by PRINTING its
                 # banner and exiting 0, so a cap arrives as a RETURNED reply
@@ -362,11 +397,7 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 if not _banner_instead_of_verdict(slot, reply):
                     slot.confirm()
                     return reply
-                logger.info(
-                    "account %s did not complete this digest and the gate "
-                    "recorded a cap signal against it — retrying this digest "
-                    "on the next account in the pool", slot.account_name,
-                )
+                _log_rotation(slot, _ROUTE_ZERO_EXIT)
             finally:
                 gate.release_probe_slot(slot.token)
 
