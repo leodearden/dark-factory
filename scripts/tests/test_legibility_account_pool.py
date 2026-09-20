@@ -40,6 +40,7 @@ import pytest
 from legibility import coder as coder_mod
 from shared.usage_gate import AccountLease
 
+from shared import cap_markers
 from shared import usage_gate as usage_gate_mod
 
 
@@ -972,6 +973,146 @@ def test_a_near_cap_pool_reads_as_a_cap_deferral_end_to_end():
     assert not any(a.capped for a in gate.accounts), (
         'and not one account was capped along the way'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5637: THE EXIT-0 BANNER ROUTE — the CLI declines by PRINTING the banner
+# and exiting 0, so the banner arrives as a RETURNED reply rather than as a
+# raised CoderCapExhausted.
+#
+# The section above covers the route where the CLI exits non-zero; this is the
+# other half of the same weather, and before this task it was not rotated at
+# all. `coder.code_digest`'s second scan site turned the unparseable banner
+# into `CodingResult(capped=True)` with no rotation and no cap recorded on the
+# gate — so the account stayed admissible, and because `tried` is scoped to one
+# digest and the pool draws reverse=True, the SAME account was drawn first for
+# every subsequent digest. One account emitting exit-0 banners therefore still
+# lost the whole night, which is the exact failure the pool exists to end.
+#
+# The banner text is drawn from `shared.cap_markers`' verbatim real-CLI corpus
+# rather than invented, so a future CLI rewording turns these tests red in the
+# same sweep as `shared/tests/test_cap_markers.py` and
+# `scripts/tests/test_legibility_census.py`.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('banner', cap_markers.REAL_CLI_CAP_HIT_MESSAGES)
+def test_a_zero_exit_banner_rotates_and_the_same_digest_completes_next_door(
+    banner,
+):
+    """The exit-0 twin of
+    ``test_a_banner_caps_that_account_and_the_same_digest_completes_next_door``.
+
+    The ONE difference from that test is that ``_RecordingInvoke`` RETURNS the
+    banner instead of raising it — which is precisely the difference the pool
+    used to be blind to. Everything else must hold identically: the gate
+    decides, the account is capped, the same digest completes next door, and
+    nothing is fabricated.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    invoke = _RecordingInvoke(replies={
+        # reverse=True leases max-c first; it banners AT EXIT 0, max-b answers.
+        'tok-max-c': banner,
+        'tok-max-b': '{"matches": [], "candidates": []}',
+    })
+
+    out = mod.pool_invoke(gate, invoke=invoke)('the digest prompt', 'haiku')
+
+    # (a) The SAME digest was retried on the OTHER account.
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-max-c', 'tok-max-b'], (
+        f'the same digest must be retried on the next account; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert [c['prompt'] for c in invoke.calls] == ['the digest prompt'] * 2, (
+        'the retry must carry the SAME prompt — a different one would be '
+        'coding a different digest'
+    )
+
+    # (b) The gate's STRICT detector decided it, and the reply went in as the
+    #     OUTPUT stream: there is no stderr on an exit-0 route.
+    assert len(gate.detect_calls) == 1, gate.detect_calls
+    assert gate.detect_calls[0]['output'] == banner
+    assert gate.detect_calls[0]['stderr'] == '', (
+        f"an exit-0 reply is the OUTPUT stream and nothing else; got "
+        f"{gate.detect_calls[0]['stderr']!r}"
+    )
+    assert gate.detect_calls[0]['oauth_token'] == 'tok-max-c', (
+        'the verdict must be attributed to the account that banner came '
+        'from, never to whichever account is current'
+    )
+
+    # (c) The account is now capped, so the rest of the night skips it.
+    assert gate.account_named('max-c').capped is True
+    assert gate.account_named('max-b').capped is False
+
+    # (d) The bannering account must NOT be confirmed healthy. That is the
+    #     other half of the defect: `confirm_account_ok` is what clears a
+    #     near_cap annotation the gate had already recorded, so confirming an
+    #     account that just refused to answer erases the gate's own warning.
+    assert gate.confirmed == ['tok-max-b'], (
+        f'only the account that actually answered may be confirmed; got '
+        f'{gate.confirmed}'
+    )
+
+    # (e) Nothing was fabricated: the second account's real reply came back.
+    assert out == '{"matches": [], "candidates": []}'
+
+    # (f) A set, not a list: InvokeSlot.detect_cap_hit also releases max-c on
+    #     its True verdict, and how often the gate is told is the gate's
+    #     business, not this module's.
+    assert set(gate.released) == {'tok-max-c', 'tok-max-b'}, gate.released
+
+
+@pytest.mark.timeout(60)
+def test_a_zero_exit_banner_night_is_not_lost_end_to_end():
+    """Three digests, two accounts, one of them bannering at exit 0.
+
+    The production outcome the task exists to guarantee, asserted through the
+    REAL ``code_digests`` control flow rather than inferred from the pieces:
+    every digest is CODED, nothing is labelled capped, and the night is not a
+    deferral. Before this, all three digests came back
+    ``CodingResult(capped=True)`` from ``code_digest``'s second scan site and
+    the night read as DEFERRED with a live account sitting right there.
+
+    FOUR CLI calls, not six, and the count is the assertion that says the
+    night was not lost: only the FIRST digest pays a rotation. Unlike a
+    near-cap verdict (``test_a_near_cap_pool_reads_as_a_cap_deferral_end_to_end``,
+    where the tried set resets per digest and every digest pays), a CapHit
+    retires max-c for the night, so digests 2 and 3 lease max-b directly.
+    """
+    gate = _pool(('max-b', False), ('max-c', False))
+    invoke = _RecordingInvoke(replies={
+        'tok-max-c': cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0],
+        'tok-max-b': '{"matches": [], "candidates": []}',
+    })
+
+    result = coder_mod.code_digests(
+        [_digest_text(f"batch-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(gate, invoke=invoke),
+    )
+
+    assert result.total == 3
+    assert len(result.records) == 3, (
+        f'every digest must be CODED — the pool had a live account for each '
+        f'of them; got {len(result.records)} records, failures '
+        f'{result.failures}'
+    )
+    assert result.capped == 0, (
+        f'not one digest may be labelled capped: `capped` means "no headroom '
+        f'left anywhere", and one account\'s banner is not that; got '
+        f'{result.capped}'
+    )
+    assert result.status == "ok"
+    assert coder_mod.is_cap_deferral(result) is False, (
+        "the night must not read as a DEFERRAL — that is the branch where a "
+        "night with live accounts used to disappear"
+    )
+    assert len(invoke.calls) == 4, (
+        f'only the first digest pays a rotation; a CapHit retires max-c for '
+        f'the night, so digests 2 and 3 lease max-b directly; got '
+        f'{[c["oauth_token"] for c in invoke.calls]}'
+    )
+    assert gate.account_named('max-c').capped is True
 
 
 # ---------------------------------------------------------------------------
