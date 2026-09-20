@@ -301,3 +301,24 @@ class TestModuleKeyNamesPathsUnderTheTestsRoot:
         """
         path = TESTS_ROOT / 'reconciliation' / 'test_stage1_stall_detector.py'
         assert _module_key(path) == 'reconciliation/test_stage1_stall_detector.py'
+
+    def test_a_cwd_relative_path_is_refused_rather_than_read_against_the_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        """Naming the module comes before reading it, so a false clean is impossible.
+
+        ``path.read_text()`` resolves a relative path against the cwd, so without
+        that ordering a relative path to a file the text prefilter MISSES returns
+        a clean ``[]`` — the guard reporting "this module forks no loader" about a
+        file it never located under its own root. The probe below is deliberately
+        innocuous for exactly that reason: it must miss the prefilter, so the case
+        is about the ordering rather than about the refusal's wording.
+        """
+        (tmp_path / 'probe.py').write_text('value = 1\n')
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError) as excinfo:
+            _unrouted_loader_lines(pathlib.Path('probe.py'))
+        assert 'TESTS_ROOT' in str(excinfo.value), (
+            'the refusal must come from _module_key — the one place this precondition '
+            'is stated — rather than from a second check that could drift from it'
+        )
