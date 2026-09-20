@@ -258,7 +258,14 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     text, so a loose false positive may re-label one digest but must never
     burn the pool.
 
-    The exit-0 banner route is not rotated — see task 5637.
+    BOTH CAP ROUTES ROTATE, and they are the same rotation (task 5637). The
+    CLI declines two ways: a non-zero exit whose banner the gate confirms
+    (above), and an exit-0 reply that is a banner rather than a verdict. The
+    second arm asks the same strict detector — ``slot.detect_cap_hit("",
+    reply)``, the reply as the OUTPUT stream and no stderr — takes the same
+    next lease, and is bounded the same way. Which route the CLI takes is
+    the CLI's choice and not the pool's, so rotating on one and confirming
+    on the other left one bannering account able to lose a whole night.
 
     TERMINATION is bounded by the caller's ``tried`` set, passed as
     ``exclude=``, not by the gate's cap transitions: a near-cap verdict
@@ -289,8 +296,6 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
-                slot.confirm()
-                return reply
             except coder.CoderCapExhausted as exc:
                 # The loose per-digest gate fired. Ask the STRICT detector
                 # what the GATE makes of it; on any True verdict it settles
@@ -301,6 +306,25 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
                 # by an assumption about what just happened.
                 if not slot.detect_cap_hit(exc.stderr, exc.stdout):
                     raise
+                logger.info(
+                    "account %s did not complete this digest and the gate "
+                    "recorded a cap signal against it — retrying this digest "
+                    "on the next account in the pool", slot.account_name,
+                )
+            else:
+                # THE OTHER CAP ROUTE. The CLI can decline by PRINTING its
+                # banner and exiting 0, so a cap arrives as a RETURNED reply
+                # as readily as a raised one. Ask the SAME strict detector,
+                # handing it the reply as the OUTPUT stream and an empty
+                # stderr -- the two-distinct-arguments contract
+                # `CoderInvocationError`'s docstring already describes. On a
+                # True verdict, do NOT confirm (which would clear the gate's
+                # own near-cap annotation on an account that just refused to
+                # answer) and do NOT return: fall through to the next lease
+                # exactly as the arm above does, bounded by the same `tried`.
+                if not slot.detect_cap_hit("", reply):
+                    slot.confirm()
+                    return reply
                 logger.info(
                     "account %s did not complete this digest and the gate "
                     "recorded a cap signal against it — retrying this digest "
