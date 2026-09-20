@@ -954,6 +954,36 @@ def test_endpoint_staleness_js_loads_before_app_jsx(index_html_body: str) -> Non
     )
 
 
+def test_endpoint_staleness_js_loads_before_data_js(index_html_body: str) -> None:
+    """endpoint_staleness.js must load BEFORE data.js.
+
+    This is the floor of the datum.js chain (PRD leaf gamma1):
+    endpoint_staleness.js -> datum.js -> data.js. datum.js destructures
+    {formatAge} from window.DF_ENDPOINT_STALENESS at top level so the tile age
+    badge and the endpoint banner state an age in ONE format, and data.js in
+    turn destructures window.DF_DATUM at top level to validate datum-kinded
+    payloads. Both destructures are deliberate load-order contracts rather than
+    `|| {}` fallbacks, so the whole chain has to run in document order.
+
+    Pinned ahead of datum.js existing, and as its own commit, so the tag MOVE
+    is reviewable on its own: endpoint_staleness.js reads no other global, so
+    hoisting it above data.js is inert today and cannot be confused with the
+    new module's behaviour when that lands next door.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _ENDPOINT_STALENESS_PREFIX,
+        _DATA_JS_PREFIX,
+        before_label='endpoint_staleness.js',
+        after_label='data.js',
+        consumer_note=(
+            'datum.js destructures window.DF_ENDPOINT_STALENESS at top level '
+            'and loads between these two; endpoint_staleness.js must define '
+            'it first.'
+        ),
+    )
+
+
 def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
     """endpoint_staleness.js is present among the VERSIONED redux assets.
 
