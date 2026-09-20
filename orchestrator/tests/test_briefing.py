@@ -13,28 +13,17 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _briefing_helpers import (
+    _mcp_search_envelope,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 
 from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT, BriefingAssembler
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
 
 
 @pytest.fixture
@@ -616,28 +605,11 @@ class TestReviewerPromptAmendmentScope:
 
 
 def _memory_reply(content: str = 'A recalled fact.') -> dict:
-    """A one-result ``search`` reply in the shape ``_mcp_search`` reads."""
-    return {
-        'result': {
-            'content': [{'type': 'text', 'text': json.dumps({'results': [{
-                'id': '1',
-                'content': content,
-                'category': 'preferences_and_norms',
-                'source_store': 'mem0',
-                'created_at': '2026-08-15T22:22:49+00:00',
-                'temporal': None,
-                'metadata': {},
-            }]})}],
-        },
-    }
-
-
-def _search_arguments(mcp_call_mock) -> list[dict]:
-    return [
-        call.args[2]['arguments']
-        for call in mcp_call_mock.await_args_list
-        if call.args[2].get('name') == 'search'
-    ]
+    """A one-result, fully-tagged ``search`` reply, in the real wire shape."""
+    entry = _result('1', content, source_store='mem0')
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return _mcp_search_envelope([entry])
 
 
 @pytest.mark.asyncio
@@ -691,7 +663,12 @@ class TestPerRoleMemoryTable:
         self, briefing: BriefingAssembler,
     ):
         """Existing callers pass no task; they must keep working, with the
-        generic conventions query and no task-scoped section."""
+        generic conventions query and no task-scoped section.
+
+        Also the task-less half of D8: a dispatch with no task declares the
+        role alone and must not invent a ``caller_task_id`` for the journal
+        to record it under.
+        """
         mcp = AsyncMock(return_value=_memory_reply())
 
         with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
@@ -702,6 +679,7 @@ class TestPerRoleMemoryTable:
         arguments = _search_arguments(mcp)
         assert len(arguments) == 1
         assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
+        assert 'caller_task_id' not in arguments[0]
 
     async def test_the_steward_continuation_asks_memory_nothing(
         self, briefing: BriefingAssembler,
@@ -725,15 +703,19 @@ class TestFormatTaskSurfaceIsPinned:
 
     Task 3254 owns ``memory_hints`` delivery in this same method and has no
     guard artifact on main, and none of task 3659's delivered checks pins
-    hint behaviour — so a rewrite that quietly reshaped what ``_format_task``
-    renders would land undetected. This pins the surface 3254 will extend,
-    byte for byte.
+    hint behaviour — so a rewrite that quietly stopped rendering one of the
+    fields an agent is briefed from would land undetected.
+
+    Pinned FIELD BY FIELD, not as one byte-for-byte equality: what 3254 needs
+    held is that each populated field reaches the prompt and each absent one
+    renders nothing. A whole-string equality would additionally freeze
+    field ORDER and every label's exact spelling, so a harmless relabelling
+    would break a guard that has nothing to do with it — and it would break
+    on 3254's own added line, which is the change it exists to protect.
     """
 
-    def test_the_rendered_surface_is_exactly_these_lines(
-        self, briefing: BriefingAssembler,
-    ):
-        task = {
+    def _task(self) -> dict:
+        return {
             'id': '3254',
             'title': 'Deliver memory hints to dispatched agents',
             'description': 'Wire metadata.memory_hints through to the briefing.',
@@ -742,11 +724,36 @@ class TestFormatTaskSurfaceIsPinned:
             'dependencies': [{'id': '3659'}, '3212'],
         }
 
-        assert briefing._format_task(task) == (
-            '**ID:** 3254\n'
-            '**Title:** Deliver memory hints to dispatched agents\n'
-            '**Description:** Wire metadata.memory_hints through to the briefing.\n'
-            '**Details:** The channel is reconciliation-internal today.\n'
-            '**Files:** orchestrator/src/orchestrator/agents/briefing.py\n'
-            '**Dependencies:** 3659, 3212'
+    def test_every_populated_field_renders_on_its_own_line(
+        self, briefing: BriefingAssembler,
+    ):
+        rendered = briefing._format_task(self._task()).splitlines()
+
+        assert '**ID:** 3254' in rendered
+        assert '**Title:** Deliver memory hints to dispatched agents' in rendered
+        assert '**Description:** Wire metadata.memory_hints through to the briefing.' in rendered
+        assert '**Details:** The channel is reconciliation-internal today.' in rendered
+        assert '**Files:** orchestrator/src/orchestrator/agents/briefing.py' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered, (
+            'a dependency reads the same whether it arrives as a dict or a bare id'
         )
+
+    def test_an_absent_field_renders_nothing_at_all(
+        self, briefing: BriefingAssembler,
+    ):
+        """No empty labels and no ``None`` — the guard against a field that
+        stops being populated turning into a line of noise."""
+        rendered = briefing._format_task({'id': '3254', 'title': 'A task'})
+
+        assert rendered == '**ID:** 3254\n**Title:** A task'
+
+    def test_the_files_line_is_the_only_opt_out(
+        self, briefing: BriefingAssembler,
+    ):
+        """``include_files=False`` is the architect's anti-anchor path (C-A1);
+        it must drop that one line and leave every other field standing."""
+        rendered = briefing._format_task(self._task(), include_files=False).splitlines()
+
+        assert not [line for line in rendered if line.startswith('**Files:**')]
+        assert '**ID:** 3254' in rendered
+        assert '**Dependencies:** 3659, 3212' in rendered

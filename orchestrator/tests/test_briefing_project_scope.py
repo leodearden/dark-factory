@@ -24,6 +24,12 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from _briefing_helpers import (
+    _mcp_search_envelope,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
 
 from orchestrator.agents.briefing import (
@@ -33,42 +39,6 @@ from orchestrator.agents.briefing import (
     MemoryQueryOutcome,
     filter_foreign_project_results,
 )
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
-
-
-def _result(id_: str, content: str, metadata: dict | None = None, source_store: str = 'graphiti') -> dict:
-    """Build a dict matching the wire shape of ``fused_memory.models.memory.MemoryResult``.
-
-    Mirrors the real result schema (id/content/category/source_store/
-    relevance_score/provenance/temporal/entities/metadata/created_at) so the
-    filter is exercised against the actual payload shape, not an invented one.
-    """
-    return {
-        'id': id_,
-        'content': content,
-        'category': None,
-        'source_store': source_store,
-        'relevance_score': 0.9,
-        'provenance': [],
-        'temporal': None,
-        'entities': [],
-        'metadata': {} if metadata is None else metadata,
-        'created_at': None,
-    }
 
 
 def _task_scope(task_id: str = '3609') -> BriefingScope:
@@ -84,20 +54,6 @@ def _task_scope(task_id: str = '3609') -> BriefingScope:
         'title': 'Project-scope the dispatched-agent briefing context block',
         'metadata': {'files': ['orchestrator/src/orchestrator/agents/briefing.py']},
     })
-
-
-def _search_arguments(mcp_call_mock) -> list[dict]:
-    """The ``arguments`` of every ``search`` tools/call the assembler made.
-
-    Filters by tool name rather than counting awaits: a task-scoped dispatch
-    also calls ``get_entity`` on the same transport, and the query-table
-    assertions are about searches.
-    """
-    return [
-        call.args[2]['arguments']
-        for call in mcp_call_mock.await_args_list
-        if call.args[2].get('name') == 'search'
-    ]
 
 
 class TestFilterForeignProjectResults:
@@ -495,26 +451,6 @@ class TestOriginTagKeyDriftGuard:
         )
 
 
-def _mcp_search_envelope(results: list[dict]) -> dict:
-    """Build the real ``tools/call`` response envelope ``_mcp_search`` reads.
-
-    Mirrors ``BriefingAssembler._mcp_search`` (briefing.py:1250-1275): FastMCP
-    returns ``{'result': {'content': [{'type': 'text', 'text': ...}]}}`` where
-    ``text`` is the JSON-serialised ``search`` tool payload. Used to patch
-    ``orchestrator.agents.briefing.mcp_call`` directly (unlike every other
-    briefing test, which patches ``_get_memory_context`` itself away to a
-    stub) so the real ``_get_memory_context`` / ``_scoped_search`` /
-    ``filter_foreign_project_results`` pipeline actually runs end-to-end.
-    """
-    return {
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps({'results': results})},
-            ],
-        },
-    }
-
-
 @pytest.mark.asyncio
 class TestGetMemoryContextFiltersForeignFacts:
     """``_get_memory_context`` drops foreign-tagged results end-to-end.
@@ -726,20 +662,11 @@ class TestQueryTableComesFromTheSharedSpecs:
             assert args['caller_task_id'] == '3609'
         assert 'claude-task-3609-implementer' in briefing._agent_identity('3609', 'implementer')
 
-    async def test_a_task_less_dispatch_declares_the_role_alone(
-        self, briefing: BriefingAssembler,
-    ):
-        """A reviewer dispatched without a task still identifies itself, and
-        asks the one query an empty scope can phrase."""
-        mcp = AsyncMock(return_value=_mcp_search_envelope([_result('1', 'A fact.')]))
-
-        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
-            await briefing._get_memory_context(BriefingScope(), 'reviewer')
-
-        arguments = _search_arguments(mcp)
-        assert len(arguments) == 1
-        assert arguments[0]['caller_agent_id'] == 'claude-reviewer'
-        assert 'caller_task_id' not in arguments[0]
+    # A task-less dispatch's query table, caller identity and absent
+    # caller_task_id are pinned one level up, through the public builder
+    # that actually has task-less callers, by
+    # test_briefing.py::TestPerRoleMemoryTable::
+    # test_the_reviewer_still_builds_without_a_task.
 
 
 @pytest.mark.asyncio

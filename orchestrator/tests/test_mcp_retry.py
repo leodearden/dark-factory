@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import logging
 from pathlib import Path
@@ -371,7 +370,6 @@ class TestTimeoutCausePredicate:
         # `asyncio.TimeoutError` is an alias of the builtin since 3.11, so
         # one assertion covers both spellings the predicate documents.
         assert is_timeout_failure(TimeoutError())
-        assert asyncio.TimeoutError is TimeoutError
 
     def test_non_timeouts_are_not_timeouts(self):
         from orchestrator.mcp_lifecycle import is_timeout_failure
@@ -381,16 +379,19 @@ class TestTimeoutCausePredicate:
         assert not is_timeout_failure(ValueError('unrelated'))
 
     def test_a_timeout_deep_in_a_none_terminated_chain_is_found(self):
-        """The wrap can nest: the walk follows the chain to its end."""
+        """The wrap can nest: the walk follows the chain to its end.
+
+        The chain built below terminates rather than cycling — a freshly
+        constructed ``ReadTimeout`` has no ``__cause__`` — which is what
+        separates this case from the two cyclic ones after it.
+        """
         from orchestrator.mcp_lifecycle import is_timeout_failure
 
-        slow = httpx.ReadTimeout('')
         inner = RuntimeError('MCP tools/call failed after 3 attempts: ReadTimeout: ')
-        inner.__cause__ = slow
+        inner.__cause__ = httpx.ReadTimeout('')
         outer = RuntimeError('search failed')
         outer.__cause__ = inner
 
-        assert slow.__cause__ is None, 'the deepest link ends the chain rather than cycling'
         assert is_timeout_failure(outer)
 
     def test_a_cyclic_cause_chain_terminates(self):
