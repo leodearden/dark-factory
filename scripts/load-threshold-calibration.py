@@ -938,20 +938,31 @@ def coverage_table(
         _stem, separator, tail = metric.partition(':')
         key = f'{spec.readability}:{tail}' if separator else spec.readability
         points = readability.get(key, [])
+        rows = len(points)
         readable = sum(1 for _ts, value in points if value == 1.0)
         out[metric] = {
             'ticks_in_corpus': ticks_in_corpus,
-            'ticks_with_a_row': len(points),
+            'ticks_with_a_row': rows,
             'readable': readable,
-            # None, not 0.0, when either count is zero. No clock is an unknown
-            # denominator and no readability row is no evidence about the
-            # series; 0.0 is the claim "we looked and it was never readable",
-            # and the floor check below would then report absence of evidence
-            # as a below-floor verdict about the corpus. Same class of defect
-            # as the fabricated 1.0 refused above.
+            # None, not 0.0, for three reasons that are all "this is not a
+            # ratio anyone knows". NO CLOCK is an unknown denominator. NO
+            # READABILITY ROW is no evidence about the series, and 0.0 would be
+            # the claim "we looked and it was never readable", so the floor
+            # check below would report absence of evidence as a verdict about
+            # the corpus — the same class of defect as the fabricated 1.0
+            # refused above. MORE ROWS THAN TICKS cannot happen at all: a
+            # readability row is written ON a tick and write_tick writes one
+            # whole tick in one transaction, so the clock is broken and every
+            # fraction resting on it is unknown.
+            #
+            # That third one is checked on the ROW COUNT rather than on whether
+            # the printed fraction exceeds 1, because the fraction above 1 is
+            # only the loudest symptom: the same broken clock with half the
+            # reads failing yields a plausible-looking 0.2 and a below-floor
+            # verdict, which is the same fault delivered quietly.
             'readable_fraction': (
                 round(readable / ticks_in_corpus, 4)
-                if ticks_in_corpus and points else None
+                if 0 < rows <= ticks_in_corpus else None
             ),
             'readability_metric': key,
         }
@@ -973,14 +984,17 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     fraction is still printed beside every hold ladder, but neither cause alone
     is a finding.
 
-    An unknown coverage (either count zero) has no cause to name, so it yields
-    nothing here rather than a division by zero — which would be a non-zero rc,
-    an infra fault to ε1/ε2.
+    An UNKNOWN coverage has no cause to name, whichever reason it is unknown
+    for (``_unknown_cause`` names those), so it yields nothing here rather than
+    a division by zero — which would be a non-zero rc, an infra fault to ε1/ε2.
+    One condition covers every reason: a fraction exists exactly when the
+    series has rows and no more of them than the corpus has ticks, which is
+    also exactly when both denominators below are non-zero.
     """
+    if stats['readable_fraction'] is None:
+        return []
     corpus, rows, readable = (
         stats['ticks_in_corpus'], stats['ticks_with_a_row'], stats['readable'])
-    if not corpus or not rows:
-        return []
     out = []
     if rows / corpus < D11_READABILITY_FLOOR:
         out.append((
@@ -1010,6 +1024,48 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     return out
 
 
+def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
+    """Why a coverage has NO fraction — one ``(degradation, detail)``, or None.
+
+    ``_below_floor``'s mirror for the case where there is no ratio to judge,
+    in the same pair shape and for the same reason: the report line and the
+    degradation list both need a cause name and the same wording, and
+    recomputing the condition in each is how ``_coverage_line`` came to print
+    "a coverage needs both" for a corpus that had both (heuristic 11).
+
+    The two reasons are different findings. ``unknown_readability`` is an
+    ABSENCE — a count is zero, so the corpus carries no evidence either way,
+    which usually means the collector never ran. ``impossible_coverage`` is an
+    INVARIANT VIOLATION: a readability row is written ON a tick and
+    ``sampler/src/sampler/store.py::write_tick`` writes one whole tick in one
+    transaction, so no corpus the sampler wrote can hold more readability rows
+    than ticks. Only a hand-seeded or partly restored one can, and it says the
+    CLOCK is wrong rather than the series.
+    """
+    if stats['readable_fraction'] is not None:
+        return None
+    corpus, rows = stats['ticks_in_corpus'], stats['ticks_with_a_row']
+    metric = stats['readability_metric']
+    if rows > corpus:
+        return (
+            'impossible_coverage',
+            f'rests on {rows} `{metric}` rows against only {corpus} '
+            f'`{TICK_METRIC}` clock rows, which cannot be true — a readability '
+            'row is written ON a tick, and the sampler writes one whole tick in '
+            'one transaction, so no corpus it wrote holds more of them than '
+            'ticks. Reported as unknown rather than as the fraction above 1 it '
+            'computes to, because the same broken clock with half the reads '
+            'failing would instead yield a plausible-looking number resting on '
+            'the very same fault',
+        )
+    return (
+        'unknown_readability',
+        f'rests on {rows} `{metric}` rows and {corpus} `{TICK_METRIC}` clock '
+        'rows, and a coverage needs both — so the hold fractions are over '
+        'readable ticks of unknown count, which is not the same as zero',
+    )
+
+
 def _coverage_line(stats: Coverage | None) -> str:
     """The report's one-line coverage verdict printed beside a hold ladder."""
     if stats is None:
@@ -1017,14 +1073,10 @@ def _coverage_line(stats: Coverage | None) -> str:
             'Coverage: no readability metric for this arm, so the hold '
             'fractions below are over readable ticks of unknown count.'
         )
-    if stats['readable_fraction'] is None:
-        return (
-            f"Coverage: UNKNOWN — the corpus holds {stats['ticks_with_a_row']} "
-            f"`{stats['readability_metric']}` rows and {stats['ticks_in_corpus']} "
-            f'`{TICK_METRIC}` clock rows, and a coverage needs both, so the '
-            'hold fractions below are over readable ticks of unknown count. '
-            'See degradations.'
-        )
+    unknown = _unknown_cause(stats)
+    if unknown is not None:
+        _cause, detail = unknown
+        return f'Coverage: UNKNOWN — {detail}. See degradations.'
     causes = [cause for cause, _detail in _below_floor(stats)]
     return (
         f"Coverage: readable on {stats['readable']}/{stats['ticks_in_corpus']} "
@@ -1040,7 +1092,7 @@ def readability_degradations(
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 
-    Four separate degradations, because they call for four different operator
+    Five separate degradations, because they call for five different operator
     readings: ``low_readability`` says the collector ran on the series and often
     failed, so read the hold fractions against that coverage;
     ``never_readable`` says it failed EVERY time, so there are no hold
@@ -1049,24 +1101,19 @@ def readability_degradations(
     only part of the corpus,
     so its hold fractions describe that span, not the whole window; and
     ``unknown_readability`` says the corpus carries no evidence either way,
-    which usually means the collector never ran at all. Folding any one into
-    another sends an operator hunting a flaky read that never happened.
+    which usually means the collector never ran at all; and
+    ``impossible_coverage`` says the corpus holds more readability rows than
+    ticks, which no corpus the sampler wrote can, so the CLOCK is what needs
+    looking at and not the series. Folding any one into another sends an
+    operator hunting a flaky read that never happened.
     """
     out = []
     for metric, stats in sorted(coverage.items()):
         if stats is None:
             continue
-        if stats['readable_fraction'] is None:
-            out.append(
-                f"unknown_readability: {metric} coverage is unknown — not zero: "
-                f"the corpus holds {stats['ticks_with_a_row']} "
-                f"{stats['readability_metric']} rows and "
-                f"{stats['ticks_in_corpus']} {TICK_METRIC} clock rows, and a "
-                'coverage needs both. Its hold fractions below are over '
-                'readable ticks of unknown count.'
-            )
-            continue
-        out += [f'{cause}: {metric} {detail}' for cause, detail in _below_floor(stats)]
+        unknown = _unknown_cause(stats)
+        causes = [unknown] if unknown is not None else _below_floor(stats)
+        out += [f'{cause}: {metric} {detail}' for cause, detail in causes]
     return out
 
 
