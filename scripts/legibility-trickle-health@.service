@@ -45,11 +45,16 @@ StandardOutput=journal
 StandardError=journal
 #
 # WHY THIS IS A SEPARATE UNIT rather than a second ExecStart appended to
-# legibility-trickle@.service: a FAILING PROBE MUST NOT FLIP THE TRICKLE
-# SERVICE TO Result=failed. check_trickle_liveness.sh's whole verdict is that
-# unit's `Result`, so a probe sharing the unit would report its own non-zero
-# exit as "the nightly run failed" -- turning every genuine health finding
-# into a permanent false alarm about a night that actually succeeded. That is
+# legibility-trickle@.service. This comment is the SINGLE HOME for that
+# argument -- it lives in the file the change it forbids would be made in,
+# and check_trickle_health.py plus OPERATIONS.md cite it rather than
+# restating it. Do not copy it back out.
+#
+# A FAILING PROBE MUST NOT FLIP THE TRICKLE SERVICE TO Result=failed.
+# check_trickle_liveness.sh's whole verdict is that unit's `Result`, so a
+# probe sharing the unit would report its own non-zero exit as "the nightly
+# run failed" -- turning every genuine health finding into a permanent false
+# alarm about a night that actually succeeded. That is
 # the exact inversion scripts/legibility/nightly.py::_escalate_barren_streak
 # refuses when it declines to write back onto result.exit_code, and running in
 # a separate unit is what makes this probe's non-zero exit safe.

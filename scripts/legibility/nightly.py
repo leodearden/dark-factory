@@ -1000,18 +1000,16 @@ def _record_trickle_progress(
     claimed crashes "are already caught loudly by
     ``check_trickle_liveness.sh`` (``Result=failed``)". True as a
     statement about that script's LOGIC; false as a claim about the
-    world, because NOTHING INVOKED IT. Verified in task 4514: no systemd
-    unit, cron entry or config bound either probe, and the only bindings
-    either ever had were the one-shot ``before_done`` milestone predicates
-    on tasks 2587/2615 — both ``done``, and a completed milestone
-    predicate never runs again. What runs them now is
-    ``legibility-trickle-health@<project>.timer`` ->
-    ``scripts/legibility/check_trickle_health.py``, and the claim is true
-    only while that timer is installed FOR THIS PROJECT. The one partial
-    mitigation that predates it is :func:`_escalate_barren_streak`'s
-    detail string ending "Probe on demand with: check_trickle_progress.py
-    ...", which is DISCOVERABILITY, not level-triggering: it makes the
-    probe hand-runnable, not bound.
+    world, because NOTHING INVOKED IT — see OPERATIONS.md §"Legibility
+    trickle health probe (04:30)" for the full account. What runs the
+    probes now is ``legibility-trickle-health@<project>.timer`` ->
+    ``scripts/legibility/check_trickle_health.py``, and the old claim is
+    true again only while that timer is installed FOR THIS PROJECT. The
+    one partial mitigation that predates it is
+    :func:`_escalate_barren_streak`'s detail string ending "Probe on
+    demand with: check_trickle_progress.py ...", which is
+    DISCOVERABILITY, not level-triggering: it makes the probe
+    hand-runnable, not bound.
 
     A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
     ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment

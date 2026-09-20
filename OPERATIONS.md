@@ -1821,12 +1821,26 @@ legibility-trickle@<project>`):
 ### Legibility trickle health probe (04:30)
 
 **What it does.** Runs both trickle probes once a night and files one
-escalation if the pipeline has stopped producing. Before task 4514 nothing
-ran either probe — every repo-wide reference to them was prose, a docstring,
-a test or PRD text, and the only bindings either ever had were the one-shot
-`before_done` milestone predicates on tasks 2587/2615 (both `done`; a
-completed milestone predicate never runs again). A probe nobody invokes is
-documentation.
+escalation if the pipeline has stopped producing.
+
+**Why it exists** — this section is the single home for that argument; the
+code, unit and test sites cite it rather than restating it. Before task 4514
+nothing ran either probe. Every repo-wide reference to them was prose, a
+docstring, a test or PRD text, and the only bindings either ever had were the
+one-shot `before_done` milestone predicates on tasks 2587/2615 (both `done`;
+a completed milestone predicate never runs again). A probe nobody invokes is
+documentation. That absence is also why the `classify_run` vocabulary hole
+task 4514 closed stayed latent so long: nothing was reading the verdict that
+would have shown it.
+
+**Shipping an installer is not binding a probe**, which is why deploying this
+is tracked separately from landing it. The adjacent precedent:
+`legibility-transcript-check@.{service,timer}` and its installer shipped under
+task 2901 ("wire the transcript-persistence detector to run periodically"),
+that task is `done`, and the timer is **still** not installed on this host.
+Once the timer below is installed for a project, the "nothing runs the
+probes" claim becomes historical **for that project only** — a second project
+without the timer is back to the pre-4514 state.
 
 **Three artefacts, three different questions.** Do not merge them again:
 
@@ -1840,6 +1854,12 @@ documentation.
 than re-deriving either verdict, so there is no lockstep duplication to keep
 in sync and `check_trickle_liveness.sh` stays byte-identical as its own
 header comment requires.
+
+It also runs in its **own** unit rather than as a second `ExecStart` on
+`legibility-trickle@` — a failing probe must not flip the nightly's unit to
+`Result=failed`, which is the very thing `check_trickle_liveness.sh` reads.
+The full argument lives where the change it forbids would be made, in
+`scripts/legibility-trickle-health@.service`.
 
 **Run it by hand:**
 

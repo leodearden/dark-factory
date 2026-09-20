@@ -2,12 +2,9 @@
 finally RUNS the two trickle probes.
 
 The defect this module closes is not a wrong verdict, it is an ABSENT
-CALLER: no systemd unit, cron entry or config bound either
-``check_trickle_progress.py`` or ``check_trickle_liveness.sh``, and the
-only bindings either ever had were the one-shot ``before_done`` milestone
-predicates on tasks 2587/2615 — both ``done``, and a completed milestone
-predicate never runs again. So the tests that matter most here are the
-ones pinning that this module EXECUTES the sibling scripts by path.
+CALLER — the full account is OPERATIONS.md §"Legibility trickle health
+probe (04:30)". So the tests that matter most here are the ones pinning
+that this module EXECUTES the sibling scripts by path.
 
 Almost every test injects BOTH probe runners, and none may shell out to a
 real ``systemctl``; ``scripts/tests/conftest.py::

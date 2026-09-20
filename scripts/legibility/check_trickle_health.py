@@ -4,20 +4,11 @@ trickle probes (task 4514).
 
 THE WHOLE POINT IS THE CALLER, NOT THE VERDICT. Both probes already
 existed and both were correct; what did not exist was anything that ran
-them. Verified in task 4514: no systemd unit, cron entry or config bound
-``check_trickle_progress.py`` or ``check_trickle_liveness.sh``, and the
-only bindings either ever had were the one-shot ``before_done`` milestone
-predicates on tasks 2587/2615 — both ``done``, and a completed milestone
-predicate never runs again. That absence is why the ``classify_run``
-vocabulary hole this same task closes stayed latent so long: nothing was
-reading the verdict that would have shown it.
-
-THE ADJACENT PRECEDENT, and the reason deploying this is tracked
-SEPARATELY from shipping it: ``legibility-transcript-check@.{service,
-timer}`` and its installer shipped under task 2901 ("wire the
-transcript-persistence detector to run periodically"), that task is
-``done``, and the timer is STILL not installed on this host. Shipping an
-installer is demonstrably not the same as binding a probe.
+them. Why that mattered, and what it left latent: OPERATIONS.md
+§"Legibility trickle health probe (04:30)", which is the single home for
+this argument. Why THIS module is a separate systemd unit rather than a
+second ``ExecStart``: ``scripts/legibility-trickle-health@.service``,
+which is the file that change would be made in.
 
 IT EXECUTES THE PROBES; IT NEVER RE-IMPLEMENTS EITHER VERDICT. That is
 what keeps the no-lockstep-duplication rule (INV-5) true BY
@@ -26,13 +17,6 @@ quiet one for 14 nights (2026-07-16..29) — lets
 ``check_trickle_liveness.sh`` stay byte-identical as its own header
 comment requires, and means the argv this module builds IS the contract a
 future ``before_done`` predicate would use.
-
-A SEPARATE UNIT, NOT A SECOND ``ExecStart`` ON ``legibility-trickle@``.
-A failing probe must not flip ``legibility-trickle@<project>.service`` to
-``Result=failed``, which would invert ``check_trickle_liveness.sh`` into a
-permanent false alarm — the exact trade
-``scripts/legibility/nightly.py::_escalate_barren_streak`` refuses in
-writing.
 
 NO STATE PATH IS PASSED TO THE PROGRESS PROBE, and it does not need one:
 since task 4514 both this reader and the nightly writer resolve

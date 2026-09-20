@@ -3,13 +3,11 @@ systemd unit templates it installs (task 4514, GAP 2).
 
 WHY THIS FILE IS THE REGRESSION TEST FOR GAP 2. The defect was not that either
 trickle probe was wrong — `check_trickle_progress.py` and
-`check_trickle_liveness.sh` both worked. It was that NOTHING RAN THEM: repo-wide,
-every reference to either was prose, a docstring, a test or PRD text, and the
-only bindings either ever had were the one-shot `before_done` milestone
-predicates on tasks 2587/2615 (both `done`, and a completed milestone predicate
-never runs again). A probe nobody invokes is documentation. So the assertions
-that a unit EXISTS and that its `ExecStart` NAMES `check_trickle_health.py` are
-not boilerplate — they are the thing that keeps the probes bound.
+`check_trickle_liveness.sh` both worked. It was that NOTHING RAN THEM; the full
+account is OPERATIONS.md §"Legibility trickle health probe (04:30)". So the
+assertions that a unit EXISTS and that its `ExecStart` NAMES
+`check_trickle_health.py` are not boilerplate — they are the thing that keeps
+the probes bound.
 
 Template-content invariants live here rather than in a separate file, per
 `test_install_trickle_timer.py::test_service_template_pins_claude_bin`'s

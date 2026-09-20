@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Install (or re-install, idempotently) the legibility-trickle-health systemd
-# user timer for a single project (task 4514, GAP 2 -- the thing that finally
-# RUNS check_trickle_progress.py and check_trickle_liveness.sh, neither of
-# which any unit, cron entry or config had ever bound).
+# user timer for a single project (task 4514, GAP 2). Why this timer exists,
+# and why running the installer is not the same as the probes being bound:
+# OPERATIONS.md section "Legibility trickle health probe (04:30)".
 #
 # Usage: install-trickle-health-timer.sh <project_id>
 #
