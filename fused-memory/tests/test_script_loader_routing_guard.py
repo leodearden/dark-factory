@@ -240,3 +240,43 @@ def test_every_exemption_names_one_live_loader_site(module_key, qualname):
         f'is dead. Delete the entry — a leftover exemption reads as a standing licence '
         f'to fork the loader there again.'
     )
+
+
+class TestModuleKeyNamesPathsUnderTheTestsRoot:
+    """``_module_key`` takes a path under ``TESTS_ROOT``, and says so when it does not.
+
+    The guard names a module by its path relative to the tests root, so a path
+    from anywhere else has no key — and the stdlib's own refusal names no
+    remedy. Sighting: ``plans/confusion-census-2026-09-20.md`` §1.4 — an ad-hoc
+    probe of this guard passed ``pathlib.Path('tests/_scratch_guard_probe.py')``
+    and got ``'tests/_scratch_guard_probe.py' is not in the subpath of
+    '<root>'``, which states the offence and leaves the caller to rediscover the
+    spelling that works.
+    """
+
+    def test_a_path_outside_the_tests_root_names_the_spelling_that_works(self):
+        probe = pathlib.Path('tests/_scratch_guard_probe.py')
+        with pytest.raises(ValueError) as excinfo:
+            _module_key(probe)
+        message = str(excinfo.value)
+        assert str(probe) in message, (
+            'the refusal must quote the path it rejected, so a caller who passed '
+            'several knows which one was wrong'
+        )
+        assert str(TESTS_ROOT) in message, (
+            'the refusal must name the boundary the path was measured against'
+        )
+        assert 'TESTS_ROOT' in message, (
+            'the refusal must name the module constant an ad-hoc caller types to build '
+            "a path that works (TESTS_ROOT / 'sub/test_x.py'). The stdlib message this "
+            'replaces names the offence and no remedy, which is the whole defect.'
+        )
+
+    def test_a_path_under_the_tests_root_keys_on_its_posix_relative_spelling(self):
+        """The shape ``_discovered_modules()`` yields keeps its key, nesting included.
+
+        The regression pin on the precondition check: the guard's own callers pass
+        exactly this shape, and ``EXEMPT_CALL_SITES`` keys on the POSIX spelling.
+        """
+        path = TESTS_ROOT / 'reconciliation' / 'test_stage1_stall_detector.py'
+        assert _module_key(path) == 'reconciliation/test_stage1_stall_detector.py'
