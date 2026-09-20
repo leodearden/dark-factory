@@ -254,6 +254,79 @@ function datumView(datum, opts) {
   };
 }
 
+// ── How long a plain-wrapped value may sit before its tile badges ──
+// TWELVE SECONDS = FOUR POLL INTERVALS. data.js polls every
+// POLL_INTERVAL_MS = 3000 with JITTER_MAX_MS = 1500, so a healthy endpoint's
+// receipt is at most ~4.5s old; 12s gives ~2.6x headroom, which is enough that
+// a jittered late poll never makes a working tile twitch.
+//
+// ORDERED FINE-THEN-COARSE AGAINST THE BANNER, deliberately not aligned with
+// it. endpoint_staleness.js declares an endpoint stale at
+// STALE_FAILURE_THRESHOLD = 3 consecutive failures, documented there as ~21s of
+// backoff. Badging at 12s makes the tile the FIRST, per-value signal and the
+// banner the later, per-endpoint explanation — two signals of distinct
+// granularity with one authority each. Matching 21s would have made the badge
+// read as a duplicate of the banner; the PRD's suggested two-interval 6s would
+// have badged a healthy tile whenever a jittered poll ran late.
+const PLAIN_DATUM_BOUND_SECONDS = 12;
+
+// ── Provenance for a value the server does not yet serve as a Datum ──
+// Every polled payload is still a bare number today: PRD leaf beta has not
+// landed. Rather than leave 43 tiles unprovenanced until it does, this wraps a
+// plain value in what IS known about it — which endpoint delivered it, and
+// when. That is ENDPOINT granularity, coarser than a served Datum's per-value
+// instant, and the wrapper exists only to cover exactly this gap (PRD
+// decision 7). A row whose payload starts carrying a real Datum stops coming
+// through here; data.js's registry is the one place that flips.
+//
+// `as_of` IS THE SERVING INSTANT, not a guess at a measurement one. A plain
+// value carries no measurement instant of its own — that is the whole
+// difference between it and a served Datum — so the strongest true statement
+// available is "the server had this value when it served the payload". The
+// server-side gap is therefore exactly zero: inventing an earlier as_of would
+// fabricate staleness, a later one would hide it. Until beta puts `served_at`
+// on the wire, even that is unavailable and the fallback is this browser's own
+// arrival instant, which is at least a real instant.
+//
+// NO RECEIPT MEANS UNKNOWN, NOT ZERO. Before an endpoint's first payload
+// resolves, DF_DATA still holds the seed values it was initialised with — and a
+// seed 0 rendered as a number is indistinguishable from a measured one. The
+// unknown Datum makes that first render an em-dash carrying its reason.
+//
+// READS `__receipt` AND NEVER `__stale`. The two answer different questions:
+// __stale records ATTEMPT history (and is republished on failure, by design),
+// __receipt records the provenance of the value currently in DF_DATA (and is
+// published on success only, which is what makes a wedged endpoint's tiles keep
+// ageing). A tile that consulted both would be a second staleness verdict fired
+// at the same instant as the banner. The parameter takes the __receipt map
+// alone so that separation is structural rather than a promise.
+function plainDatum(value, endpointKey, receipts) {
+  const map = receipts === undefined || receipts === null ? plainDatumReceipts() : receipts;
+  const receipt = map ? map[endpointKey] : undefined;
+  if (!receipt || !Number.isFinite(Number(receipt.receivedAt))) {
+    return unknownDatum('not yet fetched');
+  }
+
+  return withReceipt(
+    {
+      value,
+      as_of: receipt.servedAt || new Date(receipt.receivedAt).toISOString(),
+      state: 'fresh',
+      reason: null,
+      freshness_bound_seconds: PLAIN_DATUM_BOUND_SECONDS,
+    },
+    receipt,
+  );
+}
+
+// The browser default for plainDatum's third parameter, read lazily so a node
+// caller that passes its own map never touches a browser global — and so a
+// render that happens before data.js has published anything degrades to "no
+// receipt" rather than throwing.
+function plainDatumReceipts() {
+  return typeof window !== 'undefined' && window.DF_DATA ? window.DF_DATA.__receipt : null;
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision here
@@ -269,6 +342,8 @@ const DATUM_API = {
   datumView,
   EM_DASH,
   LOWER_BOUND_PREFIX,
+  plainDatum,
+  PLAIN_DATUM_BOUND_SECONDS,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
