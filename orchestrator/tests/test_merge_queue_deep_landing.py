@@ -73,7 +73,11 @@ from _merge_lane_fakes import FakeVerifier, fails, passes
 # spawn census, the bounded-wait term, the rounding and the three ceilings it
 # sits under are in DEEP_LANDING_SCENE_TEST_TIMEOUT's comment in
 # _orch_helpers.py -- stated once there rather than nine times at the markers.
-from _orch_helpers import DEEP_LANDING_SCENE_TEST_TIMEOUT
+from _orch_helpers import (
+    DEEP_LANDING_SCENE_BUDGET,
+    DEEP_LANDING_SCENE_TEST_TIMEOUT,
+    spawn_budget_violation,
+)
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -145,6 +149,59 @@ def git_repo(tmp_path: Path) -> Path:
     asyncio.run(_add_recording_seed_to_repo(repo))
     return repo
 
+
+# ── spawn budget (task 5582) ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _within_spawn_budget(request, monkeypatch):
+    """Fail if this test costs more real git than its class's marker is sized for.
+
+    WHY THE MARKER NEEDS A GUARD AT ALL -- and why the budget rather than a
+    comment is what keeps it honest -- is argued once, at
+    ``_orch_helpers.py::DEEP_LANDING_SCENE_TEST_TIMEOUT``.  Not restated here:
+    prose copies of a derivation are what drift.  This docstring covers only
+    what is local to the fixture and stated nowhere else.
+
+    ONE definition and NOT autouse, opted into per class by
+    ``@pytest.mark.usefixtures``.  An autouse fixture at module scope would
+    reach every class in the file, including ``TestLandedViaChainCarrier`` and
+    ``TestRemoteCancelClearsTheHolderRendezvous`` -- both measured at ZERO git
+    spawns, so both would hit the verdict's blind-seam branch and fail by
+    construction.  Nine copies in nine class bodies is the other way to dodge
+    that, and a flat SPOT violation in a file already this long.  The opt-in
+    is visible on each class, and
+    test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
+    the marker/fixture pairing in BOTH directions.
+
+    Counts BOTH asyncio spawn entry points, which is what the measurement
+    behind the constants counted.  ``create_subprocess_exec`` is the one
+    ``git_ops._run`` reaches and carries the bulk, but watching ``_exec``
+    alone would silently budget against a different number than the timeout
+    was priced from.
+
+    Per-test and IN-PROCESS by construction, never module state, so it stays
+    correct under ``--dist loadgroup`` where one class's tests can land on
+    several workers.  Patched through ``monkeypatch`` so both seams are
+    restored at teardown.
+    """
+    spawns = 0
+
+    def counting(real):
+        async def counting_spawn(*args, **kwargs):
+            nonlocal spawns
+            spawns += 1
+            return await real(*args, **kwargs)
+
+        return counting_spawn
+
+    for seam in ('create_subprocess_exec', 'create_subprocess_shell'):
+        monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+    yield
+    violation = spawn_budget_violation(
+        spawns, request.node.nodeid, budget=DEEP_LANDING_SCENE_BUDGET,
+    )
+    assert violation is None, violation
 
 # ── config / GitOps helpers ──────────────────────────────────────────────────
 
@@ -1001,6 +1058,7 @@ class TestLandedViaChainCarrier:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestTipPassAdoptionSignal:
     """The adopting exit: a PASS-shaped result the finalize half can walk."""
 
@@ -1397,6 +1455,7 @@ async def _prefix_scene_upto_finalize(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestInOrderCasWalk:
     """δ's walk: the whole verified PREFIX lands, in order, by CAS."""
 
@@ -1705,6 +1764,7 @@ def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestStaleCasAbortLeavesTheRestAlone:
     """PRD decision #9: the walk ABORTS, it never FAILS anyone.
 
@@ -1916,6 +1976,7 @@ class TestStaleCasAbortLeavesTheRestAlone:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestContendedLeaseDeferInheritance:
     """3003's DEFER classification reaches the walk too.
 
@@ -2409,6 +2470,7 @@ async def _deliver_terminal_blocked(s: dict, reason: str) -> object:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestHeadCancelOnAdoption:
     """(a)-(c) The head is torn down through the chokepoint and lands FIRST."""
 
@@ -2755,6 +2817,7 @@ class TestHeadCancelOnAdoption:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestHeadCancelLeavesTheLaneIdle:
     """(d) BOTH BUSY axes read IDLE after the cancel — 3071's precondition."""
 
@@ -2952,6 +3015,7 @@ async def _adopt_head_only(s: dict, *, timeout: float = 120) -> dict:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestAdoptedHeadLandsWithThePostVerifyWorktree:
     """(review fix #3) An adopted head lands from its POST-verify worktree.
 
@@ -3473,6 +3537,7 @@ class TestRemoteCancelClearsTheHolderRendezvous:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestChainWalkConsumesNoPermits:
     """A chain consumes no per-item speculation permits — only the head's."""
 
@@ -3893,6 +3958,7 @@ def _delta_round_transcript(scene: _DeltaScene, idx: int) -> dict:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
+@pytest.mark.usefixtures('_within_spawn_budget')
 class TestDeepLandingEndToEnd:
     """δ driven the way production drives it, one round at a time."""
 
