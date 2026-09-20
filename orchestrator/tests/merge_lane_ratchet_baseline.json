@@ -1068,7 +1068,7 @@
     "orchestrator/tests/test_verify_phase_rebase.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_verify_plan_integration.py": {"patch_targets": ["verify_failure_is_preexisting_on_main"], "private_reads": 1},
     "orchestrator/tests/test_verify_preexisting_main_break.py": {"patch_targets": [], "private_reads": 23},
-    "orchestrator/tests/test_verify_runner.py": {"patch_targets": ["_run_unscoped_typechecks"], "private_reads": 47},
+    "orchestrator/tests/test_verify_runner.py": {"patch_targets": ["_run_unscoped_typechecks"], "private_reads": 11},
     "orchestrator/tests/test_verify_scope_inversion_boundary.py": {"patch_targets": ["run_scoped_verification", "verify_failure_is_preexisting_on_main"], "private_reads": 8},
     "orchestrator/tests/test_warm_base_coherence.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_warm_lane_abort_teardown.py": {"patch_targets": [], "private_reads": 11},
