@@ -354,7 +354,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.proc_group import _unsafe_pgid_reason
+from shared.proc_group import unsafe_pgid_reason
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
@@ -446,7 +446,7 @@ class ProcessTeardown(Enum):
     #: died with it.
     GROUP_KILLED = 'its whole process group was SIGKILLed'
     #: The whole-group signal was refused as unsafe
-    #: (``shared.proc_group._unsafe_pgid_reason``) or the ``killpg`` itself
+    #: (``shared.proc_group.unsafe_pgid_reason``) or the ``killpg`` itself
     #: raised, so ONLY the direct child was signalled — anything it spawned
     #: SURVIVES (the refusal branch's own log line already says as much).
     DIRECT_KILLED = (
@@ -1750,7 +1750,7 @@ class DeterministicRunner:
         helper's: if the leader is already reaped we forgo killing surviving
         grandchildren — refusing to kill a stranger beats reaping an orphan.
 
-        The third layer is ``shared.proc_group._unsafe_pgid_reason``, applied
+        The third layer is ``shared.proc_group.unsafe_pgid_reason``, applied
         below: even a frozen, unreaped pgid is refused if it resolves to init,
         this process, our parent, our own group, or anything other than
         ``proc.pid``.  This helper deliberately REUSES that predicate rather
@@ -1778,7 +1778,7 @@ class DeterministicRunner:
                 proc.pid,
             )
             teardown = ProcessTeardown.NOT_SIGNALLED
-        elif (reason := _unsafe_pgid_reason(pgid, proc.pid)) is not None:
+        elif (reason := unsafe_pgid_reason(pgid, proc.pid)) is not None:
             # Residual defence, degrading to the direct child exactly as
             # df_pytest_isolation._kill_process_group does on the same refusal.
             logger.error(
