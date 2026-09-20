@@ -4811,12 +4811,19 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 async def test_done_provenance_accepts_deterministic_gate(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
-    """kind='deterministic-gate' with note only (no pid, no unit, no commit) is accepted.
+    """kind='deterministic-gate' with note+escalation_id (no pid, no unit, no
+    commit) is accepted.
 
     The runner emits this shape on a pure gate's resolved->done path
     (before_done is None; the escalation was the only work). No git commit
     or deploy evidence is available, so this kind must pass the provenance
     gate commit-less and pid-less.
+
+    `escalation_id` became REQUIRED for this kind in task 5241 (it cites the
+    resolving gate escalation), so the minimal accepted blob now carries one.
+    What this test still owns, and its escalation_id sibling below does not,
+    is the commit-less/pid-less acceptance and the persistence ROUTE — the
+    atomic set_status_and_stamp_audit call rather than update_task.
     """
     # No git repo needed — deterministic-gate carries no commit.
     interceptor = TaskInterceptor(
@@ -4830,6 +4837,7 @@ async def test_done_provenance_accepts_deterministic_gate(
         done_provenance={
             'kind': 'deterministic-gate',
             'note': 'pure gate resolved',
+            'escalation_id': 'esc-2331-gate',
         },
         agent_id='orchestrator',
     )
@@ -5084,7 +5092,11 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
         },
         'deterministic-deploy': {'kind': 'deterministic-deploy'},
         'deterministic-deploy-scheduled': {'kind': 'deterministic-deploy-scheduled'},
-        'deterministic-gate': {'kind': 'deterministic-gate'},
+        # escalation_id is REQUIRED for this kind (task 5241) — it cites the
+        # resolving gate escalation. This table's lockstep assertion is the
+        # repo's own guard that it tracks the contract, so it is corrected
+        # here rather than the requirement being relaxed.
+        'deterministic-gate': {'kind': 'deterministic-gate', 'escalation_id': 'esc-123'},
         'deterministic-milestone': {'kind': 'deterministic-milestone'},
         'operational-verified': {
             'kind': 'operational-verified',
@@ -5865,7 +5877,12 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_p
     [
         {'kind': 'deterministic-deploy', 'pid': 4242, 'unit': 'fused-memory.service'},
         {'kind': 'deterministic-deploy-scheduled', 'unit': 'fused-memory.service'},
-        {'kind': 'deterministic-gate', 'note': 'pure gate resolved'},
+        # escalation_id is required for the gate kind (task 5241).
+        {
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+            'escalation_id': 'esc-123',
+        },
         {'kind': 'deterministic-milestone'},
         {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted'},
     ],

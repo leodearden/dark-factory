@@ -5852,9 +5852,9 @@ async def _validate_done_provenance(
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
             "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
             "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
-            "escalation_id": <str>,              # required for "operational-verified";
-                                                 # optional for "deterministic-gate" (cites
-                                                 # the resolving gate escalation)
+            "escalation_id": <str>,              # required for "operational-verified"
+                                                 # and for "deterministic-gate" (which
+                                                 # cites the resolving gate escalation)
         }
 
     CALLER BAR FOR THE `deterministic-*` FAMILY (PRD C5 / D11, task 5241).
@@ -5912,9 +5912,18 @@ async def _validate_done_provenance(
       with no ``before_done`` action) resolved. There is no deploy evidence
       and no ``commit`` — the kind exists precisely so such a close passes
       ``require_done_provenance`` without claiming a deploy happened (task
-      2331). ``note`` carries the gate-resolution text and ``escalation_id``
-      may cite the resolving gate escalation. Stamped by DeterministicRunner
-      (deterministic_runner.py), never supplied by hand.
+      2331). ``note`` carries the gate-resolution text. ``escalation_id`` is
+      REQUIRED (task 5241): it cites the resolving gate escalation and is
+      recorded VERBATIM, with no cross-service lookup — the same no-lookup
+      contract ``operational-verified`` has. It is a deliberate SHAPE
+      DETERRENT stacked on the caller bar above: a hand-passer must at
+      minimum name a record, and that id lands in the audit trail where a
+      reader can check it. NOTE the asymmetry: the requirement is enforced
+      HERE only, not in ``shared.task_metadata.DoneProvenance``, because the
+      bar exists against callers who hand-build a dict and never touch the
+      shared model — this server is the one chokepoint every producer
+      crosses. Stamped by DeterministicRunner (deterministic_runner.py),
+      never supplied by hand.
     - ``kind="deterministic-milestone"``: a ``before_done`` ``kind="predicate"``
       milestone check exited 0. No ``commit`` is required or expected; ``note``
       carries a bounded structured verdict summarizing the predicate's stdout.
@@ -6038,6 +6047,22 @@ async def _validate_done_provenance(
                 decision.error or '',
                 error_type=decision.error_type,
             ), None
+        # AFTER the caller bar, deliberately: an unauthorized caller is
+        # refused on identity, not handed a shape hint first. And this
+        # refusal keeps the plain `done_provenance_invalid` with NO
+        # error_type — a shape defect from an AUTHORIZED caller is a
+        # different proposition, and conflating it under the caller error
+        # type would tell an operator to fix an allowlist when they need to
+        # fix a payload.
+        if kind == 'deterministic-gate' and escalation_id is None:
+            return _done_provenance_error(
+                task_id,
+                'done_provenance with kind="deterministic-gate" requires '
+                'escalation_id=<resolving gate escalation id>, recorded '
+                'verbatim. DeterministicRunner supplies it from the task\'s '
+                'milestone_gate record; a hand-built blob must at minimum '
+                'name the record it is closing against.',
+            ), None
 
     if kind == 'merged' and commit_input is None:
         return _done_provenance_error(
@@ -6121,9 +6146,11 @@ async def _validate_done_provenance(
     if note is not None:
         resolved['note'] = note
     if kind in ('operational-verified', 'deterministic-gate') and escalation_id is not None:
-        # Required (and already validated non-None above) for
-        # 'operational-verified'; optional for 'deterministic-gate', which
-        # may cite the resolving gate escalation but need not (task 2331).
+        # Required — and already validated non-None above — for BOTH kinds
+        # (task 5241 made it so for 'deterministic-gate', which cites the
+        # resolving gate escalation). The `is not None` guard is retained as
+        # the uniform shape this block shares with every other conditional
+        # copy below, not because either kind can reach here without one.
         resolved['escalation_id'] = escalation_id
 
     if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
