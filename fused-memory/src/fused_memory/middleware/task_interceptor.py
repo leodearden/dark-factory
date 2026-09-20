@@ -45,6 +45,11 @@ from fused_memory.backends.task_backend_errors import (
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware.done_provenance_authz import (
+    DETERMINISTIC_CALLER_ERROR_TYPE,
+    DETERMINISTIC_PROVENANCE_KINDS,
+    resolve_deterministic_provenance_authorization,
+)
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -1265,6 +1270,8 @@ class TaskInterceptor:
                         project_root,
                         tag,
                         is_recon_stage=is_recon_stage_write,
+                        agent_id=agent_id,
+                        config=self._config,
                     )
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
@@ -1366,6 +1373,8 @@ class TaskInterceptor:
                     project_root,
                     require=self._require_done_provenance(),
                     is_recon_stage=is_recon_stage_write,
+                    agent_id=agent_id,
+                    config=self._config,
                 )
                 if validation_err is not None:
                     return validation_err
@@ -5822,6 +5831,8 @@ async def _validate_done_provenance(
     *,
     require: bool,
     is_recon_stage: bool = False,
+    agent_id: str | None = None,
+    config: Any = None,
 ) -> tuple[dict | None, dict | None]:
     """Validate + resolve done_provenance for set_task_status(done).
 
@@ -5845,6 +5856,31 @@ async def _validate_done_provenance(
                                                  # optional for "deterministic-gate" (cites
                                                  # the resolving gate escalation)
         }
+
+    CALLER BAR FOR THE `deterministic-*` FAMILY (PRD C5 / D11, task 5241).
+    Those four kinds assert a MACHINE observation — a restart with fresh PID
+    evidence, a predicate that exited 0, a gate escalation that resolved — and
+    DeterministicRunner is their only live producer. Two factors gate them,
+    evaluated in this order and both surfacing
+    ``error_type='DeterministicProvenanceCallerNotPermitted'``:
+
+    1. ``is_recon_stage=True`` is refused UNCONDITIONALLY. Config-free by
+       design: a recon stage may not self-authorize a runner-stamped close,
+       and no operator edit may grant it (incident 5156).
+    2. Otherwise ``agent_id`` must match a prefix in
+       ``reconciliation.deterministic_provenance_allowed_agent_prefixes``
+       (default ``['orchestrator']``; an EMPTY list denies everyone, the live
+       kill switch). DENY-ON-MISSING: a missing/corrupt leaf, or a missing
+       *config* object entirely, refuses — see
+       ``middleware/done_provenance_authz.py``.
+
+    That module also carries the honest caveat, repeated here because this is
+    where the refusal is issued: the identity is SELF-REPORTED (a caller
+    sending no ``agent_id`` falls back to the clientInfo name it chose, via
+    ``server/tools.py::_resolve_identity``). The bar DETERS a cooperating
+    caller; it is not a security boundary. The residual is made visible rather
+    than prevented — every done write, accepted or refused, leaves a
+    write-journal row naming the resolved caller and the provenance kind.
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
       is required and must resolve via ``git rev-parse``; the resolved SHA is
@@ -5909,8 +5945,13 @@ async def _validate_done_provenance(
 
     ``is_recon_stage`` mirrors ``_apply_status_transition``'s
     ``is_recon_stage_write`` classification (``agent_id.startswith(
-    'recon-stage-')``); it is currently consulted only by the
-    ``kind="operational-verified"`` branch above.
+    'recon-stage-')``); it is consulted by the ``kind="operational-verified"``
+    branch and by factor 1 of the `deterministic-*` caller bar above. It is
+    passed SEPARATELY from ``agent_id`` rather than re-derived here so this
+    function and the transition gate can never disagree about who is a recon
+    stage. ``agent_id`` and ``config`` feed factor 2; both default to the
+    denying value, so a caller that forgets to thread them refuses rather
+    than silently opening the bar.
     """
     if raw is None or raw == {}:
         if require:
@@ -5971,6 +6012,32 @@ async def _validate_done_provenance(
             task_id,
             f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {kind!r})',
         ), None
+
+    if kind in DETERMINISTIC_PROVENANCE_KINDS:
+        # Factor 1 (PRD D11): config-free, and FIRST. A recon stage may not
+        # self-authorize a runner-stamped close, and an operator who adds
+        # 'recon-stage-' to the allowlist must not thereby reopen incident
+        # 5156. Same shape as the 'operational-verified' branch below, so a
+        # reader sees one rule applied twice rather than two rules.
+        if is_recon_stage:
+            return _done_provenance_error(
+                task_id,
+                f'done_provenance with kind={kind!r} cannot be recorded by a '
+                'recon-stage caller — a recon stage may not self-authorize a '
+                'close that asserts a DeterministicRunner observation. This '
+                'refusal is config-free: granting the caller prefix does not '
+                'lift it.',
+                error_type=DETERMINISTIC_CALLER_ERROR_TYPE,
+            ), None
+        # Factor 2: the configured caller allowlist, read live so the leaf
+        # stays green-tier hot-reloadable.
+        decision = resolve_deterministic_provenance_authorization(config, agent_id=agent_id)
+        if not decision.allowed:
+            return _done_provenance_error(
+                task_id,
+                decision.error or '',
+                error_type=decision.error_type,
+            ), None
 
     if kind == 'merged' and commit_input is None:
         return _done_provenance_error(
@@ -6576,6 +6643,8 @@ async def _repair_done_provenance_same_status(
     tag: str | None,
     *,
     is_recon_stage: bool = False,
+    agent_id: str | None = None,
+    config: Any = None,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -6606,6 +6675,9 @@ async def _repair_done_provenance_same_status(
     :func:`_validate_done_provenance` so a recon-stage caller cannot use this
     sanctioned repair seam to record ``kind="operational-verified"`` either
     (closing the loophole a fresh-transition-only rejection would leave open).
+    ``agent_id`` and ``config`` travel the same way and for the same reason:
+    the `deterministic-*` caller bar (task 5241) must close BOTH seams, or a
+    legacy blob could be re-stamped around it on an already-``done`` task.
     """
     validation_err, resolved = await _validate_done_provenance(
         task_id,
@@ -6613,6 +6685,8 @@ async def _repair_done_provenance_same_status(
         project_root,
         require=False,
         is_recon_stage=is_recon_stage,
+        agent_id=agent_id,
+        config=config,
     )
     if validation_err is not None:
         return validation_err
@@ -6723,13 +6797,29 @@ def _done_provenance_missing_error(task_id: str) -> dict:
     }
 
 
-def _done_provenance_error(task_id: str, reason: str) -> dict:
-    return {
+def _done_provenance_error(
+    task_id: str,
+    reason: str,
+    *,
+    error_type: str | None = None,
+) -> dict:
+    """The single builder for every ``done_provenance_invalid`` refusal.
+
+    ``error_type`` names a machine-readable refusal CLASS for the caller-bar
+    rejections (task 5241). The key is included only when supplied, so every
+    pre-existing refusal payload stays byte-identical — a consumer keying on
+    its absence is unaffected, and one that keys on its presence learns
+    something no ``reason`` substring match could tell it reliably.
+    """
+    payload = {
         'success': False,
         'error': 'done_provenance_invalid',
         'task_id': task_id,
         'reason': reason,
     }
+    if error_type is not None:
+        payload['error_type'] = error_type
+    return payload
 
 
 def _extract_task_dict(raw: Any) -> dict | None:

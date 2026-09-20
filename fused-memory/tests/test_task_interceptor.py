@@ -4179,6 +4179,7 @@ async def test_reopen_freshness_exempts_commitless_kind(
         result = await interceptor.set_task_status(
             '1', 'done', project_root,
             done_provenance={'kind': 'deterministic-deploy'},
+            agent_id='orchestrator',
         )
 
         assert 'error' not in result, result
@@ -4745,7 +4746,9 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
     PID evidence in the persisted provenance blob.
     """
     # No git repo needed — deterministic-deploy carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4757,6 +4760,7 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
             'unit': 'orchestrator-reify.service',
             'active_enter_timestamp': 'Mon 2026-06-23 20:09:00 UTC',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4779,7 +4783,9 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
     The runner emits this shape on the resume-after-human-resolution path
     (before_done_ran_at already set, escalation cleared by operator).
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4790,6 +4796,7 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
             'note': 'resumed after human resolution',
             'unit': 'orchestrator-reify.service',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4812,7 +4819,9 @@ async def test_done_provenance_accepts_deterministic_gate(
     gate commit-less and pid-less.
     """
     # No git repo needed — deterministic-gate carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4822,6 +4831,7 @@ async def test_done_provenance_accepts_deterministic_gate(
             'kind': 'deterministic-gate',
             'note': 'pure gate resolved',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4850,7 +4860,9 @@ async def test_done_provenance_deterministic_gate_persists_escalation_id(
     Stage-2 audit and any operator reading the stored blob rely on it to
     find the gate record.
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4861,6 +4873,7 @@ async def test_done_provenance_deterministic_gate_persists_escalation_id(
             'note': 'pure gate resolved',
             'escalation_id': 'esc-4064-gate',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4885,7 +4898,9 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     its scheduling evidence in the persisted provenance blob.
     """
     # No git repo needed — deterministic-deploy-scheduled carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4897,6 +4912,7 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
             'transient_unit': 'orch-redeploy-restart-1.service',
             'fire_delay_secs': 60,
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4920,7 +4936,9 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     write landed; a later re-dispatch resumes and drives the task to done
     with this note-only shape.
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4931,6 +4949,7 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
             'note': 'resumed after self-restart scheduled (crash before done write)',
             'unit': 'orchestrator-dark-factory.service',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -5084,6 +5103,11 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
     for kind in declared_kinds:
         err, resolved = await _validate_done_provenance(
             '1', minimal_payloads[kind], str(tmp_path), require=True,
+            # An AUTHORIZED caller (task 5241): the deterministic-* kinds are
+            # accepted only from an allowlisted, non-recon-stage identity, so
+            # this table tests the SHAPE contract rather than the caller bar,
+            # which TestDeterministicProvenanceCallerBar owns.
+            agent_id='orchestrator', config=FusedMemoryConfig(),
         )
         assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
         assert resolved is not None, f'kind={kind!r} resolved to None with no error'
@@ -5739,6 +5763,8 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
         str(tmp_path),
         require=False,
         is_recon_stage=False,
+        agent_id='orchestrator',
+        config=FusedMemoryConfig(),
     )
 
     assert err is None, f'expected acceptance but got: {err}'
