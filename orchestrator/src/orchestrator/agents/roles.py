@@ -455,17 +455,17 @@ half-done tree that is falsely recorded as a completed, successful run.
 # BACKGROUND_TASK_WARNING has named since task 2761."  That sentence was never
 # measured -- it inherited the authority of the genuine measurement above it
 # through the words "The same holds for", and later edits then cited the whole
-# block as settled.  It is false:
-# `ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor")`
-# returned neither name on 2026-09-10 or on 2026-09-20, and census 2026-09-10
-# sec 1.1 found zero `BashOutput`/`KillShell` tool_use across 8,546 archived
-# transcripts.
+# block as settled.  It is false: neither name has ever resolved from the
+# registry, and no transcript in the fleet census ever shows one being called.
+# THE MEASUREMENT AND ITS DATES ARE NOT RESTATED HERE -- they live once, at
+# tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS, for the
+# same reason the size figures below live at exactly one site.
 #
 # The retraction GENERALISES, and that is the part worth carrying forward: this
 # block has now aged wrong TWICE in the same way.  Its own worked example above
-# used to cite `ToolSearch("select:Monitor,TaskOutput")` returning BOTH schemas
-# -- and on 2026-09-20 the second name no longer resolved at all, ten days
-# after it was measured live.  Reachability is durable; the roster is not.  So
+# used to cite a `ToolSearch` select query returning a `TaskOutput` schema --
+# and ten days later that name no longer resolved at all (same citation).
+# Reachability is durable; the roster is not.  So
 # the guidance below is deliberately built on the things that do not churn --
 # `Bash`'s own `run_in_background` parameter, `Read` on the output file path it
 # returns, and `ToolSearch` as the way to DISCOVER the current termination tool

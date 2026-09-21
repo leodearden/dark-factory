@@ -8,9 +8,8 @@ question for built-ins -- whether the named tool EXISTS at all.
 THE DEFECT IT HOLDS (task 5332). `BACKGROUND_TASK_WARNING` told every
 Bash-capable role to "poll it to completion with `BashOutput` (or terminate
 it with `KillShell`)". Neither tool is in the harness registry, and neither
-ever was in this fleet: census 2026-09-10 §1.1 found ZERO `BashOutput` /
-`KillShell` tool_use across 8,546 archived transcripts, while 138
-`ToolSearch` requests naming them were answered with other names. An agent
+ever was in this fleet -- `MEASURED_ABSENT_TOOLS` below carries that
+measurement, its dates and the fleet census that corroborates it. An agent
 that reached that sentence had no reachable next step, so it improvised one
 -- a foreground `sleep`/`tail` poll chain, which is what the NEVER list two
 paragraphs below it forbids. The prompt was steering agents into its own
@@ -50,24 +49,17 @@ ITS KNOWN HOLE, stated rather than glossed because it is the hole this task
 fell into. The check is asymmetric: it catches a prompt naming a tool that is
 NOT in the list (the add-a-phantom direction), but a tool DELETED upstream
 stays in `HARNESS_TOOLS` and a prompt naming it stays GREEN. That is not
-hypothetical. The first revision of this task's plan proposed replacing
-`BashOutput`/`KillShell` with `TaskOutput`/`TaskStop`, measured live on
-2026-09-10; re-measured on 2026-09-20 the SAME query returned only `TaskStop`
-and `Monitor`, and `select:TaskOutput` answered "No matching deferred tools
-found". Ten days. Nothing importable from Python can see the harness
-registry, so this cannot be automated away. The two mitigations are: re-derive
-the list rather than trust it (query below), and -- the one that actually
+hypothetical: this task's own first plan proposed replacing
+`BashOutput`/`KillShell` with `TaskOutput`/`TaskStop`, and `TaskOutput` was
+measured live, then gone ten days later (`MEASURED_ABSENT_TOOLS`). Nothing
+importable from Python can see the harness registry, so this cannot be
+automated away. The two mitigations are: re-derive the list rather than trust
+it (`MEASURED_ABSENT_TOOLS` carries the query), and -- the one that actually
 carries the weight -- keep the guidance itself depending on as few volatile
 tool names as possible, which is why the wait block is now written around
 `Bash`'s own `run_in_background` parameter, `Read` on the returned output
 file path, and `ToolSearch` as the way to discover the current termination
 tool. The hole has little left to bite on.
-
-RE-DERIVE `HARNESS_TOOLS` from a live dispatched session with:
-    ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor")
-plus that session's own tool list and its deferred-tool list. `select:` is an
-exact-name lookup, so a name it does not return is ABSENT from the registry,
-not merely low-ranked.
 
 WHAT THIS DOES NOT COVER, deliberately:
   * prompt text assembled outside roles.py -- `briefing.py`'s f-strings, the
@@ -101,8 +93,8 @@ from orchestrator.agents.roles import ROLES
 # Harness tools measured PRESENT on 2026-09-20, from this dispatched session's
 # own tool list (Agent .. Write below) plus its deferred-tool list, which
 # `ToolSearch` loads on demand (CronCreate .. WebSearch below).  Re-derive with
-# the query in the module docstring; do NOT add a name on the strength of
-# remembering it.  The asymmetry that governs edits here: a name wrongly
+# the query recorded at `MEASURED_ABSENT_TOOLS` below; do NOT add a name on the
+# strength of remembering it.  The asymmetry that governs edits here: a name wrongly
 # OMITTED costs a future editor one spurious failure and a one-line fix, while
 # a name wrongly INCLUDED silently un-covers the exact defect this module
 # exists to catch.
@@ -147,18 +139,34 @@ HARNESS_TOOLS = frozenset({
     'Write',
 })
 
-# Names measured ABSENT, kept as a diagnostic arm so this regression reports
-# its own dated evidence instead of a generic "unknown token".  Two
-# measurements, and the second is the one that justifies the whole module:
-#   2026-09-10 -- ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,
-#                 TaskStop,Monitor") returned TaskOutput, TaskStop and Monitor,
-#                 and NOT BashOutput or KillShell.  Corroborated fleet-wide by
-#                 census 2026-09-10 §1.1: zero BashOutput/KillShell tool_use
-#                 across 8,546 archived transcripts, and 138 ToolSearch
-#                 requests naming them answered with other names.
-#   2026-09-20 -- the SAME query returned only TaskStop and Monitor;
-#                 `select:TaskOutput` answered "No matching deferred tools
-#                 found".  TaskOutput was live ten days earlier.
+# THE SINGLE HOME OF THE TOOL-REGISTRY MEASUREMENT.  The query, its dates and
+# the census figure live HERE and are cited from everywhere else -- roles.py's
+# retraction, this module's docstring, `_failure_message`, cli_invoke.py's
+# `_BACKGROUND_REAP_TOOLS`, test_cli_invoke_background.py.  An earlier revision
+# hand-copied them to six sites and two had already drifted apart in shape, the
+# same failure roles.py records for its size figures ("Prose copies do not move
+# when the string they describe does").  Do NOT restate a date, the query or the
+# census figure elsewhere -- cite this comment instead.
+#
+# THE QUERY, from a live dispatched session:
+#     ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor")
+# plus that session's own tool list and its deferred-tool list.  `select:` is an
+# exact-name lookup, so a name it does not return is ABSENT from the registry,
+# not merely low-ranked.  This re-derives `HARNESS_TOOLS` as well as this set.
+#
+# WHAT IT RETURNED.  Two measurements, and the second is the one that justifies
+# the whole module:
+#   2026-09-10 -- TaskOutput, TaskStop and Monitor; NOT BashOutput or KillShell.
+#                 Corroborated fleet-wide by census 2026-09-10 sec 1.1: zero
+#                 BashOutput/KillShell tool_use across 8,546 archived
+#                 transcripts, and 138 ToolSearch requests naming them answered
+#                 with other names.
+#   2026-09-20 -- only TaskStop and Monitor; `select:TaskOutput` answered "No
+#                 matching deferred tools found".  TaskOutput was live ten days
+#                 earlier.
+#
+# The names below are kept as a diagnostic arm, so this regression reports that
+# dated evidence instead of a generic "unknown token".
 MEASURED_ABSENT_TOOLS = frozenset({
     'BashOutput',
     'KillBash',
@@ -227,17 +235,12 @@ def _failure_message(where: str, unknown: list[str]) -> str:
     lines = [f'{where} names harness tools that do not exist: {unknown}.']
     if phantom:
         lines.append(
-            f'{phantom} are MEASURED ABSENT. ToolSearch("select:BashOutput,KillShell,'
-            'KillBash,TaskOutput,TaskStop,Monitor") returned TaskOutput/TaskStop/Monitor '
-            'on 2026-09-10 and only TaskStop/Monitor on 2026-09-20, where '
-            '"select:TaskOutput" answered "No matching deferred tools found"; census '
-            '2026-09-10 §1.1 found zero BashOutput/KillShell tool_use across 8,546 '
-            'archived transcripts. An agent following this prompt has no reachable next '
-            'step and will improvise a forbidden poll loop. Name a tool that exists -- '
-            'and do NOT just substitute another poll-tool name, because there is NO poll '
-            'tool in this build: Bash(run_in_background=true) returns an output FILE '
-            'PATH, and Read on that path yields the output plus an "[exited with code N]" '
-            'trailer. That is the whole collection mechanism.',
+            f'{phantom} are MEASURED ABSENT -- see MEASURED_ABSENT_TOOLS in this module '
+            'for the query and its dates. An agent following this prompt has no '
+            'reachable next step and will improvise a forbidden poll loop. Name a tool '
+            'that exists, and do NOT reach for another poll-tool name: what agents are '
+            'told to do instead is stated once, in '
+            'orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE.',
         )
     if unrecognised:
         lines.append(

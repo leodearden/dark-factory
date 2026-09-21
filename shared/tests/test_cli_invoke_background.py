@@ -10,10 +10,12 @@ A session reaps either by calling a background-management tool named in
 ``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
 issuing any tool_use whose input references the task's id or output-file path.
 The tool names appearing in the fixtures below are test DATA standing in for
-whatever a CLI build might emit, not a claim that each is live: measured
-2026-09-20, only ``TaskStop`` is (task 5332).  Exercising the accept set's full
-membership is the coverage that should stay — see the comment on
-``_BACKGROUND_REAP_TOOLS`` for why membership is kept rather than resynced.
+whatever a CLI build might emit, not a claim that each is live — only
+``TaskStop`` is (task 5332).  Exercising the accept set's full membership is
+the coverage that should stay; see the comment on ``_BACKGROUND_REAP_TOOLS``
+for why membership is kept rather than resynced, and
+orchestrator/tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS
+for the measurement that says which names are live.
 
 RCA: Reify 5164's amender ended its turn (681s, 19 turns, subtype=success,
 timed_out=false) "to wait for the completion notification" while a 2700s
@@ -443,9 +445,9 @@ class TestTaskToolReaps:
     Deliberately NOT described as the analogues of
     ``BashOutput``/``KillShell``, as this docstring used to: that framing is
     doubly wrong.  ``BashOutput`` was never live in this fleet, and
-    ``TaskOutput`` has since been removed from the registry too (measured
-    2026-09-20, task 5332).  Both remain in the accept set on purpose; these
-    cases pin that membership."""
+    ``TaskOutput`` has since been removed from the registry too (task 5332; the
+    measurement is cited from the module docstring).  Both remain in the accept
+    set on purpose; these cases pin that membership."""
 
     def test_task_output_after_launch_is_false(self) -> None:
         """TaskOutput collects a backgrounded task's result → reap → False."""

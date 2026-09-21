@@ -363,8 +363,9 @@ class AllAccountsCappedException(Exception):
 # A deliberately OVER-WIDE deny set, and the honest statement of its upkeep: it
 # is NOT in sync with the CLI's built-in tool names and does not need to be.  A
 # stale entry is harmless (``BashOutput``, ``KillShell`` and ``KillBash`` below
-# are measured absent from the registry as of 2026-09-20, task 5332 — denying a
-# tool that does not exist denies nothing), whereas a MISSING entry is the real
+# are measured absent from the registry — task 5332; see the citation on
+# ``_BACKGROUND_REAP_TOOLS`` below — and denying a tool that does not exist
+# denies nothing), whereas a MISSING entry is the real
 # hole: a *future new* built-in would not be auto-denied.  Accepted because
 # (a) these prompts forbid tool use, and (b) a future change to the CLI's
 # tool-exclusion semantics is caught loudly by the ``schema_tool_denied``
@@ -737,14 +738,13 @@ def note_unreadable_transcript(
 # engaged with its pending work rather than abandoning it, so it clears the
 # abandonment verdict.
 #
-# WHICH OF THESE ARE REAL, measured 2026-09-20 (task 5332): only ``TaskStop``.
-# ``ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,
-# Monitor")`` returned ``TaskStop`` and ``Monitor`` and nothing else;
-# ``select:TaskOutput`` answered "No matching deferred tools found" although the
-# same query had returned it on 2026-09-10.  ``BashOutput`` and ``KillShell``
-# were never observed in this fleet at all (census 2026-09-10 sec 1.1: zero
-# tool_use across 8,546 archived transcripts); ``KillBash`` is an older CLI
-# spelling.
+# WHICH OF THESE ARE REAL: only ``TaskStop`` (task 5332).  ``BashOutput`` and
+# ``KillShell`` were never observed in this fleet at all, ``KillBash`` is an
+# older CLI spelling, and ``TaskOutput`` was live until the registry dropped it.
+# The query behind those claims, its dates and the fleet census live at exactly
+# one site -- orchestrator/tests/test_roles_harness_tool_inventory.py::
+# MEASURED_ABSENT_TOOLS -- and are deliberately not restated here, because six
+# hand-copies of them had already drifted apart in shape.
 #
 # KEEP EVERY MEMBER ANYWAY.  This is an ACCEPT set, so the two directions of
 # error are not symmetric: a never-observed name costs nothing, while dropping
@@ -760,6 +760,13 @@ def note_unreadable_transcript(
 # role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
 # why correcting those prompts needed no change to this detector.  If the first
 # clause were the whole mechanism, only ``TaskStop`` would still fire it.
+#
+# That is an executable claim, not a comment's promise: the exact prescribed
+# shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
+# is pinned by test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
+# a ``command`` key) fails there rather than silently downgrading every
+# correctly-behaved session to failure.
 _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )
