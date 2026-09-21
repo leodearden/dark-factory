@@ -192,12 +192,27 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    `fresh` (the server's verdict at shaping), the **age badge wins** on screen: the
    operator reads the age, and the state is what the server knew when it answered.
 7. **Rendering is uniform and lives in the shared components only**: `charts.jsx::StatTile`,
-   `tabs.jsx::ST`, `shell.jsx::ProjectGroup` pips and the row cells accept a `Datum`.
+   `tabs.jsx::ST`, a new shared `Pip` and the row cells accept a `Datum`.
    `unknown` → em-dash with the reason as title; `stale` → value plus age badge;
    `lower_bound` → `≥` prefix. Tab code never branches on state. Every call site
-   migrates in γ1 (36 in `tabs.jsx`/`tab_overview.jsx` plus those in
-   `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx`, `tab_scheduler.jsx`
-   — enumerate by grep at implementation). Values not yet served as a `Datum` are
+   migrates in γ1 — **43 tile sites, measured 2026-09-21 (task 5706)**: 32 in
+   `tabs.jsx`, 4 in `tab_overview.jsx`, 5 in `tab_escalations.jsx`, 2 in
+   `tab_escalation_analytics.jsx`. The component is reached by **three** syntactic
+   forms and only one of them carries its own name, so enumerate by grep at
+   implementation across all three: `<StatTile` (plain destructure —
+   `tab_overview.jsx`), `<ST` (the `StatTile: ST` alias in `tabs.jsx`'s
+   `window.DF_CHARTS` destructure) and `<C.StatTile` (both escalations tabs bind
+   `const C = window.DF_CHARTS` and call through the namespace object). A `<StatTile`
+   grep alone matches 4 of the 43 and silently misses the other 39 — which is why the
+   two escalations tabs were absent from this decision's earlier enumeration. Retired
+   from that earlier list: `scheduler_drawer.jsx`, `tab_curator.jsx`,
+   `tab_memory_evals.jsx` and `tab_scheduler.jsx` carry **zero** tile call sites and
+   bind no `StatTile` at all. `shell.jsx::ProjectGroup` is **not** the pips' owner
+   either: it takes `summary` as an opaque node and renders no pip itself (the token
+   does not occur in the file). Every pip today is a caller-side JSX fragment in
+   `tabs.jsx`, `tab_tasks.jsx` and `tab_escalations.jsx`, sharing only the
+   `.proj-head .summary .pip` CSS — so γ1's shared `Pip` is **new code**, not a
+   migration of an existing component. Values not yet served as a `Datum` are
    wrapped by `plainDatum(value, endpointKey)` with the endpoint's `served_at` as
    `as_of`, so every tile has provenance at least at endpoint granularity. `data.js`
    pre-fetch defaults for datum-kinded keys become `unknown` Datums with reason
