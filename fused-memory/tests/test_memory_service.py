@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import _make_rate_limit_error
+from _mem0_record_shapes import mem0_record
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
@@ -11109,23 +11110,29 @@ class TestGetMemoryMem0Fingerprint:
 
     _UUID = '77a3f6bc-0000-0000-0000-000000000000'
 
-    @staticmethod
-    def _mem0_record(**overrides) -> dict:
-        """A record shaped exactly as installed mem0 1.0.11's get() returns it."""
-        record = {
-            'id': TestGetMemoryMem0Fingerprint._UUID,
-            'memory': 'some text',
-            'hash': 'h',
-            'created_at': '2026-09-09T12:00:00+00:00',
-            'updated_at': None,
-            'score': None,
-            # promoted_payload_keys -> lifted to the TOP LEVEL, absent from metadata
-            'agent_id': 'claude-review-df-3200',
-            'user_id': 'dark_factory',
-            'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
-            # everything else stays INSIDE metadata
-            'metadata': {'category': 'observations_and_summaries', 'topic': 't'},
-        }
+    #: One stored Qdrant payload; the record below is DERIVED from it by
+    #: mem0's own promotion rule rather than hand-written, so this module
+    #: cannot drift from the two other test modules that need the same shape.
+    _PAYLOAD = {
+        'data': 'some text',
+        'hash': 'h',
+        'created_at': '2026-09-09T12:00:00+00:00',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'claude-review-df-3200',
+        'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'category': 'observations_and_summaries',
+        'topic': 't',
+    }
+
+    @classmethod
+    def _mem0_record(cls, **overrides) -> dict:
+        """A record shaped exactly as installed mem0 1.0.11's get() returns it.
+
+        See ``tests/_mem0_record_shapes.py`` for the promotion rule and why it
+        is applied rather than transcribed.
+        """
+        record = mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
         record.update(overrides)
         return record
 
@@ -11210,11 +11217,12 @@ class TestGetMemoryTimeoutNotCoercedToNotFound:
 
     ``get_memory`` distinguishes exactly two outcomes on the mem0 path: a
     genuine miss (``rec is None`` -> ``MemoryNotFoundError``) and a fingerprint.
-    A read timeout is NEITHER, and conflating it with the miss is destructive
-    rather than merely lossy: ``ReconReportState.cite_memory`` renders
-    ``MemoryNotFoundError`` as ``memory_not_found``, and
-    ``repair_memory_citation(reason='memory_not_found')`` DELETES citations on
-    that signal — so a transient blip could erase valid provenance.
+    A read timeout is NEITHER, and conflating it with the miss puts a FALSE
+    ABSENCE into a durable reconciliation report via
+    ``ReconReportState.cite_memory``'s ``memory_not_found``.  The full chain,
+    and the corroboration gate in ``citation_repair`` that keeps it from
+    becoming a deletion, are stated once at
+    ``backends/mem0_client.py::Mem0Backend.get``.
 
     This is the pin that ``get_memory`` must never grow a ``try/except
     TimeoutError`` of its own, now that ``Mem0Backend.get`` propagates instead
@@ -11237,6 +11245,33 @@ class TestGetMemoryTimeoutNotCoercedToNotFound:
             'a read timeout must never surface as MemoryNotFoundError — that is the '
             'signal repair_memory_citation deletes citations on'
         )
+        assert 'timed out' in str(excinfo.value), (
+            f'the backend message must survive to the caller; got {str(excinfo.value)!r}'
+        )
+
+
+class TestReplayFromStoreTimeoutIsNotAZero:
+    """A mem0 ``get_all`` timeout must reach the caller, never read as "nothing".
+
+    ``replay_from_store`` calls ``get_all`` unguarded and returns the count it
+    queued, so under the old swallow a timeout produced ``{}`` -> no results ->
+    a clean ``0``, and the ``replay_to_graphiti`` MCP tool reported "0 queued"
+    for a replay that never ran.  That false-zero-to-loud-error transition is
+    half the justification for making ``Mem0Backend.get_all`` propagate, and
+    it was asserted nowhere: the behaviour is correct today only because no
+    handler stands between the two, and an ``except Exception: return 0``
+    added later for "robustness" would restore the false zero in silence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_all_timeout_propagates_rather_than_returning_zero(self, service):
+        service.mem0.get_all = AsyncMock(
+            side_effect=TimeoutError('Mem0 get_all timed out after 5.0s')
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await service.replay_from_store('dark_factory')
+
         assert 'timed out' in str(excinfo.value), (
             f'the backend message must survive to the caller; got {str(excinfo.value)!r}'
         )

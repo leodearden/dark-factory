@@ -16,6 +16,7 @@ import logging
 from unittest.mock import patch
 
 import pytest
+from _mem0_record_shapes import mem0_record
 from mcp.server.fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
@@ -2584,8 +2585,25 @@ class TestCiteMemoryOverRealMemoryService:
 
     _UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
 
-    @staticmethod
-    def _real_service(mock_config):
+    #: One stored Qdrant payload.  The record the backend hands back is
+    #: DERIVED from it by mem0's own promotion rule
+    #: (``tests/_mem0_record_shapes.py``) rather than transcribed, so this
+    #: module cannot keep asserting a retired contract after a mem0 upgrade
+    #: while a sibling module goes red.
+    _PAYLOAD = {
+        'data': 'some text',
+        'hash': 'h',
+        'created_at': '2026-09-09T12:00:00+00:00',
+        'updated_at': None,
+        'user_id': 'dark_factory',
+        'agent_id': 'claude-review-df-3200',
+        'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'category': 'observations_and_summaries',
+        'topic': 't',
+    }
+
+    @classmethod
+    def _real_service(cls, mock_config):
         """A real MemoryService whose mem0 backend hands back a mem0-shaped record.
 
         Only the BACKEND is mocked. ``get_memory`` — the function that held the
@@ -2597,21 +2615,9 @@ class TestCiteMemoryOverRealMemoryService:
 
         service = MemoryService(mock_config)
         service.mem0 = MagicMock()
-        # Shaped exactly as installed mem0 1.0.11's AsyncMemory.get returns it:
-        # promoted_payload_keys at the TOP level and excluded from metadata,
-        # category left INSIDE metadata.
-        service.mem0.get = AsyncMock(return_value={
-            'id': TestCiteMemoryOverRealMemoryService._UUID,
-            'memory': 'some text',
-            'hash': 'h',
-            'created_at': '2026-09-09T12:00:00+00:00',
-            'updated_at': None,
-            'score': None,
-            'agent_id': 'claude-review-df-3200',
-            'user_id': 'dark_factory',
-            'run_id': '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
-            'metadata': {'category': 'observations_and_summaries', 'topic': 't'},
-        })
+        service.mem0.get = AsyncMock(
+            return_value=mem0_record(cls._PAYLOAD, memory_id=cls._UUID)
+        )
         return service
 
     @pytest.mark.asyncio
@@ -2720,14 +2726,16 @@ class TestCiteMemoryExceptionNarrowing:
         """A mem0 read TimeoutError must propagate — never render as memory_not_found.
 
         The narrowness of cite_memory's `except (EdgeNotFoundError,
-        MemoryNotFoundError)` is LOAD-BEARING here, not incidental.
-        `repair_memory_citation(reason='memory_not_found')` DELETES citations on
-        that signal, so a transient read timeout rendered as "this memory does
-        not exist" would destroy valid provenance.  Since task 5265
-        `Mem0Backend.get` propagates its read timeout instead of swallowing it
-        into `None` (which `get_memory` then turned into `MemoryNotFoundError`),
-        so this is the first exception shape that can actually reach here from a
-        timed-out read.
+        MemoryNotFoundError)` is LOAD-BEARING here, not incidental: this is the
+        boundary at which a timeout would otherwise become a FALSE ABSENCE
+        written into a durable report.  The chain that follows from that, and
+        the corroboration gate that bounds it, are stated once at
+        `backends/mem0_client.py::Mem0Backend.get`.
+
+        Since task 5265 `Mem0Backend.get` propagates its read timeout instead
+        of swallowing it into `None` (which `get_memory` then turned into
+        `MemoryNotFoundError`), so this is the first exception shape that can
+        actually reach here from a timed-out read.
         """
         state, run_id, finding_id = self._state_and_finding(
             memory_raises=TimeoutError('Mem0 get timed out after 5.0s')

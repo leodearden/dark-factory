@@ -82,41 +82,6 @@ class TestMem0BackendSearch:
             f'Expected filters={expected!r}, got {call_kwargs.get("filters")!r}'
         )
 
-    @pytest.mark.asyncio
-    async def test_timeout_propagates_not_swallowed(self, backend):
-        """On TimeoutError the exception propagates — it is NOT swallowed into {}.
-
-        INV-11 `no-silent-fail-soft`: a log is not a return value.  Swallowing
-        the timeout made `{}` reach `MemoryService._search_mem0`, which reads
-        `response.get('results', [])` -> `[]`, so `search`'s per-task
-        `except Exception` never ran and the `search` MCP response was a bare
-        `{'results': []}` — byte-identical to a genuinely empty store.
-
-        The message must NAME the read timeout: `asyncio.wait_for`'s own
-        `TimeoutError` stringifies EMPTY, so a bare re-raise would land
-        `'error': ''` in `_store_failure_diagnostics` — propagating the fault
-        while discarding the one detail that makes it attributable.
-
-        Same propagate-don't-swallow shape as the deterministic Qdrant reads
-        (`scroll_by_metadata` / `count_by_metadata` / `get_point_by_id`).
-        """
-        mock_instance = MagicMock()
-        mock_instance.search = AsyncMock(side_effect=TimeoutError('too slow'))
-
-        with (
-            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
-            pytest.raises(TimeoutError) as excinfo,
-        ):
-            await backend.search(query='q', scope=Scope(project_id='p'), limit=5)
-
-        assert 'timed out' in str(excinfo.value), (
-            f'raised TimeoutError must name the read timeout so the text survives into '
-            f"_store_failure_diagnostics['error']; got {str(excinfo.value)!r}"
-        )
-        assert str(backend._read_timeout) in str(excinfo.value), (
-            f'raised TimeoutError must carry the configured read timeout '
-            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
-        )
 
 
 class TestMem0BackendScrollByMetadata:
@@ -228,10 +193,11 @@ class TestMem0BackendScrollByMetadata:
     async def test_timeout_propagates_not_swallowed(self, backend):
         """On TimeoutError, the exception propagates — it is NOT swallowed into [].
 
-        Mirrors count_by_metadata's propagate-by-default contract (no
-        try/except around asyncio.wait_for): a timed-out scroll must never be
-        indistinguishable from a genuinely-empty result (no-silent-fail
-        invariant).
+        Mirrors count_by_metadata's propagate-by-default contract: a timed-out
+        scroll must never be indistinguishable from a genuinely-empty result
+        (no-silent-fail invariant).  Since task 5265 the read is bounded by
+        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
+        it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1363,52 +1329,6 @@ class TestMem0BackendScrollAllByMetadata:
             await agen.aclose()
 
 
-class TestMem0BackendGetAll:
-    """get_all lists a scope's memories through mem0's own AsyncMemory.get_all."""
-
-    @pytest.mark.asyncio
-    async def test_timeout_propagates_not_swallowed(self, backend):
-        """On TimeoutError the exception propagates — it is NOT swallowed into {}.
-
-        ONLY a backend-level test is needed, and that is the point: both
-        consumers already handle a RAISED exception correctly, so propagation
-        was the whole missing link.
-
-          * ``reconciliation/stages/memory_consolidator.py::assemble_payload``
-            wraps this call in ``except Exception`` -> WARNING with exc_info ->
-            ``_fetch_degraded_sources.append('mem0')``, and that contract is
-            ALREADY covered by
-            ``tests/reconciliation/test_stage1.py::TestConsolidatorFetchDegradedSources
-            ::test_mem0_fetch_failure_tracks_degraded_source``.  Under the
-            swallow a timeout instead returned ``{}``, tripped the
-            "malformed/absent 'results' key" WARNING and did NOT mark mem0
-            degraded; after this, a real timeout takes the path that existing
-            test already asserts.  Duplicating its assertion here would be a
-            second copy of one claim, so it is cited by name instead.
-          * ``MemoryService.replay_from_store`` replayed 0 and reported 0
-            queued on a timeout; now the ``replay_to_graphiti`` MCP tool
-            surfaces the error rather than a false zero.
-
-        INV-11 ``no-silent-fail-soft``.
-        """
-        mock_instance = MagicMock()
-        mock_instance.get_all = AsyncMock(side_effect=TimeoutError('too slow'))
-
-        with (
-            patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
-            pytest.raises(TimeoutError) as excinfo,
-        ):
-            await backend.get_all(Scope(project_id='p'), limit=10)
-
-        assert 'timed out' in str(excinfo.value), (
-            f'raised TimeoutError must name the read timeout; got {str(excinfo.value)!r}'
-        )
-        assert str(backend._read_timeout) in str(excinfo.value), (
-            f'raised TimeoutError must carry the configured read timeout '
-            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
-        )
-
-
 class TestMem0BackendGet:
     """get fetches a single memory by id through mem0's own AsyncMemory.get."""
 
@@ -1425,38 +1345,67 @@ class TestMem0BackendGet:
         assert result == record
         assert mock_instance.get.await_args.args == ('m1',)
 
+
+class TestMem0BackendSemanticReadTimeouts:
+    """One contract, one test: every mem0-instance read propagates and NAMES itself.
+
+    ``search`` / ``get_all`` / ``get`` share a single implementation of this —
+    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
+    class — so they are asserted together.  Three near-identical copies of
+    this test could drift apart without noticing; one parametrized copy cannot,
+    which matters because the MESSAGE is a contract and not decoration: it is
+    what reaches ``MemoryService._store_failure_diagnostics['error']``, and
+    ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
+    re-raise would propagate the fault while discarding the one detail that
+    attributes it.
+
+    INV-11 ``no-silent-fail-soft``: a log is not a return value.  Each
+    method's OWN consequence — ``search``'s ``{}`` reading as a genuinely
+    empty store, ``get_all``'s two consumers starved of the exception they
+    already handle (``MemoryConsolidator.assemble_payload``'s
+    ``_fetch_degraded_sources``, pinned by
+    ``tests/reconciliation/test_stage1.py::TestConsolidatorFetchDegradedSources
+    ::test_mem0_fetch_failure_tracks_degraded_source``; and
+    ``MemoryService.replay_from_store``'s false "0 queued"), and ``get``'s
+    false absence in a durable report — is stated once in that method's
+    ``Raises:`` block in ``backends/mem0_client.py`` rather than recopied here.
+
+    The direct-to-Qdrant reads and the payload writes hold the same contract:
+    ``TestMem0BackendGetPointById``, ``TestMem0BackendScrollByMetadata``,
+    ``TestMem0BackendPayloadPrimitives.test_timeout_propagates``.
+    """
+
     @pytest.mark.asyncio
-    async def test_timeout_propagates_not_swallowed(self, backend):
-        """On TimeoutError the exception propagates — it is NOT swallowed into None.
-
-        The harm here is worse than an empty search, and concrete: a swallowed
-        timeout reached ``MemoryService.get_memory`` as ``None``, which raises
-        ``MemoryNotFoundError``, which ``ReconReportState.cite_memory`` renders
-        as ``memory_not_found`` — and ``repair_memory_citation(reason=
-        'memory_not_found')`` DELETES citations on exactly that signal.  A
-        transient read blip could therefore destroy valid provenance.  INV-11
-        ``no-silent-fail-soft``: a timeout must never be reported as "this
-        memory does not exist".
-
-        The message must NAME the read timeout, for the same reason as
-        ``search``: ``asyncio.wait_for``'s own ``TimeoutError`` stringifies
-        EMPTY.
-        """
+    @pytest.mark.parametrize(
+        ('method', 'args'),
+        [
+            ('search', ('q', Scope(project_id='p'))),
+            ('get_all', (Scope(project_id='p'),)),
+            ('get', ('m1', Scope(project_id='p'))),
+        ],
+    )
+    async def test_timeout_propagates_not_swallowed(self, backend, method, args):
         mock_instance = MagicMock()
-        mock_instance.get = AsyncMock(side_effect=TimeoutError('too slow'))
+        setattr(mock_instance, method, AsyncMock(side_effect=TimeoutError('too slow')))
 
         with (
             patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)),
             pytest.raises(TimeoutError) as excinfo,
         ):
-            await backend.get('m1', Scope(project_id='p'))
+            await getattr(backend, method)(*args)
 
-        assert 'timed out' in str(excinfo.value), (
-            f'raised TimeoutError must name the read timeout; got {str(excinfo.value)!r}'
+        message = str(excinfo.value)
+        assert 'timed out' in message, (
+            f'the raised TimeoutError must name the read timeout so the text survives '
+            f"into _store_failure_diagnostics['error']; got {message!r}"
         )
-        assert str(backend._read_timeout) in str(excinfo.value), (
-            f'raised TimeoutError must carry the configured read timeout '
-            f'({backend._read_timeout}s); got {str(excinfo.value)!r}'
+        assert method in message, (
+            f'the raised TimeoutError must name WHICH read timed out, or an operator '
+            f'cannot attribute it; got {message!r}'
+        )
+        assert str(backend._read_timeout) in message, (
+            f'the raised TimeoutError must carry the configured read timeout '
+            f'({backend._read_timeout}s); got {message!r}'
         )
 
 
@@ -1520,11 +1469,10 @@ class TestMem0BackendGetPointById:
         """On TimeoutError the exception propagates — it is NOT swallowed into None.
 
         Mirrors scroll_by_metadata/count_by_metadata's propagate-by-default
-        contract (no try/except around asyncio.wait_for): a timed-out point-fetch
-        must never be indistinguishable from a genuine not-found (no-silent-fail
-        invariant).  Mem0Backend.get holds the same contract since task 5265, so
-        this is the class-wide posture rather than a property unique to the
-        direct-to-Qdrant reads.
+        contract: a timed-out point-fetch must never be indistinguishable from a
+        genuine not-found (no-silent-fail invariant).  Mem0Backend.get holds the
+        same contract since task 5265, so this is the class-wide posture rather
+        than a property unique to the direct-to-Qdrant reads.
         """
         mock_client = AsyncMock()
         mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -2633,9 +2581,10 @@ class TestMem0BackendScanPayloadText:
 
     @pytest.mark.asyncio
     async def test_timeout_propagates_not_swallowed(self, backend):
-        """The load-bearing raw-Qdrant invariant: no try/except around
-        asyncio.wait_for, so a timed-out scan is never mistaken for a clean
-        corpus (which is exactly the wrong answer for an incidence sweep)."""
+        """The load-bearing raw-Qdrant invariant: a timed-out scan is never
+        mistaken for a clean corpus (which is exactly the wrong answer for an
+        incidence sweep).  Nothing between the pager and here converts the
+        TimeoutError into a page of zero hits."""
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
 
