@@ -2521,6 +2521,103 @@ class TestAuthorizedRaiseLedger:
         assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
 
 
+class TestUnrecordedRaises:
+    """Which measured raises THIS commit's ledger entries do not name.
+
+    The inverse of ``authorization_record``: the writer projects Violations into
+    a record, this asks whether a record covers a Violation. Records here are
+    built by calling ``authorization_record`` for real rather than hand-written,
+    so what is pinned is the round trip against the actual producer -- a
+    hand-written dict would pin this module's idea of the vocabulary instead of
+    the writer's, which is the drift the shared field names exist to prevent.
+    """
+
+    @staticmethod
+    def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
+        return metrics.authorization_record(
+            metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
+            raises,
+        )
+
+    @staticmethod
+    def _lines_raise() -> metrics.Violation:
+        return metrics._violation('lines', _MQ, 21550, 21653)
+
+    @staticmethod
+    def _cognitive_raise() -> metrics.Violation:
+        return metrics._violation('cognitive', _MQ, 2133, 2140)
+
+    def test_a_record_derived_from_the_raises_covers_them_all(self) -> None:
+        raises = [self._lines_raise(), self._cognitive_raise()]
+
+        assert metrics.unrecorded_raises(raises, [self._record(raises)]) == []
+
+    def test_no_records_leaves_every_raise_unrecorded_in_order(self) -> None:
+        raises = [self._lines_raise(), self._cognitive_raise()]
+
+        # The common refusal: a commit that staged a raising baseline and never
+        # touched the ledger. Order is the input's, so the refusal message is
+        # diffable run to run.
+        assert metrics.unrecorded_raises(raises, []) == raises
+
+    def test_a_stale_record_naming_a_different_landing_value_covers_nothing(
+        self,
+    ) -> None:
+        # THE CASE THIS FUNCTION EXISTS FOR. A hand-written or stale entry names
+        # the right measure and the right key, so any (measure, key) check would
+        # wave it through -- while the baseline it accompanies landed somewhere
+        # else entirely. `current` is the discriminator.
+        stale = self._record([metrics._violation('lines', _MQ, 21550, 21600)])
+        raises = [self._lines_raise()]
+
+        assert metrics.unrecorded_raises(raises, [stale]) == raises
+
+    def test_a_record_for_an_unrelated_measure_covers_nothing(self) -> None:
+        raises = [self._lines_raise()]
+
+        unrelated = self._record([self._cognitive_raise()])
+
+        assert metrics.unrecorded_raises(raises, [unrelated]) == raises
+
+    def test_two_records_union_rather_than_the_last_one_winning(self) -> None:
+        lines, cognitive = self._lines_raise(), self._cognitive_raise()
+
+        # Two authorized writes in one commit append two records; coverage is
+        # the union of both, not whichever landed last.
+        records = [self._record([lines]), self._record([cognitive], task_id='5723')]
+
+        assert metrics.unrecorded_raises([lines, cognitive], records) == []
+
+    def test_a_differing_baseline_still_covers_when_current_matches(self) -> None:
+        # DELIBERATE: the triple is (measure, key, current), not the full
+        # four-tuple. An agent who runs --write-baseline --authorize-raise TWICE
+        # in one commit records b->m and m->f, while the HEAD-to-staged delta
+        # reads b->f. Requiring `baseline` to match would refuse that correctly
+        # authorized commit.
+        midpoint = self._record([metrics._violation('lines', _MQ, 21600, 21653)])
+
+        assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == []
+
+    @pytest.mark.parametrize(
+        'measures', [None, 'lines', 7], ids=['missing', 'string', 'int']
+    )
+    def test_a_record_without_a_measures_list_covers_nothing_and_does_not_crash(
+        self, measures: object
+    ) -> None:
+        # Hand-mutated on purpose -- authorization_record cannot produce these.
+        # A ledger a human edited badly must REFUSE the commit, not raise a
+        # TypeError out of the gate: a crash reads as a broken instrument and
+        # sends the reader hunting the wrong thing.
+        record = self._record([self._lines_raise()])
+        if measures is None:
+            del record['measures']
+        else:
+            record['measures'] = measures
+        raises = [self._lines_raise()]
+
+        assert metrics.unrecorded_raises(raises, [record]) == raises
+
+
 # ---------------------------------------------------------------------------
 # The ratchet comparator, and INV-10 tier 1.
 #
