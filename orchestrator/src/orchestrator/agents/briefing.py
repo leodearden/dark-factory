@@ -1054,10 +1054,9 @@ suggestions-only on this exact tree — call
 
         identity = self._agent_identity(effective_tid, 'implementer')
 
-        completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
-        pre_completed = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pre_pending = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'pending']
+        # No plan-progress counts are rendered below (task 5728): plan.json is the
+        # single home and the Session Startup Protocol mandates reading it. Pinned by
+        # orchestrator/tests/test_briefing_progress_spot.py.
 
         log_summary = ''
         if iteration_log:
@@ -1123,11 +1122,6 @@ Before writing any new code:
 
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
-
-## Progress
-
-- Prerequisites: {len(pre_completed)} done, {len(pre_pending)} pending
-- Steps: {len(completed)} done, {len(pending)} pending
 
 {log_summary}
 {rebase_section}
