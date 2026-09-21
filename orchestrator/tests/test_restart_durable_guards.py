@@ -547,6 +547,132 @@ class TestOfflineLaneRedStateSurvivesRedeploy:
         redeployed.task_client.submit_fix_task.assert_awaited_once()
 
 
+def _guard_file(config, filename: str) -> Path:
+    """Where one of the offline lane's three sidecars lives.
+
+    Resolved through the production helper rather than re-spelling the
+    layout, so these tests keep pointing at the real files if it moves.
+    """
+    path = guard_state.guard_path(config.project_root, filename)
+    assert path is not None, 'the fixture always supplies a project_root'
+    return path
+
+
+_OPEN_FIX_TASKS_FILE = 'offline_lane_open_fix_tasks.json'
+_ADVANCE_COUNTS_FILE = 'offline_lane_red_advance_counts.json'
+_PROMOTED_BLOCKERS_FILE = 'offline_lane_promoted_blockers.json'
+
+
+@pytest.mark.asyncio
+class TestOfflineLaneToleratesDivergentGuardFiles:
+    """One coupled subject, three files, no joint atomicity.
+
+    ``open_fix_tasks`` / ``_red_advance_counts`` / ``_promoted_blockers`` are
+    documented as one subject keyed by one fingerprint, but they persist as
+    three independent files written one after another, each of which can
+    fail-open to ``{}`` on its own.  So a fingerprint present in one and
+    absent from another is reachable — a partial write, a single corrupt
+    file, an individually-dropped schema-drifted row — while the consumers
+    still index as if the three were in lockstep.
+
+    A ``KeyError`` out of that read is not a local crash: ``run()`` catches it
+    with exponential backoff, so it would recur on every pass for up to the
+    14-day TTL, skipping the rest of ``_run_once`` (the infra sub-run) each
+    time.  A single corrupt file would have become a two-week wedge of the
+    offline lane.  These tests drive ``_handle_red_run`` DIRECTLY so the crash
+    is observed rather than swallowed by that retry arm.
+    """
+
+    async def test_a_partial_write_still_completes_the_update_branch(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """Filing writes two files in sequence; the second failing with
+        ENOSPC/EACCES is warned and swallowed, leaving the next process with
+        the fingerprint open and no count."""
+        config = _offline_config(tmp_path)
+        await _offline_lane(tmp_path, config).advance('HEAD1')
+        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
+
+        redeployed = _offline_lane(tmp_path, config)
+        await redeployed.advance('HEAD2')
+
+        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
+            'fix-1', 'GREEN..HEAD2',
+        )
+        redeployed.task_client.submit_fix_task.assert_not_awaited()
+
+    async def test_a_corrupt_counts_file_still_completes_the_update_branch(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """``load_json_or_warn(on_corrupt='warn')`` fails THAT file open to
+        ``{}`` while its two siblings load fine — the divergence is the
+        fail-open contract working, not a second bug."""
+        config = _offline_config(tmp_path)
+        await _offline_lane(tmp_path, config).advance('HEAD1')
+        _guard_file(config, _ADVANCE_COUNTS_FILE).write_text('{not json', encoding='utf-8')
+
+        redeployed = _offline_lane(tmp_path, config)
+        await redeployed.advance('HEAD2')
+
+        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
+            'fix-1', 'GREEN..HEAD2',
+        )
+        redeployed.task_client.submit_fix_task.assert_not_awaited()
+
+    async def test_the_divergence_is_not_papered_over_by_filing_a_duplicate(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The open fingerprint is still authoritative: a lost count must not
+        route the worker back into ``_file_new_fix_task``."""
+        config = _offline_config(tmp_path)
+        await _offline_lane(tmp_path, config).advance('HEAD1')
+        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
+
+        redeployed = _offline_lane(tmp_path, config, fix_task_id='fix-2')
+        await redeployed.advance('HEAD2')
+
+        assert redeployed.worker.open_fix_tasks[_fingerprint()] == 'fix-1'
+
+    async def test_promotion_is_still_reachable_after_the_count_is_lost(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The count restarting from zero is the designed degrade.  Never
+        advancing at all is not — that is the wedge."""
+        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
+        await _offline_lane(tmp_path, config).advance('HEAD1')
+        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
+
+        rebuilding = _offline_lane(tmp_path, config)
+        await rebuilding.advance('HEAD2')
+        assert rebuilding.blockers() == [], 'the count restarts, so this is advance 1'
+
+        reaching = _offline_lane(tmp_path, config)
+        await reaching.advance('HEAD3')
+
+        assert len(reaching.blockers()) == 1
+
+    async def test_a_lost_promotion_record_re_files_once_then_settles(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The third file diverging is the same shape: one duplicate blocker
+        is the cost of the lost record, and the next worker is quiet again."""
+        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
+        first = _offline_lane(tmp_path, config)
+        await first.advance('HEAD1')
+        await first.advance('HEAD2')
+        assert len(first.blockers()) == 1
+        _guard_file(config, _PROMOTED_BLOCKERS_FILE).unlink()
+
+        re_filing = _offline_lane(tmp_path, config)
+        await re_filing.advance('HEAD3')
+        assert len(re_filing.blockers()) == 1
+
+        settled = _offline_lane(tmp_path, config)
+        await settled.advance('HEAD4')
+
+        assert settled.blockers() == []
+
+
 # ---------------------------------------------------------------------------
 # step-13 — the scheduler's resurrection guard
 # ---------------------------------------------------------------------------
