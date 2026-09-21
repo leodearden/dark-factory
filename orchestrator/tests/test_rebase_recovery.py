@@ -348,6 +348,19 @@ def _plant_merge_rr(git_dir: Path, *records: bytes) -> None:
     (git_dir / 'MERGE_RR').write_bytes(b''.join(r + b'\x00' for r in records))
 
 
+def _specimens(common_dir: Path) -> list[Path]:
+    """Every quarantined MERGE_RR under a COMMON dir, by name.
+
+    Reached through one helper on purpose.  Every negative control in this file
+    asserts that nothing was quarantined, and a negative control that globs a
+    directory the quarantine no longer writes to passes for the wrong reason --
+    it would keep passing if the quarantine ran on every healthy worktree in
+    the fleet.  Moving the destination must break these tests or change them,
+    never silently satisfy them.
+    """
+    return sorted((common_dir / 'rerere-specimens').glob('MERGE_RR.*'))
+
+
 def _record(conflict_id: str, path: str = 'src/one.py') -> bytes:
     return f'{conflict_id}\t{path}'.encode()
 
@@ -487,7 +500,7 @@ class TestQuarantineMergeRr:
         assert backup is not None
         assert not (git_dir / 'MERGE_RR').exists()
         assert backup.read_bytes() == original
-        assert backup.parent == git_dir
+        assert backup.parent == git_dir / 'rerere-specimens'
 
     def test_a_second_quarantine_does_not_clobber_the_first(
         self, tmp_path: Path,
@@ -1042,7 +1055,7 @@ class TestPreflightEndToEnd:
         assert result.merge_rr_backup is None
         assert result.verdict == 'clean'
         assert (repo / '.git' / 'MERGE_RR').read_bytes() == original
-        assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
+        assert _specimens(repo / '.git') == []
 
     def test_an_abandoned_lock_is_swept_and_the_abort_recovers(
         self, tmp_path: Path,
@@ -1203,8 +1216,14 @@ class TestLinkedWorktreeIsTheProductionShape:
         assert [r.conflict_id for r in result.dangling] == [conflict_id]
         assert result.verdict == 'repaired'
         assert result.merge_rr_backup is not None
-        assert result.merge_rr_backup.parent.resolve() == git_dir.resolve(), (
-            'evidence belongs beside the per-worktree MERGE_RR it came from'
+        assert result.merge_rr_backup.parent.resolve() == (
+            repo / '.git' / 'rerere-specimens'
+        ).resolve(), (
+            'evidence belongs in the COMMON dir: the per-worktree git dir is '
+            'torn down by the very landing that makes the evidence worth having'
+        )
+        assert git_dir.name in result.merge_rr_backup.name, (
+            'a specimen in a shared directory must name the worktree it came from'
         )
         assert not (git_dir / 'MERGE_RR').exists()
 
@@ -1215,6 +1234,49 @@ class TestLinkedWorktreeIsTheProductionShape:
         assert _git_ok(linked, 'status', '--porcelain') == ''
         assert _git_ok(linked, 'rev-parse', 'HEAD').strip() == pre_rebase_tip
         assert result.merge_rr_backup.exists(), 'evidence must outlive the abort'
+
+    def test_the_specimen_outlives_the_worktree_it_came_from(
+        self, tmp_path: Path,
+    ) -> None:
+        """The assertion that makes the destination load-bearing, not cosmetic.
+
+        A quarantine BESIDE the original satisfies every other assertion in
+        this file: the bytes are preserved, the abort returns 0, and the
+        evidence outlives the ABORT.  It is still a no-op in production,
+        because ``.git/worktrees/<id>/`` is removed by the landing that
+        follows -- so the evidence survives exactly until the task succeeds,
+        which is the case nobody is looking at.  That is not hypothetical: it
+        is how the 5033 specimen was lost (merge ``dcbff02f00``), and task
+        4797's own record predicted the code would inherit it.
+
+        Tearing the worktree down is the ONLY thing that tells the two
+        destinations apart, which is why it is asserted here and nowhere else.
+        """
+        repo, linked, conflict_id = build_linked_mid_rebase_worktree(tmp_path)
+        shutil.rmtree(repo / '.git' / 'rr-cache' / conflict_id)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+
+        result = rebase_recovery.preflight_rebase_recovery(linked)
+
+        assert result.merge_rr_backup is not None
+        specimen = result.merge_rr_backup
+        preserved = specimen.read_bytes()
+        assert conflict_id.encode() in preserved
+
+        abort = _run_argv(linked, [*rebase_recovery.RECOVERY_GIT, 'rebase', '--abort'])
+        assert abort.returncode == 0, abort.stderr
+        _git_ok(repo, 'worktree', 'remove', '--force', str(linked))
+
+        assert not git_dir.exists(), (
+            'fixture expected the per-worktree admin dir to be torn down; '
+            'without that this test cannot discriminate'
+        )
+        assert specimen.exists(), (
+            'the specimen did not outlive its worktree -- preserving evidence '
+            'inside .git/worktrees/<id>/ is the no-op this destination exists '
+            'to avoid'
+        )
+        assert specimen.read_bytes() == preserved
 
     def test_an_intact_shared_rr_cache_is_left_alone(self, tmp_path: Path) -> None:
         """The control, and the one that falsifies resolving rr-cache wrongly.
@@ -1234,7 +1296,7 @@ class TestLinkedWorktreeIsTheProductionShape:
         assert result.verdict == 'clean'
         assert result.merge_rr_backup is None
         assert (git_dir / 'MERGE_RR').read_bytes() == original
-        assert list(git_dir.glob('MERGE_RR.quarantined-*')) == []
+        assert _specimens(repo / '.git') == []
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1336,7 @@ class TestPreflightRepairsOnlyTheWorktreeItWasGiven:
     def _assert_outer_untouched(repo: Path) -> None:
         git_dir = repo / '.git'
         assert (git_dir / 'MERGE_RR').exists(), 'foreign MERGE_RR was quarantined'
-        assert list(git_dir.glob('MERGE_RR.quarantined-*')) == []
+        assert _specimens(git_dir) == []
         assert (git_dir / 'MERGE_RR.lock').exists(), 'foreign lock was unlinked'
 
     def test_plain_directory_inside_a_repo_resolves_to_nothing(
@@ -1390,7 +1452,7 @@ class TestGitOpsGuardedAbort:
         assert rc == 0, err
         assert not (repo / '.git' / 'rebase-merge').exists()
         assert _git_ok(repo, 'status', '--porcelain') == ''
-        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        backups = _specimens(repo / '.git')
         assert len(backups) == 1
         assert conflict_id.encode() in backups[0].read_bytes()
 
@@ -1433,7 +1495,7 @@ class TestGitOpsGuardedAbort:
             await rebase_recovery.guarded_abort('rebase', repo, spy_run)
 
         assert observed == ['preflight', 'abort']
-        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        backups = _specimens(repo / '.git')
         assert len(backups) == 1, 'the preflight that ran first kept the evidence'
         assert conflict_id.encode() in backups[0].read_bytes()
 
@@ -1755,7 +1817,7 @@ class TestQuarantineFailureDoesNotSwallowTheAbort:
         assert conflict_id in ' '.join(result.unrepaired)
         assert merge_rr.read_bytes() == original, 'the damage is still in place'
 
-        backups = list((repo / '.git').glob('MERGE_RR.quarantined-*'))
+        backups = _specimens(repo / '.git')
         assert [b.read_bytes() for b in backups] == [original], (
             'the copy the first half made is evidence, and it must survive'
         )
@@ -1962,7 +2024,7 @@ class TestPreflightCli:
         assert [d['conflict_id'] for d in payload['dangling']] == [conflict_id]
         assert payload['merge_rr_backup'] is None
         assert merge_rr.read_bytes() == original
-        assert list((repo / '.git').glob('MERGE_RR.quarantined-*')) == []
+        assert _specimens(repo / '.git') == []
 
     def test_stdout_is_exactly_one_json_object(
         self, tmp_path: Path, capsys,

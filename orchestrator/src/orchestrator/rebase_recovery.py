@@ -149,9 +149,14 @@ class MergeRrScan:
     managed to inspect — unknown, and unknown is not healthy.  A rename needs
     write permission on the DIRECTORY rather than read on the file, so an
     unreadable MERGE_RR can still be moved aside and its evidence kept.
+
+    ``common_dir`` is carried because it is where a quarantined MERGE_RR goes,
+    and it is the one directory in play that outlives the worktree -- see
+    :func:`_quarantine_dir`.
     """
 
     merge_rr_path: Path
+    common_dir: Path
     records: tuple[MergeRrRecord, ...]
     dangling: tuple[MergeRrRecord, ...]
     unparsable: tuple[bytes, ...]
@@ -207,6 +212,7 @@ def scan_merge_rr(*, git_dir: Path, common_dir: Path) -> MergeRrScan:
     )
     return MergeRrScan(
         merge_rr_path=merge_rr_path,
+        common_dir=common_dir,
         records=parsed.records,
         dangling=dangling,
         unparsable=parsed.unparsable,
@@ -241,6 +247,10 @@ def _suspicion(
 #: name to try.
 _QUARANTINE_STAMP = '%Y%m%dT%H%M%S'
 
+#: Directory under the COMMON git dir that holds quarantined MERGE_RR files.
+#: Common-dir, not per-worktree, for the reason :func:`_quarantine_dir` gives.
+_QUARANTINE_DIRNAME = 'rerere-specimens'
+
 #: How many names to try before giving up and reporting the MERGE_RR
 #: un-repaired.  Each failure means another run claimed that exact name in
 #: between, so exhausting this needs a burst of concurrent preflights on one
@@ -258,10 +268,12 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
     The file is MOVED rather than deleted because it is the only record of
     which conflict ids the wedged worktree was carrying, and the abort that
     follows would otherwise destroy it — a successful ``git rebase --abort``
-    deletes MERGE_RR outright.  Backup names never collide, so a worktree that
-    wedges twice keeps both wedges' evidence rather than overwriting the first
-    with the second — and that holds for CONCURRENT runs, not just ordered
-    ones, because the name is CLAIMED rather than merely found free.  A counter
+    deletes MERGE_RR outright.  It moves to the COMMON dir rather than beside
+    the original, for the reason :func:`_quarantine_dir` gives.  Backup names
+    never collide, so a worktree that wedges twice keeps both wedges' evidence
+    rather than overwriting the first with the second — and that holds for
+    CONCURRENT runs, not just ordered ones, because the name is CLAIMED rather
+    than merely found free.  A counter
     that checks ``exists()`` and then renames answers only the sequential case:
     two preflights on the same worktree in the same second both see the base
     name free, and ``Path.rename`` on POSIX silently replaces its destination,
@@ -294,8 +306,9 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
         return None
 
     for _ in range(_QUARANTINE_CLAIM_ATTEMPTS):
-        backup = _free_backup_path(scan.merge_rr_path)
+        backup = _free_backup_path(scan)
         try:
+            backup.parent.mkdir(parents=True, exist_ok=True)
             os.link(scan.merge_rr_path, backup)
         except FileExistsError:
             continue          # another run claimed it; take the next name
@@ -336,15 +349,55 @@ def quarantine_merge_rr(scan: MergeRrScan) -> Path | None:
     return backup
 
 
-def _free_backup_path(merge_rr_path: Path) -> Path:
-    """First unused ``MERGE_RR.quarantined-<stamp>[-<n>]`` beside the original.
+def _quarantine_dir(scan: MergeRrScan) -> Path:
+    """Where evidence is kept: a COMMON-dir directory, NOT beside the original.
+
+    In a linked worktree MERGE_RR lives in ``.git/worktrees/<id>/``, a
+    directory the worktree lifecycle OWNS: any successful landing, reaper sweep
+    or ``cleanup_worktree`` removes it and everything inside it.  Evidence kept
+    there survives exactly until the task succeeds -- which is the case nobody
+    is looking at, so preservation that is a no-op on the common path is
+    indistinguishable from the ``rm`` this module refuses to do.  A real
+    specimen was lost exactly that way (task 5033, merge ``dcbff02f00``).
+
+    The common dir is the natural home rather than merely a surviving one: it
+    already holds ``rr-cache``, so a specimen sits beside the thing it is
+    evidence ABOUT, and it outlives every worktree by construction.  It is also
+    necessarily on the same filesystem as the MERGE_RR being moved, which the
+    link-then-unlink in :func:`quarantine_merge_rr` requires.
+    """
+    return scan.common_dir / _QUARANTINE_DIRNAME
+
+
+def _worktree_token(scan: MergeRrScan) -> str:
+    """Which worktree a specimen came from, for a name that must now say so.
+
+    Beside the original, the containing directory identified the worktree.  In
+    the shared directory the NAME has to, or two worktrees' specimens are
+    indistinguishable to a reader and collide for the claim.  The per-worktree
+    git dir is named for the worktree; the main checkout's git dir IS the
+    common dir and carries no such name.
+    """
+    git_dir = scan.merge_rr_path.parent
+    try:
+        if git_dir.resolve() == scan.common_dir.resolve():
+            return 'main'
+    except OSError:
+        pass          # unresolvable is not the main checkout; name it as found
+    return git_dir.name
+
+
+def _free_backup_path(scan: MergeRrScan) -> Path:
+    """First unused ``<common>/rerere-specimens/MERGE_RR.<worktree>-<stamp>``.
 
     A CANDIDATE, not a reservation: between this answer and the claim another
     process may take the name, which is why the caller claims it exclusively
     and asks again rather than trusting this.
     """
     stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
-    base = merge_rr_path.with_name(f'{merge_rr_path.name}.quarantined-{stamp}')
+    base = _quarantine_dir(scan) / (
+        f'{scan.merge_rr_path.name}.{_worktree_token(scan)}-{stamp}'
+    )
     if not base.exists():
         return base
     counter = 2
@@ -959,7 +1012,13 @@ async def guarded_abort(
     line carries.
 
     Returns *run*'s ``(rc, stdout, stderr)`` unchanged, so no call site's
-    control flow, return value or logging has to change.
+    control flow or return value has to change.  A FAILED abort is logged
+    here, at the one point that sees every abort's exit code, rather than at
+    each of the four call sites: a caller that discards the rc would otherwise
+    report "aborted" for an abort that did not happen, and the worktree it
+    then hands on is half-applied rather than clean.  Logging cannot make such
+    a caller correct — it makes the failure legible instead of silent, which
+    is the fail-soft floor this module holds everywhere else.
     """
     result = await asyncio.to_thread(preflight_rebase_recovery, cwd)
     if result.verdict == VERDICT_BLOCKED:
@@ -968,7 +1027,15 @@ async def guarded_abort(
             'did not repair: %s',
             verb, cwd, '; '.join(result.unrepaired),
         )
-    return await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
+    rc, out, err = await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
+    if rc != 0:
+        logger.warning(
+            'git %s --abort FAILED in %s (rc %d): %s. The worktree is NOT '
+            'clean: whatever the abort was undoing is still on disk, so any '
+            'step that runs next sees a half-applied tree.',
+            verb, cwd, rc, (err or out or '').strip() or '(no output)',
+        )
+    return rc, out, err
 
 
 # ---------------------------------------------------------------------------

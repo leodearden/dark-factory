@@ -9607,8 +9607,8 @@ class GitOps:
         rebases the branch in *worktree* onto that ref instead.  This is used
         by ``stack_train_branches`` to chain members into a linear stack.
 
-        Returns True on success.  On failure, aborts the rebase so the
-        worktree is left in a clean state, and returns False.
+        Returns True on success.  On failure, ATTEMPTS a guarded abort and
+        returns False — which does NOT imply a clean worktree: aborts fail.
 
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
@@ -9892,8 +9892,8 @@ class GitOps:
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
-        survivor (re-link invariant).  The conflicting branch is left clean by
-        rebase_onto_main's ``git rebase --abort``.
+        survivor (re-link invariant).  rebase_onto_main ATTEMPTS a guarded
+        abort on the conflicting branch; a clean tree is not guaranteed.
 
         A missing worktree directory is treated as an eject (defensive;
         logged at WARNING level).
