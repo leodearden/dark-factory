@@ -64,7 +64,7 @@ def _load_watchdog() -> types.ModuleType:
 def _neutralize_fleet_clock_gates(
     wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stub BOTH of staleness_pass's fleet deploy-clock gates to "not blocking".
+    """Stub ALL THREE of staleness_pass's fleet coordination gates to "not blocking".
 
     For the many staleness_pass tests that are about something else entirely
     (enumeration, per-unit probes, delegation, exception isolation) and just
@@ -79,19 +79,30 @@ def _neutralize_fleet_clock_gates(
     is a hollow pass or a machine-state-dependent flake rather than a hard
     error) nothing flags it. Each gate added to the pass has so far meant
     another sweep across every such test — task 2396 added the min-interval
-    stub, task 4754 the head-start stub — so the list lives in ONE place and
-    the next gate is a one-line edit here.
+    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub —
+    so the list lives in ONE place and the next gate is a one-line edit here.
+
+    Scoped to staleness_pass's OWN gate prefix, which is what "all three" means
+    here: _count_head_start_skip_lines and _head_start_skip_line_emitted_at
+    hold the head-start gate OPEN, so the pass returns before ever reaching the
+    lease read and neither needs this helper's third line.
 
     Deliberately NOT used by the acceptance tests that must exercise the real
     file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
     expiry_real_clock_file, test_staleness_pass_head_start_fails_open_on_
     unreadable_fleet_clock, test_staleness_head_start_gates_read_separate_
-    clocks, and the boundary-scenario clock-file tests — which point
-    FLEET_DEPLOY_CLOCK_PATH at a tmp file instead and monkeypatch neither
-    gate. Nor by tests that hold a gate OPEN (lambda: True) on purpose.
+    clocks, the boundary-scenario clock-file tests, and the task-4755 lease
+    acceptance tests — which point FLEET_DEPLOY_CLOCK_PATH / FLEET_LEASE_PATH
+    at a tmp file instead and monkeypatch neither gate. Nor by tests that hold
+    a gate OPEN (lambda: True) on purpose.
     """
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    # task 4755 added the in-flight lease gate. Same hazard as the two above,
+    # with one extra edge: the lease is read TWICE per pass (once at the top,
+    # once again immediately before delegating, to close the read-then-act
+    # window), so an unstubbed test reads live machine state twice.
+    monkeypatch.setattr(wdog, "_live_fleet_lease", lambda: None)
 
 
 def _neutralize_fm_clock_gates(
@@ -104,6 +115,11 @@ def _neutralize_fm_clock_gates(
     REPO_DIR and therefore live). Kept as a SEPARATE helper rather than one
     parameterized by tier so no test can neutralize the wrong tier's gates,
     mirroring the two separate zero-arg gates in the watchdog itself.
+
+    Still exactly TWO gates after task 4755: the in-flight lease is written by
+    restart-all-orchestrators.sh only, so fused_memory_staleness_pass has no
+    lease to neutralize. Stubbing the fleet's here would be the cross-fleet
+    coupling the two-independent-clocks design forbids.
 
     Deliberately NOT used by the fm acceptance tests that must exercise the
     real file reads (test_fm_staleness_head_start_anchored_on_fm_min_interval_
@@ -2981,6 +2997,52 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must still restart a port-down unit even when the fleet-deploy "
         f"clock gate is engaged; got {restarted}"
+    )
+
+
+def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5 twin for task 4755's lease: it is the ONE gate main() may honour, and
+    only for the single unit the sweep names.
+
+    Every other gate is pinned "unaffected" outright by the sibling above.  The
+    lease cannot be, because suppressing the liveness restart of the unit a
+    sweep is currently restarting is the whole point of F4 — so the I5 pin here
+    is the complementary half: the suppression is keyed on EXACT equality with
+    current_unit, so it can never widen into the blanket liveness disable I5
+    forbids.
+
+    The case chosen is the one the producer actually writes and the obvious
+    wrong implementations all fail: lease_acquire stamps ``"current_unit": ""``
+    and only the per-unit loop fills it in, so between acquisition and the first
+    unit there is a real window in which the lease names nothing.  Under a
+    truthiness, substring or startswith test that empty string matches EVERY
+    unit, disabling liveness fleet-wide for as long as the window lasts.
+
+    Complements test_main_still_restarts_a_different_unit_while_a_sweep_holds_
+    the_lease in the task-4755 section below, which pins the same scoping for a
+    lease naming a DIFFERENT real unit.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    lease_file = tmp_path / "just-acquired.json"
+    lease_file.write_text(
+        json.dumps({"pid": os.getpid(), "started_ts": time.time(), "current_unit": ""})
+    )
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(lease_file))
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == ["orchestrator-dark-factory.service"], (
+        f"a live lease that names no unit yet must suppress liveness for NO "
+        f"unit; got {restarted}"
     )
 
 
@@ -10582,3 +10644,103 @@ def test_report_never_creates_or_removes_the_lease(
     assert recorded_calls, "report() must have driven its real helpers"
     _assert_zero_mutating_calls(recorded_calls)
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# Cross-tier drift pins for the lease (task 4755)
+#
+# The lease has the same four-mirror shape as the fleet deploy clock, and the
+# same failure mode if a mirror drifts: silently green. A watchdog reading a
+# different path than the script writes never sees a lease, so the backstop
+# un-gates itself and the collision this task exists to close reopens — with
+# every other test still passing. The df_pytest_isolation leg is worse still:
+# it would watch a file nobody writes, leaving the suite free to falsify the
+# REAL lease while reporting nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_lease_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-flight lease path literal must not diverge across its FOUR tiers.
+
+    Sibling of test_fleet_deploy_clock_path_matches_across_tiers above, same
+    rationale and the same set of tiers that cannot import each other:
+    orchestrator.service_restart.FLEET_LEASE_RELPATH is authoritative; the
+    stdlib watchdog (FLEET_LEASE_PATH), restart-all-orchestrators.sh
+    (LEASE_FILE) and df_pytest_isolation (stdlib+pytest only, since every
+    subproject conftest imports it) each hardcode a mirror.
+
+    The df_pytest_isolation leg is asserted against
+    PROTECTED_DEPLOY_CLOCK_ENV_VARS, not only against the derived
+    PROTECTED_DEPLOY_CLOCK_RELPATHS tuple: since task 5299 that dict is the
+    single place the watched-relpath tuple, the suite-wide redirect fixture and
+    the failure message's "set $VAR" remedy all derive from, so pinning
+    membership alone would leave the env var name — the half that makes the
+    guard's message actionable — unpinned.
+    """
+    from orchestrator.service_restart import FLEET_LEASE_RELPATH
+
+    # --- watchdog mirror (FLEET_LEASE_PATH) ---
+    monkeypatch.delenv("ORCH_FLEET_LEASE", raising=False)
+    wdog = _load_watchdog()
+    assert str(pathlib.Path(wdog.REPO_DIR) / FLEET_LEASE_RELPATH) == wdog.FLEET_LEASE_PATH
+
+    # --- bash script mirror (LEASE_FILE default) ---
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(r'LEASE_FILE="\$\{ORCH_FLEET_LEASE:-\$REPO_DIR/([^}]+)\}"', script_src)
+    assert match is not None, (
+        "restart-all-orchestrators.sh LEASE_FILE default pattern not found — "
+        "did its literal shape change? Update this regex to match."
+    )
+    assert match.group(1) == FLEET_LEASE_RELPATH
+
+    # --- pytest-guard mirror (df_pytest_isolation, tasks 3797 + 5299) ---
+    import df_pytest_isolation
+
+    assert FLEET_LEASE_RELPATH in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off "
+        f"FLEET_LEASE_RELPATH ({FLEET_LEASE_RELPATH!r}); the suite-wide guard "
+        "would watch a file nobody writes, leaving a test free to release a "
+        "genuine in-flight sweep's lease with nothing reported."
+    )
+    assert (
+        df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_ENV_VARS[FLEET_LEASE_RELPATH]
+        == "ORCH_FLEET_LEASE"
+    ), (
+        "the guard's redirect and its failure message both read the env var out "
+        "of PROTECTED_DEPLOY_CLOCK_ENV_VARS; a drifted name there redirects the "
+        "wrong variable and tells a 3am reader to set one that does nothing."
+    )
+
+
+def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The max-age bound's default must not drift across its three statements.
+
+    Modelled on test_orch_restart_min_interval_secs_matches_config_default
+    above. The bound is what makes a SIGKILLed sweep cost at most one delayed
+    window, and its 7200s value is DERIVED (worst legitimate sweep ~= 6270s),
+    not chosen — so a tier drifting off it is a silent correctness change, not
+    a cosmetic one. The bash script never reads the knob (it holds its lease
+    for as long as the sweep takes), so its statement is the documented default
+    in the header env-knob block; a reader who trusts that block and a reader
+    who trusts the code must not be told different numbers.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.delenv("ORCH_FLEET_LEASE_MAX_AGE_SECS", raising=False)
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
+    wdog = _load_watchdog()
+
+    assert pytest.approx(
+        OrchestratorConfig().orchestrator_restart_lease_max_age_secs
+    ) == wdog.FLEET_LEASE_MAX_AGE_SECS
+
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(
+        r"ORCH_FLEET_LEASE_MAX_AGE_SECS.*?\(default: (\d+)", script_src, re.DOTALL
+    )
+    assert match is not None, (
+        "restart-all-orchestrators.sh no longer documents "
+        "ORCH_FLEET_LEASE_MAX_AGE_SECS's default in its header env-knob block — "
+        "update this regex, or the operator-facing number is unpinned."
+    )
+    assert int(match.group(1)) == wdog.FLEET_LEASE_MAX_AGE_SECS
