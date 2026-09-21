@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
-from shared.task_statuses import ACTIVE
+from shared.task_statuses import ACTIVE, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
@@ -19,8 +19,9 @@ from dashboard.data.active_tasks import (
     collect_active_tasks,
     collect_tasks_with_counts,
 )
+from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
-from dashboard.data.task_snapshot import SnapshotHealth, classify
+from dashboard.data.task_snapshot import SnapshotHealth, TaskSnapshot, classify
 
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
@@ -316,6 +317,22 @@ def _degraded(snapshots) -> list[str]:
 
 def _count_unknown(snapshots) -> list[str]:
     return _labelled(snapshots, SnapshotHealth.COUNT_UNKNOWN)
+
+
+def _measured_census(snapshot: TaskSnapshot) -> TaskCensus:
+    """The census of a snapshot that is asserted to have measured one.
+
+    ``Datum.value`` is optional by design — an UNKNOWN or BUDGET snapshot
+    carries none — so every read of it has to say which case it expects. This
+    says "measured", and fails naming the state it actually found rather than
+    raising ``AttributeError`` on ``None`` three frames later.
+    """
+    census = snapshot.census.value
+    assert census is not None, (
+        f'expected a measured census, got state {snapshot.census.state} '
+        f'({snapshot.census.reason})'
+    )
+    return census
 
 
 def _done_counts(snapshots) -> dict[str, int]:
@@ -1685,7 +1702,7 @@ class TestShapeOneProjectNarrowing:
                 f'the default render must never request terminal rows: {call}'
             )
         assert {r['title'] for r in active} == {'task 1', 'task 2'}
-        assert snapshot.census.value.counts['done'] == 50
+        assert _measured_census(snapshot).counts[TaskStatus.DONE] == 50
 
     async def test_every_per_project_call_carries_the_per_request_budget(
         self, monkeypatch, tmp_path, dummy_client
@@ -1776,11 +1793,11 @@ class TestShapeOneProjectNarrowing:
         assert classify(snapshot) is SnapshotHealth.OK
         emitted_done = [r for r in active if r.get('status') == 'done']
         assert emitted_done == [], 'sanity: the rows really are ACTIVE-only'
-        assert snapshot.census.value.counts['done'] == 20, (
+        assert _measured_census(snapshot).counts[TaskStatus.DONE] == 20, (
             'the done count must come from the compact status map (20), not '
             f'from the {len(emitted_done)} done rows the render fetched'
         )
-        assert snapshot.census.value.total == 21
+        assert _measured_census(snapshot).total == 21
 
     async def test_offline_active_fetch_still_reports_the_project_offline(
         self, monkeypatch, tmp_path, dummy_client
