@@ -56,7 +56,7 @@ except ImportError as exc:  # pragma: no cover - exercised by the hook, not pyte
 _ARTIFACTS = (metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
 
 
-def _git(root: Path, *args: str) -> str:
+def _git(root: Path, *args: str, stdin: str | None = None) -> str:
     """Every git invocation this gate makes.
 
     ``check=True``: a plumbing call that fails is an instrument failure, and
@@ -68,6 +68,7 @@ def _git(root: Path, *args: str) -> str:
     """
     return subprocess.run(
         ['git', '-C', str(root), *args],
+        input=stdin,
         check=True,
         text=True,
         encoding='utf-8',
@@ -135,6 +136,48 @@ def _refuse_unrecorded(
     ]
 
 
+def _restored_from(root: Path, staged_oid: str) -> str | None:
+    """The commit whose baseline blob *staged_oid* restores, or None.
+
+    RESTORING BYTES THIS PATH ALREADY CARRIED IS NOT A NEW RAISE. Reverting a
+    revert puts back an image the repository already reviewed and recorded, and
+    demanding a fresh authorization for it would make the honest move the
+    expensive one. Verified exact on the real revert: `3e7d55ce47:<baseline>`,
+    `5f577b9613^:<baseline>` and `52d98220ad:<baseline>` are all blob
+    a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191.
+
+    BLOB IDENTITY, not a per-measure high-water mark. A high-water rule also
+    exempts that revert, but it stays permissively open afterwards, so a later
+    re-raise back to an old high-water would go unrecorded.
+
+    ``--full-history`` is load-bearing rather than decorative: git's default
+    history simplification omits commits from a path's log, which would silently
+    NARROW the carve-out and refuse a legitimate restore. And the enumeration
+    resolves ``<commit>:<baseline>`` rather than asking whether the object
+    exists, which is what scopes identity to this path -- a blob that happens to
+    sit elsewhere in the tree must not license a baseline.
+    """
+    baseline = metrics.BASELINE_RELPATH
+    commits = _git(
+        root, 'rev-list', '--full-history', 'HEAD', '--', baseline
+    ).split()
+    if not commits:
+        return None
+    resolved = _git(
+        root,
+        'cat-file',
+        '--batch-check',
+        stdin='\n'.join(f'{commit}:{baseline}' for commit in commits),
+    )
+    # One line per revision, in the order fed in: "<oid> <type> <size>", or
+    # "<revision> missing" where the path did not exist at that commit -- whose
+    # first field is the revision string, so it can never match an oid.
+    for commit, line in zip(commits, resolved.splitlines(), strict=False):
+        if line.split()[:1] == [staged_oid]:
+            return commit
+    return None
+
+
 def _audit_baseline(root: Path, scratch: Path) -> list[str]:
     """Audit the staged baseline against HEAD's. Empty list means clean."""
     baseline = metrics.BASELINE_RELPATH
@@ -157,6 +200,15 @@ def _audit_baseline(root: Path, scratch: Path) -> list[str]:
         _image(root, staged_oid, scratch / 'current.json'),
     )
     if not raises:
+        return []
+
+    restored = _restored_from(root, staged_oid)
+    if restored is not None:
+        print(
+            f'ratchet commit gate: {baseline} restores the blob recorded at '
+            f'this path by commit {restored}, absorbing {len(raises)} '
+            'measure(s) this repository has already reviewed. Allowed.'
+        )
         return []
 
     appended = metrics.ledger_appended_entries(
