@@ -9,21 +9,40 @@ Covers:
           restart, write-through on every mutation, fail-open loads, and the
           load-merge-write that keeps two owners of one file from erasing
           each other.
+  step-5: the TTL that bounds it — expiry hides AND prunes, the boundary is
+          exact, and a re-asserted set member neither refreshes its clock nor
+          rewrites its file.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import MutableMapping, MutableSet
-from datetime import timedelta
+from collections.abc import Callable, MutableMapping, MutableSet
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import shared.safe_io as _safe_io
 
 from orchestrator.guard_state import PersistentMap, PersistentSet
 
 _TTL = timedelta(days=1)
+
+# A round, arbitrary instant.  Every TTL assertion is relative to it, so no
+# test here depends on the wall clock.
+_T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _frozen_clock() -> tuple[list[datetime], Callable[[], datetime]]:
+    """A clock the test advances by hand.
+
+    ``guard_state`` never reads the wall clock internally (the
+    ``chronic_flake.FilingLedger`` convention), which is what makes expiry
+    exactly assertable instead of sleep-dependent.
+    """
+    frozen = [_T0]
+    return frozen, lambda: frozen[0]
 
 
 def _spy_on_writes(monkeypatch) -> list[tuple]:
@@ -313,3 +332,132 @@ class TestGuardStateDurability:
         kwargs = calls[0][2]
         assert kwargs.get('encoding') == 'utf-8'
         assert kwargs.get('mkdir') is True, 'the guards/ directory is created on demand'
+
+
+# ---------------------------------------------------------------------------
+# step-5 — the TTL that bounds the state
+# ---------------------------------------------------------------------------
+
+class TestGuardStateTtl:
+    """A guard must not outlive its subject, and its file must not grow
+    without bound.  Both follow from one TTL applied on read AND on write."""
+
+    _WEEK = timedelta(days=7)
+
+    def test_an_expired_set_member_is_indistinguishable_from_an_absent_one(
+        self, tmp_path: Path,
+    ):
+        frozen, clock = _frozen_clock()
+        guard = PersistentSet(tmp_path / 'capped.json', ttl=self._WEEK, now=clock)
+        guard.add('k')
+
+        frozen[0] = _T0 + self._WEEK + timedelta(seconds=1)
+
+        assert 'k' not in guard
+        assert len(guard) == 0
+        assert list(guard) == []
+
+    def test_an_expired_map_entry_is_indistinguishable_from_an_absent_one(
+        self, tmp_path: Path,
+    ):
+        frozen, clock = _frozen_clock()
+        guard = PersistentMap(tmp_path / 'counts.json', ttl=self._WEEK, now=clock)
+        guard['k'] = 3
+
+        frozen[0] = _T0 + self._WEEK + timedelta(seconds=1)
+
+        assert 'k' not in guard
+        assert guard.get('k', 0) == 0
+        assert len(guard) == 0
+        with pytest.raises(KeyError):
+            guard['k']
+
+    def test_the_boundary_is_exact(self, tmp_path: Path):
+        """One second short of the TTL the guard is still in force.
+
+        Pinned so a later refactor cannot quietly halve the window.
+        """
+        frozen, clock = _frozen_clock()
+        guard = PersistentSet(tmp_path / 'capped.json', ttl=self._WEEK, now=clock)
+        guard.add('k')
+
+        frozen[0] = _T0 + self._WEEK - timedelta(seconds=1)
+
+        assert 'k' in guard
+
+    def test_expiry_is_pruned_from_disk_not_merely_hidden(self, tmp_path: Path):
+        """Hiding alone would leave the file growing forever; the prune on
+        flush is what bounds it."""
+        path = tmp_path / 'capped.json'
+        frozen, clock = _frozen_clock()
+        guard = PersistentSet(path, ttl=self._WEEK, now=clock)
+        guard.add('stale')
+
+        frozen[0] = _T0 + self._WEEK + timedelta(seconds=1)
+        guard.add('fresh')
+
+        on_disk = json.loads(path.read_text(encoding='utf-8'))
+        assert sorted(on_disk) == ['fresh']
+
+    def test_expiry_is_pruned_on_load_too(self, tmp_path: Path):
+        """A restart after a long quiet period must not re-import dead rows,
+        even with no write to trigger a prune."""
+        path = tmp_path / 'capped.json'
+        frozen, clock = _frozen_clock()
+        PersistentSet(path, ttl=self._WEEK, now=clock).add('stale')
+
+        frozen[0] = _T0 + self._WEEK + timedelta(seconds=1)
+
+        assert len(PersistentSet(path, ttl=self._WEEK, now=clock)) == 0
+
+    def test_re_adding_a_live_member_neither_refreshes_nor_writes(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The scheduler re-asserts every non-pending task id on every ~15s
+        tick.  A refreshing ``add`` would make the TTL measure "last seen"
+        instead of "first observed" — so a task that stays terminal would
+        never expire — and would rewrite the file ~5,760 times a day.
+        """
+        path = tmp_path / 'was_non_pending.json'
+        frozen, clock = _frozen_clock()
+        guard = PersistentSet(path, ttl=self._WEEK, now=clock)
+        guard.add('k')
+
+        calls = _spy_on_writes(monkeypatch)
+        frozen[0] = _T0 + timedelta(days=1)
+        guard.add('k')
+
+        assert calls == [], 'a re-assertion of a live member must be silent'
+        stored = json.loads(path.read_text(encoding='utf-8'))['k']['updated_at']
+        assert datetime.fromisoformat(stored) == _T0, 'first observed, not last seen'
+
+    def test_re_setting_a_map_entry_always_refreshes(self, tmp_path: Path):
+        """The opposite rule, deliberately: a counter still being bumped has a
+        subject that is demonstrably still alive, so its TTL tracks the bump.
+        """
+        path = tmp_path / 'counts.json'
+        frozen, clock = _frozen_clock()
+        guard = PersistentMap(path, ttl=self._WEEK, now=clock)
+        guard['k'] = 1
+
+        frozen[0] = _T0 + timedelta(days=1)
+        guard['k'] += 1
+
+        stored = json.loads(path.read_text(encoding='utf-8'))['k']['updated_at']
+        assert datetime.fromisoformat(stored) == _T0 + timedelta(days=1)
+
+    def test_the_file_is_unlinked_once_nothing_is_left(self, tmp_path: Path):
+        """``data/orchestrator/guards/`` must not accumulate dead files, so an
+        empty merged map releases the file rather than writing ``{}``."""
+        path = tmp_path / 'capped.json'
+        frozen, clock = _frozen_clock()
+        guard = PersistentSet(path, ttl=self._WEEK, now=clock)
+        guard.add('k')
+        assert path.exists()
+
+        frozen[0] = _T0 + self._WEEK + timedelta(seconds=1)
+        guard.discard('k')
+        assert not path.exists()
+
+        guard.add('fresh')
+        assert path.exists(), 'and a later mark recreates it'
