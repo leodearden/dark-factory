@@ -6,6 +6,7 @@ The watchdog module has a hyphenated filename so it cannot be imported via
 No live systemd runtime is needed — all subprocess.run calls are monkeypatched.
 """
 
+import ast
 import contextlib
 import importlib.util
 import json
@@ -91,10 +92,14 @@ def _neutralize_fleet_clock_gates(
     file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
     expiry_real_clock_file, test_staleness_pass_head_start_fails_open_on_
     unreadable_fleet_clock, test_staleness_head_start_gates_read_separate_
-    clocks, the boundary-scenario clock-file tests, and the task-4755 lease
-    acceptance tests — which point FLEET_DEPLOY_CLOCK_PATH / FLEET_LEASE_PATH
-    at a tmp file instead and monkeypatch neither gate. Nor by tests that hold
-    a gate OPEN (lambda: True) on purpose.
+    clocks, and the boundary-scenario clock-file tests — which point
+    FLEET_DEPLOY_CLOCK_PATH at a tmp file instead and monkeypatch neither
+    gate. Nor by tests that hold a gate OPEN (lambda: True) on purpose.
+
+    The task-4755 lease acceptance tests are the one hybrid: _wire_stale_unit
+    calls this helper and then RE-ARMS _live_fleet_lease, so the two gates it
+    is not testing stay stubbed while the one it is testing reads a real tmp
+    file. See the comment there for why re-arming beats opting out.
     """
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
@@ -4068,6 +4073,7 @@ _BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 import json
 import os
 import sys
+import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
 
@@ -4082,6 +4088,36 @@ def _save(state):
         json.dump(state, f)
 
 
+def _observe_lease(args):
+    """Snapshot the in-flight fleet-redeploy lease as of THIS call (task 4755).
+
+    This fake is the only vantage point a test has on the lease while it is
+    actually held: it runs as a descendant of restart-all-orchestrators.sh,
+    mid-sweep, whereas the test process only ever sees the before and after.
+
+    `pid_cmdline` is what turns "pid is a plausible integer" into "pid is the
+    sweep's own": the lease names a pid, and the process wearing that pid
+    right now is read straight out of /proc. Resolved HERE rather than in the
+    test because the pid is only guaranteed to still be running while the
+    sweep that recorded it is mid-flight.
+    """
+    obs = {"args": args, "observed_at": time.time(), "lease": None, "pid_cmdline": None}
+    try:
+        with open(os.environ.get("ORCH_FLEET_LEASE", "")) as f:
+            obs["lease"] = json.load(f)
+    except (OSError, ValueError):
+        return obs
+    pid = obs["lease"].get("pid") if isinstance(obs["lease"], dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return obs
+        obs["pid_cmdline"] = raw.replace(b"\\x00", b" ").decode(errors="replace").strip()
+    return obs
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -4090,6 +4126,7 @@ def main(argv):
 
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
+    state.setdefault("lease_observations", []).append(_observe_lease(args))
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
@@ -4431,7 +4468,13 @@ def test_boundary_fake_systemctl_matches_unit_suite_verbatim() -> None:
         f"could not locate FAKE_SYSTEMCTL_SRC in {_UNIT_SUITE_FAKE_SYSTEMCTL_PATH} "
         "-- has it been renamed or restructured?"
     )
-    unit_suite_fake = match.group(1)
+    # literal_eval, not group(1) raw: the right-hand side of this comparison is
+    # an ALREADY-EVALUATED literal, so scraping the left one as source text
+    # compares `\\x00` against `\x00` and reports drift where the two fakes
+    # write byte-identical scripts. Surfaced by task 4755's _observe_lease,
+    # the first shared body to contain a backslash at all; both fakes write the
+    # NUL byte /proc/<pid>/cmdline actually uses.
+    unit_suite_fake = ast.literal_eval("'''" + match.group(1) + "'''")
 
     assert _fake_systemctl_functional_body(unit_suite_fake) == _fake_systemctl_functional_body(
         _BOUNDARY_FAKE_SYSTEMCTL_SRC
@@ -10019,7 +10062,16 @@ def _wire_stale_unit(
     delegated: list[None] = []
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
+    # _neutralize_fleet_clock_gates stubs ALL THREE fleet gates, the lease
+    # included, so the gate under test here is re-armed immediately after.
+    # Re-arming beats hand-rolling the other two stubs: the helper stays the
+    # single place the gate list lives (its own docstring's rule), so a FOURTH
+    # gate added to the pass is still a one-line edit there and is correctly
+    # neutralized for these tests too, instead of silently reading live
+    # machine state off the hardcoded REPO_DIR.
+    real_lease_gate = wdog._live_fleet_lease
     _neutralize_fleet_clock_gates(wdog, monkeypatch)
+    monkeypatch.setattr(wdog, "_live_fleet_lease", real_lease_gate)
     monkeypatch.setattr(
         wdog, "_enumerate_running_units", lambda: [synthetic_unit("stale")]
     )
