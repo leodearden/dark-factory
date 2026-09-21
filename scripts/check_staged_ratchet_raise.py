@@ -151,10 +151,12 @@ def _restores_previous_image(root: Path, staged_oid: str) -> str | None:
     version of this function admitted any blob the path had EVER carried, which
     is a wholesale ratchet reset wearing a carve-out's clothes: staging the
     baseline from 60e954b608 was waved through "absorbing 97 measure(s)". A
-    per-measure high-water-mark rule was rejected for the same defect at a
-    different granularity -- both stay permissively open to every value the
-    ratchet has moved through, and returning to one re-absorbs every measure the
-    images in between lowered. One step back is bounded by construction.
+    per-measure high-water-mark rule was rejected for the SAME defect at a
+    different granularity -- blob identity was not the cure for it, merely the
+    same unboundedness at whole-image resolution. Both stay permissively open to
+    every value the ratchet has moved through, and returning to one re-absorbs
+    every measure the images in between lowered. One step back is the only form
+    of this rule that is bounded by construction.
 
     ``--full-history`` is load-bearing rather than decorative: git's default
     history simplification omits commits from a path's log, so it could report

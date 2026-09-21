@@ -374,18 +374,24 @@ def _ports_rise(report: dict) -> None:
 
 
 class TestRestoreCarveOut:
-    """Restoring a blob this path already carried is not a new raise.
+    """Undoing the LAST change to the baseline is not a new raise.
 
     Ruled by Leo and verified exact on the real revert: `3e7d55ce47:<baseline>`,
     `5f577b9613^:<baseline>` and `52d98220ad:<baseline>` are all blob
-    a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191. Without this, reverting a revert
-    -- putting back bytes the repository already reviewed and recorded -- would
-    demand a fresh authorization for a raise nobody re-introduced.
+    a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191. The measured shape is one step
+    back: a0fb5cc8e0 was the value at b79315a31c, 5f577b9613 replaced it with
+    0a42c2ee7d, and 3e7d55ce47 put a0fb5cc8e0 straight back --
+    `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4 raises, so the
+    carve-out really does fire for it. Without it, undoing a revert would demand
+    a fresh authorization for a raise nobody re-introduced.
 
-    Blob IDENTITY, scoped to the baseline's own path in HEAD's ancestry. A
-    per-measure high-water-mark rule would also exempt that revert, but it stays
-    permissively open afterwards, so a later re-raise back to an old high-water
-    would go unrecorded.
+    NOT "a blob this path ever carried", and not "already reviewed". Both were
+    wrong and this class once said both. The images that motivated this task
+    landed at 0b04534c7b and 52d98220ad with the ledger reading `"raises": []`,
+    so they were never reviewed as raises at all; and admitting any historical
+    blob is a wholesale ratchet reset, which ``TestTheCarveOutIsOneStepBack``
+    now refutes directly. The honest reason is narrower: the path's
+    immediately-previous value is the state this repository held one commit ago.
     """
 
     @staticmethod
