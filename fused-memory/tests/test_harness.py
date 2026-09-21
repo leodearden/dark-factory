@@ -14031,9 +14031,9 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
         """The whole-repo `git worktree list` is invariant across the pass, so
         the harness hoists it exactly as `_render_live_workflow_section` does
         and threads it to every probe — one worktree list per pass, not one per
-        cited task. `worktree_index_for`'s None means *unknown*: the kwarg is
-        then omitted and each probe falls back to its own list, so the fallback
-        is asserted separately from the hoist."""
+        cited task. `worktree_index_kwargs`'s bare `{}` means *unknown*: the
+        kwarg is then omitted and each probe falls back to its own list, so the
+        fallback is asserted separately from the hoist."""
         received: list[object] = []
 
         async def _fake_is_live(_tid, _pr, **kw):
@@ -14044,11 +14044,11 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
 
         calls: list[str] = []
 
-        async def _fake_index(project_root):
+        async def _fake_index_kwargs(project_root):
             calls.append(project_root)
-            return {'refs/heads/task/599': False}
+            return {'worktree_index': {'refs/heads/task/599': False}}
 
-        monkeypatch.setattr(harness_module, 'worktree_index_for', _fake_index)
+        monkeypatch.setattr(harness_module, 'worktree_index_kwargs', _fake_index_kwargs)
 
         await self._run_gate(
             journal=journal, event_buffer=event_buffer,
@@ -14066,31 +14066,45 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
     async def test_worktree_index_hoist_failure_falls_back_to_per_task_probe(
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
-        """FAIL-SAFE — a raising/None hoist omits the kwarg entirely rather than
+        """FAIL-SAFE — an unknown hoist omits the kwarg entirely rather than
         passing an empty index, which would report every cited task as
         worktree_registered=False from a hoisted ERROR and let a stranded
-        escalation fire for a genuinely live task."""
+        escalation fire for a genuinely live task.
+
+        Driven through the REAL `worktree_index_kwargs` by exploding the probe it
+        wraps: the wrapper owns the fail-safe catch (task 3778 review — one home
+        for the three-valued contract), so the harness sees only the bare `{}`
+        that means *unknown*, and the WARNING comes from the detector."""
         received: list[object] = []
 
         async def _fake_is_live(_tid, _pr, **kw):
             received.append('worktree_index' in kw)
             return False
 
-        import fused_memory.reconciliation.harness as harness_module
+        import fused_memory.services.live_workflow_detector as detector_module
 
         async def _boom(project_root):
             raise OSError('git worktree list exploded')
 
-        monkeypatch.setattr(harness_module, 'worktree_index_for', _boom)
+        monkeypatch.setattr(detector_module, 'worktree_index_for', _boom)
 
-        await self._run_gate(
-            journal=journal, event_buffer=event_buffer,
-            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
-            monkeypatch=monkeypatch, caplog=caplog,
-            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
-        )
+        with caplog.at_level(
+            logging.DEBUG, logger='fused_memory.services.live_workflow_detector',
+        ):
+            await self._run_gate(
+                journal=journal, event_buffer=event_buffer,
+                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+                monkeypatch=monkeypatch, caplog=caplog,
+                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+            )
 
         assert received == [False]
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.services.live_workflow_detector'
+            and r.levelno >= logging.WARNING
+            and 'worktree_index_unavailable' in r.getMessage()
+        ], 'an unknown hoist must be loud, not swallowed'
 # Private sentinel for TestRemediationSnapshotClockPinnedToTreeRead._run_gate_direct:
 # distinguishes "caller omitted filtered_task_tree_fetched_at entirely" (fallback
 # case) from "caller explicitly passed None" — a plain `None` default cannot

@@ -980,6 +980,22 @@ async def worktree_index_for(project_root: str) -> dict[str, bool] | None:
       no registered worktrees. No per-task probe is needed. Collapsing this
       into ``None`` would waste the entire hoist on the commonest cheap case.
     - ``{...}`` → *known*. Use it directly.
+
+    EVERY ``None`` IS LOGGED AT WARNING, here rather than at the callers. All
+    three failure legs — a spawn ``OSError``, a non-zero rc, and a timeout
+    (which ``run_git`` RETURNS as ``timed_out=True`` with a non-zero rc rather
+    than raising) — converge on this one function, and it is the only place
+    that knows it is about to hand back the "unknown" sentinel. A caller's
+    ``except Exception`` can only see an UNEXPECTED exception, so leaving these
+    legs at DEBUG made the designed failures the silent ones: an unknown index
+    costs every probed task its own re-probe, up to
+    ``MAX_ACTIVE_TASKS_RENDERED`` of them at ``_GIT_TIMEOUT`` each, which is
+    exactly the invisible degradation task 3778 exists to end.
+
+    The REPETITION is diagnostic, not noise: N+1 of these lines in one render
+    means the hoist failed and all N per-task fallbacks re-paid the cost, which
+    is the shape an operator needs to see. :func:`worktree_index_kwargs` is the
+    wrapper both fan-out call sites use.
     """
     try:
         result = await run_git(
@@ -987,17 +1003,63 @@ async def worktree_index_for(project_root: str) -> dict[str, bool] | None:
             timeout=_GIT_TIMEOUT,
         )
     except OSError as exc:
-        logger.debug('live_workflow_detector: worktree list failed: %s', exc)
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: spawn failed for %s '
+            '(%s) — every probed task falls back to its own worktree list',
+            project_root, exc,
+        )
         return None
 
     if result.returncode != 0:
-        logger.debug(
-            'live_workflow_detector: worktree list returned %d: %s',
-            result.returncode, result.stderr.strip(),
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: worktree list %s for '
+            '%s (rc=%d): %s — every probed task falls back to its own worktree list',
+            'TIMED OUT' if result.timed_out else 'returned non-zero',
+            project_root, result.returncode, result.stderr.strip(),
         )
         return None
 
     return parse_worktree_index(result.stdout)
+
+
+async def worktree_index_kwargs(project_root: str) -> dict[str, dict[str, bool]]:
+    """Return the ``detect_live_workflow`` kwargs carrying the hoisted index.
+
+    THE SINGLE HOME OF THE HOIST WIRING. A fan-out caller hoists the whole-repo
+    worktree list once and threads it into every per-task probe; doing that
+    correctly means honouring :func:`worktree_index_for`'s three-valued
+    contract, and spelling that out at each call site put one contract in two
+    places (task 3778 review). Both call sites are now a single splat::
+
+        liveness = await detect_live_workflow(
+            task_id, project_root, **await worktree_index_kwargs(project_root),
+        )
+
+    MIND THE TWO DIFFERENT ``{}``. This function's ``{}`` means *omit the
+    kwarg* — the index is unknown, so each task probes for itself exactly as it
+    did before the hoist existed. A known-empty repo is ``{'worktree_index':
+    {}}``, a real answer that suppresses the per-task probes. Collapsing the two
+    would either waste the hoist on the commonest cheap case or report every
+    task ``worktree_registered=False`` from a hoisted ERROR — see
+    :func:`worktree_index_for` for why that false negative is the one to avoid.
+
+    The fail-safe catch lives here so no caller can forget it: an unexpected
+    exception (anything :func:`worktree_index_for` does not already classify)
+    degrades to the per-task probe and is logged at WARNING with a traceback.
+    The three ANTICIPATED failures are already logged by
+    :func:`worktree_index_for` itself, so every path to "unknown" is loud
+    exactly once.
+    """
+    try:
+        index = await worktree_index_for(project_root)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.worktree_index_unavailable: hoist raised for %s '
+            '— every probed task falls back to its own worktree list',
+            project_root, exc_info=True,
+        )
+        return {}
+    return {} if index is None else {'worktree_index': index}
 
 
 def _registration_from_index(index: Mapping[str, bool], branch: str) -> tuple[bool, bool]:
@@ -1013,14 +1075,14 @@ async def _check_worktree_registered(project_root: str, branch: str) -> tuple[bo
 
     Runs the porcelain probe for THIS branch alone and reads the answer out of
     :func:`parse_worktree_index`. Any subprocess error or unexpected output
-    silently returns ``(False, False)`` (fail-safe) — note this deliberately
-    differs from :func:`worktree_index_for`, which distinguishes failure
-    (``None``) from emptiness; here the caller has no third state to express.
+    returns ``(False, False)`` (fail-safe) — note this deliberately differs from
+    :func:`worktree_index_for`, which distinguishes failure (``None``) from
+    emptiness; here the caller has no third state to express. The failure itself
+    is not silent: :func:`worktree_index_for` logs every ``None`` at WARNING.
 
     Callers fanning this out across many tasks should hoist
-    :func:`worktree_index_for` instead and pass its result to
-    :func:`detect_live_workflow` as ``worktree_index`` — the whole point of
-    task 3778.
+    :func:`worktree_index_kwargs` instead and splat it into
+    :func:`detect_live_workflow` — the whole point of task 3778.
     """
     index = await worktree_index_for(project_root)
     if index is None:

@@ -15270,8 +15270,8 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
     async def test_rendered_text_is_unchanged_by_the_hoist(self):
         """Behaviour preservation: same fixture inputs, same section text.
 
-        Renders once with the hoist active and once with `worktree_index_for`
-        forced to fail (which degrades to exactly the pre-hoist per-task probe
+        Renders once with the hoist active and once with the hoist reporting
+        *unknown* (which degrades to exactly the pre-hoist per-task probe
         path), and pins that the two agree byte-for-byte.
         """
         from fused_memory.reconciliation.stages import task_knowledge_sync as tks
@@ -15290,7 +15290,9 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         side_effect, _ = self._counting_side_effect()
         with (
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
-            patch.object(tks, 'worktree_index_for', return_value=None),
+            # `{}` from worktree_index_kwargs means *unknown* — omit the kwarg.
+            # (A known-empty repo would be `{'worktree_index': {}}`.)
+            patch.object(tks, 'worktree_index_kwargs', return_value={}),
         ):
             per_task = await _render_live_workflow_section(
                 tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
@@ -15300,11 +15302,17 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         assert 'Live-Workflow Signals' in hoisted
 
     @pytest.mark.asyncio
-    async def test_raising_worktree_index_for_degrades_to_the_per_task_probe(self):
-        """Fail-safe: a broken hoist must not delete the section.
+    async def test_unknown_hoist_degrades_to_the_per_task_probe(self):
+        """Fail-safe: an unknown index must not delete the section.
 
-        The hoist is an optimisation; if it raises, every task falls back to
-        its own probe and the render is exactly what it was before task 3778.
+        The hoist is an optimisation; when it reports *unknown* (`{}` from
+        `worktree_index_kwargs`), every task falls back to its own probe and the
+        render is exactly what it was before task 3778.
+
+        The seam is the wrapper's RETURN value, not an exception from it: the
+        wrapper now owns the fail-safe catch, so patching it to raise would pin
+        a state production can no longer reach. That catch is unit-tested where
+        it lives (test_live_workflow_detector.py::TestWorktreeIndexKwargs).
         """
         from fused_memory.reconciliation.stages import task_knowledge_sync as tks
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
@@ -15315,7 +15323,7 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
 
         with (
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
-            patch.object(tks, 'worktree_index_for', side_effect=RuntimeError('boom')),
+            patch.object(tks, 'worktree_index_kwargs', return_value={}),
         ):
             result = await _render_live_workflow_section(
                 tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
@@ -15323,6 +15331,69 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
 
         assert 'Live-Workflow Signals' in result, 'a broken hoist dropped the section'
         assert counts['worktree_list'] == 3, 'each task must fall back to its own probe'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_probe_warns_and_still_renders_from_the_fallback(self, caplog):
+        """The costly degradation is LOUD, driven by a real failing `run_git`.
+
+        The end-to-end version of the detector's own unit tests, with NOTHING
+        stubbed between the renderer and the failing subprocess: a non-zero
+        `git worktree list` makes the hoist unknown, which then costs one extra
+        probe PER TASK (up to `_GIT_TIMEOUT` each when git hangs). The renderer's
+        `except Exception` can never see that — `worktree_index_for` returns its
+        sentinel rather than raising — so the WARNING has to come from the
+        detector, and the section must still render off the surviving signals.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        detector_logger = 'fused_memory.services.live_workflow_detector'
+        calls = {'worktree_list': 0}
+
+        def failing_worktree_list(args, **kwargs):
+            if '--porcelain' in args:
+                calls['worktree_list'] += 1
+                return subprocess.CompletedProcess(
+                    args=args, returncode=128, stdout='', stderr='not a git repository',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            # `git log -1 --format=%cI` — a commit an hour before `_NOW`, so
+            # recent_commit still reports these tasks live without the worktree
+            # signal the broken probe can no longer supply.
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='2026-01-01T11:00:00+00:00\n', stderr='',
+            )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=detector_logger),
+            patch(
+                'fused_memory.services.live_workflow_detector.run_git',
+                side_effect=as_async_run_git(failing_worktree_list),
+            ),
+        ):
+            result = await _render_live_workflow_section(
+                tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == detector_logger and r.levelno >= logging.WARNING
+        ]
+        assert warnings, (
+            'a failing worktree-list probe must warn — at DEBUG this cost ~20 s '
+            'per render with nothing above DEBUG to say why'
+        )
+        assert all('worktree_index_unavailable' in m for m in warnings), warnings
+        # 1 hoist + one fallback probe per task: the repetition IS the signal.
+        assert calls['worktree_list'] == 4, calls
+        assert 'Live-Workflow Signals' in result, (
+            'a failing probe must not delete the section — recent_commit still '
+            'reports these tasks live'
+        )
 
 
 class TestRenderLiveWorkflowSectionCapsFanOut:
@@ -15386,18 +15457,21 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
             tks_module, 'detect_live_workflow', self._recording_detector(probed)
         )
         # Neutralise the (already-tested) per-render hoists so this class
-        # measures only the fan-out, with no real subprocess. The fake must be
-        # a COROUTINE function: production awaits `worktree_index_for`, and
-        # `monkeypatch.setattr` performs no async auto-detection — unlike
-        # `patch.object`, which returns an AsyncMock when the target is a
-        # coroutine function. A sync `lambda _pr: {}` here is not neutral: it
-        # makes the await raise TypeError, which the renderer's fail-safe
-        # swallows into the degraded per-task-probe branch, so the cap would be
-        # measured with the hoist broken rather than engaged.
-        async def _worktree_index(_pr):
-            return {}
+        # measures only the fan-out, with no real subprocess. `{'worktree_index':
+        # {}}` is the "known empty repo" answer, which engages the hoist and
+        # suppresses the per-task probes; a bare `{}` would mean *unknown* and
+        # degrade to them. The fake must be a COROUTINE function: production
+        # awaits `worktree_index_kwargs`, and `monkeypatch.setattr` performs no
+        # async auto-detection — unlike `patch.object`, which returns an
+        # AsyncMock when the target is a coroutine function. A sync
+        # `lambda _pr: {...}` here is not neutral: it makes the await raise
+        # TypeError, which the detector's fail-safe swallows into the degraded
+        # per-task-probe branch, so the cap would be measured with the hoist
+        # broken rather than engaged.
+        async def _worktree_index_kwargs(_pr):
+            return {'worktree_index': {}}
 
-        monkeypatch.setattr(tks_module, 'worktree_index_for', _worktree_index)
+        monkeypatch.setattr(tks_module, 'worktree_index_kwargs', _worktree_index_kwargs)
         result = await _render_live_workflow_section(
             tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
         )

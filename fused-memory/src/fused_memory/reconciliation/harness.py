@@ -92,7 +92,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
-    worktree_index_for,
+    worktree_index_kwargs,
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import orchestrator_started_at
@@ -5264,28 +5264,14 @@ class ReconciliationHarness:
                 # cited task in this pass, so the doubly-nested loop pays ONE
                 # worktree list rather than one per cited task.
                 #
-                # Fail-safe → None, which is worktree_index_for's "unknown"
-                # sentinel: the kwarg is then omitted entirely and each probe
-                # falls back to its own list. Passing `{}` instead would report
-                # every cited task as worktree_registered=False from a hoisted
-                # ERROR — a transient git glitch would become a project-wide
-                # "nothing is live" verdict and fire stranded escalations for
-                # genuinely live tasks. `{}` from a SUCCESSFUL probe is a real
-                # answer (no registered worktrees) and is threaded through.
-                try:
-                    _worktree_index: dict[str, bool] | None = await worktree_index_for(
-                        project_root,
-                    )
-                except Exception:
-                    logger.warning(
-                        'reconciliation.integrity_gate_worktree_index_hoist_failed',
-                        extra={'category': '', 'project_id': project_id},
-                        exc_info=True,
-                    )
-                    _worktree_index = None
-                _index_kwargs: dict = (
-                    {} if _worktree_index is None else {'worktree_index': _worktree_index}
-                )
+                # worktree_index_kwargs owns the three-valued contract for both
+                # hoisting call sites: fail-safe, WARNING on every unknown, and
+                # the unknown → omit-the-kwarg rule that makes each probe fall
+                # back to its own list rather than trusting an empty index from
+                # a hoisted ERROR (which would read as a project-wide "nothing
+                # is live" and fire stranded escalations for genuinely live
+                # tasks). A known-empty repo arrives as {'worktree_index': {}}.
+                _index_kwargs: dict = await worktree_index_kwargs(project_root)
 
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)

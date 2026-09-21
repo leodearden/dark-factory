@@ -91,7 +91,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
     is_pure_gate_metadata,
-    worktree_index_for,
+    worktree_index_kwargs,
 )
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
@@ -2946,7 +2946,7 @@ async def _render_live_workflow_section(
     1. :func:`is_orchestrator_live_for` — one lock file per project_root.
     2. :func:`read_scheduler_state` — one snapshot per project_root.
     3. :func:`orchestrator_started_at` — one restart boundary per project_root.
-    4. :func:`worktree_index_for` — the whole-repo ``git worktree list
+    4. :func:`worktree_index_kwargs` — the whole-repo ``git worktree list
        --porcelain``.
 
     The fourth is the expensive one and the reason task 3778 exists.  The
@@ -2963,14 +2963,18 @@ async def _render_live_workflow_section(
     synchronous file I/O behind would just shrink the stall rather than end it.
     One hop rather than three keeps the thread-pool churn flat.
 
-    All four are wrapped fail-safe.  For the worktree index specifically,
-    ``None`` is :func:`worktree_index_for`'s "unknown" sentinel and restores
-    exactly the pre-hoist behaviour (each task probes for itself), while ``{}``
-    is a real answer ("this repo has no registered worktrees") and IS threaded
-    through — see that function's three-valued contract.  A hoist failure is
-    logged at WARNING rather than swallowed: it silently costs ~20 s per
-    render, which is precisely the class of degradation this task was filed to
-    make visible.
+    All four are wrapped fail-safe.  The worktree index owns its own wrapper,
+    :func:`worktree_index_kwargs`, because the same three-valued contract has
+    to hold for the harness integrity gate's identical hoist: *unknown* omits
+    the kwarg and restores exactly the pre-hoist behaviour (each task probes for
+    itself), while a known-empty repo arrives as ``{'worktree_index': {}}``, a
+    real answer that suppresses the per-task probes.  Every route to *unknown*
+    is logged at WARNING **by the detector, not here** — the anticipated
+    failures (spawn error, non-zero rc, timeout) by
+    :func:`worktree_index_for`, an unexpected exception by
+    :func:`worktree_index_kwargs`.  None of them is swallowed, because an
+    unknown index silently costs ~20 s per render, which is precisely the class
+    of degradation this task was filed to make visible.
 
     FAN-OUT CAP.  Only the first
     :data:`~fused_memory.reconciliation.task_filter.MAX_ACTIVE_TASKS_RENDERED`
@@ -3087,20 +3091,9 @@ async def _render_live_workflow_section(
     # invariant and by far the most expensive. See the docstring's "Per-render
     # hoists" paragraph: this one `git worktree list --porcelain` was running
     # inside detect_live_workflow for EVERY task, ~40 ms x ~500 tasks ≈ 20 s of
-    # a measured 29 s render. Fail-safe → None, which is worktree_index_for's
-    # "unknown" sentinel and restores exactly the pre-hoist per-task probe;
-    # `{}` is a real answer (no registered worktrees) and is threaded through.
-    try:
-        worktree_index: dict[str, bool] | None = await worktree_index_for(str(project_root))
-    except Exception:
-        logger.warning(
-            'reconciliation._render_live_workflow_section: '
-            'worktree-index hoist failed; falling back to a per-task probe',
-            exc_info=True,
-        )
-        worktree_index = None
-    if worktree_index is not None:
-        kwargs['worktree_index'] = worktree_index
+    # a measured 29 s render. worktree_index_kwargs owns the whole three-valued
+    # contract — fail-safe, logging, and the unknown → omit-the-kwarg rule.
+    kwargs.update(await worktree_index_kwargs(str(project_root)))
 
     live_lines: list[str] = []
 

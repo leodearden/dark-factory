@@ -2537,6 +2537,168 @@ class TestWorktreeIndexFor:
             assert await detector_module.worktree_index_for(str(tmp_path)) == {}
 
 
+class TestWorktreeIndexForLogsEveryUnknownLoudly:
+    """An "unknown" index is never silent — WARNING, not DEBUG.
+
+    The three failure legs are the ones this function DESIGNS for, so a
+    caller's `except Exception` can never see them; at DEBUG they were the
+    silent ones. An unknown index makes every probed task re-run its own
+    worktree list (up to MAX_ACTIVE_TASKS_RENDERED of them, at `_GIT_TIMEOUT`
+    each when git hangs) — the invisible degradation task 3778 exists to end.
+    """
+
+    _LOGGER = 'fused_memory.services.live_workflow_detector'
+    _EVENT = 'live_workflow_detector.worktree_index_unavailable'
+
+    async def _warnings_for(self, side_effect, tmp_path, caplog) -> list[str]:
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(
+                detector_module, 'run_git', side_effect=_as_async_run_git(side_effect),
+            ),
+        ):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_spawn_oserror_warns(self, tmp_path, caplog):
+        warnings = await self._warnings_for(OSError('boom'), tmp_path, caplog)
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'boom' in warnings[0], 'the WARNING must name the underlying error'
+
+    @pytest.mark.asyncio
+    async def test_nonzero_returncode_warns(self, tmp_path, caplog):
+        def _fail(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout='', stderr='not a git repository',
+            )
+
+        warnings = await self._warnings_for(_fail, tmp_path, caplog)
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'not a git repository' in warnings[0], 'git stderr is the diagnosis'
+
+    @pytest.mark.asyncio
+    async def test_timeout_warns_and_says_so(self, tmp_path, caplog):
+        """A timeout is the costliest leg (`_GIT_TIMEOUT` per probe), so it is named.
+
+        `run_git` RETURNS a timeout as `timed_out=True` with a non-zero rc
+        rather than raising, so it shares the rc leg — the message reads
+        `timed_out` to distinguish "git hung" from "git said no".
+        """
+        warnings = await self._warnings_for(
+            subprocess.TimeoutExpired(cmd=['git'], timeout=10), tmp_path, caplog,
+        )
+
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert self._EVENT in warnings[0]
+        assert 'TIMED OUT' in warnings[0], (
+            'a hung git must be distinguishable from a non-zero rc: '
+            f'{warnings[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_is_quiet(self, tmp_path, caplog):
+        """No false alarm on the happy path — the signal has to stay meaningful."""
+        side_effect, _ = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(
+                detector_module, 'run_git', side_effect=_as_async_run_git(side_effect),
+            ),
+        ):
+            assert await detector_module.worktree_index_for(str(tmp_path)) is not None
+
+        noisy = [
+            r.getMessage() for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not noisy, f'a successful probe must not warn; got {noisy}'
+
+
+class TestWorktreeIndexKwargs:
+    """`worktree_index_kwargs` is the SINGLE home of the hoist wiring.
+
+    Both fan-out call sites (`_render_live_workflow_section` and the harness
+    integrity gate) splat it into `detect_live_workflow`, so the three-valued
+    contract — and its fail-safe — lives in one place rather than being spelled
+    out twice (task 3778 review, heuristic 11 SPOT).
+    """
+
+    _LOGGER = 'fused_memory.services.live_workflow_detector'
+
+    @pytest.mark.asyncio
+    async def test_known_index_is_passed_as_the_kwarg(self, tmp_path):
+        side_effect, _ = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {'worktree_index': {f'refs/heads/{_BRANCH}': False}}
+
+    @pytest.mark.asyncio
+    async def test_known_empty_repo_is_a_real_answer_not_an_omission(self, tmp_path):
+        """`{'worktree_index': {}}` — the hoist must not be wasted on the cheap case."""
+        side_effect, _ = _counting_git_side_effect('')
+
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {'worktree_index': {}}
+
+    @pytest.mark.asyncio
+    async def test_unknown_omits_the_kwarg_entirely(self, tmp_path):
+        """A failed probe must NOT arrive as an empty index.
+
+        `{'worktree_index': {}}` from a hoisted ERROR would report every task
+        `worktree_registered=False` — a transient git glitch read as a
+        project-wide "nothing is live". Omitting the kwarg restores the
+        pre-hoist per-task probe instead.
+        """
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(OSError('boom'))):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_degrades_and_warns_with_a_traceback(
+        self, tmp_path, caplog,
+    ):
+        """The fail-safe catch lives here so no call site can forget it."""
+        async def _boom(_project_root):
+            raise RuntimeError('unclassified')
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=self._LOGGER),
+            patch.object(detector_module, 'worktree_index_for', _boom),
+        ):
+            kwargs = await detector_module.worktree_index_kwargs(str(tmp_path))
+
+        assert kwargs == {}
+        warnings = [
+            r for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warnings) == 1, f'expected one WARNING; got {warnings}'
+        assert 'worktree_index_unavailable' in warnings[0].getMessage()
+        assert warnings[0].exc_info is not None, (
+            'an UNEXPECTED exception must carry its traceback — it is the only '
+            'leg whose cause the message cannot name'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task 3778 — the async surface and its new patch seam
 # ---------------------------------------------------------------------------
