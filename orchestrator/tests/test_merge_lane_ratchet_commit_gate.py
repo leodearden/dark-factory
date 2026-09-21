@@ -139,6 +139,10 @@ class _Repo:
     def write_baseline(self, report: dict) -> Path:
         return self._write(metrics.BASELINE_RELPATH, metrics.render_baseline(report))
 
+    def write_baseline_text(self, text: str) -> Path:
+        """Raw bytes, for a blob ``render_baseline`` would never produce."""
+        return self._write(metrics.BASELINE_RELPATH, text)
+
     def write_ledger(self, ledger: dict) -> Path:
         return self._write(metrics.LEDGER_RELPATH, metrics.render_ledger(ledger))
 
@@ -299,3 +303,168 @@ class TestTheStagedDiffIsAudited:
         # sends them hunting the wrong thing (INV-11).
         assert 'not valid JSON' in result.stderr
         assert 'Traceback' not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# The two real incidents, carried as FIXTURES rather than read out of this
+# checkout's live git history. A regression pin that reads the repo it runs in
+# stops pinning anything the moment that history is rewritten or shallow-cloned,
+# and it would read production state from a test (esc-3072-3's whole subject).
+
+_CONFTEST = 'orchestrator/tests/conftest.py'
+_PORTS = 'orchestrator/src/orchestrator/merge_lane/ports.py'
+
+
+def _incident_report() -> dict:
+    """The seed report plus the two paths the incidents moved, at their OLD numbers."""
+    report = copy.deepcopy(_synthetic_report())
+    report['files'][_CONFTEST] = {
+        'lines': 1172,
+        'prose_lines': 752,
+        'cognitive': 42,
+        'function_local_imports': 7,
+        'reexport_names': 5,
+    }
+    report['files'][_PORTS] = {
+        'lines': 255,
+        'prose_lines': 47,
+        'cognitive': 1,
+        'function_local_imports': 0,
+        'reexport_names': 0,
+    }
+    return report
+
+
+def _conftest_rise(report: dict) -> None:
+    """The 52d98220ad shape: conftest.py 1172 -> 1187 lines, 752 -> 770 prose."""
+    report['files'][_CONFTEST].update(lines=1187, prose_lines=770)
+
+
+def _ports_rise(report: dict) -> None:
+    """The 0b04534c7b shape: ports.py 255 -> 274 lines, 47 -> 59 prose."""
+    report['files'][_PORTS].update(lines=274, prose_lines=59)
+
+
+class TestRestoreCarveOut:
+    """Restoring a blob this path already carried is not a new raise.
+
+    Ruled by Leo and verified exact on the real revert: `3e7d55ce47:<baseline>`,
+    `5f577b9613^:<baseline>` and `52d98220ad:<baseline>` are all blob
+    a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191. Without this, reverting a revert
+    -- putting back bytes the repository already reviewed and recorded -- would
+    demand a fresh authorization for a raise nobody re-introduced.
+
+    Blob IDENTITY, scoped to the baseline's own path in HEAD's ancestry. A
+    per-measure high-water-mark rule would also exempt that revert, but it stays
+    permissively open afterwards, so a later re-raise back to an old high-water
+    would go unrecorded.
+    """
+
+    @staticmethod
+    def _history_with_a_revert(tmp_path: Path) -> tuple[_Repo, str, dict]:
+        """low -> high -> low, the exact shape the conftest revert left behind."""
+        low = _incident_report()
+        high = copy.deepcopy(low)
+        _conftest_rise(high)
+
+        repo = _Repo.seeded(tmp_path, report=low)
+        repo.write_baseline(high)
+        absorbed = repo.commit_all('absorb the conftest rise')
+        repo.write_baseline(low)
+        repo.commit_all('revert the absorbed rise')
+        return repo, absorbed, high
+
+    def test_restoring_the_conftest_blob_is_allowed_and_names_its_commit(
+        self, tmp_path: Path
+    ) -> None:
+        repo, absorbed, high = self._history_with_a_revert(tmp_path)
+        repo.write_baseline(high)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+        # NAMING the provenance commit is what keeps this from reading as the
+        # gate simply failing to notice: a reviewer can go look at it.
+        assert absorbed in (result.stdout + result.stderr)
+
+    def test_the_ports_incident_is_refused_naming_both_measures(
+        self, tmp_path: Path
+    ) -> None:
+        repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
+        raised = _incident_report()
+        _ports_rise(raised)
+        repo.write_baseline(raised)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        # A blob never recorded at this path, with an empty ledger: the
+        # 0b04534c7b case, which reached main unexamined.
+        assert result.returncode != 0
+        message = result.stderr
+        assert _PORTS in message
+        assert 'lines' in message and 'prose_lines' in message
+        assert '255' in message and '274' in message
+        assert '47' in message and '59' in message
+
+    def test_a_blob_one_byte_off_the_historical_one_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # WITHOUT THIS THE CARVE-OUT IS UNFALSIFIABLE. A test that only ever
+        # stages the exact historical blob cannot tell "identity" from "these
+        # measures were once seen high".
+        repo, _absorbed, high = self._history_with_a_revert(tmp_path)
+        repo.write_baseline_text(metrics.render_baseline(high) + ' ')
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0
+        assert _CONFTEST in result.stderr
+
+    def test_the_same_blob_at_another_path_does_not_license_the_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        # PATH SCOPING. Identity is scoped to blobs recorded at the BASELINE's
+        # own path, so a blob that merely exists somewhere in the object store
+        # -- trivially arranged by committing it anywhere -- licenses nothing.
+        low = _incident_report()
+        high = copy.deepcopy(low)
+        _conftest_rise(high)
+        repo = _Repo.seeded(tmp_path, report=low)
+        (repo.root / 'scratch_baseline.json').write_text(
+            metrics.render_baseline(high), encoding='utf-8'
+        )
+        repo.commit_all('park a widened baseline at an unrelated path')
+
+        repo.write_baseline(high)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0
+        assert _CONFTEST in result.stderr
+
+    def test_a_fall_is_clean_without_consulting_history(
+        self, tmp_path: Path
+    ) -> None:
+        repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
+        repo.write_baseline(_report_with(_lower_lines))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+        # The carve-out is consulted only after a raise was measured, so a fall
+        # must not announce a restore it never looked for.
+        assert 'restore' not in result.stdout.lower()
+
+    def test_an_unchanged_baseline_is_clean_and_silent(self, tmp_path: Path) -> None:
+        repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == '' and result.stderr == ''
