@@ -214,7 +214,12 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    (`charts.jsx::StatTile` takes `value`/`unit`/`delta` today, never `datum`), a
    `value`-with-no-`datum` call throws too; γ1's node tests render each of the four
    tile-bearing tabs against a fixture payload, so an unmigrated site fails at render
-   whichever binding form reached it. Retired from that earlier list:
+   whichever binding form reached it. A re-census starts from
+   `dashboard/tests/test_charts_consumer_bindings.py`, which already enumerates all
+   three shapes across the nine `.jsx` consumers of `window.DF_CHARTS` (5 destructure,
+   3 namespace, 1 member read — re-measured 2026-09-21); its assertions deliberately
+   cover only the destructure shape, so it is a maintained starting point, not a
+   census guard. Retired from that earlier list:
    `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx` and
    `tab_scheduler.jsx` carry **zero** tile call sites and bind no `StatTile` at all. `shell.jsx::ProjectGroup` is **not** the pips' owner
    either: it takes `summary` as an opaque node and renders no pip itself (the token
