@@ -34,7 +34,8 @@ strictly tighter than this one (``cwd.parent`` rather than the basetemp):
 * ``_orch_helpers.git_env_with_ceiling`` — the same ceiling mechanism applied
   per call, on a private env copy.
 
-SECOND DEFENCE — a test run can never falsify a REAL deploy clock.
+SECOND DEFENCE — a test run can never falsify REAL fleet-redeploy coordination
+state: either deploy clock, or task 4755's in-flight lease.
 
 Task 3797.  ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE``
 from ``$ORCH_FLEET_DEPLOY_CLOCK``, defaulting to
@@ -53,6 +54,17 @@ session-scoped autouse fixture wiring them — and the same reason for living
 here: the defence must be suite-wide and impossible to opt out of, because the
 defect class is "a spawner that forgets the env var" and the next one has not
 been written yet.
+
+Task 4755 widened the defence from clocks to fleet-redeploy coordination state
+generally, by registering its IN-FLIGHT LEASE
+(``data/orchestrator/fleet_redeploy_lease.json``, env ``ORCH_FLEET_LEASE``) in
+the same table — one entry, which buys the guard, the redirect and the "set
+$VAR" remedy together.  A lease is exposed in BOTH directions where a clock is
+exposed in one: one left behind by a test SUPPRESSES real fleet redeploys until
+its max-age bound expires, and a test running the script's ``lease_release``
+against the live path DELETES a genuine in-flight sweep's lease.  Unlike a
+clock it has no benign-external-write case, so a stamp on the real lease path
+stays FALSIFIED rather than being downgraded by the attribution below.
 
 Task 5299 closed an asymmetry the guard's own message used to invite: the
 GUARD above is autoused into all nine conftests that import this module, but
@@ -469,12 +481,13 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # Deploy-clock isolation (task 3797)
 # ---------------------------------------------------------------------------
 
-# Both entries are MIN-INTERVAL deploy clocks: scripts/orchestrator-watchdog.py
-# reads each as "this component was redeployed at <ts>" and SKIPS its staleness
-# pass while the corresponding min-interval window is open (8h by default —
-# ORCH_RESTART_MIN_INTERVAL_SECS / FM_RESTART_MIN_INTERVAL_SECS). Falsifying
-# either one therefore SUPPRESSES a staleness backstop for the rest of the day,
-# invisibly and with every test still green.
+# The first two entries are MIN-INTERVAL deploy clocks:
+# scripts/orchestrator-watchdog.py reads each as "this component was redeployed
+# at <ts>" and SKIPS its staleness pass while the corresponding min-interval
+# window is open (8h by default — ORCH_RESTART_MIN_INTERVAL_SECS /
+# FM_RESTART_MIN_INTERVAL_SECS). Falsifying either one therefore SUPPRESSES a
+# staleness backstop for the rest of the day, invisibly and with every test
+# still green.
 #
 # The fused-memory clock is included even though only the fleet clock has
 # actually been falsified so far, because it is the identical defect class, not
@@ -496,6 +509,20 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
 
+# NOT a clock — task 4755's IN-FLIGHT LEASE, written by
+# scripts/restart-all-orchestrators.sh while a fleet sweep is running and
+# removed on every catchable exit path. It is protected by the same table
+# because it shares the table's exact invariant: a test run must never falsify
+# live fleet-redeploy coordination state. A lease is in fact exposed in BOTH
+# directions where a clock is exposed in one — one left behind SUPPRESSES real
+# redeploys until the max-age bound expires, and a lease_release run against
+# the live path DELETES a genuine in-flight sweep's lease. Registered here
+# rather than given a parallel fixture precisely because this table exists to
+# make two tables naming different files (or different vars) for the same thing
+# unrepresentable (heuristic 11, SPOT). Its four mirrors are pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
+
 # The env var a forgetful spawner needed to set to avoid stamping each protected
 # relpath — and, since task 5299, the SINGLE table everything else in this
 # section derives from: the watched-relpath tuple below, the failure message
@@ -506,6 +533,7 @@ FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
 PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
     FLEET_DEPLOY_CLOCK_RELPATH: 'ORCH_FLEET_DEPLOY_CLOCK',
     FM_DEPLOY_CLOCK_RELPATH: 'FM_DEPLOY_CLOCK',
+    FLEET_LEASE_RELPATH: 'ORCH_FLEET_LEASE',
 }
 
 # DERIVED, not a second literal list (heuristic 11, SPOT): a protected clock the
@@ -1066,8 +1094,8 @@ def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     damage is to production state, not to any one test's result.
 
     THE MITIGATION LIVES HERE TOO, as of task 5299.  Before task 3797's guard
-    above ever fires, both entries of :data:`PROTECTED_DEPLOY_CLOCK_ENV_VARS`
-    are pointed at a tmp file for the WHOLE session — the same redirect
+    above ever fires, EVERY entry of :data:`PROTECTED_DEPLOY_CLOCK_ENV_VARS`
+    is pointed at a tmp file for the WHOLE session — the same redirect
     ``scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect`` used to apply
     for that one rootdir only.  The guard above is wired into all NINE
     conftests that import this module (root plus the eight subproject
