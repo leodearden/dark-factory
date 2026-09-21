@@ -741,3 +741,128 @@ class TestTheWiringIsStructurallyPinned:
         # The branch is passed DOWN so the project applies its own per-check
         # policy, rather than pre-commit deciding for it.
         assert '"$ROOT/hooks/project-checks" "$ROOT" "$branch"' in source
+
+
+class TestTheCarveOutIsOneStepBack:
+    """The carve-out admits the path's IMMEDIATELY-PREVIOUS value, nothing older.
+
+    WITHOUT THESE CASES THE RULE IS UNFALSIFIABLE. The sibling class above only
+    ever stages the blob from the revert immediately preceding it, so it passes
+    identically under "the previous value" and under "any value this path ever
+    carried" -- and the second is a wholesale ratchet reset wearing a carve-out's
+    clothes. Measured against this branch before the narrowing: staging the
+    baseline blob from 60e954b608 exited 0 with "absorbing 97 measure(s)".
+
+    WHY ONE STEP BACK IS THE RIGHT BOUND. The immediately-previous value is the
+    state this repository held one commit ago, so restoring it re-raises nothing
+    the tree has not just been running with. Reaching further back does: every
+    image in between is a value the ratchet moved through, and returning to one
+    behind them re-absorbs every measure they lowered.
+    """
+
+    @staticmethod
+    def _image(n: int) -> dict:
+        """A distinct baseline image, each raising `lines` above the last."""
+        return _report_with(lambda report: report['files']['a.py'].__setitem__(
+            'lines', 1000 + n
+        ))
+
+    @classmethod
+    def _history(cls, tmp_path: Path, *images: dict) -> _Repo:
+        """A repo whose baseline walked through *images*, oldest first."""
+        repo = _Repo.seeded(tmp_path, report=images[0])
+        for index, image in enumerate(images[1:], start=1):
+            repo.write_baseline(image)
+            repo.commit_all(f'move the baseline to image {index}')
+        return repo
+
+    def test_reaching_back_past_an_intervening_value_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # low -> high -> low (a real revert) -> mid. `high` IS a blob this path
+        # carried, so the unbounded rule allows it; the path's previous value is
+        # `low`, so the narrowed rule must refuse.
+        low, high, mid = self._image(0), self._image(9), self._image(4)
+        repo = self._history(tmp_path, low, high, low, mid)
+        repo.write_baseline(high)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0, result.stdout
+
+    def test_the_deep_reach_is_refused_naming_the_measures(
+        self, tmp_path: Path
+    ) -> None:
+        # The measured real-repo exploit in miniature: four distinct images,
+        # stage the OLDEST. Every measure the three later images lowered would
+        # be re-absorbed, unrecorded.
+        images = [self._image(n) for n in (0, 3, 6, 9)]
+        repo = self._history(tmp_path, *reversed(images))
+        repo.write_baseline(images[3])
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0, result.stdout
+        # It refuses through the ordinary unrecorded-raise arm, so the message
+        # names what rose and how to authorize it.
+        assert 'lines' in result.stderr and 'a.py' in result.stderr
+        assert metrics.RAISE_REMEDY in result.stderr
+
+    def test_a_deletion_is_not_a_span_to_reach_across(
+        self, tmp_path: Path
+    ) -> None:
+        # The walk must STOP at the first entry that is not a blob rather than
+        # skipping it: a commit that deleted the baseline is not a value the
+        # path held, so what precedes it is not the previous value.
+        low, mid = self._image(0), self._image(4)
+        repo = _Repo.seeded(tmp_path, report=low)
+        repo.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
+        repo.commit_all('delete the baseline')
+        repo.write_baseline(mid)
+        repo.commit_all('reintroduce a baseline')
+
+        repo.write_baseline(low)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0, result.stdout
+
+    def test_the_immediately_previous_value_is_still_allowed(
+        self, tmp_path: Path
+    ) -> None:
+        """The real 3e7d55ce47 revert shape, and it must keep working.
+
+        Measured on this repo's own history: `git rev-list --full-history` over
+        the baseline shows blob a0fb5cc8e0 at b79315a31c, then 0a42c2ee7d
+        introduced by 5f577b9613 (task 5668), then a0fb5cc8e0 restored by
+        3e7d55ce47. `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4
+        raises -- conftest.py lines 1172->1187, prose_lines 752->770, and both
+        derived totals -- so the carve-out really does fire for it, and
+        narrowing the rule must not take that away.
+        """
+        previous, current = self._image(0), self._image(9)
+        repo = self._history(tmp_path, previous, current)
+        repo.write_baseline(previous)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+
+    def test_the_allowed_line_names_what_came_back(self, tmp_path: Path) -> None:
+        # A COUNT IS NOT ENOUGH. A reviewer reading "absorbing 97 measure(s)"
+        # learns nothing about what was reabsorbed; the measures and keys are
+        # what let them judge whether undoing the last change was right.
+        previous, current = self._image(0), self._image(9)
+        repo = self._history(tmp_path, previous, current)
+        repo.write_baseline(previous)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+        assert 'lines' in result.stdout
+        assert 'a.py' in result.stdout
