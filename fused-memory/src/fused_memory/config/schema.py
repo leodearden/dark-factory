@@ -162,7 +162,9 @@ class ServerConfig(BaseModel):
             'order of magnitude below the 15-43s stalls of task 3778, so it neither '
             'cries wolf nor misses a real wedge. The complement to '
             'thread_warn_threshold: that one watches thread growth, this one watches '
-            'whether the loop is still being scheduled at all.'
+            'whether the loop is still being scheduled at all. Not hot-reloadable '
+            '(_start_loop_lag_monitor captures it by value at spawn, like '
+            'thread_warn_threshold) — a tuned value takes effect at the next restart.'
         ),
     )
     recon_report_port: int = Field(

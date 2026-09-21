@@ -28,13 +28,16 @@ assert on rendered substrings).
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import inspect
 import logging
+import pathlib
 import time
 
 import pytest
+from _ast_guard import calls_named, parse_python_module
 from pydantic import ValidationError
 
 from fused_memory.config.schema import ServerConfig
@@ -308,27 +311,84 @@ class TestLoopLagMonitorLifecycle:
             await task
         assert task.cancelled()
 
-    @pytest.mark.asyncio
-    async def test_run_server_teardown_cancels_the_monitor(self):
-        """Scoped source check on run_server's own body.
+    def test_run_server_cancels_the_monitor_from_a_finally_block(self):
+        """Structural check over run_server's PARSED body, not its text.
 
         No behavioural equivalent exists: ``run_server`` binds two uvicorn
         ports and constructs every store in the process, so it cannot be driven
-        from a unit test.  The check is scoped to a SINGLE function's source
-        (like the retained guard in test_tool_errors.py, not a module-wide text
-        scan), and the needles are exact code constructs, so unrelated edits
-        elsewhere in main.py cannot trip it.
+        from a unit test.  What can still be asserted is the shape, and the
+        shape is what breaks: a cancel that drifts out of the ``finally`` (or
+        below an early ``return``) leaks the task and reintroduces the
+        "Task was destroyed but it is pending" wart this helper exists to
+        avoid, while the spawn disappearing entirely would leave the heartbeat
+        never running in production with every other test still green.
+
+        Asserted over the AST, and the task's own name is DERIVED from the
+        spawn's assignment target rather than spelled out, so renaming the
+        local is not a failure — the earlier version of this test matched the
+        literal strings ``'loop_lag_task.cancel()'`` and
+        ``'await loop_lag_task'``, which pinned a local variable's spelling
+        while passing happily if the cancel moved out of the ``finally``.  Same
+        move as the `inspect.getsource` tripwires already retired elsewhere in
+        this suite.
         """
-        source = inspect.getsource(server_main.run_server)
-        assert '_start_loop_lag_monitor(config)' in source, (
-            'run_server must spawn the loop-lag heartbeat'
+        tree = parse_python_module(
+            pathlib.Path(server_main.__file__).resolve()
         )
-        assert 'loop_lag_task.cancel()' in source, (
-            'run_server teardown must cancel the heartbeat (the checkpoint_task '
-            'pattern), not leave it to be killed with the loop'
+        run_server = next(
+            (
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+                and node.name == 'run_server'
+            ),
+            None,
         )
-        assert 'await loop_lag_task' in source, (
-            'run_server teardown must await the cancelled heartbeat so it settles'
+        assert run_server is not None, 'run_server not found in server/main.py'
+
+        # `ast.AnnAssign` as well as `ast.Assign`: the spawn is annotated
+        # (`loop_lag_task: asyncio.Task[None] = ...`) and dropping the
+        # annotation must not read as "the spawn is gone".
+        spawns = [
+            node for node in ast.walk(run_server)
+            if isinstance(node, ast.Assign | ast.AnnAssign)
+            and node.value is not None
+            and calls_named(node.value, '_start_loop_lag_monitor')
+        ]
+        assert len(spawns) == 1, (
+            'run_server must spawn the loop-lag heartbeat exactly once and keep '
+            f'the handle; found {len(spawns)} assignments from it'
+        )
+        spawn = spawns[0]
+        bound = spawn.targets if isinstance(spawn, ast.Assign) else [spawn.target]
+        targets = [t for t in bound if isinstance(t, ast.Name)]
+        assert targets, 'the spawned task must be bound to a name, not discarded'
+        handle = targets[0].id
+
+        def _cancels_and_awaits(body) -> bool:
+            cancelled = any(
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == handle
+                for stmt in body
+                for call in calls_named(stmt, 'cancel')
+            )
+            awaited = any(
+                isinstance(node, ast.Await)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == handle
+                for stmt in body
+                for node in ast.walk(stmt)
+            )
+            return cancelled and awaited
+
+        assert any(
+            _cancels_and_awaits(node.finalbody)
+            for node in ast.walk(run_server)
+            if isinstance(node, ast.Try)
+        ), (
+            f'teardown must cancel AND await `{handle}` from a `finally` block '
+            '(the checkpoint_task pattern) so it settles on every exit path, '
+            'not only the happy one'
         )
 
 

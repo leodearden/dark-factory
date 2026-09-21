@@ -1534,8 +1534,21 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     handle, then ``cancel()`` + ``await`` it in ``run_server``'s teardown.
 
     The threshold is read from :class:`ServerConfig` (``loop_lag_warn_ms``)
-    rather than hardcoded, so an operator can tune it per box through the
-    existing config hot-reload green tier.
+    rather than hardcoded, so an operator can tune it per box — across a
+    RESTART, exactly like the adjacent ``thread_warn_threshold``, which is
+    captured into a local the same way ``threshold_ms`` is below.
+
+    It is deliberately NOT hot-reloadable, and saying so here is the point:
+    ``server.loop_lag_warn_ms`` is absent from
+    :data:`fused_memory.config.reload.RELOADABLE_FIELDS`, so ``reload_config``
+    reports the leaf ``restart_required`` and leaves the running monitor
+    alone. It could not simply be allowlisted either — the value is captured BY
+    VALUE here and closed over by a task that runs for the process lifetime,
+    which is the "captured at construction" shape ``reload.py``'s docstring
+    names as the disqualifying condition. Promoting it to the green tier means
+    BOTH halves: pass the config object down and re-read the leaf per sample,
+    then add the allowlist entry with the live-consumer test its neighbours
+    carry.
     """
     threshold_ms = float(config.server.loop_lag_warn_ms)
     return asyncio.create_task(
