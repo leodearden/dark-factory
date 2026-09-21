@@ -73,6 +73,10 @@ WHAT THIS DOES NOT COVER, deliberately:
   * prompt text assembled outside roles.py -- `briefing.py`'s f-strings, the
     `skills/` sources -- since the scan reads roles.py's own constants;
   * comments, per the paragraph above;
+  * a tool named in PLAIN PROSE. Only backtick spans are scanned, so "poll it
+    with BashOutput" escapes. Dropping the backtick requirement is not the fix
+    -- every sentence-initial word becomes a candidate -- and this hole is
+    stated here because the deleted-upstream one below it is NOT the only one;
   * tool GRANTS. Unlike its MCP sibling this guard asserts EXISTENCE only,
     and the reason is measured and recorded in roles.py's own TOOL
     AVAILABILITY comment: `--allowed-tools` is a PERMISSION allowlist, not a
@@ -163,12 +167,25 @@ MEASURED_ABSENT_TOOLS = frozenset({
 })
 
 # Backticked CamelCase words the prompts legitimately use that name no tool.
+# Because the scan takes the LEADING identifier of a span (below), this holds
+# both bare words and the head of a longer span -- a prose label (`Hypothesis:`)
+# or a symbol citation (`GitOps.advance_main`).
 NON_TOOL_TERMS = frozenset({
+    'GitOps',
+    'Hypothesis',
     'InputValidationError',
     'NotImplementedError',
 })
 
-_BACKTICKED = re.compile(r'`([A-Za-z][A-Za-z0-9_]*)`')
+# The LEADING identifier of a backtick span, so a tool named in CALL form is
+# caught too: these prompts routinely write `ToolSearch("select:Monitor")` and
+# `Bash(run_in_background=true)`, so an anchored `...`-only pattern would have
+# let "collect it with `BashOutput(id)`" reinstate this task's defect GREEN.
+# Requiring the backtick is what keeps the scan usable -- without it every
+# sentence-initial word (`Never`, `Polling`, `Foreground`) becomes a candidate.
+# Widening cost exactly two NON_TOOL_TERMS entries when measured against every
+# prompt surface, both above.
+_BACKTICKED = re.compile(r'`([A-Za-z][A-Za-z0-9_]*)[^`]*`')
 
 # Module-level prompt constants, private ones included -- see the module
 # docstring on why the leading underscore is not optional.
@@ -231,6 +248,36 @@ def _failure_message(where: str, unknown: list[str]) -> str:
             'instead.',
         )
     return ' '.join(lines)
+
+
+def test_detector_detects() -> None:
+    """The detector's own smoke test, over literal fixtures rather than prompts.
+
+    Every other assertion in this module is `assert not unknown` -- an ABSENCE
+    check. Absence checks pass just as cheerfully when the detector is broken:
+    a typo in `_BACKTICKED`, an inverted `_is_camel_case`, or an
+    `_unknown_tool_tokens` that returned `[]` unconditionally would leave every
+    parametrized case GREEN and the invariant silently un-enforced. That is the
+    false-green shape this module's docstring narrates for scan surface (a),
+    one level further down. So: prove the guard can fail before trusting it to
+    pass. Fixtures are literals, so this pins no prompt phrasing.
+    """
+    # The task-5332 defect verbatim: both phantoms named, both reported.
+    assert _unknown_tool_tokens(
+        'poll it to completion with `BashOutput` (or terminate it with `KillShell`)'
+    ) == ['BashOutput', 'KillShell']
+
+    # The corrected guidance's shape: real tools, nothing reported.
+    assert _unknown_tool_tokens('`Read` the output file path `Bash` returned') == []
+
+    # CALL form, the idiom these prompts actually use -- see `_BACKTICKED`.
+    assert _unknown_tool_tokens('collect it with `BashOutput(bash_id)`') == ['BashOutput']
+
+    # Non-candidates: unbackticked (the documented residual hole), all-caps,
+    # lowercase, and an allowlisted non-tool.
+    assert _unknown_tool_tokens('poll it with BashOutput') == []
+    assert _unknown_tool_tokens('killed by `SIGTERM`, sized by `timeout`') == []
+    assert _unknown_tool_tokens('prefix it `Hypothesis:` so a reviewer can tell') == []
 
 
 @pytest.mark.parametrize('role_key', sorted(ROLES))
