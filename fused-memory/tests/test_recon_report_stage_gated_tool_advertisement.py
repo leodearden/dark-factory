@@ -102,6 +102,34 @@ def _names_tool(text: str, tool_name: str) -> bool:
     return re.search(pattern, text) is not None
 
 
+def _iter_call_openers(text: str, tool_name: str):
+    """Yield the index of the opening '(' for every *tool_name* call in *text*.
+
+    Same shape as `test_recon_report_guidance_drift.py::_iter_call_openers` —
+    matches the bare and the `mcp__recon-report__`-prefixed form, and refuses a
+    match whose opener is embedded inside a longer identifier.
+    """
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])(?:mcp__recon-report__)?' + re.escape(tool_name) + r'\('
+    )
+    for m in pattern.finditer(text):
+        yield m.end() - 1
+
+
+def _extract_call_args_at(text: str, paren_idx: int) -> str:
+    """Return the balanced-paren argument substring starting at *paren_idx* ('(')."""
+    assert text[paren_idx] == '('
+    depth = 0
+    for i in range(paren_idx, len(text)):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return text[paren_idx + 1 : i]
+    raise AssertionError(f'Unbalanced parens scanning from index {paren_idx}')
+
+
 def _stage_denies(tool_name: str, disallowed_attr: str) -> bool:
     """Does the stage gated by *disallowed_attr* deny *tool_name*?
 
@@ -292,3 +320,91 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
             'no such heading is in STAGE2_SYSTEM_PROMPT. Either the renderer that emits '
             'it was reworded/dropped, or the block now points at nothing.'
         )
+
+
+class TestHazardsTheNewBlocksAreExposedTo:
+    """Regression pins for the two prompt-assembly hazards these blocks newly touch.
+
+    Neither is hypothetical: both are recorded in `prompts/__init__.py` as
+    MUST-NOTs on every constant interpolated into a stage f-string, and both
+    fail in a way that points somewhere other than the block that caused them.
+    """
+
+    @pytest.mark.parametrize(
+        'block_name',
+        ['CITATION_REPAIR_TOOL_BLOCK', 'ENTITY_STANDING_DECISION_WRITE_BLOCK'],
+    )
+    def test_block_does_not_contain_the_available_tools_sentinel(self, block_name):
+        """`build_stage2_system_prompt` raises RuntimeError unless '## Available
+        Tools' occurs EXACTLY ONCE in STAGE2_SYSTEM_PROMPT, and both blocks land
+        inside it. A block carrying a second copy breaks Stage 2 at build time
+        with an error naming the sentinel, not the block."""
+        from fused_memory.reconciliation import prompts as prompts_module
+        block = getattr(prompts_module, block_name)
+        assert '## Available Tools' not in block, (
+            f'{block_name} contains the literal "## Available Tools". That sentinel must '
+            'occur exactly once in STAGE2_SYSTEM_PROMPT or build_stage2_system_prompt '
+            'raises RuntimeError. Reword the heading.'
+        )
+
+    def test_build_stage2_system_prompt_autopilot_video_does_not_raise(self):
+        """The end-to-end version of the assertion above, mirroring
+        test_recon_amend_tool_advertisement.py's guard of the same name: measure
+        the sentinel at the builder that actually enforces it."""
+        built = build_stage2_system_prompt('autopilot_video')
+        assert isinstance(built, str) and built
+
+    @pytest.mark.parametrize(
+        'prompt_label,prompt_text,disallowed_attr', _STAGE_CASES, ids=_STAGE_CASE_IDS
+    )
+    def test_repair_memory_citation_examples_carry_both_run_ids(
+        self, prompt_label, prompt_text, disallowed_attr
+    ):
+        """Every repair_memory_citation call example in an ASSEMBLED prompt shows
+        BOTH `run_id` and `target_run_id`.
+
+        `test_recon_report_guidance_drift.py::TestReconReportRunIdGuardOverAssembledPrompts`
+        scans `_SHARED_GUIDANCE_REPORT_TOOLS`, which EXCLUDES the stage-gated
+        tools — so the one stage-gated tool that IS run-scoped is covered by
+        nothing. This is that carve-out's equivalent, and it guards the specific
+        trap the block's prose calls out: the two ids are not interchangeable,
+        and passing the target's id as `run_id` fails `run_id_unknown` rather
+        than doing the intended thing. An example missing either one teaches the
+        conflation the prose exists to prevent.
+
+        Runs over all three stages, so a future example spliced into a stage
+        that does not hold the tool is caught here too (its absence there is
+        asserted separately; this asserts the shape of anything that appears).
+        """
+        examples = 0
+        for paren_idx in _iter_call_openers(prompt_text, 'repair_memory_citation'):
+            examples += 1
+            args = _extract_call_args_at(prompt_text, paren_idx)
+            for required in ('run_id', 'target_run_id'):
+                # Identifier boundary, not a substring: `'run_id=' in args` is
+                # satisfied by `target_run_id=` alone, which is the very
+                # conflation this test exists to catch.
+                found = re.search(
+                    rf'(?<![A-Za-z0-9_]){re.escape(required)}\s*=', args
+                )
+                assert found, (
+                    f'{prompt_label} contains a repair_memory_citation(...) example '
+                    f'missing `{required}=`: {args!r}. `run_id` is the CALLER\'s current '
+                    'run and `target_run_id` is the run that OWNS the finding; an example '
+                    'showing one without the other invites exactly the conflation that '
+                    f'fails `run_id_unknown`. (Stage gating for this prompt: '
+                    f'{disallowed_attr}.)'
+                )
+
+        # Non-vacuity: a scan that finds nothing is a guard that looks like
+        # coverage but isn't — the failure mode test_recon_report_guidance_drift.py
+        # names. A stage that HOLDS the tool must show at least one call example,
+        # since the call shape is the part the truncated server listing never
+        # delivers. A denying stage must show none, which the absence arm asserts.
+        if not _stage_denies('repair_memory_citation', disallowed_attr):
+            assert examples, (
+                f'{prompt_label} shows no repair_memory_citation(...) call example, but '
+                f'that stage HOLDS the tool (absent from {disallowed_attr}). Naming a '
+                'tool without its call shape is not advertisement: the call shape is '
+                'exactly what the CLI-truncated server listing never delivers.'
+            )
