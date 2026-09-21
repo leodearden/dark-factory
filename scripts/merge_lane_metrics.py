@@ -1594,7 +1594,11 @@ def append_authorization(path: Path, record: dict) -> Path:
     """Append one record to the ledger at *path*, preserving every prior entry.
 
     Append-only: history is never rewritten, so a reviewer reading the file
-    reads every raise this baseline has ever absorbed.
+    reads every raise this baseline has ever absorbed. That promise is about
+    every writer of the file, not only about this function, so it is CHECKED
+    rather than merely asserted -- ``ledger_appended_entries`` below is what
+    reads a staged ledger against its committed predecessor and refuses a
+    commit that dropped, rewrote or reordered any of it.
     """
     target = Path(path)
     ledger = load_ledger(target)
@@ -1602,6 +1606,53 @@ def append_authorization(path: Path, record: dict) -> Path:
     ledger['raises'] = [*ledger['raises'], record]
     safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
     return target
+
+
+def _common_prefix_length(previous: list, current: list) -> int:
+    """How many leading entries the two lists still agree on."""
+    return next(
+        (
+            index
+            # strict=False deliberately: the two lists have DIFFERENT
+            # lengths in every case this is asked about.
+            for index, (was, now) in enumerate(
+                zip(previous, current, strict=False)
+            )
+            if was != now
+        ),
+        min(len(previous), len(current)),
+    )
+
+
+def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
+    """The entries *current* adds to *previous*, refusing any rewrite of history.
+
+    The reader half of ``append_authorization``'s append-only promise, and the
+    only thing that makes that promise checkable: the writer can only keep it
+    for its own writes, while the file is edited by rebases, merges and hands.
+    *previous* must be a PREFIX of *current* -- length equality is not prefix
+    equality, so an entry rewritten in place is refused exactly like a dropped
+    one, and a reorder like both.
+
+    Pure: two loaded dicts in, the suffix out. The caller decides where the two
+    images came from, which is what keeps every git invocation in
+    ``scripts/check_staged_ratchet_raise.py`` and none of it here.
+    """
+    previous_raises = list(previous.get('raises', ()))
+    current_raises = list(current.get('raises', ()))
+    if current_raises[: len(previous_raises)] != previous_raises:
+        kept = _common_prefix_length(previous_raises, current_raises)
+        raise MetricsError(
+            'the authorized-raise ledger is append-only, and this change '
+            f'rewrites its history: {len(previous_raises) - kept} of its '
+            f'{len(previous_raises)} recorded entr(ies) are no longer where '
+            f'they were recorded (the staged file holds {len(current_raises)}). '
+            'Dropping, editing or reordering a recorded raise is what makes the '
+            'ledger stop reading as the provenance of every raise this baseline '
+            'has ever absorbed. Append a new entry with --authorize-raise '
+            'instead of touching a recorded one.'
+        )
+    return current_raises[len(previous_raises) :]
 
 
 # ---------------------------------------------------------------------------
