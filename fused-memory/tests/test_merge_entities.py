@@ -11,6 +11,8 @@ Covers:
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -303,36 +305,43 @@ class TestDeleteEntityNode:
 # step-5: GraphitiBackend.merge_entities
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def backend_with_mocks(mock_config, make_backend):
+    """GraphitiBackend with sub-methods mocked for orchestration testing.
+
+    Module-scoped rather than class-scoped because two classes consume it:
+    TestMergeEntities drives the orchestration, TestMergeEntitiesStructuredLog
+    drives the record that orchestration emits. One fixture, not a parallel
+    copy per class.
+    """
+    backend = make_backend(mock_config)
+    backend.get_node_text = AsyncMock(side_effect=[
+        ('DeprecatedName', 'old dep summary'),   # first call: deprecated node
+        ('SurvivingName', 'old sur summary'),     # second call: surviving node
+    ])
+    backend.redirect_node_edges = AsyncMock(return_value={
+        'outgoing_redirected': 2,
+        'incoming_redirected': 1,
+        'inter_node_deleted': 0,
+    })
+    backend.redirect_node_mentions = AsyncMock(return_value={
+        'redirected': 2,
+        'already_linked': 1,
+    })
+    backend.count_foreign_relationships = AsyncMock(return_value=1)
+    backend.delete_entity_node = AsyncMock()
+    backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
+    backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
+        'sur-uuid', 'SurvivingName',
+        old_summary='old sur summary',
+        new_summary='SurvivingName knows Foo\nDeprecatedName knows Bar',
+        edge_count=3,
+    ))
+    return backend
+
+
 class TestMergeEntities:
     """GraphitiBackend.merge_entities(deprecated_uuid, surviving_uuid) merges two nodes."""
-
-    @pytest.fixture
-    def backend_with_mocks(self, mock_config, make_backend):
-        """GraphitiBackend with sub-methods mocked for orchestration testing."""
-        backend = make_backend(mock_config)
-        backend.get_node_text = AsyncMock(side_effect=[
-            ('DeprecatedName', 'old dep summary'),   # first call: deprecated node
-            ('SurvivingName', 'old sur summary'),     # second call: surviving node
-        ])
-        backend.redirect_node_edges = AsyncMock(return_value={
-            'outgoing_redirected': 2,
-            'incoming_redirected': 1,
-            'inter_node_deleted': 0,
-        })
-        backend.redirect_node_mentions = AsyncMock(return_value={
-            'redirected': 2,
-            'already_linked': 1,
-        })
-        backend.count_foreign_relationships = AsyncMock(return_value=1)
-        backend.delete_entity_node = AsyncMock()
-        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
-        backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
-            'sur-uuid', 'SurvivingName',
-            old_summary='old sur summary',
-            new_summary='SurvivingName knows Foo\nDeprecatedName knows Bar',
-            edge_count=3,
-        ))
-        return backend
 
     @pytest.mark.asyncio
     async def test_validates_both_nodes_exist(self, backend_with_mocks):
@@ -536,6 +545,127 @@ class TestMergeEntities:
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# task 4986: one structured, machine-readable record per merge (loss mode 4b)
+# ---------------------------------------------------------------------------
+
+class TestMergeEntitiesStructuredLog:
+    """merge_entities emits EXACTLY ONE record per merge, and its payload IS
+    the audit dict the method returns.
+
+    A payload assembled separately from the returned dict would be a second
+    copy of the same facts and would drift the first time a key is added to
+    one of them; emitting the returned object makes that drift impossible by
+    construction. It also means the log line and the write journal's
+    result_summary -- which MemoryService.merge_entities already persists from
+    this same dict -- carry identical fields, so the durable record and the
+    operator-visible one cannot disagree.
+
+    JSON rather than a key=value line because the payload must carry the
+    loser's full summary text: arbitrary prose with quotes, newlines and
+    non-ASCII, which a reader should not need an ad-hoc parser to recover.
+    """
+
+    LOGGER = 'fused_memory.backends.graphiti_client'
+    PREFIX = 'merge_entities: '
+
+    @staticmethod
+    def _merge_records(caplog):
+        return [
+            r for r in caplog.records
+            if r.name == TestMergeEntitiesStructuredLog.LOGGER
+            and r.getMessage().startswith(TestMergeEntitiesStructuredLog.PREFIX)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_emits_one_json_record_equal_to_the_returned_audit_dict(
+        self, backend_with_mocks, caplog,
+    ):
+        backend = backend_with_mocks
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        records = self._merge_records(caplog)
+        assert len(records) == 1, (
+            'exactly one record per merge -- the old unstructured line must be '
+            f'REPLACED, not joined, so an auditor never reconciles two records '
+            f'of one event; got {[r.getMessage() for r in records]}'
+        )
+
+        payload = json.loads(records[0].getMessage()[len(self.PREFIX):])
+        assert payload == result, 'the logged payload IS the returned audit dict'
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_the_whole_merge_provenance(
+        self, backend_with_mocks, caplog,
+    ):
+        """Everything an auditor needs about one merge, in one record."""
+        backend = backend_with_mocks
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+
+        assert payload['surviving_uuid'] == 'sur-uuid'
+        assert payload['surviving_name'] == 'SurvivingName'
+        assert payload['deprecated_uuid'] == 'dep-uuid'
+        assert payload['deprecated_name'] == 'DeprecatedName'
+        assert payload['edges_redirected'] == {
+            'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0,
+        }
+        assert payload['mentions_redirected'] == {'redirected': 2, 'already_linked': 1}
+        assert payload['residual_relationships_destroyed'] == 1
+        # Loss mode 5: the loser's summary must be recoverable from the record.
+        assert payload['deprecated_summary'] == 'old dep summary'
+
+    @pytest.mark.asyncio
+    async def test_awkward_summary_text_round_trips(
+        self, mock_config, make_backend, caplog,
+    ):
+        """Quotes, newlines and non-ASCII survive intact -- the case an ad-hoc
+        key=value line would mangle, and the reason the payload is JSON."""
+        awkward = 'She said "hi"\nline two\ttab; naïve — 日本語 {braces} \\backslash'
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('DepName', awkward),
+            ('SurName', 'sur summary'),
+        ])
+        backend.redirect_node_edges = AsyncMock(return_value={
+            'outgoing_redirected': 0, 'incoming_redirected': 0, 'inter_node_deleted': 0,
+        })
+        backend.redirect_node_mentions = AsyncMock(return_value={
+            'redirected': 0, 'already_linked': 0,
+        })
+        backend.count_foreign_relationships = AsyncMock(return_value=0)
+        backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
+        backend.refresh_entity_summary = AsyncMock(
+            return_value=make_rebuild_detail('sur-uuid', 'SurName'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+        assert payload['deprecated_summary'] == awkward
+
+    @pytest.mark.asyncio
+    async def test_unmeasurable_residual_is_null_in_the_payload(
+        self, backend_with_mocks, caplog,
+    ):
+        """None round-trips as JSON null, keeping "could not measure" distinct
+        from "measured zero" in the durable record too."""
+        backend = backend_with_mocks
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('census query failed'),
+        )
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+        assert payload['residual_relationships_destroyed'] is None
 
 
 # ---------------------------------------------------------------------------
