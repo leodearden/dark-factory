@@ -35,10 +35,13 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     CANONICAL_HUMAN_GATE_ACTION,
+    CANONICAL_HUMAN_GATE_ACTION_MARKER,
+    CURATOR_GATE_SWEEP_FLAG_KEY,
     GATE_OWNED_ACTION_NORM_HEADING,
     extract_human_gated_task_ids,
     normalize_gate_owned_suggested_actions,
     render_gate_owned_action_norm,
+    stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
@@ -227,6 +230,23 @@ class TestCanonicalHumanGateAction:
         assert CANONICAL_HUMAN_GATE_ACTION.strip(), (
             'CANONICAL_HUMAN_GATE_ACTION must be non-empty — it is prepended '
             'verbatim onto corrected findings'
+        )
+
+    def test_canonical_action_opens_with_the_exported_marker(self):
+        """The constant is built from the marker, and the normalizer relies on it.
+
+        Referential, not a prose pin: both sides are exported identifiers.
+        ``normalize_gate_owned_suggested_actions`` tests compliance by looking
+        for the MARKER alone, so a canonical sentence that stopped opening with
+        it would make the pass non-idempotent — it would re-prepend the
+        sentence onto its own output every cycle.
+        """
+        assert CANONICAL_HUMAN_GATE_ACTION.startswith(
+            CANONICAL_HUMAN_GATE_ACTION_MARKER,
+        ), (
+            'CANONICAL_HUMAN_GATE_ACTION must open with '
+            f'{CANONICAL_HUMAN_GATE_ACTION_MARKER!r}; got '
+            f'{CANONICAL_HUMAN_GATE_ACTION[:60]!r}'
         )
 
     def test_canonical_action_carries_no_braces(self):
@@ -522,16 +542,19 @@ class TestNormalizeGateOwnedSuggestedActions:
     def test_carves_out_the_real_curator_gate_resolution_flag(self):
         """The REAL build_gate_resolution_flag output is left untouched.
 
-        Not a hand-written fixture: pinning against the real builder means a
-        future edit to either side is caught at the seam.  That flag's
-        suggested_action DELIBERATELY tells Stage 2 to set a gate task's
-        status — but only to transcribe a ruling a human curator already
+        Not a hand-written fixture: pinning against the real builder — through
+        the real ``stamp_curator_gate_sweep_provenance``, as the Stage-1 call
+        site does — means a future edit to either side is caught at the seam.
+        That flag's suggested_action DELIBERATELY tells Stage 2 to set a gate
+        task's status — but only to transcribe a ruling a human curator already
         recorded in Mem0, and it carries its own dismiss branch for the
         merely-curated case.  Without this carve-out, task 4814 would ship a
         rule that contradicts a live, deliberately-designed sibling flag on
         its very first cycle.
         """
-        flag = build_gate_resolution_flag('645', [{'id': 'mem-a'}])
+        flag = stamp_curator_gate_sweep_provenance(
+            [build_gate_resolution_flag('645', [{'id': 'mem-a'}])],
+        )[0]
         original = copy.deepcopy(flag)
 
         assert flag['flag_type'] == GATE_RESOLUTION_FLAG_TYPE, (
@@ -548,6 +571,144 @@ class TestNormalizeGateOwnedSuggestedActions:
             'the curator-gate-resolution flag must be returned byte-identical — '
             'prepending "no stage may record a decision" to a flag whose whole '
             'purpose is to transcribe a recorded human ruling would contradict it'
+        )
+
+    def test_llm_authored_flag_with_the_carve_out_flag_type_is_still_normalized(self):
+        """The carve-out needs sweep PROVENANCE, not just the flag_type string.
+
+        ``GATE_RESOLUTION_FLAG_TYPE`` is the generic value
+        ``'task_completed_not_reflected'`` and ``flag_type`` is free-form per
+        FINDING_ITEM_SCHEMA — the model picks it — so keying the exemption on
+        the string alone would let any LLM finding that happened to choose
+        that natural-language-shaped value escape the whole correction while
+        citing a human gate.
+        """
+        flag = _gate_owned_flag(flag_type=GATE_RESOLUTION_FLAG_TYPE)
+        assert CURATOR_GATE_SWEEP_FLAG_KEY not in flag, (
+            'guard on the fixture: this only tests the provenance requirement '
+            'if the LLM-shaped flag carries no sweep stamp'
+        )
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert count == 1, (
+            'a finding merely CARRYING the carved-out flag_type, with no sweep '
+            'provenance, must still be corrected — the carve-out exists for '
+            "the sweep's own output, whose evidence is a ruling a human "
+            f'curator already recorded; got {count!r}'
+        )
+        assert result[0]['suggested_action'].startswith(CANONICAL_HUMAN_GATE_ACTION)
+
+    def test_foreign_project_citation_colliding_with_a_local_gate_id_is_not_normalized(self):
+        """A cited task in ANOTHER project is not this project's gate.
+
+        The gate ids come from the LOCAL project's ``active_tasks``, while
+        ``cited_tasks`` entries carry their own required ``project_id`` and
+        foreign citations are routine (see
+        ``flag_dedup._resolve_live_cross_project_fix_task``).  Task ids are
+        small per-project integers, so a collision is a matter of time — and
+        prefixing "no reconciliation stage may decide this" onto a foreign,
+        legitimately actionable task is exactly the over-selection the
+        selector's strictness is meant to rule out.
+        """
+        flag = _gate_owned_flag(
+            task_id=None,
+            cited_tasks=[
+                {'project_id': 'know_live', 'task_id': '645', 'title': 'Not a gate'},
+            ],
+        )
+        original = copy.deepcopy(flag)
+
+        result, count = normalize_gate_owned_suggested_actions(
+            [flag], ['645'], project_id='autopilot_video',
+        )
+
+        assert count == 0, (
+            "a foreign project's task 645 is not the local gate 645; got "
+            f'{count!r}'
+        )
+        assert result[0] == original, (
+            f'the foreign-citing finding must be byte-identical; got {result[0]!r}'
+        )
+
+    def test_local_and_project_less_citations_both_still_match(self):
+        """Scoping must not cost the in-project or the project-less citation.
+
+        A ``cited_tasks`` entry naming the running project matches, and so does
+        one that omits ``project_id`` — the latter matching the top-level
+        ``task_id`` channel, which carries no project at all.
+        """
+        for label, entry in (
+            ('same project', {'project_id': 'autopilot_video', 'task_id': '645',
+                              'title': 'Gate'}),
+            ('no project_id', {'task_id': '645', 'title': 'Gate'}),
+        ):
+            result, count = normalize_gate_owned_suggested_actions(
+                [_gate_owned_flag(task_id=None, cited_tasks=[entry])],
+                ['645'],
+                project_id='autopilot_video',
+            )
+
+            assert count == 1, f'the {label} citation must match; got {count!r}'
+            assert result[0]['suggested_action'].startswith(CANONICAL_HUMAN_GATE_ACTION)
+
+    def test_omitting_project_id_keeps_the_unscoped_behaviour(self):
+        """No project argument means no project filtering — fail-open."""
+        flag = _gate_owned_flag(
+            task_id=None,
+            cited_tasks=[
+                {'project_id': 'know_live', 'task_id': '645', 'title': 'Foreign'},
+            ],
+        )
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert count == 1, (
+            'a caller that passes no project_id must get the pre-scoping '
+            f'behaviour, not silent under-correction; got {count!r}'
+        )
+        assert result[0]['suggested_action'].startswith(CANONICAL_HUMAN_GATE_ACTION)
+
+    def test_top_level_task_id_is_matched_regardless_of_project(self):
+        """The documented residual: the top-level channel carries no project.
+
+        ``task_id`` is a bare (possibly comma-joined) id with nowhere to name a
+        project, so it cannot be scoped.  Pinned so the residual is a recorded
+        contract rather than an unexamined gap.
+        """
+        result, count = normalize_gate_owned_suggested_actions(
+            [_gate_owned_flag(task_id='645')], ['645'], project_id='autopilot_video',
+        )
+
+        assert count == 1, (
+            'the top-level task_id channel names no project, so it is matched '
+            f'as a local id; got {count!r}'
+        )
+
+    def test_leaves_an_action_already_opening_with_the_marker_alone(self):
+        """Compliance is judged on the MARKER, not on verbatim reproduction.
+
+        The prompt asks the model to reproduce a 70-word sentence exactly —
+        the least likely model outcome.  Testing for the whole sentence would
+        answer a compliant paraphrase by prepending a near-duplicate of itself,
+        spending ~470 characters of the shared ``_FLAGGED_ITEMS_CHAR_BUDGET``
+        that ``_format_flagged`` drops later findings against.
+        """
+        paraphrase = (
+            CANONICAL_HUMAN_GATE_ACTION_MARKER + ' task 645 is awaiting an '
+            'operator ruling; no stage may settle it. Evidence follows.'
+        )
+        flag = _gate_owned_flag(suggested_action=paraphrase)
+        original = copy.deepcopy(flag)
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert count == 0, (
+            'an action already opening with the marker carries the signal, so '
+            f'it must not be re-prefixed; got {count!r}'
+        )
+        assert result[0] == original, (
+            f'the compliant finding must be byte-identical; got {result[0]!r}'
         )
 
     def test_passes_non_dict_elements_through_without_raising(self):
@@ -636,3 +797,38 @@ class TestNormalizeGateOwnedSuggestedActions:
                 'and altering it would perturb cross-cycle dedup, suppression '
                 'and the stage1_flag_markers_acknowledged diff'
             )
+
+
+class TestStampCuratorGateSweepProvenance:
+    """stamp_curator_gate_sweep_provenance(flags) -> copies marked as sweep output.
+
+    The provenance half of the carve-out.  It is called at the ONE Stage-1
+    call site that appends ``sweep_resolved_curator_gates``' flags, which is
+    the only place that knows where those dicts came from.
+    """
+
+    def test_stamps_the_key_on_a_copy_without_touching_the_input(self):
+        """Copies rather than mutates, matching the normalizer's own pass."""
+        flag = build_gate_resolution_flag('645', [{'id': 'mem-a'}])
+        original = copy.deepcopy(flag)
+
+        stamped = stamp_curator_gate_sweep_provenance([flag])
+
+        assert stamped[0][CURATOR_GATE_SWEEP_FLAG_KEY] is True, (
+            f'the sweep flag must carry {CURATOR_GATE_SWEEP_FLAG_KEY!r}=True; '
+            f'got {stamped[0]!r}'
+        )
+        assert flag == original, "the caller's dict must be untouched"
+        assert stamped[0] is not flag, 'the stamped flag must be a new dict'
+
+    def test_passes_non_dict_elements_through_without_raising(self):
+        """A malformed element must not cost the whole sweep batch."""
+        stamped = stamp_curator_gate_sweep_provenance(['not-a-dict', None])
+
+        assert stamped == ['not-a-dict', None], (
+            f'non-dict elements must pass through unchanged; got {stamped!r}'
+        )
+
+    def test_empty_input_returns_empty_list(self):
+        """The common case — a sweep that found nothing."""
+        assert stamp_curator_gate_sweep_provenance([]) == []

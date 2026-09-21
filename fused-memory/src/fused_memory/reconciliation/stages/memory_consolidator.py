@@ -52,6 +52,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
     normalize_gate_owned_suggested_actions,
+    stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -541,7 +542,13 @@ class MemoryConsolidator(BaseStage):
                     },
                 )
             else:
-                report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
+                # Stamped here because this call site is the only place that
+                # KNOWS these flags came from the sweep; the task-4814 phrasing
+                # carve-out below needs that provenance rather than the
+                # free-form flag_type string an LLM finding may also pick.
+                report.items_flagged = (report.items_flagged or []) + (
+                    stamp_curator_gate_sweep_provenance(gate_sweep['flags'])
+                )
                 report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
                 report.stats['curator_gate_resolution_flags_emitted'] = len(
                     gate_sweep['flags'],
@@ -931,55 +938,48 @@ class MemoryConsolidator(BaseStage):
             )
 
             # ── Gate-owned suggested_action normalization (task 4814) ─────────
-            # Stage 1 sometimes phrases a finding's suggested_action as though a
-            # later stage may DECIDE ("Stage 2 or operator should decide",
-            # "enumerate", "extend") when the cited task is a HUMAN GATE.  Stage
-            # 2 holds update_task/set_task_status, so that reads as authorizing
-            # it to close a question only a human may answer (autopilot_video
-            # run 8b2d3371, findings 640d4ceb / 66af9601).  The Stage-1 prompt
-            # norm (render_gate_owned_action_norm, quoting the same
-            # CANONICAL_HUMAN_GATE_ACTION constant) is the probabilistic half;
-            # this is the authoritative one, so the phrasing is corrected
-            # whether or not the model complied.  It keys on the STRUCTURED gate
-            # fact off the live task tree, never on the model's prose.
+            # The deterministic half of the gate-owned phrasing fix; the
+            # Stage-1 prompt norm quoting the same constant is the
+            # probabilistic half.  Rationale, evidence and the sweep carve-out
+            # live in one place: gate_owned_finding_phrasing.py's module
+            # docstring.  Corrects the STRUCTURED-REPORT channel only —
+            # report.items_flagged, which Stage 2 reads through
+            # task_knowledge_sync.py::_format_flagged (via assemble_payload's
+            # combined_flags, the same path that makes the new
+            # gate_owned_action_normalized key visible to Stage 2 at all).
+            # The mem0_active_query marker relay assemble_payload merges into
+            # that same list is NOT corrected here; see the module docstring.
             #
             # PLACEMENT — last in the block, after the acknowledgment diff, on
             # three grounds:
             #
-            # 1. It never DROPS, so there is no point normalizing a flag a later
-            #    filter would discard.  Running last means it only ever touches
-            #    survivors.
-            # 2. It must sit after the curator-gate sweep that appends
-            #    GATE_RESOLUTION_FLAG_TYPE flags, so its carve-out for those is
-            #    genuinely exercised in production rather than only in tests.
-            #    That flag legitimately asks Stage 2 to transcribe a ruling a
-            #    human curator ALREADY recorded, so normalizing it would
-            #    contradict a live sibling flag.
+            # 1. It never DROPS, so normalizing a flag a later filter would
+            #    discard is wasted work.  Running last means it only ever
+            #    touches survivors.
+            # 2. It must sit after the curator-gate sweep that appends the
+            #    carved-out flags, so the carve-out is genuinely exercised in
+            #    production rather than only in tests.
             # 3. Running after the acknowledgment diff makes the safety
             #    STRUCTURAL rather than argued: surviving_signatures and
-            #    dropped_flags have already been computed above and provably
-            #    cannot observe this rewrite at all.
+            #    dropped_flags are already computed above and provably cannot
+            #    observe this rewrite.
             #
-            # Running after dedup_flags is separately safe, and the argument is
-            # kept here because ground 3 only covers the acknowledgment diff:
+            # Running after dedup_flags is separately safe, and that argument
+            # is kept because ground 3 covers only the acknowledgment diff:
             # compute_flag_signature reads ONLY task_id/flag_type/cited_tasks,
             # none of which this touches, and compute_content_fingerprint_signature
             # (the only path that hashes finding TEXT) returns None the moment a
             # flag has a task_id or any cited_tasks task id — which a gate-owned
-            # finding, selected BY its cited task, structurally always has.  So
-            # cross-cycle dedup and suppression are untouched too.
+            # finding, selected BY its cited task, structurally always has.
             #
-            # report.items_flagged is what Stage 2 reads via _format_report, and
-            # nothing downstream of here consumes it within this stage.  The
-            # durable recon_report row deliberately keeps the LLM's verbatim
-            # self-report (the more faithful audit trail of what the stage
-            # produced); the gate_owned_action_normalized=True marker each
-            # corrected flag carries makes that divergence explicit and
-            # greppable rather than silent.
+            # The durable recon_report row deliberately keeps the LLM's
+            # verbatim self-report (the more faithful audit trail of what the
+            # stage produced); the gate_owned_action_normalized=True marker on
+            # each corrected flag makes that divergence explicit and greppable.
             #
             # Pure and sync — deliberately NOT try/except-wrapped, matching its
-            # pure sibling filter_stale_count_snapshot_corrections at the head of
-            # this same chain.
+            # pure sibling filter_stale_count_snapshot_corrections at the head
+            # of this same chain.
             if self.filtered_task_tree is not None:
                 _gate_task_ids = extract_human_gated_task_ids(
                     self.filtered_task_tree.active_tasks,
@@ -988,6 +988,7 @@ class MemoryConsolidator(BaseStage):
                     report.items_flagged, _normalized = (
                         normalize_gate_owned_suggested_actions(
                             report.items_flagged, _gate_task_ids,
+                            project_id=self.project_id,
                         )
                     )
                     report.stats['gate_owned_suggested_actions_normalized'] = _normalized

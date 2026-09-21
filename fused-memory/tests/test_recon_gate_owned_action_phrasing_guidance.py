@@ -36,6 +36,7 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     CANONICAL_HUMAN_GATE_ACTION,
     normalize_gate_owned_suggested_actions,
     render_gate_owned_action_norm,
+    stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
@@ -175,6 +176,11 @@ class TestGateOwnedNormDoesNotContradictTheCuratorGateFlag:
     prompt would leave the model believing the rule is unconditional, while
     dropping the code exemption would have the normalizer overwrite the
     sibling flag's instruction.
+
+    The code half additionally requires sweep PROVENANCE, because
+    ``GATE_RESOLUTION_FLAG_TYPE`` is a free-form value an LLM-authored finding
+    may pick for itself; ``test_gate_owned_finding_phrasing.py`` pins that an
+    unstamped finding carrying it IS corrected.
     """
 
     def test_prompt_half_names_the_carve_out_flag_type(self):
@@ -191,8 +197,16 @@ class TestGateOwnedNormDoesNotContradictTheCuratorGateFlag:
         )
 
     def test_code_half_leaves_the_real_curator_gate_flag_untouched(self):
-        """End-to-end against the REAL builder, not a hand-written fixture."""
-        flag = build_gate_resolution_flag('645', [{'id': 'mem-a'}])
+        """End-to-end against the REAL builder, not a hand-written fixture.
+
+        Routed through the real ``stamp_curator_gate_sweep_provenance``, as
+        Stage 1 does at the one site that appends the sweep's output: the
+        exemption requires that provenance and not merely the free-form
+        ``flag_type`` string an LLM-authored finding may also pick.
+        """
+        flag = stamp_curator_gate_sweep_provenance(
+            [build_gate_resolution_flag('645', [{'id': 'mem-a'}])],
+        )[0]
         original = dict(flag)
 
         result, count = normalize_gate_owned_suggested_actions([flag], ['645'])

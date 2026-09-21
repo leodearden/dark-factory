@@ -5396,6 +5396,33 @@ class TestGateOwnedActionPhrasingWiring:
         )
 
     @pytest.mark.asyncio
+    async def test_finding_citing_a_foreign_projects_task_is_left_alone(self):
+        """run() must thread its own project_id into the cited-task match.
+
+        The gate ids come from the LOCAL task tree, while a cited_tasks entry
+        carries its own project_id and foreign citations are routine (see
+        flag_dedup._resolve_live_cross_project_fix_task).  Task ids are small
+        per-project integers, so a foreign citation colliding with a local gate
+        id is a matter of time — and it would tell Stage 2 that "no
+        reconciliation stage may decide this" about a foreign, non-gate,
+        legitimately actionable task.
+        """
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+        flag = self._citing_flag('645')
+        flag['cited_tasks'][0]['project_id'] = 'know_live'
+
+        report = await self._run(stage, items_flagged=[flag])
+
+        assert report.items_flagged[0]['suggested_action'] == self._AMBIGUOUS, (
+            "know_live's task 645 is not test_project's gate 645, so the "
+            f'finding must pass through unchanged; got {report.items_flagged[0]!r}'
+        )
+        assert report.stats.get(self._STAT) == 0, (
+            f'a foreign citation must not be counted; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_carve_out_holds_against_the_live_sweep_in_production_ordering(self):
         """The REAL curator-gate flag, appended by the REAL sweep, is not normalized.
 
