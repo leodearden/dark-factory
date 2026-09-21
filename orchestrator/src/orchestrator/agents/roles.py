@@ -464,9 +464,9 @@ half-done tree that is falsely recorded as a completed, successful run.
 # The retraction GENERALISES, and that is the part worth carrying forward: this
 # block has now aged wrong TWICE in the same way.  Its own worked example above
 # used to cite a `ToolSearch` select query returning a `TaskOutput` schema --
-# and ten days later that name no longer resolved at all (same citation).
-# Reachability is durable; the roster is not.  So
-# the guidance below is deliberately built on the things that do not churn --
+# and ten days later that name no longer resolved at all (both measurements at
+# the citation above).  Reachability is durable; the roster is not.  So the
+# guidance below is deliberately built on the things that do not churn --
 # `Bash`'s own `run_in_background` parameter, `Read` on the output file path it
 # returns, and `ToolSearch` as the way to DISCOVER the current termination tool
 # -- and names a concrete tool only where unavoidable, stamped with its
