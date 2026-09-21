@@ -7317,8 +7317,7 @@ class MemoryService:
                 # is shared by every MemoryService.search call site, so without
                 # this one Qdrant read timeout would break every search in the
                 # system — and get_memories_by_metadata genuinely PROPAGATES a
-                # TimeoutError (unlike Mem0Backend.search, which swallows into
-                # {}), so that is a live path, not a hypothetical.
+                # TimeoutError, so that is a live path, not a hypothetical.
                 #
                 # `results` is left exactly as the sort/filter tail produced it
                 # — including its ORDER and every result's topic_anchored flag —
@@ -7825,13 +7824,14 @@ class MemoryService:
             MemoryNotFoundError: mem0 path, the id genuinely does not exist.
             TimeoutError: PROPAGATED from the backend read, never converted.
 
-        A MISS and a TIMEOUT must never be conflated, in either direction.
-        ``ReconReportState.cite_memory`` renders MemoryNotFoundError as
-        ``memory_not_found``, and ``repair_memory_citation(reason=
-        'memory_not_found')`` DELETES citations on that signal — so reporting a
-        transient read timeout as a miss would erase valid provenance.  Do not
-        add a ``try/except TimeoutError`` here: ``Mem0Backend.get`` propagates
-        precisely so this function can tell the two apart.
+        A MISS and a TIMEOUT must never be conflated, in either direction:
+        this function is where the two are still distinguishable, and
+        ``ReconReportState.cite_memory`` renders a ``MemoryNotFoundError`` as
+        ``memory_not_found`` — a false absence in a durable report.  The full
+        chain, and the corroboration gate that bounds it, are stated once at
+        ``backends/mem0_client.py::Mem0Backend.get``; do not re-derive them
+        here.  Do not add a ``try/except TimeoutError`` either: ``Mem0Backend.
+        get`` propagates precisely so this function can tell the two apart.
         """
         if store == 'graphiti':
             name, fact = await self.graphiti.get_edge_text(memory_id, group_id=project_id)
@@ -8936,9 +8936,9 @@ class MemoryService:
         # so the metadata-only fast paths would otherwise emit a success
         # envelope AND a journal row for a write that touched nothing.
         #
-        # A TimeoutError from here PROPAGATES untouched. Mem0Backend.
-        # get_point_by_id deliberately does not swallow it (unlike get()), which
-        # is what keeps "genuinely absent" distinguishable from "backend timed
+        # A TimeoutError from here PROPAGATES untouched — the uniform posture
+        # of every Mem0Backend read since task 5265, get() included. That is
+        # what keeps "genuinely absent" distinguishable from "backend timed
         # out"; catching both into one MemoryNotFound outcome would throw that
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
