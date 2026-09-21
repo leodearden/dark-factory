@@ -10116,3 +10116,110 @@ def test_lease_gate_evaluates_every_tick_while_only_its_skip_line_is_throttled(
     assert [m for m in logged if "lease" in m] == [], (
         f"mid-bucket ticks must stay out of the journal: {logged}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-then-act: the gates are re-evaluated at the DELEGATE call site (4755)
+#
+# Between the top-of-pass gates and the delegation there is a `git log`
+# (_newest_watched_commit_epoch) plus is_unit_enabled and TWO `systemctl show`
+# calls PER UNIT — a multi-second window, entered once every 60s. A sweep
+# started, or a clock stamped, by another tier inside that window would
+# otherwise be raced by a decision taken before it existed.
+#
+# The re-check must live in staleness_pass AT THE CALL SITE, not inside
+# _delegate_fleet_restart: every gate test in this file stubs that function as
+# a recorder, so a check buried inside it would be invisible to precisely the
+# tests that must prove it exists. These tests keep the recorder stub in place
+# and assert a call count of zero — which only holds if the check is outside.
+# ---------------------------------------------------------------------------
+
+
+def _returning_in_sequence(*values):
+    """A zero-arg stub returning *values* in order, then repeating the last."""
+    remaining = list(values)
+
+    def _next():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return _next
+
+
+def test_staleness_pass_rereads_the_clock_immediately_before_delegating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Another tier stamping the clock mid-pass must cancel this delegation."""
+    wdog = _load_watchdog()
+    now = _BUCKET_BOUNDARY_NOW
+    real_min_interval_gate = wdog._within_fleet_deploy_min_interval
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=now)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+    # Put the REAL min-interval gate back — _wire_stale_unit neutralizes it for
+    # the many tests that are about something else, and here it IS the subject
+    # — then feed its reader a clock that goes from "long ago" to "just now"
+    # between the two reads, as another tier stamping mid-pass would.
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fleet_deploy_epoch",
+        _returning_in_sequence(now - wdog.ORCH_RESTART_MIN_INTERVAL_SECS - 1, now),
+    )
+    monkeypatch.setattr(
+        wdog, "_within_fleet_deploy_min_interval", real_min_interval_gate
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert delegated == [], (
+        "a clock stamped between the top-of-pass gate and the delegate call "
+        f"must cancel the delegation; got {delegated}"
+    )
+
+
+def test_staleness_pass_rereads_the_lease_immediately_before_delegating(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sweep that STARTS mid-pass must cancel this delegation.
+
+    The window is wide enough to matter: a `git log` plus two `systemctl show`
+    calls per unit sit inside it, and the coordinator can fire at any moment.
+    """
+    wdog = _load_watchdog()
+    now = _BUCKET_BOUNDARY_NOW
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=now)
+    started_mid_pass = {
+        "pid": os.getpid(),
+        "started_ts": now - 1.0,
+        "current_unit": synthetic_unit("just-started"),
+    }
+    monkeypatch.setattr(
+        wdog, "_live_fleet_lease", _returning_in_sequence(None, started_mid_pass)
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert delegated == [], (
+        "a lease taken between the top-of-pass gate and the delegate call must "
+        f"cancel the delegation; got {delegated}"
+    )
+
+
+def test_staleness_pass_still_delegates_exactly_once_when_nothing_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """REGRESSION: the second read must not cost the ordinary path its restart.
+
+    A re-check that fired on the unchanged case would silently disable the
+    backstop outright — strictly worse than the race it closes.
+    """
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"an unchanged pass must still delegate exactly once; got {delegated}"
+    )
