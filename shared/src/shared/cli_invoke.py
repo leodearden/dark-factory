@@ -763,7 +763,7 @@ def note_unreadable_transcript(
 #
 # That is an executable claim, not a comment's promise: the exact prescribed
 # shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
-# is pinned by test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# is pinned by tests/test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
 # test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
 # a ``command`` key) fails there rather than silently downgrading every
 # correctly-behaved session to failure.
