@@ -1299,24 +1299,65 @@ def _confirm_plan(
     artifacts: TaskArtifacts,
 ) -> dict[str, Any]:
     plan, markup_facts = _read_plan_repaired(artifacts)
+    # THE REJECTION VIEW, COMPUTED ONCE AND BEFORE THE FIRST GUARD (task 4597).
+    #
+    # confirm_plan is the architect's LAST tool result, and therefore the one
+    # place a refusal reaches the durable agent transcript while the architect
+    # can still act on it — the block is already on disk by then, but plan.json
+    # is read by LATER agents. That much is true of every branch; what makes
+    # the ERROR branches the important ones is that a LEAKING architect lands
+    # on them. Refused add_plan_step calls are what leaves a plan stepless, and
+    # a refused create_plan is what leaves it absent — so the three exits that
+    # first went without the counter are precisely the exits that need it.
+    #
+    # `session_summary`, NOT `summary`: on the no-plan branch there is no
+    # document to carry a block, and the refused create_plan is sitting in the
+    # pending buffer. A plan-only view would stay silent in the one case that
+    # most needs explaining.
+    #
+    # OMIT-WHEN-ABSENT, exactly as `_with_markup_repairs`: absent on the clean
+    # path, never present-and-zero, so every existing confirm_plan response
+    # stays byte-identical and the key's PRESENCE is an unambiguous signal.
+    #
+    # A SUMMARY, not the block: `session_summary` returns {count, by_tool}
+    # only. The events and the note are already two keys away in the document,
+    # and echoing them here would put the block's bulk into the largest
+    # response the architect reads, to say what the two numbers already say.
+    #
+    # COMPOSED WITH `_with_markup_repairs` rather than folded into it: the two
+    # diagnostics answer different questions (what this read REPAIRED, versus
+    # what this session has REFUSED) and neither should be able to suppress
+    # the other.
+    rejections = plan_markup_stamp.session_summary(plan)
+
+    def _respond(payload: dict[str, Any]) -> dict[str, Any]:
+        """The ONE place that decides what a confirm_plan response carries.
+
+        Four exits each deciding for themselves is what produced the defect
+        this closes — three of them silently omitted the counter. Routing the
+        no-plan exit through here also gives it the `_with_markup_repairs`
+        wrapping its three siblings already had, which is a harmless
+        unification: `_read_plan_repaired` is total on a missing plan and
+        returns no facts, so the key stays absent exactly as before.
+        """
+        if rejections is not None:
+            payload['markup_rejections'] = rejections
+        return _with_markup_repairs(payload, markup_facts)
+
     if not plan:
-        return {'status': 'error', 'message': 'No plan exists.'}
+        return _respond({'status': 'error', 'message': 'No plan exists.'})
     if not plan.get('steps'):
-        return _with_markup_repairs(
-            {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'},
-            markup_facts,
+        return _respond(
+            {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
         )
     if not plan.get('files'):
-        return _with_markup_repairs(
-            {
-                'status': 'error',
-                'message': (
-                    'Plan has no files — cannot confirm. Call create_plan (or '
-                    'update_plan_metadata) with a non-empty files list first.'
-                ),
-            },
-            markup_facts,
-        )
+        return _respond({
+            'status': 'error',
+            'message': (
+                'Plan has no files — cannot confirm. Call create_plan (or '
+                'update_plan_metadata) with a non-empty files list first.'
+            ),
+        })
 
     now = datetime.now(UTC).isoformat()
     # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
@@ -1330,36 +1371,12 @@ def _confirm_plan(
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
-    response = {
+    return _respond({
         'status': 'ok',
         'finalized': True,
         'steps': len(plan['steps']),
         'files': len(plan.get('files', [])),
-    }
-    # THE ARCHITECT'S LAST TOOL RESULT (task 4597), and therefore the one place
-    # a refusal reaches the durable agent transcript. The block is already on
-    # disk by now, but plan.json is read by LATER agents; this is the only
-    # surface on which the architect itself, still mid-session, can see that
-    # calls it believed it made were refused and can decide to resend them.
-    #
-    # OMIT-WHEN-ABSENT, exactly as `_with_markup_repairs` below: absent on the
-    # clean path, never present-and-zero, so every existing confirm_plan
-    # response stays byte-identical and the key's PRESENCE is an unambiguous
-    # signal.
-    #
-    # A SUMMARY, not the block: `summary` returns {count, by_tool} only. The
-    # events and the note are already two keys away in the document, and
-    # echoing them here would put the block's bulk into the largest response
-    # the architect reads, to say what the two numbers already say.
-    #
-    # COMPOSED WITH `_with_markup_repairs` rather than folded into it: the two
-    # diagnostics answer different questions (what this read REPAIRED, versus
-    # what this plan has REFUSED over its life) and neither should be able to
-    # suppress the other.
-    rejections = plan_markup_stamp.summary(plan)
-    if rejections is not None:
-        response['markup_rejections'] = rejections
-    return _with_markup_repairs(response, markup_facts)
+    })
 
 
 # ---------------------------------------------------------------------------

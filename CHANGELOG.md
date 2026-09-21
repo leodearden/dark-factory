@@ -32,10 +32,17 @@ existing machine-written envelope (`_schema_version`, `_finalized_at`,
 `last_at` window bounds, up to 20 `{ts, tool, param, outcome}` events, an
 `events_truncated` disclosure whose PRESENCE means something was cut, and one
 static `note` so a reader who has never seen the key does not have to infer it.
-`confirm_plan` additionally folds a compact `{count, by_tool}` summary into its
-response — the architect's last tool result, and the only surface where the
+`confirm_plan` additionally folds a compact `{count, by_tool}` summary into EVERY
+response it can return — the success branch and all three error branches —
+because that tool result is the architect's last, and the only surface where the
 architect itself, still mid-session, can see that calls it believed it made were
-refused.
+refused. The ERROR branches are where that matters most: refused `add_plan_step`
+calls are what leaves a plan stepless, and a refused `create_plan` is what leaves
+it absent, so a leaking architect lands on an error exit rather than the success
+one. The `No plan exists.` branch is served from the PENDING BUFFER, via
+`plan_markup_stamp.session_summary` — "what this session refused" rather than
+`summary`'s "what this plan records" — since a refused `create_plan` leaves no
+document to carry a block at all.
 
 - **It deliberately does not hold the matched pattern, the mis-close tag, or the
   raw payload.** Three independent measured reasons. (1) The pattern and mis-close
