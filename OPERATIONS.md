@@ -1243,10 +1243,15 @@ Three restart mechanisms act on the orchestrator fleet. They're
 deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
-- **Liveness = brokenness.** The watchdog's port-probe pass revives a
-  wedged or port-down unit immediately: per-unit, uncapped, not gated by
-  any fleet-wide clock, and it never stamps that clock. A single
-  wedged-unit revive is not a fleet deploy.
+- **Liveness = brokenness.** `main()`'s port-probe pass over the
+  **`WATCHED` orchestrator units** revives a wedged or port-down unit
+  immediately: per-unit, uncapped, not gated by any fleet-wide clock, and
+  it never stamps that clock. A single wedged-unit revive is not a fleet
+  deploy. Read "uncapped" as scoped to those units: it does **not**
+  describe `fused-memory.service`, which is deliberately kept out of
+  `WATCHED` and has had its own streak-gated, rate-capped liveness pass
+  since task 3764 — see
+  [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
   is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
   (`orchestrator_restart_min_interval_secs`, default 28800) via a shared
@@ -1322,6 +1327,103 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   intent, not a guarantee, and read the clock file's timestamp rather than
   assuming it.
 
+### fused-memory liveness revive
+
+`fused-memory.service` has its own liveness pass —
+`scripts/orchestrator-watchdog.py::fused_memory_liveness_pass` — run on
+the same 60s timer tick, immediately after `main()`. It is **not** one of
+the three fleet mechanisms above: it targets a single unit, never invokes
+`restart-all-orchestrators.sh`, and never touches the shared fleet clock.
+Its kill decision is bounded on two independent axes — a detection streak
+and a revive rate cap — described below.
+
+**The verdict** comes from
+`scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
+classifies fm three ways: `port-down` (the port probe fails — the process
+is gone, or never bound the port), `healthy` (the zero-I/O `/alive` route
+answers within 15s), or `wedged` (the port is up but `/alive` does not
+answer — the asyncio loop is hung). `/health` is deliberately not
+consulted for the verdict: it awaits two sequential backing-store
+round-trips, which would make a slow FalkorDB/Qdrant read as a wedge and
+get the shared MCP server restarted for nothing. `/health` is still the
+readiness signal, and still feeds the `--report` row's recon-busy column.
+
+**Layer 1 — a persisted consecutive-failure streak.** A revive requires
+`FM_LIVENESS_STREAK_THRESHOLD` (default 3) *consecutive* non-healthy
+verdicts: ~3 minutes of continuous non-response at the 60s cadence. A
+single `healthy` verdict clears the streak outright. The count is
+persisted to `data/fused-memory/fm_liveness_streak.json` rather than held
+in memory because `orchestrator-watchdog.service` is `Type=oneshot` — the
+process exits between probes, so an in-memory counter could never
+accumulate. The streak is **shared across both non-healthy classes** on
+purpose: an fm instance dying mid-probe can legitimately alternate
+`port-down`/`wedged` from tick to tick, and per-class counters would each
+keep resetting, so a genuinely broken process would reach neither
+threshold.
+
+**Layer 2 — a revive cap**, on its own clock file
+`data/fused-memory/last_liveness_restart_fused_memory.json`. That is
+deliberately a *different* file from fm's deploy clock, and the separation
+holds in both directions: sharing one would let a wedge revive silence the
+fm staleness backstop for 8h (a merged fm change sitting undeployed
+because the watchdog once revived a wedge), and conversely would let a
+scheduled deploy license an immediate extra liveness kill.
+
+**One window, `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` (3600s), for every
+non-healthy class.** It is sized strictly above the 3180s (53 min)
+worst-observed pathological instance lifetime, so even a wrong verdict
+cannot reproduce that pathology, and it bounds watchdog-initiated fm
+liveness revives to <=24/day.
+
+READ THAT FIGURE CORRECTLY, because it has been misread before. 3180s is
+NOT the duration of a wedge episode. It is the longest of the fm instance
+*lifetimes* recorded in task 3764's evidence paragraph — "instance
+lifetime had collapsed to 45-53 min ... since 07-28" — measured while the
+pre-3764 detector was killing fm on a single non-healthy verdict,
+uncapped. So it characterises a KILL CADENCE against a process that was
+alive and serving, and the cap's job is to guarantee a minimum inter-kill
+interval above it. An instance does not "exhibit" a lifetime; sizing
+arguments phrased that way are reasoning about the wrong object.
+
+The cap is *shorter* than the staleness pass's 8h deploy cadence but never
+*absent*, and that matters: `restart_unit` runs `systemctl reset-failed`,
+which defeats systemd's own `StartLimitBurst` backstop, so an uncapped
+lane would re-restart a permanently-unstartable unit (bad config, missing
+dependency, corrupt venv) every ~180s forever.
+
+A shorter, port-down-specific lane was designed under task 4131 and
+DELIBERATELY NOT SHIPPED — see esc-4131-9 (Leo's 2026-09-21 ruling) and
+task 5739, which revisits it once task 5550 has removed the wedge cause.
+Measured 2026-08-23..2026-09-21: 57 `wedged` threshold-crossings against
+exactly 1 `port-down` crossing, and that one was a race with an external
+restart already in flight.
+
+**A failed — or raising — restart still arms the cap.** `restart_unit`
+passes `check=False`, so a non-zero `systemctl` exit has always armed it;
+since task 4131 a restart that *raises* (a fork/exec `OSError` under
+memory pressure, a `PermissionError`, a mid-tick `systemctl` swap) arms it
+too, via a `finally`. The failure is still logged loudly. So an operator
+who sees a non-healthy verdict and then no repeat attempt for the rest of
+the window is looking at the cap working as designed, not a stuck
+watchdog — check `LIVENESS-RESTART-AGE` in
+`--report` to see how much of the window remains.
+
+**Env knobs.** All are read once at import, each with a fallback so a
+typo'd value cannot crash the oneshot watchdog:
+
+| var | default | meaning of `<=0` |
+|---|---|---|
+| `FM_LIVENESS_STREAK_THRESHOLD` | `3` | **Clamped to >=1 — cannot be disabled.** `0` would make the gate `streak < threshold` never hold, silently restoring the one-verdict-per-kill behaviour task 3764 exists to remove. To get unbounded revives, zero a min-interval knob instead. |
+| `FM_LIVENESS_STREAK_MAX_AGE_SECS` | `300` | No age-based expiry: the count survives any gap, and continuity is then enforced only by a `healthy` verdict and by the instance-boundary expiry (which stays in force, so evidence about a dead fm process still cannot count toward killing its successor). Before task 4131 this knob was the one place `<=0` was *unsafe* — `0` expired every entry, pinning the count at 1, so at the default threshold fm could never be revived at all. |
+| `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` | `3600` | Disables the revive cap, without even reading the clock. |
+| `FM_LIVENESS_STREAK` | `data/fused-memory/fm_liveness_streak.json` | Path override for the streak file (not a duration). |
+| `FM_LIVENESS_RESTART_CLOCK` | `data/fused-memory/last_liveness_restart_fused_memory.json` | Path override for the revive clock (not a duration). |
+
+Two gates run *before* any of this and return early without reading or
+writing streak state: `is_unit_enabled` (operator intent) and the 120s
+`STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
+neither failure evidence nor recovery).
+
 ### Reading `--report`
 
 ```bash
@@ -1342,8 +1444,32 @@ columns, it prints:
   drain-aware deploy would actually hold back. `idle` proceeds
   immediately; `stale` / `absent` proceed after a short unknown-grace.
 
-Run `--report` before manually restarting a unit, or to check whether an
-upcoming fleet deploy is likely to be held up by an in-flight merge.
+A final labelled `fused-memory.service liveness` row follows the unit
+table. It is **informational only and never alters `--report`'s exit
+code** (which stays report()'s own: 0 = all fresh, 1 = at least one stale
+unit), and every field degrades independently to `unknown` rather than
+costing you the whole row:
+
+- **verdict** — `healthy` / `wedged` / `port-down`, from the same
+  port + `/alive` probe the revive pass uses, shown ungated (no
+  enabled/grace filtering), exactly as the unit rows show raw verdicts.
+- **DEPLOY-AGE** — hours since fm's own *deploy* clock was stamped. This
+  is the staleness backstop's clock, not the revive cap's.
+- **recon-busy** — from `/health`, so this column can read degraded while
+  the verdict reads `healthy`. That combination is the point of the
+  aliveness/readiness split, not an inconsistency.
+- **streak** — `<count>/<threshold>` or `none`. This is what answers "why
+  hasn't the watchdog restarted fused-memory yet" without hand-reading
+  JSON.
+- **LIVENESS-RESTART-AGE** — hours since the most recent revive, or
+  `unknown` if the watchdog has never revived fm. This is the reason a
+  revive can be suppressed: read it against
+  `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` to see how much of the window
+  remains.
+
+Run `--report` before manually restarting a unit, to check whether an
+upcoming fleet deploy is likely to be held up by an in-flight merge, or to
+see why fused-memory has (or has not) been revived.
 
 ### Known gap: the watched list is hardcoded
 
