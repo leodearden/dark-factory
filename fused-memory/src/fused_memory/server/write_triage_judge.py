@@ -273,9 +273,11 @@ _ELIDED_MARKER = '…[elided]'
 #: WHAT IT BOUNDS is the WHOLE call — :data:`JUDGE_SYSTEM_PROMPT` plus a
 #: worst-case :func:`build_judge_prompt` render, meaning
 #: :data:`_DEFAULT_JUDGE_CANDIDATE_COUNT` candidates and a new entry with
-#: every field at :data:`_FIELD_CHARS`. Not the system prompt alone: the two
-#: halves are summed on every request, so budgeting either in isolation
-#: budgets nothing.
+#: every field over :data:`_FIELD_CHARS`, each candidate carrying the 36-char
+#: uuid a real record has, and the ``attach_target`` line rendered. Not the
+#: system prompt alone: the two halves are summed on every request, so
+#: budgeting either in isolation budgets nothing. And not a construction
+#: :func:`judge_write` never makes, for the same reason.
 #:
 #: WHY IT IS A CONSTANT rather than a literal in the test that checks it. The
 #: system prompt is the half that grows — a vocabulary word, a worked example,
@@ -292,18 +294,35 @@ _ELIDED_MARKER = '…[elided]'
 #: precision, and it bites asymmetrically: a rendering 0.5% over would read as
 #: a C1 violation when it is inside "~2.5k" on any reading.
 #:
-#: The tolerance is SIZED, not chosen for comfort: 200 chars is less than one
-#: further worked example costs (~176), so the next addition to the system
-#: prompt still has to either make room or make its case here. A ceiling that
-#: admitted another example would have stopped bounding anything.
+#: The tolerance is SIZED, not chosen for comfort — but what has to stay
+#: small is the SLACK, budget minus the measured worst case, which is what a
+#: future addition could spend without anyone having to come here. That slack
+#: is 140 chars. The four worked examples presently rendered cost 157 to 192
+#: chars apiece including the blank line between them, so even the cheapest
+#: fifth one does not fit and its author has to either make room or make the
+#: case here. A ceiling that admitted another example would have stopped
+#: bounding anything.
 #:
-#: Measured at task 4811, with the elision marker counted: the true worst case
-#: is 10_051 chars — system 2_312, plus a 7_739-char render of six fields each
-#: OVER `_FIELD_CHARS`. Note "over", not "at": `_elide` returns a field of
-#: exactly `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS`
-#: plus `_ELIDED_MARKER`, so the widest render is 54 chars wider than a slate
-#: built at the cap.
-_PROMPT_CHAR_BUDGET = 2_500 * 4 + 200
+#: Measured at task 4811, PRODUCTION-SHAPED and with the elision marker
+#: counted: the worst case is 10_260 chars — system 2_312, plus a 7_948-char
+#: render of six fields each OVER `_FIELD_CHARS`. The first measurement read
+#: 10_051 because it was built from 5-char stand-in ids and no attach target,
+#: neither of which production ever hands this function. The 209-char
+#: difference is not slop:
+#:
+#: * every stored record's id is a 36-char uuid — all 104 in
+#:   ``tests/fixtures/write_triage_calibration.jsonl`` are — and
+#:   :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so
+#:   a full slate costs 155 chars more than short ids suggest;
+#: * :func:`judge_write` forwards ``attach_target_id`` on every call, so the
+#:   ``  attach_target: {id}`` line is always rendered — 54 more chars, a
+#:   fixed cost of the call rather than an optional extra.
+#:
+#: Note "over" `_FIELD_CHARS`, not "at": `_elide` returns a field of exactly
+#: `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS` plus
+#: `_ELIDED_MARKER`, so the widest render is 9 chars per field — 54 across the
+#: six — wider than a slate built at the cap.
+_PROMPT_CHAR_BUDGET = 2_500 * 4 + 400
 
 
 def _elide(text: object) -> str:

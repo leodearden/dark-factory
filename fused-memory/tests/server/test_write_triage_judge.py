@@ -28,6 +28,7 @@ import logging
 import subprocess
 import sys
 import types
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -243,19 +244,36 @@ class TestJudgeExemplars:
                     f'that is training on the test set: {text!r}'
                 )
 
-    def test_every_exemplar_field_reaches_the_model(self) -> None:
-        """Declared but unrendered exemplars would teach nothing at all.
+    def test_each_exemplar_renders_as_an_answered_pair(self) -> None:
+        """The PAIRING is the property. The three fields separately are not.
 
-        All three fields, because a pair rendered without its verdict is a
-        riddle and a verdict rendered without its pair is an assertion.
+        A pair rendered without its verdict is a riddle, and a verdict
+        rendered without its pair is an assertion — so what has to hold is
+        that each exemplar's three fields reach the model AS ONE BLOCK.
+        Checking the fields individually cannot see that: all four verdict
+        words already appear in the vocabulary bullets above the examples, so
+        ``exemplar.verdict in prompt`` is true whatever the renderer emits.
+        Measured by simulation — a ``_render_exemplars`` that dropped its
+        ``answer:`` line entirely, shipping four unanswered riddles, left the
+        per-field version of this test green.
+
+        Asserted as the contiguous triple, which is executable structure and
+        not a wording pin. It restates ``_render_exemplars``' block layout on
+        purpose — that layout IS the contract between the tuple and the model
+        — while leaving the prompt's prose around the examples free to be
+        reworded. It subsumes the per-field presence check, so there is no
+        longer a separate one.
         """
-        prompt = JUDGE_SYSTEM_PROMPT
         for exemplar in judge_module.JUDGE_EXEMPLARS:
-            for field_name in ('entry', 'candidate', 'verdict'):
-                text = getattr(exemplar, field_name)
-                assert text in prompt, (
-                    f'exemplar {field_name} never reaches the model: {text!r}'
-                )
+            block = (
+                f'new entry: {exemplar.entry}\n'
+                f'candidate: {exemplar.candidate}\n'
+                f'answer: {exemplar.verdict}'
+            )
+            assert block in JUDGE_SYSTEM_PROMPT, (
+                f'exemplar does not reach the model as an ANSWERED pair — its '
+                f'fields may all be present but not together: {block!r}'
+            )
 
     def test_the_exemplars_render_once_each_in_declaration_order(self) -> None:
         """A REPRODUCIBLE measurement needs a prompt that does not move.
@@ -326,6 +344,19 @@ class TestJudgeExemplars:
         its largest. Built rather than arithmetic, so the scaffolding between
         the fields is counted too.
 
+        BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
+        a construction the production path never makes bounds nothing. Two
+        details were missing when this test used 5-char stand-in ids and no
+        attach target, and together they cost 209 chars, enough to put the
+        real call over a budget this test reported as met. Both are now
+        asserted rather than assumed, because either could be quietly undone
+        by an edit that still left the test green: candidate ids are the
+        36-char uuids every record actually carries (all 104 in
+        ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+        ``build_judge_prompt`` renders ``- id:`` UN-elided), and
+        ``attach_target_id`` is passed, because ``judge_write`` forwards it on
+        EVERY call — so its line is part of the worst case, not an extra.
+
         THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
         field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
         ``_FIELD_CHARS`` PLUS ``_ELIDED_MARKER`` — so the input that elides
@@ -341,16 +372,25 @@ class TestJudgeExemplars:
         """
         maximal = 'x' * (_FIELD_CHARS + 1)
         candidates = [
-            _result(f'mem-{i}', 0.9, content=maximal)
-            for i in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+            _result(str(uuid.uuid4()), 0.9, content=maximal)
+            for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
         ]
-        assert _ELIDED_MARKER in build_judge_prompt(maximal, candidates), (
+        assert {len(c.id) for c in candidates} == {36}, (
+            'the slate must carry the 36-char uuids production carries — a '
+            'shorter stand-in id under-measures every candidate line'
+        )
+        rendered = build_judge_prompt(
+            maximal, candidates, attach_target_id=candidates[0].id,
+        )
+        assert _ELIDED_MARKER in rendered, (
             'the worst case must be an ELIDED render — otherwise it misses '
             'the marker _elide appends, and under-measures the real ceiling'
         )
-        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(
-            build_judge_prompt(maximal, candidates),
+        assert f'  attach_target: {candidates[0].id}' in rendered, (
+            'the attach_target line is rendered on every production call, so '
+            'a worst case measured without it is not the worst case'
         )
+        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
         assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
             f'worst-case prompt is {worst_case} chars against a budget of '
             f'{judge_module._PROMPT_CHAR_BUDGET}'
