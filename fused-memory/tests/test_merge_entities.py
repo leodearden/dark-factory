@@ -319,6 +319,11 @@ class TestMergeEntities:
             'incoming_redirected': 1,
             'inter_node_deleted': 0,
         })
+        backend.redirect_node_mentions = AsyncMock(return_value={
+            'redirected': 2,
+            'already_linked': 1,
+        })
+        backend.count_foreign_relationships = AsyncMock(return_value=1)
         backend.delete_entity_node = AsyncMock()
         backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
@@ -369,6 +374,14 @@ class TestMergeEntities:
                 'outgoing_redirected': 0, 'incoming_redirected': 0, 'inter_node_deleted': 0
             }
         )
+        backend.redirect_node_mentions = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('mentions') or {
+                'redirected': 0, 'already_linked': 0
+            }
+        )
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('residual') or 0
+        )
         backend.delete_entity_node = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('delete')
         )
@@ -379,7 +392,12 @@ class TestMergeEntities:
             side_effect=lambda *a, **kw: call_order.append('refresh') or make_rebuild_detail('sur-uuid', 'S')
         )
         await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
-        assert call_order == ['redirect', 'delete', 'dedup', 'refresh']
+        # The MENTIONS relocation MUST precede the delete. This is the whole
+        # point of loss mode 1: delete_entity_node's DETACH DELETE destroys
+        # every remaining link, so a relocation ordered after it has nothing
+        # left to move. The residual census is likewise taken before the
+        # delete -- afterwards there is nothing left to count.
+        assert call_order == ['redirect', 'mentions', 'residual', 'delete', 'dedup', 'refresh']
 
     @pytest.mark.asyncio
     async def test_dedups_surviving_node_edges(self, backend_with_mocks):
@@ -408,6 +426,88 @@ class TestMergeEntities:
         assert 'edges_redirected' in result
         assert isinstance(result['edges_redirected'], dict)
         assert 'surviving_summary' in result
+
+    @pytest.mark.asyncio
+    async def test_relocates_mentions_onto_the_survivor(self, backend_with_mocks):
+        """Awaits redirect_node_mentions once with both uuids and the group_id
+        (task 4986 loss mode 1)."""
+        backend = backend_with_mocks
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.redirect_node_mentions.assert_awaited_once_with(
+            'dep-uuid', 'sur-uuid', group_id='test',
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_mentions_redirected(self, backend_with_mocks):
+        """The MENTIONS relocation counts reach the audit dict verbatim, so the
+        record distinguishes 'two links moved' from 'two moved, one redundant'."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['mentions_redirected'] == {'redirected': 2, 'already_linked': 1}
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_keeps_the_deprecated_nodes_summary(self, backend_with_mocks):
+        """Loss mode 5: merge_entities already FETCHES the loser's summary to
+        validate the node exists, then throws it away -- and refresh_entity_summary
+        rebuilds the survivor's summary from EDGES only, so any summary text no
+        edge backs is unrecoverable after the merge. Keeping it in the audit dict
+        is the minimum fix."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['deprecated_summary'] == 'old dep summary'
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_residual_relationships_destroyed(
+        self, backend_with_mocks,
+    ):
+        """What this DETACH DELETE actually destroyed: a census taken AFTER both
+        relocations and BEFORE the delete. Loss modes 1-4 were only discoverable
+        because someone went looking; this field makes the same question
+        answerable from the record itself."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.count_foreign_relationships.assert_awaited_once_with(
+            'dep-uuid', group_id='test',
+        )
+        assert result['residual_relationships_destroyed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_residual_probe_failure_never_aborts_the_merge(self, backend_with_mocks):
+        """The probe is an audit datum, never a gate. By the time it is taken the
+        edge and mention relocations are already committed and irreversible, so a
+        raise must not propagate -- that would abort a half-applied merge on the
+        strength of a failed OBSERVATION. None is honest about the difference
+        between 'measured zero' and 'could not measure', which is the same
+        distinction count_foreign_relationships itself refuses to blur."""
+        backend = backend_with_mocks
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('census query failed'),
+        )
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['residual_relationships_destroyed'] is None
+        # The merge still COMPLETED: the delete and everything after it ran.
+        backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
+        backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_audit_keys_keep_their_values(self, backend_with_mocks):
+        """The new keys are ADDITIVE: every key the audit dict carried before
+        task 4986 still reports exactly what it did."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['surviving_uuid'] == 'sur-uuid'
+        assert result['surviving_name'] == 'SurvivingName'
+        assert result['deprecated_uuid'] == 'dep-uuid'
+        assert result['deprecated_name'] == 'DeprecatedName'
+        assert result['edges_redirected'] == {
+            'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0,
+        }
+        assert result['duplicate_edges_removed'] == 0
+        assert result['surviving_summary'] == {
+            'before': 'old sur summary',
+            'after': 'SurvivingName knows Foo\nDeprecatedName knows Bar',
+            'edge_count': 3,
+        }
 
     @pytest.mark.asyncio
     async def test_merge_with_zero_edges_succeeds(self, mock_config, make_backend):
