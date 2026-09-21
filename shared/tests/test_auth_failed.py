@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -98,8 +100,8 @@ class TestHandleAuthFailure:
 class TestAuthFailedPersistsResetsAt:
     """auth_failed event details carry the parsed resets_at when the reason
     text contains a "resets …" phrase. Source of truth for cap-time parsing
-    is the gate's _parse_resets_at; the dashboard reads what we persist
-    rather than re-parsing the reason string itself.
+    is shared.invocation_outcome._parse_resets_at; the dashboard reads what we
+    persist rather than re-parsing the reason string itself.
 
     DECIDED SHAPE (task 4042) — do not "helpfully" re-disable this branch.
     Restoring the 401/403 response-body snippet re-armed the ``'resets' in
@@ -112,13 +114,15 @@ class TestAuthFailedPersistsResetsAt:
          regression (93baf1193a < b68eea415b), so suppressing it would invent
          new behaviour.
       2. An UNPARSEABLE "resets" hint persists NOTHING rather than a fabricated
-         hour. The branch's original parser was the forked
-         ``usage_gate._parse_resets_at``, which returns ``now + 1h`` on parse
-         failure; the dashboard (``dashboard/data/costs.py::_extract_resets_at``)
-         surfaces the persisted value verbatim as a real reset ETA, so that
-         would put a fabricated recovery time on a revoked token — violating
-         PRD 7.1.a ("an unknown reset time must be reported as explicitly
-         unknown, never fabricated").
+         hour. The branch's original parser WAS the forked
+         ``usage_gate._parse_resets_at``, which returned ``now + 1h`` on parse
+         failure (task 4042 moved the call site off it; task 4357 retired the
+         fork itself). The dashboard
+         (``dashboard/src/dashboard/data/costs.py::_extract_resets_at``)
+         surfaces the persisted value verbatim as a real reset ETA, so a
+         fabricated one would put an invented recovery time on a revoked token
+         — violating PRD 7.1.a ("an unknown reset time must be reported as
+         explicitly unknown, never fabricated").
     """
 
     def _capture_fired_details(self, gate: UsageGate) -> list[tuple[str, str, str]]:
@@ -281,42 +285,96 @@ class TestAuthFailedPersistsResetsAt:
 #: inside a `.worktrees/<id>` checkout too.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Package source trees that ship production code able to reach the fork. Scoped
-#: to `<pkg>/src` on purpose: `.worktrees/` sits at the REPO root, so unlike a
-#: root-level rglob (the trap capability_manifest_corpus.py documents) this walk
-#: cannot wander into a sibling task's checkout.
-_PRODUCTION_SRC_ROOTS = ('shared/src', 'orchestrator/src')
-
-#: The ONE module allowed to call the bare `_parse_resets_at` name: it is where
-#: the non-fabricating copy is defined, so an unqualified call there is
-#: unambiguous. Everywhere else the convention (already followed by
-#: shared/src/shared/usage_gate.py's `import ... as _parse_resets_at_strict`) is
-#: to import it under the explicit alias, so a reader can tell at the call site
-#: WHICH of the two copies is running.
+#: The ONE module allowed to define — and so to call unqualified — the bare
+#: `_parse_resets_at` / `_extract_cap_message` names. Everywhere else the
+#: convention (already followed by shared/src/shared/usage_gate.py's
+#: `import ... as _parse_resets_at_strict`) is to import under the explicit
+#: alias, so a reader can tell at the call site WHICH copy is running.
 _STRICT_PARSE_OWNER = 'shared/src/shared/invocation_outcome.py'
 
+#: The names `_STRICT_PARSE_OWNER` single-sources.
+_OWNED_NAMES = ('_parse_resets_at', '_extract_cap_message')
 
-def _parse_resets_at_call_sites() -> list[str]:
-    """Every `_parse_resets_at(...)` CALL in the production source trees.
+#: Roots whose ABSENCE means the walk below is broken rather than the tree
+#: merely reorganised: these two held the retired fork and its re-export.
+_REQUIRED_SRC_ROOTS = ('shared/src', 'orchestrator/src')
 
-    AST-based, not grep-based: the fork and its history are discussed at
-    length in comments and docstrings across both `usage_gate.py` copies, and
-    a textual scan would count that prose as callers. Only `ast.Call` nodes
+
+def _production_src_roots() -> list[Path]:
+    """Every workspace package's `<pkg>/src` tree.
+
+    DISCOVERED rather than hardcoded: a fixed list covers only the trees
+    someone remembered to name, so a re-fork in a package added later — or in
+    one simply overlooked, `dashboard/src` being the pointed example, since
+    the dashboard is the consumer a fabricated reset time would mislead —
+    would sail past a guard still reporting green. Scoped to `<pkg>/src` on
+    purpose: `.worktrees/` sits at the REPO root, so unlike a root-level rglob
+    (the trap capability_manifest_corpus.py documents) this walk cannot wander
+    into a sibling task's checkout.
+    """
+    roots = sorted(p for p in _REPO_ROOT.glob('*/src') if p.is_dir())
+    found = {str(p.relative_to(_REPO_ROOT)) for p in roots}
+    # Loud, not silently narrowed: a guard that quietly stops scanning a tree
+    # it can no longer find is worse than no guard.
+    missing = [rel for rel in _REQUIRED_SRC_ROOTS if rel not in found]
+    assert not missing, f'production source root(s) missing under {_REPO_ROOT}: {missing}'
+    return roots
+
+
+class _Site(NamedTuple):
+    """One place the scan found an owned name. `detail` is the defined name
+    for a definition, the source line for a call."""
+
+    path: str
+    lineno: int
+    detail: str
+
+    def __str__(self) -> str:
+        return f'{self.path}:{self.lineno}: {self.detail}'
+
+
+class _OwnedNameSites(NamedTuple):
+    calls: tuple[_Site, ...]
+    definitions: tuple[_Site, ...]
+
+
+@functools.cache
+def _owned_name_sites() -> _OwnedNameSites:
+    """Module-level DEFINITIONS and bare-name CALLS of the owned names, across
+    every production source tree.
+
+    AST-based, not grep-based: the retired fork and its history are discussed
+    at length in comments and docstrings across `usage_gate.py` and
+    `invocation_outcome.py`, and a textual scan would count that prose as
+    callers. Only `ast.Call` nodes and MODULE-LEVEL `ast.FunctionDef` nodes
     count, so `_parse_resets_at_strict(...)` (a different name) and every
     mention in prose are excluded by construction.
+
+    The substring pre-filter is an optimisation, never a narrowing: every node
+    reported here carries an owned name as a literal identifier, so a file
+    whose text contains neither name cannot hold one. Measured on this tree,
+    it is what makes scanning all 426 production files (0.10s) cheaper than
+    parsing the 188 in two trees (1.84s).
     """
-    sites: list[str] = []
-    for rel_root in _PRODUCTION_SRC_ROOTS:
-        root = _REPO_ROOT / rel_root
-        # Loud, not silently narrowed: a guard that quietly stops scanning a
-        # tree it can no longer find is worse than no guard.
-        assert root.is_dir(), f'production source root missing: {root}'
+    calls: list[_Site] = []
+    definitions: list[_Site] = []
+    for root in _production_src_roots():
         for path in sorted(root.rglob('*.py')):
             source = path.read_text(encoding='utf-8')
+            if not any(name in source for name in _OWNED_NAMES):
+                continue
+            rel = str(path.relative_to(_REPO_ROOT))
             lines = source.splitlines()
+            tree = ast.parse(source, filename=str(path))
+            definitions.extend(
+                _Site(rel, node.lineno, node.name)
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name in _OWNED_NAMES
+            )
             # ast.walk is breadth-first, so a single file's hits are not
-            # source-ordered; the caller sorts what it reports.
-            for node in ast.walk(ast.parse(source, filename=str(path))):
+            # source-ordered; both lists are sorted before being returned.
+            for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
@@ -326,64 +384,149 @@ def _parse_resets_at_call_sites() -> list[str]:
                     called = func.attr
                 else:
                     continue
-                if called == '_parse_resets_at':
-                    rel = path.relative_to(_REPO_ROOT)
-                    sites.append(f'{rel}:{node.lineno}: {lines[node.lineno - 1].strip()}')
-    return sorted(sites)
+                if called in _OWNED_NAMES:
+                    calls.append(_Site(rel, node.lineno, lines[node.lineno - 1].strip()))
+    return _OwnedNameSites(tuple(sorted(calls)), tuple(sorted(definitions)))
 
 
-class TestFabricatingForkHasNoProductionCallers:
-    """`usage_gate._parse_resets_at` (the fabricating fork) must stay caller-free.
+class TestSingleResetsParserOwnership:
+    """`shared.invocation_outcome` is the SINGLE owner of `_parse_resets_at`
+    and `_extract_cap_message`.
 
-    Task 4042 moved the fork's ONE live call site — `_handle_auth_failure` —
-    onto the non-fabricating `shared.invocation_outcome` copy, because
-    restoring the 401/403 body snippet re-armed the `'resets' in reason.lower()`
-    branch: a body merely CONTAINING the substring "resets" without a parseable
-    phrase would otherwise persist an invented `now + 1h` recovery time onto a
-    revoked token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
+    WHAT IS MECHANICALLY ENFORCED, stated exactly so the claim and the scan
+    cannot drift apart: across EVERY workspace member's `<pkg>/src` tree, no
+    module but the owner may define either name at module level or call either
+    bare name; and `orchestrator/src/orchestrator/usage_gate.py` — the shim
+    that used to re-export both — may not bind either name. Test trees,
+    `scripts/` and prose anywhere are deliberately NOT scanned: a copy in one
+    of those cannot reach production.
 
-    DELETING the fork was deliberately out of scope: ~20 tests across `shared`
-    and `orchestrator` pin its `now + 1h` fallback contract, and
-    `orchestrator/src/orchestrator/usage_gate.py` re-exports it. So it stays
-    importable, and "do not wire new callers onto it" lived only as prose in a
-    docstring. This is the mechanical enforcement of that sentence: it fails
-    the moment production code calls the bare name anywhere outside the module
-    that DEFINES the strict copy.
+    Task 4042 moved the fabricating `usage_gate._parse_resets_at` fork's ONE
+    live call site — `_handle_auth_failure` — onto the non-fabricating
+    `shared.invocation_outcome` copy, because restoring the 401/403 body
+    snippet re-armed the `'resets' in reason.lower()` branch: a body merely
+    CONTAINING the substring "resets" without a parseable phrase would
+    otherwise persist an invented `now + 1h` recovery time onto a revoked
+    token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
 
-    If this fails because the fork was legitimately retired, delete the fork's
-    definition and this class together — do not relax the assertion.
+    Task 4357 then retired the fork itself, along with its caller-free
+    `_extract_cap_message` twin and the orchestrator re-export that kept both
+    importable. This class is what keeps the tree converged: with the fork
+    gone, the failure mode that would restore the fabrication regression is
+    RE-forking — someone re-adding a module-local parser, or re-exporting one
+    — and nothing else in the tree catches that.
+
+    Do not relax any assertion here. If a second copy is genuinely wanted,
+    that is a design change: argue it, don't let a guard erode.
     """
 
-    def test_scan_finds_the_known_strict_call_site(self):
-        # Anti-vacuity: proves the AST walk actually resolves calls, so a
-        # future rename cannot turn the guard below into a no-op that passes
-        # because it found nothing at all.
-        sites = _parse_resets_at_call_sites()
-        assert sites, 'AST scan found no _parse_resets_at call anywhere — guard is vacuous'
-
-    def test_only_the_strict_copy_owner_calls_the_bare_name(self):
-        # Exact file match, not a prefix match — and NO assertion on the call
-        # COUNT: a legitimate new call to the strict copy inside its own module
-        # must not fail this guard.
-        offenders = [
-            s for s in _parse_resets_at_call_sites()
-            if s.split(':', 1)[0] != _STRICT_PARSE_OWNER
-        ]
-        assert offenders == [], (
-            'new production caller(s) of the bare `_parse_resets_at` name: '
-            f'{offenders}. Outside {_STRICT_PARSE_OWNER} this resolves to the '
-            'FABRICATING fork in shared/src/shared/usage_gate.py (or its '
-            'orchestrator re-export), which invents `now + 1h` on parse '
-            'failure. Import the strict copy as `_parse_resets_at_strict` '
-            'instead — see TestAuthFailedPersistsResetsAt for why.'
+    def test_scan_finds_the_owner_defining_and_calling_both_names(self):
+        # Anti-vacuity: proves the AST walk resolves BOTH node kinds it
+        # reports, so a future rename cannot turn the guards below into no-ops
+        # that pass because they found nothing at all.
+        sites = _owned_name_sites()
+        assert sites.calls, 'AST scan found no call of either owned name — guard is vacuous'
+        owner_defs = {s.detail for s in sites.definitions if s.path == _STRICT_PARSE_OWNER}
+        assert owner_defs == set(_OWNED_NAMES), (
+            f'AST scan did not find both owned names defined in {_STRICT_PARSE_OWNER} '
+            f'(found {sorted(owner_defs)}) — the definition guard is vacuous.'
         )
 
-    def test_handle_auth_failure_does_not_import_the_fork(self):
+    def test_only_the_owner_calls_the_bare_names(self):
+        # Exact match on the structured `path`, not a prefix match on a
+        # rendered string — and NO assertion on the call COUNT: a legitimate
+        # new call inside the owner's own module must not fail this guard.
+        offenders = [
+            str(site) for site in _owned_name_sites().calls
+            if site.path != _STRICT_PARSE_OWNER
+        ]
+        assert offenders == [], (
+            'new production caller(s) of a bare owned name: '
+            f'{offenders}. Outside {_STRICT_PARSE_OWNER} the bare names resolve '
+            'to nothing at all (NameError) — unless a module-local fork has '
+            'been re-introduced, which is the regression this guards: the '
+            'retired fork invented `now + 1h` on parse failure. Import the '
+            'strict copy as `_parse_resets_at_strict` instead — see '
+            'TestAuthFailedPersistsResetsAt for why.'
+        )
+
+    def test_handle_auth_failure_uses_the_single_parser(self):
         # Belt-and-braces on the specific regression: the module that owns
         # _handle_auth_failure must reach the strict copy under its alias.
         import shared.usage_gate as usage_gate_module
 
         assert usage_gate_module._parse_resets_at_strict is invocation_outcome._parse_resets_at
+
+    def test_no_production_module_redefines_the_names(self):
+        """No module but the owner may DEFINE either function.
+
+        Scans every production tree rather than only `usage_gate.py` where
+        the fork used to live: with the fork gone, a re-fork is as likely to
+        appear in whichever module next wants to parse a reset string —
+        `dashboard/src/dashboard/data/costs.py`, the consumer a fabricated
+        value would mislead, being the pointed candidate.
+
+        An AST `FunctionDef` scan rather than `hasattr`/`vars()`: a module
+        legitimately imports the strict parser under an alias, and a name
+        bound by `import ... as _parse_resets_at_strict` must not be mistaken
+        for a local definition. Scanning defs also catches a re-fork that is
+        never imported anywhere — i.e. before it has a caller for
+        `test_only_the_owner_calls_the_bare_names` to find.
+        """
+        refork = [
+            str(site) for site in _owned_name_sites().definitions
+            if site.path != _STRICT_PARSE_OWNER
+        ]
+        assert refork == [], (
+            f'{refork} re-define(s) a name owned by {_STRICT_PARSE_OWNER}. Both '
+            'live ONLY there; a second copy is exactly the un-guarded drift '
+            'surface task 4357 removed, and the copy that used to live in '
+            'shared/src/shared/usage_gate.py fabricated `now + 1h` on parse '
+            'failure.'
+        )
+
+    def test_orchestrator_shim_does_not_reexport_the_retired_names(self):
+        """The orchestrator shim is public-surface-only.
+
+        `shared.usage_gate.__all__` lists no underscore names, so the star
+        import cannot reintroduce these — only an explicit re-export tuple
+        could, which is how they used to survive there.
+
+        An AST scan of the FILE rather than `import orchestrator.usage_gate`
+        + `hasattr`, for two independent reasons. (1) Layering: `shared/`
+        must not import `orchestrator/` (program decision #4 — the same note
+        appears in `test_server_error.py` and
+        `test_invocation_outcome_boundary.py`). (2) That import is not even
+        available here: verify runs `cd shared && uv run pytest` FIRST in its
+        chain, which syncs the workspace venv down to `shared`'s own
+        dependencies, so `orchestrator` is not installed and the import
+        raises `ModuleNotFoundError` — the guard would go red for a reason
+        with nothing to do with what it guards, and go green again only if
+        some earlier command happened to leave an `--all-packages` venv
+        behind. Reading the source keeps the assertion true of the file,
+        which is what "does not re-export" actually means.
+        """
+        path = _REPO_ROOT / 'orchestrator/src/orchestrator/usage_gate.py'
+        assert path.is_file(), f'orchestrator usage_gate shim missing: {path}'
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        bound: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                # A `from ... import *` alias is literally named '*' and binds
+                # nothing statically — it cannot reintroduce these two, since
+                # shared.usage_gate.__all__ lists no underscore names.
+                bound.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                bound.add(node.name)
+            elif isinstance(node, ast.Assign):
+                bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        leaked = sorted(bound & set(_OWNED_NAMES))
+        assert leaked == [], (
+            f'orchestrator/src/orchestrator/usage_gate.py re-exports {leaked}. '
+            f'Both live ONLY in {_STRICT_PARSE_OWNER}; re-exporting them from a '
+            'second module is what let the retired fabricating fork stay '
+            'importable.'
+        )
 
 
 @pytest.mark.asyncio
