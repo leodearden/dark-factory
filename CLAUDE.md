@@ -304,8 +304,12 @@ Two things that section used to claim, and that measurement disproved on
 passes no arguments, so it restarts mid-merge units ungated), and the two
 tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** close this. Until they land, don't
-reason as if a fleet redeploy is at most once per 8h.
+throughout. Tasks **4754** and **4755** have since closed this: a sweep now
+holds an in-flight lease that the backstop, the coordinator and (for its
+`current_unit` only) the liveness probe all honor. Two residuals remain — a
+sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
+and degrades to the old collision, and the fused-memory tier has no lease at
+all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
 ## Working in the main checkout
 
