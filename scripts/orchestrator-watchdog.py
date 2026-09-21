@@ -1727,7 +1727,12 @@ def _record_fm_liveness_failure(
 
 
 def main() -> None:
-    """Probe each watched port; restart the unit if the port is not listening."""
+    """Probe each watched port; restart the unit if the port is not listening.
+
+    One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
+    sweep is currently restarting is skipped, because a unit mid-restart is
+    indistinguishable from a wedged one to a port probe.
+    """
     for port, unit in WATCHED:
         try:
             if not is_unit_enabled(unit):
@@ -1741,6 +1746,31 @@ def main() -> None:
                 )
                 continue
             if not probe_port(port):
+                # A down port means this unit is wedged, dead — or being
+                # restarted right now by an in-flight fleet sweep, which the
+                # probe cannot tell apart from the other two precisely BECAUSE
+                # the sweep is restarting it. Measured: the probe cancelled the
+                # sweep's own restart jobs ("Job for ... canceled"), twice
+                # escalating to code=killed status=9/KILL.
+                #
+                # The lease read is LAZY — it happens only HERE, after a probe
+                # has already come back down, so an all-healthy tick (the
+                # overwhelmingly common case) costs zero extra I/O, and the
+                # read is maximally fresh at the decision point.
+                #
+                # Scoped to current_unit and nothing else: I5 (liveness stays
+                # uncapped, non-clock-gated and non-stamping — brokenness is
+                # not a scheduled deploy) must survive for every OTHER unit. A
+                # blanket liveness disable for the ~80 minutes of a sweep would
+                # leave a genuinely wedged unit unattended for over an hour.
+                lease = _live_fleet_lease()
+                if lease is not None and lease.get("current_unit") == unit:
+                    log(
+                        f"{unit} escalation port {port} not listening, but an "
+                        f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+                        "is restarting this unit; skipping the liveness restart"
+                    )
+                    continue
                 # Covers both wedged-active and dead-enabled (boot-race
                 # cancelled, or StartLimit-exhausted): restart_unit's
                 # stop+reset-failed+start sequence revives either case.
@@ -2093,7 +2123,11 @@ def staleness_pass() -> None:
     fleet-wide restart is delegated ONCE, after the loop, to
     _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
     (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
-    brokenness is not a scheduled deploy).
+    brokenness is not a scheduled deploy). Task 4755 added the single
+    exception, and it is deliberately as narrow as one: main() skips the
+    liveness restart of the ONE unit a live lease names as current_unit,
+    because a unit mid-restart is indistinguishable from a wedged one to a
+    port probe. Every other unit, and every other tick, is unchanged.
     """
     if _within_fleet_deploy_min_interval():
         # Bucket on wall-clock time (not elapsed-since-deploy) — see
