@@ -53,7 +53,19 @@ CLAUDE_MD_PATH = REPO_ROOT / "CLAUDE.md"
 ANCHOR_MARKER = "checkout-root-anchor"
 ANCHOR_LABEL = "Checkout root"
 
+PROBE_MARKER = "anchored-probe-idiom"
+PROBE_LABEL = "Anchor an ad-hoc probe"
+
 _ANCHOR_ARGV = ("git", "rev-parse", "--show-toplevel")
+
+_ANCHOR_PREFIX = 'cd "$(git rev-parse --show-toplevel)" &&'
+
+_PROBE_ARGV0 = ("python", "python3")
+
+# Written into the fixture checkout's ROOT CLAUDE.md, and into no other file:
+# the anchored probe can only print it by resolving its relative path against
+# the checkout root rather than against the subdirectory it was launched from.
+_FIXTURE_FIRST_LINE = "# fixture-root-marker-5690 do-not-match-by-accident"
 
 _RUN_TIMEOUT_SECS = 60
 
@@ -243,7 +255,7 @@ def test_live_claude_md_documents_the_checkout_root_anchor():
     assert _live_anchor_argv() == list(_ANCHOR_ARGV)
 
 
-def _run(argv, cwd):
+def _run(argv, cwd, marker=ANCHOR_MARKER):
     """*argv* under *cwd*, with a timeout that fails the test rather than hanging."""
     try:
         return subprocess.run(
@@ -256,7 +268,7 @@ def _run(argv, cwd):
         )
     except subprocess.TimeoutExpired:
         pytest.fail(
-            f"the {ANCHOR_MARKER!r} command documented in CLAUDE.md did not finish "
+            f"the {marker!r} command documented in CLAUDE.md did not finish "
             f"within {_RUN_TIMEOUT_SECS}s (task 5690); argv: {argv!r}, cwd: {cwd}"
         )
 
@@ -384,4 +396,127 @@ def test_documented_anchor_refuses_loudly_outside_any_checkout(tmp_path):
     assert completed.stderr.strip() != "", (
         f"the {ANCHOR_MARKER!r} command failed silently outside a checkout "
         f"(task 5690) — the refusal has to say so"
+    )
+
+
+# ── The anchored-probe idiom ──────────────────────────────────────────────────
+#
+# Knowing the checkout root does not by itself close the sighting. The call that
+# failed was a `python3 - <<'PY'` heredoc opening a file by BARE NAME, and a root
+# printed in some earlier turn does not reach inside that heredoc. So CLAUDE.md
+# has to hand over the composite — anchor AND probe in one command — and this
+# half of the file pins that the documented prefix is what makes the difference,
+# by running the same command with it and without it.
+
+
+def _live_probe_command():
+    """The live CLAUDE.md's anchored-probe command, shape-checked.
+
+    Returned as a STRING, not argv: `$(...)` and `&&` need a shell. Same
+    extractor as the anchor bullet above — a second marker, not a second
+    matcher, so there is nothing new to prove correct.
+    """
+    command = _marked_command(
+        CLAUDE_MD_PATH.read_text(encoding="utf-8"),
+        PROBE_MARKER,
+        PROBE_LABEL,
+    )
+    assert command.startswith(_ANCHOR_PREFIX), (
+        f"the command inside the {PROBE_MARKER!r} marker in CLAUDE.md does not "
+        f"start with {_ANCHOR_PREFIX!r} (task 5690): {command!r}. The idiom's "
+        f"whole content is that the anchor travels WITH the probe — an absolute "
+        f"path hard-coded in its place works only on the machine it was written "
+        f"on, and an unanchored probe is the sighting this subsection closes."
+    )
+
+    remainder = command[len(_ANCHOR_PREFIX):].strip()
+    argv = shlex.split(remainder)
+    assert len(argv) == 3 and argv[0] in _PROBE_ARGV0 and argv[1] == "-c", (
+        f"the {PROBE_MARKER!r} command in CLAUDE.md does not anchor a `python3 -c` "
+        f"probe (task 5690): {remainder!r} tokenises to {argv!r}. The sighting "
+        f"failed inside a python heredoc, so the idiom has to stay demonstrated "
+        f"in that language — a `cat` or `head` in its place would not show that "
+        f"paths INSIDE the interpreter are what the prefix fixes."
+    )
+    return command
+
+
+def test_live_claude_md_documents_the_anchored_probe_idiom():
+    """The live CLAUDE.md carries the second marker, wrapping an anchored probe.
+
+    Named separately from the execution checks below for the same reason as its
+    counterpart above: an idiom degraded into an unanchored probe or a
+    hard-coded absolute path should report itself as a SHAPE failure.
+    """
+    assert _live_probe_command().startswith(_ANCHOR_PREFIX)
+
+
+def _seeded_checkout_with_root_claude_md(tmp_path):
+    """A checkout whose ROOT holds a marked CLAUDE.md, and a nested subdir without one.
+
+    The subdirectory deliberately holds NO ``CLAUDE.md``: if it did, the
+    stripped-prefix control below would pass for the wrong reason — reading the
+    subdirectory's copy — and would certify nothing about the anchor.
+    """
+    root, nested = _seeded_checkout(tmp_path)
+    (root / "CLAUDE.md").write_text(f"{_FIXTURE_FIRST_LINE}\nsecond line\n", encoding="utf-8")
+    assert not (nested / "CLAUDE.md").exists(), (
+        f"fixture invariant broken: {nested} must hold no CLAUDE.md of its own, "
+        f"otherwise the stripped-prefix control cannot distinguish an anchored "
+        f"read from a cwd-relative one (task 5690)"
+    )
+    return root, nested
+
+
+def test_documented_probe_idiom_reads_relative_to_the_checkout_root(tmp_path):
+    """Run from a subdirectory, the documented probe still opens a ROOT-relative path."""
+    command = _live_probe_command()
+    _root, nested = _seeded_checkout_with_root_claude_md(tmp_path)
+
+    completed = _run(["bash", "-c", command], nested, marker=PROBE_MARKER)
+
+    assert completed.returncode == 0, (
+        f"the {PROBE_MARKER!r} command documented in CLAUDE.md exited "
+        f"{completed.returncode} when run from {nested} (task 5690) — agents are "
+        f"being handed an idiom that does not work.\n"
+        f" command: {command!r}\n"
+        f" stdout: {completed.stdout.strip()!r}\n"
+        f" stderr: {completed.stderr.strip()!r}"
+    )
+    assert _FIXTURE_FIRST_LINE in completed.stdout, (
+        f"the {PROBE_MARKER!r} command exited 0 from {nested} without printing "
+        f"anything derived from the checkout root's CLAUDE.md (task 5690): "
+        f"stdout {completed.stdout.strip()!r}. It is documented as putting every "
+        f"path inside it on repo-relative footing, so it has to demonstrably READ "
+        f"that file rather than merely succeed."
+    )
+
+
+def test_stripping_the_documented_anchor_reproduces_the_sightings_error(tmp_path):
+    """Without the prefix, the SAME command fails the way the sighting did.
+
+    This is what makes the pair a behavioural claim rather than two commands
+    that happen to exit 0: the failure is derived from the live CLAUDE.md's own
+    text, so it shows the documented prefix — not something incidental about
+    the fixture — is what removes the ``FileNotFoundError``.
+    """
+    command = _live_probe_command()
+    unanchored = command[len(_ANCHOR_PREFIX):].strip()
+    _root, nested = _seeded_checkout_with_root_claude_md(tmp_path)
+
+    completed = _run(["bash", "-c", unanchored], nested, marker=PROBE_MARKER)
+
+    assert completed.returncode != 0, (
+        f"the {PROBE_MARKER!r} command stripped of {_ANCHOR_PREFIX!r} still exited "
+        f"0 from {nested} (task 5690), printing {completed.stdout.strip()!r}. The "
+        f"anchor is then not load-bearing and the bullet is documenting a prefix "
+        f"that buys nothing — either the probe stopped opening a repo-relative "
+        f"path, or this fixture's subdirectory acquired a file it must not have."
+    )
+    assert "FileNotFoundError" in completed.stderr, (
+        f"the unanchored {PROBE_MARKER!r} command failed from {nested} with "
+        f"something other than the sighting's error (task 5690): "
+        f"{completed.stderr.strip()!r}. This subsection exists to stop "
+        f"`FileNotFoundError: [Errno 2] No such file or directory`, so the control "
+        f"has to reproduce exactly that rather than any nonzero exit."
     )
