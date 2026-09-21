@@ -2683,6 +2683,36 @@ class GraphitiBackend:
         old.uuid would silently coalesce any pre-existing dup-uuid edges
         instead of redirecting each one individually (task 2207 W6-δ).
 
+        Losslessly PRESERVED on a redirected edge (copied by direct
+        ``old.<prop>`` reference, which also preserves the vecf32
+        ``fact_embedding`` type): ``name``, ``fact``, ``fact_embedding``,
+        ``valid_at``, ``invalid_at``, ``expired_at``, ``created_at``,
+        ``group_id`` and ``episodes`` — the same set ``reassign_edge``
+        preserves, which is this method's single-edge sibling and the reason
+        that set is stated here rather than left to be diffed. The edge
+        ``uuid`` is the ONE exception, and deliberately so: it is re-minted
+        fresh per redirect for the dup-uuid reason above, with the original
+        recorded as ``superseded_edge_uuid``.
+
+        ``expired_at`` is load-bearing and its loss was silent (task 4986):
+        ``expired_at`` SET with ``invalid_at`` NULL is the restore hooks'
+        deliberately-restored signature — the hooks clear ``invalid_at`` and
+        never ``expired_at`` — so dropping it re-exposes a restored edge to
+        false supersession. It is written adjacent to ``invalid_at`` in both
+        SET lists, matching ``reassign_edge``, because that adjacency is what
+        makes the next omission visible by inspection; the omission this
+        closes was exactly ``expired_at`` reaching one list and not its twin.
+
+        ``new.reassigned_from_node_uuid`` records WHICH node the endpoint
+        left, the endpoint-relocation audit stamp alongside
+        ``superseded_edge_uuid``'s "which edge this replaced". It reuses
+        ``reassign_edge``'s property name rather than minting a merge-specific
+        one, so merge relocations are visible to the audits already written
+        against that spelling. The two operations stay distinguishable without
+        extra vocabulary: a merge relocation also mints a fresh uuid and
+        stamps ``superseded_edge_uuid``, which a uuid-preserving
+        ``reassign_edge`` never does.
+
         This trades a single bulk statement per direction for one query per
         edge (N+1 round-trips) — the deliberate cost of the ID(old) keying
         above. Entity merges are rare and touch modest-degree nodes in
@@ -2752,9 +2782,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.source_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
@@ -2792,9 +2824,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.target_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
