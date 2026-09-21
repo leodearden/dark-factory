@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib.util
 import inspect
+import json
 import logging
 import re
 import time
@@ -3095,6 +3096,18 @@ class GraphitiBackend:
         The value is already in hand from step 1's existence check; returning it
         rather than discarding it is the whole fix.
 
+        ONE STRUCTURED RECORD PER MERGE, AND IT IS THE RETURNED OBJECT. The INFO
+        line is ``json.dumps`` of the very dict returned below — not a payload
+        assembled beside it, which would be a second copy of the same facts and
+        would drift the first time a key was added to one of them. JSON rather
+        than a ``key=value`` line because the payload carries the loser's full
+        summary: arbitrary prose with quotes, newlines and non-ASCII that a
+        reader should not need an ad-hoc parser to recover.
+        ``MemoryService.merge_entities`` already persists this same dict as the
+        write journal's ``result_summary``, so the durable record and the
+        operator-visible one carry identical fields and cannot disagree — the
+        merge's provenance is recoverable from either surface.
+
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
             surviving_uuid: UUID of the entity node that absorbs the edges.
@@ -3144,8 +3157,12 @@ class GraphitiBackend:
                 deprecated_uuid, group_id=group_id,
             )
         except Exception:  # noqa: BLE001
+            # Deliberately NOT prefixed 'merge_entities: ' — that prefix
+            # identifies the one structured JSON record per merge emitted
+            # below, and a diagnostic sharing it would break any auditor that
+            # greps the prefix and parses the remainder.
             logger.warning(
-                'merge_entities: residual relationship census failed for dep=%s '
+                'merge_entities residual census failed for dep=%s '
                 '(merge continues; relocations already committed)',
                 deprecated_uuid, exc_info=True,
             )
@@ -3162,12 +3179,7 @@ class GraphitiBackend:
         # Rebuild the surviving node's summary
         refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
-        logger.info(
-            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s duplicate_edges_removed=%d',
-            deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
-            duplicate_edges_removed,
-        )
-        return {
+        audit = {
             'surviving_uuid': surviving_uuid,
             'surviving_name': sur_name,
             'deprecated_uuid': deprecated_uuid,
@@ -3183,6 +3195,8 @@ class GraphitiBackend:
                 'edge_count': refresh_result.get('edge_count', 0),
             },
         }
+        logger.info('merge_entities: %s', json.dumps(audit, sort_keys=True, default=str))
+        return audit
 
     @_canonicalize_group_args
     async def delete_entity(

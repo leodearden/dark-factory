@@ -664,7 +664,13 @@ class TestMergeEntitiesStructuredLog:
         with caplog.at_level(logging.INFO, logger=self.LOGGER):
             await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
 
-        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+        # The census failure logs its own diagnostic, which must NOT carry the
+        # structured record's prefix: an auditor greps that prefix and parses
+        # the remainder as JSON, so a prose line sharing it would break them.
+        records = self._merge_records(caplog)
+        assert len(records) == 1, [r.getMessage() for r in records]
+
+        payload = json.loads(records[0].getMessage()[len(self.PREFIX):])
         assert payload['residual_relationships_destroyed'] is None
 
 
