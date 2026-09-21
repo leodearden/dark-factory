@@ -32,10 +32,11 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 15-member closed output domain of verify._classify_failure today
+# The exact 16-member closed output domain of verify._classify_failure today
 # (the 12 legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
-# host-infrastructure categories, and task 3173's INFRA_KILL external-signal
-# category), including the '' (NONE) empty-string sentinel (default of
+# host-infrastructure categories, task 3173's INFRA_KILL external-signal
+# category, and task 5580's PYTEST_USAGE_ERROR — the pytest-side analogue of
+# CARGO_CLI_ERROR), including the '' (NONE) empty-string sentinel (default of
 # _worst_category on empty input; a member of both _CATEGORY_PRIORITY and
 # _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
@@ -44,6 +45,7 @@ _EXPECTED_CATEGORY_VALUES = {
     'disk_full',
     'semaphore_timeout',
     'cargo_cli_error',
+    'pytest_usage_error',
     'compile_error',
     'tree_sitter_generate_error',
     'flock_error',
@@ -58,15 +60,15 @@ _EXPECTED_CATEGORY_VALUES = {
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 15 category strings."""
+    """FailureCategory is a StrEnum with exactly the 16 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_fifteen(self):
+    def test_member_count_is_sixteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 15
+        assert len(list(FailureCategory)) == 16
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -148,9 +150,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_fifteen(self):
+    def test_row_count_is_sixteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 15
+        assert len(CATEGORY_POLICY) == 16
 
 
 class TestCategoryPolicyGoldenRows:
@@ -187,7 +189,50 @@ class TestCategoryPolicyGoldenRows:
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 14
+        assert row.severity_rank == 15
+
+    def test_pytest_usage_error_row(self):
+        """Task 5580. Four of the five fields are CARGO_CLI_ERROR's, because
+        "the tool rejected our invocation" must be adjudicated identically on
+        both sides of the table rather than re-reasoned from scratch.
+
+        archive=True — the rejected argv exists only in the per-attempt log,
+        and that log IS the diagnosis; finding it took a human session.
+
+        preexisting_probe=True — a config-caused usage error (a bad pyproject
+        addopts, an edited module test_command) genuinely IS pre-existing on
+        main, and should be found so. Also matches today's behaviour via
+        UNKNOWN_TEST_FAILURE, so no probe changes its mind.
+
+        is_infra_transient=False — deliberately NOT widening
+        INFRA_TRANSIENT_CATEGORIES, which drives bounded RETRY windows.
+        Re-running a byte-identical rejected argv cannot help: the windows
+        would burn their attempts and file a blocking L1 anyway.
+
+        verdict_indeterminate=False — predicate (2) FAILS. A diff CAN cause
+        this, so the leg keeps its veto over another host's PASS. Fail CLOSED,
+        exactly as PYTEST_INTERNALERROR and ENV_TRANSIENT do.
+        """
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        row = CATEGORY_POLICY[FailureCategory.PYTEST_USAGE_ERROR]
+        assert row.archive is True
+        assert row.preexisting_probe is True
+        assert row.is_infra_transient is False
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_pytest_usage_error_outranks_every_verdict_bearing_category(self):
+        """"The suite never ran" must win a _worst_category contest.
+
+        When a usage-error leg co-occurs with a leg that did produce a
+        verdict, the category that survives must be the one that says no
+        verdict was reached — otherwise the summary reports a test result for
+        a run that never happened.
+        """
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        usage = CATEGORY_PRIORITY.index('pytest_usage_error')
+        for weaker in ('test_failure', 'unknown_test_failure', 'passed'):
+            assert usage < CATEGORY_PRIORITY.index(weaker)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +302,7 @@ class TestDerivedRegistriesByteIdentity:
             'disk_full',
             'semaphore_timeout',
             'cargo_cli_error',
+            'pytest_usage_error',
             'compile_error',
             'tree_sitter_generate_error',
             'flock_error',

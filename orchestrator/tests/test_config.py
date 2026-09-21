@@ -1387,19 +1387,27 @@ class TestSccacheConfig:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigSccache:
-    """OrchestratorConfig.sccache field and effective_verify_env property."""
+    """OrchestratorConfig.sccache field and effective_verify_env property.
 
-    def test_sccache_defaults_to_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    All four tests construct a bare/kwargs-only ``OrchestratorConfig()`` and
+    assert on the CODE defaults, so all four need the same isolation from the
+    ambient operational yaml — hence one class-level fixture rather than a
+    per-test mix. Two of them used to hand-roll it as ``monkeypatch.chdir`` +
+    ``delenv('ORCH_CONFIG_PATH')``, which is the weaker form: it leans on the
+    cwd-relative fallback in ``settings_customise_sources`` instead of
+    pointing ``ORCH_CONFIG_PATH`` at a guaranteed-absent file, and two
+    mechanisms for one job in one class invite the next editor to copy the
+    wrong one.
+    """
+
+    def test_sccache_defaults_to_disabled(self):
         config = OrchestratorConfig()
         assert isinstance(config.sccache, SccacheConfig)
         assert config.sccache.enabled is False
 
-    def test_effective_verify_env_equals_verify_env_when_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    def test_effective_verify_env_equals_verify_env_when_disabled(self):
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 

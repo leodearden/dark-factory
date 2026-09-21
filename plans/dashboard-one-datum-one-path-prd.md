@@ -192,12 +192,49 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    `fresh` (the server's verdict at shaping), the **age badge wins** on screen: the
    operator reads the age, and the state is what the server knew when it answered.
 7. **Rendering is uniform and lives in the shared components only**: `charts.jsx::StatTile`,
-   `tabs.jsx::ST`, `shell.jsx::ProjectGroup` pips and the row cells accept a `Datum`.
+   `tabs.jsx::ST`, a new shared `Pip` and the row cells accept a `Datum`.
    `unknown` → em-dash with the reason as title; `stale` → value plus age badge;
    `lower_bound` → `≥` prefix. Tab code never branches on state. Every call site
-   migrates in γ1 (36 in `tabs.jsx`/`tab_overview.jsx` plus those in
-   `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx`, `tab_scheduler.jsx`
-   — enumerate by grep at implementation). Values not yet served as a `Datum` are
+   migrates in γ1 — **43 tile sites, measured 2026-09-21 (task 5706)**: 32 in
+   `tabs.jsx`, 4 in `tab_overview.jsx`, 5 in `tab_escalations.jsx`, 2 in
+   `tab_escalation_analytics.jsx`. The component is reached by **three** syntactic
+   forms and only one of them carries its own name, so enumerate by grep at
+   implementation across all three: `<StatTile` (plain destructure —
+   `tab_overview.jsx`), `<ST` (the `StatTile: ST` alias in `tabs.jsx`'s
+   `window.DF_CHARTS` destructure) and `<C.StatTile` (both escalations tabs bind
+   `const C = window.DF_CHARTS` and call through the namespace object;
+   `esc_flow_diagram.jsx` binds the same `C` but uses only `C.PALETTE`, so it holds no
+   tile — measured 2026-09-21). A `<StatTile` grep alone matches 4 of the 43 and
+   silently misses the other 39 — which is why the two escalations tabs were absent
+   from this decision's earlier enumeration. Those three forms are a **discovery aid,
+   not the completeness guarantee**: a fourth binding form would miss again just as
+   silently, and decision 17 rejects a substring matcher trusted as a guard. The
+   guarantee is executed, per decision 17(c) — the migrated components throw on a
+   non-`Datum` argument, and because the legacy shape is mechanically distinguishable
+   (`charts.jsx::StatTile` takes `value`/`unit`/`delta` today, never `datum`), a
+   `value`-with-no-`datum` call throws too; γ1's node tests render each of the four
+   tile-bearing tabs against a fixture payload, so an unmigrated site fails at render
+   whichever binding form reached it. A re-census starts from
+   `dashboard/tests/test_charts_consumer_bindings.py`, which already enumerates all
+   three shapes across the nine `.jsx` consumers of `window.DF_CHARTS` (5 destructure,
+   3 namespace, 1 member read — re-measured 2026-09-21); its assertions deliberately
+   cover only the destructure shape, so it is a maintained starting point, not a
+   census guard. Retired from that earlier list:
+   `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx` and
+   `tab_scheduler.jsx` carry **zero** tile call sites and bind no `StatTile` at all.
+   `shell.jsx::ProjectGroup` is **not** the pips' owner either: it takes `summary` as
+   an opaque node and renders no pip itself (the token
+   does not occur in the file). Every pip today is a caller-side JSX fragment sharing
+   only the `.proj-head .summary .pip` CSS — **23 fragments, measured 2026-09-21
+   (task 5706)** by `className="pip"`, which carries none of the tiles' alias hazard:
+   16 in `tabs.jsx`, 4 in `tab_escalations.jsx`, 3 in `tab_tasks.jsx` (one of those
+   three a `.map()` over `activityPips`, so it emits one pip per active status at
+   runtime). So γ1's shared `Pip` is **new code**, not a migration of an existing
+   component. The pips also split across phases where the tiles do not: γ1 ships `Pip`
+   and migrates the `tabs.jsx` and `tab_escalations.jsx` fragments, while
+   `tab_tasks.jsx` — which appears in no γ1 module list, only γ3's — migrates its three
+   alongside γ3's census rework. Shipping `Pip` with `tab_tasks.jsx` untouched is
+   γ1 complete, not a γ1 miss. Values not yet served as a `Datum` are
    wrapped by `plainDatum(value, endpointKey)` with the endpoint's `served_at` as
    `as_of`, so every tile has provenance at least at endpoint granularity. `data.js`
    pre-fetch defaults for datum-kinded keys become `unknown` Datums with reason
@@ -447,8 +484,10 @@ regenerates to a temp file and asserts byte equality with the committed file.
 
 ### Shared rendering components
 
-`StatTile({label, datum, history, …})`, `ST(...)` likewise, `ProjectGroup` pips and
-`LocksCell` take a `Datum`. `history` is the persisted series of the same datum key.
+`StatTile({label, datum, history, …})`, `ST(...)` likewise, the new shared `Pip`
+(γ1 — see decision 7) and `LocksCell` take a `Datum`. `shell.jsx::ProjectGroup` is
+not itself a `Datum` consumer: it keeps taking `summary` as an opaque node.
+`history` is the persisted series of the same datum key.
 `plainDatum(value, endpointKey)` wraps a not-yet-migrated value with the endpoint's
 `served_at`. Under the node test harness a component receiving a non-`Datum` throws.
 
@@ -499,9 +538,9 @@ by a real dependency edge. α and α2 are independent roots; the rest is a chain
 | α | `Datum` envelope, `TaskCensus` + views, generated task vocabulary + parity test | `dashboard/data/datum.py`, `dashboard/data/census.py`, `scripts/gen_dashboard_task_vocab.py`, `static/redux/task_vocab.js`, `index.html`, `tests/scripts/test_dashboard_task_vocab.py`, dashboard tests | **Intermediate** — unlocks β, γ1. `build_census` over a nine-member fixture yields the three-view partition with `running ≤ in_flight` (sketch #4, #5); `task_vocab.js` byte-equal to regeneration | — |
 | α2 | Extract the touched handlers and the two background loops from `app.py`, no behaviour change | `app.py`, `dashboard/src/dashboard/api/{tasks,orchestrators,burndown,merge_queue,escalations,memory,window}.py`, `dashboard/src/dashboard/loops.py`, `test_app.py` (patch paths retargeted, assertions kept) | **Intermediate** — unlocks β. No handler or loop body remains in `app.py`; each new file passes heuristic 13; every `test_app.py` assertion still passes after retargeting; `_fanout_probe_completion` still calls the raw fetch | — |
 | β | One task snapshot unit on `/tasks` (paged status map + active rows, one cache, last-good stale, terminal rows on demand); `/orchestrators` loses `summary`; `collect_done_counts` deleted | `data/task_snapshot.py`, `data/active_tasks.py`, `data/tasks.py`, `data/orchestrator.py`, `data/redux_api.py`, `api/tasks.py`, `api/orchestrators.py`, tests | **Intermediate** — unlocks γ2/γ3/δ1. `GET /api/v2/dashboard/tasks` carries `TASKS_SNAPSHOT[p].census` as a `Datum`; a forced `ReadTimeout` after a good unit serves `stale` (sketch #13); `/orchestrators` has no `summary`; `_ACTIVE_STATUSES` derives from `shared.task_statuses.ACTIVE`; the 5 s/20 s caches are gone | α, α2 |
-| γ1 | Shared components render a `Datum`; every call site migrated; `data.js` datum registry with receipt metadata, parameterised on-demand keys and unknown defaults | `charts.jsx`, `tabs.jsx` (`ST`, `LocksCell`), `shell.jsx`, `task_row_cells.js`, `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx`, `tab_scheduler.jsx`, `data.js`, `tests/js/` | **Intermediate** — unlocks γ2, γ3, δ2, ζ, η, θ. Node tests: unknown → em-dash+reason, stale → age badge computed from `_served_at`/`_received_at` that grows with a mocked local clock, lower_bound → `≥`; a non-`Datum` throws; pre-fetch render shows `unknown` tiles, not zeros; a per-project parameterised key can be requested and applied | α |
+| γ1 | Shared components render a `Datum`; every call site migrated; `data.js` datum registry with receipt metadata, parameterised on-demand keys and unknown defaults | `charts.jsx`, `tabs.jsx` (`ST`, `LocksCell`), `tab_overview.jsx`, `tab_escalations.jsx`, `tab_escalation_analytics.jsx`, `shell.jsx` (the new shared `Pip` only — no tile, `ProjectGroup` unchanged per the Contract, and its lone `window.DF_CHARTS` read `SP_SHELL` is referenced nowhere, measured 2026-09-21), `task_row_cells.js`, `tab_curator.jsx` (Sparkline/StepSpark only — no tile), `tab_memory_evals.jsx` (Sparkline/StepSpark only — no tile), `data.js`, `tests/js/` | **Intermediate** — unlocks γ2, γ3, δ2, ζ, η, θ. Node tests: unknown → em-dash+reason, stale → age badge computed from `_served_at`/`_received_at` that grows with a mocked local clock, lower_bound → `≥`; a non-`Datum` throws; pre-fetch render shows `unknown` tiles, not zeros; a per-project parameterised key can be requested and applied; each of the four tile-bearing tabs (decision 7) renders against a fixture payload, so any site left in the legacy `value` shape throws regardless of which binding form reached it | α |
 | γ2 | Orchestrators tab, Overview and app chrome consume the census views | `tabs.jsx` (OrchTab), `tab_overview.jsx`, `app.jsx`, `shell.jsx`, tests | **Leaf** — sketch #1–#3 against fixture payloads under the node harness: the reported "0/1 vs Active 33" shape cannot render; topbar and rail show the same `in_flight` number with `running` disclosed | β, γ1 |
-| γ3 | Tasks tab and PRD boxes consume the census; on-demand terminal fetch wired; client bucketers and `task_status_counts.js` (with its four pins) deleted; 4416 contract landed in the taskgraph-legibility PRD | `tab_tasks.jsx`, `prd_grouping.js`, `task_status_counts.js` (deleted), `orch_filter.js`, `data.js`, `index.html`, `test_index_html.py`, `test_cache_buster_freshness.py`, `tests/js/classic_script_scope.test.mjs`, `test_tab_tasks_status_counts.py` (retire the disjunction pin), `plans/dashboard-taskgraph-legibility-prd.md` | **Leaf** — Tasks header pips are view lookups labelled `running of in-flight`; an offline or degraded project shows `—`; toggling Complete or PRD grouping issues `?terminal=<project>` and the PRD box then shows `≥ n/m` with n from the window; a synthetic nine-status fixture renders nine pips | γ2 |
+| γ3 | Tasks tab and PRD boxes consume the census; on-demand terminal fetch wired; client bucketers and `task_status_counts.js` (with its four pins) deleted; 4416 contract landed in the taskgraph-legibility PRD | `tab_tasks.jsx`, `prd_grouping.js`, `task_status_counts.js` (deleted), `orch_filter.js`, `data.js`, `index.html`, `test_index_html.py`, `test_cache_buster_freshness.py`, `tests/js/classic_script_scope.test.mjs`, `test_tab_tasks_status_counts.py` (retire the disjunction pin), `plans/dashboard-taskgraph-legibility-prd.md` | **Leaf** — Tasks header pips use the shared `Pip` (γ1) and are view lookups labelled `running of in-flight`; an offline or degraded project shows `—`; toggling Complete or PRD grouping issues `?terminal=<project>` and the PRD box then shows `≥ n/m` with n from the window; a synthetic nine-status fixture renders nine pips | γ2 |
 | δ1 | Burndown sampler consumes the snapshot unit; gap rows; nullable member columns; `in_progress_rows` column | `data/burndown.py`, `loops.py`, tests | **Intermediate** — unlocks δ2. Against a fixture store: a forced acquisition failure writes a `gap` row with reason and a success writes a value row whose nine members sum to `total` and whose `live + stranded == in_progress_rows`; pre-migration rows read NULL, not 0, for the three new members | β |
 | δ2 | Carry-last aggregate, per-project staleness on the wire, parity/forecast over measured rows only, BurnTab nine zones, `dailyDeltas` deleted | `data/redux_api.py`, `burndown_bands.js`, `tabs.jsx` (BurnTab, OrchTab spark), `shell.jsx`, `test_redux_api.py` (update the ragged test), tests | **Leaf** — sketch #6, #7 against a fixture store with a ragged two-project history: aggregate Backlog equals the per-project sum; "Status mix" legend has nine entries; parity breach count unchanged by a gap row | δ1, γ1 |
 | ε1 | Window echo, per-tab chip validation, labels from payload, recent merges follow the chip | `api/window.py`, `app.jsx`, `tabs.jsx` (Costs/Burn/Merge headers), `data/merge_queue.py`, `test_app.py` (retire the 1440 pin), tests | **Leaf** — sketch #8, #9 first half; no header literal "30d" remains | δ2 |

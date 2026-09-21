@@ -1254,6 +1254,30 @@ budgets:
   implementer: 20.0
   merger: 8.0
 
+# Steward LIFETIME budget (flat, per-task: one steward instance handles one
+# task's escalations and accumulates across its own invocations).  RAISED
+# 12.0 -> 20.0 on 2026-09-21 by Leo's ruling (option A of cockpit decision
+# steward-lifetime-budget-cap-2026-09-19), after SIX tasks exhausted the $12
+# cap: 3353 ($12.02), 3592 ($12.02), 5488 ($12.49), 5557 ($14.82), 5588
+# ($16.12) and 4797 ($13.29).  All six were tasks whose work was finished or
+# genuinely in progress -- the recurring shape is a steward stopping ONE call
+# short of closing out.  Three of the six overran by only 0.2-4%.  Cost of the
+# old value: three spawned /unblock sessions, two tasks left blocked (5588 at
+# HIGH with a complete green plan; 4797 mid-rebase), and -- suspected, not yet
+# measured -- stewards ceasing to drain L0s, which is one candidate cause of
+# the 27h L0 strand that esc-__stale_l0_strand_sweep__-14 reported.
+#
+# 20.0 clears the largest observed total ($16.12) with ~24% headroom while
+# keeping a real guard.  NOTE the guard is checked BEFORE an invocation and the
+# last call may overshoot (per_invocation = min(budgets.steward, remaining)),
+# so an observed total can exceed the cap; budget the ceiling accordingly.
+#
+# Green-tier hot-reloadable (config.py "Steward grace" group), so this is a
+# reload not a restart, and reverting is equally cheap.  Leo is still weighing
+# option C (a PER-TASK cap rather than this flat one); if C lands, this flat
+# value becomes the fallback for tasks carrying no explicit override.
+steward_lifetime_budget: 20.0
+
 # Per-role model overrides (project-level; defaults.yaml is the fleet default).
 # implementer/debugger sonnet -> opus on dark-factory ONLY, for a two-week
 # canary from 2026-09-10 (Leo ruling D4). Basis: on the same task population

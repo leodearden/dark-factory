@@ -8424,9 +8424,10 @@ class _RerunOutcome(StrEnum):
 class _RerunObservation:
     """What ONE call-site engine actually saw re-running ONE subproject group.
 
-    Richer than a bare :class:`_RerunOutcome` because
-    ``confirm_isolated_rerun_verdict`` has to NAME why a re-run was
-    uninformative (``infra_transient_rerun:<category>``), and because the merge
+    Richer than a bare :class:`_RerunOutcome` because the ledger row has to
+    NAME why a re-run was uninformative — a reason
+    ``_unconfirmable_rerun_reason`` derives from the category recorded here,
+    and the ONE place that vocabulary is written — and because the merge
     gate's existing log line renders the observed ``category``/``passed`` pair
     verbatim.
     """
@@ -8436,16 +8437,33 @@ class _RerunObservation:
     passed: bool  # last observed VerifyResult.passed (False when none was observed)
 
 
+#: The categories under which an ISOLATED RE-RUN produced no verdict ABOUT THE
+#: CODE: the infra-transient family (a host condition), plus a pytest usage
+#: error, which means pytest REJECTED THE ARGV WE BUILT before running a test.
+#:
+#: Deliberately a SUPERSET used ONLY on the re-run path, and NOT a widening of
+#: ``INFRA_TRANSIENT_CATEGORIES`` — that set's consumers are bounded RETRY
+#: windows (merge_queue, workflow, the env-recovery retry here), and re-running
+#: a byte-identical rejected command cannot help; they would burn their
+#: attempts and file a blocking L1 anyway. The honest distinction is narrower
+#: than any category flag: only when the command was one WE SYNTHESISED for an
+#: isolated re-run does its rejection mean "we could not re-run". That is a
+#: property of this path, so it lives here (task 5580).
+_RERUN_NON_VERDICT_CATEGORIES = (
+    INFRA_TRANSIENT_CATEGORIES | {FailureCategory.PYTEST_USAGE_ERROR}
+)
+
+
 def _classify_rerun_result(result: VerifyResult) -> _RerunObservation:
     """Map ONE completed ``VerifyResult`` to a :class:`_RerunObservation`.
 
-    Category-FIRST, deliberately independent of the ``passed`` flag: an
-    infra-sentinel category is never trusted as confirmation EITHER WAY, even
+    Category-FIRST, deliberately independent of the ``passed`` flag: a
+    non-verdict category is never trusted as confirmation EITHER WAY, even
     in the (normally impossible) case it were paired with ``passed=True`` —
     the same rule ``_run_isolated_confirm_group_observation`` and
     ``run_main_tip_sweep`` already apply.
     """
-    if result.category in INFRA_TRANSIENT_CATEGORIES:
+    if result.category in _RERUN_NON_VERDICT_CATEGORIES:
         return _RerunObservation(
             _RerunOutcome.unconfirmable, result.category, result.passed,
         )
@@ -8466,15 +8484,16 @@ async def _run_isolated_confirm_group_observation(
     The source of truth for this family; ``_run_isolated_confirm_group`` is the
     one lossier shim over it, kept only because its single legacy caller wants
     a bool. This is also the ``main_probe`` call-site engine
-    (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY to name an
-    ``infra_transient_rerun:<category>`` reason.
+    (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY for
+    ``_unconfirmable_rerun_reason`` to name the reason from.
 
     Reports ``passed`` as soon as any attempt PASSES (that group is a confirmed
     flake). Otherwise ``failed`` if any attempt produced a genuine red — a real
     failure, or a timeout (``VerifyResult.timed_out`` with ``passed=False``) —
-    and ``unconfirmable`` only when EVERY attempt was uninformative: an
-    infra-sentinel category (``pytest_internalerror``/``env_transient`` — never
-    trusted as confirmation either way) or a raised exception (caught here so a
+    and ``unconfirmable`` only when EVERY attempt was uninformative: a
+    ``_RERUN_NON_VERDICT_CATEGORIES`` member (an infra sentinel, or a pytest
+    usage error meaning our own argv was rejected — never trusted as
+    confirmation either way) or a raised exception (caught here so a
     transient error on one attempt doesn't abort the remaining attempts).
     Never raises.
     """
@@ -8494,12 +8513,14 @@ async def _run_isolated_confirm_group_observation(
             continue
         last_category = result.category
         last_passed = result.passed
-        # An infra-sentinel category (pytest_internalerror/env_transient) is
-        # never trusted as confirmation, even in the (normally impossible)
-        # case it were paired with passed=True — mirrors run_main_tip_sweep's
-        # own category-first check, which is deliberately independent of the
-        # passed flag (see its INFRA_TRANSIENT_CATEGORIES branch).
-        if result.category in INFRA_TRANSIENT_CATEGORIES:
+        # A non-verdict category — the infra sentinels
+        # (pytest_internalerror/env_transient), or a pytest usage error
+        # meaning our own argv was rejected — is never trusted as
+        # confirmation, even in the (normally impossible) case it were paired
+        # with passed=True. Mirrors run_main_tip_sweep's own category-first
+        # check, which is deliberately independent of the passed flag (see its
+        # INFRA_TRANSIENT_CATEGORIES branch).
+        if result.category in _RERUN_NON_VERDICT_CATEGORIES:
             logger.debug(
                 'confirm_main_tip_failure_is_real: isolated re-run hit %s '
                 '(attempt %d/%d) for %r — unconfirmable, not counted as a pass',
@@ -8531,10 +8552,10 @@ async def _run_isolated_confirm_group(
     Returns ``True`` as soon as any attempt PASSES (that group is a confirmed
     flake). Returns ``False`` if every attempt exhausts without a pass —
     covers a genuine failure, a timeout (``VerifyResult.timed_out`` with
-    ``passed=False``), an infra-sentinel category
-    (``pytest_internalerror``/``env_transient`` — never trusted as
-    confirmation either way), and a raised exception (caught here so a
-    transient error on one attempt doesn't abort the remaining attempts).
+    ``passed=False``), a ``_RERUN_NON_VERDICT_CATEGORIES`` member (an infra
+    sentinel, or a rejected argv — never trusted as confirmation either way),
+    and a raised exception (caught here so a transient error on one attempt
+    doesn't abort the remaining attempts).
     Never raises.
 
     A lossy shim over ``_run_isolated_confirm_group_observation``, which is the
@@ -9292,6 +9313,26 @@ def _psi_cpu_some10_or_none() -> float | None:
     return sample.cpu_some10 if sample.read_ok else None
 
 
+def _unconfirmable_rerun_reason(observation: _RerunObservation) -> str:
+    """Name WHY an isolated re-run produced no verdict, for the ledger row.
+
+    Two prefixes, because a triager acts on them differently.
+    ``infra_transient_rerun`` says the HOST was unusable and the response is
+    to wait or look at the box; ``rerun_command_rejected`` says OUR OWN argv
+    was malformed and the response is to read the rendered command. Folding
+    the second into the first would file a code defect as host pressure —
+    which is how 350 merge-gate observations came to read as real reds with
+    nothing anywhere saying the command had been refused (task 5580).
+
+    Every category that produced the existing string before still produces it
+    BYTE-for-byte: θ's class-1 rate and any operator grep keyed on it are
+    unaffected.
+    """
+    if observation.category == FailureCategory.PYTEST_USAGE_ERROR:
+        return f'rerun_command_rejected:{observation.category}'
+    return f'infra_transient_rerun:{observation.category or "unknown"}'
+
+
 def _observe(
     verdict: FlakeVerdict,
     test_ids: Iterable[str],
@@ -9373,6 +9414,13 @@ async def confirm_isolated_rerun_verdict(
     _scope_to_keyword(...)), policy.timeout_secs)`` with ``lint_command`` and
     ``type_check_command`` nulled, so only the named tests run, serially,
     without pyproject ``addopts`` or its 60s per-test default.
+
+    That command is one WE BUILD, which is why pytest REJECTING it
+    (``FailureCategory.PYTEST_USAGE_ERROR``) is ``unconfirmable`` rather than
+    a red: no test ran, so nothing in the result is evidence about the code,
+    and reporting it as ``fails_in_isolation`` would launder a defect in this
+    module into a verdict about the branch. See
+    ``_RERUN_NON_VERDICT_CATEGORIES``.
 
     Node-id -> subproject mapping DELEGATES to
     ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
@@ -9577,10 +9625,7 @@ async def confirm_isolated_rerun_verdict(
             return _observe(
                 FlakeVerdict.unconfirmable, node_ids,
                 call_site=coerced_site, runner=runner,
-                reason=(
-                    f'infra_transient_rerun:'
-                    f'{unconfirmable_observation.category or "unknown"}'
-                ),
+                reason=_unconfirmable_rerun_reason(unconfirmable_observation),
                 now=now,
             )
 
