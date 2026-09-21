@@ -1325,8 +1325,14 @@ unnamed appeal to "quality" is neither reviewable nor actionable.
 - **Comments.** Aim for code that is clear with no or low comments. Needing
   abundant and escalating amounts of commenting is a symptom of poor clarity,
   and comments drift away from the code they describe. Rationale that must
-  persist belongs in memory or in the incident record, with a pointer from the
-  code. This does not license deleting existing rationale during unrelated work.
+  persist belongs in a tracked file the next agent can read — the PRD, docs/,
+  or a test — with a pointer from the code. A pointer into memory or an
+  escalation record does not count: no dispatched role but the steward can read
+  an escalation, and a memory record is reached by search, not by a path the
+  code can name. Prose written to answer a reviewer — a measurement, a rejected
+  alternative, a defence of a decision — belongs in the commit message, or in
+  the task record where the agent holds a task write, not in the file. This
+  does not license deleting existing rationale during unrelated work.
 - **Tests.** Test access to a module's internals is an interface design smell:
   such a test pins implementation rather than behaviour, and the seam it reaches
   through is usually the real defect. Five symptoms, each reportable as an
@@ -1339,7 +1345,10 @@ unnamed appeal to "quality" is neither reviewable nor actionable.
 ## Do not steer by
 
 - **Raw line count.** Comments and docstrings can be most of a file; one large
-  module in this factory's own code measured 55% prose.
+  module in this factory's own code measured 55% prose. That is a caution about
+  the metric, not a tolerance for prose: heuristic 14's thresholds are alarms
+  that trigger a measurement, never a number to get under by deleting prose or
+  by a cheating split.
 - **Average complexity.** A file can average a good grade while eight of its
   functions score the worst one.
 - **Line coverage under autouse stubs.** A suite that stubs the thing under test
@@ -1360,7 +1369,15 @@ ARCHITECT_CODE_QUALITY_ADDENDUM = """
 When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
 split is legitimate only when every resulting file makes internal sense in
 isolation: size is necessary, not sufficient. Small satellites that are
-function-bags over a parent's private state fail 13 while passing 14.
+function-bags over a parent's private state fail 13 while passing 14. Layering
+is a downward import of names a lower file defines and never takes back; a
+satellite that imports from the file that imports it is stitching, regardless
+of what the import brings across. When a plan leaves a large file whole rather
+than splitting it, record as a design decision the partition it tried and the
+heuristic-13 symptom each candidate hit — an upward import, a cycle, a
+reach-back — or none. Naming a symptom means naming the two modules and the
+specific import that would close the cycle or reach back; a sentence that
+merely asserts one exists is not a measurement.
 """
 
 
