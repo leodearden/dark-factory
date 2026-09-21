@@ -522,6 +522,10 @@ class TestMergeEntities:
             'incoming_redirected': 0,
             'inter_node_deleted': 0,
         })
+        backend.redirect_node_mentions = AsyncMock(return_value={
+            'redirected': 0, 'already_linked': 0,
+        })
+        backend.count_foreign_relationships = AsyncMock(return_value=0)
         backend.delete_entity_node = AsyncMock()
         backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(

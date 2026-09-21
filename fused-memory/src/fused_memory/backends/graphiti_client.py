@@ -3059,17 +3059,41 @@ class GraphitiBackend:
 
         Orchestrates the full merge workflow:
         1. Validate both nodes exist via get_node_text (raises NodeNotFoundError if
-           either is missing).
+           either is missing), keeping the deprecated node's SUMMARY.
         2. Redirect all RELATES_TO edges from deprecated to surviving via
            redirect_node_edges.
-        3. Delete the deprecated node via delete_entity_node.
-        4. Collapse any parallel duplicate edges left on the surviving node via
+        3. Relocate Episodic MENTIONS provenance onto the survivor via
+           redirect_node_mentions.
+        4. Census what the delete is about to destroy that step 2/3 did not
+           relocate, via count_foreign_relationships (best-effort).
+        5. Delete the deprecated node via delete_entity_node.
+        6. Collapse any parallel duplicate edges left on the surviving node via
            dedup_valid_edges_for_node (task 2118 — redirect_node_edges mints a
            fresh uuid per redirected edge, but the survivor may already hold
            an equivalent (neighbor, fact, valid_at) edge, so this
            uuid-agnostic pass is still required to collapse those parallel
            duplicates).
-        5. Rebuild the surviving node's summary via refresh_entity_summary.
+        7. Rebuild the surviving node's summary via refresh_entity_summary.
+
+        STEP 3 MUST PRECEDE STEP 5. ``delete_entity_node`` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n``, which destroys EVERY
+        remaining relationship — so a MENTIONS relocation ordered after it has
+        nothing left to move, and the loser's episode provenance is simply gone
+        (task 4986 loss mode 1). The same ordering is why step 4's census is
+        taken before the delete: afterwards there is nothing left to count.
+
+        STEP 4 IS AN AUDIT DATUM, NEVER A GATE. By the time it runs, steps 2 and
+        3 are already committed and irreversible, so a raise must not propagate
+        — that would abort a half-applied merge on the strength of a failed
+        OBSERVATION. A failed census records ``None``, which keeps "could not
+        measure" distinct from "measured zero", the same distinction
+        ``count_foreign_relationships`` itself refuses to blur.
+
+        THE DEPRECATED NODE'S SUMMARY IS KEPT (task 4986 loss mode 5). Step 7
+        rebuilds the survivor's summary from EDGES only, so any of the loser's
+        summary text that no edge backs is unrecoverable once the node is gone.
+        The value is already in hand from step 1's existence check; returning it
+        rather than discarding it is the whole fix.
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -3077,22 +3101,55 @@ class GraphitiBackend:
 
         Returns:
             Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
-            deprecated_name, edges_redirected (sub-dict with redirect counts),
-            duplicate_edges_removed (count collapsed post-redirect),
-            surviving_summary (dict with old/new summary and edge_count).
+            deprecated_name, deprecated_summary (the loser's summary text, which
+            nothing else preserves), edges_redirected (sub-dict with RELATES_TO
+            redirect counts), mentions_redirected (sub-dict with the MENTIONS
+            relocated/already-linked counts), residual_relationships_destroyed
+            (what the DETACH DELETE destroyed that was not relocated, or None if
+            the census could not be taken), duplicate_edges_removed (count
+            collapsed post-redirect), surviving_summary (dict with old/new
+            summary and edge_count).
 
         Raises:
             NodeNotFoundError: if either UUID does not exist.
             RuntimeError: if the backend is not initialized.
         """
-        # Validate both nodes exist and capture their names
-        dep_name, _ = await self.get_node_text(deprecated_uuid, group_id=group_id)
+        # Validate both nodes exist and capture their names. The deprecated
+        # node's SUMMARY is kept, not discarded: refresh_entity_summary rebuilds
+        # the survivor's summary from EDGES only, so any of the loser's summary
+        # text no edge backs is unrecoverable once the node is gone.
+        dep_name, dep_summary = await self.get_node_text(deprecated_uuid, group_id=group_id)
         sur_name, _ = await self.get_node_text(surviving_uuid, group_id=group_id)
 
         # Redirect edges
         edges_redirected = await self.redirect_node_edges(
             deprecated_uuid, surviving_uuid, group_id=group_id,
         )
+
+        # Relocate Episodic MENTIONS provenance. MUST precede the delete:
+        # delete_entity_node's DETACH DELETE destroys every remaining link, so
+        # a relocation ordered after it would have nothing left to move.
+        mentions_redirected = await self.redirect_node_mentions(
+            deprecated_uuid, surviving_uuid, group_id=group_id,
+        )
+
+        # What this DETACH DELETE is about to destroy that was NOT relocated.
+        # Best-effort and never a gate: both relocations above are already
+        # committed and irreversible, so a failed OBSERVATION must not abort a
+        # half-applied merge. None keeps "could not measure" distinct from
+        # "measured zero" — the distinction count_foreign_relationships itself
+        # refuses to blur.
+        try:
+            residual = await self.count_foreign_relationships(
+                deprecated_uuid, group_id=group_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'merge_entities: residual relationship census failed for dep=%s '
+                '(merge continues; relocations already committed)',
+                deprecated_uuid, exc_info=True,
+            )
+            residual = None
 
         # Delete the deprecated node
         await self.delete_entity_node(deprecated_uuid, group_id=group_id)
@@ -3115,7 +3172,10 @@ class GraphitiBackend:
             'surviving_name': sur_name,
             'deprecated_uuid': deprecated_uuid,
             'deprecated_name': dep_name,
+            'deprecated_summary': dep_summary,
             'edges_redirected': edges_redirected,
+            'mentions_redirected': mentions_redirected,
+            'residual_relationships_destroyed': residual,
             'duplicate_edges_removed': duplicate_edges_removed,
             'surviving_summary': {
                 'before': refresh_result.get('old_summary', ''),
