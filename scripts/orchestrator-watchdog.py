@@ -1337,6 +1337,30 @@ def _live_fleet_lease() -> dict | None:
     return lease
 
 
+def _fleet_lease_age_secs(lease: dict) -> float | None:
+    """Wall-clock age of *lease* in seconds, or None when its started_ts is unusable."""
+    try:
+        return time.time() - float(lease["started_ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _describe_lease(lease: dict) -> str:
+    """Render *lease* for a human: ``pid N, unit U, age Xs``.
+
+    Every tier that suppresses an action because of a lease says so in the
+    journal, and each needs the SAME three facts — they are exactly what
+    distinguishes a genuinely held lease from a leftover one without opening
+    the file. Rendering them in one place keeps those lines readable as a set.
+    """
+    age = _fleet_lease_age_secs(lease)
+    return (
+        f"pid {lease.get('pid')}, "
+        f"unit {lease.get('current_unit') or '-'}, "
+        f"age {'unknown' if age is None else f'{age:.0f}s'}"
+    )
+
+
 def _within_fleet_staleness_head_start() -> bool:
     """Return True iff the FLEET deploy min-interval window opened <STALENESS_GRACE_SECS ago.
 
@@ -2045,10 +2069,18 @@ def staleness_pass() -> None:
     event-driven coordinator" is true AT THE WINDOW BOUNDARY for the first
     time.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight --drain stamped the clock),
-    which needs in-flight state and is task 4755.
+    In-flight lease (task 4755): a THIRD clock-layer gate, checked after the
+    head start and still ahead of the commit-grace gate. The two gates above
+    order this tier against the OTHER tier at each window boundary; neither
+    can see THIS tier's own in-flight sweep, because the clock they read is
+    stamped only when a sweep FINISHES and verifies (I2). For the ~80 minutes
+    a --drain sweep takes, every gate above therefore sees an 8h-stale clock
+    and concludes nothing is happening — measured: the backstop delegated a
+    second redeploy into its own running sweep. restart-all-orchestrators.sh
+    now writes a lease for the duration, and this gate honours it. A lease is
+    live only while its pid is alive AND it is under FLEET_LEASE_MAX_AGE_SECS,
+    so a SIGKILLed sweep costs at most one delayed window rather than wedging
+    the fleet — see scripts/orchestrator-watchdog.py::_live_fleet_lease.
 
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
@@ -2081,6 +2113,19 @@ def staleness_pass() -> None:
             log(
                 f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
                 "since the fleet-deploy min-interval opened"
+            )
+        return
+
+    lease = _live_fleet_lease()
+    if lease is not None:
+        # Same bucket idiom again. The skip line names the pid, the unit and
+        # the age because those are exactly what distinguishes a HELD lease
+        # from a stale one in the journal — an operator asking "why didn't the
+        # backstop fire?" must not have to hand-read JSON to find out.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: a fleet redeploy is already in flight "
+                f"(lease {_describe_lease(lease)})"
             )
         return
 
@@ -2166,10 +2211,19 @@ def fused_memory_staleness_pass() -> None:
     an orchestrator fleet redeploy does not open or reset fm's head-start
     window and vice-versa.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight redeploy stamped the clock),
-    which needs in-flight state and is task 4755.
+    SCOPE, and a RESIDUAL the orchestrator tier no longer has: this orders the
+    two TIERS at each clock-open only. It does NOT address the fm backstop
+    colliding with its OWN in-flight sweep (a tick whose min-interval check
+    passed before an in-flight redeploy stamped the clock), because fm has no
+    in-flight state. Task 4755 added a lease for the ORCHESTRATOR fleet only,
+    written by restart-all-orchestrators.sh and read by staleness_pass above;
+    this tier is a genuinely separate fleet — its own unit, its own
+    restart-fused-memory.sh, its own clock (deliberately never shared in
+    either direction, see the FM_DEPLOY_CLOCK_PATH module comment) and its own
+    transient unit name — so gating it on the orchestrator fleet's lease would
+    be exactly the cross-fleet coupling that two-clock design forbids, and no
+    writer ever creates a lease for fm anyway. Closing this needs an fm lease
+    of its own, on 4755's four-tier-mirror-plus-drift-test template.
 
     Stateless (I6): staleness is recomputed from live systemd + git each tick,
     so a successful restart (from this pass or the fm coordinator) advances
