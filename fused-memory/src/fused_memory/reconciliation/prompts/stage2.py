@@ -16,6 +16,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -206,6 +207,8 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 (including cross_project_routing findings emitted above): \
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}
+
+{CITATION_REPAIR_TOOL_BLOCK}
 
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 

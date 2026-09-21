@@ -70,6 +70,90 @@ destroys entities and edges exclusively sourced from that episode.\
 """
 
 # ---------------------------------------------------------------------------
+# Stage-gated citation-repair tool listing (task 4395)
+# ---------------------------------------------------------------------------
+# Stage 1 and Stage 2 both HOLD `repair_memory_citation` — it appears only in
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES, which only STAGE3_DISALLOWED folds
+# (cli_stage_runner.py) — yet neither stage's prompt named it, so neither agent
+# ever learned it exists. `--disallowed-tools` OMITS a denied tool rather than
+# rejecting a call, so a held-but-unadvertised tool is indistinguishable from
+# one the stage does not have: there is nothing for the agent to probe.
+#
+# The stage-agnostic server-level listing is NOT the channel for this. The
+# claude CLI truncates FastMCP server `instructions` at 2048 characters and
+# RECON_REPORT_INSTRUCTIONS (server/recon_report.py) is ~7560: the tool NAME
+# survives in the roster line near the top, while the numbered entry carrying
+# its call shape, its two-id contract and its error codes sits past the cut and
+# reaches no agent. The stage prompt is passed as the system prompt and is
+# subject to no such cap, so this block is the ONLY channel that delivers the
+# contract — which is why it states the call shape in full rather than
+# deferring to the server listing.
+#
+# SHARED between Stage 1 and Stage 2 because every sentence below is true
+# verbatim in both: the holding map, the two-id contract, and the reasons
+# Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
+# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py
+# and by test_recon_report_guidance_drift.py's absence guard.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. MUST NOT reference any section by HEADING NAME: the
+# block is shared between two prompts whose section sets differ, so a heading
+# that exists in one may not exist in the other (the hazard
+# STALE_KNOWLEDGE_ANNOTATION_NORM's comment records twice) — name parameters and
+# tools instead. Every `mcp__recon-report__` call example below carries BOTH
+# `run_id` and `target_run_id`, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py: the existing assembled-
+# prompt run_id scan is scoped to the shared-guidance tools and does not reach
+# this one. Not an f-string: it is interpolated INTO f-strings, and braces
+# inside an interpolated value are not re-parsed by the enclosing f-string, so
+# its own text needs no {{/}} escaping.
+CITATION_REPAIR_TOOL_BLOCK = """\
+## Repairing a Prior Run's Dangling Citation
+You hold `mcp__recon-report__repair_memory_citation`. Stage 1 and Stage 2 both hold it; \
+Stage 3 is denied it because Stage 3 is read-only and is the stage that DETECTS dangling \
+citations — detect and repair must not be the same actor. Nothing in your tool listing \
+distinguishes a tool you lack from one nobody told you about, so treat this paragraph as \
+the grant.
+
+**When to reach for it.** A memory cited by a PRIOR, already-completed run's finding no \
+longer backs that finding — either it no longer resolves (a consolidation or supersession \
+dropped the record) or it resolves but is the wrong record. The `cite_*` tools cannot \
+reach such a finding: they require the OWNING run to have a live active stage, and a \
+closed run's report state is evicted within minutes. This tool rewrites the durable \
+journal instead, which is why it is the only path.
+
+**Call shape.**
+`mcp__recon-report__repair_memory_citation(run_id=<your current run_id>, \
+target_run_id=<the run that OWNS the finding>, finding_id=..., memory_id=<the cited \
+memory>, store="mem0", replacement_memory_id=<the correct memory, or omit to DROP the \
+citation>, reason=..., justification=...)`
+
+The two ids are the trap: `run_id` keeps its usual meaning everywhere else here — YOUR \
+current run, which also supplies the repair's attribution — and `target_run_id` is the \
+run that owns the finding. Passing the target's id as `run_id` does not silently do the \
+right thing; it just fails `run_id_unknown`. Omit `replacement_memory_id` to DROP the \
+citation rather than re-point it.
+
+**`reason` names the defect CLASS and is CHECKED, not trusted** — it is written verbatim \
+into the durable provenance record. `"memory_not_found"` (the default) requires the cited \
+memory to be CONFIRMED ABSENT. `"wrong_memory"` requires it to RESOLVE, and additionally \
+requires a non-blank `justification` saying why it does not back the finding — that record \
+is the only surviving account of removing a citation that was still live. Picking the \
+wrong class is not a judgement call you win: it is a refusal naming the other one.
+
+**Two containment rules.** Only `store="mem0"` can be corroborated (`"graphiti"` is \
+refused with `unsupported_store` — the absence check is a Mem0 point read and would \
+false-flag every graphiti citation as dangling). And the repair is confined to YOUR OWN \
+project: the journal holds runs for every project this process reconciles, so a \
+`target_run_id` owned by another project is refused with `project_mismatch` before any \
+lookup or write.
+
+On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
+`"status"`, so `status` is safe to branch on.\
+"""
+
+# ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
 # States the precedence order for annotating superseded, wrong, or corrupted
