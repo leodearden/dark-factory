@@ -2851,6 +2851,112 @@ class GraphitiBackend:
             'inter_node_deleted': inter_node_deleted,
         }
 
+    @_canonicalize_group_args
+    async def redirect_node_mentions(
+        self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
+    ) -> dict:
+        """Relocate Episodic MENTIONS provenance from one Entity onto another.
+
+        The MENTIONS sibling of :meth:`redirect_node_edges`: same merge-time
+        endpoint move, different relationship type. That one is RELATES_TO-typed
+        in all three of its phases, and :meth:`delete_entity_node` then issues a
+        bare DETACH DELETE that destroys EVERY remaining link — so without this
+        method a merge silently destroyed the loser's episode provenance
+        (task 4986 loss mode 1).
+
+        Only INCOMING links exist to consider: MENTIONS is always
+        Episodic->Entity, so unlike ``redirect_node_edges`` there is no
+        outgoing direction and no inter-node phase.
+
+        AN ALREADY-LINKED EPISODE IS SKIPPED, NOT MOVED AND NOT DELETED. Moving
+        it would give the survivor two links for one episode; deleting it would
+        make this a destructive primitive rather than a relocation. Provenance
+        is the (episode, entity) PAIR, not the link object — when the survivor
+        already carries that episode, nothing is lost by leaving the loser's
+        redundant copy for the CALLER's delete to remove. Leaving the deletion
+        to the caller is also what makes a re-run after a partial failure
+        converge: already-moved links are on the survivor and are simply not
+        seen again, and the remaining ones move. The skip is COUNTED rather than
+        silent, so a merge log records the difference between "two links moved"
+        and "two links moved, one was redundant".
+
+        Enumerated by the stable internal ``ID(m)``, never ``m.uuid``, for the
+        same reason ``redirect_node_edges`` enumerates by ``ID(old)``: a uuid may
+        already be duplicated and so cannot target a single link. The
+        existence probe runs INSIDE the loop, which is what makes two links
+        from the SAME episode collapse to one — hoisted above the loop it
+        would read "not linked" once and move both.
+
+        Unlike the RELATES_TO redirect, the link ``uuid`` is PRESERVED rather
+        than re-minted: that one mints a fresh uuid4 to repair a graph-wide
+        per-edge uuid uniqueness invariant, and nothing folds MENTIONS links by
+        uuid, so preserving it keeps the episode-link identity stable across a
+        merge. ``uuid``, ``group_id`` and ``created_at`` are the COMPLETE
+        property set — graphiti_core's ``EPISODIC_EDGE_SAVE`` writes only those
+        three, and MENTIONS carries no embedding — the same three copied by
+        ``maintenance/cross_graph_move.py``, which documents why.
+
+        Runs in no transaction and is safe to retry from the top after a crash
+        partway through, for the convergence reason above. Counters are
+        incremented only after each write completes, so they reflect work done
+        rather than work enumerated.
+
+        Args:
+            deprecated_uuid: UUID of the entity node losing its MENTIONS links.
+            surviving_uuid: UUID of the entity node that absorbs them.
+            group_id: Project graph to target.
+
+        Returns:
+            Dict with keys: ``redirected`` (links moved onto the survivor) and
+            ``already_linked`` (links left in place because the survivor
+            already carried that episode).
+        """
+        graph = self._graph_for(group_id)
+
+        enumerated = await graph.ro_query(
+            'MATCH (ep:Episodic)-[m:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN ID(m) AS eid, ep.uuid AS episode_uuid',
+            {'dep_uuid': deprecated_uuid},
+        )
+        links = [(row[0], row[1]) for row in (enumerated.result_set or [])]
+
+        redirected = 0
+        already_linked = 0
+        for eid, episode_uuid in links:
+            existing = await graph.ro_query(
+                'MATCH (ep:Episodic {uuid: $episode_uuid})-[m:MENTIONS]->'
+                '(sur:Entity {uuid: $sur_uuid}) '
+                'RETURN m.uuid LIMIT 1',
+                {'episode_uuid': episode_uuid, 'sur_uuid': surviving_uuid},
+            )
+            if existing.result_set:
+                already_linked += 1
+                continue
+
+            await graph.query(
+                'MATCH (ep:Episodic)-[old:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+                'WHERE ID(old) = $eid '
+                'MATCH (sur:Entity {uuid: $sur_uuid}) '
+                'CREATE (ep)-[new:MENTIONS]->(sur) '
+                'SET new.uuid = old.uuid, '
+                '    new.group_id = old.group_id, '
+                '    new.created_at = old.created_at, '
+                '    new.reassigned_from_node_uuid = $dep_uuid '
+                'DELETE old',
+                {
+                    'dep_uuid': deprecated_uuid,
+                    'sur_uuid': surviving_uuid,
+                    'eid': eid,
+                },
+            )
+            redirected += 1
+
+        logger.info(
+            'redirect_node_mentions: dep=%s sur=%s redirected=%d already_linked=%d',
+            deprecated_uuid, surviving_uuid, redirected, already_linked,
+        )
+        return {'redirected': redirected, 'already_linked': already_linked}
+
     async def _repair_duplicate_edge_uuids(self, group_id: str) -> int:
         """One-shot idempotent repair: re-mint fresh uuids on legacy dup-uuid
         RELATES_TO edges so per-uuid count(*) <= 1 — B6 dup-uuid-edge repair.
