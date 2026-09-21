@@ -211,6 +211,52 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
     os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
 )
 
+# Path to the IN-FLIGHT LEASE (task 4755), sibling of the clock above and
+# deliberately NOT the same file: the clock says "a sweep FINISHED and
+# verified", the lease says "a sweep is RUNNING RIGHT NOW". The clock alone
+# cannot express the second, because restart-all-orchestrators.sh stamps it
+# only on its verified-fresh exit-0 path (I2), so for the whole ~80-minute
+# duration of a --drain sweep every other tier sees a clock that is 8h stale
+# and concludes nothing is happening. Written by that script at sweep start,
+# removed on every catchable exit path.
+#
+# Mirrors orchestrator.service_restart.FLEET_LEASE_RELPATH. FOUR copies of this
+# literal exist — that module, this file, restart-all-orchestrators.sh
+# (LEASE_FILE) and df_pytest_isolation.py — because none of those four can
+# import any of the others (this script is stdlib-only; df_pytest_isolation is
+# stdlib+pytest only; the third is bash). They are pinned equal by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+# Env-overridable so tests can point every tier at a tmp file without touching
+# real data/.
+FLEET_LEASE_PATH = os.environ.get(
+    "ORCH_FLEET_LEASE",
+    os.path.join(REPO_DIR, "data", "orchestrator", "fleet_redeploy_lease.json"),
+)
+
+# How long a lease may go unrefreshed before every reader treats it as expired,
+# whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
+# reviewer can re-check it: the worst LEGITIMATE sweep is one permanently-busy
+# unit burning the full ORCH_RESTART_FORCE_FIRE_AFTER_SECS busy grace (4500s)
+# + ~6 stale/absent units at ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s each) + 7 x
+# (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS 120) = 4500 + 720 +
+# 1050 = 6270s ~= 1.74h. 7200 clears that with ~15% headroom while staying far
+# below the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
+# point: a leaked lease can therefore delay at most ONE redeploy window and can
+# never wedge the fleet indefinitely — the same reasoning that makes the pid
+# test alone insufficient. A sweep with TWO simultaneously-busy units does
+# exceed the bound and loses the lease mid-sweep, degrading to exactly the
+# pre-4755 collision; that is bounded and deliberate, never a new failure.
+#
+# Mirrors OrchestratorConfig.orchestrator_restart_lease_max_age_secs (this
+# stdlib script cannot import it), pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_max_age_matches_config_default.
+# Uses the module's env-with-default try/except idiom: a typo'd env var must
+# not crash the oneshot watchdog.
+try:
+    FLEET_LEASE_MAX_AGE_SECS = int(os.environ["ORCH_FLEET_LEASE_MAX_AGE_SECS"])
+except (KeyError, ValueError):
+    FLEET_LEASE_MAX_AGE_SECS = 7200
+
 # staleness_pass() is a stateless oneshot: every ~60s timer tick
 # (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
 # module docstring), so there is no cross-tick memory to log the fleet-deploy
@@ -1201,6 +1247,94 @@ def _within_fleet_deploy_min_interval() -> bool:
     return _within_min_interval(
         ORCH_RESTART_MIN_INTERVAL_SECS, _read_last_fleet_deploy_epoch
     )
+
+
+def _pid_alive(pid) -> bool:
+    """Return True iff *pid* names a live process.
+
+    A deliberate COPY of
+    orchestrator/src/orchestrator/session_registry.py::_pid_alive, contract
+    preserved verbatim. The copy is FORCED, not a second opinion: this script
+    is a stdlib-only systemd oneshot that imports no first-party package — the
+    same constraint that forces the FLEET_LEASE_PATH literal above.
+
+    - Anything that is not a positive int (including bool, which IS an int in
+      Python) returns False WITHOUT reaching os.kill. That is a hazard guard,
+      not defensiveness: os.kill(0, 0) signals the CALLER'S ENTIRE process
+      group and os.kill(-N, 0) a foreign group, so a corrupt or zero pid read
+      off disk must be rejected before the syscall rather than by catching its
+      exception. session_registry.resolve_session_pid documents the same trap.
+    - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
+      PermissionError -> alive (visible but unsignalable); other OSError ->
+      treated as dead.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_fleet_lease() -> dict | None:
+    """Return the in-flight fleet-redeploy lease body at FLEET_LEASE_PATH, or None.
+
+    The LEASE-layer read primitive, one level above _read_json_state (which
+    owns the missing/corrupt/non-object branches), so the lease inherits one
+    fail-open contract shared with the three clocks rather than introducing a
+    fourth. A MISSING file is the normal "no sweep running" case and is
+    deliberately SILENT — logging it would spam the journal every 60s tick;
+    corrupt/unreadable/non-object IS logged and swallowed.
+
+    Returns the RAW body, liveness unevaluated, so report() can distinguish
+    WHY a lease is not live (pid dead vs. past the bound) — a distinction
+    _live_fleet_lease below deliberately collapses.
+
+    Reads FLEET_LEASE_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work — the same requirement
+    _read_last_fleet_deploy_epoch states.
+    """
+    return _read_json_state(FLEET_LEASE_PATH)
+
+
+def _live_fleet_lease() -> dict | None:
+    """Return the lease body iff a fleet sweep is genuinely in flight, else None.
+
+    LIVE requires BOTH tests, and they fail in opposite directions so neither
+    alone suffices. Age alone would let a lease left behind by a SIGKILLed
+    sweep suppress every redeploy for the full bound — the exact hole the
+    stamp-on-verified-success clock (I2) exists to close, which a naive lease
+    would reintroduce. Pid alone would be defeated by pid reuse, where an
+    unrelated process inherits the number and the lease becomes immortal.
+    Requiring both means a crashed sweep costs at most ONE delayed window.
+
+    Any unusable pid or started_ts yields None: a lease that cannot be
+    evaluated must fail toward RELEASING, never toward holding the fleet. Note
+    the deliberate divergence from the repo's OTHER lease
+    (session_registry.LEASE_HEARTBEAT_TTL), which fails toward KEEPING the
+    lease — that one protects a holder against eviction, this one suppresses
+    fleet redeploys.
+
+    Both module globals are read INSIDE the body (not defaulted at def time)
+    so tests that monkeypatch them still work.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        return None
+    if not _pid_alive(lease.get("pid")):
+        return None
+    try:
+        started_ts = float(lease["started_ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if time.time() - started_ts >= FLEET_LEASE_MAX_AGE_SECS:
+        return None
+    return lease
 
 
 def _within_fleet_staleness_head_start() -> bool:
