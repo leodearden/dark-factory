@@ -532,9 +532,9 @@ _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
 # several tasks, so filing it against whichever promote happened to cross the
 # threshold would be arbitrary attribution with two real costs:
 # ``get_task_escalations(that_task)`` would surface an infra record unrelated to
-# the task, and because this helper calls ``_submit_or_dedupe`` directly (it is
-# sync, and must never fail the promote) it bypasses the terminal-task
-# chokepoint, so the report could land PENDING on an already-terminal task.
+# the task, and because this helper calls ``_submit_or_dedupe`` directly (it
+# must never fail the promote) it bypasses the terminal-task chokepoint, so the
+# report could land PENDING on an already-terminal task.
 # The affected L2 ids stay named in the summary and detail, which is where the
 # attribution belongs.  The ids also form one greppable
 # ``esc-l2-amendment-truncation-N`` series.
@@ -1181,7 +1181,7 @@ def create_server(
           'persist_check', 'level'}`` when the post-write re-read could not
           confirm the write, so the filer keeps driving its blocked task rather
           than standing down; see
-          ``escalation/src/escalation/dedupe.py::submit_or_dedupe``, which
+          ``escalation/src/escalation/dedupe.py::attach_or_submit``, which
           produces it, and through it
           ``queue.py::observed_submit_response`` (task 5368).  Local to THIS
           function: the L2 branch above never consults the dedupe gate, so an
@@ -2453,10 +2453,13 @@ def create_server(
         # tools here (`get_task_escalations` and friends) need nothing — FastMCP
         # threadpools sync tool functions (`FunctionTool.run` ->
         # `call_sync_fn_in_threadpool`), so only `async def` tools run inline.
-        # The other inline scans are in the WRITE paths (`escalate_info`/
-        # `escalate_blocker` via `dedupe.find_dedupe_parent`, `promote_to_l2` via
-        # `find_pending_l2_by_root_cause`); hopping a lock-holding mutation
-        # changes submit/dedupe interleaving, which needs its own task.
+        # The WRITE paths' scans hop too since task 5648 — `escalate_info` /
+        # `escalate_blocker` via `dedupe.submit_or_dedupe_off_loop`,
+        # `promote_to_l2` via its own combined read, and `queue.make_id`'s
+        # recovery scan at all five minting sites.  What remains inline there is
+        # the flock'd WRITES (`submit`, `submit_resolved`, `attach_dedupe_child`,
+        # `add_members_to_l2`), which carry no scan; why they must stay is
+        # stated beside `dedupe.submit_or_dedupe_off_loop` rather than here.
         def read_pending():
             if task_id:
                 return queue.get_by_task(task_id, status='pending')
