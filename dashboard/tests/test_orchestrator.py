@@ -8,51 +8,23 @@ from pathlib import Path
 import pytest
 
 
-def _shape_task(task: dict) -> dict | None:
-    """Coerce a raw test task dict into the dashboard's per-task wire shape."""
-    raw_id = task.get('id')
-    if raw_id is None:
-        return None
-    try:
-        tid = int(raw_id)
-    except (TypeError, ValueError):
-        return None
-    raw_deps = task.get('dependencies', []) or []
-    deps: list[int] = []
-    for d in raw_deps:
-        try:
-            deps.append(int(d))
-        except (TypeError, ValueError):
-            continue
-    metadata = task.get('metadata', {}) or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    return {
-        'id': tid,
-        'title': task.get('title') or '',
-        'status': task.get('status'),
-        'priority': task.get('priority'),
-        'dependencies': deps,
-        'metadata': metadata,
-        'updated_at': task.get('updated_at'),
-    }
-
-
 @pytest.fixture()
-def fake_fetch_tasks(monkeypatch):
-    """Patch fetch_tasks to return shaped tasks for registered project roots."""
-    registry: dict[Path, list[dict]] = {}
+def no_mcp(monkeypatch):
+    """Fail the test if anything under ``discover_orchestrators`` reads MCP.
 
-    async def _fake(client, config, project_root):
-        return list(registry.get(Path(project_root).resolve(), []))
+    Patched at ``dashboard.data.tasks.mcp_tool_call`` — the substrate every
+    task read in this package goes through — rather than at
+    ``orchestrator.fetch_tasks``. A patch of the latter keeps passing when the
+    fetch merely moves to another name in the same module; this one cannot be
+    satisfied by any read under any name.
+    """
 
-    monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _fake)
+    async def _forbidden(client, url, tool, args, **kwargs):
+        raise AssertionError(
+            f'orchestrator discovery must issue no MCP call; got {tool!r}'
+        )
 
-    def register(root: Path, tasks: list[dict]) -> None:
-        shaped = [r for r in (_shape_task(t) for t in tasks) if r is not None]
-        registry[Path(root).resolve()] = shaped
-
-    return register
+    monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _forbidden)
 
 
 class TestFindRunningOrchestrators:
@@ -265,24 +237,16 @@ class TestFindRunningOrchestrators:
 
 
 class TestDiscoverOrchestrators:
-    """Tests for discover_orchestrators — combines process, task tree (MCP), and artifact data."""
+    """Tests for discover_orchestrators — process discovery and root resolution."""
 
-    async def test_combines_process_and_worktree_data(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Running orchestrator is enriched with task tree and worktree artifact data."""
+    async def test_combines_process_and_worktree_data(self, tmp_path, no_mcp):
+        """A running orchestrator becomes one entry keyed on its resolved root."""
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
         from dashboard.data.orchestrator import discover_orchestrators
 
         config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-            {'id': '2', 'title': 'Build', 'status': 'done', 'priority': 'high', 'dependencies': ['1'], 'metadata': {}},
-            {'id': '3', 'title': 'Test', 'status': 'in-progress', 'priority': 'medium', 'dependencies': ['2'], 'metadata': {}},
-            {'id': '4', 'title': 'Review', 'status': 'blocked', 'priority': 'medium', 'dependencies': ['3'], 'metadata': {}},
-            {'id': '5', 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': ['4'], 'metadata': {}},
-            {'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
 
         wt_dir = tmp_path / '.worktrees' / '7'
         wt_dir.mkdir(parents=True)
@@ -295,17 +259,16 @@ class TestDiscoverOrchestrators:
         prd_path = str(tmp_path / 'prd.md')
         mock_procs = [{'pid': 1234, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         entry = result[0]
         assert 1234 in entry['pids']
         assert entry['prd'] == prd_path
         assert entry['running'] is True
-        assert len(entry['tasks']) == 6
-        assert entry['summary'] == {'total': 6, 'done': 2, 'in_progress': 2, 'blocked': 1, 'pending': 1}
+        assert entry['started'] == 'Mar18'
 
-    async def test_no_running_orchestrators(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_no_running_orchestrators(self, tmp_path, no_mcp):
         """Empty process list returns empty result."""
         from unittest.mock import patch
 
@@ -315,29 +278,11 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=[]):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert result == []
 
-    async def test_missing_task_tree(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Orchestrator returned even when MCP task list is empty."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        # registry is empty for this project — fetch_tasks returns []
-
-        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': '10:30'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        assert result[0]['tasks'] == []
-        assert result[0]['summary'] == {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0}
-
-    async def test_single_process_produces_pids_list(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_single_process_produces_pids_list(self, tmp_path, no_mcp):
         """Single running orchestrator produces entry with 'pids' list and no 'pid' key."""
         from unittest.mock import patch
 
@@ -348,7 +293,7 @@ class TestDiscoverOrchestrators:
 
         mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         entry = result[0]
@@ -357,7 +302,7 @@ class TestDiscoverOrchestrators:
         assert entry['pids'] == [1234]
         assert 'pid' not in entry
 
-    async def test_same_prd_grouped_into_single_entry(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_same_prd_grouped_into_single_entry(self, tmp_path, no_mcp):
         """Two processes with the same PRD path are merged into one entry with both PIDs."""
         from unittest.mock import patch
 
@@ -365,9 +310,6 @@ class TestDiscoverOrchestrators:
         from dashboard.data.orchestrator import discover_orchestrators
 
         config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
 
         wt_dir = tmp_path / '.worktrees' / '1'
         wt_dir.mkdir(parents=True)
@@ -378,15 +320,12 @@ class TestDiscoverOrchestrators:
             {'pid': 5678, 'prd': prd_path, 'config_path': None, 'running': False, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
-        entry = result[0]
-        assert entry['pids'] == [1234, 5678]
-        assert len(entry['tasks']) == 1
-        assert entry['summary']['total'] == 1
+        assert result[0]['pids'] == [1234, 5678]
 
-    async def test_different_projects_produce_separate_entries(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_different_projects_produce_separate_entries(self, tmp_path, no_mcp):
         """Two processes targeting different project roots produce two separate entries."""
         from unittest.mock import patch
 
@@ -405,14 +344,14 @@ class TestDiscoverOrchestrators:
             {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 2
         pids_by_root = {entry['project_root']: entry['pids'] for entry in result}
         assert pids_by_root[str(proj_a)] == [1234]
         assert pids_by_root[str(proj_b)] == [5678]
 
-    async def test_grouped_running_true_when_any_running(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_grouped_running_true_when_any_running(self, tmp_path, no_mcp):
         """Grouped entry has running=True if at least one process is still running."""
         from unittest.mock import patch
 
@@ -426,12 +365,12 @@ class TestDiscoverOrchestrators:
             {'pid': 5678, 'prd': '/prd.md', 'config_path': None, 'running': False, 'started': 'Mar17'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert result[0]['running'] is True
 
-    async def test_grouped_running_false_when_all_completed(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_grouped_running_false_when_all_completed(self, tmp_path, no_mcp):
         """Grouped entry has running=False if all processes in the group have completed."""
         from unittest.mock import patch
 
@@ -445,12 +384,12 @@ class TestDiscoverOrchestrators:
             {'pid': 5678, 'prd': '/prd.md', 'config_path': None, 'running': False, 'started': 'Mar17'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert result[0]['running'] is False
 
-    async def test_bare_fallback_with_symlink_config_root(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_bare_fallback_with_symlink_config_root(self, tmp_path, no_mcp):
         """Bare process (no prd, no config_path) with symlinked config.project_root returns canonical path."""
         from unittest.mock import patch
 
@@ -462,31 +401,23 @@ class TestDiscoverOrchestrators:
         link = tmp_path / "link"
         link.symlink_to(real_dir)
 
-        fake_fetch_tasks(real_dir, [
-            {"id": "1", "title": "T", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
-        ])
-
         config = DashboardConfig(project_root=link)
 
         mock_procs = [{"pid": 1234, "prd": None, "config_path": None, "running": True, "started": "Apr09"}]
         with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert result[0]["project_root"] == str(real_dir)
         assert result[0]["pids"] == [1234]
 
-    async def test_multi_bare_processes_grouped_under_project_root(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_multi_bare_processes_grouped_under_project_root(self, tmp_path, no_mcp):
         """Multiple bare processes sharing the same config root are merged."""
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
         from dashboard.data.orchestrator import discover_orchestrators
 
-        fake_fetch_tasks(tmp_path, [
-            {"id": "1", "title": "Alpha", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
-            {"id": "2", "title": "Beta", "status": "in-progress", "priority": "medium", "dependencies": [], "metadata": {}},
-        ])
         config = DashboardConfig(project_root=tmp_path)
 
         mock_procs = [
@@ -495,7 +426,7 @@ class TestDiscoverOrchestrators:
             {"pid": 1003, "prd": None, "config_path": None, "running": False, "started": "Apr09"},
         ]
         with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert result[0]["pids"] == [1001, 1002, 1003]
@@ -503,9 +434,8 @@ class TestDiscoverOrchestrators:
         assert result[0]["prd"] is None
         assert result[0]["label"] == str(tmp_path.resolve())
         assert result[0]["running"] is True
-        assert result[0]["summary"] == {"total": 2, "done": 1, "in_progress": 1, "blocked": 0, "pending": 0}
 
-    async def test_symlink_and_canonical_paths_grouped_into_single_entry(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_symlink_and_canonical_paths_grouped_into_single_entry(self, tmp_path, no_mcp):
         """Two processes whose PRDs resolve to the same project root are merged into one entry."""
         from unittest.mock import patch
 
@@ -518,10 +448,6 @@ class TestDiscoverOrchestrators:
         link_dir = tmp_path / "link_proj"
         link_dir.symlink_to(real_dir)
 
-        fake_fetch_tasks(real_dir, [
-            {"id": "2", "title": "Work", "status": "in-progress", "priority": "high", "dependencies": [], "metadata": {}},
-        ])
-
         (tmp_path / "unrelated").mkdir()
         config = DashboardConfig(project_root=tmp_path / "unrelated")
 
@@ -533,346 +459,11 @@ class TestDiscoverOrchestrators:
             {"pid": 222, "prd": prd_canonical, "config_path": None, "running": True, "started": "Apr09"},
         ]
         with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert set(result[0]["pids"]) == {111, 222}
         assert result[0]["project_root"] == str(real_dir)
-
-
-class TestDiscoverOrchestratorsBudget:
-    """discover_orchestrators must be bounded as a WHOLE, not merely per request.
-
-    ``fetch_tasks``' own *timeout* is a per-HTTP-request budget: it bounds
-    connect/read/write and pool acquisition, and nothing else. The incident
-    that motivated these tests hung inside httpcore's connection lock, where
-    no outbound socket is ever opened and that timeout never fires — so this
-    endpoint wedged for 19.8 h with the per-request budget fully in place.
-    Only an enclosing ``asyncio.wait_for`` cancels that wait.
-
-    Every hang stub below is therefore ``await asyncio.Event().wait()`` on an
-    event nothing ever sets. That is deliberate and load-bearing: a stub that
-    slept for a fixed duration would pass against the PRE-FIX code as soon as
-    the sleep was shorter than the budget, proving nothing. An Event that is
-    never set has no duration at all, so the ONLY thing that can end the await
-    is the wait_for cancellation.
-
-    That same property would hang the pytest process forever against unfixed
-    code, so each call under test is additionally wrapped in a TEST-SIDE
-    ``asyncio.wait_for(..., timeout=2.0)``. The inner budget is monkeypatched
-    down to 0.05 s, so the guard is 40x the budget: it can only trip on a real
-    regression, never on scheduling jitter.
-
-    NO ASSERTION IN THIS CLASS MAY MEASURE WALL CLOCK. Every bound here is
-    proven by call counts and by the operator-facing budget messages — which
-    are what the code actually promises an operator — and the 2.0 s test-side
-    ``wait_for`` above is the only clock permitted, because its job is to stop
-    an unbounded walk hanging pytest rather than to measure anything. Two
-    elapsed-time assertions used to live here and both recurred as flakes on a
-    loaded host: task 5201's 0.534 s against a 0.5 s ceiling, and task 5032's
-    merge-verify 0.793 s against 1.5x a 0.5 s budget. Each time the behaviour
-    under test passed and only the clock missed. They were removed after
-    measuring that they discriminated nothing the mechanism assertions did not
-    already catch (see the mutation recorded in
-    ``test_the_loop_deadline_truncates_a_root_share_not_the_per_root_budget``).
-    Do not restore one.
-    """
-
-    async def test_a_hanging_fetch_tasks_does_not_hang_discover_orchestrators(
-        self, tmp_path, monkeypatch, dummy_client,
-    ):
-        """One root whose fetch never returns is reported DEGRADED, not offline."""
-        import asyncio
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data import orchestrator
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        calls: list[str] = []
-
-        async def _hang(client, config, project_root):
-            calls.append(str(project_root))
-            await asyncio.Event().wait()  # nothing ever sets it
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 0.05)
-
-        proj = tmp_path / 'proj_a'
-        (proj / '.taskmaster').mkdir(parents=True)
-        config = DashboardConfig(project_root=tmp_path)
-        mock_procs = [{
-            'pid': 1234, 'prd': str(proj / 'prd.md'), 'config_path': None,
-            'running': True, 'started': 'Mar18',
-        }]
-
-        with patch(
-            'dashboard.data.orchestrator.find_running_orchestrators',
-            return_value=mock_procs,
-        ):
-            result = await asyncio.wait_for(
-                discover_orchestrators(client=dummy_client, config=config),
-                timeout=2.0,
-            )
-
-        assert len(calls) == 1, 'the hang stub must actually have been reached'
-        assert len(result) == 1
-        entry = result[0]
-        assert entry['tasks'] == []
-        assert entry['offline'] is False, (
-            'the budget cancelled this fetch; nothing about it demonstrably '
-            'FAILED. Reporting it offline tells an operator fused-memory is '
-            f'down when the handler merely ran out of time: {entry}'
-        )
-        assert entry['degraded'] is True, (
-            "a cancelled fetch leaves this root's task tree UNKNOWN, and the "
-            'entry must say so in a field a consumer can branch on, not only '
-            f'inside the free-text error: {entry}'
-        )
-        assert entry['summary']['total'] == 0
-        assert 'error' in entry
-        # A starved root must not read as a healthy project with zero tasks:
-        # the real cause has to reach the operator on the wire.
-        assert 'budget' in entry['error']
-
-    async def test_a_root_that_never_got_its_turn_is_marked_degraded_not_silently_empty(
-        self, tmp_path, monkeypatch, dummy_client,
-    ):
-        """The whole-loop deadline degrades the unreached root, not the loop."""
-        import asyncio
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data import orchestrator
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        calls: list[str] = []
-
-        async def _hang(client, config, project_root):
-            calls.append(str(project_root))
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        # The first root consumes the ENTIRE loop budget, so the second never
-        # gets its turn.
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 0.05)
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', 0.05)
-
-        proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster').mkdir(parents=True)
-        proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster').mkdir(parents=True)
-        config = DashboardConfig(project_root=tmp_path)
-        mock_procs = [
-            {'pid': 1234, 'prd': str(proj_a / 'prd.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-        ]
-
-        with patch(
-            'dashboard.data.orchestrator.find_running_orchestrators',
-            return_value=mock_procs,
-        ):
-            result = await asyncio.wait_for(
-                discover_orchestrators(client=dummy_client, config=config),
-                timeout=2.0,
-            )
-
-        # The loop is not abandoned: BOTH roots still come back.
-        assert len(result) == 2
-        for entry in result:
-            assert entry['degraded'] is True, (
-                'a root the budget never let us measure must not render as a '
-                'healthy project with zero tasks — that is the invisible '
-                f'failure this whole task exists to close: {entry}'
-            )
-            assert entry['offline'] is False, (
-                'neither root was proven unreachable — one was cancelled '
-                'mid-fetch and the other never attempted at all. Reporting '
-                'them offline sends an operator to restart a healthy service: '
-                f'{entry}'
-            )
-            assert entry['error']
-        # The second root was skipped outright, not attempted and abandoned.
-        assert len(calls) == 1
-
-    async def test_the_loop_deadline_truncates_a_root_share_not_the_per_root_budget(
-        self, tmp_path, monkeypatch, dummy_client,
-    ):
-        """When the loop deadline binds, IT is the bound — and the message says so.
-
-        The two tests above set the per-root and total budgets EQUAL, so
-        ``min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)`` could be replaced by
-        the per-root constant alone and both would still pass — reintroducing
-        the ``roots x per-root budget`` worst case the whole-loop deadline
-        exists to prevent. Here the per-root budget is 10x the loop budget, so
-        only the ``min`` can keep the walk bounded, and only the ``min`` can
-        report the share the root ACTUALLY got.
-
-        The discriminator for that mutation is the REPORTED SHARE, not a clock.
-        Measured 2026-09-15: mutating ``share = min(remaining,
-        _ORCHESTRATORS_PER_ROOT_BUDGET)`` to the bare per-root constant, with
-        both of this class's wall-clock assertions simultaneously neutralised,
-        still reddened this test — on ``'1.0s share' not in error``. The
-        elapsed-time assertion that used to sit below was therefore pure flake
-        surface, and is gone.
-
-        One residual is knowingly left uncovered: the reported share and the
-        applied ``timeout=`` read the same ``share`` local, so a mutation
-        touching ONLY the ``timeout=`` argument would slip past. Catching it
-        would mean monkeypatching ``asyncio.wait_for`` to observe a call this
-        module makes internally — reaching past the module's interface for a
-        mutation nobody has seen. Deliberately not chased.
-        """
-        import asyncio
-        import re
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data import orchestrator
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        calls: list[str] = []
-
-        async def _hang(client, config, project_root):
-            calls.append(str(project_root))
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        # Deliberately FAR above the loop budget: a walk bounded by the
-        # per-root constant alone would spend 1.0 s on the first root.
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', 1.0)
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', 0.1)
-
-        proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster').mkdir(parents=True)
-        proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster').mkdir(parents=True)
-        config = DashboardConfig(project_root=tmp_path)
-        mock_procs = [
-            {'pid': 1234, 'prd': str(proj_a / 'prd.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-        ]
-
-        with patch(
-            'dashboard.data.orchestrator.find_running_orchestrators',
-            return_value=mock_procs,
-        ):
-            result = await asyncio.wait_for(
-                discover_orchestrators(client=dummy_client, config=config),
-                timeout=2.0,
-            )
-
-        assert len(result) == 2
-        assert len(calls) == 1
-
-        # The operator message must name the share this root actually got, not
-        # the per-root constant it never received.
-        error = result[0]['error']
-        assert '1.0s share' not in error, (
-            f'the message reports the {orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET}s '
-            f'per-root constant as the share, but the loop budget truncated it: {error!r}'
-        )
-        match = re.search(r'exceeded its ([0-9.]+)s share', error)
-        assert match, f'no share reported in {error!r}'
-        assert float(match.group(1)) <= 0.1 + 1e-9, (
-            f'reported share {match.group(1)}s exceeds the 0.1s loop budget '
-            f'that was the binding constraint: {error!r}'
-        )
-
-    async def test_two_pids_sharing_one_root_pay_the_budget_once(
-        self, tmp_path, monkeypatch, dummy_client, caplog,
-    ):
-        """Two processes on one root cost ONE budget, not one each.
-
-        The saving comes from the ``groups`` merge (roots are unique dict
-        keys), which is upstream of ``project_cache`` — so within one call the
-        cache can never be hit twice. This pins the OBSERVABLE property rather
-        than either mechanism: a refactor that walked processes instead of
-        roots would make a two-PID host pay 2x the budget on every poll, and
-        that is what must not regress.
-
-        The deterministic ``len(calls) == 1`` assertion is what actually pins
-        that property. Its backstop is the WARNING COUNT below — exactly one
-        'exceeded its ... share' record means exactly one budget was actually
-        SPENT — and no longer a wall-clock ceiling; see this class's docstring
-        for why nothing here measures elapsed time.
-        """
-        import asyncio
-        import logging
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data import orchestrator
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        calls: list[str] = []
-
-        async def _hang(client, config, project_root):
-            calls.append(str(project_root))
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        # The hang stub means this test literally sleeps for one budget, and
-        # nothing asserts on its magnitude now that the clock is gone.
-        budget = 0.05
-        monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', budget)
-
-        proj = tmp_path / 'proj_shared'
-        (proj / '.taskmaster').mkdir(parents=True)
-        config = DashboardConfig(project_root=tmp_path)
-        # Two PIDs, two DIFFERENT prd paths, one resolved project root.
-        mock_procs = [
-            {'pid': 1234, 'prd': str(proj / 'docs' / 'a.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': str(proj / 'docs' / 'b.md'), 'config_path': None,
-             'running': True, 'started': 'Mar18'},
-        ]
-
-        with patch(
-            'dashboard.data.orchestrator.find_running_orchestrators',
-            return_value=mock_procs,
-        ), caplog.at_level(logging.WARNING, logger='dashboard.data.orchestrator'):
-            result = await asyncio.wait_for(
-                discover_orchestrators(client=dummy_client, config=config),
-                timeout=2.0,
-            )
-
-        assert len(calls) == 1, (
-            f'the shared root was fetched {len(calls)} times — one PID per '
-            'fetch means an N-orchestrator host pays N x the budget for one '
-            'project on every poll'
-        )
-        assert len(result) == 1
-        assert sorted(result[0]['pids']) == [1234, 5678]
-        assert result[0]['offline'] is False, (
-            'the single fetch was cancelled by the budget, not proven to fail'
-        )
-        assert result[0]['degraded'] is True, (
-            "the shared root's task tree is UNKNOWN for this render, and both "
-            'PIDs must carry that fact rather than a confident zero'
-        )
-        assert result[0]['error']
-        # Backstop to `len(calls) == 1`: one budget SPENT, not merely one
-        # fetch issued. Each root that overruns logs exactly one 'exceeded
-        # its ... share' WARNING, so a walk that charged per PROCESS would
-        # log two for this single shared root.
-        overruns = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and 'exceeded its' in r.getMessage()
-        ]
-        assert len(overruns) == 1, (
-            f'{len(overruns)} budget-overrun warnings were logged for ONE '
-            'shared root, which overruns once and so must log once. More than '
-            'one means an N-orchestrator host pays N x the budget for a single '
-            'project on every poll: look at the `groups` merge and the '
-            '`if project_root not in project_cache` guard in '
-            f'discover_orchestrators. Messages: '
-            f'{[r.getMessage() for r in overruns]}'
-        )
 
 
 class TestResolveProjectRoot:
@@ -937,10 +528,17 @@ class TestResolveProjectRoot:
 
 
 class TestDiscoverOrchestratorsPerProject:
-    """Tests for per-project task loading in discover_orchestrators."""
+    """Per-project ROOT RESOLUTION — which root a process is attributed to.
 
-    async def test_different_projects_get_own_tasks(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Two orchestrators in different projects each see their own task tree."""
+    This class used to own per-project TASK loading as well. That half is gone:
+    ``discover_orchestrators`` no longer reads a task tree, so there is nothing
+    per-project left to load. What survives is the half that was always the
+    harder one — resolving a PRD path, a config path or nothing at all to one
+    canonical root, and merging everything that lands on the same root.
+    """
+
+    async def test_different_projects_are_attributed_to_their_own_roots(self, tmp_path, no_mcp):
+        """Two orchestrators under different roots stay two entries, each canonical."""
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -951,38 +549,24 @@ class TestDiscoverOrchestratorsPerProject:
         proj_a = tmp_path / 'proj_a'
         proj_a.mkdir()
         (proj_a / '.taskmaster').mkdir()
-        fake_fetch_tasks(proj_a, [
-            {'id': '1', 'title': 'A1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-            {'id': '2', 'title': 'A2', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-        ])
 
         proj_b = tmp_path / 'proj_b'
         proj_b.mkdir()
         (proj_b / '.taskmaster').mkdir()
-        fake_fetch_tasks(proj_b, [
-            {'id': '10', 'title': 'B1', 'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
 
         mock_procs = [
             {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
             {'pid': 2000, 'prd': str(proj_b / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         by_root = {e['project_root']: e for e in result}
+        assert set(by_root) == {str(proj_a), str(proj_b)}
+        assert by_root[str(proj_a)]['pids'] == [1000]
+        assert by_root[str(proj_b)]['pids'] == [2000]
 
-        a_entry = by_root[str(proj_a)]
-        assert len(a_entry['tasks']) == 2
-        assert a_entry['summary']['total'] == 2
-        assert a_entry['summary']['done'] == 1
-
-        b_entry = by_root[str(proj_b)]
-        assert len(b_entry['tasks']) == 1
-        assert b_entry['summary']['total'] == 1
-        assert b_entry['summary']['pending'] == 1
-
-    async def test_same_project_prds_merged_into_single_entry(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_same_project_prds_merged_into_single_entry(self, tmp_path, no_mcp):
         """Two PRDs in the same project are merged into one entry (grouped by project root)."""
         from unittest.mock import patch
 
@@ -991,22 +575,17 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'T1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-
         mock_procs = [
             {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
             {'pid': 2000, 'prd': str(tmp_path / 'prd2.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert set(result[0]['pids']) == {1000, 2000}
-        assert len(result[0]['tasks']) == 1
 
-    async def test_fallback_to_config_project_root(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_fallback_to_config_project_root(self, tmp_path, no_mcp):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
         from unittest.mock import patch
 
@@ -1015,18 +594,14 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-
         mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
-        assert len(result[0]['tasks']) == 1
+        assert result[0]['project_root'] == str(tmp_path.resolve())
 
-    async def test_project_root_in_result_is_resolved_when_config_root_is_symlink(self, tmp_path, fake_fetch_tasks, dummy_client):
+    async def test_project_root_in_result_is_resolved_when_config_root_is_symlink(self, tmp_path, no_mcp):
         """project_root in result dict is canonicalised even when config.project_root is a symlink."""
         from unittest.mock import patch
 
@@ -1038,107 +613,73 @@ class TestDiscoverOrchestratorsPerProject:
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
 
-        fake_fetch_tasks(real_dir, [
-            {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-
         config = DashboardConfig(project_root=link)
 
         mock_procs = [{'pid': 9999, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Apr07'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
         assert len(result) == 1
         assert result[0]['project_root'] == str(real_dir)
 
-    async def test_last_update_is_max_updated_at_when_all_tasks_dated(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """last_update equals the most-recent updated_at when all tasks carry the field."""
-        from unittest.mock import patch
 
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
+class TestDiscoverOrchestratorsIsProcessDiscoveryOnly:
+    """``/orchestrators`` stopped fetching task trees. This is what that means.
 
-        config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {},
-             'updated_at': '2026-06-10T10:00:00'},
-            {'id': '2', 'title': 'B', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {},
-             'updated_at': '2026-06-12T15:30:00'},
-            {'id': '3', 'title': 'C', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {},
-             'updated_at': '2026-06-11T08:00:00'},
-        ])
+    Discovery used to pull EVERY root's whole task tree — under its own
+    two-layer budget, its own cache and its own offline/degraded split — to
+    compute a five-key ``summary`` and a ``last_update``. The task snapshot
+    unit on ``/api/v2/dashboard/tasks`` now owns every task count the dashboard
+    reports, so the second implementation is gone rather than kept in
+    agreement by hand.
 
-        mock_procs = [{'pid': 1234, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        assert result[0]['last_update'] == '2026-06-12T15:30:00'
-
-    async def test_last_update_is_none_when_no_task_has_updated_at(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """last_update is None when no task in the tree carries an updated_at value."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-        ])
-
-        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': '10:30'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        assert result[0]['last_update'] is None
-
-    async def test_last_update_ignores_tasks_without_updated_at(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """last_update equals max over dated tasks; tasks without updated_at are skipped."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {},
-             'updated_at': '2026-06-09T09:00:00'},
-            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-            {'id': '3', 'title': 'C', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {},
-             'updated_at': '2026-06-14T20:00:00'},
-        ])
-
-        mock_procs = [{'pid': 9001, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Apr01'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        assert result[0]['last_update'] == '2026-06-14T20:00:00'
-
-
-class TestDiscoverOrchestratorsOfflineMarker:
-    """discover_orchestrators carries *offline* and *degraded* SEPARATELY.
-
-    This class owns the SPLIT, not merely the marker's survival. The invariant
-    itself — *offline* means the fetch demonstrably failed and the project is
-    proven unreachable, *degraded* means a budget expired first and the
-    project's state is simply UNKNOWN — is stated once, at
-    ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``,
-    together with the operator consequence of collapsing them.
-
-    ``TestDiscoverOrchestratorsBudget`` pins the degraded corner. What is
-    pinned here is the other two: a fetch that demonstrably failed, and a
-    healthy one.
+    What replaces the budget machinery is not a smaller budget: it is the
+    absence of anything to bound. A function that reads no task tree cannot
+    time one out, cannot cache one, and cannot report one unreachable.
     """
 
-    async def test_offline_marker_preserved_not_discarded(self, tmp_path, monkeypatch, dummy_client):
-        """When fetch_tasks returns the offline marker, the project entry must still appear
-        with offline=True and error from the marker, not be silently discarded.
+    async def test_discovery_issues_no_mcp_call_at_all(self, tmp_path, monkeypatch):
+        """ZERO MCP traffic — asserted at the wire, not by counting patches.
 
-        Fails today because `fetched if isinstance(fetched, list) else []` discards the marker.
+        A test that patched ``orchestrator.fetch_tasks`` would keep passing if
+        the fetch merely moved to a different name in the same module. The
+        substrate stub cannot be satisfied that way: ANY read, under any name,
+        fails the test.
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        calls: list[str] = []
+
+        async def _forbidden(client, url, tool, args, **kwargs):
+            calls.append(tool)
+            raise AssertionError(
+                f'discover_orchestrators must issue no MCP call; got {tool!r} '
+                f'with {args!r}'
+            )
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _forbidden)
+
+        config = DashboardConfig(project_root=tmp_path)
+        mock_procs = [
+            {'pid': 1, 'prd': str(tmp_path / 'a.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 2, 'prd': None, 'config_path': None, 'running': True, 'started': 'Mar18'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(config)
+
+        assert calls == []
+        assert len(result) == 2, 'both processes are still discovered'
+
+    async def test_entries_carry_no_task_derived_key(self, tmp_path, no_mcp):
+        """``tasks``, ``summary`` and ``last_update`` are ABSENT, not empty.
+
+        An empty ``summary`` would read as a measured "this orchestrator has no
+        tasks" — the fabricated zero the whole PRD exists to remove — and
+        ``last_update: None`` from a producer that never looked is the same lie
+        in a quieter register. The count lives on ``/tasks`` now.
         """
         from unittest.mock import patch
 
@@ -1147,58 +688,46 @@ class TestDiscoverOrchestratorsOfflineMarker:
 
         config = DashboardConfig(project_root=tmp_path)
         prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 9999, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
-
-        async def offline_fetch(client, cfg, project_root):
-            return {'offline': True, 'error': 'boom'}
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', offline_fetch)
+        mock_procs = [
+            {'pid': 1234, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': prd_path, 'config_path': None, 'running': False, 'started': 'Mar18'},
+        ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
+            result = await discover_orchestrators(config)
 
-        assert len(result) == 1, 'offline-marker entry must NOT be dropped from the result'
+        assert len(result) == 1, 'two PIDs on one resolved root are still one entry'
         entry = result[0]
-        assert entry.get('offline') is True, f'expected offline=True, got: {entry}'
-        assert entry.get('error') == 'boom', f'expected error=boom, got: {entry}'
-        assert entry.get('degraded') is False, (
-            'this fetch was attempted and demonstrably failed, so the project '
-            'is proven unreachable — reporting it merely degraded understates '
-            f'a real outage as an unmeasured one: {entry}'
-        )
-        # Summary should be all-zero (no tasks)
-        s = entry.get('summary', {})
-        assert s.get('total', -1) == 0
+        for gone in ('tasks', 'summary', 'last_update'):
+            assert gone not in entry, (
+                f'{gone!r} is derived from a task tree this function no longer '
+                f'reads — its presence would be a value nobody measured: {entry}'
+            )
+        # Everything discovery itself measures is unchanged.
+        assert entry['pids'] == [1234, 5678]
+        assert entry['prd'] == prd_path
+        assert entry['label'] == prd_path
+        assert entry['project_root'] == str(tmp_path.resolve())
+        assert entry['running'] is True
+        assert entry['started'] == 'Mar18'
 
-    async def test_a_healthy_root_is_neither_offline_nor_degraded(
-        self, tmp_path, monkeypatch, dummy_client,
-    ):
-        """The common case sets BOTH flags False — neither may be absent.
+    def test_the_fetch_budget_machinery_is_gone(self):
+        """The budget, and the record it bounded, no longer exist.
 
-        Every consumer downstream reads the pair unconditionally (the shaper
-        ``bool()``-coerces both; the orchestrators tab branches on both), so
-        "no key at all" is not an acceptable spelling of "healthy".
+        Deleted rather than left inert: a constant naming a budget for a fetch
+        that cannot happen is a comment that lies, and the next reader would
+        spend real time working out which call site it governs.
         """
-        from unittest.mock import patch
+        import dashboard.data.orchestrator as orchestrator_mod
 
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 4242, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
-
-        async def healthy_fetch(client, cfg, project_root):
-            return [{'id': 1, 'title': 'a real task', 'status': 'done'}]
-
-        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', healthy_fetch)
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        entry = result[0]
-        assert entry['summary']['total'] == 1, f'the success arm was not taken: {entry}'
-        assert entry['offline'] is False, f'a fetch that returned tasks is not offline: {entry}'
-        assert entry['degraded'] is False, f'a fetch that returned tasks is not degraded: {entry}'
+        for name in (
+            '_ORCHESTRATORS_PER_ROOT_BUDGET',
+            '_ORCHESTRATORS_TOTAL_BUDGET',
+            '_RootFetch',
+        ):
+            assert not hasattr(orchestrator_mod, name), (
+                f'{name} bounded or recorded a task fetch that no longer '
+                'happens — delete it rather than leaving it to be re-bound'
+            )
 
 
 class TestReadMaxConcurrentTasks:

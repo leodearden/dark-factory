@@ -28,7 +28,11 @@ def test_shape_orchestrators_picks_first_pid_and_basename_project():
     assert orch['pids'] == [482103, 482104]
     assert orch['project'] == 'dark-factory'
     assert orch['running'] is True
-    assert orch['summary']['total'] == 0
+    assert 'summary' not in orch, (
+        'nothing measures a task count on this path any more, so the shaper '
+        'must not project one — a fabricated all-zero summary would read as a '
+        f'measured "this orchestrator has no tasks": {orch}'
+    )
     assert 'current_task' not in orch
 
 

@@ -67,7 +67,7 @@ def test_health_endpoint(client):
 
 
 def test_orchestrators_returns_orchestrators_and_projects(client):
-    """Even with no running orchestrators the response carries both keys."""
+    """Even with no running orchestrators the response carries every key."""
     with patch(
         'dashboard.api.orchestrators.discover_orchestrators',
         new=AsyncMock(return_value=[]),
@@ -75,12 +75,50 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
         resp = client.get('/api/v2/dashboard/orchestrators')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'}
+    assert set(body) == {
+        'ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK', 'served_at',
+    }
     assert isinstance(body['ORCHESTRATORS'], list)
     assert isinstance(body['PROJECTS'], list)
     assert isinstance(body['ORCHESTRATORS_SPARK'], dict)
     assert 'labels' in body['ORCHESTRATORS_SPARK']
     assert 'values' in body['ORCHESTRATORS_SPARK']
+
+
+def test_orchestrators_payload_is_stamped_and_carries_no_task_summary(client):
+    """The endpoint says when it looked, and claims no task count at all.
+
+    ``summary`` used to be the whole reason discovery fetched every root's
+    task tree. The tree is gone, so the key must be gone too — an all-zero
+    summary shaped from an absent one would read as a measured "no tasks",
+    which is the fabricated zero this PRD exists to remove.
+    """
+    from datetime import datetime
+
+    raw = [{
+        'pids': [4321],
+        'prd': '/proj/dark-factory/prd.md',
+        'label': '/proj/dark-factory/prd.md',
+        'project_root': '/proj/dark-factory',
+        'running': True,
+        'started': 'Mar18',
+    }]
+    with patch(
+        'dashboard.api.orchestrators.discover_orchestrators',
+        new=AsyncMock(return_value=raw),
+    ):
+        resp = client.get('/api/v2/dashboard/orchestrators')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    served_at = datetime.fromisoformat(body['served_at'])
+    assert served_at.utcoffset() is not None, (
+        'served_at must name one moment, not a local-clock reading'
+    )
+    [orch] = body['ORCHESTRATORS']
+    assert 'summary' not in orch, f'no task count is measured here: {orch}'
+    assert orch['pids'] == [4321]
+    assert orch['project'] == 'dark-factory'
 
 
 def _snapshot(*, health='ok', done=0):
