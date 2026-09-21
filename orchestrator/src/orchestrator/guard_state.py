@@ -39,12 +39,16 @@ so a caller — and every TTL test — can drive elapsed scenarios deterministic
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterable, Iterator, MutableMapping, MutableSet
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from shared import safe_io
+from shared.safe_io import load_json_or_warn
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +84,16 @@ class _GuardStore:
 
     Private: callers hold a :class:`PersistentSet` or :class:`PersistentMap`,
     which is where the collection semantics live.  This class owns only the
-    entries, the clock and (from step-4) the file.
+    entries, the clock and the file.
+
+    The cache is warmed once at construction and every mutation writes through
+    one ``flush`` chokepoint (the ``LandedOutbox`` convention), so no code path
+    can forget to persist.  A ``path`` of ``None`` makes both halves no-ops and
+    the store purely in-memory.
+
+    On disk the shape is ``{"<key>": {"value": <json>, "updated_at": "<iso>"}}``
+    — structured, so a reader parses fields rather than a meaningful string,
+    and human-readable, so an operator can see when a guard fired.
     """
 
     def __init__(
@@ -93,7 +106,12 @@ class _GuardStore:
         self._path = path
         self._ttl = ttl
         self._now = now
-        self._entries: dict[str, _Entry] = {}
+        # Keys this instance removed, held until a write actually lands so a
+        # failed flush does not silently forget the removal.  Re-storing a key
+        # retracts its pending removal — otherwise a removal whose flush failed
+        # would keep deleting the key from every later merge.
+        self._removed: set[str] = set()
+        self._entries: dict[str, _Entry] = self._load_raw()
 
     # --- reads ---
 
@@ -115,6 +133,7 @@ class _GuardStore:
     def put(self, key: str, value: Any) -> None:
         """Store *value* under *key*, always refreshing the timestamp."""
         self._entries[key] = _Entry(value=value, updated_at=self._now())
+        self._removed.discard(key)
         self.flush()
 
     def insert_if_absent(self, key: str, value: Any) -> bool:
@@ -128,6 +147,7 @@ class _GuardStore:
         if key in self._entries:
             return False
         self._entries[key] = _Entry(value=value, updated_at=self._now())
+        self._removed.discard(key)
         self.flush()
         return True
 
@@ -135,11 +155,106 @@ class _GuardStore:
         """Drop *key*.  Returns whether it was there to drop."""
         if self._entries.pop(key, None) is None:
             return False
+        self._removed.add(key)
         self.flush()
         return True
 
+    # --- disk ---
+
+    def _load_raw(self) -> dict[str, _Entry]:
+        """Read the file, returning ``{}`` on any failure (fail-open).
+
+        A row that is valid JSON but schema-drifted is dropped INDIVIDUALLY
+        with a WARNING rather than voiding the whole file — without that,
+        fail-open would degrade to fail-empty for every other key in it
+        (``orchestrator/src/orchestrator/landed_outbox.py::LandedOutbox._load_raw``).
+
+        Losing this state is never a correctness bug, only a re-armed guard,
+        which is why absent and corrupt both resolve to empty rather than
+        raising into a steward loop or a scheduler tick.
+        """
+        if self._path is None:
+            return {}
+        data, ok = load_json_or_warn(self._path, default={}, on_corrupt='warn')
+        if not ok or not isinstance(data, dict):
+            return {}
+        entries: dict[str, _Entry] = {}
+        for key, row in data.items():
+            entry = self._entry_from_row(key, row)
+            if entry is not None:
+                entries[key] = entry
+        return entries
+
+    def _entry_from_row(self, key: str, row: Any) -> _Entry | None:
+        """Rebuild one stored row, or ``None`` (with a WARNING) if it drifted."""
+        if not isinstance(row, dict) or 'value' not in row or 'updated_at' not in row:
+            logger.warning(
+                'guard_state: dropping malformed row for key=%r in %s', key, self._path,
+            )
+            return None
+        raw_updated_at = row['updated_at']
+        try:
+            updated_at = datetime.fromisoformat(raw_updated_at)
+        except (TypeError, ValueError):
+            logger.warning(
+                'guard_state: dropping row with unparseable updated_at=%r for key=%r in %s',
+                raw_updated_at, key, self._path,
+            )
+            return None
+        if updated_at.tzinfo is None:
+            # This store only ever writes aware timestamps; a naive one is a
+            # hand-edit or a foreign writer.  Dropping it here is what keeps
+            # the TTL comparison from raising on a naive/aware mix later —
+            # the fail-open contract has to hold on the READ path too.
+            logger.warning(
+                'guard_state: dropping row with naive updated_at=%r for key=%r in %s',
+                raw_updated_at, key, self._path,
+            )
+            return None
+        return _Entry(value=row['value'], updated_at=updated_at)
+
     def flush(self) -> None:
-        """Persist the entries.  No-op until step-4 gives this store its disk half."""
+        """Persist the entries: LOAD, MERGE, then write.
+
+        Not a blind overwrite, because one file can have several owners in one
+        process — multiple ``TaskSteward`` instances share one file per counter
+        — and an overwrite would let one steward's flush erase another's
+        entries, silently re-arming the guard this store exists to keep.
+        Merge-by-key is sound because every key is globally unique (escalation
+        ids, task ids).  Our own entries win and our own removals apply; the
+        merged view is then adopted as this instance's cache, so a second
+        owner's keys stop looking absent to us.
+
+        Fail-open, and that policy lives HERE rather than in the write helper
+        (which always propagates): an ``OSError`` is warned and swallowed, and
+        the in-memory entries stay authoritative for the rest of the process.
+        A transient disk failure degrades this guard to exactly its old
+        behaviour instead of crashing its caller.
+        """
+        if self._path is None:
+            return
+        merged = {**self._load_raw(), **self._entries}
+        for key in self._removed:
+            merged.pop(key, None)
+        try:
+            safe_io.atomic_write_text(
+                self._path,
+                json.dumps({k: self._row_from_entry(e) for k, e in merged.items()}),
+                encoding='utf-8',
+                mkdir=True,
+            )
+        except OSError as exc:
+            logger.warning(
+                'guard_state: failed to persist guard state at %s'
+                ' (state is held in memory only): %s', self._path, exc,
+            )
+            return
+        self._removed.clear()
+        self._entries = merged
+
+    @staticmethod
+    def _row_from_entry(entry: _Entry) -> dict[str, Any]:
+        return {'value': entry.value, 'updated_at': entry.updated_at.isoformat()}
 
 
 class PersistentSet(MutableSet[str]):
