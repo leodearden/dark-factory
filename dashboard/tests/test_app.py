@@ -519,7 +519,7 @@ def _terminal_row(task_id, status='done'):
         'status': status,
         'dependencies': [],
         'metadata': {},
-        'updated_at': '2026-01-01T00:00:00+00:00',
+        'updatedAt': f'2026-01-0{task_id % 9 + 1}T00:00:00+00:00',
     }
 
 
@@ -620,6 +620,12 @@ class TestTerminalWindow:
             f'state is the disclosure, got {entry["state"]!r}'
         )
         assert len(entry['value']) == 10
+        assert all(row['started'] == 0 for row in entry['value']), (
+            'a finished task has no elapsed runtime to report'
+        )
+        assert all(row['completed'] for row in entry['value']), (
+            'a terminal row carries the completion instant the substrate offers'
+        )
         as_of = datetime.fromisoformat(entry['as_of'])
         assert as_of.utcoffset() is not None, (
             'as_of must name one moment, not a local-clock reading'
@@ -671,8 +677,9 @@ class TestTerminalWindow:
         read — and ``fetch_tasks``, the whole-set read, must not be reached at
         all on this path.
         """
-        import dashboard.data.task_snapshot as snapshot_mod
         from shared.task_statuses import TERMINAL
+
+        import dashboard.data.task_snapshot as snapshot_mod
 
         whole: list[dict] = []
         paged: list[dict] = []

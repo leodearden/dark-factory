@@ -681,6 +681,58 @@ def _shape_one_project(
     return active
 
 
+def shape_terminal_rows(
+    project_root: Path,
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> list[dict]:
+    """Shape a terminal window's raw rows into task rows for the wire.
+
+    The sibling of :func:`_shape_one_project`, and here for the same reason:
+    row shaping lives in this module so the two row shapes are built by one
+    ``_build_task_row`` and cannot drift into two slightly different 20-key
+    dicts. ``task_snapshot`` reads the window; this turns it into rows.
+
+    PURE given its arguments, and deliberately thinner than the active
+    shaping. Three fields differ, each because a terminal task has no live
+    state to report:
+
+    * ``started`` is ``0`` — a finished task has no elapsed runtime;
+    * ``deps`` is empty — dependency chips answer "what is this waiting on",
+      which is not a question about a finished task, and resolving them would
+      need a status map this path never reads;
+    * ``completed`` carries ``updated_at``, the only completion instant the
+      substrate offers.
+
+    No runtime probe is issued: :func:`_runtime_fields` under
+    ``'not_configured'`` degrades every runtime-sourced field to an honest
+    ``None`` rather than a fabricated zero. Probing for rows that by
+    definition have no live agent would spend a budget to learn nothing.
+
+    Rows are returned in the order the substrate served them (ascending id).
+    Ordering for display is the consumer's, and the ``Datum``'s
+    ``lower_bound`` state is what tells it the list is a window rather than a
+    population.
+    """
+    project = _project_label(project_root)
+    runtime_status = _probe_status(None)
+    shaped: list[dict] = []
+    for task in rows:
+        task_id = task.get('id')
+        if not isinstance(task_id, int):
+            continue
+        rt = _runtime_fields({}, runtime_status, task_id, now=now)
+        row = _build_task_row(
+            project, task, task_id, rt, _task_uid(project, task_id), now=now,
+        )
+        row['started'] = 0
+        row['deps'] = []
+        row['completed'] = task.get('updated_at') or ''
+        shaped.append(row)
+    return shaped
+
+
 async def _acquire_and_shape(
     client: httpx.AsyncClient,
     config: DashboardConfig,

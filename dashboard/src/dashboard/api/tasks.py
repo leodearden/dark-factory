@@ -9,18 +9,30 @@ for why each is its own signal.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from dashboard.data.active_tasks import _all_project_roots, collect_tasks_with_counts
-from dashboard.data.datum import DatumContractError, validate_datum
+from dashboard.config import DashboardConfig
+from dashboard.data.active_tasks import (
+    _all_project_roots,
+    _project_label,
+    collect_tasks_with_counts,
+    shape_terminal_rows,
+)
+from dashboard.data.datum import Datum, DatumContractError, DatumState, validate_datum
 from dashboard.data.task_snapshot import (
+    FRESHNESS_BOUND_SECONDS,
     SnapshotFailure,
     SnapshotHealth,
     TaskSnapshot,
+    acquire_terminal_window,
     classify,
+    measured_terminal_total,
     unmeasured_snapshot,
 )
 from dashboard.data.utils import resolve_now
@@ -60,6 +72,51 @@ def _validated(
             failure=SnapshotFailure.UNREACHABLE,
         )
     return snapshot
+
+
+async def _terminal_window(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    label: str,
+    snapshots: dict[str, TaskSnapshot],
+    *,
+    served_at: datetime,
+) -> Datum[list[dict]]:
+    """The terminal rows ``?terminal=<label>`` asked for, as one ``Datum``.
+
+    THE ONLY read the default render does not make, spent here because the
+    client that wants terminal rows is the only one that should pay for them.
+    ``task_snapshot.acquire_terminal_window`` owns what the window bounds and
+    why its answer is a ``LOWER_BOUND``; this resolves the label the request
+    names and hands the rows to the shaper every other task row goes through.
+
+    An unresolvable *label* is ANSWERED — never raised on, and never answered
+    with an empty list. A 500 would lose the rest of a payload that is
+    otherwise fine, and an empty success reads as "this project has no
+    terminal tasks", which is a measurement nobody made.
+    """
+    root = next(
+        (r for r in _all_project_roots(config) if _project_label(r) == label), None
+    )
+    if root is None:
+        return Datum(
+            None, None, DatumState.UNKNOWN,
+            f'no configured project root is labelled {label!r}',
+            FRESHNESS_BOUND_SECONDS,
+        )
+    snapshot = snapshots.get(label)
+    window = await acquire_terminal_window(
+        client, config, root, now=served_at,
+        # None when this root's census is not fresh, which is exactly what
+        # makes the window unpositionable: the count the offset is computed
+        # from IS the census's, so the two facts cannot disagree.
+        terminal_total=None if snapshot is None else measured_terminal_total(snapshot),
+    )
+    if window.value is None:
+        return window
+    return replace(
+        window, value=shape_terminal_rows(Path(root), window.value, now=served_at),
+    )
 
 
 @router.get('/api/v2/dashboard/tasks')
@@ -132,9 +189,29 @@ async def api_tasks(request: Request) -> JSONResponse:
     The key is ABSENT rather than empty: ``data.js::applyKey`` returns early on
     a missing key, so each client surface keeps its seeded default, whereas
     ``{}`` would read as a measured "no project has any done tasks".
+
+    **``?terminal=<project>`` — terminal rows, on request only.** The default
+    render stopped fetching them, so its cost no longer grows with the terminal
+    tree at all; a client that wants them asks, and gets ``TASKS_TERMINAL``
+    carrying ONE ``Datum`` in the ``lower_bound`` state. Absent the parameter
+    the key is absent too, for the same reason ``DONE_COUNTS`` is.
+
+    That ``lower_bound`` state IS the disclosure PRD decision 5 substitutes for
+    the retired live-PRD terminal-member exemption. Task 4416 asked how a tab
+    showing only a window of terminal rows can honour "all live members of a
+    live PRD are shown"; the answer adopted is option (a) — live members inside
+    the fetched window — with the under-count DISCLOSED rather than sanctioned
+    silently. The exemption machinery that used to widen the window per-PRD is
+    gone with it: its own constant comment recorded that it could only ever
+    exempt rows that were FETCHED, so it never met that contract either. The
+    CLIENT half — reading the state and rendering the disclosure — belongs to
+    leaf γ3, which migrates the Tasks tab.
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
+    # The one request-scoped input this handler takes. Absent is not the same
+    # as empty: no parameter means no terminal read and no terminal key.
+    terminal = request.query_params.get('terminal')
     # ONE instant for the whole payload, resolved before the fan-out. Every
     # Datum below is validated against THIS served_at rather than against
     # whatever the clock says when each one happens to be shaped, so the
@@ -177,10 +254,34 @@ async def api_tasks(request: Request) -> JSONResponse:
     no_rows_anywhere = (
         len(set(offline_projects) | set(degraded_projects)) == total_roots
     )
+    payload: dict[str, object] = {}
+    if terminal is not None:
+        window = await _terminal_window(
+            http_client, config, terminal, snapshots, served_at=served_at,
+        )
+        # Validated here like every other emitted datum, and by the same rule:
+        # a break is a BUG in this layer, so it degrades this one key rather
+        # than 500-ing a payload whose other facts are fine.
+        try:
+            validate_datum(window, served_at)
+        except DatumContractError as broken:
+            logger.warning(
+                'terminal window for %s breaks the %s datum invariant and is '
+                'served as UNKNOWN; this is a BUG, not an outage',
+                terminal, broken.invariant.value, exc_info=True,
+            )
+            window = Datum(
+                None, None, DatumState.UNKNOWN,
+                f'terminal window broke the {broken.invariant.value} '
+                f'invariant: {broken}',
+                FRESHNESS_BOUND_SECONDS,
+            )
+        payload['TASKS_TERMINAL'] = {terminal: window.to_wire()}
     # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
     # denominates over the population its numerator is drawn from.
     return JSONResponse(
         {
+            **payload,
             'ACTIVE_TASKS': active,
             'TASKS_SNAPSHOT': wire_snapshots,
             'TASKS_OFFLINE': (

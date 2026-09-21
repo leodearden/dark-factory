@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import logging
 import os
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
@@ -48,13 +49,25 @@ from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
 import httpx
-from shared.task_statuses import ACTIVE
+from shared.task_statuses import ACTIVE, TERMINAL
 
 from dashboard.config import DashboardConfig
-from dashboard.data.census import CensusVocabularyError, TaskCensus, build_census
+from dashboard.data.census import (
+    CensusVocabularyError,
+    TaskCensus,
+    TaskView,
+    build_census,
+)
 from dashboard.data.datum import Datum, DatumState, validate_datum
 from dashboard.data.mcp_fanout import TTLCache
-from dashboard.data.tasks import fetch_statuses, fetch_tasks, task_is_stranded
+from dashboard.data.tasks import (
+    fetch_statuses,
+    fetch_task_page,
+    fetch_tasks,
+    task_is_stranded,
+)
+
+logger = logging.getLogger(__name__)
 
 # --- Budget constants -------------------------------------------------------
 
@@ -581,3 +594,130 @@ async def acquire_snapshot(
         return await _read_unit(client, config, project_root, now=now)
 
     return await _snapshot_cache.get_or_refresh(str(project_root), _refresh)
+
+
+# ---------------------------------------------------------------------------
+# The on-demand terminal window
+# ---------------------------------------------------------------------------
+
+_TERMINAL_FETCH_WINDOW = 400
+"""How many terminal (done + cancelled) rows ONE ``?terminal=`` request reads.
+
+A ceiling, and the reason one is needed: unbounded, this read pulls every done
+row in the tree — ~4000 rows / ~40 MB on dark-factory, measured 2026-09-18 as
+9.4 MB of a 16.4 MB payload. It used to be paid on EVERY render; now only the
+request that asks for terminal rows pays it, and only up to here.
+
+SELECTED BY DESCENDING TASK ID, which is the only ordering the substrate
+offers: ``SqliteTaskBackend._get_tasks_internal`` is ``ORDER BY id`` and
+``page_size``/``offset`` slice that ascending list, with no ``ORDER BY
+updated_at`` anywhere. Tasks are filed and completed in roughly id order, so
+the common case matches recency; the divergent case — a long-parked low-id
+task completing late — is real, which is why this is 8x the 50-row cap the
+retired default-render buckets used, why exceeding it WARNS, and why the
+answer crosses the wire as ``LOWER_BOUND`` rather than as a plain list.
+"""
+
+
+def measured_terminal_total(snapshot: TaskSnapshot) -> int | None:
+    """*snapshot*'s terminal population, or ``None`` if it did not measure one.
+
+    The window's offset is ``n_terminal - window``, so this count is what makes
+    the window POSITIONABLE. A non-fresh census has no count to give — and a
+    fabricated zero would collapse the offset to 0, which slices the
+    ascending-id list at its OLDEST end. ``None`` is the honest answer and
+    :func:`acquire_terminal_window` is what refuses to guess past it.
+    """
+    census = snapshot.census
+    if census.state is not DatumState.FRESH or census.value is None:
+        return None
+    return census.value.views[TaskView.TERMINAL]
+
+
+async def acquire_terminal_window(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | bytes | os.PathLike[str],
+    *,
+    now: datetime,
+    terminal_total: int | None,
+) -> Datum[list[dict]]:
+    """Read the newest :data:`_TERMINAL_FETCH_WINDOW` terminal rows, or say why not.
+
+    Lives beside the unit because it is the same datum family read through the
+    same access implementation, under the third slot of
+    :data:`PER_PROJECT_MCP_CALLS` — the one the default render deliberately
+    does not spend.
+
+    Three outcomes, and the state is the whole disclosure:
+
+    * positioned and read — ``LOWER_BOUND``, because rows outside the window
+      were never fetched and the value is therefore known to under-report.
+      ``reason`` names the window so a consumer can tell "all of them" from
+      "the newest N". UNIFORMLY ``LOWER_BOUND``, even when the population fits:
+      *terminal_total* comes from a DIFFERENT read, so a task completing
+      between the two can leave a row outside a window that looked roomy, and
+      a state that flipped on a count the consumer cannot see would make the
+      rare truncation the one case nobody's code path had exercised;
+    * *terminal_total* is ``None`` — ``UNKNOWN``. Without the census the offset
+      would collapse to ``max(0, 0 - window) == 0``, and since
+      ``page_size``/``offset`` slice an ASCENDING-id list that serves the
+      OLDEST terminal rows, which a recency-ordered tab then presents as its
+      newest. Showing months-old rows as the newest is a worse failure than
+      showing none, so an unpositionable window is not fetched at all;
+    * the read failed — ``UNKNOWN`` carrying the producer's failure verbatim.
+
+    NO last-good fallback, unlike the unit: this window is acquired per
+    request rather than on a refresh cycle, so there is no "previous value at
+    its own instant" to age — only the value this request asked for and got,
+    or did not.
+
+    Benign race: *terminal_total* was measured by a different read, so a task
+    completing between the two shifts the window by a row.
+    """
+    if terminal_total is None:
+        return Datum(
+            None, None, DatumState.UNKNOWN,
+            'the terminal window cannot be positioned without a measured '
+            'terminal count, and an unpositioned window serves the OLDEST '
+            'rows rather than the newest',
+            FRESHNESS_BOUND_SECONDS,
+        )
+
+    window = _TERMINAL_FETCH_WINDOW
+    if terminal_total > window:
+        logger.warning(
+            'project root %s: %d terminal (done+cancelled) tasks exceed the '
+            '%d-row fetch window — only the %d highest-id terminal rows are '
+            'read, so a low-id task completed long after it was filed can be '
+            'missing',
+            project_root, terminal_total, window, window,
+        )
+    half = await _bounded(
+        fetch_task_page(
+            client, config, project_root,
+            statuses=sorted(TERMINAL),
+            page_size=window,
+            # A COMPUTED offset, not a LIMIT: the slice is over ascending ids,
+            # so reaching the high-id end is arithmetic rather than an option.
+            offset=max(0, terminal_total - window),
+            timeout=PER_CALL_TIMEOUT,
+        ),
+        label='terminal window',
+    )
+    if half.value is None:
+        return Datum(
+            None, None, DatumState.UNKNOWN, half.reason or 'read failed',
+            FRESHNESS_BOUND_SECONDS,
+        )
+    return Datum(
+        half.value, now, DatumState.LOWER_BOUND,
+        (
+            f'the newest {window} of {terminal_total} terminal rows; older '
+            'ones were never read'
+            if terminal_total > window
+            else f'all {terminal_total} terminal rows, read under a '
+                 f'{window}-row window'
+        ),
+        FRESHNESS_BOUND_SECONDS,
+    )
