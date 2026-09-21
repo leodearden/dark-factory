@@ -844,17 +844,22 @@ class TestDedupValidEdgesForNode:
 
 class TestFindDuplicateEntityNodes:
     """GraphitiBackend.find_duplicate_entity_nodes(name, *, group_id) returns every
-    Entity node sharing an exact name, canonical-ordered (most valid edges, then
-    oldest created_at, then uuid) so the post-write node-dedup sweep can pick
-    matches[0] as the merge survivor."""
+    Entity node sharing an exact name, canonical-ordered (highest provenance_rank,
+    then oldest created_at, then uuid) so the post-write node-dedup sweep can pick
+    matches[0] as the merge survivor.
+
+    provenance_rank is edge_count + mentions_count (task 4986). edge_count keeps
+    its exact pre-4986 meaning -- valid RELATES_TO only -- because two consumers
+    read it for something other than ranking; MENTIONS enters ranking ONLY
+    through the two new keys."""
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_only(self, mock_config, make_backend, make_graph_mock):
         """Read-only lookup: awaits graph.ro_query exactly once, never graph.query."""
         backend = make_backend(mock_config)
         rows = [
-            ['canon-uuid', 100, 5],
-            ['dup-uuid-1', 200, 2],
+            ['canon-uuid', 100, 5, 1, 6],
+            ['dup-uuid-1', 200, 2, 0, 2],
         ]
         await assert_ro_query_only(
             backend, make_graph_mock, rows, 'find_duplicate_entity_nodes',
@@ -880,7 +885,8 @@ class TestFindDuplicateEntityNodes:
 
     @pytest.mark.asyncio
     async def test_cypher_orders_canonical_first(self, mock_config, make_backend, make_graph_mock):
-        """ORDER BY ranks highest edge_count first, then oldest created_at, then uuid."""
+        """ORDER BY ranks highest provenance_rank first, then oldest created_at,
+        then uuid (task 4986: was edge_count DESC, which is MENTIONS-blind)."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -889,28 +895,44 @@ class TestFindDuplicateEntityNodes:
         order_idx = cypher.find('ORDER BY')
         assert order_idx != -1, f'Expected ORDER BY clause in cypher: {cypher}'
         order_clause = cypher[order_idx:]
-        assert 'edge_count DESC' in order_clause
+        assert 'provenance_rank DESC' in order_clause
         assert 'created_at ASC' in order_clause
         assert 'uuid ASC' in order_clause
-        # edge_count must be the primary sort key, then created_at, then uuid
-        assert order_clause.find('edge_count') < order_clause.find('created_at') < order_clause.find('uuid')
+        # The ordinal check below compares str.find results, which return -1 for
+        # an ABSENT key -- so an ordinal chain on a key that has left the clause
+        # passes VACUOUSLY rather than going red. That is exactly how this
+        # assertion would have degraded silently when edge_count stopped being
+        # the sort key, so each key's PRESENCE is asserted before its position.
+        keys = ('provenance_rank', 'created_at', 'uuid')
+        positions = [order_clause.find(k) for k in keys]
+        assert all(pos != -1 for pos in positions), (
+            f'every ordinal-checked key must be PRESENT in the clause, else the '
+            f'ordering assertion passes by absence: {dict(zip(keys, positions))} '
+            f'in {order_clause!r}'
+        )
+        assert positions == sorted(positions), (
+            f'sort keys must appear in rank order {keys}: {order_clause!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_returns_rows_preserving_order(self, mock_config, make_backend, make_graph_mock):
         """Returns list[dict] with uuid/created_at/edge_count, preserving DB row order."""
         backend = make_backend(mock_config)
         rows = [
-            ['canon-uuid', 100, 5],
-            ['dup-uuid-1', 200, 2],
-            ['dup-uuid-2', 300, 1],
+            ['canon-uuid', 100, 5, 1, 6],
+            ['dup-uuid-1', 200, 2, 3, 5],
+            ['dup-uuid-2', 300, 1, 0, 1],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.find_duplicate_entity_nodes('Reify', group_id='test')
         assert result == [
-            {'uuid': 'canon-uuid', 'created_at': 100, 'edge_count': 5},
-            {'uuid': 'dup-uuid-1', 'created_at': 200, 'edge_count': 2},
-            {'uuid': 'dup-uuid-2', 'created_at': 300, 'edge_count': 1},
+            {'uuid': 'canon-uuid', 'created_at': 100, 'edge_count': 5,
+             'mentions_count': 1, 'provenance_rank': 6},
+            {'uuid': 'dup-uuid-1', 'created_at': 200, 'edge_count': 2,
+             'mentions_count': 3, 'provenance_rank': 5},
+            {'uuid': 'dup-uuid-2', 'created_at': 300, 'edge_count': 1,
+             'mentions_count': 0, 'provenance_rank': 1},
         ]
 
     @pytest.mark.asyncio
@@ -928,11 +950,12 @@ class TestFindDuplicateEntityNodes:
     ):
         """A single matching node -> single-element list (no duplicate to merge)."""
         backend = make_backend(mock_config)
-        rows = [['only-uuid', 100, 0]]
+        rows = [['only-uuid', 100, 0, 0, 0]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.find_duplicate_entity_nodes('Unique', group_id='test')
-        assert result == [{'uuid': 'only-uuid', 'created_at': 100, 'edge_count': 0}]
+        assert result == [{'uuid': 'only-uuid', 'created_at': 100, 'edge_count': 0,
+                           'mentions_count': 0, 'provenance_rank': 0}]
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -1673,5 +1696,154 @@ class TestRedirectNodeMentionsLiveFalkorDB:
             assert spy.writes == 0, (
                 f'a loser with zero MENTIONS must issue no writes, got {spy.writes}'
             )
+        finally:
+            await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestFindDuplicateEntityNodesProvenanceRankLiveFalkorDB:
+    """Survivor rank counts episode provenance, not just valid edges
+    (task 4986 loss mode 2).
+
+    `find_duplicate_entity_nodes` ordered by `edge_count DESC` alone, so an
+    episode-rich but edge-poor node LOST the rank and was deleted — destroying
+    provenance the survivor never had. Measured in 12 of 50 live duplicate
+    groups on 2026-08-31.
+
+    `edge_count` deliberately keeps its exact pre-4986 meaning (valid
+    RELATES_TO only). MENTIONS enters ONLY through `mentions_count` and
+    `provenance_rank`, and only `provenance_rank` orders the result — see
+    the sweep-contract guard below for the consumer that forces the split.
+    """
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @staticmethod
+    async def _node(graph, uuid_, name, group_id, created_at):
+        await graph.query(
+            'CREATE (:Entity {uuid: $uuid, name: $name, group_id: $gid, created_at: $created})',
+            {'uuid': uuid_, 'name': name, 'gid': group_id, 'created': created_at},
+        )
+
+    @staticmethod
+    async def _relates(graph, src, dst, edge_uuid, invalid_at=None):
+        await graph.query(
+            'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+            'CREATE (a)-[:RELATES_TO {uuid: $uuid, invalid_at: $invalid_at}]->(b)',
+            {'src': src, 'dst': dst, 'uuid': edge_uuid, 'invalid_at': invalid_at},
+        )
+
+    @staticmethod
+    async def _mentions(graph, episode, entity, link_uuid):
+        await graph.query(
+            'MATCH (ep:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+            'CREATE (ep)-[:MENTIONS {uuid: $uuid}]->(n)',
+            {'ep': episode, 'n': entity, 'uuid': link_uuid},
+        )
+
+    @pytest.mark.asyncio
+    async def test_episode_richer_node_wins_the_rank(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        # A: 2 valid RELATES_TO + 1 MENTIONS -> rank 3
+        # B: 1 valid RELATES_TO + 3 MENTIONS -> rank 4, and created LATER so
+        #    the created_at tie-break cannot be what puts it first.
+        await self._node(graph, 'A', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'B', 'Dup', graph_name, '2026-06-01T00:00:00Z')
+        await self._node(graph, 'nbr', 'Neighbour', graph_name, '2026-01-01T00:00:00Z')
+        for ep in ('ep1', 'ep2', 'ep3'):
+            await graph.query('CREATE (:Episodic {uuid: $u})', {'u': ep})
+
+        await self._relates(graph, 'A', 'nbr', 'a-e1')
+        await self._relates(graph, 'A', 'nbr', 'a-e2')
+        await self._relates(graph, 'B', 'nbr', 'b-e1')
+        # An INVALIDATED edge on B must still not count toward edge_count.
+        await self._relates(graph, 'B', 'nbr', 'b-e-dead', invalid_at='2026-02-02T00:00:00Z')
+        await self._mentions(graph, 'ep1', 'A', 'm-a1')
+        for i, ep in enumerate(('ep1', 'ep2', 'ep3')):
+            await self._mentions(graph, ep, 'B', f'm-b{i}')
+
+        backend = self._backend(mock_config)
+        try:
+            dups = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            by_uuid = {row['uuid']: row for row in dups}
+
+            assert [row['uuid'] for row in dups] == ['B', 'A'], (
+                'the episode-richer node must survive; under edge_count DESC '
+                f'alone A wins and its provenance is destroyed: {dups!r}'
+            )
+            # edge_count is UNCHANGED: valid RELATES_TO only, invalidated
+            # edges excluded exactly as before.
+            assert by_uuid['A']['edge_count'] == 2
+            assert by_uuid['B']['edge_count'] == 1
+            assert by_uuid['A']['mentions_count'] == 1
+            assert by_uuid['B']['mentions_count'] == 3
+            assert by_uuid['A']['provenance_rank'] == 3
+            assert by_uuid['B']['provenance_rank'] == 4
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_edge_count_stays_zero_for_a_mentions_only_node(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """SWEEP CONTRACT GUARD (task 3673 hazard note 2).
+
+        `reconciliation/degenerate_task_node_sweep.py` DELETES a placeholder
+        node when `int(match['edge_count']) == 0`. Folding MENTIONS into
+        edge_count would silently change WHICH nodes that sweep deletes — a
+        behaviour change in a file task 4986 never edits and whose tests would
+        never have shown it. This assertion is what protects it.
+        """
+        graph_name, graph = merge_entities_live_graph
+        await self._node(graph, 'M', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        for ep in ('ep1', 'ep2'):
+            await graph.query('CREATE (:Episodic {uuid: $u})', {'u': ep})
+            await self._mentions(graph, ep, 'M', f'm-{ep}')
+
+        backend = self._backend(mock_config)
+        try:
+            (row,) = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            assert row['edge_count'] == 0, (
+                'a node with zero valid RELATES_TO must still report '
+                "edge_count == 0, or the degenerate-node sweep's predicate "
+                'silently changes meaning'
+            )
+            assert row['mentions_count'] == 2
+            assert row['provenance_rank'] == 2
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_equal_rank_falls_through_to_created_at_then_uuid(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """The pre-existing tie-breaks are unchanged beneath the new primary key."""
+        graph_name, graph = merge_entities_live_graph
+        # Equal provenance_rank (1 each), reached DIFFERENTLY: one by an edge,
+        # one by a mention -- so the tie-break is genuinely exercised.
+        await self._node(graph, 'older', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'newer-a', 'Dup', graph_name, '2026-09-01T00:00:00Z')
+        await self._node(graph, 'newer-b', 'Dup', graph_name, '2026-09-01T00:00:00Z')
+        await self._node(graph, 'nbr', 'Neighbour', graph_name, '2026-01-01T00:00:00Z')
+        await graph.query("CREATE (:Episodic {uuid: 'ep1'})")
+
+        await self._mentions(graph, 'ep1', 'older', 'm-older')
+        await self._relates(graph, 'newer-a', 'nbr', 'na-e1')
+        await self._relates(graph, 'newer-b', 'nbr', 'nb-e1')
+
+        backend = self._backend(mock_config)
+        try:
+            dups = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            assert all(row['provenance_rank'] == 1 for row in dups), dups
+            # oldest created_at first; the two same-instant nodes then by uuid.
+            assert [row['uuid'] for row in dups] == ['older', 'newer-a', 'newer-b']
         finally:
             await backend.close()

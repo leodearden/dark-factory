@@ -125,9 +125,10 @@ class TestResolveOrCreateEntityCollapse:
         merge_entities mocked as AsyncMocks for orchestration-only testing.
 
         get_nodes_by_exact_name defaults to 3 same-name matches (>=2 branch).
-        find_duplicate_entity_nodes returns them survivor-first (edge_count
-        DESC, created_at ASC, uuid ASC per its own contract): 'surv' has the
-        most edges, 'dup1'/'dup2' are the duplicates to fold in.
+        find_duplicate_entity_nodes returns them survivor-first (provenance_rank
+        DESC, created_at ASC, uuid ASC per its own contract, where
+        provenance_rank is edge_count + mentions_count -- task 4986): 'surv' has
+        the richest provenance, 'dup1'/'dup2' are the duplicates to fold in.
         """
         backend = make_backend(mock_config)
         backend.get_nodes_by_exact_name = AsyncMock(return_value=[
@@ -136,9 +137,12 @@ class TestResolveOrCreateEntityCollapse:
             {'uuid': 'dup2', 'name': 'Foo', 'summary': '', 'labels': []},
         ])
         backend.find_duplicate_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'surv', 'created_at': 1, 'edge_count': 5},
-            {'uuid': 'dup1', 'created_at': 2, 'edge_count': 1},
-            {'uuid': 'dup2', 'created_at': 3, 'edge_count': 0},
+            {'uuid': 'surv', 'created_at': 1, 'edge_count': 5,
+             'mentions_count': 2, 'provenance_rank': 7},
+            {'uuid': 'dup1', 'created_at': 2, 'edge_count': 1,
+             'mentions_count': 1, 'provenance_rank': 2},
+            {'uuid': 'dup2', 'created_at': 3, 'edge_count': 0,
+             'mentions_count': 0, 'provenance_rank': 0},
         ])
         backend.merge_entities = AsyncMock()
         return backend
@@ -271,11 +275,17 @@ class TestGroupIdScopingAmendment:
         """
         seeded = [
             {'uuid': 'home-1', 'name': 'Foo', 'group_id': 'home',
-             'summary': '', 'labels': ['Entity'], 'created_at': 1, 'edge_count': 5},
+             'summary': '', 'labels': ['Entity'], 'created_at': 1,
+             'edge_count': 5, 'mentions_count': 1},
             {'uuid': 'home-2', 'name': 'Foo', 'group_id': 'home',
-             'summary': '', 'labels': ['Entity'], 'created_at': 2, 'edge_count': 1},
+             'summary': '', 'labels': ['Entity'], 'created_at': 2,
+             'edge_count': 1, 'mentions_count': 0},
+            # The foreign clone keeps the highest rank AND the oldest
+            # created_at, so it still wins survivor-first ordering pre-fix —
+            # the destructive scenario this test exists to guard.
             {'uuid': 'foreign-1', 'name': 'Foo', 'group_id': 'foreign',
-             'summary': '', 'labels': ['Entity'], 'created_at': 0, 'edge_count': 99},
+             'summary': '', 'labels': ['Entity'], 'created_at': 0,
+             'edge_count': 99, 'mentions_count': 3},
         ]
 
         async def fake_ro_query(cypher, params):
@@ -288,12 +298,17 @@ class TestGroupIdScopingAmendment:
             result = MagicMock()
             if 'edge_count' in cypher:
                 # find_duplicate_entity_nodes shape — emulate the DB-side
-                # ORDER BY edge_count DESC, created_at ASC, uuid ASC.
+                # ORDER BY provenance_rank DESC, created_at ASC, uuid ASC,
+                # where provenance_rank is edge_count + mentions_count.
+                def _rank(r):
+                    return r['edge_count'] + r['mentions_count']
                 ordered = sorted(
-                    matched, key=lambda r: (-r['edge_count'], r['created_at'], r['uuid'])
+                    matched, key=lambda r: (-_rank(r), r['created_at'], r['uuid'])
                 )
                 result.result_set = [
-                    [r['uuid'], r['created_at'], r['edge_count']] for r in ordered
+                    [r['uuid'], r['created_at'], r['edge_count'],
+                     r['mentions_count'], _rank(r)]
+                    for r in ordered
                 ]
             elif 'labels(n)' in cypher:
                 # get_nodes_by_exact_name shape
@@ -393,8 +408,10 @@ class TestEnsureEntityNode:
             {'uuid': 'dup1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []},
         ]
         backend.find_duplicate_entity_nodes.return_value = [
-            {'uuid': 'surv', 'created_at': 1, 'edge_count': 5},
-            {'uuid': 'dup1', 'created_at': 2, 'edge_count': 0},
+            {'uuid': 'surv', 'created_at': 1, 'edge_count': 5,
+             'mentions_count': 2, 'provenance_rank': 7},
+            {'uuid': 'dup1', 'created_at': 2, 'edge_count': 0,
+             'mentions_count': 0, 'provenance_rank': 0},
         ]
         result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
         assert result == 'surv'
@@ -551,8 +568,10 @@ class TestEnsureEntityNodeNoMerge:
             {'uuid': 'u-b', 'name': 'Task 3127', 'summary': '', 'labels': []},
         ]
         backend.find_duplicate_entity_nodes.return_value = [
-            {'uuid': 'u-a', 'created_at': 1, 'edge_count': 5},
-            {'uuid': 'u-b', 'created_at': 2, 'edge_count': 0},
+            {'uuid': 'u-a', 'created_at': 1, 'edge_count': 5,
+             'mentions_count': 2, 'provenance_rank': 7},
+            {'uuid': 'u-b', 'created_at': 2, 'edge_count': 0,
+             'mentions_count': 0, 'provenance_rank': 0},
         ]
 
     @pytest.mark.asyncio
