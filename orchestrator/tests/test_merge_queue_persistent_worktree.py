@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -353,13 +354,13 @@ class _WorktreeRecordingVerifier(FakeVerifier):
         super().__init__()
         self.worktrees: list[Path] = []
 
-    async def run_scoped(  # type: ignore[override]
+    async def run_scoped(
         self,
         worktree: Path,
-        config: object,
-        module_configs: list[object],
+        config: Any,
+        module_configs: list[Any],
         task_files: list[str] | None = None,
-        **options: object,
+        **options: Any,
     ):
         self.worktrees.append(worktree)
         return await super().run_scoped(

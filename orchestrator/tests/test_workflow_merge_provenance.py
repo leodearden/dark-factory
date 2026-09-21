@@ -47,11 +47,14 @@ def _arm_escalation_queue(f: _Fixture, tmp_path: Path) -> EscalationQueue:
     ``escalation_queue`` is a PUBLIC TaskWorkflow attribute (ctor parameter,
     workflow.py::TaskWorkflow.__init__), so a block can be observed as the
     escalation it actually files rather than by stubbing ``_mark_blocked``.
-    ``unblock_auto=None`` short-circuits ``_spawn_dry_run_unblock``'s
-    fire-and-forget investigation, which a unit test must never launch.
+    ``unblock_auto.enabled = False`` short-circuits ``_spawn_dry_run_unblock``'s
+    fire-and-forget investigation, which a unit test must never launch — it is
+    the second term of that method's own guard (workflow.py::TaskWorkflow.
+    _spawn_dry_run_unblock), so the skip is the one production takes when an
+    operator turns the hook off.
     """
     f.wf.escalation_queue = EscalationQueue(tmp_path / 'escalations')
-    f.wf.config.unblock_auto = None
+    f.wf.config.unblock_auto.enabled = False
     return f.wf.escalation_queue
 
 

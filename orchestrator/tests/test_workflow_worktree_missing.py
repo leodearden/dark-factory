@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -91,6 +92,7 @@ def _make_workflow(
 
 async def _drive_worktree_missing(wf: TaskWorkflow) -> DrivenMerge:
     """Run the submit to completion, playing the merger for a worktree-missing block."""
+    assert wf.merge_queue is not None
     return await drive_merge(
         wf._submit_to_merge_queue('task/999', pre_rebased=False),
         wf.merge_queue,
@@ -108,6 +110,7 @@ def _merge_review(wf: TaskWorkflow) -> dict | None:
     and these workflows hold a REAL TaskArtifacts — so the file it leaves in
     ``.task/reviews/`` is the observable the stub used to stand in for.
     """
+    assert wf.artifacts is not None
     return wf.artifacts.read_reviews().get('merge')
 
 
@@ -126,7 +129,7 @@ async def test_worktree_missing_with_terminal_status_returns_done(
     assert driven.result == WorkflowOutcome.DONE
     assert _merge_review(wf) is None, 'the short-circuit writes no merge review'
     # …and never marks the row blocked, which is where _mark_blocked lands.
-    wf.scheduler.set_task_status.assert_not_awaited()
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_not_awaited()
     wf.scheduler.get_status.assert_awaited_once_with('999')
 
 
@@ -155,7 +158,7 @@ async def test_worktree_missing_with_cancelled_status_returns_cancelled(
     assert driven.result == WorkflowOutcome.CANCELLED
     assert wf.machine.state is WorkflowState.CANCELLED
     assert _merge_review(wf) is None, 'the short-circuit writes no merge review'
-    wf.scheduler.set_task_status.assert_not_awaited()
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_not_awaited()
     wf.scheduler.get_status.assert_awaited_once_with('999')
 
 
@@ -176,7 +179,7 @@ async def test_worktree_missing_with_nonterminal_status_falls_through(
     assert review is not None and review['verdict'] == 'ISSUES_FOUND', (
         f'the fall-through must leave a merge-failure review, got: {review}'
     )
-    wf.scheduler.set_task_status.assert_awaited_once_with('999', 'blocked')
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
 
 
 @pytest.mark.asyncio
@@ -192,7 +195,7 @@ async def test_worktree_missing_with_get_status_error_falls_through(
     driven = await _drive_worktree_missing(wf)
 
     assert driven.result == WorkflowOutcome.BLOCKED
-    wf.scheduler.set_task_status.assert_awaited_once_with('999', 'blocked')
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +212,7 @@ async def _submit_then_cancel(
     makes the race genuine: it proves the enqueue happened and leaves the
     future unresolved, which is the state ``_await_cancellable`` arbitrates.
     """
+    assert wf.merge_queue is not None
     submit = asyncio.ensure_future(
         wf._submit_to_merge_queue('task/x', pre_rebased=False)
     )
