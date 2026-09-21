@@ -908,19 +908,19 @@ HEARTBEAT_INTERVAL_SECS: float = 5.0
 #: builds had been healthy.  The derived 90.0s is 18 heartbeat periods wide
 #: where the old value was 2.
 #:
-#: PER-HOST OVERRIDE — leo-laptop does not run this value, and retuning either
-#: input above will not move it: its /usr/local/bin/orchestrator shim exports
-#: ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS=600 (ssh read-only 2026-09-18, still
-#: live 09-20), and ``cli.py::_env_float`` lets that env var displace this
-#: constant outright — proof, not re-argued here:
-#: ``test_laptop_warm_verify_boundary.py::test_watchdog_timeout_env_override_fires_fast_without_heartbeat``
-#: Unclamped by choice: a ``max(env, derived)`` clamp reddens that file's 60s
-#: wedge detector, and the override is an operator's only mid-incident lever.
-#: Nothing here observes that host's value.  It is HELD on purpose (task 5577,
-#: ruled 2026-09-21): 90.0s ran there 2026-09-14 and the first dispatch under
-#: it (req 42ef0d6b) still died at 901s; no 90.0s sample since.  Do NOT delete
-#: the export because the numbers agree — they do not; reversal is gated on
-#: measuring that host's leftover-pgid rate at 90.0s.
+#: PER-HOST OVERRIDE — leo-laptop does not run this value, and retuning either input
+#: above will not move it: its /usr/local/bin/orchestrator shim exports
+#: ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS="${ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS:-600}"
+#: (ssh read-only 2026-09-18, still live 09-20), and ``cli.py::_env_float`` lets that env
+#: var displace this constant outright — proof, not re-argued here:
+#: ``orchestrator/tests/test_laptop_warm_verify_boundary.py::test_watchdog_timeout_env_override_fires_fast_without_heartbeat``
+#: Unclamped by choice: a ``max(env, derived)`` clamp reddens that file's 60s wedge
+#: detector, and the override is an operator's only mid-incident lever.  Nothing here
+#: observes that host's value.  It is HELD on purpose (task 5577, ruled 2026-09-21): 90.0s
+#: ran there 2026-09-14 and the first dispatch under it (req 42ef0d6b) still died at 901s;
+#: no 90.0s sample since.  Do NOT delete the export because the numbers agree — they do
+#: not; reversal is gated on that host's leftover-pgid rate at 90.0s.  That sample needs
+#: no shim edit: the ``:-`` defers to whatever the dispatch env already sets.
 WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = (
     WATCHDOG_TRANSPORT_HEADROOM * SSH_TRANSPORT_DEAD_PEER_SECS
 )
