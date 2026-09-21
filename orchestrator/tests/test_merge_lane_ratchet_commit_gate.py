@@ -721,7 +721,24 @@ class TestTheHookActuallyRunsTheGate:
 
 
 class TestTheWiringIsStructurallyPinned:
-    """Read off THIS checkout's own hook files, so a rename cannot go unnoticed."""
+    """REFERENTIAL INTEGRITY only. Reachability is pinned behaviourally above.
+
+    hooks/project-checks is a shell script, so it cannot import
+    ``BASELINE_RELPATH`` / ``LEDGER_RELPATH`` and carries hardcoded duplicates of
+    them. This asserts the duplicates still name the real constants and the real
+    auditor (heuristic 11, SPOT) -- a rename that updated the Python and not the
+    hook would otherwise leave a filter that silently matches nothing.
+
+    It survives arbitrary rewording of the surrounding script, which is what
+    distinguishes it from a shape pin. The sibling that asserted on
+    hooks/pre-commit's literal SOURCE TEXT was deleted: its negative assertion
+    stayed green against any rewording that KEPT the bug (``[ "$branch" = "main"
+    ] || exit 0``), and its positive one went spuriously red on a
+    behaviour-preserving rewrite (``"${branch}"``). Reachability is pinned by
+    ``TestTheHookActuallyRunsTheGate`` instead, which drives a real `git commit`
+    on a task branch through real copied hooks and asserts HEAD did not move --
+    and no rewording of pre-commit can fool that.
+    """
 
     def test_project_checks_audits_both_artifacts_through_the_auditor(self) -> None:
         source = (_REPO_ROOT / 'hooks' / 'project-checks').read_text(encoding='utf-8')
@@ -729,18 +746,6 @@ class TestTheWiringIsStructurallyPinned:
         assert metrics.BASELINE_RELPATH in source
         assert metrics.LEDGER_RELPATH in source
         assert 'scripts/check_staged_ratchet_raise.py' in source
-
-    def test_pre_commit_reaches_project_checks_on_every_branch(self) -> None:
-        source = (_REPO_ROOT / 'hooks' / 'pre-commit').read_text(encoding='utf-8')
-
-        # THE BLOCK THAT MADE THE GATE UNREACHABLE. It returned 0 on every
-        # branch that is not main, before project-checks was ever reached -- so
-        # a check placed there could only ever fire on a direct, non-merge
-        # commit made while main was checked out.
-        assert 'if [ "$branch" != "main" ]; then' not in source
-        # The branch is passed DOWN so the project applies its own per-check
-        # policy, rather than pre-commit deciding for it.
-        assert '"$ROOT/hooks/project-checks" "$ROOT" "$branch"' in source
 
 
 class TestTheCarveOutIsOneStepBack:
