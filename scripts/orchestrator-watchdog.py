@@ -2082,6 +2082,12 @@ def staleness_pass() -> None:
     so a SIGKILLed sweep costs at most one delayed window rather than wedging
     the fleet — see scripts/orchestrator-watchdog.py::_live_fleet_lease.
 
+    That gate and the min-interval cap are BOTH re-evaluated a second time
+    immediately before delegating (task 4755), because the unit probes between
+    the two points take multi-second wall clock — see the comment at that call
+    site for the measured width of the window and why the second read is not
+    rate-limited.
+
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
@@ -2170,6 +2176,33 @@ def staleness_pass() -> None:
             log(f"staleness probe error for {unit}: {exc}")
 
     if stale_found:
+        # READ-THEN-ACT (task 4755). The gates at the top of this pass were
+        # evaluated BEFORE a `git log` (_newest_watched_commit_epoch) and,
+        # per unit, an is_unit_enabled plus TWO `systemctl show` calls — a
+        # multi-second window, entered once every 60s. Both facts they read
+        # are written by OTHER processes at moments this pass does not
+        # control: the coordinator can fire, and a sweep can stamp the clock,
+        # at any point inside it. Re-evaluating here costs one small JSON read
+        # each on the rare ticks that actually reach a delegation, and makes
+        # the decision current as of the instant it is acted on.
+        #
+        # NOT rate-limited, unlike the top-of-pass skip lines: this path is
+        # reached only when a stale unit was genuinely found, so it is rare
+        # and highly actionable — and a race we declined to take is exactly
+        # the evidence an operator needs to explain a missing redeploy.
+        if _within_fleet_deploy_min_interval():
+            log(
+                "skip: the fleet-deploy clock was stamped while this pass was "
+                "probing units; another tier got there first"
+            )
+            return
+        lease = _live_fleet_lease()
+        if lease is not None:
+            log(
+                "skip: a fleet redeploy started while this pass was probing "
+                f"units (lease {_describe_lease(lease)})"
+            )
+            return
         log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
         _delegate_fleet_restart()
 
