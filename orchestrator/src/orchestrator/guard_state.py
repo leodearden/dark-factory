@@ -184,7 +184,7 @@ class _GuardStore:
         self._removed.discard(key)
         self.flush()
 
-    def insert_if_absent(self, key: str, value: Any) -> bool:
+    def insert_if_absent(self, key: str, value: Any, *, flush: bool = True) -> bool:
         """Store *value* under *key* only if *key* is not already present.
 
         Returns whether anything changed.  A present, unexpired key is left
@@ -193,12 +193,22 @@ class _GuardStore:
         would make the TTL measure "last seen" rather than "first observed".
         An EXPIRED key is re-inserted with a fresh timestamp, which is how an
         aged-out guard re-arms.
+
+        ``flush=False`` inserts without persisting and hands the write to the
+        caller — the one opt-out from "every mutation writes", which is why it
+        is keyword-only and defaults to True rather than being inferred.  What
+        makes it safe rather than merely fast is that :meth:`flush` writes the
+        WHOLE merged map and never a delta, so an unflushed insert is
+        persisted by ANY later flush of this store.  A batch's trailing flush
+        therefore closes the crash-before-the-next-write window, not a
+        correctness hole.
         """
         if self.has_live(key):
             return False
         self._entries[key] = _Entry(value=value, updated_at=self._now())
         self._removed.discard(key)
-        self.flush()
+        if flush:
+            self.flush()
         return True
 
     def remove(self, key: str) -> bool:
@@ -347,25 +357,43 @@ class PersistentSet(MutableSet[str]):
         self._store.remove(value)
 
     def update(self, values: Iterable[str]) -> None:
-        """Add every element of *values*, writing once rather than per element.
+        """Add every element of *values*, then write ONCE.
 
-        ``MutableSet`` has no ``update``; the derail registry marks a whole
-        train in one call and the scheduler re-asserts a whole tick's
-        observations, so the batched write is what keeps those quiet.
+        ``MutableSet`` has no ``update``.  This one defers each element's
+        write and flushes after the loop, and a batch that inserted nothing
+        new writes nothing at all.
+
+        The single write is load-bearing, not an optimisation to trade away
+        later: :meth:`_GuardStore.flush` re-reads, re-merges and re-serialises
+        the whole map, so a per-element flush costs a batch of N some N+1
+        writes and O(N^2) parse/serialise work.  Measured at the per-element
+        shape this replaced: N=373 -> 374 writes in 3.17s, N=1500 -> 1501 in
+        19.22s.  The worst case is
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
+        whose cold start observes every active non-pending task at once —
+        N=373 in the live store when this was measured — inline on the event
+        loop of the first ``acquire_next`` tick after a fleet redeploy.
         """
         changed = False
         for value in values:
-            changed |= self._store.insert_if_absent(value, True)
+            changed |= self._store.insert_if_absent(value, True, flush=False)
         if changed:
             self._store.flush()
 
     def __ior__(self, value: Iterable[str]) -> Self:
-        """Batch-insert, writing once.
+        """Batch-insert via :meth:`update`, so this too is one write.
 
-        ``MutableSet`` supplies a ``__ior__`` that loops calling ``add``, which
-        would write per element.  Overriding it means a caller whose attribute
-        is declared as the ABC — the narrow type that lets a test substitute a
-        plain ``set`` — still gets :meth:`update`'s single write.
+        ``MutableSet`` supplies a ``__ior__`` that loops calling ``add``,
+        which would write per element.  Overriding it is what the three
+        production batch call sites actually depend on, since all three use
+        ``|=`` rather than ``update``:
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
+        and
+        ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+        It also keeps the batched write for a caller whose attribute is
+        declared as the ABC — the narrow type that lets a test substitute a
+        plain ``set``.
         """
         self.update(value)
         return self
