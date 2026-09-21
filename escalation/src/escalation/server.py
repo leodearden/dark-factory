@@ -39,7 +39,7 @@ from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_
 from escalation.canonical import canonical_root_cause
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
-from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
+from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
 from escalation.merge_lane_resolution import (
     InvalidMergeLane,
     resolve_merge_lane,
@@ -1153,12 +1153,16 @@ def create_server(
 
     # --- Shared submit/dedupe helper ---
 
-    def _submit_or_dedupe(esc: Escalation) -> dict[str, Any]:
+    async def _submit_or_dedupe(esc: Escalation) -> dict[str, Any]:
         """Submit *esc* to the queue, or fold it into an existing pending parent.
 
-        Delegates to ``dedupe.submit_or_dedupe`` which centralises the gate +
-        TOCTOU logic so recon (A7b) can reuse the same orchestration without
-        duplication.
+        Delegates to ``dedupe.submit_or_dedupe_off_loop``, which centralises
+        the gate + TOCTOU logic — its sync sibling ``submit_or_dedupe`` is the
+        same composition, so recon (A7b) reuses the orchestration without
+        duplication.  The off-loop variant is the one this server wants
+        because every tool here runs on the ORCHESTRATOR's event loop; which
+        half hops and why the other must not is stated once beside that
+        function.
 
         Born-at-L2 escalations (``esc.severity in BORN_AT_L2_SEVERITIES``) are
         bypassed from deduplication: they need their own on-disk record stamped
@@ -1199,7 +1203,7 @@ def create_server(
             # the observed-state response separately (still carrying esc.level,
             # so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
-        return _dedupe_submit_or_dedupe(queue, esc, cfg)
+        return await _dedupe_submit_or_dedupe_off_loop(queue, esc, cfg)
 
     # --- Amendment-truncation storm escape (INV-4, task 3997) ---
 
@@ -1210,7 +1214,7 @@ def create_server(
     # counter in this closure is what preserves that property.
     _amendment_truncation_storm = StormCounter()
 
-    def _report_amendment_truncation_storm(l2_id: str) -> None:
+    async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
         ``queue.add_members_to_l2`` already counts every dropped amendment on
@@ -1254,7 +1258,7 @@ def create_server(
             # Task 3550: unstamped by design — synthetic anchor task id and
             # severity='info' (pins Link 1 -> NON_PINNING), so the filing
             # identity is never read, and no incarnation filed it anyway.
-            _submit_or_dedupe(Escalation(
+            await _submit_or_dedupe(Escalation(
                 # Filed under the synthetic anchor, NOT the triggering promote's
                 # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
                 id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
@@ -1294,7 +1298,7 @@ def create_server(
                 l2_id, e,
             )
 
-    def _report_root_cause_overfold(l2_id: str, variants: int) -> None:
+    async def _report_root_cause_overfold(l2_id: str, variants: int) -> None:
         """File ONE info escalation when *l2_id* reaches the distinct-spelling threshold.
 
         ``queue.add_members_to_l2`` already accumulates every DISTINCT
@@ -1330,7 +1334,7 @@ def create_server(
         a notification; a raised one would cost the fold.
         """
         try:
-            _submit_or_dedupe(Escalation(
+            await _submit_or_dedupe(Escalation(
                 # Synthetic anchor, NOT the triggering promote's task_id — see
                 # _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID.
                 id=queue.make_id(_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID),
@@ -1479,15 +1483,15 @@ def create_server(
 
         # Gate 1: semantic bypass — this escalation is expected even for terminal tasks
         if terminal_state_is_the_bug:
-            return _submit_or_dedupe(esc)
+            return await _submit_or_dedupe(esc)
 
         # Gate 2: review_suggestions is owned by A4b
         if esc.category == 'review_suggestions':
-            return _submit_or_dedupe(esc)
+            return await _submit_or_dedupe(esc)
 
         # Gate 3: chokepoint disabled (no lookup injected)
         if task_status_lookup is None:
-            return _submit_or_dedupe(esc)
+            return await _submit_or_dedupe(esc)
 
         # Gate 4: query task status; fail-open on any error
         try:
@@ -1497,7 +1501,7 @@ def create_server(
                 'task_status_lookup raised for task %s, failing open: %s',
                 esc.task_id, exc,
             )
-            return _submit_or_dedupe(esc)
+            return await _submit_or_dedupe(esc)
 
         if status in {'done', 'cancelled'}:
             # Atomic submit-as-resolved: single file write, single resolve callback,
@@ -1529,7 +1533,7 @@ def create_server(
             }
 
         # Non-terminal or unknown status → submit normally
-        return _submit_or_dedupe(esc)
+        return await _submit_or_dedupe(esc)
 
     # --- Agent-side tools ---
 
@@ -3027,7 +3031,7 @@ def create_server(
                 # _report_amendment_truncation_storm never raises, so a failed
                 # report can never fail this fold.
                 if outcome['dropped']:
-                    _report_amendment_truncation_storm(existing_id)
+                    await _report_amendment_truncation_storm(existing_id)
                 # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
                 # Exactly-once per L2 by construction — `variants` is monotone
                 # and increments by one, so the equality can only hold on the
@@ -3036,7 +3040,7 @@ def create_server(
                     outcome['variant_added']
                     and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
                 ):
-                    _report_root_cause_overfold(existing_id, outcome['variants'])
+                    await _report_root_cause_overfold(existing_id, outcome['variants'])
                 return {
                     'id': existing_id,
                     'status': 'updated',

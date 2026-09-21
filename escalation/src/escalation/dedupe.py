@@ -22,8 +22,14 @@ Provides:
 
 Design contracts (see plan.json design_decisions for rationale):
 - find_dedupe_parent() does NOT check DedupeConfig.infra_dedupe_enabled.
-  That gate is the caller's responsibility (server._submit_or_dedupe).
-  This keeps the function pure/testable and avoids action-at-a-distance.
+  That gate belongs to resolve_dedupe_parent(), the READ half of the
+  orchestration wrapper.  This keeps the matcher pure/testable and avoids
+  action-at-a-distance.
+- submit_or_dedupe() is exactly resolve_dedupe_parent() (the two gates and
+  the scan; writes nothing) followed by attach_or_submit() (the TOCTOU guard
+  and the write).  submit_or_dedupe_off_loop() composes the same two halves
+  with the scan on a worker thread; only the read may hop, and the rationale
+  block above it is the one home for why.
 - Cross-task: get_pending() scans all tasks, so infra fan-out (same
   summary from 30 task_ids simultaneously) collapses into a single parent.
 - Cross-LEVEL folding never happens (task 3236): find_dedupe_parent
@@ -40,14 +46,18 @@ from __future__ import annotations
 
 __all__ = [
     'DedupeConfig',
+    'attach_or_submit',
     'compute_content_fingerprint',
     'content_fingerprint_key',
     'find_dedupe_parent',
     'gate_backlog_fingerprint_key',
+    'resolve_dedupe_parent',
     'submit_or_dedupe',
+    'submit_or_dedupe_off_loop',
     'summary_dedupe_key',
 ]
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -652,3 +662,61 @@ def submit_or_dedupe(
     *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
     """
     return attach_or_submit(queue, esc, resolve_dedupe_parent(queue, esc, config, now=now))
+
+
+# WHY THE READ HOPS, AND WHY THE WRITE BESIDE IT DOES NOT.  This is the single
+# home for both halves of that boundary; `server.py::get_pending_escalations`
+# and `tests/test_write_path_scans_off_loop.py` point here rather than
+# restating it.
+#
+# THE READ.  This server has no process of its own:
+# `orchestrator/src/orchestrator/harness.py::Harness._start_escalation_server`
+# runs it under `asyncio.create_task` on the ORCHESTRATOR's loop.  So an
+# inline `get_pending()` glob does not stall a dedicated server — it stalls the
+# scheduler and the merge worker.  The same measurement task 4391 took on the
+# read path applies unchanged here (the scan is the same one), and it grows
+# with LIFETIME escalation count rather than with the pending set.
+#
+# THE WRITE, which deliberately stays on the caller's thread.  `queue.submit`
+# fires `_notify_callback` (queue.py, inside `submit`), wired in production to
+# `harness.py::Harness._on_escalation`, whose body is
+# `self._escalation_events.get(task_id).set()` over a
+# `dict[str, asyncio.Event]` built in `Harness.__init__`.  `asyncio.Event.set()`
+# is NOT thread-safe: called from a worker thread it reaches `loop.call_soon`
+# with no self-pipe write, so the waiting workflow/steward's wake-up is delayed
+# indefinitely, and under `loop.set_debug(True)` it raises `RuntimeError` —
+# which `submit`'s own `except Exception` around the callback swallows to a
+# WARNING.  That is a SILENTLY dropped workflow wake-up, i.e. a stranded
+# blocked task, on the hottest path in the system.  The same argument covers
+# `submit_resolved`, `attach_dedupe_child` and `add_members_to_l2`.
+#
+# Moving the write therefore needs that wake made thread-safe FIRST.  The
+# pattern already exists one method away — `harness.py::_schedule_coro_threadsafe`
+# solves exactly this problem for the coroutine half, `_on_escalation_resolved`
+# — but has never been applied to the `event.set()` half, and doing so is a
+# change to the orchestrator harness's hot callback with its own tests.  Its
+# own task.
+#
+# What the yield point between the two halves costs here is ONE missed fold: a
+# same-key sibling submitted in the window mints its own pending record instead
+# of folding.  `find_dedupe_parent`'s contract already tolerates that (a miss
+# costs a duplicate, never corruption), and it is already reachable from the
+# other writer PROCESSES against the same queue root.  A parent that
+# disappears in the window is covered by `attach_or_submit`'s TOCTOU guard.
+async def submit_or_dedupe_off_loop(
+    queue: EscalationQueue,
+    esc: Escalation,
+    config: DedupeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """``submit_or_dedupe`` with the parent scan moved to a worker thread.
+
+    Same composition, same four response shapes, same *now* contract — see the
+    sync sibling and the two halves it names.  The only difference is WHERE the
+    read runs, which is the axis this function exists to vary.
+
+    For a caller NOT already on an event loop, ``submit_or_dedupe`` is the one
+    to use: recon (A7b) and the fused-memory middlewares call it directly.
+    """
+    parent_id = await asyncio.to_thread(resolve_dedupe_parent, queue, esc, config, now)
+    return attach_or_submit(queue, esc, parent_id)
