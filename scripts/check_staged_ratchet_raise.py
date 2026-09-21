@@ -178,7 +178,29 @@ def _restored_from(root: Path, staged_oid: str) -> str | None:
     return None
 
 
-def _audit_baseline(root: Path, scratch: Path) -> list[str]:
+def _appended_ledger_entries(root: Path, scratch: Path) -> list[dict]:
+    """This commit's NEW ledger entries, refusing any rewrite of the recorded ones.
+
+    Resolved whenever a ratchet artifact is staged, not only when the baseline
+    moved: the append-only promise is broken precisely by a commit that touches
+    the ledger ALONE, so an audit conditioned on the baseline would leave it
+    unenforced in the one case that breaks it (heuristic 10, uniformly).
+
+    The refusal is ``ledger_appended_entries``' own ``MetricsError`` rather than
+    a line this function composes. That asymmetry against the baseline arm is
+    deliberate: a rewritten history cannot be excused by anything else in the
+    commit, whereas a measured raise can be -- by a covering ledger entry, or by
+    a restore.
+    """
+    return metrics.ledger_appended_entries(
+        _ledger_image(root, f'HEAD:{metrics.LEDGER_RELPATH}', scratch, 'head.json'),
+        _ledger_image(root, f':{metrics.LEDGER_RELPATH}', scratch, 'staged.json'),
+    )
+
+
+def _audit_baseline(
+    root: Path, scratch: Path, appended: list[dict]
+) -> list[str]:
     """Audit the staged baseline against HEAD's. Empty list means clean."""
     baseline = metrics.BASELINE_RELPATH
     head_oid = _blob_oid(root, f'HEAD:{baseline}')
@@ -211,37 +233,46 @@ def _audit_baseline(root: Path, scratch: Path) -> list[str]:
         )
         return []
 
-    appended = metrics.ledger_appended_entries(
-        _ledger_image(root, f'HEAD:{metrics.LEDGER_RELPATH}', scratch, 'head.json'),
-        _ledger_image(root, f':{metrics.LEDGER_RELPATH}', scratch, 'staged.json'),
-    )
     return _refuse_unrecorded(raises, appended)
 
 
+def _refuse(lines: list[str]) -> int:
+    if not lines:
+        return 0
+    print('\n'.join(lines), file=sys.stderr)
+    return 1
+
+
 def _audit(root: Path) -> int:
-    if not _staged(root, 'ACMRD'):
+    staged = _staged(root, 'ACMRD')
+    if not staged:
+        # The cheap filter, and it decides before anything consults HEAD: an
+        # ordinary commit is never ambushed, and never pays for archaeology.
         return 0
 
     if metrics.BASELINE_RELPATH in _staged(root, 'D'):
         # The first half of "delete the destination first", closed before any
         # comparison is attempted. Deleting the baseline is never legitimate:
         # the freshness gate fails hard without it.
-        print(
+        return _refuse([
             f'ratchet commit gate: {metrics.BASELINE_RELPATH} may not be '
             'DELETED. With nothing to compare against, every frozen measure '
             'resets and every ceiling is re-grandfathered, unrefused and '
-            'unrecorded.',
-            file=sys.stderr,
-        )
-        return 1
+            'unrecorded.'
+        ])
 
     with tempfile.TemporaryDirectory() as scratch:
-        refusals = _audit_baseline(root, Path(scratch))
-
-    if not refusals:
-        return 0
-    print('\n'.join(refusals), file=sys.stderr)
-    return 1
+        # The ledger audit runs on BOTH paths; the baseline audit only when the
+        # baseline is staged. Neither can excuse the other: a covering append
+        # does not launder a rewritten history, and an untouched history does
+        # not excuse an unrecorded raise.
+        appended = _appended_ledger_entries(root, Path(scratch))
+        refusals = (
+            _audit_baseline(root, Path(scratch), appended)
+            if metrics.BASELINE_RELPATH in staged
+            else []
+        )
+    return _refuse(refusals)
 
 
 def _build_parser() -> argparse.ArgumentParser:
