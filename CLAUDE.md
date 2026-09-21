@@ -134,6 +134,40 @@ Any workspace member works; `shared` is used because it is the one member every
 resolves to its OWN tree, an un-synced one to the main checkout — both are
 correct, and knowing which you are in is the whole point of asking.
 
+### Anchoring ad-hoc paths
+
+The Bash working directory PERSISTS across calls, and any earlier `cd` moved it
+— including one buried in a compound command several turns ago. Your own
+command text does not show where the command will run: in the transcript behind
+`plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
+session carried different tracked cwds.
+
+So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
+arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
+'test_foo.py'`, which names neither the directory you assumed nor the one you
+actually got. Your cwd is **not derivable from your command text**. Ask git;
+never assume you are still where you last were.
+
+<!-- checkout-root-anchor:begin
+     EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py from a subdirectory
+     of a temp checkout, asserting it answers with the checkout ROOT and not
+     with cwd. Edit it into `pwd` or a hard-coded path and that guard goes
+     red — which is the point. -->
+- **Checkout root**: `git rev-parse --show-toplevel`
+<!-- checkout-root-anchor:end -->
+
+Two measured properties are why this and not `pwd`: it answers the same from
+every directory inside the checkout, and from a directory inside no checkout it
+refuses loudly — exit 128, `fatal: not a git repository`, nothing on stdout —
+rather than handing back a path that is silently wrong.
+
+It answers with the checkout you are STANDING IN, which inside a linked
+worktree is that worktree's own root — the right answer for your task's files,
+and the wrong one when you specifically need the MAIN checkout (`.taskmaster/`,
+`claim_warm_worktree`'s `project_root`). `skills/do/SKILL.md` owns that other
+derivation; take it from there rather than adapting this one.
+
 ## Memory Usage
 
 ### When to read memory
