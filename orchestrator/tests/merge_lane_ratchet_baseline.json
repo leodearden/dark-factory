@@ -1044,7 +1044,7 @@
     "orchestrator/tests/test_recovery_emission_wiring.py": {"patch_targets": [], "private_reads": 74},
     "orchestrator/tests/test_remove_merge_worktree_guarded.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_repend_state_machine.py": {"patch_targets": [], "private_reads": 59},
-    "orchestrator/tests/test_restart_durable_guards.py": {"patch_targets": [], "private_reads": 38},
+    "orchestrator/tests/test_restart_durable_guards.py": {"patch_targets": [], "private_reads": 58},
     "orchestrator/tests/test_routing_integration_gate.py": {"patch_targets": [], "private_reads": 20},
     "orchestrator/tests/test_seed_lane_lock_reentrancy.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_session_resume_integration_gate.py": {"patch_targets": [], "private_reads": 114},

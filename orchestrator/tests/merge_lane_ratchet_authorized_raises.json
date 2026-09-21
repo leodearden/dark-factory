@@ -85,6 +85,24 @@
           "current": 31340
         }
       ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the scheduler's resurrection-guard wiring tests join the cross-guard suite; their private_reads rise because _was_non_pending / _pending_anchor / _update_age_anchors / _compute_age have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 38,
+          "current": 58
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6762,
+          "current": 6782
+        }
+      ]
     }
   ]
 }

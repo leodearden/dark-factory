@@ -16,6 +16,8 @@ Covers:
   step-9: the merge worker's coalesce one-strike registry.
   step-11: the offline lane's red-path state (open fix task, advance count,
            promoted blocker) — one coupled subject keyed by one fingerprint.
+  step-13: the scheduler's resurrection guard, which decides whether a
+           re-pended task carries an age bonus it did not earn.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import shared.safe_io as _safe_io
 from _orch_helpers import make_placeholder_future
 from escalation.models import Escalation
 
@@ -542,3 +545,126 @@ class TestOfflineLaneRedStateSurvivesRedeploy:
         redeployed = _offline_lane(tmp_path, config, fix_task_id='fix-2')
         await redeployed.advance('HEAD2')
         redeployed.task_client.submit_fix_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# step-13 — the scheduler's resurrection guard
+# ---------------------------------------------------------------------------
+
+_MAX_ID = 5000
+
+
+def _scheduler():
+    """A started scheduler on this test's ``project_root``.
+
+    conftest's autouse ``_isolate_orch_config`` pins that root to the test's
+    ``tmp_path``, so a second build in the same test IS the redeployed
+    scheduler: same guards directory, empty memory.
+    """
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.scheduler import Scheduler
+
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    scheduler.finish_startup()
+    return scheduler
+
+
+def _task(task_id: str, status: str = 'pending') -> dict:
+    return {
+        'id': task_id,
+        'title': f'Task {task_id}',
+        'status': status,
+        'priority': 'medium',
+        'dependencies': [],
+        'metadata': {'files': [f'mod{task_id}']},
+    }
+
+
+def _spy_on_guard_writes(monkeypatch) -> list:
+    calls: list = []
+    real = _safe_io.atomic_write_text
+
+    def recorder(path, text, **kwargs):
+        calls.append(path)
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+    return calls
+
+
+class TestResurrectionAnchorSurvivesRedeploy:
+    """``_update_age_anchors`` is driven directly, so the assertion is about
+    the anchor and nothing else."""
+
+    def test_a_resurrected_task_does_not_re_acquire_its_age_bonus(self, guard_clock):
+        """On main the fresh scheduler anchors '100' to ``int('100')``, giving
+        it an age of 4900 — worth ``age_alpha: 10.0 x 4900``.  It jumps the
+        queue over genuinely-old pending tasks once per redeploy, and its
+        victims are the starvation watchdog's own."""
+        first = _scheduler()
+        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+        first._update_age_anchors([_task('100')], _MAX_ID)
+
+        redeployed = _scheduler()
+        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+
+        assert redeployed._compute_age('100', _MAX_ID) == 0
+
+    def test_a_genuinely_old_pending_task_keeps_its_age(self, guard_clock):
+        """The property the fix must not break."""
+        redeployed = _scheduler()
+        redeployed._update_age_anchors([_task('200')], _MAX_ID)
+
+        assert redeployed._compute_age('200', _MAX_ID) == _MAX_ID - 200
+
+    def test_a_non_numeric_id_anchors_to_max_id_either_way(self, guard_clock):
+        """Pins the third branch across the change."""
+        first = _scheduler()
+        first._update_age_anchors([_task('epic-a', status='cancelled')], _MAX_ID)
+
+        redeployed = _scheduler()
+        redeployed._update_age_anchors([_task('epic-a')], _MAX_ID)
+        redeployed._update_age_anchors([_task('epic-b')], _MAX_ID)
+
+        assert redeployed._compute_age('epic-a', _MAX_ID) == 0
+        assert redeployed._compute_age('epic-b', _MAX_ID) == 0
+
+    def test_a_steady_state_tick_performs_no_write(self, guard_clock, monkeypatch):
+        """At a ~15s tick this is the difference between a quiet guard and a
+        file rewritten ~5,760 times a day."""
+        scheduler = _scheduler()
+        scheduler._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+
+        writes = _spy_on_guard_writes(monkeypatch)
+        scheduler._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+
+        assert writes == [], 'a re-observation of an unchanged observation must be silent'
+
+    def test_the_guard_expires(self, guard_clock):
+        """The mark cannot outlive the task it was recorded for."""
+        first = _scheduler()
+        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+
+        guard_clock[0] = _T0 + timedelta(days=31)
+
+        redeployed = _scheduler()
+        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+        assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
+
+
+@pytest.mark.asyncio
+class TestStaleSweepRecordingSurvivesRedeploy:
+    """``_phase_stale_sweep`` is the other write site and must be covered too."""
+
+    async def test_a_swept_id_is_still_marked_after_a_restart(self, guard_clock):
+        first = _scheduler()
+        first._pending_anchor['300'] = 5
+        first.get_tasks = AsyncMock(return_value=[_task('99')])
+        first.get_statuses = AsyncMock(return_value=({}, None))
+
+        await first.acquire_next()
+        assert '300' in first._was_non_pending
+
+        redeployed = _scheduler()
+        redeployed._update_age_anchors([_task('300')], _MAX_ID)
+        assert redeployed._compute_age('300', _MAX_ID) == 0
