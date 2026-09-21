@@ -5,16 +5,44 @@ Covers:
           purely in-memory (``path=None``) — this is the interface the nine
           existing call sites already speak, so the wiring steps can swap the
           facades in without editing a single one of them.
+  step-3: durability against a real file — round-trip across a simulated
+          restart, write-through on every mutation, fail-open loads, and the
+          load-merge-write that keeps two owners of one file from erasing
+          each other.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import MutableMapping, MutableSet
 from datetime import timedelta
+from pathlib import Path
+
+import shared.safe_io as _safe_io
 
 from orchestrator.guard_state import PersistentMap, PersistentSet
 
 _TTL = timedelta(days=1)
+
+
+def _spy_on_writes(monkeypatch) -> list[tuple]:
+    """Record every ``atomic_write_text`` call, then perform it for real.
+
+    Mirrors the recorder in ``test_b3_gate.py`` /
+    ``test_landed_outbox.py``: patching the shared module attribute is what
+    makes the delegation itself observable, so a hand-rolled tmp+rename would
+    fail these tests as well as the repo's AST fence.
+    """
+    calls: list[tuple] = []
+    real = _safe_io.atomic_write_text
+
+    def recorder(path, text, **kwargs):
+        calls.append((path, text, kwargs))
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -162,3 +190,126 @@ class TestPersistentMapSemantics:
         filled = {'k': 'v'}
         assert m == filled
         assert filled == m
+
+
+# ---------------------------------------------------------------------------
+# step-3 — the state actually survives a restart
+# ---------------------------------------------------------------------------
+
+class TestGuardStateDurability:
+    """A second instance on the same path is how a fleet redeploy looks from
+    inside the guard: same file, fresh process memory."""
+
+    def test_set_round_trips_across_a_restart(self, tmp_path: Path):
+        """The whole task, as one assertion."""
+        path = tmp_path / 'capped.json'
+        PersistentSet(path, ttl=_TTL).add('esc-1')
+        assert 'esc-1' in PersistentSet(path, ttl=_TTL)
+
+    def test_map_round_trips_int_and_str_values(self, tmp_path: Path):
+        path = tmp_path / 'counts.json'
+        first = PersistentMap(path, ttl=_TTL)
+        first['esc-1'] = 3
+        first['fp-1'] = 'fix-42'
+
+        second = PersistentMap(path, ttl=_TTL)
+        assert second['esc-1'] == 3
+        assert second['fp-1'] == 'fix-42'
+
+    def test_write_is_through_not_at_exit(self, tmp_path: Path):
+        """No ``flush``/``close`` call is made between the mutation and the
+        re-read — a guard that only persisted at exit would lose everything
+        to the SIGKILL half of a redeploy."""
+        path = tmp_path / 'capped.json'
+        PersistentSet(path, ttl=_TTL).add('esc-1')
+        assert path.exists(), 'the single add must already be on disk'
+
+    def test_deletion_is_durable(self, tmp_path: Path):
+        """A consumed guard must not resurrect on the next start."""
+        set_path = tmp_path / 'capped.json'
+        first_set = PersistentSet(set_path, ttl=_TTL)
+        first_set.add('esc-1')
+        first_set.discard('esc-1')
+        assert 'esc-1' not in PersistentSet(set_path, ttl=_TTL)
+
+        map_path = tmp_path / 'counts.json'
+        first_map = PersistentMap(map_path, ttl=_TTL)
+        first_map['esc-1'] = 1
+        del first_map['esc-1']
+        assert 'esc-1' not in PersistentMap(map_path, ttl=_TTL)
+
+    def test_absent_file_is_an_empty_store(self, tmp_path: Path):
+        assert len(PersistentSet(tmp_path / 'never-written.json', ttl=_TTL)) == 0
+
+    def test_corrupt_file_fails_open(self, tmp_path: Path):
+        """Fail-open, per ``load_json_or_warn(..., on_corrupt='warn')``: a
+        guard whose state file got truncated must still run."""
+        path = tmp_path / 'capped.json'
+        path.write_text('{not json', encoding='utf-8')
+
+        guard = PersistentSet(path, ttl=_TTL)
+        assert len(guard) == 0
+        guard.add('esc-2')
+        assert 'esc-2' in PersistentSet(path, ttl=_TTL)
+
+    def test_schema_drifted_rows_are_dropped_individually(self, tmp_path: Path):
+        """One bad row must not void the whole file — otherwise fail-open
+        degrades to fail-empty for every other key in it
+        (the ``landed_outbox._load_raw`` precedent)."""
+        path = tmp_path / 'counts.json'
+        path.write_text(json.dumps({
+            'a': {'value': 1, 'updated_at': '2026-01-01T00:00:00+00:00'},
+            'b': 'not-a-record',
+            'c': {'value': 1, 'updated_at': 'nonsense'},
+        }), encoding='utf-8')
+
+        guard = PersistentMap(path, ttl=timedelta(days=36500))
+        assert sorted(guard) == ['a']
+        assert guard['a'] == 1
+
+    def test_unwritable_path_degrades_to_memory(self, tmp_path: Path, monkeypatch, caplog):
+        """A disk failure must never crash a steward loop, a merge worker or
+        a scheduler tick; it degrades to today's in-memory behaviour."""
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+
+        guard = PersistentSet(tmp_path / 'capped.json', ttl=_TTL)
+        with caplog.at_level(logging.WARNING):
+            guard.add('esc-1')
+
+        assert 'esc-1' in guard, 'in-memory state stays authoritative'
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_two_owners_of_one_file_do_not_erase_each_other(self, tmp_path: Path):
+        """Multiple ``TaskSteward`` instances live in ONE process and share one
+        file per counter, so a blind overwrite would silently re-arm the very
+        guard this task makes durable.  Keys are globally unique (escalation
+        ids, task ids), so merge-by-key is sound."""
+        path = tmp_path / 'capped.json'
+        owner_a = PersistentSet(path, ttl=_TTL)
+        owner_b = PersistentSet(path, ttl=_TTL)
+
+        owner_a.add('esc-a')
+        owner_b.add('esc-b')
+
+        witness = PersistentSet(path, ttl=_TTL)
+        assert sorted(witness) == ['esc-a', 'esc-b']
+
+        owner_a.discard('esc-a')
+        after = PersistentSet(path, ttl=_TTL)
+        assert sorted(after) == ['esc-b'], "a's removal must not take b's key"
+
+    def test_delegates_to_the_shared_atomic_writer(self, tmp_path: Path, monkeypatch):
+        """``tests/scripts/test_atomic_write_regrowth.py`` is an AST fence that
+        fails the build on a new hand-rolled ``os.replace``/``os.rename``
+        writer; this pins the delegation at the unit level too."""
+        calls = _spy_on_writes(monkeypatch)
+
+        PersistentSet(tmp_path / 'nested' / 'capped.json', ttl=_TTL).add('esc-1')
+
+        assert len(calls) == 1, f'expected exactly one delegated write, got {calls}'
+        kwargs = calls[0][2]
+        assert kwargs.get('encoding') == 'utf-8'
+        assert kwargs.get('mkdir') is True, 'the guards/ directory is created on demand'
