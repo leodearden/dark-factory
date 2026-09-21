@@ -1474,6 +1474,48 @@ def authorization_record(
     }
 
 
+
+def _record_measures(record: dict) -> list[dict]:
+    measures = record.get('measures')
+    if not isinstance(measures, list):
+        return []
+    return [measure for measure in measures if isinstance(measure, dict)]
+
+
+def unrecorded_raises(
+    raises: Sequence[Violation], records: Sequence[dict]
+) -> list[Violation]:
+    """The raises in *raises* that no entry in *records* names. Pure.
+
+    The inverse of ``authorization_record``, and placed beside it so the writer
+    and the auditor read a raise out of one field vocabulary (SPOT) rather than
+    two that can drift. Coverage is the triple ``(measure, key, current)``.
+
+    ``current`` is in the triple because it is the discriminator that actually
+    catches a stale or hand-written entry: such an entry names the right measure
+    and the right key while the baseline it accompanies landed somewhere else,
+    so a ``(measure, key)`` check would wave it through. ``baseline`` is
+    deliberately OUT of it: an agent who runs ``--write-baseline
+    --authorize-raise`` twice in one commit records ``b -> m`` and ``m -> f``,
+    while the HEAD-to-staged delta reads ``b -> f``, so requiring it to match
+    would refuse a correctly authorized commit.
+
+    A record whose ``measures`` is missing or not a list simply covers nothing:
+    a badly hand-edited ledger must REFUSE the commit, not crash the gate.
+    """
+    covered = {
+        (measure.get('measure'), measure.get('key'), measure.get('current'))
+        for record in records
+        for measure in _record_measures(record)
+    }
+    return [
+        violation
+        for violation in raises
+        if (violation.measure, violation.key, violation.current) not in covered
+    ]
+
+
+
 def empty_ledger() -> dict:
     """A ledger that has authorized nothing -- the day-one and fail-closed state."""
     return {
