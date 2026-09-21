@@ -34,6 +34,21 @@ from orchestrator.mcp.plan_tools import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the markup stamp's pending buffer around every test in this module.
+
+    THE SAME shape and the same reason as
+    ``test_plan_tools_markup_guard._clear_pending_refusals``: process-global
+    state on a per-agent stdio server, which one test would otherwise leak into
+    the next. ``_confirm_plan`` READS that buffer (task 4597), so without this
+    a buffered refusal would inflate an unrelated test's reported count.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
+
+
 @pytest.fixture()
 def artifacts(tmp_path):
     """TaskArtifacts pointing at a temporary worktree."""
@@ -636,6 +651,12 @@ class TestConfirmPlanSurfacesTheRejectionCounter:
     is the one surface where the architect itself, mid-session, can still see
     that calls it believed it made were refused. Hence a compact summary here
     despite the block sitting two keys away in the document.
+
+    EVERY BRANCH, not just the success one. An architect that has been leaking
+    reaches an ERROR branch — refused add_plan_step calls are what leaves a
+    plan stepless, and a refused create_plan is what leaves it absent — so the
+    three error exits are where the explanation is most needed and were the
+    three that first went without it.
     """
 
     def _stamp(self, artifacts, **overrides):
@@ -709,6 +730,117 @@ class TestConfirmPlanSurfacesTheRejectionCounter:
 
         assert 'markup_rejections' not in result
         assert set(result) == {'status', 'finalized', 'steps', 'files'}
+
+
+    def _buffer(self, *, tool: str = 'create_plan', param: str = 'analysis') -> None:
+        """Hold one refusal in the pending buffer — the pre-plan leak shape.
+
+        A refused ``create_plan`` has no document to stamp, so its event waits
+        in process-global state until a plan exists to adopt it. That is the
+        case a plan-only view cannot describe, and the case an architect is
+        most likely to be sitting in when it calls confirm_plan.
+        """
+        plan_markup_stamp.note_pending({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': tool,
+            'param': param,
+            'outcome': 'rejected',
+        })
+
+    def test_a_stamped_plan_with_no_steps_still_reports_the_counter(self, artifacts):
+        """THE LIKELIEST ROW OF ALL, and the one the counter most has to serve.
+
+        Refused ``add_plan_step`` calls are precisely what leaves a plan with
+        no steps, so the branch that rejects a stepless plan is the branch an
+        architect that has been leaking reaches. Reporting the counter only on
+        the success branch would withhold the explanation from exactly the
+        response that needs it.
+        """
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'no steps' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_stamped_plan_with_no_files_still_reports_the_counter(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'files' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_buffered_refusal_is_reported_when_no_plan_exists(self, artifacts):
+        """The row that proves the fix reads the SESSION, not just the plan.
+
+        There is no document here to hold a block, so ``summary(plan)`` alone
+        returns None and this branch would stay silent — while the architect
+        that reached it did so *because* its create_plan was refused.
+        """
+        self._buffer(tool='create_plan')
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert result['message'] == 'No plan exists.'
+        assert result['markup_rejections'] == {
+            'count': 1, 'by_tool': {'create_plan': 1},
+        }
+
+    def test_the_success_branch_reports_it_and_adds_no_other_key(self, artifacts):
+        """Routing all four exits through one responder must not widen any of them."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result) == {
+            'status', 'finalized', 'steps', 'files', 'markup_rejections',
+        }
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_clean_session_leaves_the_three_error_responses_as_they_are(
+        self, artifacts
+    ):
+        """The omit-when-absent contract, on every branch that just grew a key.
+
+        Nothing stamped and nothing buffered, so each error response must be
+        EQUAL to what it is today — not merely free of a zeroed counter. The
+        key's PRESENCE is the signal, and an always-present one would be a
+        silent contract change on three envelopes at once.
+        """
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'No plan exists.',
+        }
+
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'Plan has no steps — cannot confirm.',
+        }
+
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        assert _confirm_plan(artifacts) == {
+            'status': 'error',
+            'message': (
+                'Plan has no files — cannot confirm. Call create_plan (or '
+                'update_plan_metadata) with a non-empty files list first.'
+            ),
+        }
 
 
 class TestReportBlockingDependency:
