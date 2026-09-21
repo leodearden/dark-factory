@@ -93,6 +93,12 @@ _QUOTED_ARGV = re.compile(
 #: to the next top-level heading.
 _SHADOW_SECTION = "## Shadow-mode standing-policy rulings (measurement only)"
 
+#: The heading of the skill's `design_concern` handling, pinned as a literal the
+#: same way. Its body is read to the next `### ` heading, which INCLUDES the
+#: `#### Standing rule ...` subsection — `"#### ".startswith("### ")` is False,
+#: the fourth character being `#` rather than a space.
+_DESIGN_CONCERN_SECTION = "### `design_concern` (info or blocking)"
+
 #: The standing-policy class ruled IN FORCE on 2026-09-21 — one token serving as
 #: both the class name and the marker slug, so the two cannot drift apart.
 _POLICY_CLASS = "scope-not-delivered"
@@ -510,3 +516,33 @@ def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
                 f"shadow-measurement vocabulary, which is the one thing it must "
                 f"not become."
             )
+
+
+def test_the_watcher_skills_design_concern_handling_cites_the_policy_class():
+    """The skill is the OTHER home of the ruling — the one the watcher loads.
+
+    A ruling surviving in the policy document but deleted from the skill is a
+    ruling the watcher never reads, and the deletion is silent. That is the
+    two-home ablation failure `tests/scripts/test_line_pin_policy.py` records,
+    and it is held here the same way: a begin/end marker pair per home, and
+    NOTHING asserted about the wording between them.
+
+    The span is read out of the `design_concern` handling rather than out of the
+    whole file, because WHERE it sits is the point: a span parked at the bottom
+    beside the failure modes is one that handling would never cite. Reusing
+    `_marked_span` also makes an unterminated or duplicated span fail
+    identically in both homes.
+    """
+    section = _section(_read(SKILL), _DESIGN_CONCERN_SECTION, level="### ")
+    source = f"{SKILL.relative_to(REPO_ROOT)}, under {_DESIGN_CONCERN_SECTION}"
+    span = _marked_span(section, source)
+
+    relative = str(POLICY.relative_to(REPO_ROOT))
+    assert relative in span, (
+        f"the `{_POLICY_CLASS}` span must name {relative}: that document is the "
+        f"authority for the two closure forms and the worked example, and this "
+        f"skill must POINT at it rather than restate them. A second copy of a "
+        f"two-item vocabulary, sitting in the file the watcher actually reads, "
+        f"would be the copy that drifts and the copy that gets believed."
+    )
+    assert POLICY.is_file()
