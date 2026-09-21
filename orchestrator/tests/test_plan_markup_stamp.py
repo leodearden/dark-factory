@@ -709,6 +709,123 @@ class TestSummaryIsTheCompactView:
         assert plan_markup_stamp.summary(plan) == {'count': 0, 'by_tool': {}}
 
 
+class TestSessionSummaryAlsoSeesTheBuffer:
+    """"What this SESSION refused", against :func:`summary`'s "what this PLAN records".
+
+    The two answers differ on exactly one case, and it is the case that matters
+    most: a refused ``create_plan`` leaves no document to stamp, so the plan's
+    own block cannot describe it and the event waits in the pending buffer.
+    A caller that must answer "were calls lost" on a path where NO PLAN MAY
+    EXIST wants this function; one holding a document that certainly exists is
+    served by either.
+    """
+
+    def _buffer(self, *, tool: str = 'create_plan', at: float = 1_000.0) -> None:
+        """Hold one refusal in the pending buffer, through the real algebra."""
+        plan_markup_stamp.note_pending(
+            plan_markup_stamp.build_event(make_fact(tool=tool), now=_Clock(at))
+        )
+
+    def _planned(self, *tools: str) -> dict[str, Any]:
+        """A plan carrying one stamped block, one event per named tool."""
+        block: dict[str, Any] | None = None
+        for tool in tools:
+            one = plan_markup_stamp.block_of(_events(1, tool=tool)[0])
+            block = one if block is None else plan_markup_stamp.merge_block(block, one)
+        return {'steps': [], plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: block}
+
+    def test_with_an_empty_buffer_it_is_exactly_the_plan_summary(self):
+        """Nothing buffered, so the two functions cannot disagree."""
+        plan = self._planned('add_plan_step')
+
+        assert plan_markup_stamp.pending_block() is None
+        assert plan_markup_stamp.session_summary(plan) == plan_markup_stamp.summary(plan)
+        assert plan_markup_stamp.session_summary(plan) == {
+            'count': 1, 'by_tool': {'add_plan_step': 1},
+        }
+
+    def test_a_buffered_refusal_is_reported_when_there_is_no_plan(self):
+        """The case :func:`summary` cannot serve — and the whole reason for this.
+
+        Both spellings of "no plan" are pinned: the ``None`` a caller may hold,
+        and the empty dict ``TaskArtifacts.read_plan`` returns for a missing
+        file, which is what ``_confirm_plan`` actually sees on this path.
+        """
+        self._buffer()
+
+        for absent in (None, {}):
+            assert plan_markup_stamp.summary(absent) is None, (
+                'the plan-only view is blind here, which is the premise'
+            )
+            assert plan_markup_stamp.session_summary(absent) == {
+                'count': 1, 'by_tool': {'create_plan': 1},
+            }
+
+    def test_the_plan_and_the_buffer_are_merged_rather_than_one_winning(self):
+        """Both sources are real losses, so both have to land in the count."""
+        self._buffer(tool='create_plan')
+        self._buffer(tool='add_design_decision', at=1_001.0)
+        plan = self._planned('add_design_decision', 'add_plan_step')
+
+        assert plan_markup_stamp.session_summary(plan) == {
+            'count': 4,
+            'by_tool': {
+                'add_design_decision': 2, 'add_plan_step': 1, 'create_plan': 1,
+            },
+        }
+
+    def test_neither_source_reports_nothing(self):
+        """The omit-when-absent convention keeps an unambiguous thing to omit."""
+        assert plan_markup_stamp.pending_block() is None
+        assert plan_markup_stamp.session_summary({'steps': [], 'files': ['a.py']}) is None
+        assert plan_markup_stamp.session_summary({}) is None
+        assert plan_markup_stamp.session_summary(None) is None
+
+    def test_reading_it_twice_is_non_destructive(self):
+        """A read that CONSUMED the buffer would destroy the record it reports.
+
+        The buffer belongs to ``_create_plan``, which adopts it into the
+        document it is about to write; a reporting read that cleared it would
+        make merely asking "were calls lost" erase the answer.
+        """
+        self._buffer()
+        before = plan_markup_stamp.pending_block()
+
+        first = plan_markup_stamp.session_summary(None)
+        second = plan_markup_stamp.session_summary(None)
+
+        assert first == second == {'count': 1, 'by_tool': {'create_plan': 1}}
+        assert plan_markup_stamp.pending_block() == before
+        drained = plan_markup_stamp.drain_pending({'steps': []})
+        assert drained[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1, (
+            'a later create_plan must still adopt the buffered refusal'
+        )
+
+    def test_it_is_total_against_a_mangled_plan_or_buffer(self, monkeypatch):
+        """It runs on an ERROR path, so raising is never an option.
+
+        ``plan.json`` is agent-adjacent and the buffer is process-global, so
+        both sides can hold junk. A reporting read that raised would turn a
+        diagnostic into a second failure on the response it was explaining.
+        """
+        for junk in ('a string', 42, ['a', 'list'],
+                     {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: 'a string'},
+                     {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: 42}):
+            assert plan_markup_stamp.session_summary(junk) is None, (
+                f'{junk!r} must degrade to nothing rather than raise'
+            )
+
+        # The buffer has no public way to poison it — note_pending takes an
+        # event and folds it through the algebra — so this one row reaches the
+        # global directly. monkeypatch restores it either way.
+        monkeypatch.setattr(plan_markup_stamp, '_PENDING_BLOCK', 'a string')
+
+        assert plan_markup_stamp.session_summary(None) is None
+        assert plan_markup_stamp.session_summary(self._planned('add_plan_step')) == {
+            'count': 1, 'by_tool': {'add_plan_step': 1},
+        }, 'a mangled buffer must not erase what the plan itself records'
+
+
 class TestNormalizeBlockGuardsTheCarryForward:
     """``_create_plan`` is the one consumer that copies a stored block onward.
 
