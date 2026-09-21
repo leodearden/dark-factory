@@ -793,11 +793,33 @@ class OfflineLaneWorker:
         bumps the red-advance count and defers to
         :meth:`_maybe_promote_blocker` for the staged L2 promotion check
         (C4).
+
+        THE THREE SIDECARS CAN DIVERGE, so every count read defaults rather
+        than indexing — here and in :meth:`_maybe_promote_blocker`.  They are
+        ONE coupled subject keyed by one fingerprint but THREE files with no
+        joint atomicity, so a fingerprint present in one and absent from
+        another is reachable: a write that failed after its sibling
+        succeeded, a single corrupt file fail-opened to ``{}``, a
+        schema-drifted row dropped individually, an entry whose TTL expired
+        before its sibling's.  A ``KeyError`` out of a guard read would also
+        contradict the contract ``guard_state`` enforces everywhere else —
+        absent and corrupt both resolve to empty precisely so a guard never
+        raises into its caller — and :meth:`run` would catch it with
+        exponential backoff, recurring every pass for up to the TTL with the
+        infra sub-run skipped each time.  Restarting the count from zero is
+        the intended degrade; wedging the lane for two weeks is not.
+
+        ``self.open_fix_tasks[fp]`` stays an indexing read deliberately: it is
+        guarded by the ``fp in self.open_fix_tasks`` branch test taken
+        microseconds earlier in the same call with no await between, and
+        there is no sensible degrade without a task id.  The
+        divergence-tolerant read belongs where a default is meaningful, not
+        everywhere mechanically.
         """
         task_id = self.open_fix_tasks[fp]
         if self.task_client is not None:
             await self.task_client.append_suspect_range(task_id, self._suspect_range(head))
-        self._red_advance_counts[fp] += 1
+        self._red_advance_counts[fp] = self._red_advance_counts.get(fp, 0) + 1
         await self._maybe_promote_blocker(fp, task_id)
 
     async def _maybe_promote_blocker(self, fp: str, task_id: str) -> None:
@@ -844,7 +866,8 @@ class OfflineLaneWorker:
                 self._promoted_blockers.add(fp)
                 return
 
-        if self._red_advance_counts[fp] >= self.config.git.offline_lane_red_advances_before_blocker:
+        advances = self._red_advance_counts.get(fp, 0)
+        if advances >= self.config.git.offline_lane_red_advances_before_blocker:
             await self._file_blocker_escalation(task_id, fp)
             self._promoted_blockers.add(fp)
 
