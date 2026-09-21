@@ -2107,6 +2107,142 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert breach['current'] == metrics.FILE_LINE_CEILING + 1
 
 
+class TestCompareBaselineFiles:
+    """The comparison the WRITER cannot make: two committed IMAGES, not a tree.
+
+    ``write_baseline``'s gate compares a fresh report against whatever happens to
+    be at the destination, so deleting that destination -- or rendering elsewhere
+    and copying over -- leaves it nothing to compare and every measure resets.
+    These pin the face that reads two baseline FILES, which is what lets the
+    committed-diff auditor ask "did this diff raise anything" without the tree.
+
+    Synthetic images throughout, written with ``render_baseline`` into tmp_path:
+    microseconds, and never the module-scoped ``live_report`` measurement.
+    """
+
+    @staticmethod
+    def _image(tmp_path: Path, name: str, report: dict) -> Path:
+        target = tmp_path / name
+        target.write_text(metrics.render_baseline(report), encoding='utf-8')
+        return target
+
+    @staticmethod
+    def _fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
+        """The four fields a ledger record is projected from, message excluded.
+
+        Asserting on the tuple rather than on ``message`` is what keeps these
+        tests about the COMPARISON: the wording lives in ``_violation`` and is
+        pinned by ``TestViolationShape``, so re-deriving it here would be a
+        second copy that drifts.
+        """
+        return (
+            violation.measure,
+            violation.key,
+            violation.baseline,
+            violation.current,
+        )
+
+    @classmethod
+    def _pair(cls, tmp_path: Path, mutate) -> tuple[Path, Path]:
+        """Two images: the seed, and the seed with one measure perturbed."""
+        moved = copy.deepcopy(_synthetic_report())
+        mutate(moved)
+        return (
+            cls._image(tmp_path, 'previous.json', _synthetic_report()),
+            cls._image(tmp_path, 'current.json', moved),
+        )
+
+    def test_a_rise_is_reported_per_path_and_in_the_derived_total(
+        self, tmp_path: Path
+    ) -> None:
+        previous, current = self._pair(
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+        )
+
+        raises = metrics.compare_baseline_files(previous, current)
+
+        # The per-path violation is field-for-field what the writer's own gate
+        # would have produced, so a ledger record derived from either describes
+        # the same raise. The total comes along because it is DERIVED -- moving
+        # the mass to a new path is the shape that check exists for.
+        assert [self._fields(v) for v in raises] == [
+            self._fields(metrics._violation('lines', 'a.py', 1000, 1005)),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
+        ]
+
+    def test_a_fall_is_clean(self, tmp_path: Path) -> None:
+        previous, current = self._pair(
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 995)
+        )
+
+        # Lowering is the point of a ratchet, so it must never need authorizing.
+        assert metrics.compare_baseline_files(previous, current) == []
+
+    def test_byte_identical_images_are_clean(self, tmp_path: Path) -> None:
+        previous, current = self._pair(tmp_path, lambda report: None)
+
+        assert previous.read_bytes() == current.read_bytes()
+        assert metrics.compare_baseline_files(previous, current) == []
+
+    def test_the_argument_order_cannot_read_clean_when_crossed(
+        self, tmp_path: Path
+    ) -> None:
+        # THE ONE MISTAKE THAT WOULD DISARM THE AUDITOR SILENTLY.
+        # ``_measure_raises`` takes (current, previous) while this face takes
+        # (previous, current), so a crossed call is a live hazard -- and a
+        # crossed call reads CLEAN, which is the failure a gate must never have.
+        previous, current = self._pair(
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+        )
+
+        assert metrics.compare_baseline_files(previous, current)
+        assert metrics.compare_baseline_files(current, previous) == []
+
+    def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
+        # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
+        # path ABSENT from the previous image is held to the ceiling, so writing
+        # an oversized new file into the baseline cannot grandfather it.
+        oversized = metrics.FILE_LINE_CEILING + 1
+        previous, current = self._pair(
+            tmp_path,
+            lambda report: report['files'].__setitem__(
+                'new_big.py', _blank_file_entry(lines=oversized)
+            ),
+        )
+
+        raises = metrics.compare_baseline_files(previous, current)
+
+        assert (
+            'new_file_over_ceiling',
+            'new_big.py',
+            metrics.FILE_LINE_CEILING,
+            oversized,
+        ) in [self._fields(v) for v in raises]
+
+    def test_a_missing_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
+        # Inherited from load_baseline, never re-implemented: an unreadable
+        # image must never read as an empty-baseline pass (INV-11).
+        previous = self._image(tmp_path, 'previous.json', _synthetic_report())
+        absent = tmp_path / 'gone.json'
+
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.compare_baseline_files(previous, absent)
+
+        assert str(absent) in str(excinfo.value)
+
+    def test_a_malformed_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
+        previous = self._image(tmp_path, 'previous.json', _synthetic_report())
+        broken = tmp_path / 'broken.json'
+        broken.write_text('{"files": {', encoding='utf-8')
+
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.compare_baseline_files(previous, broken)
+
+        message = str(excinfo.value)
+        assert str(broken) in message
+        assert 'not valid JSON' in message
+
+
 class TestAuthorizedRaise:
     """The other half of the gate: a raise that WAS authorized lands, recorded.
 
