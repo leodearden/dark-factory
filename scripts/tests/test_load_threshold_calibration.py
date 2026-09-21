@@ -577,6 +577,46 @@ def test_an_unwritable_report_dir_is_a_named_degradation_not_a_traceback(
 # ── a hold fraction is meaningless without the coverage it was computed over ──
 
 
+def test_read_series_counts_the_tick_clock_rather_than_loading_it(tmp_path: Path):
+    """The corpus tick count is a COUNT(*), not a series fetched for its len().
+
+    Driven in-process because the fact under test is a property of
+    ``read_series``'s return value that the trailing JSON cannot show: the
+    payload reports the same count either way, and only the returned
+    readability dict says whether the clock's rows were MATERIALISED to get it.
+
+    The cost this defends is measured, not stylistic. ``runqueue_read_ok`` is
+    written on every completed tick, so at the 30-day steady state the script's
+    own docstring cites it is ~518k ``(ts, value)`` tuples — built into a list
+    purely so ``coverage_table`` could take its ``len()``. The ε2 cut
+    (``--arm own_cpu_some_avg10``) and the four PSI arms never read that series
+    at all, and none of them DECLARES the clock as its readability metric; the
+    runqueue arm still gets it as a series because it does. The count itself is
+    served index-only by ``idx_samples_metric_ts`` — measured plan against this
+    exact schema: ``SEARCH samples USING COVERING INDEX idx_samples_metric_ts
+    (metric=?)``, no temp B-tree.
+    """
+    module = load_script()
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 100,
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    read = module.read_series(db, 'own_cpu_some_avg10')
+
+    assert read.degradations == [], read.degradations
+    assert read.ticks_in_corpus == 100
+    assert module.TICK_METRIC not in read.readability, (
+        'the tick clock was materialised as a series for an arm that does not '
+        f'declare it as its readability metric: {sorted(read.readability)}'
+    )
+    # The evidence the arm DID ask for is still fetched, both halves of it.
+    assert len(read.readability['own_read_ok:leaf.service']) == 100
+    assert len(read.series['own_cpu_some10:leaf.service']) == 100
+
+
+
 def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: Path):
     """The denominator is SUCCESSFUL reads, not ticks, so coverage must ship too.
 
@@ -914,6 +954,262 @@ def test_a_psi_arm_says_it_has_no_readability_metric_rather_than_inventing_one(
     payload = trailing_json(result.stdout)
     assert payload['coverage']['psi_mem_full_avg10'] is None
     assert 'low_readability' not in payload['degradations']
+
+
+def seed_a_leaf_that_never_reads(path: Path) -> Path:
+    """A 100-tick corpus with one healthy leaf and one discovered-but-dark one.
+
+    Exactly the shape ``collect_load_metrics`` writes for a cgroup leaf found
+    on every tick whose ``cpu.pressure`` never reads: ``own_read_ok:<leaf>`` =
+    0.0 on each of those ticks, and NO ``own_cpu_some10:<leaf>`` row at all,
+    because a failed read persists no value — persisting α's fail-open 0.0
+    would fabricate an idle cgroup.
+    """
+    return seed_db(path, {
+        'runqueue_read_ok': [1.0] * 100,
+        'own_read_ok:good.service': [1.0] * 100,
+        'own_cpu_some10:good.service': [30.0] * 100,
+        'own_read_ok:dark.service': [0.0] * 100,
+    })
+
+
+def test_a_leaf_discovered_every_tick_and_readable_on_none_is_still_reported(
+    tmp_path: Path,
+):
+    """The one case ``coverage_table``'s own rationale could not see.
+
+    It keys per leaf because "one cgroup can be unreadable while its siblings
+    are fine, which is exactly the case worth seeing" — and the FULLY
+    unreadable leaf was invisible, because the block iterated the VALUE series
+    and a leaf readable on no tick has no value rows to iterate. Measured
+    before this change: the coverage keys were the healthy sibling alone, the
+    degradations named nothing, and the string 'dark.service' appeared NOWHERE
+    in stdout. A leaf the sampler discovered 100 times and never once read was
+    reported identically to one that never existed, and those call for
+    opposite next actions.
+    """
+    db = seed_a_leaf_that_never_reads(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['own_cpu_some10:dark.service'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'own_read_ok:dark.service',
+    }
+    # The sibling is untouched: this is per leaf, not a stem-wide verdict.
+    assert payload['coverage']['own_cpu_some10:good.service'][
+        'readable_fraction'] == pytest.approx(1.0)
+    [dark] = [d for d in payload['degradation_details'] if 'dark.service' in d]
+    assert '100' in dark, dark
+
+
+def test_an_arm_readable_on_no_tick_is_reported_in_a_full_run(tmp_path: Path):
+    """A non-stem arm goes dark the same way, and hid in a FULL run too.
+
+    ``runqueue_read_ok`` = 0.0 on every tick is a sampler that ran 100 times
+    and got no /proc/stat reading, so it wrote no ``runqueue_ratio`` value row
+    at all. Measured before this change, with a healthy PSI arm in the same
+    corpus so the run was not empty: the only coverage key was that PSI arm's
+    ``None``, and the runqueue arm had no row and no degradation — "this arm
+    never read" and "this corpus has no such arm" printed identically.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [0.0] * 100,
+        'psi_mem_full_avg10': [5.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert payload['coverage']['runqueue_ratio'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'runqueue_read_ok',
+    }
+
+
+def test_a_never_readable_series_is_named_apart_from_a_flaky_one(tmp_path: Path):
+    """Zero reads is its own finding, not the extreme of a low read rate.
+
+    The operator reading differs, which is the whole reason this vocabulary is
+    enumerated. ``low_readability`` ends "read its hold fractions against that
+    coverage" — but a series readable on NO tick HAS no hold fractions and no
+    candidate-threshold section at all, because a tick with no readable value
+    writes no value row. Naming it apart is what tells the reader that the
+    series' absence from the ladder sections is failed reads rather than a
+    leaf that was never discovered — the confusion the whole fix is about.
+    """
+    db = seed_a_leaf_that_never_reads(tmp_path / 'db.sqlite')
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'never_readable' in payload['degradations'], payload['degradations']
+    assert 'low_readability' not in payload['degradations'], (
+        f'zero reads was folded into the flaky-read cause: '
+        f'{payload["degradation_details"]}'
+    )
+    # It was discovered on every tick, so its presence is not a finding.
+    assert 'partial_presence' not in payload['degradations'], payload['degradations']
+    [dark] = details(payload, 'never_readable')
+    assert 'own_cpu_some10:dark.service' in dark and '100/100' in dark, dark
+    assert not [d for d in payload['degradation_details'] if 'good.service' in d], (
+        'the healthy sibling raised a degradation of its own'
+    )
+
+
+def test_absence_and_never_reading_are_two_independent_causes(tmp_path: Path):
+    """Ordered exclusivity would hide half of a leaf that arrived late AND read never.
+
+    ``partial_presence`` is rows over corpus ticks and ``never_readable`` is a
+    zero numerator over rows; they are judged on different bases, so a leaf
+    discovered for the last fifth of the corpus and readable on none of those
+    20 ticks is BOTH. Only ``low_readability`` is displaced — the two are the
+    same ratio, reported at a different name.
+    """
+    db = seed_leaf_present_for_the_last_fifth(tmp_path / 'db.sqlite', readable=0)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    fired = [cause for cause in
+             ('partial_presence', 'low_readability', 'never_readable')
+             if cause in payload['degradations']]
+    assert fired == ['partial_presence', 'never_readable'], (
+        payload['degradation_details'])
+    [absent] = details(payload, 'partial_presence')
+    [dark] = details(payload, 'never_readable')
+    assert '20/100' in absent, absent
+    assert '20/100' in dark, dark
+
+
+def test_a_sampler_that_never_read_is_distinguishable_from_one_that_never_ran(
+    tmp_path: Path,
+):
+    """The two readings of an empty arm call for opposite next actions.
+
+    Measured before this change, a corpus holding 100 ``runqueue_read_ok`` =
+    0.0 rows and nothing else reported ``no_samples_in_window: no rows for
+    ['runqueue_ratio']`` with ``coverage == {}`` — which an operator reads as a
+    sampler that never ran, and goes to check the timer unit. It ran 100 times
+    and never got a /proc/stat reading, which is a host or collector fault.
+    The evidence that separates them was already fetched and then discarded by
+    ``read_series``'s no-value-rows early return.
+
+    ``no_samples_in_window`` keeps its name and text here: it is literally
+    true, there are no value rows in the window. What was missing is not a
+    different name but the readability evidence beside it.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {'runqueue_read_ok': [0.0] * 100})
+
+    result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert 'no_samples_in_window' in payload['degradations'], payload['degradations']
+    assert payload['coverage']['runqueue_ratio'] == {
+        'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
+        'readable': 0, 'readable_fraction': 0.0,
+        'readability_metric': 'runqueue_read_ok',
+    }
+    assert 'never_readable' in payload['degradations'], payload['degradations']
+
+
+def test_a_coverage_that_cannot_be_true_is_refused_rather_than_printed(
+    tmp_path: Path,
+):
+    """More readability rows than corpus ticks is a broken invariant, not a ratio.
+
+    Measured before this change, this corpus printed ``Coverage: readable on
+    100/50 corpus ticks (200.0%), present on 100/50`` with no degradation at
+    all. ``sampler/src/sampler/store.py::write_tick`` writes one whole tick in
+    ONE transaction, so no corpus the sampler wrote can produce it — it is the
+    hand-seeded or partly-restored one — which is exactly why it belongs in the
+    report as an invariant violation rather than folded into a shortfall cause.
+
+    The 200% is only the loudest symptom, and not the thing being guarded: the
+    SAME broken clock with half the reads failing yields a perfectly plausible
+    0.2 and a ``low_readability`` verdict — a wrong answer delivered quietly,
+    which is worse. So the check is on the row counts, not on the fraction.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_read_ok': [1.0] * 50,
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    assert coverage['readable_fraction'] is None, coverage
+    # The three counts stay reported verbatim: they are the evidence for the
+    # verdict, and without them a reader cannot see WHICH numbers are impossible.
+    assert (coverage['ticks_with_a_row'], coverage['readable'],
+            coverage['ticks_in_corpus']) == (100, 100, 50), coverage
+    assert 'impossible_coverage' in payload['degradations'], payload['degradations']
+    for quiet in ('low_readability', 'partial_presence', 'unknown_readability'):
+        assert quiet not in payload['degradations'], payload['degradation_details']
+
+    [line] = [ln for ln in result.stdout.splitlines() if ln.startswith('Coverage:')]
+    assert 'UNKNOWN' in line, line
+    assert '%' not in line, (
+        'the report printed a coverage percentage it does not believe: ' + line)
+    # Both counts and both metric names, so the reader can see which two
+    # numbers cannot both be true and which series they were counted from.
+    assert '100' in line and '50' in line, line
+    assert 'own_read_ok:leaf.service' in line and 'runqueue_read_ok' in line, line
+
+
+def test_a_zero_clock_with_readability_rows_is_impossible_not_unknown(
+    tmp_path: Path,
+):
+    """WHICH unknown cause a missing clock produces, with rows present. Pinned.
+
+    Both names fit this corpus on their face: the clock count is zero, which
+    reads as an absence, and the readability rows outnumber it, which reads as
+    the invariant violation. ``rows > corpus`` is tested first, so it is the
+    violation — and that is the right verdict, because a readability row is
+    written ON a tick: 100 of them mean at least 100 ticks happened, and a
+    clock of 0 contradicts them exactly as a clock of 50 would.
+
+    Neither existing zero-clock test pins it. ``..._reports_unknown_not_zero``
+    and ``..._is_unknown_even_when_the_clock_ran`` both seed ZERO readability
+    rows, so both reach ``unknown_readability`` under either precedence, and
+    the boundary between the two causes went untested. It is worth a test
+    because these are two of the five separate operator readings the coverage
+    path exists to keep apart, and they send the reader to opposite places:
+    ``unknown_readability`` to a collector that never ran,
+    ``impossible_coverage`` to a corpus restored or seeded by hand.
+    """
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'own_read_ok:leaf.service': [1.0] * 100,
+        'own_cpu_some10:leaf.service': [30.0] * 100,
+    })
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    assert (coverage['ticks_in_corpus'], coverage['ticks_with_a_row']) == (0, 100)
+    assert coverage['readable_fraction'] is None, coverage
+    assert 'impossible_coverage' in payload['degradations'], payload['degradations']
+    assert 'unknown_readability' not in payload['degradations'], (
+        'a clock contradicted by 100 readability rows was reported as an '
+        f'absence of evidence: {payload["degradation_details"]}'
+    )
+    # The missing side is named, so the reader is sent to the clock and not to
+    # the leaf whose rows are the only thing the corpus does have.
+    [detail] = details(payload, 'impossible_coverage')
+    assert 'runqueue_read_ok' in detail and 'own_read_ok:leaf.service' in detail, detail
 
 
 def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
