@@ -13,17 +13,22 @@ files on disk.
 
 Covers:
   step-7: the steward's capped set and its three per-escalation counters.
+  step-9: the merge worker's coalesce one-strike registry.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 from escalation.models import Escalation
 
 from orchestrator import guard_state
+from orchestrator.merge_types import QueuedBranch
 
 # A round, arbitrary instant.  Every TTL assertion is relative to it, so no
 # test here depends on the wall clock.
@@ -227,3 +232,131 @@ class TestStewardCapSurvivesRedeploy:
         redeployed = make_steward(task={'id': '42', 'title': 't', 'description': 'd'})
         assert 'esc-42-7' in redeployed._capped_escalations
         assert 'esc-43-7' in redeployed._capped_escalations
+
+
+# ---------------------------------------------------------------------------
+# step-9 — the merge worker's one strike stays spent
+# ---------------------------------------------------------------------------
+
+def _merge_config(project_root: Path):
+    from orchestrator.config import GitConfig, OrchestratorConfig
+    return OrchestratorConfig(
+        project_root=project_root,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+        ),
+    )
+
+
+def _merge_request(task_id: str, config):
+    from orchestrator.merge_queue import MergeRequest
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        worktree=config.project_root / f'wt-{task_id}',
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=make_placeholder_future(),
+    )
+
+
+def _merge_worker(project_root: Path | None, config):
+    """A bare worker rooted at *project_root* (``None`` = no project root).
+
+    ``git_ops.project_root`` is a GENUINE path rather than an auto-specced
+    child mock on purpose: a ``MagicMock`` is a valid ``os.PathLike`` whose
+    ``os.fspath()`` is repr-derived, so letting the attribute auto-spec would
+    have the worker materialise a real ``MagicMock/`` tree the moment it
+    persisted anything — the task-3223 incident conftest's
+    ``_no_mock_derived_stray_dirs`` fence exists for.
+    """
+    from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
+
+    git_ops = MagicMock()
+    git_ops.config = config
+    if project_root is None:
+        del git_ops.project_root
+    else:
+        git_ops.project_root = project_root
+
+    def _factory(train_id: str) -> TrainCallbacks:
+        return TrainCallbacks(
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+
+    # event_store=None short-circuits signal 2 (the blocked-history arm) by its
+    # own `is not None` guard, so these assertions isolate signal 1.
+    return SpeculativeMergeWorker(
+        git_ops,
+        asyncio.Queue(),
+        event_store=None,
+        train_callback_factory=_factory,
+    )
+
+
+@pytest.mark.asyncio
+class TestCoalesceDerailSurvivesRedeploy:
+    """A train that derailed once must not re-form after a restart.
+
+    On main the registry is a bare ``set()`` rebuilt at construction, which is
+    why ``train_derailed`` reads 19-in-30d / 16-in-14d: the identical poison
+    train re-forms on the redeploy cadence, forever.
+    """
+
+    async def test_a_derailed_member_is_still_excluded_after_a_restart(
+        self, tmp_path: Path, guard_clock,
+    ):
+        config = _merge_config(tmp_path)
+        _merge_worker(tmp_path, config)._mark_coalesce_derailed(['4001', '4002'])
+
+        redeployed = _merge_worker(tmp_path, config)
+        for task_id in ('4001', '4002'):
+            assert redeployed._default_coalesce_exclusion_reason(
+                _merge_request(task_id, config),
+            ) == 'coalesce_derailed_one_strike'
+
+    async def test_a_task_that_never_derailed_is_unaffected(
+        self, tmp_path: Path, guard_clock,
+    ):
+        config = _merge_config(tmp_path)
+        _merge_worker(tmp_path, config)._mark_coalesce_derailed(['4001', '4002'])
+
+        redeployed = _merge_worker(tmp_path, config)
+        assert redeployed._default_coalesce_exclusion_reason(
+            _merge_request('4003', config),
+        ) is None
+
+    async def test_the_strike_expires(self, tmp_path: Path, guard_clock):
+        """A task is not excluded from train formation forever — the marker
+        decays with the TTL, which IS the decay policy the old comment
+        anticipated."""
+        config = _merge_config(tmp_path)
+        _merge_worker(tmp_path, config)._mark_coalesce_derailed(['4001'])
+
+        guard_clock[0] = _T0 + timedelta(days=8)
+
+        assert _merge_worker(tmp_path, config)._default_coalesce_exclusion_reason(
+            _merge_request('4001', config),
+        ) is None
+
+    async def test_a_worker_without_a_project_root_still_works(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The bare-worker case degrades to memory and writes nothing — the
+        same property ``test_merge_queue_multihost_wiring.py`` pins for the
+        sibling state paths."""
+        config = _merge_config(tmp_path)
+        worker = _merge_worker(None, config)
+        worker._mark_coalesce_derailed(['4001'])
+
+        assert worker._default_coalesce_exclusion_reason(
+            _merge_request('4001', config),
+        ) == 'coalesce_derailed_one_strike'
+        assert not (tmp_path / 'data').exists(), 'nothing may reach disk'
