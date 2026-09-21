@@ -462,8 +462,10 @@ regenerates to a temp file and asserts byte equality with the committed file.
 
 ### Shared rendering components
 
-`StatTile({label, datum, history, …})`, `ST(...)` likewise, `ProjectGroup` pips and
-`LocksCell` take a `Datum`. `history` is the persisted series of the same datum key.
+`StatTile({label, datum, history, …})`, `ST(...)` likewise, the new shared `Pip`
+(γ1 — see decision 7) and `LocksCell` take a `Datum`. `shell.jsx::ProjectGroup` is
+not itself a `Datum` consumer: it keeps taking `summary` as an opaque node.
+`history` is the persisted series of the same datum key.
 `plainDatum(value, endpointKey)` wraps a not-yet-migrated value with the endpoint's
 `served_at`. Under the node test harness a component receiving a non-`Datum` throws.
 
