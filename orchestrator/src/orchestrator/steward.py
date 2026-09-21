@@ -19,8 +19,10 @@ Lifecycle:
   ``resolve_issue`` still in flight from the killed agent session can win it —
   and ``_give_up_with_wip`` then publishes ``StewardResolved`` rather than
   misreporting a genuine resolution as a benign interruption.
-- A capped escalation is TERMINAL for this steward: ``_mark_capped`` records
-  it and ``_handle_escalation`` becomes a no-op for that id.
+- A capped escalation is TERMINAL for this TASK until the guard TTL elapses:
+  ``_mark_capped`` records it durably and ``_handle_escalation`` becomes a
+  no-op for that id, for this steward AND for any steward a later redeploy
+  builds for the same task.
 - Stopped by the workflow after task completion + grace period.
 
 The give-up contract is load-bearing for BOTH workflow waiters, which is why
@@ -41,7 +43,9 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import MutableMapping, MutableSet
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -56,6 +60,7 @@ from shared.proc_group import terminate_process_group
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
@@ -95,6 +100,13 @@ _MAX_CAP_RETRIES = 16
 # new typed exception per case.  Independent of ``steward_max_attempts``,
 # which guards a single escalation; this guards the loop itself.
 _MAX_LOOP_ERRORS = 3
+
+
+# How long a steward's give-up is remembered across restarts.  An upper bound
+# on the subject, not a tuning dial: seven days is the realistic lifetime of one
+# escalation record, and the state must not outlive it.  Past the TTL the
+# record is uncapped again and its ladder is full.
+_STEWARD_GUARD_TTL = timedelta(days=7)
 
 
 @dataclass
@@ -150,21 +162,39 @@ class TaskSteward:
         self._session_id: str | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
-        self._retry_counts: dict[str, int] = {}
-        self._timeout_counts: dict[str, int] = {}
-        self._empty_output_counts: dict[str, int] = {}
-        # Escalations this steward has permanently given up on — TERMINAL for
-        # THIS steward, never re-handled (task 3170, fix B).  Before this
-        # existed nothing recorded that a cap had already fired, so ANY early
-        # return from _handle_escalation left the record pending,
-        # _next_escalation re-returned it from a synchronous read, and
-        # _run_loop re-handled it at loop speed with no sleep and no state
-        # change (1,183,854 identical log lines in 20.5h on reify 5189, each
-        # iteration also awaiting a `git rev-list` subprocess via the wip
-        # probe).  Populated by _mark_capped at every cap-fire early return
-        # and honoured at three sites: _handle_escalation's early return,
-        # _next_escalation's filter, and the watcher's --exclude-id argv.
-        self._capped_escalations: set[str] = set()
+        # The four guards below are restart-durable and TTL-bounded (task
+        # 5352): they are keyed by ESCALATION id and live in
+        # <project_root>/data/orchestrator/guards/, so a fleet redeploy no
+        # longer hands a record that already exhausted its ladder a fresh full
+        # budget.  A project_root that cannot be resolved yields the in-memory
+        # mode — today's behaviour — with no branch at any consumption site.
+        self._retry_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'steward_retry_counts.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        self._timeout_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'steward_timeout_counts.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        self._empty_output_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'steward_empty_output_counts.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
+        # Escalations a steward has permanently given up on — TERMINAL for this
+        # TASK, never re-handled (task 3170, fix B).  Before this existed
+        # nothing recorded that a cap had already fired, so ANY early return
+        # from _handle_escalation left the record pending, _next_escalation
+        # re-returned it from a synchronous read, and _run_loop re-handled it at
+        # loop speed with no sleep and no state change (1,183,854 identical log
+        # lines in 20.5h on reify 5189, each iteration also awaiting a
+        # `git rev-list` subprocess via the wip probe).  Populated by
+        # _mark_capped at every cap-fire early return and honoured at three
+        # sites: _handle_escalation's early return, _next_escalation's filter,
+        # and the watcher's --exclude-id argv.
+        self._capped_escalations: MutableSet[str] = PersistentSet(
+            guard_path(config.project_root, 'steward_capped_escalations.json'),
+            ttl=_STEWARD_GUARD_TTL,
+        )
         # Loud-ONCE guard for the capped-only idle state (see
         # _log_capped_idle_once).  Reset whenever a non-capped escalation is
         # handled, so a later relapse into the idle state logs again.
@@ -253,10 +283,11 @@ class TaskSteward:
         - ``_loop_error_count``: an unconditional backstop on the generic
           ``except Exception`` path so any other persistent failure (MCP
           unreachable, etc.) is bounded.
-        - ``_capped_escalations`` (task 3170): an escalation this steward has
-          given up on is TERMINAL for it, so ``_next_escalation`` filters it
-          out and this loop falls into its 1s backoff instead of re-handling
-          it forever.  Entry into that idle state is announced once via
+        - ``_capped_escalations`` (task 3170): an escalation a steward has
+          given up on is TERMINAL for the task — durably, so a redeploy does
+          not re-adopt it (task 5352) — so ``_next_escalation`` filters it out
+          and this loop falls into its 1s backoff instead of re-handling it
+          forever.  Entry into that idle state is announced once via
           ``_log_capped_idle_once`` — the flag is cleared below whenever a
           live escalation is handled.
         """
@@ -448,9 +479,10 @@ class TaskSteward:
         publish-without-dismiss is invisible to it and strands the workflow.
         Any NEW early return added here inherits that obligation.
 
-        A capped escalation is TERMINAL for this steward (task 3170, fix B):
-        once any guard below has fired, ``_mark_capped`` records the id and
-        this method becomes a no-op for it.  The early return sits ABOVE the
+        A capped escalation is TERMINAL for this task (task 3170, fix B;
+        made durable by task 5352): once any guard below has fired,
+        ``_mark_capped`` records the id and this method becomes a no-op for
+        it, in this steward and in any steward a later redeploy builds.  The early return sits ABOVE the
         "handling escalation" info log deliberately — a capped record must
         produce no further log lines at all, which is the O(1)-not-O(10^6)
         signal that distinguishes a healthy idle steward from the spin this
@@ -1057,9 +1089,20 @@ class TaskSteward:
         Called from EVERY cap-fire early return in :meth:`_handle_escalation`
         — not just the two wip-gated branches — so the busy-loop shape is
         unreachable from any future early return added there (task 3170,
-        fix B).  ``_capped_escalations`` is deliberately per-steward, not
-        persisted: it means "terminal for THIS steward", and a fresh steward
-        for the same task is entitled to try again.
+        fix B).
+
+        ``_capped_escalations`` is PERSISTED (task 5352), reversing what this
+        docstring used to claim.  "Terminal for THIS steward" meant a fresh
+        steward for the same task was entitled to try again — and since the
+        fleet redeploys every ~8-15h, a permanently unhandleable escalation
+        was re-adopted and its ladder re-burnt on that cadence, indefinitely.
+        The give-up is now terminal for the TASK.
+
+        Two things bound that.  The key is the ESCALATION id, so a genuinely
+        new record always finds a full budget and only the byte-identical one
+        that already exhausted the ladder is remembered.  And the record
+        expires after ``_STEWARD_GUARD_TTL``, so even that memory does not
+        outlive its subject.
         """
         self._capped_escalations.add(escalation_id)
 

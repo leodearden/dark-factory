@@ -66,6 +66,27 @@ logger = logging.getLogger(__name__)
 _MISSING: Any = object()
 
 
+def guard_path(project_root: str | Path | None, filename: str) -> Path | None:
+    """Where one guard's state lives, or ``None`` when there is no project root.
+
+    ``None`` is not an error: it is the in-memory mode, which is what a
+    bare-harness owner gets.  Returning it from HERE is what keeps the four
+    call sites free of a ``state_path is None`` branch.
+
+    The falsy/``'None'`` test is the guard
+    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._write_snapshot_best_effort``
+    already applies for the same reason: pydantic types ``project_root`` as a
+    ``Path`` and rejects ``None`` on construction AND assignment, so the only
+    way an empty or literal ``'None'`` value arrives is a write that bypassed
+    validation (``object.__setattr__``, as that module's guard tests do).
+    Without the test, such a value would materialise a directory literally
+    named ``./None/`` under the process CWD.
+    """
+    if not project_root or str(project_root) == 'None':
+        return None
+    return Path(project_root, 'data', 'orchestrator', 'guards', filename)
+
+
 def _utc_now() -> datetime:
     """The default clock: an aware UTC timestamp.
 
@@ -110,11 +131,15 @@ class _GuardStore:
         path: Path | None,
         *,
         ttl: timedelta,
-        now: Callable[[], datetime] = _utc_now,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._path = path
         self._ttl = ttl
-        self._now = now
+        # Resolved here rather than as a default argument, so replacing the
+        # module-level ``_utc_now`` moves the clock of every guard that did not
+        # inject one — which is how the wiring tests drive expiry without
+        # threading a test-only clock through four unrelated owners.
+        self._now = now or _utc_now
         # Keys this instance removed, held until a write actually lands so a
         # failed flush does not silently forget the removal.  Re-storing a key
         # retracts its pending removal — otherwise a removal whose flush failed
@@ -311,7 +336,7 @@ class PersistentSet(MutableSet[str]):
         path: Path | None,
         *,
         ttl: timedelta,
-        now: Callable[[], datetime] = _utc_now,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = _GuardStore(path, ttl=ttl, now=now)
 
@@ -371,7 +396,7 @@ class PersistentMap(MutableMapping[str, Any]):
         path: Path | None,
         *,
         ttl: timedelta,
-        now: Callable[[], datetime] = _utc_now,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = _GuardStore(path, ttl=ttl, now=now)
 
