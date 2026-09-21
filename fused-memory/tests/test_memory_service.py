@@ -4789,17 +4789,25 @@ class TestDedupEpisodeNodes:
 
 # The fixture family every family-keyed test below is built on: three spellings
 # of task 605, in the survivor-first order the backend's substring probe returns
-# them (most valid edges, then oldest, then uuid).
+# them (highest provenance_rank, then oldest, then uuid — where provenance_rank
+# is edge_count + mentions_count, task 4986).
 #
-# The 13-edge node is the LOWERCASE one, not the canonically-named one. That
+# The richest node is the LOWERCASE one, not the canonically-named one. That
 # inversion is deliberate and is the tracked motivating case: it is exactly
 # where the uniform family[0] survivor rule differs from the old
-# "a canonically-named node wins regardless of edge count" policy, and it is
+# "a canonically-named node wins regardless of provenance" policy, and it is
 # why the rewrite moves 2 edges instead of 13.
+#
+# The mentions values are chosen so 'u-lower' still survives: task 4986 changed
+# what RANKS a survivor, and re-deciding this tracked case while doing so would
+# have silently retired the very scenario these tests exist to hold.
 _FAMILY_605 = [
-    {'uuid': 'u-lower', 'name': 'task 605', 'created_at': 100, 'edge_count': 13},
-    {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': 50, 'edge_count': 2},
-    {'uuid': 'u-plural', 'name': 'tasks 605', 'created_at': 150, 'edge_count': 1},
+    {'uuid': 'u-lower', 'name': 'task 605', 'created_at': 100,
+     'edge_count': 13, 'mentions_count': 2, 'provenance_rank': 15},
+    {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': 50,
+     'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
+    {'uuid': 'u-plural', 'name': 'tasks 605', 'created_at': 150,
+     'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
 ]
 
 
@@ -4837,7 +4845,7 @@ class TestNormalizeTaskNodeNames:
     Survivor policy is now ONE rule: the family's first member under the
     backend's survivor-first ordering survives, every other member is merged
     into it, and it is renamed onto the canonical name last. The old "a
-    canonically-named node wins regardless of edge count" special case is gone
+    canonically-named node wins regardless of provenance" special case is gone
     — it existed to avoid recreating the exact-name duplicate
     _dedup_episode_nodes resolves, and what rules that duplicate out now is the
     merge-before-rename ORDER rather than family-keying on its own.
@@ -4963,7 +4971,8 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'700': [
-            {'uuid': 'u-solo', 'name': 'Task 700', 'created_at': 10, 'edge_count': 4},
+            {'uuid': 'u-solo', 'name': 'Task 700', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='Task 700')])
@@ -4984,7 +4993,8 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'800': [
-            {'uuid': 'u-solo', 'name': 'task 800', 'created_at': 10, 'edge_count': 4},
+            {'uuid': 'u-solo', 'name': 'task 800', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='task 800')])
@@ -5022,7 +5032,8 @@ class TestNormalizeTaskNodeNames:
         normalization hook causing the very bug the split hook repairs."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        foreign = {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20, 'edge_count': 7}
+        foreign = {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20,
+             'edge_count': 7, 'mentions_count': 0, 'provenance_rank': 7}
         _install_family_probe(service, {'605': [_FAMILY_605[0], foreign, *_FAMILY_605[1:]]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
@@ -5050,12 +5061,15 @@ class TestNormalizeTaskNodeNames:
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
         _install_family_probe(service, {'605': [
-            {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 5, 'edge_count': 99},
+            {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 5,
+             'edge_count': 99, 'mentions_count': 0, 'provenance_rank': 99},
             _FAMILY_605[0],
             _FAMILY_605[1],
-            {'uuid': 'u-notes', 'name': 'release 605 notes', 'created_at': 7, 'edge_count': 2},
+            {'uuid': 'u-notes', 'name': 'release 605 notes', 'created_at': 7,
+             'edge_count': 2, 'mentions_count': 0, 'provenance_rank': 2},
             _FAMILY_605[2],
-            {'uuid': 'u-1605', 'name': 'Task 1605', 'created_at': 9, 'edge_count': 1},
+            {'uuid': 'u-1605', 'name': 'Task 1605', 'created_at': 9,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
         ]})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 605')])
@@ -5130,8 +5144,10 @@ class TestNormalizeTaskNodeNames:
         _install_family_probe(service, {
             '605': _FAMILY_605,
             '700': [
-                {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 10, 'edge_count': 5},
-                {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 20, 'edge_count': 1},
+                {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 10,
+             'edge_count': 5, 'mentions_count': 0, 'provenance_rank': 5},
+                {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 20,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
             ],
         })
 

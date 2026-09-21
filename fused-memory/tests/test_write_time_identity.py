@@ -21,7 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
 
-from fused_memory.backends.graphiti_client import AmbiguousEntityError, GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    _PROVENANCE_RANK_CLAUSE,
+    _PROVENANCE_RANK_ORDER,
+    AmbiguousEntityError,
+    GraphitiBackend,
+)
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend._identity_lock_for
@@ -744,7 +749,8 @@ class TestFindEntityNodesByNameSubstring:
     async def test_returns_named_rows_ordered_survivor_first(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        """rows[0] is the merge survivor — most valid edges, then oldest, then uuid.
+        """rows[0] is the merge survivor — highest provenance_rank, then oldest,
+        then uuid.
 
         Same contract as the exact-match sibling, from the same ORDER BY
         clause, so the normalizer's one survivor rule reads identically for
@@ -753,22 +759,53 @@ class TestFindEntityNodesByNameSubstring:
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock([
-            ['u-high', 'task 605', '2026-01-02', 13],
-            ['u-canon', 'Task 605', '2026-01-01', 2],
-            ['u-low', 'tasks 605', '2026-01-03', 1],
+            ['u-high', 'task 605', '2026-01-02', 13, 1, 14],
+            ['u-canon', 'Task 605', '2026-01-01', 2, 0, 2],
+            ['u-low', 'tasks 605', '2026-01-03', 1, 0, 1],
         ])
         backend._driver._get_graph = MagicMock(return_value=graph)
 
         rows = await backend.find_entity_nodes_by_name_substring('605', group_id='home')
 
         cypher = extract_cypher(graph.ro_query.call_args)
-        assert 'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC' in cypher
+        assert _PROVENANCE_RANK_ORDER in cypher
         assert 'invalid_at IS NULL' in cypher  # only VALID edges are counted
         assert rows == [
-            {'uuid': 'u-high', 'name': 'task 605', 'created_at': '2026-01-02', 'edge_count': 13},
-            {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': '2026-01-01', 'edge_count': 2},
-            {'uuid': 'u-low', 'name': 'tasks 605', 'created_at': '2026-01-03', 'edge_count': 1},
+            {'uuid': 'u-high', 'name': 'task 605', 'created_at': '2026-01-02',
+             'edge_count': 13, 'mentions_count': 1, 'provenance_rank': 14},
+            {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': '2026-01-01',
+             'edge_count': 2, 'mentions_count': 0, 'provenance_rank': 2},
+            {'uuid': 'u-low', 'name': 'tasks 605', 'created_at': '2026-01-03',
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
         ]
+
+    @pytest.mark.asyncio
+    async def test_ranks_by_the_same_shared_clause_as_the_exact_match_sibling(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The two survivor-ranking methods cannot diverge, because they are
+        built from the SAME objects — not from two clauses that happen to read
+        alike.
+
+        This method's own docstring promises it orders "exactly as
+        find_duplicate_entity_nodes orders its matches". Task 5264 made that
+        promise by COPYING the clause, which is how the MENTIONS-blind ranking
+        reached a second, newer merge path. Asserting the shared constants
+        appear verbatim in BOTH emitted queries is what turns the promise into
+        something a change has to break loudly.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.find_entity_nodes_by_name_substring('605', group_id='home')
+        substring_cypher = extract_cypher(graph.ro_query.call_args)
+        await backend.find_duplicate_entity_nodes('Task 605', group_id='home')
+        exact_cypher = extract_cypher(graph.ro_query.call_args)
+
+        for cypher in (substring_cypher, exact_cypher):
+            assert _PROVENANCE_RANK_CLAUSE in cypher
+            assert _PROVENANCE_RANK_ORDER in cypher
 
     @pytest.mark.asyncio
     async def test_row_order_is_the_drivers_and_is_never_re_sorted_here(
@@ -780,8 +817,8 @@ class TestFindEntityNodesByNameSubstring:
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock([
-            ['u-low', 'tasks 605', '2026-01-03', 1],
-            ['u-high', 'task 605', '2026-01-02', 13],
+            ['u-low', 'tasks 605', '2026-01-03', 1, 0, 1],
+            ['u-high', 'task 605', '2026-01-02', 13, 1, 14],
         ])
         backend._driver._get_graph = MagicMock(return_value=graph)
 
