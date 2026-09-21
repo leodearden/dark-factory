@@ -12,6 +12,9 @@ Covers:
   step-5: the TTL that bounds it — expiry hides AND prunes, the boundary is
           exact, and a re-asserted set member neither refreshes its clock nor
           rewrites its file.
+  step-15: a batch of N inserts costs ONE write, not N+1 — every flush
+          re-serialises the whole map, so the per-element form made a cold
+          start's first tick O(N^2).
 """
 
 from __future__ import annotations
@@ -461,3 +464,116 @@ class TestGuardStateTtl:
 
         guard.add('fresh')
         assert path.exists(), 'and a later mark recreates it'
+
+
+# ---------------------------------------------------------------------------
+# step-15 — a batch of N inserts is ONE write, not N+1
+# ---------------------------------------------------------------------------
+
+class TestGuardStateBatchedWrites:
+    """Both batch entry points coalesce their writes into one.
+
+    ``_GuardStore.flush`` re-reads, re-merges and re-serialises the WHOLE map,
+    so a per-element flush costs a batch of N some N+1 writes and O(N^2)
+    parse/serialise work.  Measured in this worktree before the fix: N=373
+    performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.  N=373
+    is not hypothetical — it is today's count of active non-pending tasks, so
+    it is what the first ``acquire_next`` tick after every fleet redeploy
+    pays, inline on the event loop.
+
+    ``|=`` is the form that matters: all three production batch call sites use
+    it, not ``update`` —
+    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
+    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
+    and
+    ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+    """
+
+    _N = 50
+
+    @staticmethod
+    def _keys(start: int, stop: int) -> list[str]:
+        return [f'task-{i}' for i in range(start, stop)]
+
+    def test_update_of_new_keys_performs_exactly_one_write(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        guard = PersistentSet(tmp_path / 'derailed.json', ttl=_TTL)
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.update(self._keys(0, self._N))
+
+        assert len(calls) == 1, f'expected one write for {self._N} keys, got {len(calls)}'
+
+    def test_ior_performs_exactly_one_write(self, tmp_path: Path, monkeypatch):
+        """The production form.  ``MutableSet.__ior__`` loops calling ``add``,
+        so the override has to keep delegating to the batched path."""
+        guard = PersistentSet(tmp_path / 'derailed.json', ttl=_TTL)
+
+        calls = _spy_on_writes(monkeypatch)
+        guard |= set(self._keys(0, self._N))
+
+        assert len(calls) == 1, f'expected one write for {self._N} keys, got {len(calls)}'
+
+    def test_a_wholly_redundant_batch_performs_no_write(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The steady-state property, at batch granularity: the scheduler
+        re-asserts its whole observation set on every ~15s tick."""
+        guard = PersistentSet(tmp_path / 'was_non_pending.json', ttl=_TTL)
+        guard.update(self._keys(0, self._N))
+
+        calls = _spy_on_writes(monkeypatch)
+        guard |= set(self._keys(0, self._N))
+
+        assert calls == [], 'a re-assertion of an unchanged batch must be silent'
+
+    def test_a_mixed_batch_performs_one_write_and_keeps_every_key(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """One new id among a tick's worth of already-known ones is the normal
+        case, so it must cost one write rather than one per new id."""
+        guard = PersistentSet(tmp_path / 'was_non_pending.json', ttl=_TTL)
+        guard.update(self._keys(0, self._N))
+
+        calls = _spy_on_writes(monkeypatch)
+        guard |= set(self._keys(0, self._N + 5))
+
+        assert len(calls) == 1, f'expected one write for a mixed batch, got {len(calls)}'
+        assert sorted(guard) == sorted(self._keys(0, self._N + 5))
+
+    def test_the_single_write_is_still_durable(self, tmp_path: Path, monkeypatch):
+        """The assertion that stops the fix being "skip the writes" rather
+        than "coalesce them"."""
+        path = tmp_path / 'derailed.json'
+        guard = PersistentSet(path, ttl=_TTL)
+
+        calls = _spy_on_writes(monkeypatch)
+        guard |= set(self._keys(0, self._N))
+
+        assert len(calls) == 1
+        assert sorted(PersistentSet(path, ttl=_TTL)) == sorted(self._keys(0, self._N))
+
+    def test_an_aborted_batch_self_heals(self, tmp_path: Path):
+        """An insert that never got its flush is not lost.
+
+        ``flush`` writes the whole merged map rather than a delta, so ANY
+        later write persists it.  The trailing flush in a batch therefore
+        closes a crash-before-next-write window, not a correctness hole.
+        """
+        path = tmp_path / 'derailed.json'
+        guard = PersistentSet(path, ttl=_TTL)
+
+        def _explodes():
+            yield 'task-a'
+            yield 'task-b'
+            raise RuntimeError('source of truth went away mid-batch')
+
+        with pytest.raises(RuntimeError):
+            guard.update(_explodes())
+
+        assert sorted(guard) == ['task-a', 'task-b'], 'the partial batch is in memory'
+
+        guard.add('task-c')
+
+        assert sorted(PersistentSet(path, ttl=_TTL)) == ['task-a', 'task-b', 'task-c']

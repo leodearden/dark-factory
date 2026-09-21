@@ -629,14 +629,36 @@ class TestResurrectionAnchorSurvivesRedeploy:
         assert redeployed._compute_age('epic-a', _MAX_ID) == 0
         assert redeployed._compute_age('epic-b', _MAX_ID) == 0
 
-    def test_a_steady_state_tick_performs_no_write(self, guard_clock, monkeypatch):
-        """At a ~15s tick this is the difference between a quiet guard and a
-        file rewritten ~5,760 times a day."""
+    def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
+        self, guard_clock, monkeypatch,
+    ):
+        """The two halves of one property, measured from the same spy.
+
+        The COLD START is the first ``acquire_next`` tick after every fleet
+        redeploy, inline on the event loop: it observes every active
+        non-pending task at once — 373 in the live store today, 345 of them
+        ``deferred``, a status that accumulates monotonically — so a
+        per-element write would make that tick pay N writes of an N-entry
+        file.  The STEADY STATE re-observes the same ids every ~15s, which is
+        the difference between a quiet guard and a file rewritten ~5,760 times
+        a day.  Spying from BEFORE the first call is what makes the cold start
+        assertable at all.
+        """
+        cold_start = [
+            _task(str(tid), status='deferred') for tid in range(1000, 1200)
+        ]
         scheduler = _scheduler()
-        scheduler._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
 
         writes = _spy_on_guard_writes(monkeypatch)
-        scheduler._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+        scheduler._update_age_anchors(cold_start, _MAX_ID)
+
+        assert len(writes) == 1, (
+            f'a cold start of {len(cold_start)} observations must be one write,'
+            f' got {len(writes)}'
+        )
+
+        writes.clear()
+        scheduler._update_age_anchors(cold_start, _MAX_ID)
 
         assert writes == [], 'a re-observation of an unchanged observation must be silent'
 
