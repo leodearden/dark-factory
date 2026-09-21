@@ -1838,6 +1838,30 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     return _measure_raises(current, baseline)
 
 
+def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
+    """Every raise the move from the *previous* baseline image to *current* makes.
+
+    THE ENFORCEMENT POINT THE WRITER CANNOT BE. ``write_baseline``'s gate
+    compares a fresh report against whatever sits at the destination, so a
+    baseline deleted first, or rendered elsewhere and copied over, leaves it
+    nothing to compare and resets every frozen measure. This face compares two
+    committed IMAGES instead, which is the shape a raise actually arrives in:
+    a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
+    commit with -- and being two images rather than a measurement, it runs no
+    complexipy, reads no tree, and still consults no git.
+
+    Both images load through ``load_baseline``, so a missing or malformed one is
+    that function's named hard failure rather than a silent empty-baseline pass.
+
+    DELIBERATELY NOT APPLIED here, as in ``write_baseline`` and for the same
+    stated reason: ``_require_matching_params``. A commit that widens
+    ``CLUSTER_PATHS`` legitimately changes the recorded params, and that is the
+    one workflow ``resolve_cluster_paths`` prescribes.
+    """
+    return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
+
+
+
 # ---------------------------------------------------------------------------
 # CLI, in the house shape of scripts/scan_task_toolcall_leaks.py: _build_parser()
 # / _render_table() / main(argv) -> int, with the exit ladder documented in the
