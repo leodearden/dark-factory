@@ -9735,3 +9735,192 @@ def test_cli_report_exit_code_unchanged_by_the_new_fields(
 
     assert wdog._cli(["--report"]) == 1
     assert "2/" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The in-flight fleet-redeploy LEASE (task 4755)
+#
+# A lease is LIVE iff the recorded pid is alive AND the lease is younger than
+# FLEET_LEASE_MAX_AGE_SECS. BOTH tests are required and they fail in opposite
+# directions: age alone lets a SIGKILLed sweep's leftover lease suppress every
+# redeploy for the full bound, and pid alone is defeated by pid reuse, where an
+# unrelated process inherits the number and the lease becomes immortal.
+# Requiring both means a crashed sweep costs at most ONE delayed window.
+#
+# The pid predicate must reject a non-positive pid BEFORE reaching os.kill:
+# os.kill(0, 0) signals the CALLER'S ENTIRE process group and os.kill(-N, 0) a
+# foreign group, so a corrupt pid is a live hazard, not a defensiveness
+# question. Mirrors orchestrator/src/orchestrator/session_registry.py::_pid_alive.
+# ---------------------------------------------------------------------------
+
+
+def _reliably_dead_pid() -> int:
+    """A pid that has exited AND been reaped, so it names no live process."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    assert wait_pid_gone(proc.pid), f"pid {proc.pid} outlived its own reaping"
+    return proc.pid
+
+
+def _write_lease(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body,
+) -> pathlib.Path:
+    """Point FLEET_LEASE_PATH at a tmp file holding *body* (dict -> JSON, str verbatim)."""
+    lease_file = tmp_path / "lease.json"
+    lease_file.write_text(body if isinstance(body, str) else json.dumps(body))
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(lease_file))
+    return lease_file
+
+
+def _poison_os_kill(wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if os.kill is reached at all — the pid-0 hazard guard."""
+
+    def _never(*args, **kwargs):
+        raise AssertionError(
+            f"os.kill must never be called for an unusable pid; got {args!r}"
+        )
+
+    monkeypatch.setattr(wdog.os, "kill", _never)
+
+
+def test_live_fleet_lease_returns_payload_when_pid_alive_and_fresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A lease held by THIS process, stamped now, is live and returned intact."""
+    wdog = _load_watchdog()
+    unit = synthetic_unit("lease-holder")
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {"pid": os.getpid(), "started_ts": time.time(), "current_unit": unit},
+    )
+
+    lease = wdog._live_fleet_lease()
+
+    assert lease is not None, "a live lease must be reported, not swallowed"
+    assert lease["pid"] == os.getpid()
+    assert lease["current_unit"] == unit
+    assert isinstance(lease["started_ts"], (int, float))
+
+
+def test_live_fleet_lease_is_none_when_pid_is_dead_despite_fresh_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A SIGKILLed sweep's leftover lease must not suppress the backstop.
+
+    The age test alone would hold this lease live for the whole max-age bound.
+    """
+    wdog = _load_watchdog()
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": _reliably_dead_pid(),
+            "started_ts": time.time(),
+            "current_unit": synthetic_unit("gone"),
+        },
+    )
+
+    assert wdog._live_fleet_lease() is None
+
+
+def test_live_fleet_lease_is_none_past_the_max_age_bound_despite_live_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Pid reuse must not make a lease immortal — the age test is independent.
+
+    os.getpid() is trivially alive, so only the bound can reject this one.
+    """
+    wdog = _load_watchdog()
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": time.time() - (wdog.FLEET_LEASE_MAX_AGE_SECS + 1),
+            "current_unit": synthetic_unit("ancient"),
+        },
+    )
+
+    assert wdog._live_fleet_lease() is None
+
+
+def test_live_fleet_lease_is_none_when_the_file_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """No lease file is the normal "no sweep running" case, and must be silent."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._live_fleet_lease() is None
+    assert logged == [], (
+        f"a missing lease is read on every 60s tick; logging it would spam the "
+        f"journal: {logged}"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["not json at all", '{"pid": 1, ', "[1, 2]", '"hello"', "null"],
+    ids=["garbage", "truncated", "list", "string", "null"],
+)
+def test_live_fleet_lease_fails_open_on_an_unusable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, body: str
+) -> None:
+    """A corrupt lease must never raise, and must never wedge the fleet."""
+    wdog = _load_watchdog()
+    _write_lease(wdog, monkeypatch, tmp_path, body)
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._live_fleet_lease() is None
+    assert logged, "a degraded read is a genuine degradation and must be logged"
+
+
+@pytest.mark.parametrize(
+    "pid",
+    [None, 0, -1, -12345, "4321", 12.0, True, False],
+    ids=["missing", "zero", "neg-one", "neg-group", "string", "float", "true", "false"],
+)
+def test_live_fleet_lease_rejects_an_unusable_pid_without_calling_os_kill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, pid
+) -> None:
+    """An unusable pid is rejected BEFORE the syscall, not by catching it.
+
+    os.kill(0, 0) signals the caller's entire process group and os.kill(-N, 0)
+    a foreign group, so reaching the syscall at all is the defect.
+    """
+    wdog = _load_watchdog()
+    body = {"started_ts": time.time(), "current_unit": synthetic_unit("bad-pid")}
+    if pid is not None:
+        body["pid"] = pid
+    _write_lease(wdog, monkeypatch, tmp_path, body)
+    _poison_os_kill(wdog, monkeypatch)
+
+    assert wdog._live_fleet_lease() is None
+
+
+@pytest.mark.parametrize(
+    "started_ts",
+    [None, "recently", [], {}, "NaN-ish"],
+    ids=["missing", "string", "list", "dict", "unparseable"],
+)
+def test_live_fleet_lease_is_none_when_started_ts_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, started_ts
+) -> None:
+    """Without a usable timestamp the bound cannot be applied, so the lease is not live."""
+    wdog = _load_watchdog()
+    body = {"pid": os.getpid(), "current_unit": synthetic_unit("no-ts")}
+    if started_ts is not None:
+        body["started_ts"] = started_ts
+    _write_lease(wdog, monkeypatch, tmp_path, body)
+
+    assert wdog._live_fleet_lease() is None
