@@ -163,21 +163,36 @@ class TaskSteward:
         self._stopped = False
         self._task: asyncio.Task | None = None
         # The four guards below are restart-durable and TTL-bounded (task
-        # 5352): they are keyed by ESCALATION id and live in
-        # <project_root>/data/orchestrator/guards/, so a fleet redeploy no
-        # longer hands a record that already exhausted its ladder a fresh full
-        # budget.  A project_root that cannot be resolved yields the in-memory
-        # mode — today's behaviour — with no branch at any consumption site.
+        # 5352), keyed by (TASK, escalation id): one file per task under
+        # <project_root>/data/orchestrator/guards/<guard>/<task_id>.json, so a
+        # fleet redeploy no longer hands a record that already exhausted its
+        # ladder a fresh full budget, and a redeployed steward for the SAME
+        # task reads the same file.  A project_root that cannot be resolved
+        # yields the in-memory mode — the pre-5352 behaviour — with no branch
+        # at any consumption site.
+        #
+        # The per-task scoping is load-bearing, not tidiness.  Both places
+        # that ENUMERATE rather than test membership read the whole set, so a
+        # file shared by every steward in the process made
+        # _log_capped_idle_once warn with a count and a list of escalations
+        # belonging to OTHER tasks — falsifying task 3170's incident signal,
+        # whose success condition is silence — and made
+        # _watch_for_escalation's argv grow with a week of fleet-wide cap
+        # history.  A task id as a filename component follows
+        # orchestrator/src/orchestrator/cli.py::_write_task_file, so there is
+        # no new sanitisation contract here.
         self._retry_counts: MutableMapping[str, int] = PersistentMap(
-            guard_path(config.project_root, 'steward_retry_counts.json'),
+            guard_path(config.project_root, 'steward_retry_counts', f'{task_id}.json'),
             ttl=_STEWARD_GUARD_TTL,
         )
         self._timeout_counts: MutableMapping[str, int] = PersistentMap(
-            guard_path(config.project_root, 'steward_timeout_counts.json'),
+            guard_path(config.project_root, 'steward_timeout_counts', f'{task_id}.json'),
             ttl=_STEWARD_GUARD_TTL,
         )
         self._empty_output_counts: MutableMapping[str, int] = PersistentMap(
-            guard_path(config.project_root, 'steward_empty_output_counts.json'),
+            guard_path(
+                config.project_root, 'steward_empty_output_counts', f'{task_id}.json',
+            ),
             ttl=_STEWARD_GUARD_TTL,
         )
         # Escalations a steward has permanently given up on — TERMINAL for this
@@ -192,7 +207,9 @@ class TaskSteward:
         # sites: _handle_escalation's early return, _next_escalation's filter,
         # and the watcher's --exclude-id argv.
         self._capped_escalations: MutableSet[str] = PersistentSet(
-            guard_path(config.project_root, 'steward_capped_escalations.json'),
+            guard_path(
+                config.project_root, 'steward_capped_escalations', f'{task_id}.json',
+            ),
             ttl=_STEWARD_GUARD_TTL,
         )
         # Loud-ONCE guard for the capped-only idle state (see
@@ -1096,13 +1113,18 @@ class TaskSteward:
         steward for the same task was entitled to try again — and since the
         fleet redeploys every ~8-15h, a permanently unhandleable escalation
         was re-adopted and its ladder re-burnt on that cadence, indefinitely.
-        The give-up is now terminal for the TASK.
+        The give-up is now terminal for the TASK, which is exactly what the
+        state is keyed by: one file per task, so a redeployed steward for the
+        same task reads it and a steward for any other task cannot.
 
-        Two things bound that.  The key is the ESCALATION id, so a genuinely
-        new record always finds a full budget and only the byte-identical one
-        that already exhausted the ladder is remembered.  And the record
-        expires after ``_STEWARD_GUARD_TTL``, so even that memory does not
-        outlive its subject.
+        Three things bound that.  The key is (task, ESCALATION id), so a
+        genuinely new record always finds a full budget and only the
+        byte-identical one that already exhausted the ladder is remembered.
+        The file is per-task, so the two sites that ENUMERATE this set —
+        :meth:`_log_capped_idle_once` and :meth:`_watch_for_escalation`'s
+        ``--exclude-id`` argv — see this task's ids and nothing else.  And the
+        record expires after ``_STEWARD_GUARD_TTL``, so even that memory does
+        not outlive its subject.
         """
         self._capped_escalations.add(escalation_id)
 

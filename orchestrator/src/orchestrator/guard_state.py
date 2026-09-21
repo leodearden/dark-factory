@@ -66,12 +66,20 @@ logger = logging.getLogger(__name__)
 _MISSING: Any = object()
 
 
-def guard_path(project_root: str | Path | None, filename: str) -> Path | None:
+def guard_path(project_root: str | Path | None, *parts: str) -> Path | None:
     """Where one guard's state lives, or ``None`` when there is no project root.
 
     ``None`` is not an error: it is the in-memory mode, which is what a
-    bare-harness owner gets.  Returning it from HERE is what keeps the four
-    call sites free of a ``state_path is None`` branch.
+    bare-harness owner gets.  Returning it from HERE is what keeps the call
+    sites free of a ``state_path is None`` branch.
+
+    *parts* are the path components below the guards directory, supplied
+    separately rather than as one string carrying an embedded ``/`` for a
+    reader to re-parse.  A per-process guard passes one part (its file name);
+    a per-TASK guard passes two — the guard's name and ``f'{task_id}.json'``
+    — so the scoping is visible in the arguments instead of hidden in
+    punctuation.  ``atomic_write_text(..., mkdir=True)`` creates whatever
+    directories that implies on first write.
 
     The falsy/``'None'`` test is the guard
     ``orchestrator/src/orchestrator/scheduler.py::Scheduler._write_snapshot_best_effort``
@@ -84,7 +92,7 @@ def guard_path(project_root: str | Path | None, filename: str) -> Path | None:
     """
     if not project_root or str(project_root) == 'None':
         return None
-    return Path(project_root, 'data', 'orchestrator', 'guards', filename)
+    return Path(project_root, 'data', 'orchestrator', 'guards', *parts)
 
 
 def _utc_now() -> datetime:
@@ -277,10 +285,14 @@ class _GuardStore:
     def flush(self) -> None:
         """Persist the entries: LOAD, MERGE, then write.
 
-        Not a blind overwrite, because one file can have several owners in one
-        process — multiple ``TaskSteward`` instances share one file per counter
-        — and an overwrite would let one steward's flush erase another's
-        entries, silently re-arming the guard this store exists to keep.
+        Not a blind overwrite, because a file can have more than one live
+        owner and an overwrite would let one owner's flush erase another's
+        entries, silently re-arming the guard this store exists to keep.  The
+        guards that own one file per process are only ever single-writer in
+        the steady state, but a replacement owner is constructed while its
+        predecessor is still alive — a redeployed ``TaskSteward`` for the same
+        task overlaps the one it replaces — so single-writer is a property of
+        a moment, not of the file, and this primitive does not assume it.
         Merge-by-key is sound because every key is globally unique (escalation
         ids, task ids).  Our own entries win and our own removals apply; the
         merged view is then adopted as this instance's cache, so a second

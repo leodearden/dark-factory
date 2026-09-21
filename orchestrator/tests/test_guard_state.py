@@ -305,10 +305,11 @@ class TestGuardStateDurability:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     def test_two_owners_of_one_file_do_not_erase_each_other(self, tmp_path: Path):
-        """Multiple ``TaskSteward`` instances live in ONE process and share one
-        file per counter, so a blind overwrite would silently re-arm the very
-        guard this task makes durable.  Keys are globally unique (escalation
-        ids, task ids), so merge-by-key is sound."""
+        """A replacement owner is constructed while its predecessor is still
+        alive — a redeployed ``TaskSteward`` for the same task overlaps the one
+        it replaces — so a blind overwrite would silently re-arm the very guard
+        this task makes durable.  Keys are globally unique (escalation ids,
+        task ids), so merge-by-key is sound."""
         path = tmp_path / 'capped.json'
         owner_a = PersistentSet(path, ttl=_TTL)
         owner_b = PersistentSet(path, ttl=_TTL)
