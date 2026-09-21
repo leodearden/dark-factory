@@ -221,8 +221,9 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    cover only the destructure shape, so it is a maintained starting point, not a
    census guard. Retired from that earlier list:
    `scheduler_drawer.jsx`, `tab_curator.jsx`, `tab_memory_evals.jsx` and
-   `tab_scheduler.jsx` carry **zero** tile call sites and bind no `StatTile` at all. `shell.jsx::ProjectGroup` is **not** the pips' owner
-   either: it takes `summary` as an opaque node and renders no pip itself (the token
+   `tab_scheduler.jsx` carry **zero** tile call sites and bind no `StatTile` at all.
+   `shell.jsx::ProjectGroup` is **not** the pips' owner either: it takes `summary` as
+   an opaque node and renders no pip itself (the token
    does not occur in the file). Every pip today is a caller-side JSX fragment sharing
    only the `.proj-head .summary .pip` CSS — **23 fragments, measured 2026-09-21
    (task 5706)** by `className="pip"`, which carries none of the tiles' alias hazard:
