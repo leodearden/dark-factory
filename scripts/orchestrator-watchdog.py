@@ -2368,6 +2368,43 @@ def _format_epoch(epoch: int | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
 
 
+def _format_fleet_lease() -> str:
+    """Render the in-flight fleet-redeploy lease for ``--report``, in one line.
+
+    Reads via _read_fleet_lease, NOT _live_fleet_lease, deliberately: the
+    latter collapses every not-live reason into None, and the two not-live
+    reasons call for DIFFERENT operator actions. A dead holder means a sweep
+    crashed with its work unfinished; an overrun one means the sweep is
+    probably still running and merely past the bound. An operator must be able
+    to tell which without opening the file — that is the whole reason the
+    lease is surfaced at all.
+
+    Strictly read-only, like every other --report field (I7/I8): this never
+    creates, rewrites or removes the lease. The producer's lease_release is an
+    ``rm -f``, so doctor mode must be visibly not that.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        # _read_fleet_lease cannot distinguish absent from corrupt (both are
+        # None by its fail-open contract), so ask the filesystem directly.
+        return "none" if not os.path.exists(FLEET_LEASE_PATH) else "unreadable"
+    age = _fleet_lease_age_secs(lease)
+    if age is None:
+        return "unreadable"
+    pid = lease.get("pid")
+    if not _pid_alive(pid):
+        return f"stale (pid {pid} not running, age {age / 60:.0f}m)"
+    if age >= FLEET_LEASE_MAX_AGE_SECS:
+        return (
+            f"expired (pid {pid}, age {age / 3600:.1f}h > "
+            f"{FLEET_LEASE_MAX_AGE_SECS / 3600:.1f}h bound)"
+        )
+    return (
+        f"live (pid {pid}, unit {lease.get('current_unit') or '-'}, "
+        f"age {age / 60:.0f}m)"
+    )
+
+
 def _classify_unit_heartbeat(unit: str, now: float) -> str:
     """Classify *unit*'s merge-idle heartbeat for report()'s MERGE-IDLE column.
 
@@ -2447,8 +2484,20 @@ def report() -> int:
     defers on; idle proceeds immediately and stale/absent proceed after the
     gate's short unknown-grace.
 
-    Read-only: report() never writes the fleet-deploy clock file and issues
-    zero mutating systemctl calls (I8).
+    FLEET-LEASE is a single fleet-wide LINE printed above the table (task
+    4755), not an eighth column: the lease is one fact about the whole fleet,
+    so a column would repeat it on every row for no gain — DEPLOY-AGE already
+    pays that cost and is the reason not to add a second. It renders four
+    distinguishable states — none / live / stale (holder not running) /
+    expired (past FLEET_LEASE_MAX_AGE_SECS) / unreadable — because the two
+    not-live reasons call for different operator actions. It is the only way
+    to see, without hand-reading JSON, why the backstop and the coordinator
+    are both declining to redeploy.
+
+    Read-only: report() never writes the fleet-deploy clock file, never
+    creates, rewrites or removes the in-flight lease, and issues zero mutating
+    systemctl calls (I8). The lease clause is explicit because the producer's
+    lease_release is an ``rm -f``: doctor mode must be visibly not that.
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
@@ -2465,6 +2514,7 @@ def report() -> int:
         "head-start / commit-grace restraint gates staleness_pass() applies "
         "before actually restarting a unit."
     )
+    print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
         f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
         f"{'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
