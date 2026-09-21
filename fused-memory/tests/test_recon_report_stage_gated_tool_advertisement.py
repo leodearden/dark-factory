@@ -185,3 +185,110 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
                 '— Stage 2 HOLDS it (absent from STAGE2_DISALLOWED in cli_stage_runner.py) '
                 'and a held-but-unadvertised tool is invisible to the agent.'
             )
+
+
+class TestStageGatedToolBlocksAreWiredNotRePasted:
+    """Pins the WIRING of the two advertisement blocks — constant identity,
+    verbatim, exactly once, per stage — never their prose.
+
+    This is the INV-5 guard the membership assertions above cannot be. Every
+    per-name assertion in the class above passes equally if the block text were
+    re-pasted inline in stage1.py / stage2.py instead of interpolating the
+    shared constant, which is exactly the drift these constants exist to
+    prevent. Same discipline test_recon_gate_closure_guidance.py's docstring
+    states: prose may be reworded freely; the wiring may not silently break.
+
+    Each test imports its constant LOCALLY rather than at module scope, the
+    pattern TestStagePromptsCarryTheAnnotationNorm documents in
+    test_recon_amend_tool_advertisement.py: while a constant does not exist
+    yet, its ImportError is isolated to the test that needs it and the
+    already-green assertions elsewhere in this file stay collectible.
+    """
+
+    def test_citation_repair_block_embedded_exactly_once_in_stage1_prompt(self):
+        from fused_memory.reconciliation.prompts import CITATION_REPAIR_TOOL_BLOCK
+        assert STAGE1_SYSTEM_PROMPT.count(CITATION_REPAIR_TOOL_BLOCK) == 1, (
+            'STAGE1_SYSTEM_PROMPT must interpolate CITATION_REPAIR_TOOL_BLOCK verbatim, '
+            'exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        )
+
+    def test_citation_repair_block_embedded_exactly_once_in_stage2_prompt(self):
+        from fused_memory.reconciliation.prompts import CITATION_REPAIR_TOOL_BLOCK
+        assert STAGE2_SYSTEM_PROMPT.count(CITATION_REPAIR_TOOL_BLOCK) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate CITATION_REPAIR_TOOL_BLOCK verbatim, '
+            'exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        )
+
+    def test_citation_repair_block_absent_from_stage3_prompt(self):
+        """Stage 3 is denied repair_memory_citation via
+        DISALLOW_RECON_REPORT_JOURNAL_WRITES — it is the stage that DETECTS
+        dangling citations, and detect and repair must not be the same actor."""
+        from fused_memory.reconciliation.prompts import CITATION_REPAIR_TOOL_BLOCK
+        assert CITATION_REPAIR_TOOL_BLOCK not in STAGE3_SYSTEM_PROMPT
+
+    def test_standing_decision_write_block_embedded_exactly_once_in_stage2_prompt(self):
+        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
+        assert STAGE2_SYSTEM_PROMPT.count(ENTITY_STANDING_DECISION_WRITE_BLOCK) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate ENTITY_STANDING_DECISION_WRITE_BLOCK '
+            'verbatim, exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        )
+
+    def test_standing_decision_write_block_absent_from_stage1_prompt(self):
+        """Stage 2 is the ONLY stage holding write_entity_standing_decision —
+        Stage 1 and Stage 3 are denied it via DISALLOW_RECON_REPORT_LEDGER_WRITES.
+        A block that leaked into Stage 1 would also trip the absence arm above,
+        but this pins the CONSTANT rather than the tool name, so a reworded
+        block still cannot drift into the wrong stage."""
+        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
+        assert ENTITY_STANDING_DECISION_WRITE_BLOCK not in STAGE1_SYSTEM_PROMPT
+
+    def test_standing_decision_write_block_absent_from_stage3_prompt(self):
+        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
+        assert ENTITY_STANDING_DECISION_WRITE_BLOCK not in STAGE3_SYSTEM_PROMPT
+
+    @pytest.mark.parametrize('project_id', _STAGE2_PROJECT_IDS)
+    def test_citation_repair_block_survives_both_build_stage2_branches(self, project_id):
+        from fused_memory.reconciliation.prompts import CITATION_REPAIR_TOOL_BLOCK
+        built = build_stage2_system_prompt(project_id)
+        assert built.count(CITATION_REPAIR_TOOL_BLOCK) == 1, (
+            f'build_stage2_system_prompt({project_id!r}) dropped or duplicated '
+            'CITATION_REPAIR_TOOL_BLOCK.'
+        )
+
+    @pytest.mark.parametrize('project_id', _STAGE2_PROJECT_IDS)
+    def test_standing_decision_write_block_survives_both_build_stage2_branches(
+        self, project_id
+    ):
+        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
+        built = build_stage2_system_prompt(project_id)
+        assert built.count(ENTITY_STANDING_DECISION_WRITE_BLOCK) == 1, (
+            f'build_stage2_system_prompt({project_id!r}) dropped or duplicated '
+            'ENTITY_STANDING_DECISION_WRITE_BLOCK.'
+        )
+
+    @pytest.mark.parametrize(
+        'heading',
+        ['## Entity Standing Decisions', '## Investigation Outcome Records'],
+    )
+    def test_headings_the_standing_decision_block_cross_references_exist_in_stage2(
+        self, heading
+    ):
+        """ENTITY_STANDING_DECISION_WRITE_BLOCK deliberately POINTS AT these two
+        sections instead of re-pasting them — the grounds enum lives in the
+        first (rendered by render_entity_standing_decision_schema_section()) and
+        the arm-2 evidence pool in the second (render_investigation_outcome_section()),
+        and each is single-sourced there.
+
+        Cross-referencing a heading that does not exist in the target prompt is
+        a recorded hazard: STALE_KNOWLEDGE_ANNOTATION_NORM's comment carries two
+        such MUST-NOTs, both for headings that exist in one stage prompt and not
+        another. That block avoids the hazard by naming no heading at all; this
+        one accepts it (it is Stage-2-only, so both headings are reachable) and
+        pays for it with this guard. If a renderer is reworded or dropped, the
+        pointer must be updated in the same change.
+        """
+        assert heading in STAGE2_SYSTEM_PROMPT, (
+            f'ENTITY_STANDING_DECISION_WRITE_BLOCK points the agent at {heading!r}, but '
+            'no such heading is in STAGE2_SYSTEM_PROMPT. Either the renderer that emits '
+            'it was reworded/dropped, or the block now points at nothing.'
+        )
