@@ -1214,6 +1214,34 @@ def create_server(
     # counter in this closure is what preserves that property.
     _amendment_truncation_storm = StormCounter()
 
+    # --- promote_to_l2 find -> write serialisation (task 5648) ---
+
+    # Same PROCESS-LOCAL, per-instance-BY-CONSTRUCTION reasoning as the
+    # StormCounter above, and the same reason for living in this closure:
+    # server.py holds zero module-level mutable state.  A module-level lock
+    # would also bind two create_server instances in one test session to one
+    # critical section.
+    #
+    # WHY THIS SITE IS SERIALISED AND THE `escalate_*` PATH IS NOT.  The two
+    # differ in what a lost atomicity COSTS, not in how likely it is.  A missed
+    # L0 fold costs one extra pending record, which find_dedupe_parent's own
+    # contract already tolerates and which several other writer PROCESSES
+    # against this queue root can already produce.  A duplicate L2 is a
+    # duplicate HUMAN PAGE: nothing downstream folds it, promote_to_l2 is the
+    # SOLE minting path for a root_cause (further narrowed by the
+    # PROMOTE_ALLOWED identity gate), and this file already refuses a
+    # root_cause that canonicalises to empty precisely because duplicate L2s
+    # are a defect worth rejecting input over.
+    #
+    # Holding it across the hop reproduces the inline code's mutual exclusion
+    # exactly while freeing the loop, so it is strictly better than what was
+    # here before and imposes no new constraint.
+    #
+    # What it does NOT claim: it is per-PROCESS.  A cross-process minter is
+    # still covered by the existing find -> update race fall-through below
+    # ("pending L2 disappeared during member-update"), which stays.
+    _promote_lock = asyncio.Lock()
+
     async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
@@ -2995,134 +3023,154 @@ def create_server(
                 ),
             }
 
-        # Validate FIRST, derive second — an invalid explicit severity must mint
-        # nothing and must never be reachable past the derive branch.  Derived
-        # from the RAW member_ids: the fold is order-independent by
-        # construction, and deduplicating the id list is a storage concern.
-        #
-        # `derived is None` means the members said nothing usable (no id
-        # resolved, or every resolved member carried an out-of-vocabulary
-        # severity).  The two paths below fail safe in DIFFERENT directions,
-        # which is why the helper reports the fact instead of picking one.
-        derived = (
-            None if severity is not None else _derive_l2_severity(queue, member_ids)
-        )
+        # Everything from here on is inside the lock: the FIND and the WRITE it
+        # decides between must not interleave with another promote on this
+        # loop.  The validations above stay OUTSIDE it and outside the hop, so
+        # a rejected call still mints nothing and still costs no I/O.  The two
+        # `await _report_*` calls stay INSIDE: neither helper takes this lock,
+        # so no self-deadlock is possible, and breaking up a 120-line body to
+        # shave a hold that only occurs on a rare threshold crossing would cost
+        # more clarity than it buys.
+        async with _promote_lock:
+            # Validate FIRST, derive second — an invalid explicit severity must mint
+            # nothing and must never be reachable past the derive branch.  Derived
+            # from the RAW member_ids: the fold is order-independent by
+            # construction, and deduplicating the id list is a storage concern.
+            #
+            # `derived is None` means the members said nothing usable (no id
+            # resolved, or every resolved member carried an out-of-vocabulary
+            # severity).  The two paths below fail safe in DIFFERENT directions,
+            # which is why the helper reports the fact instead of picking one.
+            #
+            # ONE hop for BOTH reads: they are adjacent with only pure-memory
+            # severity resolution between them, so a single to_thread introduces
+            # ONE yield point where two would introduce two — the same loop relief
+            # for fewer interleavings to reason about.  _derive_l2_severity's
+            # per-member queue.get() can itself trigger a targeted archive rglob
+            # via _locate_path, so it is a scan worth hopping rather than a cheap
+            # read to leave behind.
+            def _read_for_promote():
+                derived = (
+                    None if severity is not None else _derive_l2_severity(queue, member_ids)
+                )
+                return derived, queue.find_pending_l2_by_root_cause(root_cause)
 
-        # CREATE must land on some severity, so an underivable set fails safe
-        # UP to 'blocking' — unchanged from before task 3976.
-        effective_severity = (
-            severity
-            if severity is not None
-            else (derived if derived is not None else 'blocking')
-        )
+            derived, existing_id = await asyncio.to_thread(_read_for_promote)
 
-        # UPDATE must NOT fail up: the existing L2 already carries a severity
-        # derived from its real members, so an underivable set has nothing to
-        # contribute and leaves the record (and its updated_at) alone.  Failing
-        # up here would re-inflate a correctly-inherited info L2 to blocking on
-        # nothing more than a typo'd or momentarily unreadable member id —
-        # exactly the inflation this task removes.
-        severity_floor = severity if severity is not None else derived
-
-        # Dedup check: look for an existing pending L2 with the same root_cause.
-        existing_id = queue.find_pending_l2_by_root_cause(root_cause)
-        if existing_id is not None:
-            # severity_floor is the caller's explicit value, or max(member
-            # severities) over the ids in THIS call — exactly the floor the
-            # incoming members justify — or None when they justify none, in
-            # which case add_members_to_l2 leaves the severity untouched.
-            # Upward-only inside add_members_to_l2, so an append can never
-            # quiet an existing L2.
-            # What this fold did to `amendments` is reported BY THE WRITER,
-            # from inside `escalation_id_lock` where it is already computed —
-            # not re-derived here from a pre-read plus a "did the count grow"
-            # heuristic.  That heuristic cost a second full read+parse per fold
-            # and was a real TOCTOU: the queue is built for cross-process
-            # mutators, so a concurrent fold between the pre-read and the call
-            # made the flag wrong in either direction.
-            outcome: AmendmentOutcome = {
-                'recorded': False, 'dropped': 0,
-                'variant_added': False, 'variants': 0,
-            }
-            updated = queue.add_members_to_l2(
-                existing_id,
-                list(dict.fromkeys(member_ids)),
-                severity_floor=severity_floor,
-                # The framing this promote carried in is APPENDED to the L2's
-                # `amendments` rather than discarded (task 3997, C2).  The
-                # record's OWN root_cause/detail/options/summary are untouched.
-                root_cause=root_cause,
-                evidence=evidence,
-                options=list(options),
-                summary=summary,
-                agent_role=agent_role,
-                outcome=outcome,
+            # CREATE must land on some severity, so an underivable set fails safe
+            # UP to 'blocking' — unchanged from before task 3976.
+            effective_severity = (
+                severity
+                if severity is not None
+                else (derived if derived is not None else 'blocking')
             )
-            if updated is not None:
-                # INV-4: repeated truncation gets a HEARER, not just a WARNING.
-                # The trigger is this call's OWN shed count, so it fires on the
-                # event rather than on an inferred difference.  Purely additive —
-                # _report_amendment_truncation_storm never raises, so a failed
-                # report can never fail this fold.
-                if outcome['dropped']:
-                    await _report_amendment_truncation_storm(existing_id)
-                # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
-                # Exactly-once per L2 by construction — `variants` is monotone
-                # and increments by one, so the equality can only hold on the
-                # single fold that crosses.  Never fatal, same as above.
-                if (
-                    outcome['variant_added']
-                    and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
-                ):
-                    await _report_root_cause_overfold(existing_id, outcome['variants'])
-                return {
-                    'id': existing_id,
-                    'status': 'updated',
-                    'members': updated.members,
-                    # Read off the returned Escalation, so this is the
-                    # POST-floor value rather than the argument.
-                    'severity': updated.severity,
-                    # Report the preservation, so a caller LEARNS its framing
-                    # landed instead of having to re-read the record to find out.
-                    'amendment_recorded': outcome['recorded'],
-                    'amendments': len(updated.amendments),
+
+            # UPDATE must NOT fail up: the existing L2 already carries a severity
+            # derived from its real members, so an underivable set has nothing to
+            # contribute and leaves the record (and its updated_at) alone.  Failing
+            # up here would re-inflate a correctly-inherited info L2 to blocking on
+            # nothing more than a typo'd or momentarily unreadable member id —
+            # exactly the inflation this task removes.
+            severity_floor = severity if severity is not None else derived
+
+            # Dedup check (read above): an existing pending L2 with this root_cause.
+            if existing_id is not None:
+                # severity_floor is the caller's explicit value, or max(member
+                # severities) over the ids in THIS call — exactly the floor the
+                # incoming members justify — or None when they justify none, in
+                # which case add_members_to_l2 leaves the severity untouched.
+                # Upward-only inside add_members_to_l2, so an append can never
+                # quiet an existing L2.
+                # What this fold did to `amendments` is reported BY THE WRITER,
+                # from inside `escalation_id_lock` where it is already computed —
+                # not re-derived here from a pre-read plus a "did the count grow"
+                # heuristic.  That heuristic cost a second full read+parse per fold
+                # and was a real TOCTOU: the queue is built for cross-process
+                # mutators, so a concurrent fold between the pre-read and the call
+                # made the flag wrong in either direction.
+                outcome: AmendmentOutcome = {
+                    'recorded': False, 'dropped': 0,
+                    'variant_added': False, 'variants': 0,
                 }
-            # Race: the pending L2 was resolved/archived between find and update.
-            # Fall through to the create path so the caller gets a valid result
-            # rather than a misleading {'status': 'updated', 'members': []}.
-            logger.warning(
-                'promote_to_l2: pending L2 %s disappeared during member-update (race); '
-                'creating a new L2 for root_cause=%r',
-                existing_id, root_cause,
-            )
+                updated = queue.add_members_to_l2(
+                    existing_id,
+                    list(dict.fromkeys(member_ids)),
+                    severity_floor=severity_floor,
+                    # The framing this promote carried in is APPENDED to the L2's
+                    # `amendments` rather than discarded (task 3997, C2).  The
+                    # record's OWN root_cause/detail/options/summary are untouched.
+                    root_cause=root_cause,
+                    evidence=evidence,
+                    options=list(options),
+                    summary=summary,
+                    agent_role=agent_role,
+                    outcome=outcome,
+                )
+                if updated is not None:
+                    # INV-4: repeated truncation gets a HEARER, not just a WARNING.
+                    # The trigger is this call's OWN shed count, so it fires on the
+                    # event rather than on an inferred difference.  Purely additive —
+                    # _report_amendment_truncation_storm never raises, so a failed
+                    # report can never fail this fold.
+                    if outcome['dropped']:
+                        await _report_amendment_truncation_storm(existing_id)
+                    # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
+                    # Exactly-once per L2 by construction — `variants` is monotone
+                    # and increments by one, so the equality can only hold on the
+                    # single fold that crosses.  Never fatal, same as above.
+                    if (
+                        outcome['variant_added']
+                        and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
+                    ):
+                        await _report_root_cause_overfold(existing_id, outcome['variants'])
+                    return {
+                        'id': existing_id,
+                        'status': 'updated',
+                        'members': updated.members,
+                        # Read off the returned Escalation, so this is the
+                        # POST-floor value rather than the argument.
+                        'severity': updated.severity,
+                        # Report the preservation, so a caller LEARNS its framing
+                        # landed instead of having to re-read the record to find out.
+                        'amendment_recorded': outcome['recorded'],
+                        'amendments': len(updated.amendments),
+                    }
+                # Race: the pending L2 was resolved/archived between find and update.
+                # Fall through to the create path so the caller gets a valid result
+                # rather than a misleading {'status': 'updated', 'members': []}.
+                logger.warning(
+                    'promote_to_l2: pending L2 %s disappeared during member-update (race); '
+                    'creating a new L2 for root_cause=%r',
+                    existing_id, root_cause,
+                )
 
-        # Create path: build a fresh L2 and submit it.
-        # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
-        # do not create duplicate entries in the on-disk record.
-        # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
-        # regardless of filing identity) and filed by a human/watcher promotion,
-        # not by a task-workflow incarnation.
-        esc_id = await asyncio.to_thread(queue.make_id, task_id)
-        esc = Escalation(
-            id=esc_id,
-            task_id=task_id,
-            agent_role=agent_role,
-            severity=effective_severity,
-            category=category,
-            summary=summary,
-            detail=evidence,
-            level=2,
-            members=list(dict.fromkeys(member_ids)),
-            root_cause=root_cause.strip(),
-            options=list(options),
-        )
-        queue.submit(esc)
-        return {
-            'id': esc.id,
-            'status': 'created',
-            'members': esc.members,
-            'severity': esc.severity,
-        }
+            # Create path: build a fresh L2 and submit it.
+            # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
+            # do not create duplicate entries in the on-disk record.
+            # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
+            # regardless of filing identity) and filed by a human/watcher promotion,
+            # not by a task-workflow incarnation.
+            esc_id = await asyncio.to_thread(queue.make_id, task_id)
+            esc = Escalation(
+                id=esc_id,
+                task_id=task_id,
+                agent_role=agent_role,
+                severity=effective_severity,
+                category=category,
+                summary=summary,
+                detail=evidence,
+                level=2,
+                members=list(dict.fromkeys(member_ids)),
+                root_cause=root_cause.strip(),
+                options=list(options),
+            )
+            queue.submit(esc)
+            return {
+                'id': esc.id,
+                'status': 'created',
+                'members': esc.members,
+                'severity': esc.severity,
+            }
 
     # --- Merge queue tools ---
 
