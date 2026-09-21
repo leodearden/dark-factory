@@ -3907,6 +3907,32 @@ class OrchestratorConfig(BaseSettings):
             'force_fire_after_secs + this. 0 disables. 10-min default.'
         ),
     )
+    # Max age of the in-flight fleet-redeploy lease (task 4755) before the
+    # orchestrator's own coordinator stops believing it. While
+    # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
+    # the coordinator stands down; the bound is what keeps a lease stranded by
+    # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
+    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
+    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
+    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
+    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
+    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
+    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # red-tier / restart-only, matching its siblings
+    # orchestrator_restart_merge_phase_grace_secs /
+    # orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_lease_max_age_secs: float = Field(
+        default=7200.0,
+        description=(
+            'Max age of the in-flight fleet-redeploy lease before the '
+            'orchestrator coordinator stops honouring it and redeploys anyway. '
+            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
+            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
+            'sweep delays at most one window. 2h default.'
+        ),
+    )
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
