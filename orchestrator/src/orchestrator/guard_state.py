@@ -31,6 +31,15 @@ collection ABCs so the guards keep the vocabulary they already speak:
 * :class:`PersistentMap` — a ``MutableMapping`` of key -> JSON value
   ("this happened N times", "this fingerprint owns that task id").
 
+Every entry carries a ``ttl`` supplied by the guard that owns it.  That value
+is an upper bound rather than a tuning dial — it asserts "this state must not
+outlive its subject", and each guard's subject (an escalation record, a task's
+residency in the merge queue, an open fix task, a resurrected task's pending
+window) has a lifetime its own module already knows, which is why the number
+lives next to the guard and not in this one.  Expiry is applied on read, on
+load and on flush, so an aged-out guard genuinely re-arms and the sidecar's
+growth is bounded without a separate sweeper.
+
 ``now`` is always injected rather than read from the wall clock internally,
 so a caller — and every TTL test — can drive elapsed scenarios deterministically
 (the convention
@@ -115,18 +124,32 @@ class _GuardStore:
 
     # --- reads ---
 
+    def _is_live(self, entry: _Entry, now: datetime) -> bool:
+        """Whether *entry* is still within the TTL at *now*.
+
+        The TTL is an upper bound, not a tuning dial: a guard's state must not
+        outlive the thing it was recorded about.  Everything reads through this
+        predicate, so an expired entry is indistinguishable from an absent one
+        and a guard that has aged out genuinely re-arms.
+        """
+        return now - entry.updated_at < self._ttl
+
     def live_keys(self) -> list[str]:
-        """Every key currently visible, in insertion order."""
-        return list(self._entries)
+        """Every unexpired key, in insertion order."""
+        now = self._now()
+        return [k for k, e in self._entries.items() if self._is_live(e, now)]
 
     def has_live(self, key: str) -> bool:
-        """Whether *key* is currently visible."""
-        return key in self._entries
+        """Whether *key* is present and unexpired."""
+        entry = self._entries.get(key)
+        return entry is not None and self._is_live(entry, self._now())
 
     def live_get(self, key: str, default: Any = None) -> Any:
-        """The value stored under *key*, or *default* if it is not present."""
+        """The value stored under *key*, or *default* if absent or expired."""
         entry = self._entries.get(key)
-        return default if entry is None else entry.value
+        if entry is None or not self._is_live(entry, self._now()):
+            return default
+        return entry.value
 
     # --- mutations (each flushes through the one chokepoint) ---
 
@@ -139,12 +162,14 @@ class _GuardStore:
     def insert_if_absent(self, key: str, value: Any) -> bool:
         """Store *value* under *key* only if *key* is not already present.
 
-        Returns whether anything changed.  A present key is left with its
-        ORIGINAL timestamp: the set facade's ``add`` is re-issued on every
-        tick by some callers, and re-timestamping would make the TTL measure
-        "last seen" rather than "first observed".
+        Returns whether anything changed.  A present, unexpired key is left
+        with its ORIGINAL timestamp and triggers no write: the set facade's
+        ``add`` is re-issued on every tick by some callers, and re-timestamping
+        would make the TTL measure "last seen" rather than "first observed".
+        An EXPIRED key is re-inserted with a fresh timestamp, which is how an
+        aged-out guard re-arms.
         """
-        if key in self._entries:
+        if self.has_live(key):
             return False
         self._entries[key] = _Entry(value=value, updated_at=self._now())
         self._removed.discard(key)
@@ -178,10 +203,11 @@ class _GuardStore:
         data, ok = load_json_or_warn(self._path, default={}, on_corrupt='warn')
         if not ok or not isinstance(data, dict):
             return {}
+        now = self._now()
         entries: dict[str, _Entry] = {}
         for key, row in data.items():
             entry = self._entry_from_row(key, row)
-            if entry is not None:
+            if entry is not None and self._is_live(entry, now):
                 entries[key] = entry
         return entries
 
@@ -225,6 +251,12 @@ class _GuardStore:
         merged view is then adopted as this instance's cache, so a second
         owner's keys stop looking absent to us.
 
+        Expired entries are pruned from the MERGED map, so another owner's dead
+        rows are collected too and not just our own — this, plus the same prune
+        on load, is the whole of what bounds the file's growth.  An empty result
+        releases the file rather than writing ``{}``, so the guards directory
+        cannot accumulate dead files.
+
         Fail-open, and that policy lives HERE rather than in the write helper
         (which always propagates): an ``OSError`` is warned and swallowed, and
         the in-memory entries stay authoritative for the rest of the process.
@@ -236,13 +268,18 @@ class _GuardStore:
         merged = {**self._load_raw(), **self._entries}
         for key in self._removed:
             merged.pop(key, None)
+        now = self._now()
+        merged = {k: e for k, e in merged.items() if self._is_live(e, now)}
         try:
-            safe_io.atomic_write_text(
-                self._path,
-                json.dumps({k: self._row_from_entry(e) for k, e in merged.items()}),
-                encoding='utf-8',
-                mkdir=True,
-            )
+            if not merged:
+                self._path.unlink(missing_ok=True)
+            else:
+                safe_io.atomic_write_text(
+                    self._path,
+                    json.dumps({k: self._row_from_entry(e) for k, e in merged.items()}),
+                    encoding='utf-8',
+                    mkdir=True,
+                )
         except OSError as exc:
             logger.warning(
                 'guard_state: failed to persist guard state at %s'
