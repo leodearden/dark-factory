@@ -10535,6 +10535,41 @@ def test_report_row_shows_unknown_liveness_restart_age_when_never_stamped(
     )
 
 
+def test_report_row_degrades_only_the_age_field_when_the_clock_read_RAISES(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """I8: a RAISING clock read costs one column, not the whole fm row.
+
+    _safe_age exists for the residue its callers' own fail-soft readers cannot
+    cover -- an unreadable file, a mid-read replace -- which reach it as a
+    RAISE rather than as None. The neighbouring age tests only cover an ABSENT
+    clock, which returns None without raising, so they leave that contract
+    unpinned: narrowing _safe_age's `except Exception` to a single error class
+    keeps every one of them green. This test is the one that goes red, because
+    losing the residue means losing the entire row an operator reads
+    mid-incident, not just the age.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    def _raises() -> float | None:
+        raise OSError("clock file vanished mid-read")
+
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", _raises)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert re.search(r"LIVENESS-RESTART-AGE:\s*unknown", out), (
+        f"a raising clock read must degrade its own field to 'unknown': {out!r}"
+    )
+    # The point of the helper: every SIBLING field on the row still renders.
+    assert "wedged" in out, f"a raising age read must not cost the verdict: {out!r}"
+    assert "streak:" in out, f"a raising age read must not cost the streak: {out!r}"
+    assert "DEPLOY-AGE:" in out, f"a raising age read must not cost DEPLOY-AGE: {out!r}"
+    assert "recon-busy:" in out, f"a raising age read must not cost recon-busy: {out!r}"
+
+
 def test_report_row_is_strictly_read_only_over_streak_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

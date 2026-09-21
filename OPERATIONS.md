@@ -1409,7 +1409,8 @@ scheduled deploy license an immediate extra liveness kill.
 non-healthy class.** It is sized strictly above the 3180s (53 min)
 worst-observed pathological instance lifetime, so even a wrong verdict
 cannot reproduce that pathology, and it bounds watchdog-initiated fm
-liveness revives to <=24/day.
+liveness revives to <=24/day. Lowering it was rejected, not overlooked: a
+shorter window re-exposes wedges to the kill-flapping task 3764 removed.
 
 READ THAT FIGURE CORRECTLY, because it has been misread before. 3180s is
 NOT the duration of a wedge episode. It is the longest of the fm instance

@@ -359,10 +359,21 @@ except (KeyError, ValueError):
 
 # Minimum wall-clock seconds between successive watchdog-initiated fm LIVENESS
 # restarts — the second layer, bounding the blast radius of a verdict that is
-# wrong anyway. 3600s strictly exceeds the 3180s (53 min) worst observed
-# pathological instance lifetime, so even a wrong verdict cannot reproduce that
+# wrong anyway. 3600s strictly exceeds the 3180s (53 min) LONGEST observed
+# pathological instance LIFETIME, so even a wrong verdict cannot reproduce that
 # pathology, and it bounds watchdog-initiated fm restarts to <=24/day versus
-# today's unbounded. Deliberately 8x SHORTER than the staleness pass's
+# today's unbounded.
+#
+# READ 3180s CORRECTLY: it is an INSTANCE LIFETIME, not the duration of a wedge.
+# Task 3764's evidence records fm instance lifetime (from runs.instance_id)
+# collapsing from ~20-35h to 45-53 min while the pre-3764 detector killed fm on
+# a single non-healthy verdict, uncapped -- so 3180s is a KILL CADENCE against a
+# process that was alive and serving, and this cap's job is to guarantee a
+# minimum inter-kill interval above it. Misreading it as a wedge duration is
+# what produced the port-down fast lane that esc-4131-9 dropped; OPERATIONS.md
+# section 8 carries the same reading. Note 53 min is the LONGEST of that
+# collapsed range, used deliberately as the conservative bar -- the most
+# pathological lifetime is the shortest. Deliberately 8x SHORTER than the staleness pass's
 # FM_RESTART_MIN_INTERVAL_SECS (28800s): a brokenness revive must react faster
 # than a scheduled deploy (I5). 0 disables the cap entirely.
 try:
@@ -1477,8 +1488,8 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     Called from fused_memory_liveness_pass() in the ``finally`` around
     restart_unit(), so the cap is armed even if the restart raised or the
     subsequent streak clear fails. Thin wrapper over the shared _stamp_clock
-    helper, which owns the ``{ts, iso}`` payload schema and the atomic-write
-    dance.
+    helper, which owns the payload schema and the atomic-write dance -- see
+    _stamp_clock for the field list, so this docstring cannot drift from it.
 
     THE RETURN VALUE IS LOAD-BEARING and must not be dropped. This is the one
     watchdog write whose failure points the WRONG way: _atomic_write_json is
@@ -1872,7 +1883,7 @@ def _register_transient_unit(argv: list[str], unit: str) -> None:
             argv, check=False, timeout=10, capture_output=True, text=True
         )
     except Exception as exc:  # noqa: BLE001
-        log(f"systemd-run registration of {unit} failed: {exc!r}")
+        logger.warning(f"systemd-run registration of {unit} failed: {exc!r}")
         return
 
     banner = (result.stderr or "").strip()
