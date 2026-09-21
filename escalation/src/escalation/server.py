@@ -1258,10 +1258,39 @@ def create_server(
             # Task 3550: unstamped by design — synthetic anchor task id and
             # severity='info' (pins Link 1 -> NON_PINNING), so the filing
             # identity is never read, and no incarnation filed it anyway.
+            # The mint runs OFF the loop, here and at the four other
+            # write-path sites.  `make_id` is scan-free in steady state, but on
+            # the ABSENT-counter branch — which its own docstring says every
+            # brand-new id-namespace key's FIRST mint takes — it reconciles via
+            # `_recover_seq_from_disk`, which globs the queue root AND rglobs
+            # the whole archive subtree.  Measured on the live root
+            # (2026-09-21): 8,421 dirents, 3,913 archived records across 30
+            # dated subdirs, ~12.6 ms per new key — the same order as the
+            # 13.12 ms pending scan task 4391 moved, and growing with lifetime
+            # count and archive retention the same way.  2,222 counters live
+            # there now, i.e. 2,222 first mints already paid it on the
+            # orchestrator's loop.
+            #
+            # No added serialisation, because none is needed: the whole
+            # read -> increment -> durable write already runs inside
+            # `escalation_id_lock(queue_dir, f'esc-{key}.seq')`, and `make_id`'s
+            # docstring already states that concurrent minters under one key
+            # serialise on that stable sidecar inode and never observe the same
+            # counter value.  `fcntl.flock` is per-open-file-description, so
+            # hopping merely adds in-process threads to a set the lock was
+            # already built to cover.  The yield point it introduces sits
+            # between validation and the `Escalation` construction and touches
+            # no other shared state.
+            #
+            # Why the WRITES beside it stay inline is a different argument, and
+            # it lives beside `dedupe.submit_or_dedupe_off_loop`.
+            esc_id = await asyncio.to_thread(
+                queue.make_id, _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+            )
             await _submit_or_dedupe(Escalation(
                 # Filed under the synthetic anchor, NOT the triggering promote's
                 # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
-                id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
+                id=esc_id,
                 task_id=_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
                 agent_role='escalation-server',
                 # A report about lost framing is a notification, not a page:
@@ -1334,10 +1363,13 @@ def create_server(
         a notification; a raised one would cost the fold.
         """
         try:
+            esc_id = await asyncio.to_thread(
+                queue.make_id, _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+            )
             await _submit_or_dedupe(Escalation(
                 # Synthetic anchor, NOT the triggering promote's task_id — see
                 # _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID.
-                id=queue.make_id(_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID),
+                id=esc_id,
                 task_id=_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
                 agent_role='escalation-server',
                 # A report about matching precision is a notification, not a
@@ -1605,8 +1637,9 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
-            id=queue.make_id(task_id),
+            id=esc_id,
             task_id=task_id,
             agent_role=agent_role,
             severity=severity,
@@ -1763,8 +1796,9 @@ def create_server(
         # fail-dangerous); an unexpected filer is made observable instead.
         if level == 1:
             _warn_if_unexpected_l1_filer(agent_role, task_id, category)
+        esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
-            id=queue.make_id(task_id),
+            id=esc_id,
             task_id=task_id,
             agent_role=agent_role,
             severity=severity,
@@ -3068,8 +3102,9 @@ def create_server(
         # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
         # regardless of filing identity) and filed by a human/watcher promotion,
         # not by a task-workflow incarnation.
+        esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
-            id=queue.make_id(task_id),
+            id=esc_id,
             task_id=task_id,
             agent_role=agent_role,
             severity=effective_severity,
