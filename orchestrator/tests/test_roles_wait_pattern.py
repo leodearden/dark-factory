@@ -460,7 +460,6 @@ async def test_amender_prompt_reinforces_the_wait_rules(
     ):
         prompt = await briefing.build_amender_prompt(
             plan={'task_id': '1', 'title': 't', 'analysis': 'a'},
-            iteration_log=[],
             suggestions=[],
             locked_modules=['x'],
             task_id='1',
