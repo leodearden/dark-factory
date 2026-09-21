@@ -67,8 +67,9 @@ WHAT THIS DOES NOT COVER, deliberately:
   * comments, per the paragraph above;
   * a tool named in PLAIN PROSE. Only backtick spans are scanned, so "poll it
     with BashOutput" escapes. Dropping the backtick requirement is not the fix
-    -- every sentence-initial word becomes a candidate -- and this hole is
-    stated here because the deleted-upstream one below it is NOT the only one;
+    -- every sentence-initial word becomes a candidate. Stated because ITS
+    KNOWN HOLE above is not the only hole, and reading it as exhaustive is
+    what would let this one through unnoticed;
   * tool GRANTS. Unlike its MCP sibling this guard asserts EXISTENCE only,
     and the reason is measured and recorded in roles.py's own TOOL
     AVAILABILITY comment: `--allowed-tools` is a PERMISSION allowlist, not a
