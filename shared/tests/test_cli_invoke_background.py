@@ -335,7 +335,16 @@ class TestForegroundBgLogReadIsAReap:
 
     def test_read_tool_of_bg_log_is_false(self) -> None:
         """`Read` on the bg-log path — the reap the CLI's own launch message
-        recommends ("use Read on that file path") → False."""
+        recommends ("use Read on that file path") → False.
+
+        This is also the shape
+        orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE
+        now steers every Bash-capable role into (task 5332), which is why
+        correcting those prompts needed no change to the detector. Keep it: it
+        is the executable form of that claim, and narrowing
+        ``_iter_input_strings`` to a ``command`` key fails HERE rather than
+        silently downgrading every correctly-behaved session to failure.
+        """
         records = [
             _assistant([_bash_launch(command='cargo test --all')]),
             _bg_launch_result(),
