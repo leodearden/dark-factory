@@ -117,7 +117,14 @@ class TestStateRepairMemoryCitation:
         """No active entry for ``run_id`` -> the existing refusal, no journal call."""
         journal = await _seeded_journal(tmp_path)
         try:
-            journal.get_run = AsyncMock(wraps=journal.get_run)
+            # Spies the repair path's FIRST journal touch. That is
+            # ``get_run_with_stage_reports_text`` (it must return the CAS token
+            # from the same row as the parsed run), not ``get_run`` — which the
+            # repair now reaches only for its read-after-write, so a spy there
+            # would no longer prove the journal went untouched.
+            journal.get_run_with_stage_reports_text = AsyncMock(
+                wraps=journal.get_run_with_stage_reports_text
+            )
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
             state = _state(memory_service=memory, journal=journal)
 
@@ -132,7 +139,7 @@ class TestStateRepairMemoryCitation:
 
             assert outcome['error'] == 'run_id_unknown'
             assert outcome['error_type'] == 'ReconReportRunUnknown'
-            assert journal.get_run.await_count == 0
+            assert journal.get_run_with_stage_reports_text.await_count == 0
         finally:
             await journal.close()
 
