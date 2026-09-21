@@ -42,17 +42,17 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_terminal_metadata_flags,
     maybe_escalate_suppression_storm,
 )
+from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    extract_human_gated_task_ids,
+    normalize_gate_owned_suggested_actions,
+    stamp_curator_gate_sweep_provenance,
+)
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
-)
-from fused_memory.reconciliation.gate_owned_finding_phrasing import (
-    extract_human_gated_task_ids,
-    normalize_gate_owned_suggested_actions,
-    stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
