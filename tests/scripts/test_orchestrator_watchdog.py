@@ -10389,3 +10389,196 @@ def test_main_does_not_read_the_lease_when_every_probe_is_up(
         f"the lease must be read only AFTER a probe has come back down; "
         f"got {len(reads)} read(s) on an all-healthy tick"
     )
+
+
+# ---------------------------------------------------------------------------
+# --report surfaces the in-flight lease, and still mutates nothing (4755)
+#
+# Hidden state that changes whether a fleet redeploy happens, with no
+# doctor-mode way to inspect it, is exactly the silent degradation the
+# project's norms forbid. The four states must be DISTINGUISHABLE: "pid dead"
+# and "past the bound" must not both render as a bare "stale", because an
+# operator has to know WHICH liveness test failed to decide whether a sweep
+# died or merely overran.
+#
+# One LINE, not a column: the table is already seven columns wide and the
+# lease is one fleet-wide fact, so a column would repeat it on every row for
+# no gain. DEPLOY-AGE already pays that cost and is the reason not to add a
+# second.
+#
+# The read-only contract (I7/I8) must explicitly cover NOT DELETING the lease:
+# the producer's lease_release is an `rm -f`, so a copy-paste of it into the
+# read-only path is the realistic regression.
+# ---------------------------------------------------------------------------
+
+
+def _wire_report_fleet(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> list[list[str]]:
+    """Drive report() over a one-unit fresh fleet; record every subprocess argv."""
+    commit_epoch = 1_800_000_000
+    unit = synthetic_unit("reported")
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
+    return recorded_calls
+
+
+def _fleet_lease_line(captured_out: str) -> str:
+    """The single FLEET-LEASE: line, asserted to exist exactly once and above the table."""
+    lines = [ln for ln in captured_out.splitlines() if ln.startswith("FLEET-LEASE:")]
+    assert len(lines) == 1, (
+        f"expected exactly one fleet-wide FLEET-LEASE line, got {lines}"
+    )
+    header_index = next(
+        i for i, ln in enumerate(captured_out.splitlines()) if ln.startswith("UNIT")
+    )
+    assert captured_out.splitlines().index(lines[0]) < header_index, (
+        "the FLEET-LEASE line belongs above the per-unit table, not inside it"
+    )
+    return lines[0]
+
+
+def test_report_renders_a_live_lease_with_pid_unit_and_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An operator must be able to see WHO holds the lease and for how long."""
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    held = synthetic_unit("mid-restart")
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {"pid": os.getpid(), "started_ts": time.time() - 600, "current_unit": held},
+    )
+
+    wdog.report()
+
+    line = _fleet_lease_line(capsys.readouterr().out)
+    assert "live" in line, line
+    assert str(os.getpid()) in line, line
+    assert held in line, line
+
+
+def test_report_renders_an_absent_lease_as_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No sweep running is the normal state and must still be stated explicitly."""
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+
+    wdog.report()
+
+    assert "none" in _fleet_lease_line(capsys.readouterr().out)
+
+
+def test_report_distinguishes_a_dead_holder_from_an_overrun_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two not-live states must NOT both render as a bare "stale".
+
+    They call for different operator actions: a dead holder means a sweep
+    crashed and its work is unfinished; an overrun one means the sweep is
+    probably still running and merely past the bound.
+    """
+    wdog = _load_watchdog()
+
+    _wire_report_fleet(wdog, monkeypatch)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": _reliably_dead_pid(),
+            "started_ts": time.time() - 60,
+            "current_unit": synthetic_unit("crashed"),
+        },
+    )
+    wdog.report()
+    dead_line = _fleet_lease_line(capsys.readouterr().out)
+
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": time.time() - wdog.FLEET_LEASE_MAX_AGE_SECS - 60,
+            "current_unit": synthetic_unit("overran"),
+        },
+    )
+    wdog.report()
+    expired_line = _fleet_lease_line(capsys.readouterr().out)
+
+    assert "live" not in dead_line and "live" not in expired_line
+    assert dead_line != expired_line, (
+        f"a dead holder and an overrun sweep must be distinguishable without "
+        f"opening the file; both rendered as {dead_line!r}"
+    )
+
+
+def test_report_renders_a_corrupt_lease_as_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A corrupt lease must be reported as such, never silently as "none"."""
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    _write_lease(wdog, monkeypatch, tmp_path, "{not json")
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.report()
+
+    assert "unreadable" in _fleet_lease_line(capsys.readouterr().out)
+
+
+def test_report_never_creates_or_removes_the_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """I7/I8 extended to the lease: read-only means never `rm -f` it either.
+
+    lease_release is an `rm -f` on the producer side, so a copy-paste of it
+    into doctor mode would silently release a genuine in-flight sweep's lease
+    every time an operator ran --report.
+    """
+    wdog = _load_watchdog()
+    recorded_calls = _wire_report_fleet(wdog, monkeypatch)
+    lease_file = _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": time.time(),
+            "current_unit": synthetic_unit("untouched"),
+        },
+    )
+    before = lease_file.read_bytes()
+    absent = tmp_path / "never-created.json"
+
+    wdog.report()
+
+    assert lease_file.exists(), "--report must never remove a live lease"
+    assert lease_file.read_bytes() == before, "--report must never rewrite the lease"
+    assert not absent.exists()
+    assert recorded_calls, "report() must have driven its real helpers"
+    _assert_zero_mutating_calls(recorded_calls)
+    capsys.readouterr()
