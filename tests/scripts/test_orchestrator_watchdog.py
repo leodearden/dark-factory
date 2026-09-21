@@ -9924,3 +9924,195 @@ def test_live_fleet_lease_is_none_when_started_ts_is_unusable(
     _write_lease(wdog, monkeypatch, tmp_path, body)
 
     assert wdog._live_fleet_lease() is None
+
+
+# ---------------------------------------------------------------------------
+# The backstop honours the lease (task 4755)
+#
+# The backstop's existing gates order it against the OTHER tier at each
+# window boundary; none of them can see the backstop's OWN in-flight sweep,
+# because restart-all-orchestrators.sh stamps the clock only on its
+# verified-fresh exit-0 path (I2). The lease is that missing state — and it
+# must gate in BOTH directions: a live lease suppresses, and anything short of
+# live (dead pid, past the bound, no file) must still let the backstop act,
+# or a leftover file becomes a permanent fleet-wide off switch.
+# ---------------------------------------------------------------------------
+
+#: A wall clock pinned to a SKIP_LOG_INTERVAL_SECS bucket boundary, where a
+#: rate-limited skip line is guaranteed to be emitted (``t % 1800 < 120``).
+_BUCKET_BOUNDARY_NOW = 1800.0 * 1000.0
+
+
+def _wire_stale_unit(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: float,
+) -> list[None]:
+    """Drive staleness_pass to the delegation point with one genuinely stale unit.
+
+    Leaves the LEASE gate alone — it is what these tests are about — and
+    returns the recorder every caller asserts on.
+    """
+    delegated: list[None] = []
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
+    monkeypatch.setattr(
+        wdog, "_enumerate_running_units", lambda: [synthetic_unit("stale")]
+    )
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    return delegated
+
+
+def test_staleness_pass_defers_to_a_live_in_flight_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A sweep already in flight must not be collided with by the backstop.
+
+    This is the measured incident: the backstop delegated a second redeploy
+    while its own --drain sweep was mid-flight, because the clock the gates
+    read is stamped only when that sweep FINISHES.
+    """
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    held_unit = synthetic_unit("being-restarted")
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": _BUCKET_BOUNDARY_NOW - 60.0,
+            "current_unit": held_unit,
+        },
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    wdog.staleness_pass()
+
+    assert delegated == [], (
+        f"a live lease must suppress the backstop's own second sweep; got {delegated}"
+    )
+    skip_lines = [m for m in logged if "lease" in m]
+    assert skip_lines, f"the skip must be journalled, not silent: {logged}"
+    assert str(os.getpid()) in skip_lines[0], skip_lines
+    assert held_unit in skip_lines[0], (
+        f"an operator must be able to tell a held lease from a stale one: {skip_lines}"
+    )
+
+
+def test_staleness_pass_delegates_when_the_lease_pid_is_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A crashed sweep's leftover lease must not become a fleet-wide off switch."""
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    dead_pid = _reliably_dead_pid()
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": dead_pid,
+            "started_ts": _BUCKET_BOUNDARY_NOW - 60.0,
+            "current_unit": synthetic_unit("orphaned"),
+        },
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"a lease whose holder is gone must not suppress the backstop; got {delegated}"
+    )
+
+
+def test_staleness_pass_delegates_once_the_lease_is_past_its_max_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """CRASH SAFETY: a SIGKILLed sweep's lease expires, and the fleet recovers.
+
+    Deliberately its own test rather than folded into the dead-pid case: SIGKILL
+    is uncatchable by construction, so the lease survives with a pid that may
+    well have been REUSED by then. The bound is the only thing that can release
+    it, and it must be able to on its own.
+    """
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),  # trivially alive; only the bound can reject it
+            "started_ts": _BUCKET_BOUNDARY_NOW - wdog.FLEET_LEASE_MAX_AGE_SECS - 1,
+            "current_unit": synthetic_unit("sigkilled"),
+        },
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"a lease past FLEET_LEASE_MAX_AGE_SECS must not hold the fleet; got {delegated}"
+    )
+
+
+def test_staleness_pass_delegates_when_no_lease_file_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """REGRESSION: the lease must never become a REQUIRED file.
+
+    No sweep has ever run on a fresh checkout, so there is no lease — and the
+    backstop must behave exactly as it did before task 4755.
+    """
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, f"no lease means no suppression; got {delegated}"
+
+
+def test_lease_gate_evaluates_every_tick_while_only_its_skip_line_is_throttled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Mid-bucket the skip line is silent — but the GATE still suppresses.
+
+    The same contract the min-interval and head-start skip lines carry: the
+    rate limit is on the journal, never on the decision. A gate that only
+    applied when it logged would suppress one tick in thirty.
+    """
+    wdog = _load_watchdog()
+    mid_bucket = _BUCKET_BOUNDARY_NOW + wdog.SKIP_LOG_INTERVAL_SECS / 2
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=mid_bucket)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": mid_bucket - 60.0,
+            "current_unit": synthetic_unit("quiet"),
+        },
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    wdog.staleness_pass()
+
+    assert delegated == [], (
+        f"the gate must apply on every tick, not only on logged ones; got {delegated}"
+    )
+    assert [m for m in logged if "lease" in m] == [], (
+        f"mid-bucket ticks must stay out of the journal: {logged}"
+    )
