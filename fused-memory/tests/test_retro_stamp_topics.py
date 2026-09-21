@@ -11,43 +11,21 @@ is a plain unit test; the single I/O boundary (an injected
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
-import sys
-import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory import topic_slug as topic_slug_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load retro_stamp_topics.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'retro_stamp_topics'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
 
 
 @pytest.fixture(autouse=True)
@@ -1517,6 +1495,12 @@ class TestStampOne:
         assert kwargs['metadata_patch'] == {'topic': 'topic-one'}
         assert kwargs['metadata_mode'] == 'merge'
         assert kwargs['_source'] == 'retro_stamp_topics'
+        assert kwargs['agent_id'] == 'retro_stamp_topics', (
+            'a metadata_patch write routes through '
+            '_apply_memory_metadata_validation, whose census/storm keying '
+            'reads agent_id (not _source) -- an unset agent_id keys every '
+            'row from this sweep to a null agent'
+        )
         assert 'content' not in kwargs, (
             f'a content argument would re-embed the record: {kwargs}'
         )

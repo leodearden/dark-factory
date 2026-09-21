@@ -196,6 +196,32 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout, which every pyproject.toml in
+     the repo declares at the same value. Pinned by
+     tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
+     and this paragraph goes red until it is updated to match. -->
+  Every pytest config caps a single test at `540` seconds of WALL CLOCK (not CPU
+  time), a value DERIVED FROM MEASUREMENT rather than picked — see
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
+  the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
+  All eight configs carry it, the repo root included, so a bare root-bound
+  `pytest` is no longer uncapped: pytest reads exactly ONE inifile — the
+  rootdir's — and never merges across `pyproject.toml` files, so a member's
+  setting does nothing for a run rooted elsewhere. Opt a slow test up with
+  `@pytest.mark.timeout(N)`, but note that the marker OVERRIDES the budget in
+  both directions rather than raising a floor under it, so an `N` below the
+  value silently TIGHTENS the run — `orchestrator/tests/_orch_helpers.py`'s
+  constant block is the single home of that reasoning.
+  One caveat with teeth, because it decides what the MERGE GATE enforces: every
+  verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
+  the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
+  — an unmarked test taking 310 seconds passes locally and reds the gate, and
+  the two tests the measurement above derived its value from still run at the
+  4.9x headroom that measurement calls insufficient. Aligning that yaml knob is
+  outside the scope that set these configs and is filed as residue 2 of
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
+<!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
      Mirrors the `ruff check` leg of `lint_command` in
      dark-factory-orchestrator.yaml. Pinned by
@@ -269,11 +295,21 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   Reversing this decision means updating this section, `CLAUDE.md` and
   `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
-  picks up that package's `[tool.pyright]` block):
+  picks up that package's `[tool.pyright]` block) — the same seven workspace
+  members the merge gate checks:
+  <!-- type-check-command-mirror:begin
+       Mirrors the package DIRECTORIES walked by `type_check_command` in
+       dark-factory-orchestrator.yaml. The RUNNER deliberately differs —
+       `uv run pyright` here, `npx pyright` there — and both resolve the
+       same pinned version (see below). Pinned by
+       tests/scripts/test_contributing_type_check_command_drift.py: widen
+       the yaml chain and this block goes red until it is updated to
+       match. -->
   ```bash
-  cd fused-memory && uv run pyright   # also: orchestrator, dashboard
+  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs all seven
+  <!-- type-check-command-mirror:end -->
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same seven
   workspace members via `npx pyright` (needs Node 22+) — either invocation
   works, and both resolve the SAME pyright version: `uv run pyright` resolves
   the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
@@ -322,6 +358,12 @@ two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
 in the machine-operated main checkout (see `OPERATIONS.md` §"Working in
 the main checkout").
+
+These gates are the **floor**. The **bar** is `docs/code-quality.md` — the
+single normative definition of code quality (quality as the cost and risk of
+the next change, fourteen named heuristics, and the comment and test
+stances). Reviewers cite its heuristics by name; a change can pass every gate
+above and still be correctly rejected against it.
 
 ---
 

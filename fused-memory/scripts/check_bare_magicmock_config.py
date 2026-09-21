@@ -676,24 +676,23 @@ def _dataclass_double_violation(
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
-    'orchestrator/tests/test_merge_queue.py': 317,
+    'orchestrator/tests/test_merge_queue.py': 309,
     'orchestrator/tests/test_merge_queue_concurrent_verify.py': 90,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,
     'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
-    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 18,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 8,
     'orchestrator/tests/test_merge_queue_equivalence.py': 12,
     'orchestrator/tests/test_merge_queue_restart_hook.py': 12,
-    'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
-    'orchestrator/tests/test_coalesce_integration_gate.py': 8,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 4,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 4,
     'orchestrator/tests/test_merge_queue_coalesce.py': 8,
     'orchestrator/tests/test_merge_queue_persistent_worktree.py': 6,
     'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 4,
     'orchestrator/tests/test_merge_guard_pipeline.py': 2,
     'orchestrator/tests/test_merge_queue_supervisor.py': 2,
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 2,
-    'orchestrator/tests/test_merge_queue_warm_cold_shadow.py': 2,
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
     'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py': 1,
 }

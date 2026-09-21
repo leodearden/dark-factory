@@ -197,10 +197,21 @@ def emit_markup_storm_escalation(
     *storm* is the record its ONE live producer sends —
     :meth:`shared.mcp_markup_middleware.MarkupGuardMiddleware._record_storm` via
     :mod:`fused_memory.server.markup_guard`'s sink — and the keys read off it
-    are ``count``, ``threshold``, ``window_seconds`` and ``outcome``. Every one
-    is read defensively, because degenerate and legacy shapes (``{}``,
-    ``{'count': 9}``) reach this filer from tests and older callers and must
-    still produce a routable record.
+    are ``count``, ``threshold``, ``window_seconds``, ``outcome``, and the
+    attribution that producer now supplies: ``crossing_agent_id``,
+    ``crossing_subject_task_id``, ``crossing_subject_agent_role`` (the ONE call
+    that crossed the threshold) and ``callers`` (every distinct caller seen in
+    the window). Every one is read defensively, because degenerate and legacy
+    shapes (``{}``, ``{'count': 9}``) reach this filer from tests and older
+    callers and must still produce a routable record.
+
+    The attribution is why the remedy below no longer leads with a grep. It
+    used to be the ONLY route to the caller, and it is not one a triager can
+    always take: a per-agent stdio server's stderr is consumed by the spawning
+    CLI and never reaches journald, and ``journald --user`` retention on this
+    host is roughly 72h while measured storm records were read at 6-7 days old.
+    The grep survives as corroboration — do not delete its tokens, which
+    ``test_the_record_points_at_log_lines_that_actually_exist`` pins.
 
     ``count`` is ALREADY this project's own number: the producer keys one
     ``StormCounter`` per ``(project, outcome)`` pair, so a window can only ever
@@ -391,6 +402,27 @@ def emit_markup_storm_escalation(
         f'count={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
+        # WHO leaked, which is what makes the remedy below dischargeable
+        # without a journal. `crossing_*` names the ONE call that crossed the
+        # threshold; `callers` names every distinct caller seen in the window —
+        # two different questions, because on a shared server like this one a
+        # burst can be several agents at once and a record naming only whoever
+        # tripped the wire would be confidently misattributed.
+        #
+        # `.get`, like every line above: the docstring commits this filer to
+        # the degenerate and legacy shapes (`{}`, `{'count': 9}`) that reach it
+        # from tests and older callers, and those must still file.
+        #
+        # BELOW the outcome line, never above it, and every one `!r`. These
+        # carry caller-supplied strings, and `_recorded_outcome` scans this
+        # body for the FIRST line starting with `outcome=` — so an unescaped
+        # newline here could inject a spoofed one and silently disable the
+        # fold-mismatch warning that is an operator's only sign a later burst
+        # folded into a record naming a different outcome.
+        f'crossing_agent_id={storm.get("crossing_agent_id")!r}',
+        f'crossing_subject_task_id={storm.get("crossing_subject_task_id")!r}',
+        f'crossing_subject_agent_role={storm.get("crossing_subject_agent_role")!r}',
+        f'callers={storm.get("callers")!r}',
         '',
         'The fused-memory MCP write guard (tasks 3141, 4458) flagged multiple '
         'writes carrying raw MCP envelope markup within one rolling window; '
@@ -451,12 +483,19 @@ def emit_markup_storm_escalation(
             # cannot be grepped without already knowing the answer, and an
             # unmeasured outcome would render `markup guard: None`.
             suggested_action=(
-                'identify the leaking caller from the markup guard logs — grep '
-                "'markup_guard_storm' for this burst and 'markup guard:' for "
-                'the individual calls, whose outcome, tool, agent_id and '
-                'project are named on each line — and report it against '
+                'read the caller off this record: the detail names '
+                'crossing_agent_id, crossing_subject_task_id and '
+                'crossing_subject_agent_role for the call that crossed the '
+                'threshold, and callers for every distinct caller seen in the '
+                'window — then report it against '
                 'plans/toolcall-markup-containment-prd.md — DF task '
-                '3083 is done and closed to appends'
+                '3083 is done and closed to appends. The guard also logs each '
+                "event (grep 'markup_guard_storm' for the burst and 'markup "
+                "guard:' for the individual calls), but treat that as OPTIONAL "
+                'corroboration: a per-agent stdio server\'s stderr is consumed '
+                'by the spawning CLI and never reaches journald at all, and '
+                'journald --user retention on this host is roughly 72h while '
+                'these records are routinely read days later'
             ),
             level=1,
         )

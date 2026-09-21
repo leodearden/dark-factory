@@ -714,18 +714,26 @@ class TestTheForceStoreArms:
         assert metadata['source'] == 'notes', f'{metadata!r}'
 
     @pytest.mark.asyncio
-    async def test_a_recon_stage_agent_is_force_stored_and_never_attached(self) -> None:
-        """The recon-stage exemption SURVIVES this leaf. Leaf iota retires it.
+    async def test_a_recon_stage_agent_is_triaged_like_any_other_caller(self) -> None:
+        """Leaf iota (task 3134) has RETIRED the recon-stage exemption.
 
-        Stage-1 consolidation writes a merged canonical that is EXPECTED to
-        closely resemble the duplicates it replaces, with no ordering guarantee
-        that those duplicates are deleted first. Attaching it as a sighting of
-        one of them would invert consolidation — the merged entry would become
-        a child of the very memory it was written to supersede.
+        The arm rested on Stage-1 consolidation writing a merged canonical
+        through this tool, closely resembling the duplicates it replaces,
+        "with no ordering guarantee that those duplicates are deleted first" —
+        so attaching it as a sighting of one of them would have inverted
+        consolidation.
 
-        Removing this is leaf iota's explicit signal ("a recon-agent direct
-        near-dup add_memory now triages like anyone else"), so it must still
-        hold here; iota is the owner of its removal, not this leaf.
+        That write no longer comes through this tool. Stage 1 folds a cluster
+        with `consolidate_memories`, whose canonical write goes through
+        `memory_service.add_memory` directly and never reaches this seam, and
+        which writes the canonical BEFORE any delete — the very ordering
+        guarantee whose absence justified force-storing. With the premise gone
+        the arm goes with it, which is iota's explicit signal: "a recon-agent
+        direct near-dup add_memory now triages like anyone else".
+
+        So a recon-stage write is now ROUTED BY BAND. At 0.99 that is the
+        high band, exactly as for any other caller — and the retrieval
+        round-trip is now AWAITED, where the arm previously returned above it.
         """
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
@@ -735,11 +743,16 @@ class TestTheForceStoreArms:
 
         result = await _call(server, agent_id='recon-stage-1')
 
-        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
-        assert CANONICAL_ID_KEY not in result, f'consolidation was inverted: {result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, (
+            f'a recon-stage write must be band-routed like any other caller, and '
+            f'0.99 is the deterministic high band: {result!r}'
+        )
+        assert result[CANONICAL_ID_KEY] == 'm1', (
+            f'expected the band attach any other caller would get: {result!r}'
+        )
         metadata = mock_service.add_memory.await_args.kwargs['metadata']
-        assert PARENT_ID_KEY not in (metadata or {}), f'{metadata!r}'
-        mock_service.search.assert_not_awaited()
+        assert (metadata or {}).get(PARENT_ID_KEY) == 'm1', f'{metadata!r}'
+        mock_service.search.assert_awaited()
 
 
     @pytest.mark.asyncio
@@ -1630,14 +1643,20 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
     async def test_a_force_stored_write_never_reaches_the_judge(self) -> None:
         """The exemptions are exemptions from SPEND, not just from routing.
 
-        `allow_near_duplicate`, a recon-stage agent and a caller-declared
-        parentage all force-store. Each already skips retrieval; this pins that
-        none of them can reach the judge either, which is the expensive half.
+        `allow_near_duplicate` and a caller-declared parentage force-store. Each
+        already skips retrieval; this pins that neither can reach the judge
+        either, which is the expensive half.
+
+        A recon-stage agent USED to be a third case here. Task 3134 retired
+        that arm, so such a write is now band-routed and DOES reach the judge
+        at `_MIDDLE_BAND` like any other caller's — which is why it is gone
+        from this loop rather than merely reworded. That is not left as a
+        claim: `test_a_recon_stage_write_now_pays_for_the_judge` below pins
+        the inverse.
         """
         judge = AsyncMock(return_value=OUTCOME_AMENDED)
         for label, overrides in [
             ('allow_near_duplicate', {'metadata': {'allow_near_duplicate': True}}),
-            ('a recon-stage agent', {'agent_id': 'recon-stage-1'}),
             ('a caller-declared kind', {'metadata': {'kind': 'cycle_summary'}}),
         ]:
             mock_service = self._service()
@@ -1649,6 +1668,41 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
             assert judge.await_count == 0, (
                 f'{label}: a force-store is an exemption from SPEND too'
             )
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_write_now_pays_for_the_judge(self) -> None:
+        """The retirement's SPEND consequence, as a pin rather than a comment.
+
+        The loop above lost its recon-stage entry when task 3134 retired the
+        force-store arm, and this is the other half of that deletion: such a
+        write is now band-routed, so a MIDDLE-band one reaches the judge and
+        buys an LLM round-trip on the SYNCHRONOUS write path exactly like any
+        other caller's.
+
+        That is the half most likely to surprise an operator who flips
+        `write_triage.enabled` on — the recon stages write continuously — and
+        it is latent today only because the flag ships false. The surviving
+        recon-stage triage case (`TestTheForceStoreArms
+        ::test_a_recon_stage_agent_is_triaged_like_any_other_caller`) sits at
+        0.99, which the bands decide WITHOUT consulting the judge, so without
+        this test no recon-stage write in the suite ever meets one.
+        """
+        mock_service = self._service()
+        judge = AsyncMock(return_value=OUTCOME_AMENDED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            server = create_mcp_server(mock_service)
+            result = await _call(server, agent_id='recon-stage-1')
+
+        assert judge.await_count == 1, (
+            f'a recon-stage middle-band write must reach the judge like any '
+            f'other caller: {result!r}'
+        )
+        # `amended` is unreachable from the bands alone at `_MIDDLE_BAND` (the
+        # stub judge answers `stored` unconditionally), so this says the
+        # verdict actually reached the ack rather than that a fake said it.
+        assert result[ROUTED_KEY] == OUTCOME_AMENDED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
 
 
 #: A verdict word no judge publishes and no table wires — the FIFTH outcome,

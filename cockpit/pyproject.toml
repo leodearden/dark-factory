@@ -28,6 +28,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.7.1",
     "hypothesis>=6.0",
 ]
@@ -62,5 +63,42 @@ docstring-code-format = true
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
 ]
-addopts = "-m 'not smoke'"
+# PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
+# fused-memory/pyproject.toml verbatim (`-n auto --dist loadgroup -m 'not
+# integration'` there), so every parallel module in this workspace reads as one
+# family with only the marker differing.
+# WHY each flag is spelled this way is written ONCE, in the guard that enforces
+# it: tests/scripts/test_merge_gate_parallelism_config.py — its module docstring
+# for `auto` rather than a literal worker count (the count resolves through
+# dark-factory-orchestrator.yaml's PYTEST_XDIST_AUTO_NUM_WORKERS, so one knob
+# governs every parallel module and the A/B cut moves them together),
+# ::test_parallel_member_addopts_declare_xdist_with_loadgroup for `--dist
+# loadgroup`, and ::test_parallel_member_addopts_do_not_copy_max_worker_restart
+# for why orchestrator's `--max-worker-restart=0` is deliberately NOT copied.
+# Five near-identical copies of that argument would be five places to drift when
+# the A/B knob is next cut, so this file states only what is local to it.
+# THE `-m` TERM SURVIVES, and stays ONE flat `not X`: smoke tests drive real
+# X11/tmux against the live host DISPLAY and are opt-in only
+# (tests/test_smoke_marker_config.py proves that behaviourally), `-m` is a
+# single argparse option so a second one would silently replace this, and
+# tests/scripts/test_pytest_workspace_collection.py::_FLAT_DESELECT_RE rejects
+# any richer expression rather than approximating it.
+# MEASURED at `-n 8 --dist loadgroup` on the 5408 tree: 346 passed in 18.76s,
+# exit 0.
+addopts = "-n auto --dist loadgroup -m 'not smoke'"
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` is chosen from existing evidence, not a new experiment, and the
+# signal-vs-thread trade is deliberately NOT reopened here: the addopts above are
+# the IDENTICAL flag set dashboard/ and escalation/pyproject.toml run, both of
+# which carry timeout_method = "signal" and record themselves measured green
+# under exactly those flags (task 5408). The argument for why flipping to
+# `thread` is a real trade rather than a free upgrade lives once, in
+# fused-memory/pyproject.toml's own timeout_method block.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 540
+timeout_method = "signal"

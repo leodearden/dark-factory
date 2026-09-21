@@ -47,6 +47,12 @@ def shape_orchestrators(
     are still surfaced (with ``active: False``).  ``running_spark`` is an
     optional ``{labels, values}`` time-series of the total running-orchestrator
     count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
+
+    ``offline`` and ``degraded`` are projected as an unconditional PAIR — an
+    absent key shapes to ``False`` rather than being omitted, so no consumer
+    has to branch on presence — and this shaper must never collapse one into
+    the other; the invariant and its cost are stated at
+    ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``.
     """
     orchestrators = list(orchestrators)
     out_orchs: list[dict] = []
@@ -67,6 +73,7 @@ def shape_orchestrators(
             'last_update': o.get('last_update'),
             'summary': dict(o.get('summary') or {}),
             'offline': bool(o.get('offline')),
+            'degraded': bool(o.get('degraded')),
         }
         if o.get('error') is not None:
             orch_entry['error'] = o['error']

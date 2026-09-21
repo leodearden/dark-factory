@@ -67,7 +67,12 @@ import toolcall_markup_corpus_extract as extract
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    _ATTRIBUTION_AXIS_MAXLEN,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    _bounded_axis,
+)
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
 
 # ---------------------------------------------------------------------------
@@ -1011,10 +1016,18 @@ class TestB3StrandRiskTierForwards:
         assert warning['outcome'] == 'repaired'
 
     async def test_the_warning_names_the_pattern_and_the_misclose(self):
+        """MOVED BY TASK 5283: ``INVOKE_CLOSER`` -> the ``detail`` closer.
+
+        This specimen's leak opens with ``detail``'s own closer and the invoke
+        closer merely terminates the swallowed tail, so the old expectation
+        named a literal ~40 characters downstream of the defect. Both channels
+        now derive ``matched_pattern`` from ``detect_for`` over the same
+        ``(value, param, schema_params)`` triple, which reports the HEAD.
+        """
         _, result = await self._forward()
 
         warning = meta_of(result)['markup_repair']
-        assert warning['matched_pattern'] == INVOKE_CLOSER
+        assert warning['matched_pattern'] == _closer('detail')
         assert warning['misclose'] == _closer('detail')
 
     async def test_fastmcps_own_meta_is_preserved_not_replaced(self):
@@ -1973,11 +1986,18 @@ class TestB9RecoveredNameCollidesWithASuppliedArgument:
 # ---------------------------------------------------------------------------
 
 
-#: The eight keys PRD section 6 contracts for ``markup_detected``, plus the key
-#: naming the fact itself. Asserted as an EXACT set, which catches drift in both
-#: directions: a missing key sends a consumer back to log-scraping, and an extra
-#: value-bearing key would turn the fact stream into a second copy of the
-#: caller's payload.
+#: The eight keys PRD section 6 contracts for ``markup_detected``, the key
+#: naming the fact itself, and — as of task **4502** — ``quoted_markup_params``.
+#: Asserted as an EXACT set, which catches drift in both directions: a missing
+#: key sends a consumer back to log-scraping, and an extra value-bearing key
+#: would turn the fact stream into a second copy of the caller's payload.
+#:
+#: The 4502 addition is NAMES ONLY, so it does not breach that second guard: it
+#: is the subset of ``recovered_params`` whose delivered value still trips
+#: ``detect``, which exists because narrowing boundary row B5 made such a value
+#: possible and INV-2 requires it be countable rather than silent. Extending
+#: this set is deliberate — the exactness is the point, so a key may only
+#: appear here alongside the reason it is not payload.
 FACT_KEYS = {
     'fact',
     'tool',
@@ -1986,6 +2006,7 @@ FACT_KEYS = {
     'misclose',
     'outcome',
     'recovered_params',
+    'quoted_markup_params',
     'agent_id',
     'project',
 }
@@ -2585,7 +2606,16 @@ class TestB10StormEscape:
             )
         return excinfo
 
-    async def _unrepairable(self, h, project='/srv/alpha'):
+    @staticmethod
+    async def _unrepairable(h, project='/srv/alpha'):
+        """One unrepairable refusal attributed to *project*, by *agent_id*.
+
+        STATIC, like ``_storms`` below and for the same reason: it touches no
+        instance state, and the sibling class beside this one drives the
+        IDENTITY axis through it — ``add_memory`` is the toy that declares
+        ``agent_id``, so a bound-method-only helper would have to be copied to
+        be reused.
+        """
         with pytest.raises(ToolError):
             await h.call(
                 'add_memory',
@@ -2874,6 +2904,336 @@ class TestB10StormEscape:
 
         assert self._storms(first) == []
         assert self._storms(second) == []
+
+
+# ---------------------------------------------------------------------------
+# The storm record names its own caller (task 4805).
+# ---------------------------------------------------------------------------
+
+
+class TestTheStormNamesItsCrossingCaller:
+    """A burst record that cannot say WHO leaked is an alarm with no address.
+
+    Measured on four real ``esc-plan-tools-markup-storm-*`` records: the storm
+    escalation's only route to the caller was its own ``suggested_action``, a
+    grep of the guard's log lines — and those records were read 6-7 days old,
+    well past this host's ~72h ``journald --user`` retention, on a server whose
+    stderr never reaches journald at all. The instruction was undischargeable
+    by construction, so the record had to carry the answer itself.
+
+    The two attribution axes are BOTH driven here, deliberately. ``_identity``
+    (``agent_id``) comes back empty on exactly the servers whose surfaces carry
+    the answer — the real escalation signature, mirrored verbatim by the
+    ``escalate_info_typed`` toy, declares ``task_id``/``agent_role`` and none
+    of ``agent_id``/``project_root``/``project_id`` — so an ``agent_id``-only
+    fix would be structurally inert on the boundary that most needs it.
+    """
+
+    #: The real escalation signature's four required parameters, as
+    #: ``TestB3ExtendedListTypedRecovery`` already spells them — but with the
+    #: subject axis set to values no other row uses, so a leak of these
+    #: assertions into another test would be visible.
+    SUBJECT = {'task_id': '4805', 'agent_role': 'implementer-4805'}
+    OTHER_SUBJECT = {'task_id': '4744', 'agent_role': 'architect-4744'}
+
+    def _harness(self, policy, clock, **kwargs):
+        return build_harness(
+            policy, time_provider=clock, storm_threshold=3, storm_window_seconds=3600.0, **kwargs
+        )
+
+    @staticmethod
+    def _storms(h) -> list[dict[str, Any]]:
+        """The same projection ``TestB10StormEscape`` uses."""
+        return TestB10StormEscape._storms(h)
+
+    async def _typed_repair(self, h, **subject):
+        """One FORWARD_REPAIR repair on the REAL escalation signature.
+
+        ``escalate_info_typed`` declares no project axis, so every call here
+        lands in the ``(None, 'repaired')`` counter — one burst, whatever the
+        subject.
+        """
+        return await h.call(
+            'escalate_info_typed',
+            {
+                **(subject or self.SUBJECT),
+                'category': 'risk_identified',
+                'summary': 'It stranded',
+                'detail': TestB3StrandRiskTierForwards.DETAIL,
+            },
+        )
+
+    async def _anonymous_repair(self, h):
+        """One repair whose caller declared NOTHING resolvable.
+
+        The legacy ``escalate_info`` toy declares neither ``agent_id`` nor
+        ``task_id``/``agent_role``, and ``project_root`` is left off.
+        """
+        return await h.call(
+            'escalate_info',
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+    # -- (a) the subject axis, on the boundary where it is the only one -----
+
+    async def test_the_storm_names_the_crossing_call_subject(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._typed_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+
+    # -- (b) the identity axis, and the old keys are UNCHANGED --------------
+
+    async def test_the_storm_names_the_crossing_call_agent_id(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await TestB10StormEscape._unrepairable(h)
+            clock.advance(60)
+
+        assert self._storms(h)[0]['crossing_agent_id'] == 'claude-caller'
+
+    async def test_the_pre_existing_keys_are_untouched(self):
+        """ADDITIVE, not a re-shaping.
+
+        Three sinks read this dict and one of them (the escalation server's
+        ``_file_markup_storm``) renders ``sorted(record)`` wholesale, so a
+        changed VALUE on an existing key would silently rewrite records this
+        task never meant to touch.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await TestB10StormEscape._unrepairable(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+        assert storm['window_seconds'] == 3600.0
+        assert storm['outcome'] == 'unrepairable'
+        assert storm['project'] == '/srv/alpha'
+
+    # -- (c) complete even when null ---------------------------------------
+
+    async def test_every_crossing_key_is_present_even_when_nothing_resolved(self):
+        """The contract ``_emit_fact``'s docstring already states for ``misclose``.
+
+        A consumer must never have to tell "no caller declared" apart from
+        "that emitter forgot the key" — the first is a fact about the leak,
+        the second is a bug in this layer, and an absent key reads as both.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._anonymous_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        for key in ('crossing_agent_id', 'crossing_subject_task_id',
+                    'crossing_subject_agent_role'):
+            assert key in storm, f'{key} is absent, not null'
+            assert storm[key] is None
+
+    # -- the window-wide axis: EVERY caller, not only the crossing one ------
+
+    async def test_the_storm_names_every_caller_in_the_window(self):
+        """The crossing call is one event of many.
+
+        On a shared, long-lived server (the escalation server, fused-memory)
+        a burst can be several agents at once, and naming only whoever
+        happened to trip the wire is exactly the confident misattribution
+        ``_identity``'s docstring rules against. All three calls land in ONE
+        counter — ``escalate_info_typed`` declares no project axis, so
+        ``project`` is ``None`` for every one and the outcome is identical —
+        so one storm fires over two distinct callers.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) == 2, callers
+        assert callers == sorted(callers)
+        assert any('4805' in c and 'implementer-4805' in c for c in callers)
+        assert any('4744' in c and 'architect-4744' in c for c in callers)
+
+    async def test_the_crossing_call_still_names_only_itself(self):
+        """The two axes answer DIFFERENT questions and must not be conflated.
+
+        ``callers`` is "who was in this window"; ``crossing_*`` is "who tripped
+        it". Folding either into the other loses the one an operator needs.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+
+    async def test_an_unattributable_burst_names_nobody_but_still_counts(self):
+        """``StormCounter``'s own rule, made visible on the record.
+
+        An unlabelled event still counts toward the burst; there is simply
+        nothing to name it against. ``callers`` is therefore PRESENT and
+        EMPTY — never absent, and never holding a placeholder string — so
+        ``count`` and ``len(callers)`` can never be read as the same number.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._anonymous_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['callers'] == []
+
+    async def test_the_caller_set_is_not_degenerate(self):
+        """NON-CIRCULAR pin on the defect itself.
+
+        Before this fix the label handed to ``StormCounter.record`` was
+        ``f'{project}\\x1f{outcome}'`` — the very string the counter is keyed
+        by — so the distinct-label set was degenerate BY CONSTRUCTION and
+        could never hold two entries however many callers leaked. A
+        one-element ``callers`` on the two-caller burst above is that bug,
+        not a smaller-than-expected list.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) != 1, callers
+        # Spelled ``chr(0x1f)`` and not as an escape, so this reads as the
+        # counter's real separator byte rather than a four-character literal.
+        assert not any(chr(0x1f) in c for c in callers), callers
+
+    # -- (d) one dict, so the caller-facing shapes cannot drift -------------
+
+    async def test_the_rejected_payload_storm_carries_the_attribution(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(2):
+            with pytest.raises(ToolError):
+                await self._typed_repair(h)
+            clock.advance(60)
+        with pytest.raises(ToolError) as excinfo:
+            await self._typed_repair(h)
+
+        storm = _reject_payload(excinfo)['storm']
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+        assert storm['crossing_agent_id'] is None
+
+    async def test_the_forwarded_meta_storm_carries_the_attribution(self):
+        """The two record shapes are ONE dict — pinned here so they cannot part.
+
+        ``_with_storm`` folds the same object into the refusal payload and the
+        FORWARD_REPAIR ``meta``; splitting a record-only channel out of it is
+        exactly the lock-step duplication this PRD exists to end (INV-5).
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(2):
+            await self._typed_repair(h)
+            clock.advance(60)
+        result = await self._typed_repair(h)
+
+        storm = meta_of(result)['markup_repair']['storm']
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+        assert storm['crossing_agent_id'] is None
+
+    # -- (e) the axes are argument values, so they are BOUNDED --------------
+
+    def test_the_bound_leaves_a_real_identifier_alone(self):
+        """The bound must be invisible on every value this fleet actually mints.
+
+        The longest ids here are ~30 characters, so a bound that altered one
+        would be trading a rare pathological record for a wrong ordinary one.
+        ``None`` passes through as ``None``: absent is not empty, and the
+        record's present-and-null contract rests on that.
+        """
+        assert _bounded_axis('claude-task-4805-implementer') == (
+            'claude-task-4805-implementer'
+        )
+        assert _bounded_axis(None) is None
+        assert _bounded_axis('') == ''
+        # Exactly at the bound is NOT truncated — an off-by-one here would
+        # silently mark untruncated values as prefixes.
+        edge = 'x' * _ATTRIBUTION_AXIS_MAXLEN
+        assert _bounded_axis(edge) == edge
+
+    def test_the_bound_marks_what_it_shortened(self):
+        """Silent truncation is worse than none.
+
+        A shortened id is otherwise indistinguishable from a real one, so a
+        triager could compare it against the true id, find they differ, and
+        conclude the record names a caller that does not exist. The marker is
+        ASCII because this value is ``json.dumps``-ed into the caller-facing
+        payload, which escapes non-ASCII — a ``…`` would arrive as a
+        ``\u2026`` that reads as corruption rather than as truncation.
+        """
+        bounded = _bounded_axis('y' * (_ATTRIBUTION_AXIS_MAXLEN + 500))
+
+        # A str in, a str out — never widened to None on the truncating path,
+        # which would turn a too-long id into "nobody declared one".
+        assert isinstance(bounded, str)
+        assert bounded.startswith('y' * _ATTRIBUTION_AXIS_MAXLEN)
+        assert bounded.endswith('...')
+        assert len(bounded) == _ATTRIBUTION_AXIS_MAXLEN + 3
+        assert bounded.isascii()
+
+    async def test_a_blob_in_an_axis_does_not_ride_into_the_record(self):
+        """The pathological case is not hypothetical, and that is the point.
+
+        These axes are argument VALUES — the exact things this guard fires on
+        — so the axis a serialization leak lands in can itself BE the leaked
+        blob. Unbounded, it would ride whole into an operator-facing escalation
+        body, into every bounce payload for the rest of the window, and into
+        the ``StormCounter``'s retained event list once per event.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+        blob = 'B' * 4000
+
+        for _ in range(3):
+            await self._typed_repair(h, task_id=blob, agent_role='implementer-4805')
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        crossing = storm['crossing_subject_task_id']
+        assert crossing is not None
+        assert len(crossing) == _ATTRIBUTION_AXIS_MAXLEN + 3, len(crossing)
+        assert blob not in crossing
+        # The window-wide axis is bounded by the same helper, so neither name
+        # for the caller can be the one that carries the blob.
+        assert storm['callers'] and all(blob not in c for c in storm['callers'])
+        # The unbounded value reaches NOTHING on the record.
+        assert blob not in repr(storm)
 
 
 # ---------------------------------------------------------------------------
@@ -3359,13 +3719,17 @@ class TestSelfNameCloserIsSeenAtTheBoundary:
         assert payload['recovered_params'] == []
 
     async def test_the_two_pattern_channels_AGREE(self):
-        """``matched_pattern`` and the fact's ``pattern`` are fed differently.
+        """``matched_pattern`` and the fact's ``pattern`` name one literal.
 
-        ``matched_pattern`` comes from ``Repair.pattern``, which falls back to
-        the misclose when no literal is present — so it already reported the
-        self-name closer even while the gate was blind. The fact's ``pattern``
-        is fed DIRECTLY by the boundary scan, so it is the one that goes red
-        today. Asserting both in one place is what pins them together.
+        ``matched_pattern`` comes from ``Repair.pattern`` and the fact's
+        ``pattern`` from the boundary scan, so the two are fed through
+        different code paths and this row is where they are pinned together.
+
+        This specimen carries NO fixed literal, so it is the easy half: both
+        derivations fall through to the same self-name closer whatever they
+        ask. ``TestOnePatternPerEvent`` covers the hard half — a value where a
+        fixed literal TRAILS the leak, which is where the two used to
+        disagree — and records why they now cannot.
         """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
@@ -3450,6 +3814,440 @@ class TestSelfNameCloserIsSeenAtTheBoundary:
         }
         assert h.facts == []
         assert h.escalations == []
+
+
+class TestOnePatternPerEvent:
+    """One leak, one answer: every channel names the SAME literal.
+
+    ``matched_pattern`` has two derivations today, and they are not the same
+    expression. The gate asks ``detect_for(value, param)``; ``repair`` asks the
+    blanket, param-free ``detect``. Where a fixed literal happens to TRAIL the
+    leak, the two disagree — so one event is published with two different
+    answers, the fact stream naming the head and the caller's payload naming
+    the tail.
+
+    That is exactly the diagnostic PRD section 2.2 exists to close: a guard
+    that reports "whatever follows" rather than where the envelope actually
+    starts. Task 4696 closed it on the unrepairable arm, where there is no
+    ``Repair`` to read a pattern off; these rows close it on the REPAIRED arm,
+    where there is.
+
+    THE SPECIMEN is the PRD's own partial-drift shape: prose, the absorbing
+    parameter's SELF-NAME closer, then a canonical opener naming a sibling
+    whose value the harness parser swallowed. Measured at HEAD before the fix,
+    with ``param='how'`` and ``schema=('what','how','where')``::
+
+        detect(value)                 '\\x3cparameter name='   offset 39
+        detect_for(value, 'how')      the ``how`` closer       offset 33
+        repair(...).pattern           '\\x3cparameter name='   offset 39
+
+    so the self-name closer is the HEAD of the leak and the canonical opener
+    merely trails it by six characters. Both tiers are covered because they
+    read ``Repair.pattern`` through different keys — ``_reject``'s flat
+    ``matched_pattern`` and ``_forward``'s ``meta['markup_repair']`` block —
+    and a fix that reached only one of them would leave the other divergent.
+    """
+
+    #: The absorbing parameter's own closer, then the swallowed sibling in the
+    #: canonical dialect. A genuine repair: ``where`` really is recovered, so
+    #: these rows exercise the arm that HAS a ``Repair`` to read a pattern off,
+    #: which is what distinguishes them from the unrepairable rows above.
+    MIXED_HOW = (
+        'Reuse the declared table directly.'
+        + _closer('how')
+        + '\n'
+        + _canonical_opener('where')
+        + 'plan_tools'
+        + _closer('parameter')
+    )
+    MIXED_HOW_CLEAN = 'Reuse the declared table directly.'
+
+    def test_the_specimen_really_does_carry_BOTH_dialects(self):
+        """Otherwise these rows would pass for the wrong reason.
+
+        The divergence only exists when a fixed literal is present AND a
+        widened needle precedes it. A specimen that lost either half would make
+        the two channels agree trivially, by the misclose fallback, which is
+        the case already pinned by ``test_the_two_pattern_channels_AGREE``.
+        """
+        assert detect(self.MIXED_HOW) == '\x3cparameter name='
+        assert self.MIXED_HOW.index(_closer('how')) < self.MIXED_HOW.index(
+            '\x3cparameter name='
+        ), 'the self-name closer must PRECEDE the fixed literal'
+
+    async def test_reject_tier_publishes_one_pattern(self):
+        """(1) REJECT_WITH_REPAIR: the fact and the payload agree, on the HEAD."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.MIXED_HOW},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+
+        assert payload['matched_pattern'] == fact['pattern'], (
+            'one event may not be published with two different answers'
+        )
+        assert fact['pattern'] == _closer('how'), (
+            'and the answer is the HEAD of the leak, not the literal trailing it'
+        )
+        assert fact['misclose'] == _closer('how')
+
+    async def test_forward_tier_publishes_one_pattern(self):
+        """(2) FORWARD_REPAIR: the same property through the other key."""
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'add_reuse_item',
+            {'what': 'the declared table', 'how': self.MIXED_HOW},
+        )
+
+        warning = meta_of(result)['markup_repair']
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+
+        assert warning['matched_pattern'] == fact['pattern']
+        assert fact['pattern'] == _closer('how')
+        assert fact['misclose'] == _closer('how')
+
+    async def test_the_repair_itself_is_unchanged(self):
+        """The pattern is a DIAGNOSTIC; changing it may not change the repair.
+
+        Stated as its own row because the change under test edits ``repair``'s
+        return value, and a reader needs the recovery half pinned independently
+        of the reporting half.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.MIXED_HOW},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['repaired_call'] == {
+            'what': 'the declared table',
+            'how': self.MIXED_HOW_CLEAN,
+            'where': 'plan_tools',
+        }
+        assert payload['recovered_params'] == ['where']
+
+
+class TestQuotedMarkupIsSurfacedNotSilent:
+    """Task **4502**: a recovery whose RECOVERED value still trips ``detect``.
+
+    Boundary row B5 was narrowed so that a faithful REPORT of a markup leak is
+    repaired rather than refused. That necessarily delivers a recovered value
+    still carrying a literal — the report quotes the pattern that tripped the
+    tripwire, and a recovered value is verbatim caller text under invariant D5.
+    Delivering it is the correct outcome: refusing drops exactly the characters
+    the PRD exists to stop dropping.
+
+    But it must be COUNTABLE. Per INV-2 and the repo's loud-over-silent-
+    degradation norm, the guard publishes ``quoted_markup_params`` — the SORTED
+    names of the recovered parameters whose delivered value still trips
+    ``detect`` — on the ``markup_detected`` fact and on BOTH policy payloads. A
+    caller mechanically retrying an offered ``repaired_call`` can then see WHY
+    it still carries a literal, and reach for the existing
+    ``allow_mcp_markup`` override, instead of looping against its own rejection.
+
+    NAMES ONLY, like ``recovered_params``: no fact or payload ever becomes a
+    second copy of the caller's data.
+    """
+
+    #: ``detail`` mis-closes with its own tag, a clean ``project_root`` pair
+    #: follows, and ``suggested_action`` is a final unterminated opener whose
+    #: value QUOTES the content closer — the shape of a leak report. Two
+    #: recovered siblings, exactly ONE of them quoting, so the new field cannot
+    #: pass by accidentally echoing ``recovered_params``.
+    CLEAN = 'The write-time tripwire fired on a value that had absorbed its siblings.'
+    ACTION = (
+        'Narrow the guard; the report quotes matched_pattern='
+        + _closer('content')
+        + ' verbatim, which is caller text, not a leak.'
+    )
+    DETAIL = (
+        CLEAN
+        + _closer('detail') + '\n'
+        + _canonical_opener('project_root') + '/home/leo/src/dark-factory'
+        + '\x3c/parameter>' + '\n'
+        + _canonical_opener('suggested_action') + ACTION
+    )
+
+    ARGS = {'summary': 'A markup leak was reported', 'detail': DETAIL}
+
+    async def _forwarded(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('escalate_info', dict(self.ARGS))
+        return h, result
+
+    async def test_the_call_is_FORWARDED_not_refused(self):
+        """(a) The whole point of the narrowing: those characters land.
+
+        Before task 4502 this shape returned ``None`` from ``repair`` and
+        routed to the unrepairable path, so the recommendation and the evidence
+        were dropped on the floor while the guard reported success at refusing.
+        """
+        h, _ = await self._forwarded()
+
+        assert [f['outcome'] for f in h.facts] == ['repaired']
+        assert h.facts[0]['recovered_params'] == ['project_root', 'suggested_action']
+        assert h.recorder.args == {
+            'tool': 'escalate_info',
+            'summary': 'A markup leak was reported',
+            'detail': self.CLEAN,
+            'suggested_action': self.ACTION,
+            'project_root': '/home/leo/src/dark-factory',
+        }
+
+    async def test_the_fact_names_the_quoting_parameter(self):
+        """(b) The new tenth key on the ``markup_detected`` fact.
+
+        ``project_root`` is recovered too and is clean, so this cannot pass by
+        echoing ``recovered_params``.
+        """
+        h, _ = await self._forwarded()
+
+        assert h.facts[0]['quoted_markup_params'] == ['suggested_action']
+
+    async def test_the_forward_meta_names_the_quoting_parameter(self):
+        """(c) Same list on the ToolResult meta a forwarded caller reads."""
+        _, result = await self._forwarded()
+
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == [
+            'suggested_action'
+        ]
+
+    async def test_the_reject_payload_names_the_quoting_parameter(self):
+        """(d) Same list on the refusal payload, which is the load-bearing one.
+
+        Under ``REJECT_WITH_REPAIR`` the caller is handed a ``repaired_call``
+        to resubmit verbatim — and that call still carries a literal, so a
+        caller retrying it mechanically would be rejected again. Naming the
+        parameter is what turns an infinite retry loop into an adjudicable
+        report.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('escalate_info', dict(self.ARGS))
+        payload = _reject_payload(excinfo)
+
+        assert payload['quoted_markup_params'] == ['suggested_action']
+        # The claim is TRUE of the offered call, not merely asserted about it.
+        assert detect(payload['repaired_call']['suggested_action']) is not None
+        assert detect(payload['repaired_call']['project_root']) is None
+
+    async def test_an_ordinary_repair_reports_the_field_PRESENT_AND_EMPTY(self):
+        """(e) THE NEGATIVE CONTROL, and the shape convention.
+
+        Present-and-empty rather than absent, matching this file's existing
+        convention that ``misclose`` is present-and-null on the unrepairable
+        path: a consumer must never have to tell "nothing quoted" apart from
+        "that emitter forgot the key".
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'submit_task',
+            {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+        )
+
+        assert h.facts[0]['recovered_params'] == ['priority']
+        assert h.facts[0]['quoted_markup_params'] == []
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == []
+
+    async def test_an_unrepairable_value_reports_it_present_and_empty_too(self):
+        """(e), continued — the path with no ``Repair`` at all.
+
+        There is nothing recovered to inspect, so the answer is the empty list
+        for the same present-and-empty reason, not an omitted key.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert h.facts[0]['outcome'] == 'unrepairable'
+        assert h.facts[0]['quoted_markup_params'] == []
+
+
+class TestQuotedMarkupIsSurfacedForANonStringParameter:
+    """Task **4502**: the census against a NON-string declared type.
+
+    The class above pins ``quoted_markup_params`` for ``str``-typed recoveries
+    only, and every other pin in this file does the same. That leaves the shape
+    the carve-out was actually written about untested: the real
+    ``escalate_info`` declares ``evidence: list[dict[str, Any]] | None``, which
+    :func:`_accepted_types` documents as "the parameter this whole mechanism
+    exists for", and a leak REPORT puts the quoted literal in exactly that
+    parameter. So this class drives :func:`escalate_info_typed`, the toy that
+    carries the real server's signature verbatim.
+
+    Two roads make a quoting parameter invisible to a census read off the
+    DELIVERED map, and both are exercised below:
+
+    (a) DECODED. ``_coerce_recovered`` types the verbatim slice into a ``list``,
+        so a ``str``-only scan of the delivered map skips it — while the prose
+        inside those dicts still carries the literal the report is about.
+
+    (b) DROPPED. The slice does not decode, so under ``FORWARD_REPAIR`` it is
+        removed from the forwarded map and preserved in the residue channel.
+        A census read off the delivered map cannot see it either, which makes
+        the same parameter named under ``REJECT_WITH_REPAIR`` and unnamed under
+        ``FORWARD_REPAIR`` — the answer depending on policy rather than on the
+        caller's text.
+
+    ``quoted_markup_params`` is a census of the CALLER'S VERBATIM TEXT (D5),
+    which is why neither road may hide a name. It therefore OVERLAPS
+    ``unrecovered_params`` rather than partitioning against it: the two keys
+    answer different questions — "this text quoted a literal" and "this value
+    did not land" — and a value can honestly be both.
+    """
+
+    #: The clean, ``str``-typed sibling. Present so the census cannot pass by
+    #: echoing ``recovered_params``: exactly one of the two recoveries quotes.
+    CLEAN = 'The write-time tripwire fired on a value that had absorbed its siblings.'
+    ACTION = 'Attach these observations to the root-cause task; nothing to do here.'
+
+    #: (a) Loadable JSON that decodes to the declared ``list`` AND quotes a
+    #: content closer in its prose — the verbatim shape of the committed corpus
+    #: record ``toolu_01XbCz5NFCA6pCvmseyqFgvy``.
+    DECODED = json.dumps([
+        {
+            'observation': (
+                'add_memory rejected: field=content, matched_pattern='
+                + _closer('content')
+                + ', agent_id=claude-task-4502-implementer'
+            ),
+            'measured_at': 'HEAD=6f5c0adeab',
+            'ref': 'add_memory call #1',
+        }
+    ])
+
+    #: (b) NOT loadable JSON, so ``_coerce_recovered`` reports it untypable and
+    #: ``FORWARD_REPAIR`` drops it — and it quotes a content closer too.
+    DROPPED = (
+        'The tripwire reported field=content matched_pattern='
+        + _closer('content')
+        + ' three times; the entries were never serialized as JSON.'
+    )
+
+    REQUIRED = {
+        'task_id': '4502',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'A markup leak was reported',
+    }
+
+    @classmethod
+    def _args(cls, evidence: str) -> dict[str, Any]:
+        """``detail`` mis-closes with its own tag and absorbs both siblings."""
+        return {
+            **cls.REQUIRED,
+            'detail': (
+                cls.CLEAN
+                + _closer('detail') + '\n'
+                + _canonical_opener('suggested_action') + cls.ACTION
+                + '\x3c/parameter>' + '\n'
+                + _canonical_opener('evidence') + evidence
+            ),
+        }
+
+    async def _forwarded(self, evidence: str):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('escalate_info_typed', self._args(evidence))
+        return h, result
+
+    # -- (a) the decoded case ---------------------------------------------
+
+    async def test_a_DECODED_recovery_is_still_counted(self):
+        """The fact names ``evidence`` even though it lands as a ``list``.
+
+        Measured before the fix: ``recovered_params=['evidence',
+        'suggested_action']`` with ``quoted_markup_params=[]`` — the census
+        empty for the sole shape it exists to count.
+        """
+        h, _ = await self._forwarded(self.DECODED)
+
+        assert h.facts[0]['recovered_params'] == ['evidence', 'suggested_action']
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+
+    async def test_the_forward_meta_counts_it_too(self):
+        _, result = await self._forwarded(self.DECODED)
+
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == ['evidence']
+
+    async def test_the_declared_type_delivery_is_UNCHANGED_by_the_census(self):
+        """Counting it must not stop coercing it.
+
+        A guard that simply left the verbatim ``str`` in place would satisfy a
+        ``str``-only census and then die inside pydantic with ``Input should be
+        a valid list`` — the exact failure ``_coerce_recovered`` exists to
+        prevent. The census must be right WHILE the delivery stays right.
+        """
+        h, _ = await self._forwarded(self.DECODED)
+        delivered = h.recorder.args['evidence']
+
+        assert isinstance(delivered, list) and delivered
+        assert all(isinstance(entry, dict) for entry in delivered)
+        assert h.recorder.args['detail'] == self.CLEAN
+
+    async def test_the_reject_payload_counts_it_as_well(self):
+        """The load-bearing path: this ``repaired_call`` is offered for retry."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('escalate_info_typed', self._args(self.DECODED))
+        payload = _reject_payload(excinfo)
+
+        assert payload['quoted_markup_params'] == ['evidence']
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+
+    # -- (b) the dropped case ---------------------------------------------
+
+    async def test_a_DROPPED_recovery_is_still_counted(self):
+        """Naming it must not depend on whether the value happened to land.
+
+        Measured before the fix on this exact input: the verbatim census is
+        ``['evidence']``, the ``FORWARD_REPAIR`` census ``[]`` and the
+        ``REJECT_WITH_REPAIR`` census ``['evidence']`` — the same caller text,
+        named or not by policy alone.
+        """
+        h, result = await self._forwarded(self.DROPPED)
+        warning = meta_of(result)['markup_repair']
+
+        assert h.facts[0]['quoted_markup_params'] == ['evidence']
+        assert warning['quoted_markup_params'] == ['evidence']
+
+    async def test_it_is_named_by_BOTH_keys_at_once(self):
+        """The deliberate overlap, and the reason it is not a contradiction.
+
+        ``unrecovered_params`` says the value did not land; the census says the
+        caller's text quoted a literal. Both are true of this one parameter,
+        and a reader who expects them to partition would conclude one of the
+        two emitters is wrong.
+        """
+        h, result = await self._forwarded(self.DROPPED)
+        warning = meta_of(result)['markup_repair']
+
+        assert warning['unrecovered_params'] == ['evidence']
+        assert warning['quoted_markup_params'] == ['evidence']
+        # It really was dropped: the delivered call carries no evidence at all.
+        assert h.recorder.args['evidence'] is None
+        # And the census is NOT a copy of recovered_params, which the drop
+        # legitimately shrank.
+        assert h.facts[0]['recovered_params'] == ['suggested_action']
 
 
 def test_this_module_spells_no_raw_envelope_literal():

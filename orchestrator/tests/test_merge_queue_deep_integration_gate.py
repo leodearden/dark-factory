@@ -299,10 +299,21 @@ HARNESS NOTES
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
     Sync tests live in their OWN unmarked class.
-  * The ini default per-test ``timeout`` is 60 s; every class doing real git plus
-    a real worker carries ``@pytest.mark.timeout(300)``.  The CLI ``--timeout=300``
-    some runners pass does NOT remove the need for the mark, and pytest-timeout's
-    thread method ``os._exit()``s the xdist worker on overrun under
+  * The ini default per-test ``timeout`` is
+    ``_orch_helpers.PYPROJECT_DEFAULT_TIMEOUT``, a mirror of
+    orchestrator/pyproject.toml kept honest by
+    test_whole_tree_scan_timeout_guard.py -- deliberately a POINTER and not a
+    number repeated here, which is how this note's previous "60 s" claim
+    outlived the 60 -> 300 raise.  Every class doing real git plus a real
+    worker carries a ``@pytest.mark.timeout`` override, always spelled as a
+    named constant and never as a literal (ratcheted by
+    test_timeout_marker_inversion_guard.py).
+    TestRow7KillSwitchByteIdentity's is ``DEEP_GATE_SCENE_TEST_TIMEOUT``,
+    DERIVED from that class's measured git-spawn count and held honest by its
+    autouse budget fixture (task 5333); the rest pin
+    ``VERIFY_CLI_PER_TEST_TIMEOUT``.  The CLI ``--timeout`` some runners
+    pass does NOT remove the need for the mark, and pytest-timeout's thread
+    method ``os._exit()``s the xdist worker on overrun under
     ``--max-worker-restart=0``.
   * Monkeypatching is INSTANCE-level wherever possible:
     test_merge_queue_reachback_patch_guard.py freezes the
@@ -318,16 +329,31 @@ HARNESS NOTES
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pytest
+from _merge_lane_census import lanes_by_task, queued_in_lane
+
+# task 5333: Row 7 ALONE is sized by measurement (DEEP_GATE_SCENE_TEST_TIMEOUT);
+# every other real-git class here stays at the verify CLI budget because none of
+# their spawn counts has been measured, and widening an unmeasured marker is the
+# guessing this task replaced. The asymmetry is a decision, not an oversight.
+from _orch_helpers import (
+    DEEP_GATE_SCENE_BUDGET,
+    DEEP_GATE_SCENE_TEST_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
+    count_git_spawns,
+    spawn_budget_violation,
+)
 from shared.task_metadata import RetryLedger
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import (
     CapPermit,
@@ -526,9 +552,31 @@ def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
     return git_ops.worktree_base / f'_merge-{tag}'
 
 
-def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+def _make_worker(
+    git_ops: GitOps, *, verifier: VerifyPort = merge_queue.PRODUCTION_VERIFIER,
+) -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
+
+    *verifier* is the lane's injected ``VerifyPort``.  It defaults to the
+    production one, so a caller that states no verdict of its own is
+    byte-identical to before the parameter existed.
+    """
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), verifier=verifier)
+
+
+def _verifier_with_scoped(scoped) -> ProductionVerifier:
+    """The production ``VerifyPort`` with ONLY its SCOPED leg supplied here.
+
+    ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
+    replacing ``scoped`` states a scene's verdict through the port the worker
+    already takes — rather than rebinding
+    ``orchestrator.merge_queue.run_scoped_verification`` out from under
+    conftest's autouse stub — and leaves the other six legs (unscoped
+    typechecks, the disk guard, post-merge pyright and equivalence, cold
+    shadow, dry-run) genuinely production.
+    """
+    production = cast(ProductionVerifier, merge_queue.PRODUCTION_VERIFIER)
+    return dataclasses.replace(production, scoped=lambda: scoped)
 
 
 # ── event capture ────────────────────────────────────────────────────────────
@@ -906,27 +954,27 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
     bottom of the stack, at the subprocess launcher, and lets everything above
     it run for real.
 
-    TWO patches, and BOTH are required for the capture to be non-vacuous:
+    TWO things, and BOTH are required for the capture to be non-vacuous:
 
       * ``verify._run_cmd`` -> a recorder returning ``(0, '', False)`` (rc 0,
-        no output, not timed out).  The recorder is the reason no configured
-        command ever actually executes — the gate's config carries the SHIPPED
-        ``test_command``/``lint_command``/``type_check_command``, which would
-        otherwise launch the whole repo's suite.  Same shape as
+        no output, not timed out) — patched HERE.  The recorder is the reason
+        no configured command ever actually executes — the gate's config
+        carries the SHIPPED ``test_command``/``lint_command``/
+        ``type_check_command``, which would otherwise launch the whole repo's
+        suite.  Same shape as
         test_verify.py::TestRunVerificationColdFirstUse.
-      * ``merge_queue.run_scoped_verification`` -> the REAL
-        ``verify.run_scoped_verification``.  The conftest autouse
-        ``_mock_merge_queue_verification`` replaces this with a passed=True
-        stub for every test in the suite, and that stub sits ABOVE
-        ``run_verification`` — i.e. above ``_resolve_verify_timeout``.  Without
-        this restore the recorder is never called at all and the assertion
-        passes on an empty list.  (Hence the ``assert captured`` vacuity guard
-        every caller carries.)
+      * the scene's injected ``VerifyPort``, whose SCOPED leg is the REAL
+        ``verify.run_scoped_verification`` — wired by ``real_local=True``
+        (:func:`_scene_verifier`), not here.  The conftest autouse
+        ``_mock_merge_queue_verification`` replaces the module-level name with
+        a passed=True stub for every test in the suite, and that stub sits
+        ABOVE ``run_verification`` — i.e. above ``_resolve_verify_timeout``.
+        Without the injection the recorder is never called at all and the
+        assertion passes on an empty list.  (Hence the ``assert captured``
+        vacuity guard every caller carries.)
 
     Returns the live list, appended to as commands dispatch.
     """
-    from orchestrator import verify as _verify
-
     captured: list[float] = []
 
     async def _recording_run_cmd(
@@ -936,10 +984,6 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
         return 0, '', False
 
     monkeypatch.setattr('orchestrator.verify._run_cmd', _recording_run_cmd)
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _verify.run_scoped_verification,
-    )
     return captured
 
 
@@ -1133,22 +1177,6 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
                 req.result.cancel()
             worker._retire_item(req.request_id)
     return drained
-
-
-def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
-    """Return the lane whose buffer currently holds *task_id*, or ``None``.
-
-    MEMBERSHIP, not position — the composition rows that care about position
-    compare the whole ``[r.task_id for r in buffer]`` list instead, because
-    submission order inside a lane IS the next round's ``chain_snapshot`` and a
-    membership check cannot see a reorder.  This is for the weaker claim that
-    still needs saying: the item is on the queue at all, in the lane it was
-    submitted to, rather than having been silently promoted or dropped.
-    """
-    for lane in ('high', 'normal'):
-        if any(r.task_id == task_id for r in worker._lane_buffers[lane]):
-            return lane
-    return None
 
 
 # ── durable-tier readers ─────────────────────────────────────────────────────
@@ -2033,6 +2061,26 @@ class _StubRemoteAllocator:
         self._held = False
         return True
 
+    # -- the read side `snapshot()` goes through --------------------------------
+    # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
+    # `host_names` UNCONDITIONALLY for `occupancy.hosts_total`
+    # (merge_queue.py::SpeculativeMergeWorker.snapshot), so a stub without it
+    # makes the worker's own public observation surface unreadable on a remote
+    # scene -- an AttributeError from inside snapshot(), not a failed claim.
+    #
+    # `host_states()` is deliberately NOT provided: the `hosts` block is built
+    # by `_host_states_block`, whose first statement is
+    # `if not isinstance(self._host_allocator, HostAllocator): return []`.
+    # That gate is a TYPE check by design (its docstring: the doubles "answer
+    # every attribute, so hasattr/duck-typing would let them crash or inject
+    # garbage"), so for THIS duck-typed stub the block is `[]` whatever the
+    # stub offers -- and an assertion written against `hosts` here would be
+    # permanently vacuous.
+
+    @property
+    def host_names(self) -> list[str]:
+        return [self._lease.name]
+
 
 def _verify_rows(db_path: Path) -> list[dict]:
     """Return every ``merge_verify`` row's parsed ``data`` dict, in order.
@@ -2576,6 +2624,36 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
     return fake
 
 
+def _scene_verifier(verdict, real_local: bool, log: list[dict]) -> VerifyPort:
+    """The ``VerifyPort`` a scene's seam selection implies.
+
+    ``verdict=`` and ``real_local=`` are the two seams that decide the SCOPED
+    verdict, and both state it through the port rather than by rebinding
+    ``orchestrator.merge_queue.run_scoped_verification``: ``verdict=`` injects
+    the caller's content-keyed callable, recording every call on *log*
+    (which becomes ``scene.verdicts``); ``real_local=`` injects the REAL
+    ``verify.run_scoped_verification`` so the whole stack beneath it — down to
+    ``verify._resolve_verify_timeout``, which is the only reason that arm
+    exists — genuinely runs.
+
+    Every other seam leaves the production port in place, which is what keeps
+    conftest's autouse ``_mock_merge_queue_verification`` stub in charge of the
+    rounds that state no verdict of their own.
+    """
+    if verdict is not None:
+        async def _recording_verdict(worktree, *args, **kwargs):
+            result = await verdict(worktree, *args, **kwargs)
+            log.append({'worktree': Path(worktree), 'passed': result.passed})
+            return result
+
+        return _verifier_with_scoped(_recording_verdict)
+    if real_local:
+        from orchestrator import verify as _verify
+
+        return _verifier_with_scoped(_verify.run_scoped_verification)
+    return merge_queue.PRODUCTION_VERIFIER
+
+
 async def _make_gate_scene(
     repo: Path, tmp_path: Path, monkeypatch, *,
     chain_cap: int,
@@ -2611,18 +2689,19 @@ async def _make_gate_scene(
         is about TELEMETRY (``chain_items``, ``chain_build_ms``), because that
         is produced strictly below that call.
       * ``real_local=True`` — patch NOTHING on the verify path: a LOCAL lease,
-        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and (via
-        :func:`_capture_verify_timeouts`, which the caller installs) the real
+        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and —
+        through the INJECTED port (:func:`_scene_verifier`) — the real
         ``run_scoped_verification`` → ``run_verification``.  The ONLY seam that
         reaches ``verify._resolve_verify_timeout``, so the only one a BUDGET
-        claim can be made at.  The caller supplies the recorder; *script* is
-        ignored on this arm (the verdict is whatever the real stack produces —
-        a pass, since the recorder returns rc 0).
+        claim can be made at.  The caller supplies the recorder
+        (:func:`_capture_verify_timeouts`); *script* is ignored on this arm
+        (the verdict is whatever the real stack produces — a pass, since the
+        recorder returns rc 0).
 
     *verdict* is the CONTENT-KEYED alternative to the positional *script*, and
     it selects a fourth seam — the deepest one that still decides a verdict.
     It is a ``run_scoped_verification``-shaped callable (see
-    :func:`_verdict_from_tree`) installed over conftest's autouse stub, with
+    :func:`_verdict_from_tree`) injected as the port's SCOPED leg, with
     everything above it left real: a LOCAL lease (so the ordinary arm really
     warm-swaps into a ``_spec-`` lane and the verdict sees a real tree), the
     real ``_run_post_merge_verify``, and therefore the real rendering of a red
@@ -2651,16 +2730,13 @@ async def _make_gate_scene(
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_queue`` names test_merge_queue_reachback_patch_guard.py
     sanctions — ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b) the
-    PUBLIC verify seams conftest's own autouse ``_mock_merge_queue_verification``
-    already occupies: ``orchestrator.merge_queue.run_scoped_verification`` (the
-    ``verdict=`` arm below, installed over that stub so it wins) and
-    ``orchestrator.verify._run_cmd`` plus the same ``run_scoped_verification``
-    name (:func:`_capture_verify_timeouts`, which RESTORES the real function so
-    the resolver is reachable at all).  (b) is not a reach-back: the guard
-    freezes the ``merge_queue.<private>`` surface, and both of these are public
-    names the shipped test harness itself patches.  Everything else — every
-    worker attribute, every ``GitOps`` method — is patched on the INSTANCE.
+    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b)
+    ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
+    public name one layer BELOW the port that no ``VerifyPort`` leg covers.
+    The scoped verdict itself is NOT patched at all any more: both seams that
+    decide one go in through the worker's injected ``VerifyPort``
+    (:func:`_scene_verifier`).  Everything else — every worker attribute, every
+    ``GitOps`` method — is patched on the INSTANCE.
     """
     from orchestrator.event_store import EventStore
 
@@ -2673,9 +2749,16 @@ async def _make_gate_scene(
         await _create_branch_editing(repo, f'task/{tid}', filename, body)
     db_path = tmp_path / db_name
     store = EventStore(db_path, f'run-{db_name}')
-    worker = _make_worker(git_ops)
+    # The scoped verdict is stated through the INJECTED port, so the seam has
+    # to be settled before the worker exists; `verdict_log` is the ledger the
+    # `verdict=` arm records onto, handed to the scene below.
+    verdict_log: list[dict] = []
+    worker = _make_worker(
+        git_ops, verifier=_scene_verifier(verdict, real_local, verdict_log),
+    )
     worker._event_store = store
     scene = _GateScene(git_ops, config, worker, repo, store, db_path)
+    scene.verdicts = verdict_log
 
     if remote:
         from orchestrator.verify_runner import HostLease
@@ -2731,20 +2814,6 @@ async def _make_gate_scene(
             'script= and verdict= are mutually exclusive: a scene cannot state '
             'its verdicts both by position and by tree content'
         )
-
-        async def _recording_verdict(worktree, *args, **kwargs):
-            result = await verdict(worktree, *args, **kwargs)
-            scene.verdicts.append({
-                'worktree': Path(worktree), 'passed': result.passed,
-            })
-            return result
-
-        # The same public name conftest's autouse `_mock_merge_queue_verification`
-        # patches, so this is a documented seam rather than a
-        # `merge_queue.<private>` reach-back.  Installed AFTER it, so it wins.
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.run_scoped_verification', _recording_verdict,
-        )
     elif real_local:
         # Hard-guarded for the same reason `verdict=` is: this arm patches
         # NOTHING on the verify path, so a positional script would be silently
@@ -2787,7 +2856,7 @@ async def _make_gate_scene(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepScaleBuild:
     """A real 16-item chain at ``chain_cap=32`` — the PRD's stated maximum."""
 
@@ -2909,7 +2978,7 @@ class TestDeepScaleBuild:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow11TimeoutMargin:
     """Row 11: a 16-item chain (cap 32) fits inside the merge-verify budget."""
 
@@ -2956,15 +3025,15 @@ class TestRow11TimeoutMargin:
         )
         # The two knobs this test's whole claim is a routing statement about.
         config = scene.config
-        assert config.merge_verify_cold_command_timeout_secs == 7200.0, (
-            'the shipped merge-verify cold budget moved: expected 7200.0, got '
-            f'{config.merge_verify_cold_command_timeout_secs!r}'
-        )
-        assert config.verify_cold_command_timeout_secs == 5400.0, (
-            'the shipped GENERAL cold budget moved, so the exact-set assertion '
-            'below is no longer a negative control (it discriminates between '
-            'the two routes only while the two budgets DIFFER): got '
-            f'{config.verify_cold_command_timeout_secs!r}'
+        merge_budget = config.merge_verify_cold_command_timeout_secs
+        general_budget = config.verify_cold_command_timeout_secs
+        # Both are operator-tunable, so the premise is that they DIFFER, not
+        # that either holds a particular value: the exact-set assertion below
+        # discriminates between the two routes only while they do.
+        assert merge_budget != general_budget, (
+            'the merge-verify and general cold budgets have converged on '
+            f'{merge_budget!r}, so the exact-set assertion below is no longer '
+            'a negative control'
         )
 
         assert captured, (
@@ -2972,10 +3041,11 @@ class TestRow11TimeoutMargin:
             '(the autouse run_scoped_verification stub was probably still in '
             'place, short-circuiting above the resolver)'
         )
-        assert set(captured) == {7200.0}, (
+        assert set(captured) == {merge_budget}, (
             f'every command in a merge verify is handed the merge-verify cold '
-            f'budget, and NOTHING else — 5400.0, the general cold budget a '
-            f'dropped is_merge_verify would fall back to, must not appear; got '
+            f'budget ({merge_budget!r}), and NOTHING else — {general_budget!r}, '
+            f'the general cold budget a dropped is_merge_verify would fall back '
+            f'to, must not appear; got '
             f'{sorted(set(captured))!r} across {len(captured)} commands'
         )
 
@@ -3301,7 +3371,7 @@ _ROW3_CAP = 6
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow3HalvingIsolatesTheBadItem:
     """Row 3: one genuinely-red item, and a bisection that terminates on it."""
 
@@ -3734,7 +3804,7 @@ _ROW8_FOLLOWERS = 8
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow8DeepFailsNeverFeedTheThrashLadder:
     """Row 8: a red deep tip renders nothing, so the ladder has nothing to eat."""
 
@@ -3839,15 +3909,34 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         # membership: a chain rebuild that reordered the buffer would leave the
         # next round chaining a different prefix while every membership
         # assertion above still passed.
-        assert [r.task_id for r in worker._lane_buffers['normal']] == list(
-            _gate_followers(_ROW8_FOLLOWERS)
-        ), (
-            f'the followers left their submission order: '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+        followers = list(_gate_followers(_ROW8_FOLLOWERS))
+        queued = queued_in_lane(worker, 'normal')
+        assert queued[:len(followers)] == followers, (
+            f'the followers left their submission order: {queued!r}'
         )
-        assert list(worker._lane_buffers['high']) == [], (
+
+        # The head trailing them TWICE is the FIXTURE, not the code, so it is
+        # asserted on its own rather than folded into the expected list above:
+        # each red round requeues its dispatching request onto the outer queue,
+        # and `_pair` re-dispatches the same object on round 2 by design (its
+        # docstring says why) instead of consuming round 1's requeue, so the
+        # one request is queued twice over.  Split, a `_pair` cleanup that
+        # consumed the requeue reddens only this claim, and a genuine leak
+        # producing a THIRD requeue is distinguishable from the fixture's own
+        # noise instead of reading as the same failure as a reorder.
+        tail = queued[len(followers):]
+        assert tail.count('101') == 2, (
+            f'the dispatching head must trail the followers exactly twice — '
+            f'once per red round, `_pair` re-dispatching the same object; '
+            f'got {tail!r}'
+        )
+        assert set(tail) == {'101'}, (
+            f'nothing but the requeued head may sit behind the followers; '
+            f'got {tail!r}'
+        )
+        assert queued_in_lane(worker, 'high') == [], (
             f'nothing was ever enqueued high; got '
-            f'{[r.task_id for r in worker._lane_buffers["high"]]!r}'
+            f'{queued_in_lane(worker, "high")!r}'
         )
 
     async def test_the_pair_leaves_the_shipped_thrash_ladder_byte_identical(
@@ -4272,9 +4361,40 @@ other six were silently inert."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+# task 5333: DERIVED from this class's measured git-spawn count rather than
+# chosen -- see DEEP_GATE_SCENE_TEST_TIMEOUT's comment in _orch_helpers.py for
+# the measurement, the rounding and the two ceilings it sits under.
+@pytest.mark.timeout(DEEP_GATE_SCENE_TEST_TIMEOUT)
 class TestRow7KillSwitchByteIdentity:
     """Row 7: at cap=0 a whole RUN is byte-identical to the pre-PRD transcript."""
+
+    @pytest.fixture(autouse=True)
+    def _within_spawn_budget(self, request, monkeypatch):
+        """Fail if this test costs more real git than its marker is sized for.
+
+        WHY THE MARKER NEEDS A GUARD AT ALL -- and why the budget rather than
+        a comment is what keeps it honest -- is argued once, at
+        ``_orch_helpers.py::DEEP_GATE_SCENE_TEST_TIMEOUT``.  Not restated here:
+        prose copies of a derivation are what drift.  This docstring covers
+        only what is local to the fixture and stated nowhere else.
+
+        A WIRE between two shared parts and nothing else:
+        ``count_git_spawns`` is the instrument and ``spawn_budget_violation``
+        the verdict, both in _orch_helpers.py, both also used by this file's
+        counterpart in test_merge_queue_deep_landing.py.  Which seams are
+        counted, and why both of them, is stated once at ``count_git_spawns``;
+        a copy of that instrument here is what would let the two budgets drift
+        apart.  What is local to THIS scene is the size of the seam that a
+        single-seam instrument would have missed: ``create_subprocess_exec``
+        carries the bulk (231 / 110 / 110), and each of these three tests
+        makes exactly 3 ``create_subprocess_shell`` calls on top.
+        """
+        spawns = count_git_spawns(monkeypatch)
+        yield
+        violation = spawn_budget_violation(
+            spawns(), request.node.nodeid, budget=DEEP_GATE_SCENE_BUDGET,
+        )
+        assert violation is None, violation
 
     async def _sequence(
         self, git_repo: Path, tmp_path: Path, monkeypatch, *,
@@ -4484,7 +4604,7 @@ truncates and nothing is left over: the chain is exactly the queue."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBoundaryRowsComposed:
     """Rows 1, 2, 5, 6, 9 and 10, each inside ONE continuous multi-round run."""
 
@@ -4627,14 +4747,20 @@ class TestBoundaryRowsComposed:
             f'{_finalized_rows(scene.db_path)!r}'
         )
 
-        # ── every item still queued, at its ORIGINAL lane index ─────────────
-        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+        # ── every item still queued: the followers at their ORIGINAL lane
+        #    index, then the red tip requeued behind them ────────────────────
+        assert queued_in_lane(worker, 'normal') == [*followers, '101'], (
             f'the chain mutated the queue on a red tip: '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
+        # ONE census for the whole block: each `snapshot()` walks the in-flight
+        # set, the verifier queue, both lane buffers, the outer queue and the
+        # lifecycle registry, so a per-task lookup would pay for that walk once
+        # per follower.
+        lanes = lanes_by_task(worker)
         for tid in followers:
-            assert _lane_of(worker, tid) == 'normal', (
-                f'task {tid} left its lane on a red tip'
+            assert lanes.get(tid) == 'normal', (
+                f'task {tid} left its lane on a red tip: {lanes.get(tid)!r}'
             )
             assert not scene.reqs[tid].result.done(), (
                 f'task {tid} was handed a verdict no verify produced'
@@ -4855,12 +4981,12 @@ class TestBoundaryRowsComposed:
             assert rc == 0, f'{sha[:8]} is no longer on main after the abort'
 
         # ── every unlanded link is back at its EXACT lane index, unresolved ─
-        assert [r.task_id for r in worker._lane_buffers['normal']] == [
+        assert queued_in_lane(worker, 'normal') == [
             '103', '104', '105', '106',
         ], (
             f'submission order must survive the abort — it is the next round\'s '
             f'chain_snapshot; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
         for tid in ('103', '104', '105', '106'):
             req = scene.reqs[tid]
@@ -5118,7 +5244,7 @@ reason for it are documented on :func:`_setup_repo`.)
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRow4ConflictTruncatesSilently:
     """Row 4: a chain conflict is a fact about the CHAIN, not a verdict."""
 
@@ -5226,10 +5352,10 @@ class TestRow4ConflictTruncatesSilently:
         )
 
         # ── every offered item is UNTOUCHED, in its original lane position ──
-        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+        assert queued_in_lane(worker, 'normal') == followers, (
             f'submission order must survive a truncation — it is the next '
             f'round\'s chain_snapshot; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+            f'{queued_in_lane(worker, "normal")!r}'
         )
         for tid in followers:
             req = scene.reqs[tid]
@@ -5452,7 +5578,7 @@ round-by-round failure rather than as a mysteriously mis-armed hook."""
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepGateCapstone:
     """One continuous six-round run: conservation, and telemetry vs git."""
 
@@ -5554,11 +5680,11 @@ class TestDeepGateCapstone:
             f'the head and its first link landed before the bump; got '
             f'{r5["landed"]!r}'
         )
-        assert [r.task_id for r in worker._lane_buffers['normal']][:4] == [
+        assert queued_in_lane(worker, 'normal')[:4] == [
             '110', '111', '112', '113',
         ], (
             f'every unlanded link returns to its EXACT lane index; got '
-            f'{[r.task_id for r in worker._lane_buffers["normal"]][:4]!r}'
+            f'{queued_in_lane(worker, "normal")[:4]!r}'
         )
         _conserved(r5)
 

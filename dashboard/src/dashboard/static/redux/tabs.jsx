@@ -21,6 +21,7 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // asserted served-200 and asserted to load before this file.
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
+const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -249,6 +250,13 @@ function OrchTab({ projectFilter, search }) {
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
+            {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
+                them sends an operator to restart a healthy service. Invariant:
+                dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts.
+                The !o.offline guard states the precedence here rather than trusting the
+                producer, so a malformed entry with both set reads as the stronger, proven one. */}
+            {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
+            {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
             <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{o.summary.done}/{total}</span>
             {o.summary.in_progress > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{o.summary.in_progress} active</span>}
             {o.summary.blocked > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{o.summary.blocked} blocked</span>}
@@ -723,17 +731,25 @@ function ReconTab({ projectFilter, search }) {
             lastFullIso = ts; lastFullProject = pid;
           }
         }
-        const totalRuns = r.runs.length;
-        const successCount = r.runs.filter(x => x.status === 'success').length;
-        const successPct = totalRuns ? Math.round(successCount / totalRuns * 100) : null;
-        // Sparkline of recent run durations (oldest first).
+        // ONE derivation for every run-derived tile below — recon_status.js
+        // owns the vocabulary, so no two tiles can disagree about the same
+        // window. That window is the UNFILTERED r.runs, like the three tiles
+        // beside them (Buffered events, Active agents, Last full run): the
+        // strip reports the store, the tables below report the operator's
+        // project/search filter. The Recent runs table headlines its own,
+        // narrower window as "N matching", so each run-derived tile names
+        // its scope in the hint — otherwise the two numbers read as a
+        // disagreement rather than as two different questions.
+        const counts = reconRunCounts(r.runs);
+        const successPct = reconSuccessPct(counts);
+        // Sparkline of recent run durations (oldest first), same window.
         const durSpark = r.runs
           .filter(x => x.duration_seconds != null)
           .slice(0, 40)
           .map(x => x.duration_seconds)
           .reverse();
         return (
-          <div className="col-span-12 grid cols-4">
+          <div className="col-span-12 grid cols-5">
             <ST label="Buffered events" value={r.buffer.buffered_count}
                 hint={r.buffer.oldest_event_age_seconds != null
                   ? `oldest ${r.buffer.oldest_event_age_seconds}s`
@@ -742,6 +758,9 @@ function ReconTab({ projectFilter, search }) {
             <ST label="Active agents" value={r.burst_state.length}
                 hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
                 spark={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+            <ST label="In progress" value={counts.inFlight}
+                hint={`of ${counts.total} recent runs (all projects)`}
+                spark={[]} />
             <ST label="Last full run"
                 value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
                 hint={lastFullProject || 'no completed run'}
@@ -749,7 +768,9 @@ function ReconTab({ projectFilter, search }) {
             <ST label="Run success rate"
                 value={successPct != null ? successPct : '—'}
                 unit={successPct != null ? '%' : ''}
-                hint={`${totalRuns} runs · last ${durSpark.length} durations`}
+                hint={`${counts.terminal} finished · ${counts.inFlight} in flight`
+                  + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')
+                  + ' (all projects)'}
                 spark={durSpark} sparkColor={CP.ok} />
           </div>
         );
@@ -808,7 +829,7 @@ function ReconTab({ projectFilter, search }) {
                   <td className="mono">{rn.project_id || rn.project}</td>
                   <td style={{ color: 'var(--fg-2)' }}>{rn.trigger_reason || rn.trigger}</td>
                   <td>{rn.run_type || rn.type}</td>
-                  <td><span className={`badge ${rn.status === 'success' || rn.status === 'completed' ? 'ok' : rn.status === 'failed' ? 'bad' : 'warn'}`}>{rn.status}</span></td>
+                  <td><span className={`badge ${reconStatusTone(rn.status)}`}>{rn.status}</span></td>
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>

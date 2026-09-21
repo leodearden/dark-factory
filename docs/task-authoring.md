@@ -66,6 +66,28 @@ target project's checkout (e.g. `/home/leo/src/dark-factory`). It's how
 fused-memory locates the right per-project task backend and write lock;
 pass the same value consistently for a given project across a session.
 
+### `test_strategy` is closed — use `details`
+
+Decided, not deferred. The `tasks.test_strategy` column is Taskmaster
+inheritance and there is **no write path**: neither `submit_task` nor
+`update_task` declares the field, `SqliteTaskBackend.add_task`'s INSERT binds
+the literal `''` in that column's position rather than a parameter
+(`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.add_task`),
+and `SqliteTaskBackend.update_task` never adds it to its updatable columns. It
+also reaches no orchestrator role — and, being unwritable, never will. Measured
+2026-09-11 (task 5359): 24 tasks carry content, out of ~5,365; all 24 are
+terminal, with ids in 24–1143, i.e. the pre-fused-memory Taskmaster-JSON era.
+
+Put per-task test direction in **`details`** instead. That field IS writable by
+both tools and IS rendered to the architect by
+`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._format_task`.
+
+The column is not dropped, and that is deliberate: a migration on a live store
+would destroy those 24 rows of real historical content and shrink the
+four-column hygiene scan at
+`scripts/scan_task_toolcall_leaks.py::SCANNED_COLUMNS` — its one actual reader —
+for no benefit, since an unwritable field is already inert.
+
 ---
 
 ## 2. Task statuses & transitions
@@ -516,6 +538,33 @@ script's existence and executability with a test.
 
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
+
+**What the dispatched agent sees**
+
+As of task 5359 a task's own `metadata.delivered_checks` is rendered into every
+briefing built through
+`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._format_task`
+— architect, simple_task, revalidation, plan-completion, plan-tightening and
+steward-initial. Before that it reached no role at all, so an agent was measured
+against a contract it could not see: the gate
+`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`
+blocks the mark-done of the task CARRYING the checks, not only the dispatch of
+its dependents.
+
+For an author, the consequence is that the agent now reads your `pattern`. The
+warning above — that a symbol-name grep is satisfiable by prose — is therefore
+no longer only a hazard YOU can trip when authoring; it is one the agent can
+trip while implementing. That is why the rendered section states plainly that
+satisfying a pattern without delivering the behaviour is a defect rather than a
+pass, and that a descriptor the task's work cannot satisfy should be escalated
+(`escalate_blocker(category='design_concern')`) rather than written into the
+tree to make the grep match. It does not restate the descriptor shape; it points
+back here.
+
+The implementer, amender, debugger, completion judge, reviewer and merger do
+NOT see the field directly — they hold a plan plus a task id, or a diff, not the
+task record. They inherit the constraint through the plan the architect authors
+from it.
 
 **Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable):
 
@@ -1028,7 +1077,7 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class
+execution_class, merge_lane, pending_since, pending_since_backfilled
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1103,6 +1152,56 @@ carrying an out-of-vocabulary value. Note also that `EXECUTION_CLASSES` is not
 the write-time contract: `operational_routing_guard` and
 `operational_ask_registry` each hardcode their own `{operational, decision}`
 set rather than deriving it.
+
+`merge_lane` selects the merge-queue **priority lane** a task's merge
+request is drained from: `'normal'` (the default) or `'high'`. Every `'high'`
+request is picked ahead of every `'normal'` one; ordering within a lane is
+unaffected (oldest first). It is the only way a task can ask to be merged
+ahead of the queue.
+
+`merge_request` honours it: with no explicit `lane` argument the submitted
+request inherits `metadata.merge_lane`, under the precedence **`lane`
+argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
+task's *metadata* is silently normalised to `'normal'` by
+`orchestrator/src/orchestrator/merge_queue.py::_normalize_lane`, so a typo
+*here* is a silent downgrade — which is exactly why the companion `lane`
+parameter rejects an unknown value loudly instead (see its docstring in
+`escalation/src/escalation/server.py::merge_request` for that contract). The
+asymmetry is deliberate; the reason for it is stated once, in
+`escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
+rule this section applies to the carrier census below.
+
+`'high'` remains reserved for the **rare, gated hotfix / main-health class**
+(task 1689) — its three machine writers are all of that shape. Routine work
+declaring itself urgent starves the normal lane, which is the failure the
+reservation exists to prevent. The carrier census and the reason this key was
+blessed rather than typed are recorded beside the frozenset entry in
+`shared/src/shared/task_metadata.py`, per the one-place rule.
+
+`pending_since` and `pending_since_backfilled` are the list's only
+**machine-authored** entries: blessed so the schema recognises them on
+**read**, but **silently stripped from any caller-supplied metadata on
+write**. Do not set either one when filing or updating a task — a value you
+supply is dropped, not honoured, and the strip is logged under
+`task_metadata.machine_authored_key_stripped`.
+
+`pending_since` is the durable wall-clock anchor for how long a task has been
+waiting to be dispatched. It is written only by the fused-memory status
+chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
+`add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
+`* -> pending` landing, and read by the scheduler's age term and the watchdog
+idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+v5 migration, marking the rows it anchored from `updated_at` so that
+population stays countable.
+
+The strip is a write-**authority** rule, not a schema rule: the anchor is the
+scheduler's input, so a caller able to write it could price its own dispatch
+and jump the queue permanently. It is enforced at every caller -> store
+boundary from one implementation,
+`sqlite_task_backend.py::strip_machine_authored_metadata`. Note that
+`update_task(metadata_mode='replace')` still drops a stored anchor along with
+the rest of the blob — fail-safe, since the row then reads as anchorless
+(age 0) rather than pre-aged.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are

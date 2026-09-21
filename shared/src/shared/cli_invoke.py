@@ -439,8 +439,22 @@ class AgentResult:
     - ``account_name``: the OAuth account used for this invocation
     - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
     - ``schema_salvaged``: True when the CLI reported is_error=True but a valid
-      ``structured_output`` was present — commonly ``error_max_turns`` paired
-      with a completed JSON schema tool-use turn. Callers treat this as success.
+      ``structured_output`` was present, so the call is treated as success. The
+      salvage branch fires whenever a dict structured payload accompanies an
+      is_error result — which makes a *surfaced* ``error_max_turns`` failure
+      itself proof that no *dict* payload was attached (a non-dict
+      ``structured_output`` is a payload that IS present yet still is not
+      salvaged — see
+      ``test_is_error_with_non_dict_structured_output_not_salvaged`` — whereas
+      a dict payload would already have flipped the result to success before a
+      caller ever saw the failure). Measured (CLI 2.1.236/2.1.241, via
+      ``fused-memory/scripts/probe_schema_max_turns.py`` — added by task 3241,
+      unmerged as of this writing; the path resolves once that branch lands):
+      ``error_max_turns`` almost never carries a completed JSON schema
+      tool-use turn — the model spent its turns on prose and never invoked
+      the schema tool — so at that boundary salvage is rarely a backstop and
+      usually has nothing to recover. Re-run the probe to re-check this claim
+      if CLI turn-budget behavior changes.
     - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
       structured payload AND a ``StructuredOutput`` permission denial — i.e. the
       schema tool itself was blocked.  This is a systemic config break (the

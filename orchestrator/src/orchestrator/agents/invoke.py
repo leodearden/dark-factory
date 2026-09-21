@@ -524,21 +524,24 @@ def _parse_codex_output(
 
 
 def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
-    """Write MCP server config as .codex/config.toml."""
+    """Write MCP server config as .codex/config.toml.
+
+    codex reads one ``[mcp_servers.<name>]`` table per server with ``command``
+    (the executable alone) and an ``args`` list, plus an optional
+    ``[mcp_servers.<name>.env]`` subtable. Keys and values are JSON-encoded,
+    which is valid TOML for strings and string arrays, so a server name with a
+    hyphen or a path with a quote cannot break the file.
+    """
     lines = []
-    servers = mcp_config.get('mcpServers', {})
-    for name, cfg in servers.items():
-        lines.append('[[mcp_servers]]')
-        lines.append(f'name = "{name}"')
-        command = cfg.get('command', '')
-        args = cfg.get('args', [])
-        full_cmd = f'{command} {" ".join(args)}'.strip()
-        lines.append(f'command = "{full_cmd}"')
+    for name, cfg in mcp_config.get('mcpServers', {}).items():
+        table = f'mcp_servers.{json.dumps(name)}'
+        lines.append(f'[{table}]')
+        lines.append(f'command = {json.dumps(cfg.get("command", ""))}')
+        lines.append(f'args = {json.dumps([str(a) for a in cfg.get("args", [])])}')
         env_vars = cfg.get('env', {})
         if env_vars:
-            lines.append('[mcp_servers.env]')
-            for k, v in env_vars.items():
-                lines.append(f'{k} = "{v}"')
+            lines.append(f'[{table}.env]')
+            lines.extend(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
         lines.append('')
     config_path.write_text('\n'.join(lines))
 

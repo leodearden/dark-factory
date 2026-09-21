@@ -39,15 +39,35 @@ import asyncio
 import logging
 import os
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import httpx
+
+# PEP 696 TypeVar defaults, via typing_extensions rather than typing: pyright
+# rejects `typing.TypeVar(default=...)` under this package's
+# `pythonVersion = "3.11"` pin ("Type variable default types require Python
+# 3.13 or newer"), while accepting and APPLYING the typing_extensions
+# spelling at the same pin. Declared directly in pyproject.toml (task 5018).
+from typing_extensions import TypeVar as TypeVarD
 
 logger = logging.getLogger(__name__)
 
 V = TypeVar('V')
+# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so every
+# existing single-argument `TTLCache[V]` keeps checking unedited — a
+# defaulted TypeVar may not precede a non-defaulted one, so V stays first.
+#
+# THE TRADE, since the result reads backwards against every stdlib mapping
+# generic (`TTLCache[dict, _TasksRead]` looks like `Mapping[value, key]`):
+# declaring K FIRST with no default would read conventionally, at the cost of
+# editing all six single-argument `TTLCache[V]` annotations in src plus 32 in
+# test_mcp_fanout.py — churn across five modules, none of which cares what the
+# key type is. The default was chosen instead, and the inversion it forces is
+# deliberate rather than a typo.
+K = TypeVarD('K', default=str)
 
 
 # ── per-URL failure log policy (task 3871) ──────────────────────────
@@ -151,6 +171,143 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # fraction of a 100-connection pool". With ~8 live TTLCache instances the
 # worst case is a low tens of connections even if every key wedged at once.
 _MAX_LIVE_BYPASSES_PER_KEY = 3
+
+# How long the shutdown reap waits for a cancelled bypass to actually unwind.
+#
+# Cancellation is a REQUEST: how long the coroutine takes to honour it is the
+# coroutine's business. A refresh whose cleanup awaits — a `finally` that
+# flushes, a shielded section, an anyio cancel scope exiting in the wrong task
+# — can take arbitrarily long, or never finish at all. Unbounded, that hangs
+# `dashboard.app.lifespan`'s teardown, and a process sitting in shutdown with
+# no diagnostic is strictly worse than what this reap replaced: the old
+# abandon-don't-cancel policy could leak a task but never DELAYED anything.
+#
+# So the wait degrades to the old leak plus a journal line naming the keys.
+# 5s is generous against what the reap actually waits for — a cancelled httpx
+# request unwinds in milliseconds — while staying far below any sensible
+# process-shutdown patience (systemd's stock TimeoutStopSec is 90s).
+_REAP_UNWIND_TIMEOUT_SECONDS = 5.0
+
+# ── the one fan-out failure tuple ───────────────────────────────────
+#
+# "This URL failed; log it, record it, invalidate its session and move on."
+# Exported rather than re-spelled per site: this tuple previously existed
+# verbatim in three places (:func:`first_success` plus ``memory``'s two
+# hand-rolled aggregating loops), and adding the builtin ``TimeoutError``
+# under task 4958 had to edit all three in lockstep — exactly the drift a
+# triple copy invites. One definition means the next addition cannot
+# half-land.
+#
+# Members:
+#   ``httpx.ConnectError`` / ``httpx.TimeoutException`` /
+#   ``httpx.HTTPStatusError`` — transport-level failures.
+#   ``TimeoutError`` (the BUILTIN) — a whole-operation expiry. Listed IN
+#     ADDITION to ``httpx.TimeoutException`` because the two are unrelated
+#     types: ``httpx.TimeoutException`` derives from ``httpx.HTTPError``, NOT
+#     from the builtin, so catching one does not catch the other.
+#   ``ValueError`` — a caller-detected "soft failure" (a structured MCP error
+#     dict, an empty/malformed result) that ``call`` raises to signal
+#     fall-through. :class:`PreformattedFanoutError` subclasses it.
+#
+# ``task_runtime`` and ``merge_halt`` carry their own near-copies with
+# ``OSError`` added. They are outside task 4958's file lock and deliberately
+# left alone; folding them in is a separate change.
+FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.HTTPStatusError,
+    TimeoutError,
+    ValueError,
+)
+
+
+# ── per-URL whole-operation deadline (task 4958) ────────────────────
+#
+# DERIVATION, not a guessed threshold — and derived from the worst closure
+# :func:`first_success` SUPPORTS, not from the simplest one. Its contract
+# admits "a coroutine performing several paired calls against that URL", and
+# ``scheduler::collect_scheduler_state``'s ``_call`` is exactly that: one
+# ``get_scheduler_state`` plus two ``get_scheduler_events``. Against a COLD
+# session that is FIVE posts — ``initialize`` and
+# ``notifications/initialized``, then three ``tools/call`` — each at
+# ``memory.mcp_tool_call``'s 10s per-request default, so 50s is the worst
+# LEGITIMATE cost of a supported closure. 75.0 adds 50% margin for server
+# think time so a slow-but-healthy endpoint is never converted into a false
+# offline sentinel — for the scheduler that sentinel is ``(None, [], [])``,
+# i.e. the whole scheduler tab blanks out, and because that fan-out runs
+# per-project under ``asyncio.gather`` it would bite hardest on the
+# multi-project dashboards that are already slowest.
+#
+# (This was 45.0 as first written, derived from the three-post SINGLE-tool-call
+# case; that is below the 50s above, so the scheduler's legitimate worst case
+# sat outside the budget. Raised under review, task 4958.)
+#
+# Deliberately ABOVE the dashboard suite's ``timeout = 60`` pytest-timeout ini
+# value, which the 45.0 derivation had tried to stay under. The consequence is
+# accepted, not mitigated by shrinking an operator-facing backstop to fit the
+# test harness' clock: no test waits on this constant — every one either passes
+# an explicit ``per_url_timeout`` or monkeypatches this name (which works
+# because it is resolved at CALL time, see :func:`call_with_deadline`) — so the
+# only thing 60s would buy is a prettier failure for a hypothetical future test
+# that forgot to.
+#
+# This is a BACKSTOP, not a latency target: it is ~950x below the 19.8h hang
+# that motivated it, and callers needing tight latency keep their own enclosing
+# ``asyncio.wait_for`` (metrics.py does, at 2-5s).
+_DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
+
+# ── why a per-HTTP-request budget cannot bound the operation ────────
+#
+# Recording the measurement (httpx 0.28.1 / httpcore 1.0.9) so a future reader
+# does not re-derive it and conclude the deadline above is redundant with
+# ``mcp_tool_call``'s ``timeout``. It is not — that budget is per REQUEST, and
+# even one request is not fully bounded by it:
+#
+# 1. ``read`` bounds each individual socket read, NOT the whole response body.
+#    ``httpcore._async.http11::HTTP11Connection._receive_response_headers`` and
+#    ``::_receive_response_body`` each resolve ``timeouts.get('read', None)``
+#    once and then call ``_receive_event(timeout=timeout)`` inside a
+#    ``while True`` loop; ``::_receive_event`` in turn hands that same value to
+#    every individual ``self._network_stream.read(...)``. So the budget is
+#    re-armed per socket read, and a peer emitting one byte just inside each
+#    read window keeps the request alive indefinitely with the budget never
+#    firing. This is not exotic on this transport:
+#    ``memory.MCP_HEADERS`` sends ``Accept: application/json,
+#    text/event-stream`` and ``client.post`` reads the FULL body, so an SSE
+#    response the server never closes parks ``resp.text`` forever under a
+#    per-request budget that is behaving exactly as documented.
+# 2. ``httpcore._async.connection::AsyncHTTPConnection.handle_async_request``
+#    acquires ``self._request_lock`` (an ``anyio.Lock``) with NO timeout; only
+#    the ``_connect`` inside it is budgeted.
+#
+# Layered on top of that, a COLD session performs three posts (see
+# :func:`memory.mcp_tool_call`), each with its own budget. Hence the
+# whole-operation deadline above, applied per URL.
+#
+# ── why there is deliberately NO per-endpoint pool cap ──────────────
+#
+# Investigated under task 4958 and rejected. The pool-pinning risk is a
+# CONSEQUENCE of the unbounded hang, not an independent defect: with every leg
+# now bounded, a wedged endpoint pins at most (concurrent pollers) connections
+# for at most the deadline, after which ``asyncio.wait_for`` cancels the
+# request and httpcore's ``except BaseException`` in
+# ``httpcore._async.connection_pool::AsyncConnectionPool.handle_async_request``
+# removes the pool request and closes the connection. That sits well inside
+# ``app::_build_http_limits``' ``max(100, 4 * 3 * endpoints)`` ceiling.
+# Conversely a per-endpoint semaphore would add a NEW queueing layer whose
+# acquisition is itself unbounded — reintroducing this exact bug class one
+# level down — and would require editing ``app.py`` for no measured benefit.
+#
+# ── why the deadline is default-on ──────────────────────────────────
+#
+# Most live :func:`first_success` call sites carry no enclosing deadline of
+# their own — measured under task 4958: ``app::api_curator_cancel`` (the
+# ``cancel_ticket`` proxy), ``app::_scheduler_proxy``, the three ``tasks``
+# sites, and ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
+# had to hand-convert ``TimeoutError`` into ``ValueError`` to do so. Those
+# unwrapped sites are precisely the ones that could park forever, and they are
+# outside this module — so an opt-in parameter would have left the hole open
+# for exactly the population it exists to protect.
 
 
 class PreformattedFanoutError(ValueError):
@@ -315,6 +472,62 @@ def reset_failure_streaks() -> None:
     _failure_streaks.clear()
 
 
+async def call_with_deadline(
+    url: str,
+    call: Callable[[str], Awaitable[V]],
+    deadline: float | None = None,
+) -> V:
+    """Await ``call(url)`` under a whole-operation *deadline*, in seconds.
+
+    The shared layering primitive for this cluster: an MCP ``timeout`` is a
+    per-HTTP-request budget and cannot bound an operation (see the note beside
+    :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS`), so a hard bound has to come
+    from an enclosing deadline. ``task_runtime``, ``metrics`` and
+    ``merge_halt`` each hand-rolled that pairing; this is the one copy the
+    fan-out helpers use.
+
+    ``deadline=None`` means :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS`, resolved
+    HERE at *call* time rather than captured as a def-time default argument, so
+    a monkeypatched module constant takes effect immediately — the same idiom
+    :class:`TTLCache` documents for ``ttl_seconds``. Resolving it in this one
+    place is what lets :func:`first_success` and ``memory``'s two hand-rolled
+    aggregating loops share one policy instead of each re-implementing the
+    fallback, and keeps the constant private to this module rather than reached
+    into across a module boundary.
+
+    On expiry the ``TimeoutError`` ``asyncio.timeout`` raises carries an EMPTY
+    message, which :func:`describe_exc` degrades to the content-free string
+    ``'TimeoutError'`` — exactly the causeless log line and offline pill that
+    function exists to prevent. It is therefore re-raised as a message-bearing
+    ``TimeoutError`` naming the budget, so an operator can tell "our
+    whole-operation backstop fired" from an httpx read timeout. A plain
+    ``TimeoutError`` (not :class:`PreformattedFanoutError`) is used because
+    ``describe_exc``'s normal ``'Type: message'`` rendering is already correct
+    here — the type name is the diagnosis, not a duplicate prefix.
+
+    Whose deadline fired is decided STRUCTURALLY, by ``asyncio.timeout``'s
+    ``expired()``, never by sniffing the exception's message. Only OUR budget's
+    expiry is re-rendered; a ``TimeoutError`` raised by *call* itself — most
+    importantly one from a nested ``asyncio.wait_for`` with its own, tighter
+    budget, which raises an EMPTY message too — is re-raised untouched. Message
+    emptiness would have mis-attributed such an expiry as "no response within
+    75.0s" after 2s, putting a wrong number in the one operator-facing string
+    this helper exists to make trustworthy.
+    """
+    if deadline is None:
+        deadline = _DEFAULT_PER_URL_DEADLINE_SECONDS
+    cm = asyncio.timeout(deadline)
+    try:
+        async with cm:
+            return await call(url)
+    except TimeoutError:
+        if not cm.expired():
+            raise
+        raise TimeoutError(
+            f'no response within {deadline:.1f}s (whole-operation deadline)',
+        ) from None
+
+
 async def first_success(
     urls: Sequence[str],
     call: Callable[[str], Awaitable[V]],
@@ -322,22 +535,24 @@ async def first_success(
     log_label: str,
     offline_result: Callable[[list[str]], V],
     log_failures: bool = True,
+    per_url_timeout: float | None = None,
 ) -> V:
     """Call *call(url)* for each URL in order; return the first success.
 
     ``call`` is invoked with one URL at a time and must return an awaitable
     (a single MCP tool call, or a coroutine performing several paired calls
-    against that URL). On:
+    against that URL). On any member of
+    :data:`FANOUT_FAILURE_EXCEPTIONS` — transport errors, a whole-operation
+    ``TimeoutError``, or a caller-raised ``ValueError`` signalling a soft
+    failure; see that tuple for what each one means — the failing URL's cached
+    MCP session is invalidated, the error is recorded, and the loop continues
+    to the next URL. Any other exception type propagates uncaught.
 
-    - ``httpx.ConnectError`` / ``httpx.TimeoutException`` / ``httpx.HTTPStatusError``
-      — a transport-level failure;
-    - ``ValueError`` — a caller-detected "soft failure" (e.g. a structured
-      MCP error dict or an empty/malformed result) that *call* raises to
-      signal fall-through;
-
-    the failing URL's cached MCP session is invalidated, the error is
-    recorded, and the loop continues to the next URL. Any other exception
-    type propagates uncaught.
+    Before the builtin ``TimeoutError`` was listed there, it propagated
+    uncaught (it is not a ``httpx.TimeoutException``), which is why
+    ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError`` before
+    calling in. That conversion is still correct — it happens before this
+    frame sees the exception — and is deliberately left in place.
 
     If every URL fails, returns ``offline_result(errors)`` where *errors*
     is the list of collected ``f'{url}: {e}'`` strings — letting each
@@ -361,6 +576,45 @@ async def first_success(
     proxies that already emit their own fully-detailed WARNING at the call
     site: the failure is then reported exactly once, by the caller, rather
     than twice at the same level.
+
+    **A builtin ``TimeoutError`` is exempt from that suppression** and is
+    always reported. It cannot be a duplicate of a call-site line, by
+    construction: a whole-operation expiry cancels ``call`` mid-flight, so what
+    the call site sees is a ``CancelledError`` — a ``BaseException``, outside
+    its own ``except (ConnectError, TimeoutException, HTTPStatusError,
+    ValueError)`` — and it logs nothing. Suppressing here too would make a hang
+    the ONE failure at those two sites that leaves no journal trace at all,
+    which is the task-1814 shape this module's log policy exists to prevent.
+
+    ``per_url_timeout`` is a **whole-operation deadline applied to each URL's
+    attempt**, and it is ON BY DEFAULT. ``None`` is forwarded to
+    :func:`call_with_deadline`, which resolves it to
+    :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS` at *call* time; there is
+    deliberately no way to disable it. A backstop with an off switch is a
+    footgun — the only caller who would reach for it is one that has not
+    thought about hangs, which is exactly the population it protects. Most live
+    call sites (``app.py``'s two proxies, the three ``tasks.py`` sites,
+    ``scheduler.py``'s) have no enclosing deadline of their own and are the
+    ones that can park forever; a default-on bound closes that for them without
+    editing any of them, and is non-binding for the callers that already wrap
+    in their own 2-5s ``asyncio.wait_for``. A caller wanting a looser bound
+    passes a larger float; a caller wanting a tighter one keeps its own
+    enclosing ``wait_for``. Expiry is an ordinary per-URL failure: it is logged,
+    collected, invalidated and fallen through like any other.
+
+    **A cancellation invalidates the in-flight URL's session and then
+    re-raises.** ``asyncio.CancelledError`` derives from ``BaseException``, so
+    the ``except`` tuple above cannot catch it: a caller's enclosing
+    ``asyncio.wait_for`` firing mid-attempt used to unwind this function with
+    the hung URL's ``McpSession`` still cached, so every subsequent poll reused
+    it and hung identically — the incident shape this helper now closes.
+    Invalidating is consistent with the policy already in force here (a
+    ``httpx.TimeoutException`` invalidates too, and re-initialising a session
+    after a failure is cheap and strictly more conservative), and is harmless
+    during process shutdown, when the sessions are being torn down anyway.
+    Re-raising is mandatory: swallowing a ``CancelledError`` would break
+    shutdown and ``asyncio.gather`` sibling cancellation, which ``app.py``'s
+    ``safe_gather_result`` deliberately lets propagate.
     """
     # Local import breaks the memory<->mcp_fanout import cycle: memory.py
     # imports first_success at module top, so invalidate_session (which
@@ -371,22 +625,90 @@ async def first_success(
     errors: list[str] = []
     for url in urls:
         try:
-            result = await call(url)
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            if log_failures:
+            # per_url_timeout is forwarded as-is: None means "the module
+            # default", which call_with_deadline resolves at call time.
+            result = await call_with_deadline(url, call, per_url_timeout)
+        except asyncio.CancelledError:
+            # Deliberately NOT reported through log_fanout_failure: a
+            # cancellation is not an endpoint failure, and counting it would
+            # corrupt the streak counters that gate the transition-only
+            # WARNING policy above (a cancelled poll would open a streak that
+            # demotes the next real failure's opening WARNING to DEBUG).
+            invalidate_session(url)
+            raise
+        except FANOUT_FAILURE_EXCEPTIONS as e:
+            # A whole-operation expiry is reported even when the caller asked
+            # for silence — see the log_failures paragraph above for why it
+            # can never be a duplicate of the call site's own line.
+            if log_failures or isinstance(e, TimeoutError):
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
             invalidate_session(url)
         else:
-            if log_failures:
-                note_fanout_success(log_label, url)
+            # Unconditional, unlike the failure report: a timeout can open a
+            # streak even at a log_failures=False site, and a streak left open
+            # would silently demote that site's NEXT opening WARNING to DEBUG.
+            # This stays silent for those callers as before whenever no streak
+            # is open — note_fanout_success is then a no-op.
+            note_fanout_success(log_label, url)
             return result
     return offline_result(errors)
 
 
-class TTLCache(Generic[V]):
-    """Single-flight, short-TTL cache keyed by an arbitrary string.
+# Every live TTLCache, enrolled from __init__ so reap_detached_refreshes()
+# below can reach all of them without anyone enumerating the 8 module-level
+# instances spread over 4 modules (app.py, data/tasks.py, data/merge_queue.py,
+# data/scheduler.py). Enrolment is what makes shutdown coverage exhaustive by
+# construction: a ninth cache is reaped with no edit at its call site.
+#
+# WEAK, so the registry cannot become a leak of its own — a cache constructed
+# inside a test drops out when the test does. Module-level for the same reason
+# _failure_streaks above is: the state is genuinely per-process, and the
+# alternative (an explicit list in app.py's lifespan) trades one global for an
+# import edge onto every module that happens to own a cache.
+_live_caches: weakref.WeakSet[TTLCache[Any, Any]] = weakref.WeakSet()
+
+
+async def reap_detached_refreshes() -> int:
+    """Cancel every in-flight bypass refresh across all live caches; return the count.
+
+    The process-shutdown hook for :meth:`TTLCache.cancel_live_bypasses` —
+    called from the dashboard app's ``lifespan`` teardown. See that method
+    for why cancelling is correct here and nowhere else.
+
+    One WARNING when anything was actually reaped: a detached refresh
+    outliving its app lifespan is an anomaly worth a journal line, and at one
+    line per shutdown it needs no streak throttle (contrast
+    :meth:`TTLCache._note_lock_bypass`, which sits on a hot path).
+
+    The registry is snapshotted before the first ``await`` rather than
+    iterated lazily: it is a ``WeakSet``, so a collection during one of those
+    awaits would otherwise mutate the set mid-iteration.
+
+    **Every registered cache gets its chance to be reaped**, whatever any
+    other cache does — the registry admits any ``TTLCache`` subclass, and this
+    runs inside ``dashboard.app.lifespan``'s teardown, where a cache skipped
+    here leaks its tasks into the next app on a loop that will by then be
+    closed (the task-3466 class). ``Exception``, never ``BaseException``: a
+    ``CancelledError`` here is the SHUTDOWN itself being cancelled, and
+    swallowing that would make this unkillable inside a teardown that is
+    already being torn down.
+    """
+    total = 0
+    for cache in list(_live_caches):
+        try:
+            total += await cache.cancel_live_bypasses()
+        except Exception:
+            logger.exception('failed to reap detached refreshes for one cache')
+    if total:
+        logger.warning(
+            'reaped %d detached cache refresh(es) still in flight at shutdown', total
+        )
+    return total
+
+
+class TTLCache(Generic[V, K]):
+    """Single-flight, short-TTL cache keyed by an arbitrary HASHABLE.
 
     Generalizes scheduler.py's ``_scheduler_cache`` +
     ``_scheduler_refresh_lock`` double-checked-locking pattern: a warm entry
@@ -505,6 +827,20 @@ class TTLCache(Generic[V]):
     add eviction from outside (``_store`` is private), so the fix belongs
     here. Steady-state size is now "keys requested within the eviction
     horizon", regardless of how many distinct keys the caller has ever used.
+
+    **Shutdown is the ONE exception to abandon-don't-cancel.** Everywhere else
+    — :meth:`_evict_expired`'s ``dead_bypasses`` sweep, :meth:`clear`,
+    :meth:`_bypass_refresh`'s supersession — an abandoned bypass is
+    deliberately left running: it may still store a late value and heal the
+    key for whoever asks next, which is what lets a wedged key recover on its
+    own. That reasoning holds for exactly as long as a "next caller" can
+    exist. At process shutdown none can, while the task still pins a
+    connection on the shared httpx client — and, since these caches are
+    module-level and event loops are not, it can outlive the loop that
+    started it. :meth:`cancel_live_bypasses` (and its module-level fan-out
+    :func:`reap_detached_refreshes`) is therefore the single place a bypass is
+    ever cancelled, and is called only from the app's ``lifespan`` teardown.
+    Runtime behaviour is untouched.
     """
 
     # Multiple of the TTL after which an untouched entry is evicted. Entries
@@ -516,14 +852,14 @@ class TTLCache(Generic[V]):
         self._ttl_fn: Callable[[], float] = (
             ttl_seconds if callable(ttl_seconds) else (lambda: ttl_seconds)
         )
-        self._store: dict[str, tuple[float, V]] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._store: dict[K, tuple[float, V]] = {}
+        self._locks: dict[K, asyncio.Lock] = {}
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
         # by cache key. Per-instance because the key space is per-cache:
         # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
-        # share key strings exactly, and three more live instances key on a
+        # share keys exactly, and three more live instances key on a
         # bare project_root — a module-level dict would collapse them.
-        self._bypass_streaks: dict[str, int] = {}
+        self._bypass_streaks: dict[K, int] = {}
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to
         # ONE per key (see _bypass_refresh) rather than one per timed-out
@@ -535,7 +871,7 @@ class TTLCache(Generic[V]):
         # review fix). A completed entry is removed instantly by the task's
         # own done-callback; a superseded entry is dropped by the caller
         # that replaces it.
-        self._bypass_tasks: dict[str, tuple[float, asyncio.Task[V]]] = {}
+        self._bypass_tasks: dict[K, tuple[float, asyncio.Task[V]]] = {}
         # Every LIVE bypass task for a key, in creation order — not just the
         # one currently TRACKED as "the" bypass in _bypass_tasks above.
         # _bypass_tasks answers "who should the next caller join?", which is
@@ -547,9 +883,10 @@ class TTLCache(Generic[V]):
         # (see _MAX_LIVE_BYPASSES_PER_KEY). Entries are removed by the
         # task's own done-callback, and swept defensively by
         # _live_bypasses_for / _evict_expired.
-        self._live_bypasses: dict[str, list[asyncio.Task[V]]] = {}
+        self._live_bypasses: dict[K, list[asyncio.Task[V]]] = {}
+        _live_caches.add(self)
 
-    def get_fresh(self, key: str) -> V | None:
+    def get_fresh(self, key: K) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
         cached = self._store.get(key)
         if cached is not None and (time.monotonic() - cached[0]) < self._ttl_fn():
@@ -687,7 +1024,7 @@ class TTLCache(Generic[V]):
 
     async def _refresh_and_store(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -723,7 +1060,7 @@ class TTLCache(Generic[V]):
 
     def _start_bypass(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> asyncio.Task[V]:
@@ -769,7 +1106,7 @@ class TTLCache(Generic[V]):
         task.add_done_callback(_forget_if_current)
         return task
 
-    def _live_bypasses_for(self, key: str) -> list[asyncio.Task[V]]:
+    def _live_bypasses_for(self, key: K) -> list[asyncio.Task[V]]:
         """Return *key*'s live bypass tasks, dropping any already finished.
 
         ``_start_bypass``'s done-callback is the primary reclaimer, but a
@@ -787,7 +1124,7 @@ class TTLCache(Generic[V]):
 
     async def _start_or_join_at_cap(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -817,7 +1154,7 @@ class TTLCache(Generic[V]):
 
     async def _bypass_refresh(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -920,7 +1257,7 @@ class TTLCache(Generic[V]):
 
     def _note_lock_bypass(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         *,
         reason: str = 'lock_timeout',
@@ -997,7 +1334,7 @@ class TTLCache(Generic[V]):
         else:
             logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
 
-    def _note_lock_acquired(self, key: str) -> None:
+    def _note_lock_acquired(self, key: K) -> None:
         """Close an open bypass streak for *key*, logging recovery.
 
         Emits at WARNING — the same level as the streak's opening line — so
@@ -1018,7 +1355,7 @@ class TTLCache(Generic[V]):
 
     async def get_or_refresh(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         *,
         cache_ok: Callable[[V], bool] = lambda v: True,
@@ -1104,6 +1441,117 @@ class TTLCache(Generic[V]):
                 return await self._refresh_and_store(key, refresh, cache_ok)
             finally:
                 lock.release()
+
+    async def cancel_live_bypasses(self) -> int:
+        """Cancel and await every bypass refresh still in flight; return the count.
+
+        The shutdown-only exception to abandon-don't-cancel (see the class
+        docstring). Unlike :meth:`clear`, which merely stops TRACKING an
+        in-flight bypass and leaves it running, this ends it: the cancellation
+        is AWAITED, so by the time this returns the task has actually unwound
+        and released its connection rather than merely been asked to.
+
+        AWAITED FOR AT MOST ``_REAP_UNWIND_TIMEOUT_SECONDS``, because how long
+        a coroutine takes to honour a cancellation is the coroutine's business
+        and the thing being reaped is by hypothesis already wedged. A cleanup
+        that never finishes would otherwise hang ``dashboard.app.lifespan``'s
+        teardown outright — worse than the leak this reap exists to fix, since
+        abandon-don't-cancel never DELAYED a shutdown. Past the bound the task
+        is abandoned exactly as that older policy would have abandoned it,
+        with one WARNING naming the keys so the degradation is visible rather
+        than inferred.
+
+        EVERY outcome of that unwind is consumed, not only ``CancelledError``
+        — a refresh can finish by raising on its own account (an anyio/httpx
+        cancel-scope ``RuntimeError``, a ``finally`` that blows up), and a
+        detached bypass by construction has no awaiter such an outcome could
+        mean anything to. :meth:`_start_bypass`'s done-callback already
+        settles that policy for the same tasks while the process runs; this
+        matches it rather than narrowing it to one exception type. Narrowing
+        is not cosmetic here: an escape reaches :func:`reap_detached_refreshes`
+        and then ``dashboard.app.lifespan``, above the closes that follow it.
+
+        Reads the roster through :meth:`_live_bypasses_for` so its sweep
+        applies: a task that finished before its done-callback ran is dropped
+        rather than counted as reaped. Both maps are rebuilt before the first
+        cancellation, so the done-callbacks those cancellations trigger find
+        nothing of theirs to unpick and cannot mutate a roster being iterated.
+
+        **Only tasks on the CALLING loop are touched**, because this cache
+        outlives individual event loops while its tasks do not. The instances
+        are module-level, and the dashboard's own test suite runs a fresh loop
+        per ``TestClient(app)`` in its own thread, so a roster entry left by an
+        earlier loop is a state this method will really meet. Cancelling one
+        cancels its parked future, which schedules that future's callbacks
+        through ``loop.call_soon`` — on a closed loop, ``RuntimeError: Event
+        loop is closed``, the same escape ``dashboard.app.lifespan``'s
+        docstring attributes to task 3466.
+
+        The residual, named honestly: a task on a CLOSED foreign loop is
+        UNREACHABLE, not reaped. Its loop is gone, so nothing this process can
+        do will advance, finish or free it, and it is excluded from the
+        returned count for that reason. Its roster entry is dropped anyway —
+        otherwise a dead loop's residue counts against
+        ``_MAX_LIVE_BYPASSES_PER_KEY`` forever, denying the live loop bypasses
+        it is entitled to.
+
+        A task on a foreign loop that is still OPEN is a different state and
+        keeps BOTH its roster entries. It is someone else's in-flight work,
+        not residue: it still holds a connection, so it must still count
+        against that key's bound, and the loop running it will reach its own
+        shutdown, where this same method has to find it. Un-tracking it here
+        would reset the bound while the task runs on, and then lose the task
+        itself — recreating the very leak this reap exists to close. Only
+        ``is_closed()`` separates the two states; "not my loop" alone does
+        not, and overlapping app lifespans are routine in this project's own
+        test suite.
+
+        Counts tasks that actually ENDED, not keys and not tasks merely asked
+        to end: a key may hold up to ``_MAX_LIVE_BYPASSES_PER_KEY`` tasks, and
+        one still unwinding past the bound is a leak being reported, not work
+        reclaimed. A task that ended by RAISING is counted — it ended, so it
+        released its connection.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _runs_on_another_live_loop(task: asyncio.Task[V]) -> bool:
+            task_loop = task.get_loop()
+            return task_loop is not loop and not task_loop.is_closed()
+
+        reapable = [
+            (key, task)
+            for key in list(self._live_bypasses)
+            for task in self._live_bypasses_for(key)
+            if task.get_loop() is loop
+        ]
+        retained: dict[K, list[asyncio.Task[V]]] = {}
+        for key, tasks in self._live_bypasses.items():
+            elsewhere = [task for task in tasks if _runs_on_another_live_loop(task)]
+            if elsewhere:
+                retained[key] = elsewhere
+        self._live_bypasses = retained
+        self._bypass_tasks = {
+            key: entry
+            for key, entry in self._bypass_tasks.items()
+            if _runs_on_another_live_loop(entry[1])
+        }
+        for _key, task in reapable:
+            task.cancel()
+        abandoned: set[asyncio.Task[V]] = set()
+        if reapable:  # asyncio.wait rejects an empty set; a clean cache is one
+            _ended, abandoned = await asyncio.wait(
+                [task for _key, task in reapable],
+                timeout=_REAP_UNWIND_TIMEOUT_SECONDS,
+            )
+        if abandoned:
+            logger.warning(
+                '%d detached cache refresh(es) did not unwind within %.1fs and '
+                'are abandoned (keys: %s); shutdown continues without them',
+                len(abandoned),
+                _REAP_UNWIND_TIMEOUT_SECONDS,
+                ', '.join(sorted({repr(k) for k, task in reapable if task in abandoned})),
+            )
+        return len(reapable) - len(abandoned)
 
     def clear(self) -> None:
         """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).

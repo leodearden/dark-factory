@@ -102,6 +102,7 @@ from shared.config_dir import (  # noqa: E402
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
     sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
@@ -132,6 +133,22 @@ MODE_WEDGE_SHAPE: dict[str, str | None] = {
     'mcp_wedge': 'mcp_init_hang',
     'replay': None,
 }
+
+#: The closed set :func:`_poisoned_observation` filters ``wedge_shape`` against,
+#: derived from the dict above rather than retyped so the two cannot drift.
+#: Hoisted to module level because the filter runs per degraded row and rebuilding
+#: it per call would be pure waste.  ``None`` IS a member (healthy/replay), which
+#: is why the filter must be a membership test and never a truthiness one.
+#:
+#: A TUPLE, matching :data:`MODES` and :data:`SAMPLE_KINDS`, and NOT a frozenset:
+#: ``in`` on a set HASHES the candidate, so an unhashable ``wedge_shape`` (a dict
+#: or a list) would raise ``TypeError`` from inside ``_poisoned_observation`` —
+#: the last-resort never-raise path whose entire reason to exist is that a raise
+#: there loses an already-paid-for live capture.  Tuple membership compares with
+#: ``==`` and is total.  ``dict.fromkeys`` collapses the duplicate ``None`` while
+#: keeping declaration order; at <=5 elements the linear scan costs nothing on a
+#: path that fires at most once per degraded row.
+_WEDGE_SHAPES: tuple[str | None, ...] = tuple(dict.fromkeys(MODE_WEDGE_SHAPE.values()))
 
 #: Full-sample offsets (seconds since spawn).  Recorded as PROVENANCE only — no
 #: test asserts a wall-clock threshold, because none is achievable (host load,
@@ -341,17 +358,29 @@ def _bool_or_none(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-#: Anchored, length-bounded shapes for the two PROBE-AUTHORED identity strings a
+#: Anchored, length-bounded shapes for the PROBE-AUTHORED identity strings a
 #: degraded row is allowed to carry (see :func:`_poisoned_observation`).  Matching
-#: one is what makes the value clean BY CONSTRUCTION rather than by a scan: both
-#: alphabets exclude every named marker (``sk-ant-``, ``accessToken``, ...), and
-#: the longest ``[A-Za-z0-9_-]`` stretch either shape admits is 36 characters (a
-#: whole UUID), well under the 64-character generic run threshold.  ``fullmatch``
-#: is load-bearing — an unanchored match would let arbitrary text ride along.
+#: one is what makes the value clean BY CONSTRUCTION rather than by a scan: every
+#: alphabet excludes every named marker (``sk-ant-``, ``accessToken``, ...), and
+#: the longest ``[A-Za-z0-9_-]`` stretch any of these shapes admits is 36
+#: characters (a whole UUID), well under the 64-character generic run threshold.
+#: ``fullmatch`` is load-bearing — an unanchored match would let arbitrary text
+#: ride along.
 _ISO_TIMESTAMP_RE = re.compile(
     r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[+-]\d{2}:\d{2}|Z)'
 )
 _UUID_RE = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+
+#: The default ``probe_run_id`` :func:`main` builds — ``f'{args.mode}-{uuid4().hex[:12]}'``.
+#: Built FROM ``MODES`` rather than hand-spelled, so a new mode cannot leave the
+#: validator rejecting ids the probe itself just generated.  Its longest
+#: ``[A-Za-z0-9_-]`` stretch is ``len(max(MODES, key=len)) + 1 + 12`` = 24
+#: characters (``build_wedge-`` plus 12 hex), far under the 64-character generic
+#: threshold, and the alphabet ``[a-z_]``/``[0-9a-f]`` excludes every named marker
+#: — so it keeps the row clean by construction under exactly the argument above.
+_PROBE_RUN_ID_RE = re.compile(
+    '(?:' + '|'.join(re.escape(mode) for mode in MODES) + r')-[0-9a-f]{12}'
+)
 
 
 def _shaped_or_none(value: Any, shape: re.Pattern[str]) -> str | None:
@@ -379,37 +408,53 @@ def _poisoned_observation(
     pre-first-token path — a placeholder without it would merely trade the
     AssertionError for a KeyError at exactly the same blast radius.
 
-    ATTRIBUTION.  ``captured_at`` and ``session_id`` are carried too, because
-    ``main()`` APPENDS to ``--out``: one JSONL file routinely holds several runs
-    and several modes, and a row saying only ``mode='healthy', sample_index=2``
-    cannot be traced back to the run that produced it — which makes the stderr
-    warning's "fix ``_scrub_value``, then re-run the probe" advice unactionable.
-    Both are probe-authored (``datetime.now(UTC).isoformat()`` and a ``uuid4``)
-    and both are validated against an anchored shape before being carried, so
-    they keep the row's clean-by-construction property rather than trusting their
-    provenance: a value the probe did not author simply degrades to ``None``.
+    ATTRIBUTION.  ``captured_at``, ``session_id`` and ``probe_run_id`` are carried
+    too, because ``main()`` APPENDS to ``--out``: one JSONL file routinely holds
+    several runs and several modes, and a row saying only ``mode='healthy',
+    sample_index=2`` cannot be traced back to the run that produced it — which
+    makes the stderr warning's "fix ``_scrub_value``, then re-run the probe"
+    advice unactionable.  All three are probe-authored by default
+    (``datetime.now(UTC).isoformat()``, a ``uuid4``, and
+    ``f'{args.mode}-{uuid4().hex[:12]}'``) and all three are validated against an
+    anchored shape before being carried, so they keep the row's
+    clean-by-construction property rather than trusting their provenance: a value
+    the probe did not author simply degrades to ``None``.  ``probe_run_id`` earns
+    its place over the other two specifically because it is the corpus JOIN KEY —
+    ``test_every_row_is_linked_to_a_raw_probe_run`` fails a curated row whose
+    ``probe_run_id`` is absent from the raw capture, and ``session_id`` appears
+    nowhere in that provenance contract.  An operator-supplied ``--probe-run-id``
+    simply will not ``fullmatch`` and degrades to ``None``, which is exactly the
+    behaviour before it was carried, so there is no regression path.
+    ``wedge_shape`` is carried under the same closed-set treatment as ``mode``,
+    against a set the probe itself owns (``MODE_WEDGE_SHAPE``).
 
     Nothing else survives.  Dropping ``transcript_records`` / ``config_dir_tree``
     / ``run_exit`` / ``spawn_argv`` is what costs this ONE sample its analytical
-    value — the deliberate price of not losing the other N.  ``cli_version`` and
-    ``probe_run_id`` are dropped with them: the first is ``claude --version``
-    output and the second can come straight from ``--probe-run-id``, so neither
-    is probe-authored and neither has a shape that could be validated.
+    value — the deliberate price of not losing the other N.  ``cli_version`` is
+    dropped with them: it is ``claude --version`` output, so it is neither
+    probe-authored nor owner of a shape that could be validated.
     """
     substrate = observation.get('substrate_returns')
     if not isinstance(substrate, dict):
         substrate = {}
     mode = observation.get('mode')
+    wedge_shape = observation.get('wedge_shape')
     sample_kind = observation.get('sample_kind')
     return {
         'redaction_failed': True,
         'redaction_failure_pattern': pattern_name,
         'mode': mode if mode in MODES else None,
+        # `in`, never truthiness: None is a legitimate member of _WEDGE_SHAPES
+        # (the healthy and replay regimes both stamp it).
+        'wedge_shape': wedge_shape if wedge_shape in _WEDGE_SHAPES else None,
         'sample_kind': sample_kind if sample_kind in SAMPLE_KINDS else None,
         'sample_index': _int_or_none(observation.get('sample_index')),
         'sample_offset_secs': _number_or_none(observation.get('sample_offset_secs')),
         'captured_at': _shaped_or_none(observation.get('captured_at'), _ISO_TIMESTAMP_RE),
         'session_id': _shaped_or_none(observation.get('session_id'), _UUID_RE),
+        'probe_run_id': _shaped_or_none(
+            observation.get('probe_run_id'), _PROBE_RUN_ID_RE
+        ),
         'substrate_returns': {
             key: (substrate.get(key) if isinstance(substrate.get(key), int) else None)
             for key in _SUBSTRATE_KEYS
@@ -977,12 +1022,6 @@ _PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
 #: request, and the name says so out loud on an operator's `ls /tmp`.
 _PROBE_KEEP_SUFFIX = '-keep'
 
-#: Set once the stale-probe-dir sweep has run in this process.  The sweep
-#: reclaims OTHER (dead) processes' leftovers, so it is a process-wide one-shot:
-#: re-running it per probe re-scans /tmp for no benefit.
-_probe_dir_sweep_done: bool = False
-
-
 def _sweep_stale_probe_dirs_once() -> int:
     """Reclaim dead-PID probe config dirs left by earlier processes.
 
@@ -997,39 +1036,39 @@ def _sweep_stale_probe_dirs_once() -> int:
     on-disk population, which is why ``usage_gate`` pairs the same two
     mechanisms for its own probe dirs.
 
-    Never raises, for ANY exception class: tmp hygiene must not be able to fail
-    a capture that costs real money to retake.  The probe has no logger and
-    prints its warnings to stderr (see :func:`_gate`), so this does too.
+    The once-per-process bookkeeping, the set-before-call ordering and the
+    never-raise contract all live in
+    :func:`shared.config_dir.sweep_stale_pid_dirs_once`, whose docstring carries
+    the rationale for each; this wrapper supplies only what is genuinely local —
+    the prefix and the probe's reporting voice.  Never raises, for ANY exception
+    class: tmp hygiene must not be able to fail a capture that costs real money
+    to retake.  The probe has no logger and prints its warnings to stderr (see
+    :func:`_gate`), so this does too.
     """
-    global _probe_dir_sweep_done
-    if _probe_dir_sweep_done:
-        return 0
-    # Set BEFORE the call, not after, so a raising sweep still cannot re-run on
-    # every subsequent probe.
-    _probe_dir_sweep_done = True
-    try:
-        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
-        if reclaimed:
-            # Silent on the zero case so the steady state stays quiet; loud when
-            # there is something to say, so an operator can see the /tmp
-            # population draining rather than rebuilding.
-            print(
-                f'startup_completion_probe: reclaimed {reclaimed} stale probe config '
-                f'dir(s) under {_PROBE_DIR_PREFIX} (dead-PID sweep).',
-                file=sys.stderr,
-            )
-        return reclaimed
-    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
-        # sweep_stale_pid_dirs already contains OSError internally, so anything
-        # reaching here is UNFORESEEN.  Letting it escape would abort a probe run
-        # over a stale /tmp dir, which is strictly worse than leaving one behind.
-        print(
+    return sweep_stale_pid_dirs_once(
+        _PROBE_DIR_PREFIX,
+        # Passed EXPLICITLY, resolved from this module's globals at call time,
+        # and deliberately not defaulted inside the helper: this name is what
+        # test_startup_completion_probe.py's autouse _confine_stale_dir_sweep
+        # re-binds, and it is the only thing keeping that suite off the real
+        # /tmp (pinned by
+        # test_the_module_level_sweep_name_is_still_the_interception_point).
+        sweep=sweep_stale_pid_dirs,
+        # Silent on the zero case so the steady state stays quiet; loud when
+        # there is something to say, so an operator can see the /tmp population
+        # draining rather than rebuilding.
+        on_reclaimed=lambda reclaimed: print(
+            f'startup_completion_probe: reclaimed {reclaimed} stale probe config '
+            f'dir(s) under {_PROBE_DIR_PREFIX} (dead-PID sweep).',
+            file=sys.stderr,
+        ),
+        on_failure=lambda exc: print(
             f'startup_completion_probe: WARNING — stale probe-dir sweep of '
             f'{_PROBE_DIR_PREFIX} failed ({exc!r}); continuing without it (the next '
             f'process start retries).',
             file=sys.stderr,
-        )
-        return 0
+        ),
+    )
 
 
 def _drain_exit(

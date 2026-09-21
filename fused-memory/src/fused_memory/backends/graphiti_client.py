@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
@@ -410,11 +410,50 @@ class ActiveEdgesError(Exception):
 
 
 class AmbiguousEntityError(Exception):
-    """Raised when multiple entity nodes share the same name.
+    """Raised when multiple entity nodes share the same name in one graph.
+
+    ONE condition, two callers who differ in what they do about it:
+    - a READ that cannot answer (``resolve_entity_by_name``: which of these
+      did you mean?), and
+    - a WRITE that REFUSES to collapse (``ensure_entity_node`` under
+      ``merge_duplicates=False``: collapsing them is irreversible and is
+      deliberately not a side effect of a repair — adjudicate the duplicates
+      by hand).
 
     The error message includes all matching UUIDs so the caller can
-    disambiguate and call refresh_entity_summary with a specific UUID.
+    disambiguate and call refresh_entity_summary with a specific UUID. The
+    same facts are also carried as STRUCTURED fields — ``.name``,
+    ``.group_id``, ``.uuids`` — so a consumer can name the duplicate-name
+    group without an ad-hoc parse of the message.
+
+    THEY ARE REQUIRED KEYWORD ARGUMENTS, NOT DEFAULTED ONES. A structured
+    field present at one raise site and empty at another is not an invariant
+    a consumer can key off, and this one HAS a consumer that keys off it:
+    ``MemoryService._repair_edge_findings`` composes its whole refusal record
+    out of these three. Permissive defaults would let a future raise site —
+    or any construction from a bare message — book a structurally valid
+    ``'unrepairable'`` reading ``Repair target '' names a duplicate-name
+    group in '': []``: a record that passes every check while carrying no
+    evidence at all, which is the silent degradation INV-4 exists to prevent.
+    Requiring them costs nothing (both raise sites already pass all three)
+    and turns the invariant from documented into enforced.
+
+    ``uuids`` is stored as a tuple: the error is the EVIDENCE for a refusal
+    and must not be mutable.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        name: str,
+        group_id: str,
+        uuids: Iterable[str],
+    ) -> None:
+        super().__init__(message)
+        self.name = name
+        self.group_id = group_id
+        self.uuids = tuple(uuids)
 
 
 class IncompleteEnumerationError(Exception):
@@ -571,6 +610,14 @@ kind, so a future fifth structural path is covered by construction.
 # reconciliation sweeps and cleanup_count_snapshots still call the shims, so
 # they cannot yet distinguish "swept a complete corpus" from "swept what we
 # could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
+#
+# A THIRD CONSUMER, outside this file: scripts/measure_plural_enum_guard_recall.py
+# (task 4576) pages through _paged_ro_query and composes both its Cypher
+# strings from _ALL_VALID_EDGES_MATCH, so the read-only recall probe measures
+# the same population this module enumerates.  It supplies its OWN projection
+# and its own count(DISTINCT e.uuid) census — it decides completeness in
+# distinct EDGES, not in rows — and so re-derives its own verdict rather than
+# reading paged.complete.  Comment only; nothing here changes on its account.
 #
 # MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
 # 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
@@ -1157,6 +1204,19 @@ class _MultiTenantFalkorDriver(FalkorDriver):
         return cloned
 
 
+# The one copy of the ``uuid=`` contract that ``GraphitiBackend.add_episode``
+# carries to its caller — interpolated into BOTH failure messages that seam
+# emits (the content-discard warning and the translated not-found), and pointed
+# at, not restated, by that method's docstring. Verified against graphiti_core
+# 0.28.2, ``graphiti_core/graphiti.py::Graphiti.add_episode``.
+_UUID_MEANS_LOAD = (
+    "A non-None uuid= selects graphiti_core's LOAD branch "
+    '(EpisodicNode.get_by_uuid), so it can only name an episode that ALREADY '
+    'exists, never one to create under that id. To create a NEW episode pass '
+    'uuid=None and read the minted uuid off result.episode.uuid.'
+)
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -1472,26 +1532,70 @@ class GraphitiBackend:
         compose rather than overwrite. This is the only channel that reaches
         the persisted episode: the harm being labelled is the EDGES extracted
         from it, not the tool response.
+
+        ``uuid`` means LOAD, never create-with-this-id — the contract stated
+        once at ``graphiti_client.py::_UUID_MEANS_LOAD``, which is what both
+        failure messages below carry. See
+        ``services/memory_service.py::MemoryService._execute_graphiti_write``,
+        the only production caller, for why the minted identity is load-bearing.
+        A legitimate load-an-existing-episode call passes ``content=''``: any
+        non-empty ``content`` alongside a resolving ``uuid`` is discarded
+        upstream in favour of the stored episode body, and warns here.
+
+        Raises:
+            NodeNotFoundError: the module-local one, when a non-None ``uuid``
+                does not resolve. Chained from graphiti_core's own, whose
+                message names only the caller's own input.
         """
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
+        if uuid is not None and content:
+            logger.warning(
+                f'add_episode called with both uuid={uuid} and content in group '
+                f'{group_id}: the content will NOT be stored — the '
+                f'already-stored episode body wins. {_UUID_MEANS_LOAD}'
+            )
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
-        return await asyncio.wait_for(
-            client.add_episode(
-                name=name,
-                episode_body=content,
-                source=source,
-                group_id=group_id,
-                source_description=source_description,
-                reference_time=ref_time,
-                entity_types=entity_types,
-                uuid=uuid,
-            ),
-            timeout=self._write_timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                client.add_episode(
+                    name=name,
+                    episode_body=content,
+                    source=source,
+                    group_id=group_id,
+                    source_description=source_description,
+                    reference_time=ref_time,
+                    entity_types=entity_types,
+                    uuid=uuid,
+                ),
+                timeout=self._write_timeout,
+            )
+        except GraphitiCoreNodeNotFoundError as exc:
+            # Translate only a not-found provably about the caller's own uuid —
+            # graphiti_core raises the same class from entity/edge resolution
+            # after the episode loaded fine. The proof CONSTRUCTS the genuine
+            # upstream exception instead of parsing its text (the regex in
+            # durable_queue.py::_parse_not_found_uuid exists only because that
+            # module refuses to import graphiti_core; this one already does), so
+            # an upstream reword fails open rather than mislabelling.
+            #
+            # The replacement message deliberately does not match
+            # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
+            # it would fall open to ordinary retry rather than task 3586's
+            # ('permanent', 1) rule — moot today, since post-3561 an add_episode
+            # payload cannot carry a uuid at all. Enforced, not merely claimed:
+            # tests/test_graphiti_add_episode_uuid_param.py::
+            # test_the_translated_message_stays_retryable_for_the_durable_queue
+            # feeds this message through durable_queue's real parser.
+            if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
+                raise
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {uuid} — '
+                f'{_UUID_MEANS_LOAD}'
+            ) from exc
 
     @_canonicalize_group_args
     async def search(
@@ -3042,7 +3146,10 @@ class GraphitiBackend:
         if len(rows) > 1:
             uuids = [row[0] for row in rows]
             raise AmbiguousEntityError(
-                f'Multiple entities found with name {name!r}: {uuids}'
+                f'Multiple entities found with name {name!r}: {uuids}',
+                name=name,
+                group_id=group_id,
+                uuids=uuids,
             )
         return rows[0][0]
 
@@ -3141,6 +3248,101 @@ class GraphitiBackend:
             }
             for row in (result.result_set or [])
         ]
+
+    @_canonicalize_group_args
+    async def find_entity_nodes_by_name_substring(
+        self, substring: str, *, group_id: str
+    ) -> list[dict]:
+        """Return every Entity node whose name CONTAINS *substring*, canonical-ordered.
+
+        The substring-match sibling of find_duplicate_entity_nodes above: same
+        group-scoped shape, same valid-edge count, same survivor-first ordering
+        — only the name predicate differs, from exact equality to CONTAINS, and
+        the node's name joins the returned columns.
+
+        A deliberately TASK-AGNOSTIC candidate-NARROWING primitive. It knows
+        nothing about task labels or any other vocabulary: it hands back a
+        superset and the CALLER applies its own precise membership test. The
+        sole caller today, MemoryService._normalize_task_node_names, probes with
+        a task's verbatim digits to reach 'Task 605', 'task 605', 'tasks 605'
+        and 'task #605' in one query, then filters the candidates through
+        utils/task_naming.canonicalize_task_node_name — which is what keeps
+        'Task 6051', 'Task 1605' and the foreign 'reify:605' out. Expressing
+        that membership rule as a Cypher predicate instead would put a second
+        copy of the label vocabulary inside a query string, where it can be
+        neither tested nor kept in step with utils/canonical_labels.py.
+
+        Digits make a good probe for a second reason: they are case-free, so
+        one CONTAINS match reaches every capitalization without needing
+        case-insensitive Cypher. Callers should nevertheless supply a SELECTIVE
+        substring — this is an un-indexed scan of the graph's Entity nodes, and
+        an unselective one both costs more and risks the row cap below.
+
+        Scoped by an explicit `n.group_id = $group_id` property predicate, for
+        the same reason find_duplicate_entity_nodes carries one (2026-07-06
+        amendment): task-2115's cross-graph leak can plant a node whose
+        group_id property names ANOTHER project physically inside this graph
+        key, and a caller collapsing duplicates must never see it.
+
+        Single un-paginated ro_query rather than _paged_ro_query, which needs a
+        total `ORDER BY n.uuid` for stable SKIP/LIMIT paging and so cannot
+        carry the survivor-first ordering that makes rows[0] meaningful. A
+        selective substring returns a handful of rows, so paging would buy
+        nothing. Truncation at the server's row cap is still conceivable for an
+        unselective substring, and it is WARNED rather than swallowed: a
+        silently short view would leave a caller's collapse incomplete with
+        nothing in the logs to explain it.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            substring: Case-SENSITIVE substring to match against n.name.
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts with keys: uuid, name, created_at, edge_count —
+            ordered canonical (survivor) first, exactly as
+            find_duplicate_entity_nodes orders its matches. Empty list when
+            nothing matches.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity) '
+            'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
+            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+            'WITH n, count(DISTINCT e) AS edge_count '
+            'RETURN n.uuid, n.name, n.created_at, edge_count '
+            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+        )
+        start = time.monotonic()
+        result = await graph.ro_query(
+            cypher, {'substring': substring, 'group_id': group_id}
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+            }
+            for row in (result.result_set or [])
+        ]
+        logger.debug(
+            'name-substring scan for %r in graph %r took %.1fms (%d row(s))',
+            substring, group_id, elapsed_ms, len(rows),
+        )
+        if len(rows) >= _RESULTSET_SIZE:
+            logger.warning(
+                'name-substring scan for %r in graph %r returned %d rows, at or above '
+                'the server result-set cap of %d — the result is probably TRUNCATED and '
+                'any family built from it incomplete. Use a more selective substring.',
+                substring, group_id, len(rows), _RESULTSET_SIZE,
+            )
+        return rows
 
     async def _scan_duplicate_entity_names(self, group_id: str) -> list[tuple[str, int]]:
         """Detect exact-name duplicate Entity nodes in *group_id*'s graph — B5 dup-node alarm.
@@ -3301,8 +3503,64 @@ class GraphitiBackend:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
         return survivor['uuid']
 
+    async def _resolve_without_collapsing(self, name: str, *, group_id: str) -> str | None:
+        """Exact-name resolve that REFUSES a duplicate-name group instead of collapsing it.
+
+        The orthogonal sibling of :meth:`_resolve_or_create_entity`, carrying
+        that method's exact contracts so ``ensure_entity_node`` can fork the
+        resolve half alone:
+        - Same lock contract: callers MUST hold ``_identity_lock_for(group_id)``;
+          this method performs no locking of its own.
+        - Same ``str | None`` return: 0 matches -> None (the caller mints),
+          1 match -> that node's uuid.
+        - >=2 matches -> raise ``AmbiguousEntityError`` with the structured
+          ``.name``/``.group_id``/``.uuids`` fields populated. Nothing is merged,
+          nothing is written.
+
+        WHY THE COLLAPSE IS UNREACHABLE HERE. A merge is irreversible: it folds
+        one node's edges into another and destroys the distinction. That is only
+        ever a DELIBERATE act — Ratified Decision 1 of the memory-identity
+        programme — never a side effect of some other operation that happened to
+        find two nodes. The PRD's S1 scope amendment
+        (``plans/fm-memory-identity-prd.md``) licenses the collapse on exactly
+        one path, the episode-write dedup, which reaches
+        ``_resolve_or_create_entity`` directly; every other caller must refuse
+        the >=2 arm with a structured refusal rather than merge. This method is
+        how they do it.
+
+        Args:
+            name: Exact name of the Entity to resolve.
+            group_id: Project graph to target.
+
+        Returns:
+            The uuid of the one Entity node with this name in *group_id*'s
+            graph, or None if none existed.
+
+        Raises:
+            AmbiguousEntityError: if two or more nodes share this name.
+        """
+        nodes = await self.get_nodes_by_exact_name(name, group_id=group_id)
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]['uuid']
+        uuids = [node['uuid'] for node in nodes]
+        raise AmbiguousEntityError(
+            f'Multiple entities found with name {name!r}: {uuids}',
+            name=name,
+            group_id=group_id,
+            uuids=uuids,
+        )
+
     @_canonicalize_group_args
-    async def ensure_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+    async def ensure_entity_node(
+        self,
+        name: str,
+        *,
+        group_id: str,
+        summary: str = '',
+        merge_duplicates: bool = True,
+    ) -> str:
         """Resolve an Entity node by exact name, MINTING one if none exists.
 
         The resolve-or-MINT sibling of :meth:`_resolve_or_create_entity`, whose
@@ -3347,6 +3605,30 @@ class GraphitiBackend:
             group_id: Project graph to target.
             summary: Summary property for a newly minted node. Ignored on the
                 resolve path — an existing node's summary is never overwritten.
+            merge_duplicates: whether a duplicate-name group may be COLLAPSED
+                to resolve this name. The three arms are 0 -> mint,
+                1 -> resolve, and >=2 -> collapse-and-return-the-survivor when
+                True (the default) or refuse when False. The default
+                reproduces this method's historical behaviour verbatim, so no
+                existing caller changes and Seam S1's episode-write dedup path
+                keeps the collapse the PRD licenses for it. Pass False from any
+                other caller: a merge is irreversible and is only ever a
+                deliberate act, never a side effect (Ratified Decision 1).
+
+                BOTH current False callers are in ``services/memory_service.py``,
+                named here so a reader need not grep for them:
+                ``MemoryService._repair_edge_findings`` (the referent repair
+                pass, which catches the refusal and books the finding
+                ``'unrepairable'`` rather than ``'failed'`` — the backend did
+                not fail, it declined), and ``MemoryService.ensure_entity_node``
+                (task 4932's gated mint wrapper, where the flag is redundant by
+                construction with that wrapper's own pre-read and is passed
+                anyway so Ratified Decision 1 is structural at both non-S1 call
+                sites rather than dependent on one caller's ordering).
+
+                Seam S1 is absent from that list BY CONSTRUCTION, not by
+                omission: it calls ``_resolve_or_create_entity`` directly and
+                never reaches this method at all.
 
         Returns:
             The UUID of the single canonical Entity node with this name in
@@ -3354,8 +3636,18 @@ class GraphitiBackend:
 
         Raises:
             RuntimeError: if the backend is not initialized.
+            AmbiguousEntityError: if ``merge_duplicates`` is False and two or
+                more nodes share this name. Carries the conflicting uuids as
+                structured data, so the caller can name the duplicate group.
         """
-        resolved = await self._resolve_or_create_entity(name, group_id=group_id)
+        # Only the RESOLVE half forks — the two resolvers share one `str | None`
+        # contract, so the short-circuit below and the whole mint/embedding block
+        # stay a single unforked site.
+        resolve = (
+            self._resolve_or_create_entity if merge_duplicates
+            else self._resolve_without_collapsing
+        )
+        resolved = await resolve(name, group_id=group_id)
         if resolved is not None:
             return resolved
 

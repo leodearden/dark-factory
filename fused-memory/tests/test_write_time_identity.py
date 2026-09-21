@@ -19,9 +19,9 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params
+from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import AmbiguousEntityError, GraphitiBackend
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend._identity_lock_for
@@ -511,3 +511,288 @@ class TestEnsureEntityNode:
         )
         assert extract_params(_create_calls(backend._test_graph)[0])['group_id'] == 'dark_factory'
         backend._driver._get_graph.assert_called_with('dark_factory')
+
+
+# ---------------------------------------------------------------------------
+# task 4985 step-1/2: ensure_entity_node(..., merge_duplicates=False) — guard (c)
+# ---------------------------------------------------------------------------
+
+class TestEnsureEntityNodeNoMerge:
+    """ensure_entity_node(..., merge_duplicates=False) — the no-merge mode.
+
+    Mirrors task 4932 guard 2's semantics one layer down: 0 matches mint,
+    1 match resolves, >=2 matches REFUSE structurally and merge NOTHING.
+
+    The >=2 arm exists because a destructive collapse is only ever a
+    deliberate act, never a side effect of a repair. The default
+    (merge_duplicates=True) keeps Seam S1's episode-write dedup path
+    byte-identical, which test_the_default_still_collapses pins.
+    """
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend, make_graph_mock):
+        """Same shape as TestEnsureEntityNode's fixture: the REAL resolve half
+        runs against mocked reads, and the graph mock captures every write."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        backend.merge_entities = AsyncMock()
+        backend.update_node_embedding = AsyncMock()
+        backend.client.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        backend._test_graph = graph
+        return backend
+
+    @staticmethod
+    def _two_matches(backend) -> None:
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-a', 'name': 'Task 3127', 'summary': '', 'labels': []},
+            {'uuid': 'u-b', 'name': 'Task 3127', 'summary': '', 'labels': []},
+        ]
+        backend.find_duplicate_entity_nodes.return_value = [
+            {'uuid': 'u-a', 'created_at': 1, 'edge_count': 5},
+            {'uuid': 'u-b', 'created_at': 2, 'edge_count': 0},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_matches_raise_ambiguous_entity_error(self, backend_with_mocks):
+        """(1) >=2 matches refuse with AmbiguousEntityError instead of collapsing."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError):
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+
+    @pytest.mark.asyncio
+    async def test_refusal_carries_structured_name_group_and_uuids(self, backend_with_mocks):
+        """(1) The refusal is DATA, not a message to parse: .name/.group_id/.uuids."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError) as excinfo:
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        exc = excinfo.value
+        assert exc.name == 'Task 3127'
+        assert exc.group_id == 'dark_factory'
+        assert exc.uuids == ('u-a', 'u-b')
+        assert isinstance(exc.uuids, tuple)
+
+    @pytest.mark.asyncio
+    async def test_refusal_message_still_lists_the_conflicting_uuids(self, backend_with_mocks):
+        """(1) An operator reading a log line loses nothing to the new fields."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError) as excinfo:
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        message = str(excinfo.value)
+        assert 'Task 3127' in message
+        assert 'u-a' in message
+        assert 'u-b' in message
+
+    @pytest.mark.asyncio
+    async def test_refusal_merges_nothing_and_mints_nothing(self, backend_with_mocks):
+        """(1) The whole point: no merge_entities, no CREATE."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        with pytest.raises(AmbiguousEntityError):
+            await backend.ensure_entity_node(
+                'Task 3127', group_id='dark_factory', merge_duplicates=False
+            )
+        backend.merge_entities.assert_not_awaited()
+        assert _create_calls(backend._test_graph) == []
+
+    @pytest.mark.asyncio
+    async def test_single_match_resolves_without_consulting_duplicates(self, backend_with_mocks):
+        """(2) Exactly one match returns that uuid; no merge, no CREATE, and
+        find_duplicate_entity_nodes is never even asked."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-1', 'name': 'Task 3127', 'summary': '', 'labels': []}
+        ]
+        result = await backend.ensure_entity_node(
+            'Task 3127', group_id='dark_factory', merge_duplicates=False
+        )
+        assert result == 'u-1'
+        backend.find_duplicate_entity_nodes.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+        assert _create_calls(backend._test_graph) == []
+
+    @pytest.mark.asyncio
+    async def test_zero_matches_mint_exactly_as_the_default_mode_does(self, backend_with_mocks):
+        """(3) The mint arm is unforked: same CREATE params, same summary, same
+        group_id as test_zero_matches_mints_an_entity_node pins for the default."""
+        backend = backend_with_mocks
+        result = await backend.ensure_entity_node(
+            'dark_factory:2500',
+            group_id='reify',
+            summary='cross-project ref',
+            merge_duplicates=False,
+        )
+        creates = _create_calls(backend._test_graph)
+        assert len(creates) == 1
+        cypher = extract_cypher(creates[0])
+        params = extract_params(creates[0])
+        assert 'CREATE' in cypher
+        assert ':Entity' in cypher
+        assert params['name'] == 'dark_factory:2500'
+        assert params['group_id'] == 'reify'
+        assert params['summary'] == 'cross-project ref'
+        assert params['created_at']
+        assert uuid.UUID(params['uuid'])
+        assert result == params['uuid']
+
+    @pytest.mark.asyncio
+    async def test_the_default_still_collapses(self, backend_with_mocks):
+        """(4) REGRESSION PIN, not a RED: omitting merge_duplicates on a
+        2+-match fixture still collapses and returns the survivor, so Seam S1's
+        episode-write dedup keeps its ratified collapse."""
+        backend = backend_with_mocks
+        self._two_matches(backend)
+        result = await backend.ensure_entity_node('Task 3127', group_id='dark_factory')
+        assert result == 'u-a'
+        backend.merge_entities.assert_awaited_once_with('u-b', 'u-a', group_id='dark_factory')
+        assert _create_calls(backend._test_graph) == []
+
+
+# ---------------------------------------------------------------------------
+# task 5264: GraphitiBackend.find_entity_nodes_by_name_substring
+# ---------------------------------------------------------------------------
+
+class TestFindEntityNodesByNameSubstring:
+    """The substring-match sibling of find_duplicate_entity_nodes.
+
+    A task-agnostic candidate-NARROWING primitive. The family-keyed normalizer
+    probes it with a task's verbatim digits to reach every spelling of one task
+    in a single query — 'Task 605', 'task 605', 'tasks 605', 'task #605' — and
+    then decides membership in Python via canonicalize_task_node_name. The
+    method itself knows nothing about task labels, which is precisely what
+    keeps the label vocabulary out of a Cypher string where it could neither be
+    tested nor kept in step with utils/canonical_labels.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_matches_a_bound_substring_never_an_exact_name(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """CONTAINS, not `{name: $name}` — and the substring is a BOUND param.
+
+        Interpolating it into the query text would make any name carrying
+        Cypher syntax an injection vector and defeat the planner's cache; the
+        exact-equality shape it replaces is what made the old arrival-keyed
+        normalizer able to see only two spellings of a family.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.find_entity_nodes_by_name_substring('605', group_id='home')
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'n.name CONTAINS $substring' in cypher
+        assert '{name: $name}' not in cypher
+        assert '605' not in cypher  # bound, never interpolated
+        assert params.get('substring') == '605'
+
+    @pytest.mark.asyncio
+    async def test_filters_by_the_group_id_property_and_binds_it_canonicalized(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Inherits find_duplicate_entity_nodes' 2026-07-06 scoping amendment.
+
+        The graph KEY alone is not enough: task-2115's cross-graph leak can
+        plant a node whose group_id property names ANOTHER project physically
+        inside this graph key, and without the predicate the normalizer would
+        happily merge that foreign node into the local family.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.find_entity_nodes_by_name_substring('605', group_id='know-live')
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'n.group_id = $group_id' in cypher
+        assert params.get('group_id') == 'know_live'
+
+    @pytest.mark.asyncio
+    async def test_returns_named_rows_ordered_survivor_first(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """rows[0] is the merge survivor — most valid edges, then oldest, then uuid.
+
+        Same contract as the exact-match sibling, from the same ORDER BY
+        clause, so the normalizer's one survivor rule reads identically for
+        both. ``name`` joins the returned columns because the caller has to
+        canonicalize each candidate to decide family membership.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([
+            ['u-high', 'task 605', '2026-01-02', 13],
+            ['u-canon', 'Task 605', '2026-01-01', 2],
+            ['u-low', 'tasks 605', '2026-01-03', 1],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        rows = await backend.find_entity_nodes_by_name_substring('605', group_id='home')
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC' in cypher
+        assert 'invalid_at IS NULL' in cypher  # only VALID edges are counted
+        assert rows == [
+            {'uuid': 'u-high', 'name': 'task 605', 'created_at': '2026-01-02', 'edge_count': 13},
+            {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': '2026-01-01', 'edge_count': 2},
+            {'uuid': 'u-low', 'name': 'tasks 605', 'created_at': '2026-01-03', 'edge_count': 1},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_row_order_is_the_drivers_and_is_never_re_sorted_here(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Feeding rows the ORDER BY would never produce proves the method does
+        not re-derive the ordering: a Python-side sort would be a second copy
+        of the survivor rule, free to drift from the clause both siblings share.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([
+            ['u-low', 'tasks 605', '2026-01-03', 1],
+            ['u-high', 'task 605', '2026-01-02', 13],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        rows = await backend.find_entity_nodes_by_name_substring('605', group_id='home')
+
+        assert [row['uuid'] for row in rows] == ['u-low', 'u-high']
+
+    @pytest.mark.asyncio
+    async def test_no_match_yields_an_empty_list_rather_than_raising(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        assert await backend.find_entity_nodes_by_name_substring(
+            '99999', group_id='home'
+        ) == []
+
+    @pytest.mark.asyncio
+    async def test_is_read_only(self, mock_config, make_backend, make_graph_mock):
+        """Structural, not asserted-about: the census workstream's whole promise
+        is that nothing on its path can write, and this is its only query."""
+        backend = make_backend(mock_config)
+
+        await assert_ro_query_only(
+            backend,
+            make_graph_mock,
+            [],
+            'find_entity_nodes_by_name_substring',
+            '605',
+            group_id='home',
+        )

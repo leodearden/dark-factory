@@ -1369,7 +1369,7 @@ def test_clear_override_rejects_invalid_body(client, body):
     # call_count before the endpoint even runs its validation logic.
     with (
         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp,
-        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()),
+        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()),
     ):
         if body is None:
             resp = client.post(
@@ -1456,7 +1456,7 @@ def test_reorder_pin_queue_rejects_invalid_body(client, body):
 
     # Patch collect_metrics_snapshot to prevent the background _metrics_loop
     # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()), \
+    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
          patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
@@ -1893,7 +1893,7 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
 
     # Patch collect_metrics_snapshot to prevent the background _metrics_loop
     # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()), \
+    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
          patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/scheduler/override',
