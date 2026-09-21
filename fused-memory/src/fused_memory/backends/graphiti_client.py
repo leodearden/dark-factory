@@ -1218,6 +1218,32 @@ _UUID_MEANS_LOAD = (
 )
 
 
+# The one copy of the survivor-ranking rule, shared by BOTH ranking methods —
+# ``find_duplicate_entity_nodes`` (exact name) and
+# ``find_entity_nodes_by_name_substring`` (substring). Module-level for the same
+# reason ``_UUID_MEANS_LOAD`` above is: it is a contract several sites inside the
+# class must express identically, and a constant is the only way to say so once.
+#
+# INVARIANT: the two methods must order IDENTICALLY. Each feeds a destructive
+# merge that keeps rows[0] and folds every other row into it, so a divergence
+# silently leaves the two paths keeping different survivors. Copying this clause
+# instead of sharing it is precisely the drift that produced task 4986's loss
+# mode 3 (``expired_at`` added to one SET list and not its twin), and that task
+# 5264 reproduced when it cloned the then-current MENTIONS-blind ranking into a
+# second method. A test importing these constants can enforce the invariant; two
+# docstrings promising each other cannot.
+_PROVENANCE_RANK_CLAUSE = (
+    'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+    'WITH n, count(DISTINCT e) AS edge_count '
+    'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
+    'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
+)
+
+# The ordering the clause above exists to make possible. Kept adjacent to it so
+# the projection and the sort key cannot be updated apart.
+_PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -3420,9 +3446,34 @@ class GraphitiBackend:
         but scoped to surfacing exact-name DUPLICATES for the post-write
         node-dedup sweep (MemoryService._dedup_episode_nodes) rather than
         resolving a single canonical node. Results are ordered
-        canonical-first — most valid edges, then oldest created_at, then
-        uuid — so callers can treat matches[0] as the merge survivor and
+        canonical-first — highest provenance_rank, then oldest created_at,
+        then uuid — so callers can treat matches[0] as the merge survivor and
         matches[1:] as the deprecated duplicates to fold into it.
+
+        WHY MENTIONS BELONG IN THE RANK (task 4986). matches[0] is the node
+        that SURVIVES and matches[1:] are DELETED, so a node this ordering
+        demotes loses its Episodic provenance with it. Ranking on valid
+        RELATES_TO alone therefore destroyed episode links the survivor never
+        had — measured in 12 of 50 live duplicate groups on 2026-08-31.
+        ``provenance_rank`` = ``edge_count`` + ``mentions_count`` is what the
+        ordering now keys on, and it is RETURNED rather than left for callers
+        to re-derive, so the key that ORDERED the list is the key a caller can
+        READ.
+
+        ``edge_count`` DELIBERATELY KEEPS ITS PRE-4986 MEANING — valid
+        RELATES_TO only — because two consumers read it for something other
+        than ranking. ``reconciliation/degenerate_task_node_sweep.py`` deletes
+        a placeholder node on ``int(match['edge_count']) == 0``, so folding
+        MENTIONS in would silently change WHICH nodes that sweep destroys;
+        ``maintenance/task_family_census.py`` reports it per variant in an
+        operator-facing line that would silently start counting episodes.
+        MENTIONS therefore enters ONLY through the two new keys.
+
+        The ranking clause and its ORDER BY come from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` / ``_PROVENANCE_RANK_ORDER``, shared with
+        ``find_entity_nodes_by_name_substring`` so the two survivor-ranking
+        methods cannot drift apart; see those constants for why that is an
+        invariant rather than a convenience.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
         amendment), not just the graph key selected via _graph_for — task-2115's active
@@ -3437,9 +3488,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, created_at, edge_count — ordered
-            canonical (survivor) first. Empty list when no entity matches;
-            a single-element list when the name is unique (no duplicate).
+            List of dicts with keys: uuid, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first.
+            Empty list when no entity matches; a single-element list when the
+            name is unique (no duplicate).
 
         Raises:
             RuntimeError: if the backend is not initialized.
@@ -3448,10 +3501,10 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity {name: $name}) '
             'WHERE n.group_id = $group_id '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
-            'WITH n, count(DISTINCT e) AS edge_count '
-            'RETURN n.uuid, n.created_at, edge_count '
-            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
         )
         result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
@@ -3459,6 +3512,8 @@ class GraphitiBackend:
                 'uuid': row[0],
                 'created_at': row[1],
                 'edge_count': row[2],
+                'mentions_count': row[3],
+                'provenance_rank': row[4],
             }
             for row in (result.result_set or [])
         ]
