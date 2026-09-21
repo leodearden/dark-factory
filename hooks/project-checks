@@ -20,12 +20,20 @@
 # actually landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a
 # raise where it is introduced is the only placement that bites.
 #
-# $2 defaults to a `rev-parse` so a direct invocation of this script still
-# works, and a project-checks that ignored $2 entirely would still be valid
-# for any other repo that copied hooks/.
+# $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
+# measured rather than stylistic. Before the branch was passed down this
+# script had no branch concept at all: invoked directly, it ran every check.
+# orchestrator/tests/test_project_checks_pyright_scope.py invokes it exactly
+# that way against a throwaway repo -- whose branch is whatever
+# init.defaultBranch happens to be -- so a rev-parse default silently skips
+# the pyright scoping those four tests exist to pin. Defaulting to main keeps
+# a direct invocation byte-identical to its prior behaviour AND points the
+# unspecified case at the STRICTEST set: an omitted argument must never be
+# the reason a check quietly does not run (INV-11). A project-checks that
+# ignores $2 entirely also stays valid for any other repo that copied hooks/.
 
 ROOT="${1:?}"
-BRANCH="${2:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
+BRANCH="${2:-main}"
 
 # ── merge-lane ratchet audit (ALL BRANCHES, staged-scoped) ───────────
 #
