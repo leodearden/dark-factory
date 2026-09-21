@@ -83,43 +83,176 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
     assert 'values' in body['ORCHESTRATORS_SPARK']
 
 
+def _snapshot(*, health='ok', done=0):
+    """A ``TaskSnapshot`` in the state *health* names, as the collector emits one.
+
+    Built through the real ``Datum``/``build_census`` types rather than a mock,
+    because the handler validates every emitted datum against the payload's own
+    ``served_at`` — a mock would sail past exactly the contract these tests are
+    about. Stamped at the live clock so a FRESH half is inside its own
+    freshness bound at the instant the handler serves it.
+    """
+    from datetime import UTC, datetime
+    from types import MappingProxyType
+
+    from dashboard.data.census import build_census
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import (
+        FRESHNESS_BOUND_SECONDS,
+        SnapshotFailure,
+        TaskSnapshot,
+    )
+
+    as_of = datetime.now(UTC)
+    status_map = {task_id: 'done' for task_id in range(1, done + 1)}
+    fresh_rows = Datum([], as_of, DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
+    fresh_census = Datum(
+        build_census(status_map), as_of, DatumState.FRESH, None,
+        FRESHNESS_BOUND_SECONDS,
+    )
+    unknown = Datum(
+        None, None, DatumState.UNKNOWN, f'canned {health} root',
+        FRESHNESS_BOUND_SECONDS,
+    )
+    failure, rows, census = {
+        'ok': (SnapshotFailure.NONE, fresh_rows, fresh_census),
+        'offline': (SnapshotFailure.UNREACHABLE, unknown, unknown),
+        'degraded': (SnapshotFailure.BUDGET, unknown, unknown),
+        'count_unknown': (SnapshotFailure.NONE, fresh_rows, unknown),
+    }[health]
+    return TaskSnapshot(
+        census=census, rows=rows,
+        in_progress_live=None if rows is unknown else 0,
+        in_progress_stranded=None if rows is unknown else 0,
+        skew_seconds=None if unknown in (rows, census) else 0,
+        status_map=MappingProxyType(status_map), failure=failure,
+    )
+
+
+def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
+    """``{label: TaskSnapshot}`` for *labels*, in order, routed by membership."""
+    counts = done or {}
+    health = dict.fromkeys(offline, 'offline')
+    health.update(dict.fromkeys(degraded, 'degraded'))
+    health.update(dict.fromkeys(count_unknown, 'count_unknown'))
+    return {
+        label: _snapshot(health=health.get(label, 'ok'), done=counts.get(label, 0))
+        for label in labels
+    }
+
+
+_TASKS_KEYS = {
+    'ACTIVE_TASKS', 'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+    'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+    'TASKS_PROJECT_COUNT', 'served_at',
+}
+"""The default render's whole payload. DONE_COUNTS is gone, and its ABSENCE is
+asserted rather than an empty dict: ``data.js::applyKey`` returns early on a
+missing key, so the client keeps its seeded default, while ``{}`` would read as
+a measured "no project has any done tasks"."""
+
+
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {}, [], [])),
+        new=AsyncMock(return_value=([], {})),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
+    assert 'DONE_COUNTS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
-    assert body['DONE_COUNTS'] == {}
+    assert body['TASKS_SNAPSHOT'] == {}
 
 
-def test_tasks_endpoint_includes_done_counts(client):
-    """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
+def test_tasks_endpoint_carries_a_validated_census_per_root(client):
+    """The server, not the client, owns the count — and says when it measured it.
+
+    Replaces ``test_tasks_endpoint_includes_done_counts``: the fact that test
+    protected (a per-project done count comes from the SERVER) is unchanged,
+    but it now travels inside a ``Datum`` that says how fresh it is, so a
+    client can tell a measured zero from a failed read.
+    """
+    from datetime import datetime
+
+    from dashboard.data.datum import Datum, DatumState, validate_datum
+
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
+        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], done={'dark-factory': 7}))),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert body['DONE_COUNTS'] == {'dark-factory': 7}
+
+    served_at = datetime.fromisoformat(body['served_at'])
+    assert served_at.utcoffset() is not None, (
+        'served_at must name one moment, not a local-clock reading'
+    )
+
+    entry = body['TASKS_SNAPSHOT']['dark-factory']
+    assert set(entry) == {
+        'census', 'rows', 'in_progress_live', 'in_progress_stranded',
+        'skew_seconds',
+    }
+    census = entry['census']
+    assert census['state'] == 'fresh'
+    assert census['value']['counts']['done'] == 7
+    assert census['value']['total'] == 7
+
+    # Every emitted datum must satisfy the envelope's contract against the
+    # payload's OWN served_at — the user-observable signal this leaf delivers.
+    for key in ('census', 'rows'):
+        half = entry[key]
+        as_of = datetime.fromisoformat(half['as_of'])
+        assert as_of <= served_at, f'{key} claims to be measured after it was served'
+        validate_datum(
+            Datum(
+                half['value'], as_of, DatumState(half['state']), half['reason'],
+                half['freshness_bound_seconds'],
+            ),
+            served_at,
+        )
+
+
+def test_tasks_default_render_issues_no_terminal_fetch(client):
+    """No ``?terminal=``, no terminal row — asserted at the MCP wire.
+
+    The default render's whole point is that its cost stops growing with the
+    terminal tree, so "the handler discards the done rows afterwards" would be
+    precisely the defect.
+    """
+    calls: list[dict] = []
+
+    async def _mcp(http_client, url, tool, args, **_kw):
+        calls.append({'tool': tool, 'args': dict(args)})
+        if tool == 'get_statuses':
+            return {'statuses': {}}
+        return {'tasks': []}
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200
+    for call in calls:
+        requested = call['args'].get('statuses') or []
+        assert 'done' not in requested and 'cancelled' not in requested, (
+            f'the default render must ask for no terminal row: {call}'
+        )
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
-    """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
+    """When every root's read demonstrably failed, the payload sets ``offline=True``."""
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
+        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], offline=['dark-factory']))),
+    ), patch(
+        'dashboard.api.tasks._all_project_roots',
+        new=lambda config: _fake_roots(1),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -144,7 +277,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
+    mock = AsyncMock(return_value=([mock_row], {}))
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -164,57 +297,29 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     ]
 
     # (c) top-level key set unchanged
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
 
 
-def test_tasks_endpoint_passes_max_cancelled_per_project(client):
-    """api_tasks must call collect_tasks_with_counts with max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT.
+def test_tasks_endpoint_asks_for_no_terminal_cap(client):
+    """The handler passes no render cap, because there is no cap left to pass.
 
-    Asserts:
-    (a) max_cancelled_per_project == _MAX_CANCELLED_PER_PROJECT is passed in call kwargs
-    (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
-        resolve_external == True
-    (c) top-level payload key-set is unchanged BY THIS BEHAVIOUR — no new key
-        is added for cancelled (the set itself is stated in the assertion)
-
-    RED today: app.py does not yet pass max_cancelled_per_project.
+    Replaces ``test_tasks_endpoint_passes_max_cancelled_per_project``: the
+    per-bucket caps retired with the default-render terminal fetch, so the
+    contract to protect is now the ABSENCE of those arguments — passing one
+    would be the handler re-imposing a server-side render policy on a request
+    that no longer asks for terminal rows at all.
     """
-    from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
-
-    mock = AsyncMock(return_value=([], [], {}, [], []))
+    mock = AsyncMock(return_value=([], {}))
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
-    body = resp.json()
-
     call_kwargs = mock.call_args.kwargs
-
-    # (a) max_cancelled_per_project
-    assert call_kwargs.get('max_cancelled_per_project') == _MAX_CANCELLED_PER_PROJECT, (
-        f'expected max_cancelled_per_project={_MAX_CANCELLED_PER_PROJECT} in call kwargs, '
-        f'got: {call_kwargs}'
-    )
-
-    # (b) existing kwargs unchanged
-    assert call_kwargs.get('max_done_per_project') == _MAX_DONE_PER_PROJECT, (
-        f'expected max_done_per_project={_MAX_DONE_PER_PROJECT} in call kwargs, got: {call_kwargs}'
-    )
-    assert call_kwargs.get('resolve_external') is True, (
-        f'expected resolve_external=True in call kwargs, got: {call_kwargs}'
-    )
-
-    # (c) payload key-set unchanged
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert 'max_done_per_project' not in call_kwargs
+    assert 'max_cancelled_per_project' not in call_kwargs
+    assert call_kwargs.get('resolve_external') is True
+    assert set(resp.json()) == _TASKS_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -240,11 +345,26 @@ def _tasks_body(
     client, *, offline_projects, degraded_projects=(),
     count_unknown_projects=(), total_roots,
 ):
-    """GET /api/v2/dashboard/tasks with a canned collector result and N roots."""
+    """GET /api/v2/dashboard/tasks with a canned collector result and N roots.
+
+    The three lists are no longer RETURNED by the collector — they are derived
+    from the per-root units — so the fixture builds the units that must yield
+    them. A test that could only state the lists directly would be asserting
+    the handler copies a list; this one asserts it reads a state machine.
+    """
+    labels = sorted(
+        {*offline_projects, *degraded_projects, *count_unknown_projects}
+        | {f'p{i}' for i in range(total_roots)}
+    )
     collector = AsyncMock(
         return_value=(
-            [], list(offline_projects), {},
-            list(degraded_projects), list(count_unknown_projects),
+            [],
+            _snapshots(
+                labels,
+                offline=offline_projects,
+                degraded=degraded_projects,
+                count_unknown=count_unknown_projects,
+            ),
         )
     )
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector), patch(
@@ -378,12 +498,12 @@ def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client)
     """The payload carries every banner fact, and FILE_LOCKS stays gone."""
     body = _tasks_body(client, offline_projects=[], total_roots=1)
 
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
+    assert 'DONE_COUNTS' not in body, (
+        'an absent key leaves the client on its seeded default; an empty dict '
+        'would read as a measured "no project has any done tasks"'
+    )
 
 
 def test_memory_returns_memory_status(client):
