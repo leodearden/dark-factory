@@ -506,6 +506,359 @@ def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client)
     )
 
 
+# ---------------------------------------------------------------------------
+# /api/v2/dashboard/tasks?terminal=<project> — the on-demand window (task 5587)
+# ---------------------------------------------------------------------------
+
+
+def _terminal_row(task_id, status='done'):
+    """One raw MCP ``get_tasks`` row in a terminal status, distinguishable by id."""
+    return {
+        'id': task_id,
+        'title': f'task {task_id}',
+        'status': status,
+        'dependencies': [],
+        'metadata': {},
+        'updated_at': '2026-01-01T00:00:00+00:00',
+    }
+
+
+def _terminal_render(
+    client, monkeypatch, *, terminal, labels=('dark-factory',),
+    terminal_rows=(), done=None, window=None, count_unknown=(),
+):
+    """``GET /tasks?terminal=<terminal>`` over a canned substrate; ``(body, calls)``.
+
+    The collector and the root enumerator are canned so the CENSUS the window
+    is positioned from is known exactly — the window's offset is a function of
+    the terminal population, so a test that cannot state that population
+    cannot check the offset. ``mcp_tool_call`` is left REAL underneath, so the
+    terminal read is asserted at the wire: "the handler discards the rows
+    afterwards" is precisely the defect, and which rows the server was asked
+    for is observable nowhere else.
+    """
+    from pathlib import Path
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    import dashboard.data.tasks as tasks_mod
+
+    if window is not None:
+        monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
+    tasks_mod._fetch_tasks_cache_clear()
+
+    calls: list[dict] = []
+
+    async def _mcp(http_client, url, tool, args, **kwargs):
+        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
+        # assertable at the wire nowhere else.
+        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
+        if tool == 'get_statuses':
+            return {'statuses': {}}
+        rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
+        statuses = args.get('statuses')
+        if statuses is not None:
+            rows = [row for row in rows if row.get('status') in statuses]
+        page_size = args.get('page_size')
+        if page_size is not None:
+            start = args.get('offset') or 0
+            rows = rows[start:start + page_size]
+        return {'tasks': rows}
+
+    snapshots = _snapshots(labels, count_unknown=count_unknown, done=done)
+    try:
+        with patch(
+            'dashboard.api.tasks.collect_tasks_with_counts',
+            new=AsyncMock(return_value=([], snapshots)),
+        ), patch(
+            'dashboard.api.tasks._all_project_roots',
+            new=lambda config: [Path('/proj') / label for label in labels],
+        ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+            resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
+    finally:
+        tasks_mod._fetch_tasks_cache_clear()
+    assert resp.status_code == 200, resp.text
+    return resp.json(), calls
+
+
+def _terminal_get_tasks(calls):
+    return [call for call in calls if call['tool'] == 'get_tasks']
+
+
+class TestTerminalWindow:
+    """``?terminal=<project>`` — the only render that pays for terminal rows.
+
+    The default render stopped fetching them, so every fact the retired
+    ``TestShapeOneProjectNarrowing`` terminal cases protected — the window
+    reaches the HIGH-id end, it goes through ``fetch_task_page``, truncation
+    WARNS rather than capping silently, and an unpositionable window is not
+    fetched at all — has to hold HERE or it holds nowhere.
+    """
+
+    def test_the_window_is_a_lower_bound_datum_naming_the_bound(
+        self, client, monkeypatch
+    ):
+        """(a) The disclosure IS the state: a windowed read under-reports, and says so.
+
+        The window size is parsed OUT of ``reason`` and compared to the module
+        constant rather than matched against a fixed string, so a reworded
+        message cannot silently change the bound the payload discloses.
+        """
+        import re
+        from datetime import datetime
+
+        from dashboard.data.task_snapshot import _TERMINAL_FETCH_WINDOW
+
+        body, _calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            done={'dark-factory': 10},
+        )
+
+        entry = body['TASKS_TERMINAL']['dark-factory']
+        assert entry['state'] == 'lower_bound', (
+            'a windowed read is a measured value known to under-report — the '
+            f'state is the disclosure, got {entry["state"]!r}'
+        )
+        assert len(entry['value']) == 10
+        as_of = datetime.fromisoformat(entry['as_of'])
+        assert as_of.utcoffset() is not None, (
+            'as_of must name one moment, not a local-clock reading'
+        )
+        assert as_of <= datetime.fromisoformat(body['served_at'])
+        assert _TERMINAL_FETCH_WINDOW in [
+            int(number) for number in re.findall(r'\d+', entry['reason'] or '')
+        ], (
+            'the reason must disclose the window the rows were read under, so '
+            'a consumer can tell "these are all of them" from "these are the '
+            f'newest {_TERMINAL_FETCH_WINDOW}"; got {entry["reason"]!r}'
+        )
+
+    def test_the_window_reaches_the_high_id_end(self, client, monkeypatch):
+        """(b) ``offset`` must select the NEWEST terminal rows, not the oldest.
+
+        Relocated from ``TestShapeOneProjectNarrowing``. ``page_size``/
+        ``offset`` slice an ASCENDING-id list, so a naive ``offset=0`` returns
+        the oldest terminal rows — the opposite of what the tab renders.
+        """
+        body, calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            done={'dark-factory': 10}, window=3,
+        )
+
+        page = _terminal_get_tasks(calls)
+        assert len(page) == 1, f'exactly one windowed read, got {page}'
+        assert page[0]['args'].get('statuses') == ['cancelled', 'done']
+        assert page[0]['args'].get('page_size') == 3
+        assert page[0]['args'].get('offset') == 7, 'max(0, n_terminal - window)'
+
+        emitted = sorted(
+            int(row['id'].rsplit('T-', 1)[-1])
+            for row in body['TASKS_TERMINAL']['dark-factory']['value']
+        )
+        assert emitted == [107, 108, 109], (
+            f'the window must reach the high-id end, got {emitted}'
+        )
+
+    def test_the_terminal_window_goes_through_fetch_task_page(
+        self, client, monkeypatch
+    ):
+        """(b) The read that wants a PARTIAL answer names itself one.
+
+        Relocated from ``TestShapeOneProjectNarrowing``. After task 5018 the
+        partial-answer intent lives in the function name rather than in an
+        argument combination, so a reader cannot mistake this for a whole-tree
+        read — and ``fetch_tasks``, the whole-set read, must not be reached at
+        all on this path.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+        from shared.task_statuses import TERMINAL
+
+        whole: list[dict] = []
+        paged: list[dict] = []
+
+        async def _whole_set(client_, config, project_root, **kwargs):
+            whole.append(kwargs)
+            return []
+
+        async def _one_page(client_, config, project_root, **kwargs):
+            paged.append(kwargs)
+            return []
+
+        monkeypatch.setattr(snapshot_mod, 'fetch_tasks', _whole_set)
+        monkeypatch.setattr(snapshot_mod, 'fetch_task_page', _one_page)
+
+        _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            done={'dark-factory': 10},
+        )
+
+        assert len(paged) == 1, f'exactly one windowed read, got {paged}'
+        assert paged[0]['statuses'] == sorted(TERMINAL)
+        assert paged[0]['page_size'] == snapshot_mod._TERMINAL_FETCH_WINDOW
+        assert paged[0]['offset'] == max(
+            0, 10 - snapshot_mod._TERMINAL_FETCH_WINDOW
+        )
+        assert whole == [], (
+            'the terminal window is a PARTIAL read and must not borrow the '
+            f'whole-set read to make it, got {whole}'
+        )
+
+    def test_no_truncation_warning_when_the_population_fits(
+        self, client, monkeypatch, caplog
+    ):
+        """(c) n_terminal <= window → offset 0, every terminal row, no WARNING."""
+        import logging
+
+        body, calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 106)],
+            done={'dark-factory': 6}, window=10,
+        )
+
+        assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
+        assert len(body['TASKS_TERMINAL']['dark-factory']['value']) == 6
+        assert not [
+            record for record in caplog.records
+            if record.name == 'dashboard.data.task_snapshot'
+            and record.levelno >= logging.WARNING
+        ], 'no truncation WARNING may fire when the population fits the window'
+
+    def test_truncation_warns_naming_project_and_counts(
+        self, client, monkeypatch, caplog
+    ):
+        """(c) n_terminal > window → a WARNING naming project, count and window.
+
+        Relocated from ``TestShapeOneProjectNarrowing``. No silent cap: the
+        window selects by descending id while a reader expects recency, so
+        when the gap can bite it has to be visible in the log.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
+            _terminal_render(
+                client, monkeypatch, terminal='dark-factory',
+                terminal_rows=[_terminal_row(i) for i in range(100, 112)],
+                done={'dark-factory': 12}, window=3,
+            )
+
+        messages = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'dashboard.data.task_snapshot'
+            and record.levelno >= logging.WARNING
+        ]
+        assert any(
+            'dark-factory' in message and '12' in message and '3' in message
+            for message in messages
+        ), f'expected a truncation WARNING naming project/count/window, got {messages}'
+
+    def test_an_unpositionable_window_is_unknown_not_the_oldest_rows(
+        self, client, monkeypatch
+    ):
+        """(d) No census, no offset — and offset 0 would serve the OLDEST rows.
+
+        Relocated from ``test_offline_status_map_never_emits_the_oldest_
+        terminal_rows``. The offset is ``n_terminal - window`` and
+        ``n_terminal`` comes from the census; with the census unmeasured the
+        offset collapses to ``max(0, 0 - window) == 0``, which slices the
+        ASCENDING-id list at its OLDEST end — months-old rows presented as the
+        newest. Emitting nothing and saying why is the honest failure.
+        """
+        body, calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            count_unknown=['dark-factory'], window=3,
+        )
+
+        entry = body['TASKS_TERMINAL']['dark-factory']
+        assert entry['state'] == 'unknown'
+        assert entry['value'] is None, (
+            'omitting the rows is honest; showing the OLDEST as the newest is not'
+        )
+        assert entry['as_of'] is None
+        assert (entry['reason'] or '').strip(), (
+            'an unknown datum must say why it is unknown'
+        )
+        assert _terminal_get_tasks(calls) == [], (
+            'a window that cannot be positioned must not be fetched at all, '
+            f'got {_terminal_get_tasks(calls)}'
+        )
+        # The rest of the payload is unaffected — this is a partial
+        # degradation of one key, not a failed render.
+        assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
+
+    def test_an_unconfigured_project_is_unknown_not_a_500(
+        self, client, monkeypatch
+    ):
+        """(e) A name that resolves to no root is answered, not crashed on.
+
+        An empty success would be the worse failure of the two: it reads as
+        "this project has no terminal tasks", which is a measurement nobody
+        made.
+        """
+        body, calls = _terminal_render(
+            client, monkeypatch, terminal='no-such-project',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            done={'dark-factory': 10},
+        )
+
+        entry = body['TASKS_TERMINAL']['no-such-project']
+        assert entry['state'] == 'unknown'
+        assert entry['value'] is None
+        assert 'no-such-project' in (entry['reason'] or ''), (
+            f'the reason must name what could not be resolved, got {entry["reason"]!r}'
+        )
+        assert _terminal_get_tasks(calls) == []
+
+    def test_no_terminal_query_carries_no_terminal_key(self, client):
+        """(f) The key is ABSENT, not empty — an empty dict is a claim."""
+        with patch(
+            'dashboard.api.tasks.collect_tasks_with_counts',
+            new=AsyncMock(return_value=([], _snapshots(['dark-factory']))),
+        ):
+            resp = client.get('/api/v2/dashboard/tasks')
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'TASKS_TERMINAL' not in body
+        assert set(body) == _TASKS_KEYS
+
+    def test_the_terminal_fetch_spends_the_third_roster_slot(
+        self, client, monkeypatch
+    ):
+        """(g) The window is bounded by the budget the roster reserved for it.
+
+        The roster names three bounded OPERATIONS and the default render spends
+        two; this render spends the third. The arithmetic
+        ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
+        _TASKS_PER_PROJECT_BUDGET`` is what makes that affordable, and the
+        ``timeout=`` at the wire is what makes it true rather than aspirational.
+        """
+        from dashboard.data.active_tasks import _TASKS_PER_PROJECT_BUDGET
+        from dashboard.data.task_snapshot import (
+            PER_CALL_TIMEOUT,
+            PER_PROJECT_MCP_CALLS,
+        )
+
+        _body, calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            done={'dark-factory': 10},
+        )
+
+        page = _terminal_get_tasks(calls)
+        assert len(page) == 1
+        assert page[0]['kwargs'].get('timeout') == PER_CALL_TIMEOUT, (
+            'the terminal read must carry the per-operation budget its roster '
+            f'slot reserves, got {page[0]["kwargs"]}'
+        )
+        assert any('terminal' in slot for slot in PER_PROJECT_MCP_CALLS), (
+            'the roster must name the slot this read spends, or the budget '
+            f'arithmetic is not about it: {PER_PROJECT_MCP_CALLS}'
+        )
+        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
+
+
 def test_memory_returns_memory_status(client):
     """memory endpoint composes status + queue stats into a MEMORY_STATUS block."""
     with patch(
