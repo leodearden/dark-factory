@@ -7164,6 +7164,73 @@ def test_registration_failure_reports_the_exit_code_and_the_reason(
 
 
 @pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_a_failure_with_nothing_captured_still_says_the_capture_was_empty(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """An empty stderr must render as a placeholder, not as a truncated line.
+
+    The failure line interpolates systemd-run's capture, so an empty one would
+    otherwise end in a bare colon — indistinguishable in the journal from a
+    line that was cut off, and it silently loses the fact that systemd-run
+    explained nothing. The exit code is the whole of what is known, and the
+    placeholder is what says so.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(
+            calls,
+            register_rc=203,
+            register_stderr="",
+            probe_stdout="inactive\n",
+            probe_rc=4,
+        ),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()
+
+    loud = [m for m in log_messages if _REGISTRATION_FAILURE_TOKEN in m.lower()]
+    assert loud, f"an empty capture must not silence the failure: {log_messages}"
+    assert any("203" in m for m in loud), (
+        f"the exit code is all that is known here, so it must survive: {loud}"
+    )
+    assert any("<no stderr captured>" in m for m in loud), (
+        f"an empty capture must be stated, not rendered as a dangling colon: {loud}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
+def test_a_successful_registration_with_no_banner_stays_silent(
+    monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
+) -> None:
+    """Exit 0 with nothing captured logs NOTHING — the empty-capture branch.
+
+    The happy path runs on essentially every stale tick, so relaying an empty
+    banner would add a content-free line per tick to the journal this task
+    exists to make readable. Paired with the banner-surfacing arm above, this
+    pins both sides of `if banner:`.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        subprocess, "run", _registration_run(calls, register_rc=0, register_stderr="")
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    getattr(wdog, delegate)()
+
+    assert len(calls) == 1, f"the happy path must make exactly one call: {calls}"
+    assert log_messages == [], (
+        f"an empty banner has nothing to report, so it must not be relayed: {log_messages}"
+    )
+
+
+@pytest.mark.parametrize(("delegate", "unit"), _REGISTRATION_DELEGATES)
 def test_the_two_registration_outcomes_are_distinguishable(
     monkeypatch: pytest.MonkeyPatch, delegate: str, unit: str
 ) -> None:
@@ -7175,23 +7242,33 @@ def test_the_two_registration_outcomes_are_distinguishable(
     """
     wdog = _load_watchdog()
 
-    def run_with(probe_stdout: str, probe_rc: int) -> list[str]:
+    def run_with(probe_stdout: str, probe_rc: int) -> tuple[list[str], list[list[str]]]:
         messages: list[str] = []
+        calls: list[list[str]] = []
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
                 subprocess,
                 "run",
                 _registration_run(
-                    [], register_rc=1, probe_stdout=probe_stdout, probe_rc=probe_rc
+                    calls, register_rc=1, probe_stdout=probe_stdout, probe_rc=probe_rc
                 ),
             )
             mp.setattr(wdog, "log", lambda m: messages.append(m))
             getattr(wdog, delegate)()
-        return messages
+        return messages, calls
 
-    in_flight = run_with("active\n", 0)
-    failed = run_with("inactive\n", 4)
+    in_flight, in_flight_calls = run_with("active\n", 0)
+    failed, failed_calls = run_with("inactive\n", 4)
 
+    # The recorder is bound per arm rather than thrown away, because "the probe
+    # is what separates them" is the mechanism under test: two different lines
+    # produced WITHOUT a probe would satisfy every assertion below.
+    assert len(_probe_calls(in_flight_calls)) == 1, (
+        f"the in-flight line must come from a state probe: {in_flight_calls}"
+    )
+    assert len(_probe_calls(failed_calls)) == 1, (
+        f"the failure line must come from a state probe: {failed_calls}"
+    )
     assert in_flight and failed, f"both outcomes must log: {in_flight} / {failed}"
     assert in_flight != failed, (
         f"an in-flight collision and a genuine failure must not log the same line: {failed}"
@@ -7262,6 +7339,77 @@ def test_the_is_active_probe_never_raises_and_falls_to_not_in_flight(
     )
     assert any(unit in m for m in log_messages), (
         f"the probe must log its own inability, naming the unit: {log_messages}"
+    )
+
+
+# systemd's ActiveState vocabulary, split by whether it means "this unit has
+# not finished yet". Every OTHER probe stub in this suite pairs stdout with the
+# return code systemctl would really have emitted alongside it, which is
+# precisely why neither signal is pinned: with the two always agreeing, `return
+# result.returncode == 0` is observationally identical to the real
+# implementation.
+_ACTIVE_STATE_VOCABULARY = [
+    ("active", True),
+    ("activating", True),
+    ("reloading", True),
+    ("inactive", False),
+    ("deactivating", False),
+    ("failed", False),
+    ("unknown", False),
+    ("", False),
+]
+
+
+@pytest.mark.parametrize(("state", "in_flight"), _ACTIVE_STATE_VOCABULARY)
+@pytest.mark.parametrize("probe_rc", [0, 1, 3, 4])
+def test_the_is_active_probe_branches_on_the_state_not_the_return_code(
+    monkeypatch: pytest.MonkeyPatch, state: str, in_flight: bool, probe_rc: int
+) -> None:
+    """THE DISCRIMINATOR ITSELF, with the return code held independent.
+
+    Sweeping the rc across every state DISSOCIATES the two signals, which is
+    the only way this can distinguish the real implementation from an rc-only
+    one. It kills two regressions the rest of the suite cannot see: rewriting
+    the body as `result.returncode == 0`, and shrinking
+    UNIT_IN_FLIGHT_ACTIVE_STATES to {"active"}. Either would report a
+    transient redeploy unit observed mid-'activating' as "registration failed
+    with exit N" — a false alarm on exactly the journal line task item (5)
+    exists to make trustworthy, since `is-active` exits NON-ZERO while a unit
+    is still activating.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    unit = "orch-fleet-staleness-redeploy.service"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _registration_run(calls, probe_stdout=f"{state}\n", probe_rc=probe_rc),
+    )
+
+    assert wdog._unit_is_active(unit) is in_flight, (
+        f"ActiveState {state!r} must read as in_flight={in_flight} whatever "
+        f"`is-active` exits with (rc={probe_rc})"
+    )
+    assert len(_probe_calls(calls)) == 1, f"exactly one probe must fire: {calls}"
+    assert unit in _probe_calls(calls)[0], f"the probe must name the unit: {calls}"
+
+
+def test_the_in_flight_states_are_exactly_systemds_unfinished_ones() -> None:
+    """The vocabulary above and the frozenset must not drift apart.
+
+    Without this, a state added to UNIT_IN_FLIGHT_ACTIVE_STATES would be
+    untested rather than failing — the parametrization enumerates what it
+    KNOWS about, and cannot notice what it does not.
+    """
+    wdog = _load_watchdog()
+
+    exercised = frozenset(
+        state for state, in_flight in _ACTIVE_STATE_VOCABULARY if in_flight
+    )
+
+    assert exercised == wdog.UNIT_IN_FLIGHT_ACTIVE_STATES, (
+        "the in-flight states this suite exercises must be the whole of the "
+        f"set the probe branches on: {wdog.UNIT_IN_FLIGHT_ACTIVE_STATES}"
     )
 
 
@@ -9874,9 +10022,9 @@ def test_liveness_pass_cap_suppresses_restart_inside_window(
         wdog.fused_memory_liveness_pass()
 
     assert restarted == [], f"the cap must suppress the restart; got {restarted}"
-    assert any("3600" in m for m in logged), (
-        f"the skip line must name the interval so an operator can see WHY: {logged}"
-    )
+    assert any(
+        f"one per {wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS}s" in m for m in logged
+    ), f"the skip line must name the interval so an operator can see WHY: {logged}"
 
 
 def test_liveness_pass_cap_does_not_clear_the_streak(
