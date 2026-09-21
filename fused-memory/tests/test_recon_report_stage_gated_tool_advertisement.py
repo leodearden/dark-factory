@@ -27,8 +27,9 @@ falls past the cut and reaches no agent. The stage prompts are passed as the
 system prompt and are subject to no such cap, so they are the only channel that
 can carry the contract.
 
-There is deliberately NO hand-maintained tool-name list here. The (tool, stage)
-matrix is DERIVED from `STAGE_GATED_REPORT_TOOLS` (which lives next to the
+There is deliberately NO hand-maintained tool list here, and no hand-maintained
+parameter list either. The (tool, stage) matrix is DERIVED from
+`STAGE_GATED_REPORT_TOOLS` (which lives next to the
 @mcp.tool() registrations) crossed with the live `STAGE{1,2,3}_DISALLOWED` lists
 that actually reach `--disallowed-tools`. A newly stage-gated tool is held to
 this contract automatically, with no edit to this file. That is the same drift
@@ -36,10 +37,20 @@ this contract automatically, with no edit to this file. That is the same drift
 close ("it lived in a test file the tool author never opens"), and it is the
 drift that produced this task: `repair_memory_citation` gained a THIRD holding
 (Stage 1) after the original absence guard was written, and nobody noticed.
+
+The same derivation covers the call SHAPES the prompt blocks transcribe: the
+required parameters of each example are read off
+`get_recon_report_tool_signatures()`, the seam the shared-guidance generator is
+built on, rather than re-typed here. Hand-transcribed shapes are unavoidable for
+these two tools — the generator emits ONE stage-agnostic block into all three
+prompts, which is precisely what a stage-gated tool cannot have — so pinning
+them against the live signatures is what keeps the transcription from becoming
+the task-2559 drift a second time.
 """
 
 from __future__ import annotations
 
+import inspect
 import re
 
 import pytest
@@ -51,7 +62,10 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-from fused_memory.server.recon_report import STAGE_GATED_REPORT_TOOLS
+from fused_memory.server.recon_report import (
+    STAGE_GATED_REPORT_TOOLS,
+    get_recon_report_tool_signatures,
+)
 
 # (prompt label, assembled prompt, the cli_stage_runner attribute that gates it).
 # The disallow-list ATTRIBUTE NAME travels with each case rather than a
@@ -75,24 +89,34 @@ _STAGE_CASE_IDS = [label for label, _text, _attr in _STAGE_CASES]
 _STAGE2_PROJECT_IDS = ('dark_factory', 'autopilot_video')
 
 
-def _names_tool(text: str, tool_name: str) -> bool:
-    """Is *tool_name* named in *text* as a whole identifier, not as a substring?
+def _names_report_tool(text: str, tool_name: str) -> bool:
+    """Is *tool_name* named in *text* as a whole recon-report tool identifier?
 
-    Same shape as `test_recon_report_guidance_drift.py::_names_tool` — copied
-    rather than imported across test modules, as that module documents. A bare
-    ``tool_name in text`` is not a coverage check: it passes on any longer word
-    that merely CONTAINS the name. That hole is LIVE here, not hypothetical —
-    `render_entity_standing_decision_schema_section()` puts the string
-    `entity_standing_decision` into BOTH stage prompts, so a substring check for
-    `write_entity_standing_decision` in the wrong direction would be satisfied by
-    a section that never mentions the tool.
+    DELIBERATELY NOT named `_names_tool`. The drift module has a helper by that
+    name with DIFFERENT semantics — it matches the bare name only — and two
+    same-named helpers that disagree about what they match are a trap for the
+    next editor, who would reasonably "fix" one to match the other. The name
+    here says which of the two this is: it accepts the `mcp__recon-report__`
+    prefix as well as the bare name.
 
-    The optional `mcp__recon-report__` prefix is the one deliberate difference
-    from the drift module's helper, and mirrors that module's
-    `_iter_call_openers`: stage prompts advertise a tool by its FULLY-QUALIFIED
-    call name (as `AMEND_AND_EPISODE_TOOLS_BLOCK` does for the fused-memory
-    namespace), where the character before the bare name is `_` and a
-    prefix-blind identifier boundary would never match.
+    That prefix is the whole reason for a second helper. Stage prompts
+    advertise a tool by its FULLY-QUALIFIED call name (as
+    `AMEND_AND_EPISODE_TOOLS_BLOCK` does for the fused-memory namespace), where
+    the character before the bare name is `_` — so a prefix-blind identifier
+    boundary never matches, and `_iter_call_openers` below (in both modules)
+    already takes the same prefix-tolerant shape for exactly this reason.
+
+    Copied rather than imported across test modules: that is the norm
+    `test_recon_gate_closure_guidance.py::_make_consolidator` states ("rather
+    than importing that module's private helper across test modules").
+
+    What the identifier boundary buys, in both spellings: a bare
+    ``tool_name in text`` is not a coverage check, because it passes on any
+    longer word that merely CONTAINS the name. That hole is LIVE here, not
+    hypothetical — `render_entity_standing_decision_schema_section()` puts the
+    string `entity_standing_decision` into BOTH stage prompts, so a substring
+    check for `write_entity_standing_decision` in the wrong direction would be
+    satisfied by a section that never mentions the tool.
     """
     pattern = (
         r'(?<![A-Za-z0-9_])(?:mcp__recon-report__)?'
@@ -159,7 +183,7 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
             pytest.skip(
                 f'{tool_name} is denied by {disallowed_attr} — the absence arm below owns this pair'
             )
-        assert _names_tool(prompt_text, tool_name), (
+        assert _names_report_tool(prompt_text, tool_name), (
             f'{prompt_label} never names `{tool_name}`, but that stage HOLDS it — '
             f'it is absent from {disallowed_attr} (cli_stage_runner.py), so the agent '
             'can call it. `--disallowed-tools` OMITS denied tools rather than rejecting '
@@ -181,7 +205,7 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
                 f'{tool_name} is absent from {disallowed_attr}, so that stage HOLDS it — '
                 'the naming arm above owns this pair'
             )
-        assert not _names_tool(prompt_text, tool_name), (
+        assert not _names_report_tool(prompt_text, tool_name), (
             f'{prompt_label} names `{tool_name}`, but that stage DENIES it '
             f'({disallowed_attr} in cli_stage_runner.py). Naming a denied tool in a stage '
             'prompt tells the agent about an action it cannot take, and the denial '
@@ -203,12 +227,12 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
         """
         built = build_stage2_system_prompt(project_id)
         if _stage_denies(tool_name, 'STAGE2_DISALLOWED'):
-            assert not _names_tool(built, tool_name), (
+            assert not _names_report_tool(built, tool_name), (
                 f'build_stage2_system_prompt({project_id!r}) names `{tool_name}`, but '
                 'Stage 2 DENIES it (STAGE2_DISALLOWED in cli_stage_runner.py).'
             )
         else:
-            assert _names_tool(built, tool_name), (
+            assert _names_report_tool(built, tool_name), (
                 f'build_stage2_system_prompt({project_id!r}) must still name `{tool_name}` '
                 '— Stage 2 HOLDS it (absent from STAGE2_DISALLOWED in cli_stage_runner.py) '
                 'and a held-but-unadvertised tool is invisible to the agent.'
@@ -216,19 +240,25 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
 
 
 class TestStageGatedToolBlocksAreWiredNotRePasted:
-    """Pins the WIRING of the two advertisement blocks — constant identity,
-    verbatim, exactly once, per stage — never their prose.
+    """Pins the WIRING of the two advertisement sections — single-source
+    identity, verbatim, exactly once, per stage — never their prose.
+
+    One section is a constant (CITATION_REPAIR_TOOL_BLOCK, shared by two
+    stages) and one a renderer (render_entity_standing_decision_write_section,
+    Stage-2-only, so it can interpolate the arm-2 threshold from code). Both
+    are pinned the same way, by comparing the assembled prompt against the
+    single source's own TEXT.
 
     This is the INV-5 guard the membership assertions above cannot be. Every
-    per-name assertion in the class above passes equally if the block text were
-    re-pasted inline in stage1.py / stage2.py instead of interpolating the
-    shared constant, which is exactly the drift these constants exist to
-    prevent. Same discipline test_recon_gate_closure_guidance.py's docstring
-    states: prose may be reworded freely; the wiring may not silently break.
+    per-name assertion in the class above passes equally if the text were
+    re-pasted inline in stage1.py / stage2.py instead of interpolated, which is
+    exactly the drift these single sources exist to prevent. Same discipline
+    test_recon_gate_closure_guidance.py's docstring states: prose may be
+    reworded freely; the wiring may not silently break.
 
-    Each test imports its constant LOCALLY rather than at module scope, the
+    Each test imports its section LOCALLY rather than at module scope, the
     pattern TestStagePromptsCarryTheAnnotationNorm documents in
-    test_recon_amend_tool_advertisement.py: while a constant does not exist
+    test_recon_amend_tool_advertisement.py: while a section does not exist
     yet, its ImportError is isolated to the test that needs it and the
     already-green assertions elsewhere in this file stay collectible.
     """
@@ -255,24 +285,37 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
         assert CITATION_REPAIR_TOOL_BLOCK not in STAGE3_SYSTEM_PROMPT
 
     def test_standing_decision_write_block_embedded_exactly_once_in_stage2_prompt(self):
-        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
-        assert STAGE2_SYSTEM_PROMPT.count(ENTITY_STANDING_DECISION_WRITE_BLOCK) == 1, (
-            'STAGE2_SYSTEM_PROMPT must interpolate ENTITY_STANDING_DECISION_WRITE_BLOCK '
-            'verbatim, exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        from fused_memory.reconciliation.prompts import (
+            render_entity_standing_decision_write_section,
+        )
+
+        block = render_entity_standing_decision_write_section()
+        assert STAGE2_SYSTEM_PROMPT.count(block) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_entity_standing_decision_write_section() verbatim, exactly once '
+            '(INV-5: stated once, interpolated, never re-pasted).'
         )
 
     def test_standing_decision_write_block_absent_from_stage1_prompt(self):
         """Stage 2 is the ONLY stage holding write_entity_standing_decision —
         Stage 1 and Stage 3 are denied it via DISALLOW_RECON_REPORT_LEDGER_WRITES.
-        A block that leaked into Stage 1 would also trip the absence arm above,
-        but this pins the CONSTANT rather than the tool name, so a reworded
-        block still cannot drift into the wrong stage."""
-        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
-        assert ENTITY_STANDING_DECISION_WRITE_BLOCK not in STAGE1_SYSTEM_PROMPT
+        A section that leaked into Stage 1 would also trip the absence arm
+        above, but this pins the RENDERER'S OUTPUT rather than the tool name,
+        so a reworded section still cannot drift into the wrong stage."""
+        from fused_memory.reconciliation.prompts import (
+            render_entity_standing_decision_write_section,
+        )
+
+        block = render_entity_standing_decision_write_section()
+        assert block not in STAGE1_SYSTEM_PROMPT
 
     def test_standing_decision_write_block_absent_from_stage3_prompt(self):
-        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
-        assert ENTITY_STANDING_DECISION_WRITE_BLOCK not in STAGE3_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts import (
+            render_entity_standing_decision_write_section,
+        )
+
+        block = render_entity_standing_decision_write_section()
+        assert block not in STAGE3_SYSTEM_PROMPT
 
     @pytest.mark.parametrize('project_id', _STAGE2_PROJECT_IDS)
     def test_citation_repair_block_survives_both_build_stage2_branches(self, project_id):
@@ -287,24 +330,28 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
     def test_standing_decision_write_block_survives_both_build_stage2_branches(
         self, project_id
     ):
-        from fused_memory.reconciliation.prompts import ENTITY_STANDING_DECISION_WRITE_BLOCK
+        from fused_memory.reconciliation.prompts import (
+            render_entity_standing_decision_write_section,
+        )
+
+        block = render_entity_standing_decision_write_section()
         built = build_stage2_system_prompt(project_id)
-        assert built.count(ENTITY_STANDING_DECISION_WRITE_BLOCK) == 1, (
+        assert built.count(block) == 1, (
             f'build_stage2_system_prompt({project_id!r}) dropped or duplicated '
-            'ENTITY_STANDING_DECISION_WRITE_BLOCK.'
+            'render_entity_standing_decision_write_section().'
         )
 
     @pytest.mark.parametrize(
         'heading',
         ['## Entity Standing Decisions', '## Investigation Outcome Records'],
     )
-    def test_headings_the_standing_decision_block_cross_references_exist_in_stage2(
+    def test_headings_the_standing_decision_section_points_at_precede_it_in_stage2(
         self, heading
     ):
-        """ENTITY_STANDING_DECISION_WRITE_BLOCK deliberately POINTS AT these two
-        sections instead of re-pasting them — the grounds enum lives in the
-        first (rendered by render_entity_standing_decision_schema_section()) and
-        the arm-2 evidence pool in the second (render_investigation_outcome_section()),
+        """render_entity_standing_decision_write_section() deliberately POINTS AT
+        these two sections instead of re-pasting them — the grounds enum lives in
+        the first (rendered by render_entity_standing_decision_schema_section())
+        and the arm-2 record pool in the second (render_investigation_outcome_section()),
         and each is single-sourced there.
 
         Cross-referencing a heading that does not exist in the target prompt is
@@ -312,13 +359,31 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
         such MUST-NOTs, both for headings that exist in one stage prompt and not
         another. That block avoids the hazard by naming no heading at all; this
         one accepts it (it is Stage-2-only, so both headings are reachable) and
-        pays for it with this guard. If a renderer is reworded or dropped, the
-        pointer must be updated in the same change.
+        pays for it with this guard.
+
+        The POSITIONAL half is the part that actually bites. The section says
+        "above" of both headings, so mere membership is not enough: reordering
+        the Stage-2 sections, or moving this section earlier, leaves a
+        membership-only guard green while the prompt sends the agent scrolling
+        the wrong way for the grounds enum. Asserting the order turns that into
+        a test failure at the moment of the reorder.
         """
+        from fused_memory.reconciliation.prompts import (
+            render_entity_standing_decision_write_section,
+        )
+
+        block = render_entity_standing_decision_write_section()
         assert heading in STAGE2_SYSTEM_PROMPT, (
-            f'ENTITY_STANDING_DECISION_WRITE_BLOCK points the agent at {heading!r}, but '
-            'no such heading is in STAGE2_SYSTEM_PROMPT. Either the renderer that emits '
-            'it was reworded/dropped, or the block now points at nothing.'
+            f'render_entity_standing_decision_write_section() points the agent at '
+            f'{heading!r}, but no such heading is in STAGE2_SYSTEM_PROMPT. Either the '
+            'renderer that emits it was reworded/dropped, or the section now points at '
+            'nothing.'
+        )
+        assert STAGE2_SYSTEM_PROMPT.index(heading) < STAGE2_SYSTEM_PROMPT.index(block), (
+            f'render_entity_standing_decision_write_section() says {heading!r} is '
+            '"above" it, but in the assembled STAGE2_SYSTEM_PROMPT that heading comes '
+            'AFTER the section. Either restore the order in stage2.py, or reword the '
+            'pointer so it does not claim a direction it no longer has.'
         )
 
 
@@ -332,7 +397,7 @@ class TestHazardsTheNewBlocksAreExposedTo:
 
     @pytest.mark.parametrize(
         'block_name',
-        ['CITATION_REPAIR_TOOL_BLOCK', 'ENTITY_STANDING_DECISION_WRITE_BLOCK'],
+        ['CITATION_REPAIR_TOOL_BLOCK', 'render_entity_standing_decision_write_section'],
     )
     def test_block_does_not_contain_the_available_tools_sentinel(self, block_name):
         """`build_stage2_system_prompt` raises RuntimeError unless '## Available
@@ -340,7 +405,10 @@ class TestHazardsTheNewBlocksAreExposedTo:
         inside it. A block carrying a second copy breaks Stage 2 at build time
         with an error naming the sentinel, not the block."""
         from fused_memory.reconciliation import prompts as prompts_module
-        block = getattr(prompts_module, block_name)
+        attr = getattr(prompts_module, block_name)
+        # One of the two is a renderer and one a constant; take the TEXT either way
+        # so this pin does not have to be re-decided when a section changes form.
+        block = attr() if callable(attr) else attr
         assert '## Available Tools' not in block, (
             f'{block_name} contains the literal "## Available Tools". That sentinel must '
             'occur exactly once in STAGE2_SYSTEM_PROMPT or build_stage2_system_prompt '
@@ -357,43 +425,62 @@ class TestHazardsTheNewBlocksAreExposedTo:
     @pytest.mark.parametrize(
         'prompt_label,prompt_text,disallowed_attr', _STAGE_CASES, ids=_STAGE_CASE_IDS
     )
-    def test_repair_memory_citation_examples_carry_both_run_ids(
-        self, prompt_label, prompt_text, disallowed_attr
+    @pytest.mark.parametrize('tool_name', sorted(STAGE_GATED_REPORT_TOOLS))
+    def test_call_examples_show_every_required_parameter(
+        self, tool_name, prompt_label, prompt_text, disallowed_attr
     ):
-        """Every repair_memory_citation call example in an ASSEMBLED prompt shows
-        BOTH `run_id` and `target_run_id`.
+        """Every stage-gated call example in an ASSEMBLED prompt names every
+        parameter the LIVE signature requires.
 
-        `test_recon_report_guidance_drift.py::TestReconReportRunIdGuardOverAssembledPrompts`
-        scans `_SHARED_GUIDANCE_REPORT_TOOLS`, which EXCLUDES the stage-gated
-        tools — so the one stage-gated tool that IS run-scoped is covered by
-        nothing. This is that carve-out's equivalent, and it guards the specific
-        trap the block's prose calls out: the two ids are not interchangeable,
-        and passing the target's id as `run_id` fails `run_id_unknown` rather
-        than doing the intended thing. An example missing either one teaches the
-        conflation the prose exists to prevent.
+        The prompt blocks HAND-TRANSCRIBE these call shapes, which is precisely
+        the text that drifted in task 2559 and motivated generating the shared
+        guidance from live signatures in the first place. The stage-gated tools
+        cannot use that generator — it renders one stage-agnostic block into all
+        three prompts, and these two tools are stage-gated exactly because such a
+        block would be wrong for at least one stage — so the transcription is
+        unavoidable here. What is avoidable is leaving it unpinned: the required
+        parameters are READ OFF `get_recon_report_tool_signatures()` (the same
+        seam the guidance generator and the drift module both use) rather than
+        hand-listed, so a tool that gains a required parameter, or renames one,
+        fails here instead of shipping a prompt that teaches a call which cannot
+        pass argument validation.
 
-        Runs over all three stages, so a future example spliced into a stage
-        that does not hold the tool is caught here too (its absence there is
-        asserted separately; this asserts the shape of anything that appears).
+        `run_id` / `target_run_id` on `repair_memory_citation` are the sharpest
+        case, and they fall out of the derivation rather than needing a special
+        case: both are required, so an example showing one without the other
+        fails — which is the exact conflation the block's prose warns about
+        (passing the target's id as `run_id` fails `run_id_unknown` rather than
+        doing the intended thing).
+
+        Runs over all three stages, so an example spliced into a stage that does
+        not hold the tool is shape-checked here too (its mere presence there is
+        failed by the absence arm above).
         """
+        signature = get_recon_report_tool_signatures()[tool_name]
+        required = [
+            name
+            for name, param in signature.parameters.items()
+            if param.default is inspect.Parameter.empty
+            and param.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        ]
+
         examples = 0
-        for paren_idx in _iter_call_openers(prompt_text, 'repair_memory_citation'):
+        for paren_idx in _iter_call_openers(prompt_text, tool_name):
             examples += 1
             args = _extract_call_args_at(prompt_text, paren_idx)
-            for required in ('run_id', 'target_run_id'):
+            for name in required:
                 # Identifier boundary, not a substring: `'run_id=' in args` is
                 # satisfied by `target_run_id=` alone, which is the very
                 # conflation this test exists to catch.
-                found = re.search(
-                    rf'(?<![A-Za-z0-9_]){re.escape(required)}\s*=', args
-                )
+                found = re.search(rf'(?<![A-Za-z0-9_]){re.escape(name)}\s*=', args)
                 assert found, (
-                    f'{prompt_label} contains a repair_memory_citation(...) example '
-                    f'missing `{required}=`: {args!r}. `run_id` is the CALLER\'s current '
-                    'run and `target_run_id` is the run that OWNS the finding; an example '
-                    'showing one without the other invites exactly the conflation that '
-                    f'fails `run_id_unknown`. (Stage gating for this prompt: '
-                    f'{disallowed_attr}.)'
+                    f'{prompt_label} contains a {tool_name}(...) example missing '
+                    f'`{name}=`, which its live signature requires (no default). '
+                    f'Required parameters, read from get_recon_report_tool_signatures(): '
+                    f'{required}. Example args were: {args!r}. A transcribed call shape '
+                    'that omits a required parameter teaches a call that fails argument '
+                    f'validation. (Stage gating for this prompt: {disallowed_attr}.)'
                 )
 
         # Non-vacuity: a scan that finds nothing is a guard that looks like
@@ -401,10 +488,10 @@ class TestHazardsTheNewBlocksAreExposedTo:
         # names. A stage that HOLDS the tool must show at least one call example,
         # since the call shape is the part the truncated server listing never
         # delivers. A denying stage must show none, which the absence arm asserts.
-        if not _stage_denies('repair_memory_citation', disallowed_attr):
+        if not _stage_denies(tool_name, disallowed_attr):
             assert examples, (
-                f'{prompt_label} shows no repair_memory_citation(...) call example, but '
-                f'that stage HOLDS the tool (absent from {disallowed_attr}). Naming a '
-                'tool without its call shape is not advertisement: the call shape is '
-                'exactly what the CLI-truncated server listing never delivers.'
+                f'{prompt_label} shows no {tool_name}(...) call example, but that stage '
+                f'HOLDS the tool (absent from {disallowed_attr}). Naming a tool without '
+                'its call shape is not advertisement: the call shape is exactly what the '
+                'CLI-truncated server listing never delivers.'
             )
