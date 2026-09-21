@@ -24,6 +24,16 @@ THE RULE, verified against installed mem0 1.0.11
 ``MemoryService.get_memory_by_id`` applies none of that: it returns the FULL
 unprocessed payload under ``metadata``, all keys at one level.  Both readings
 live here so the divergence between them is visible in one screen.
+
+WHY THIS IS NOT IN ``_fm_helpers.py``, which is where the repo's cross-file
+test helpers otherwise go: that module is already ~1900 lines over 28
+unrelated concerns, and the norm's actual reason — a uniquely-named importable
+module rather than ``conftest.py``, so root pytest's ``sys.modules['conftest']``
+collision cannot bite — is satisfied identically here.  ``tests/conftest.py``
+puts the tests dir on ``sys.path``, so ``from _mem0_record_shapes import ...``
+resolves unqualified from ``tests/``, ``tests/server/`` and
+``tests/reconciliation/`` alike.  Do not fold this into ``_fm_helpers.py``;
+it has one subject and should keep it (code-quality heuristics 6 and 14).
 """
 
 from __future__ import annotations
