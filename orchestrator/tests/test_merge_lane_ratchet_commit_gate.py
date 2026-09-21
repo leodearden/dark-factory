@@ -109,6 +109,22 @@ class _Repo:
         repo.commit_all('seed the ratchet artifacts')
         return repo
 
+    @classmethod
+    def unborn(cls, tmp_path: Path) -> _Repo:
+        """An initialized repo with NO commit yet -- HEAD names nothing."""
+        root = tmp_path / 'repo'
+        root.mkdir()
+        bootstrap = subprocess.run(
+            ['git', 'init', '-b', 'main'],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            env=git_env_with_ceiling(root),
+            check=False,
+        )
+        assert bootstrap.returncode == 0, bootstrap.stderr
+        return cls(root)
+
     def git(self, *args: str, check: bool = True) -> str:
         proc = subprocess.run(
             ['git', *args],
@@ -465,6 +481,118 @@ class TestRestoreCarveOut:
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == '' and result.stderr == ''
+
+
+class TestLedgerIsAppendOnlyAtTheGate:
+    """The arm where the LEDGER moves, whether or not the baseline did.
+
+    ``append_authorization``'s docstring promises that "a reviewer reading the
+    file reads every raise this baseline has ever absorbed". It can only keep
+    that for its OWN writes, while the file is also edited by rebases, merges
+    and hands. A gate that looked at the ledger only when the baseline also
+    moved would leave a commit that quietly deletes historical entries
+    unexamined -- so the promise would stay unenforced in exactly the case that
+    breaks it (heuristic 10, uniformly).
+    """
+
+    @staticmethod
+    def _with_history(tmp_path: Path) -> tuple[_Repo, dict]:
+        repo = _Repo.seeded(tmp_path)
+        history = _record([metrics._violation('lines', 'a.py', 990, 1000)], '5485')
+        repo.write_ledger(_ledger_with(history))
+        repo.commit_all('record a historical raise')
+        return repo, history
+
+    def test_appending_to_the_ledger_alone_is_clean(self, tmp_path: Path) -> None:
+        repo, history = self._with_history(tmp_path)
+        repo.write_ledger(_ledger_with(history, _record([], '5722')))
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stderr
+
+    def test_dropping_a_historical_entry_is_refused(self, tmp_path: Path) -> None:
+        repo, _history = self._with_history(tmp_path)
+        repo.write_ledger(_ledger_with())
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0
+        assert 'append-only' in result.stderr
+        assert '1' in result.stderr
+
+    def test_rewriting_a_historical_entry_in_place_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Same COUNT, changed content: a check that compared lengths would pass
+        # this, and a rewritten `reason` is exactly how a raise stops reading as
+        # what it was.
+        repo, _history = self._with_history(tmp_path)
+        forged = _record([metrics._violation('lines', 'a.py', 990, 1000)], '5485')
+        forged['reason'] = 'actually it was a refactor'
+        repo.write_ledger(_ledger_with(forged))
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0
+        assert 'append-only' in result.stderr
+
+    def test_a_covering_append_does_not_launder_a_rewritten_history(
+        self, tmp_path: Path
+    ) -> None:
+        # THE PIN THAT THE TWO AUDITS CANNOT SHORT-CIRCUIT EACH OTHER. The raise
+        # is correctly authorized AND a recorded entry is gone; either alone
+        # decides nothing, so both must be reported.
+        repo, _history = self._with_history(tmp_path)
+        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_ledger(
+            _ledger_with(
+                _record([
+                    metrics._violation('lines', 'a.py', 1000, 1005),
+                    metrics._violation(
+                        'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
+                    ),
+                ])
+            )
+        )
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode != 0
+        assert 'append-only' in result.stderr
+
+    def test_a_malformed_staged_ledger_is_refused_by_name(
+        self, tmp_path: Path
+    ) -> None:
+        repo, _history = self._with_history(tmp_path)
+        (repo.root / metrics.LEDGER_RELPATH).write_text(
+            '{"raises": ', encoding='utf-8'
+        )
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        # A ledger that cannot be parsed is one whose history cannot be audited,
+        # and it must NEVER read as "nothing was authorized" (load_ledger's own
+        # stated polarity).
+        assert result.returncode != 0
+        assert 'not valid JSON' in result.stderr
+        assert 'Traceback' not in result.stderr
+
+    def test_an_unborn_head_with_nothing_staged_does_no_archaeology(
+        self, tmp_path: Path
+    ) -> None:
+        # The cheap filter must decide BEFORE anything consults HEAD: a repo
+        # whose HEAD names nothing is the sharpest way to assert that, because
+        # every history read would fail on it.
+        result = _Repo.unborn(tmp_path).gate()
 
         assert result.returncode == 0, result.stderr
         assert result.stdout == '' and result.stderr == ''
