@@ -1,9 +1,17 @@
 """Aggregate active tasks across all known projects for the redux dashboard.
 
-Joins three sources — task tree (via fused-memory MCP), per-task runtime
-state (via the orchestrator's escalation MCP, ``get_task_runtime_state``),
-and optional burst state from reconciliation — into the ``ACTIVE_TASKS``
-shape consumed by the React dashboard's tasks tab.
+Joins three sources — the per-root task snapshot unit
+(``dashboard.data.task_snapshot``, which owns every read of the task tree),
+per-task runtime state (via the orchestrator's escalation MCP,
+``get_task_runtime_state``), and optional burst state from reconciliation —
+into the ``ACTIVE_TASKS`` shape consumed by the React dashboard's tasks tab.
+
+THIS MODULE READS NOTHING ITSELF beyond the runtime fan-out and the batched
+external-status tail. A root's task state arrives as a ``TaskSnapshot``,
+already stamped with the instant it was measured and already carrying, per
+half, whether that measurement succeeded and why not. What lives here is the
+WALK — the budget, the admission width, the rotation, the canonical
+re-assembly — and the SHAPING of one root's rows out of one unit.
 
 Output shape (per task) matches ``data.js`` mock fixtures:
 
@@ -65,7 +73,7 @@ import logging
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import httpx
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
@@ -73,23 +81,18 @@ from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
-from dashboard.data.task_snapshot import PER_CALL_TIMEOUT
-from dashboard.data.tasks import (
-    fetch_external_statuses,
-    fetch_statuses,
-    fetch_task_page,
-    fetch_tasks,
-    task_is_stranded,
+from dashboard.data.task_snapshot import (
+    SnapshotFailure,
+    SnapshotHealth,
+    TaskSnapshot,
+    acquire_snapshot,
+    classify,
+    unmeasured_snapshot,
 )
+from dashboard.data.tasks import fetch_external_statuses, task_is_stranded
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
-
-_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
-# The two terminal buckets the Tasks tab renders. Sent as the ``statuses``
-# filter for the bounded terminal window, so this set is what crosses the wire
-# — keep it in step with the (status, cap) pairs iterated below.
-_TERMINAL_STATUSES = {'done', 'cancelled'}
 
 # Why a task row's runtime fields are what they are — the FAULT DOMAIN of the
 # runtime probe, not the task (task 3517). Mirrors the ``status``-discriminator
@@ -111,22 +114,6 @@ _TERMINAL_STATUSES = {'done', 'cancelled'}
 RuntimeStatus = Literal[
     'ok', 'not_configured', 'unreachable', 'deadline_exceeded', 'unknown',
 ]
-
-# Maximum done / cancelled tasks to include per project when the caller opts in
-# via ``max_done_per_project`` / ``max_cancelled_per_project``.
-# Kept at module level so app.py can import them.
-# Upper bound on how many terminal (done + cancelled) rows are pulled per
-# project per render — 8x the 50-row _MAX_DONE_PER_PROJECT render cap below.
-#
-# This is the ceiling: without it the Tasks tab pulled every done row in the
-# tree (~4000 rows / ~40 MB on dark-factory) to render at most 50 of them.
-# 8x rather than 1x because the window is selected by DESCENDING TASK ID
-# while the render cap selects by ``updated_at`` — see _shape_one_project's
-# docstring for why those differ and when the gap can bite.
-_TERMINAL_FETCH_WINDOW = 400
-
-_MAX_DONE_PER_PROJECT = 50
-_MAX_CANCELLED_PER_PROJECT = 50
 
 # --- Budget constants -------------------------------------------------------
 #
@@ -247,34 +234,6 @@ _TASKS_TOTAL_BUDGET = 20.0
 # 5128 tasks, reify 7279) and seven that finish in under 0.1 s — in
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
-
-# Defensive-visibility threshold: a PRD with an unusually large number of live
-# done/cancelled members beyond the per-bucket cap logs a warning, so a
-# pathological case is visible rather than silently inflating the payload.
-#
-# This comment used to also assert that the exemption "never drops rows —
-# 'all live members' is the contract, not 'up to N'". _TERMINAL_FETCH_WINDOW
-# made that FALSE and the correction belongs here, at the site that states the
-# contract, not only in _shape_one_project's docstring: the exemption can only
-# exempt rows that were FETCHED, so a live PRD's done/cancelled members with
-# ids below the window's high-id end are absent from `tasks` and can never be
-# exempted at all. On a tree with more terminal tasks than the window
-# (dark-factory has ~4000 against a 400-row window) the contract in
-# plans/dashboard-taskgraph-legibility-prd.md is therefore no longer met, and
-# front-end PRD member aggregation under-counts by exactly those rows.
-#
-# Left as a disclosed narrowing rather than silently widened here: raising the
-# window to restore it trades directly against the payload budget this task
-# exists to bound, and that trade is a product decision about the PRD contract
-# rather than a defect in this module. Tracked as TASK 4416, which weighs the
-# three candidate resolutions (amend the PRD contract / raise the window /
-# fetch live-PRD members explicitly) — a task id, not "the review notes", so a
-# future reader can actually check whether it was revisited. Do not "fix" it
-# here by quietly bumping the window: the point of 4416 is that the contract
-# in plans/dashboard-taskgraph-legibility-prd.md and this code must agree
-# either way.
-_LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
-
 
 def _project_label(root: Path) -> str:
     """Display label for a project root path: the directory's basename."""
@@ -599,22 +558,21 @@ def _resolve_deps(
     """Resolve *task*'s ``dependencies`` ids into ``{id, title, done}`` dicts.
 
     *by_id* is the lookup over the rows this render actually fetched.  It used
-    to span the whole tree; since ``_shape_one_project`` bounded the terminal
-    fetch it does not, so a done dependency outside the window would drop out
-    of ``by_id`` and lose its chip entirely.
+    to span the whole tree; the rows are now narrowed to
+    ``shared.task_statuses.ACTIVE`` server-side, so a DONE dependency is never
+    among them and would drop out of ``by_id`` and lose its chip entirely.
 
     Resolution order, most to least informative:
 
     1. a full row in *by_id* — real title, real status;
     2. otherwise, an id present in *status_map* — an honest PARTIAL entry:
        the ``done`` flag is authoritative, the title degrades to ``''``.
-       BRANCH (2) IS THE COMMON CASE ON A LARGE TREE, not a rare fallback: it
-       fires for every dependency below the terminal window's high-id end, so
-       on a project with far more terminal tasks than ``_TERMINAL_FETCH_WINDOW``
-       (dark-factory: ~4000 against 400) MOST of an active task's done
-       dependencies resolve titleless.  ``tab_tasks.jsx`` therefore renders the
-       id ALONE for these — the `` · `` separator is emitted only when a title
-       exists, or the chips would read as ``3502 ·`` with nothing after it;
+       BRANCH (2) IS THE COMMON CASE, not a rare fallback: it fires for EVERY
+       terminal dependency, since none of them is in the narrowed rows, so
+       most of an active task's done dependencies resolve titleless.
+       ``tab_tasks.jsx`` therefore renders the id ALONE for these — the
+       `` · `` separator is emitted only when a title exists, or the chips
+       would read as ``3502 ·`` with nothing after it;
 
     3. otherwise dropped, unchanged.  The id exists nowhere the dashboard can
        see, and fabricating a chip for it would be worse than omitting it.
@@ -649,249 +607,56 @@ def _resolve_deps(
     return deps
 
 
-async def _shape_one_project(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
+def _shape_one_project(
     project_root: Path,
+    snapshot: TaskSnapshot,
     *,
-    max_done_per_project: int = 0,
-    max_cancelled_per_project: int = 0,
-    now: datetime | None = None,
+    now: datetime,
     runtime: TaskRuntimeSnapshot | None = None,
-) -> tuple[list[dict], bool, int | None]:
-    """Build ``(active_tasks, offline, done_count)`` for a single project root.
+) -> list[dict]:
+    """Shape one project's ACTIVE rows out of an already-acquired *snapshot*.
 
-    *offline* is True when the MCP fetch failed for this project; the
-    caller surfaces that in the API payload so the React Tasks tab can
-    show an offline banner.
+    PURE given its arguments: it reads no clock, issues no MCP call and
+    touches no cache. Acquiring the unit is I/O and lives in
+    ``task_snapshot.acquire_snapshot``; turning it into rows is arithmetic and
+    lives here. The split is what lets the shaping be exercised against a
+    canned unit and the reads be exercised against a canned substrate, with
+    neither test having to stand in for the other.
 
-    *done_count* is the project's total number of ``'done'`` tasks, **before**
-    the *max_done_per_project* cap is applied.  It comes from the compact
-    ``fetch_statuses`` map (``{id: status}``), NOT from the fetched rows —
-    the rows are now a bounded window, so counting them would undercount any
-    project with more terminal tasks than the window holds.
+    It reads exactly two things off the unit:
 
-    **Three bounded calls, not one unbounded one.**  This function used to
-    issue a single unnarrowed ``fetch_tasks`` and derive active rows, terminal
-    buckets and *done_count* from that one full tree; on dark-factory that
-    meant transferring ~4000 done rows (~40 MB) per render to show at most 50
-    of them.  It now issues:
+    * ``snapshot.rows.value`` — the project's ACTIVE rows, or ``None`` when
+      that half was never measured. ``None`` yields an EMPTY list, never a
+      fabricated row: the unit's own ``Datum`` is what tells the consumer
+      whether an empty table means "no active work" or "we could not look".
+    * ``snapshot.status_map`` — the raw ``{id: status}`` map, which is
+      ``_resolve_deps``' only bounded fallback for a dependency outside the
+      fetched rows. The rows are narrowed to ``shared.task_statuses.ACTIVE``
+      server-side, so a DONE dependency is never among them and this fallback
+      is the common case rather than a rare one; skipping it would silently
+      drop dependency chips, the exact regression that fallback was added to
+      prevent.
 
-    1. ``fetch_tasks(statuses=sorted(_ACTIVE_STATUSES))`` — active rows,
-       filtered server-side in SQL;
-    2. ``fetch_statuses(...)`` — the compact map, ~95% smaller, supplying both
-       *done_count* and the terminal population that positions (3).  Issued
-       concurrently with (1);
-    3. ``fetch_task_page(statuses=sorted(_TERMINAL_STATUSES), page_size=...,
-       offset=...)``
-       — a bounded window of terminal rows, issued ONLY when a terminal cap is
-       actually requested.  ``collect_active_tasks``'s scheduler path passes
-       both caps as 0 and therefore transfers no terminal row at all.
+    A STALE rows half is shaped exactly like a fresh one. The rows really were
+    measured — just earlier — and the ``Datum`` carrying them says when; the
+    alternative is blanking a project's table on one failed refresh, which is
+    strictly less informative than showing what was last true.
 
-    The only component that still grows with the tree is the ~15 B/task status
-    map, not the ~10 KB/task rows.
-
-    **Scope of that win — read this before quoting the numbers.**  Every claim
-    above is about THIS function and the ``/api/v2/dashboard/tasks`` payload it
-    shapes.  It is NOT a claim about the process's total MCP traffic per poll.
-    Four other callers still issue an UNNARROWED ``fetch_tasks`` on the same
-    poll cycle — ``app._load_task_cards``, ``data/orchestrator.py``,
-    ``data/merge_queue.py`` and ``data/burndown.py`` — and since the
-    ``fetch_tasks`` cache key now includes the narrowing args, the Tasks tab no
-    longer shares their cached full tree.  Net per poll the process therefore
-    still transfers the whole tree once for those callers AND additionally
-    issues this function's narrowed calls.  What this change delivers is that
-    the TASKS TAB no longer pulls the full tree and no longer grows with the
-    terminal tree; removing the remaining whole-tree transfer means narrowing
-    those four callers too, which is separate work and is not done here.
-
-    **Two disclosed display-semantics changes**, both caused by what
-    ``get_tasks`` does and does not offer:
-
-    * The terminal window is selected by DESCENDING TASK ID.  That is the only
-      ordering available — ``SqliteTaskBackend._get_tasks_internal`` is
-      ``ORDER BY id`` and ``page_size``/``offset`` slice that ascending list,
-      and there is no ``ORDER BY updated_at``.  Rows inside the window are
-      still sorted by ``updated_at`` descending for display, so the common
-      case is unchanged (tasks are filed and completed in roughly id order).
-      The divergent case is real: a long-parked low-id task completing late
-      can fall outside the window.  ``_TERMINAL_FETCH_WINDOW`` is therefore 8x
-      the render cap, and truncation logs a WARNING rather than capping
-      silently.
-    * The live-PRD terminal-member exemption below now covers only members
-      INSIDE the window, for the same reason.
-
-    Benign race: *n_terminal* comes from a separate ``get_statuses`` read, so a
-    task completing between the two calls can shift the window by a row.
-
-    If the compact map read fails while the active fetch succeeded, the project
-    is NOT declared offline — the active rows are still good.  Two things
-    degrade together, because both depend on the map and on nothing else:
-    *done_count* is returned as ``None`` (UNKNOWN — not zero, and not
-    offline; the caller omits the project from ``DONE_COUNTS``), and the
-    terminal window is SKIPPED entirely, so no done/cancelled row is emitted
-    for that render.  Skipping is required, not merely tidy: the window's
-    offset is computed from the map's terminal population, so without the map
-    the offset collapses to 0 and — since ``page_size``/``offset`` slice an
-    ASCENDING-id list — would select the OLDEST terminal rows and present them
-    as the tab's most recent.  A WARNING is logged.  Only an offline ACTIVE
-    fetch means offline.
-
-    When *max_done_per_project* > 0, the most-recent N done tasks
-    (sorted by ``updated_at`` descending, then ``id`` descending) are
-    appended to the returned list.  Each done row carries a ``completed``
-    field (the ``updated_at`` ISO string or ``''``).  Active rows are
-    unaffected.
-
-    When *max_cancelled_per_project* > 0, the most-recent N cancelled tasks
-    are similarly appended (same sort key, same ``completed`` field, same
-    ``started: 0`` / ``deps: []`` treatment as done rows).
+    *now* is the caller's single resolved instant: every row's ``started`` and
+    every ``stranded`` verdict share it, so two rows from different projects
+    cannot disagree about what time it is.
 
     *runtime* is this project's ``TaskRuntimeSnapshot`` (resolved ONCE by the
     caller — see ``collect_tasks_with_counts`` — via ``fetch_task_runtime``).
     ``None`` (no escalation URL configured for this project) is treated
     identically to ``runtime.offline``: every row's runtime-sourced fields
-    degrade to an honest ``None`` via :func:`_runtime_fields`, distinct from
-    the task-tree ``offline`` return value above.
+    degrade to an honest ``None`` via :func:`_runtime_fields`, which is a
+    DIFFERENT fault domain from the task-tree read the snapshot reports on.
     """
     project = _project_label(project_root)
-    # Resolve the reference instant ONCE per build pass — never per row — so
-    # every row's ``started`` and ``stranded`` verdict share one instant.
-    effective_now = resolve_now(now)
-
-    # (1) active rows, SQL-filtered server-side, and (2) the compact
-    # {id: status} map — concurrently, since neither depends on the other.
-    #
-    # (2) is UNCONDITIONAL, including on the scheduler path where done_count is
-    # discarded. It looks gateable on `wants_terminal` and is not: the map is
-    # also _resolve_deps' only bounded fallback for a dependency outside the
-    # fetched rows, so skipping it would silently drop dependency chips — the
-    # exact regression that fallback was added to prevent — on every render
-    # that path serves. done_count is the map's cheapest product, not its only
-    # one.
-    #
-    # Its COST is bounded by the enclosing per-project wait_for alone:
-    # fetch_statuses holds no cache of its own since task 5587, and the map is
-    # now walked in STATUSES_SAFE_PAGE_SIZE pages rather than read whole.
-    #
-    # Both carry the Tasks-tab-LOCAL PER_CALL_TIMEOUT rather than
-    # tasks.DEFAULT_PER_CALL_TIMEOUT: this tab is the only caller that reads a
-    # 5 000-task tree, and at the shared 2.0 s default the measurement of
-    # 2026-09-07 marked the three largest roots OFFLINE on a cold render. See
-    # the constant for the numbers and for why the shared default may not move.
-    fetched, status_map = await asyncio.gather(
-        fetch_tasks(
-            client, config, project_root,
-            statuses=sorted(_ACTIVE_STATUSES),
-            timeout=PER_CALL_TIMEOUT,
-        ),
-        fetch_statuses(
-            client, config, project_root, timeout=PER_CALL_TIMEOUT,
-        ),
-    )
-    if isinstance(fetched, dict) and fetched.get('offline'):
-        return [], True, 0
-    tasks = list(fetched) if isinstance(fetched, list) else []
-
-    # The compact map is the authoritative source of done_count (a count, not
-    # rows) and of the terminal population that positions the window below.
-    map_offline = not isinstance(status_map, dict) or bool(status_map.get('offline'))
-    status_map = (
-        {} if map_offline
-        else {k: v for k, v in status_map.items() if isinstance(k, int)}
-    )
-
-    # The window is POSITIONED by n_terminal (see below), which only the
-    # compact map can supply. That count now rides fetch_statuses' 5 s TTL, so
-    # a task completing inside that window can leave the offset one row short
-    # and hold the newest done row out of the list for up to 5 s — bounded,
-    # self-correcting on the next miss, and far inside the 20 s staleness the
-    # terminal rows already carry from fetch_tasks' own cache. It cuts the
-    # other way too: a stable n_terminal means a stable offset, so the
-    # terminal fetch's cache key stops churning on every completion. Without it the offset collapses to 0, and since
-    # page_size/offset slice an ASCENDING-id list, offset 0 selects the OLDEST
-    # terminal rows — which are then sorted by updated_at desc and emitted as
-    # the tab's "most recent" done list. Showing months-old rows as the newest
-    # is a worse failure than showing none, so an unpositionable window is not
-    # fetched at all.
-    wants_terminal = (
-        (max_done_per_project > 0 or max_cancelled_per_project > 0)
-        and not map_offline
-    )
-    if wants_terminal:
-        n_terminal = sum(1 for s in status_map.values() if s in _TERMINAL_STATUSES)
-        window = _TERMINAL_FETCH_WINDOW
-        if n_terminal > window:
-            logger.warning(
-                'project %s: %d terminal (done+cancelled) tasks exceed the '
-                '%d-row fetch window — only the %d highest-id terminal rows '
-                'are fetched, so a low-id task completed long after it was '
-                'filed can be missing from the Tasks tab',
-                project, n_terminal, window, window,
-            )
-        # fetch_task_page, not fetch_tasks: this read wants a PARTIAL answer
-        # (the WARNING above says so), and after task 5018 that contract is in
-        # the function name rather than in an argument combination.
-        # page_size/offset slice a list ordered by ASCENDING id, so reaching
-        # the high-id end requires a computed offset rather than a LIMIT.
-        terminal = await fetch_task_page(
-            client, config, project_root,
-            statuses=sorted(_TERMINAL_STATUSES),
-            page_size=window,
-            offset=max(0, n_terminal - window),
-            timeout=PER_CALL_TIMEOUT,
-        )
-        if isinstance(terminal, list):
-            # DEDUP, not concatenate. The two fetches are separate cached
-            # reads, so a task that completed between them appears in BOTH:
-            # once from the active read, once from the terminal read. Emitting
-            # both yields two rows sharing one _task_uid — the id the React
-            # tab uses as a map key and as its selection identity — so the
-            # task renders twice, as pending AND as done.
-            #
-            # This is not a narrow race. Both reads cache per (root,
-            # narrowing, mode) for the TTL, and the terminal key embeds an offset
-            # that changes on EVERY completion — so a completion mints a fresh
-            # terminal key (cold, sees 'done') while the active key is still
-            # served from an entry up to a full TTL old (still 'pending').
-            # Every completion would duplicate a row for up to the TTL window.
-            # The pre-narrowing single fetch made this structurally impossible;
-            # splitting the read is what introduced it.
-            #
-            # The terminal snapshot WINS: it is the newer of the two reads by
-            # exactly the reasoning above, so its status is the more current.
-            merged = {t.get('id'): t for t in tasks}
-            merged.update({t.get('id'): t for t in terminal})
-            tasks = list(merged.values())
-        else:
-            logger.warning(
-                'project %s: terminal-window fetch failed (%s) — done and '
-                'cancelled rows are omitted from this render',
-                project, terminal.get('error') if isinstance(terminal, dict) else terminal,
-            )
-
-    if map_offline:
-        # Degrade honestly rather than declaring an otherwise-healthy project
-        # offline: the active fetch succeeded, so its rows are still good.
-        # The count, though, loses its ONLY authoritative source. Counting the
-        # fetched rows instead would now be a fabricated zero — the terminal
-        # window was skipped just above, so no done row was fetched at all —
-        # so the count is reported as UNKNOWN (None) and the caller omits the
-        # project from DONE_COUNTS, the same not-zero-and-not-offline channel
-        # the budget-degraded path uses.
-        done_count = None
-        logger.warning(
-            'project %s: compact status map unavailable — done_count is '
-            'UNKNOWN for this render (not zero, and not offline), and the '
-            'terminal window was skipped because it cannot be positioned '
-            'without the map, so no done/cancelled row is emitted',
-            project,
-        )
-    else:
-        done_count = sum(1 for s in status_map.values() if s == 'done')
-
+    tasks = snapshot.rows.value or []
     if not tasks:
-        return [], False, done_count
+        return []
 
     runtime_status = _probe_status(runtime)
     runtime_index: dict[int, TaskRuntimeEntry] = (
@@ -902,96 +667,66 @@ async def _shape_one_project(
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
 
     active: list[dict] = []
-
     for task in tasks:
-        status = task.get('status')
-        if status not in _ACTIVE_STATUSES:
+        task_id = task.get('id')
+        if not isinstance(task_id, int):
             continue
-
-        task_id = task['id']
-        rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
-
+        rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
         uid = _task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid, now=effective_now)
+        row = _build_task_row(project, task, task_id, rt, uid, now=now)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
-        row['deps'] = _resolve_deps(task, by_id, project, status_map=status_map)
+        row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)
         active.append(row)
+    return active
 
-    # PRDs with at least one member still in an active status. Done/cancelled
-    # members of these "live" PRDs are exempt from the terminal-bucket cap —
-    # see Contract: task-row prd field in plans/dashboard-taskgraph-legibility-prd.md.
-    live_prds = {row['prd'] for row in active if row.get('prd')}
 
-    # Bounded terminal buckets: iterate over (status, cap) pairs. Rows within
-    # the top-N cap keep the original done/cancelled shape; done/cancelled
-    # members of a still-live PRD are additionally emitted beyond the cap
-    # (with populated deps) per the live-PRD terminal-member exemption above.
-    for _bkt_status, _bkt_cap in (
-        ('done', max_done_per_project),
-        ('cancelled', max_cancelled_per_project),
-    ):
-        if _bkt_cap <= 0:
-            continue
-        bucket_tasks = [t for t in tasks if t.get('status') == _bkt_status]
-        # Sort by updated_at descending; id descending as tie-breaker.
-        bucket_tasks.sort(
-            key=lambda t: (t.get('updated_at') or '', t.get('id') or 0),
-            reverse=True,
-        )
-        capped_ids = {t['id'] for t in bucket_tasks[:_bkt_cap]}
-        exempted_count = 0
-        for task in bucket_tasks:
-            task_id = task['id']
-            prd = _coalesce_prd(task.get('metadata') or {})
-            is_live_member = prd is not None and prd in live_prds
-            beyond_cap = task_id not in capped_ids
-            if beyond_cap and not is_live_member:
-                continue
-            if beyond_cap:
-                exempted_count += 1
-            uid = _task_uid(project, task_id)
-            rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
-            row = _build_task_row(project, task, task_id, rt, uid, prd=prd, now=effective_now)
-            # terminal rows: no meaningful start time; deps only for live-PRD
-            # members (the terminal-member exemption), else unsurfaced.
-            row['started'] = 0
-            row['deps'] = (
-                _resolve_deps(task, by_id, project, status_map=status_map)
-                if is_live_member else []
-            )
-            row['completed'] = task.get('updated_at') or ''
-            active.append(row)
-        if exempted_count > _LIVE_PRD_EXEMPTION_WARN_THRESHOLD:
-            logger.warning(
-                'project %s: live-PRD exemption emitted %d %s rows beyond the '
-                'cap (max=%d) — a PRD may have an unusually large number of '
-                'live terminal members',
-                project, exempted_count, _bkt_status, _bkt_cap,
-            )
+async def _acquire_and_shape(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: Path,
+    *,
+    now: datetime,
+    runtime: TaskRuntimeSnapshot | None = None,
+) -> tuple[list[dict], TaskSnapshot]:
+    """ONE root's whole share of a render: acquire its unit, shape its rows.
 
-    return active, False, done_count
+    The unit the per-project budget bounds and the semaphore admits, named so
+    the budget has something to point at. Both halves of the share are here
+    because neither is meaningful without the other — rows with no snapshot
+    have no provenance, and a snapshot with no rows renders nothing.
+    """
+    snapshot = await acquire_snapshot(client, config, project_root, now=now)
+    rows = _shape_one_project(project_root, snapshot, now=now, runtime=runtime)
+    return rows, snapshot
 
 
 async def collect_tasks_with_counts(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     *,
-    max_done_per_project: int = 0,
-    max_cancelled_per_project: int = 0,
     resolve_external: bool = False,
     now: datetime | None = None,
-) -> tuple[list[dict], list[str], dict[str, int], list[str], list[str]]:
-    """Aggregate active tasks and per-project done counts in a single MCP pass.
+) -> tuple[list[dict], dict[str, TaskSnapshot]]:
+    """Aggregate every root's active rows and its task snapshot in one pass.
 
-    Returns ``(active_tasks, offline_projects, done_counts,
-    degraded_projects, count_unknown_projects)``
-    where:
+    Returns ``(active_rows, snapshots_by_label)``, with an entry in the second
+    for EVERY configured root — including the ones this render never reached,
+    which carry a ``BUDGET``-kind unit rather than being absent.
 
-    - *active_tasks* is the list of active (and optionally bounded done) rows
-    - *offline_projects* lists project labels whose MCP fetch failed
-    - *done_counts* maps project label → total done task count (pre-cap)
-    - *degraded_projects* lists project labels the budget did not deliver
+    ONE ENTRY PER ROOT, not a row list beside three parallel lists of labels.
+    The previous 5-tuple made "which projects are offline" and "which
+    projects have a count" two separate answers that a caller had to keep in
+    agreement by hand; here both are properties of the same record, and
+    ``task_snapshot.classify`` is the single rule that routes one to a banner.
+    A project therefore cannot be named offline while its census says it was
+    measured, because there is only one thing to read.
+
+    The entries are keyed by project LABEL, which is the directory basename,
+    so two configured roots sharing one collapse to a single entry. That is
+    pre-existing and deliberate: the label is what the wire and the front end
+    address a project by, and the ROW assembly below is still keyed by root,
+    so no root's rows are lost to the collision.
 
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
     (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
@@ -1016,18 +751,20 @@ async def collect_tasks_with_counts(
     into a per-root slot and re-assembled in ROOT order, so completion order
     can never reach the payload.
 
-    Expiry yields a PARTIAL payload with explicit per-project markers, never a
-    truncated-but-confident one: every project that timed out or never got its
-    turn is named in *degraded_projects*, and neither contributes a
-    *done_counts* entry (no count was measured, so none is fabricated — not
-    even a ``0``, which renders as a real "this project has zero done tasks").
+    Expiry yields a PARTIAL payload with explicit per-project provenance,
+    never a truncated-but-confident one: a project that timed out or never got
+    its turn still has an entry, and that entry's census is non-fresh rather
+    than zero — no count was measured, so none is fabricated, and a ``0``
+    would render as a real "this project has zero done tasks".
 
-    *degraded* and *offline* are DISTINCT FACTS and must never be merged by a
-    consumer: *offline* means the fetch demonstrably failed (the project is
-    proven unreachable), *degraded* means the budget expired first and this
-    project's state is simply UNKNOWN.  Collapsing them tells an operator that
-    fused-memory is down when the only thing that happened is that the handler
-    ran out of time — sending them to restart a healthy service.
+    Expiry is a fact about THIS handler, not about the server, which is why
+    the unit carries a structured kind rather than an offline flag:
+    ``SnapshotFailure.UNREACHABLE`` means the read demonstrably failed and
+    ``BUDGET`` means the budget expired first, and ``task_snapshot.classify``
+    is the only place they are turned into banners. Collapsing them tells an
+    operator that fused-memory is down when the only thing that happened is
+    that the handler ran out of time — sending them to restart a healthy
+    service.
 
     When *resolve_external* is ``True``, gathers the deduped union of every
     row's ``external_deps`` ids, issues **one** batched
@@ -1044,34 +781,24 @@ async def collect_tasks_with_counts(
     mean the whole, or the claim is false for the last leg of the handler.
 
     *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
-    this aggregation boundary and threaded into every project's
-    ``_shape_one_project`` call, so every returned row's ``started`` shares
-    the same instant regardless of which project it came from.
+    this aggregation boundary and threaded into every project's share, so
+    every returned row's ``started``, every ``Datum``'s ``as_of`` and every
+    strand verdict share one instant regardless of which project produced it.
 
     Per-task runtime state (loops/attempts/started/agent/lane/phase/
     lane_state) is likewise fetched ONCE here — a single concurrent fan-out
     via :func:`dashboard.data.task_runtime.fetch_task_runtime` over
-    ``config.escalation_urls`` — and each project's snapshot is threaded into
-    its ``_shape_one_project`` call, mirroring the single-``now`` threading.
+    ``config.escalation_urls`` — and each project's runtime snapshot is
+    threaded into its share, mirroring the single-``now`` threading.
 
-    Prefer this over calling ``collect_active_tasks`` and
-    ``collect_done_counts`` concurrently: it still avoids a redundant
-    per-project fan-out (one walk of the roots, one shared *now*, one shared
-    runtime snapshot) rather than two independent ones.
+    Per root the DEFAULT render spends two of the three bounded operations in
+    ``task_snapshot.PER_PROJECT_MCP_CALLS``; the third is reserved for the
+    ``?terminal=`` request, which is the only one that asks for terminal rows.
 
-    It no longer HALVES the round-trips, and DONE_COUNTS is no longer the same
-    snapshot as the rows — both claims stood before the narrowing and neither
-    survives it, so do not rely on either:
-
-    * per project this issues the 2-3 calls enumerated in
-      ``task_snapshot.PER_PROJECT_MCP_CALLS``, not half of what the two
-      collectors cost;
-    * DONE_COUNTS comes from the compact ``fetch_statuses`` map while the rows
-      come from ``fetch_tasks``. Both are cached, at 5 s and 20 s
-      respectively, so the count can be up to ~15 s NEWER than the rows it
-      sits beside. The skew is one-directional by construction (the count is
-      never the staler half) and is the same skew ``fetch_tasks``' own
-      "Data consistency" note documents.
+    The count and the rows are two halves of ONE unit read under one TTL and
+    stamped with one instant, so the skew between them is measured and
+    reported (``snapshot.skew_seconds``) rather than implied by two caches at
+    different TTLs. That skew used to be up to ~15 s and undisclosed.
     """
     effective_now = resolve_now(now)
     # The deadline is taken BEFORE the runtime fan-out, so that fan-out is
@@ -1081,17 +808,7 @@ async def collect_tasks_with_counts(
     deadline = loop.time() + _TASKS_TOTAL_BUDGET
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
     all_active: list[dict] = []
-    offline_projects: list[str] = []
-    done_counts: dict[str, int] = {}
-    degraded_projects: list[str] = []
-    # Roots whose ACTIVE rows loaded fine but whose compact status map did
-    # not, so done_count is UNKNOWN and the terminal window was skipped.
-    # These are NOT offline (their rows are good and current) and NOT
-    # degraded (nothing timed out), so without a list of their own they
-    # would appear in no marker at all — and the front end would render
-    # them as a healthy project with a confident "0 done". That is the
-    # invisible-failure class this task exists to close.
-    count_unknown_projects: list[str] = []
+    snapshots: dict[str, TaskSnapshot] = {}
 
     # ROTATED for admission, canonical for output. The rotation is what stops
     # the same trailing roots being starved on every render; see
@@ -1100,22 +817,37 @@ async def collect_tasks_with_counts(
     roots = _all_project_roots(config)
     admission_order = _rotated_project_roots(config)
     # Admission control, not a work queue: the coroutines are all created up
-    # front and the semaphore decides how many are inside _shape_one_project
+    # front and the semaphore decides how many are inside _acquire_and_shape
     # at once. See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
     slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
 
-    async def _one(root: Path) -> dict[str, Any]:
-        """Shape ONE root, returning a result record — never mutating shared state.
+    def _unreached(
+        root: Path, reason: str, failure: SnapshotFailure,
+    ) -> tuple[list[dict], TaskSnapshot]:
+        """No rows, plus the unit a root this render did not measure still owes."""
+        return [], unmeasured_snapshot(
+            root, now=effective_now, reason=reason, failure=failure,
+        )
 
-        Every branch returns a record instead of appending to the outer lists.
+    async def _one(root: Path) -> tuple[list[dict], TaskSnapshot]:
+        """Serve ONE root, returning its rows and its unit — never mutating shared state.
+
+        Every branch returns a result instead of appending to the outer list.
         Appending from inside a concurrent coroutine would order the payload by
         COMPLETION, and the Tasks tab renders ``all_active`` directly, so the
         table would reshuffle on every 3 s poll. The caller re-assembles these
-        records in ROOT order below.
+        results in ROOT order below.
 
-        The record carries NO label: the caller pairs each one with the root
+        The result carries NO label: the caller pairs each one with the root
         that produced it, which is the only identity that is unique (see the
         re-assembly below).
+
+        Every non-happy branch still returns a UNIT, never a marker flag: a
+        root the budget never reached owes the wire an entry exactly as much
+        as a healthy one, and its kind is what routes it to a banner. The
+        reason is composed HERE, where the branch knows which budget expired
+        and how much of it remained, and is then carried verbatim by both the
+        WARNING and the unit — one sentence, one place, two readers.
         """
         label = _project_label(root)
         async with slots:
@@ -1129,32 +861,37 @@ async def collect_tasks_with_counts(
                 # active work" on the Tasks tab, which is the same class of
                 # invisible failure the fan-out logging policy was raised to
                 # WARNING to close.
-                logger.warning(
-                    'project %s: skipped — the %.1fs Tasks budget was already '
-                    'spent before this project was reached; its rows and done '
-                    'count are UNKNOWN for this render (not zero, and not offline)',
-                    label, _TASKS_TOTAL_BUDGET,
+                reason = (
+                    f'skipped — the {_TASKS_TOTAL_BUDGET:.1f}s Tasks budget was '
+                    'already spent before this project was reached'
                 )
-                return {'degraded': True}
+                logger.warning(
+                    'project %s: %s; its rows and census are UNKNOWN for this '
+                    'render (not zero, and not offline)',
+                    label, reason,
+                )
+                return _unreached(root, reason, SnapshotFailure.BUDGET)
             try:
-                active, offline, done_count = await asyncio.wait_for(
-                    _shape_one_project(
+                active, snapshot = await asyncio.wait_for(
+                    _acquire_and_shape(
                         client, config, root,
-                        max_done_per_project=max_done_per_project,
-                        max_cancelled_per_project=max_cancelled_per_project,
                         now=effective_now,
                         runtime=runtime_by_label.get(label),
                     ),
                     timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
                 )
             except TimeoutError:
-                logger.warning(
-                    'project %s: exceeded its %.1fs share of the %.1fs Tasks '
-                    'budget (%.1fs remained) — its rows and done count are '
-                    'UNKNOWN for this render (not zero, and not offline)',
-                    label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
+                reason = (
+                    f'exceeded its {_TASKS_PER_PROJECT_BUDGET:.1f}s share of the '
+                    f'{_TASKS_TOTAL_BUDGET:.1f}s Tasks budget '
+                    f'({remaining:.1f}s remained)'
                 )
-                return {'degraded': True}
+                logger.warning(
+                    'project %s: %s — its rows and census are UNKNOWN for this '
+                    'render (not zero, and not offline)',
+                    label, reason,
+                )
+                return _unreached(root, reason, SnapshotFailure.BUDGET)
             except Exception:
                 # DEFENSE IN DEPTH, and deliberately broad. The fan-out
                 # normally converts a failed read into the offline marker, so
@@ -1188,8 +925,13 @@ async def collect_tasks_with_counts(
                     'roots still render; this is a BUG, not an outage',
                     label, exc_info=True,
                 )
-                return {'offline': True}
-        return {'active': active, 'offline': offline, 'done_count': done_count}
+                return _unreached(
+                    root,
+                    'unexpected error while shaping this project (see the '
+                    'WARNING and its traceback)',
+                    SnapshotFailure.UNREACHABLE,
+                )
+        return active, snapshot
 
     # return_exceptions=False is correct here BECAUSE the broad `except
     # Exception` above lives INSIDE _one: nothing can escape to the gather, so
@@ -1203,34 +945,17 @@ async def collect_tasks_with_counts(
     # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
     # React tab's map key) and drop the other root's rows entirely. Roots are
     # deduped by `_all_project_roots`, so this pairing is total and 1:1;
-    # `strict=True` says so rather than trusting it.
+    # `strict=True` says so rather than trusting it. (`snapshots` below is
+    # label-keyed because the wire addresses projects by label; the collision
+    # costs an ENTRY there, never a row.)
     by_root = dict(zip(admission_order, results, strict=True))
 
     # CANONICAL ROOT order — neither completion order nor admission order.
     # This is the only place the shared accumulators are written.
     for root in roots:
-        result = by_root[root]
-        label = _project_label(root)
-        if result.get('degraded'):
-            degraded_projects.append(label)
-            continue
-        if result.get('offline'):
-            offline_projects.append(label)
-            continue
-        done_count = result['done_count']
-        if done_count is not None:
-            done_counts[label] = done_count
-        else:
-            # done_count is None => the compact status map read failed for an
-            # otherwise-healthy project. Omitting the label from done_counts
-            # keeps a fabricated 0 off the wire, but omission ALONE is not
-            # enough: the client's fallback counts the done rows it received,
-            # and the terminal window was deliberately skipped for exactly
-            # these projects, so that fallback is always 0 and renders as a
-            # confident "0 done". Naming the root here is what lets the
-            # banner and the header say UNKNOWN instead.
-            count_unknown_projects.append(label)
-        all_active.extend(result['active'])
+        rows, snapshot = by_root[root]
+        snapshots[_project_label(root)] = snapshot
+        all_active.extend(rows)
 
     if resolve_external:
         # Gather the deduped union of external dep ids for ACTIVE (non-done) rows only.
@@ -1289,29 +1014,26 @@ async def collect_tasks_with_counts(
                     else:
                         entry['status'] = status_map.get(entry['id'], 'unknown')
 
-    return (
-        all_active, offline_projects, done_counts,
-        degraded_projects, count_unknown_projects,
-    )
+    return all_active, snapshots
 
 
 async def collect_active_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     *,
-    max_done_per_project: int = 0,
-    max_cancelled_per_project: int = 0,
     now: datetime | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Collect active tasks across all known projects.
 
     Returns ``(active_tasks, offline_projects)`` where *offline_projects* is
-    the list of project labels whose MCP fetch failed.  The handler turns a
-    non-empty *offline_projects* into ``offline: True`` on the dashboard payload.
+    the list of project labels whose read DEMONSTRABLY failed.  The handler
+    turns a non-empty *offline_projects* into ``offline: True`` on the
+    dashboard payload.
 
-    When *max_done_per_project* > 0, the most-recent N done tasks per project
-    are appended to the returned list (each with a ``completed`` field).
-    Default 0 leaves the return shape unchanged — scheduler.py is unaffected.
+    The labels are DERIVED from each root's unit through
+    ``task_snapshot.classify``, not carried alongside it: there is one place
+    that decides what "offline" means, and this narrower contract reads it
+    rather than restating it.
 
     *now* is forwarded to ``collect_tasks_with_counts`` so every row's
     ``started`` derives from a single shared instant; see that function's
@@ -1320,52 +1042,18 @@ async def collect_active_tasks(
     Lock state is surfaced via the scheduler endpoint — see
     /api/v2/dashboard/scheduler.
 
-    Note: callers that also need per-project done counts should use
-    ``collect_tasks_with_counts`` to avoid a second MCP round-trip.
-
-    The whole-handler budget applies here too, but its *degraded_projects*
-    marker is absorbed rather than forwarded: this narrower two-element
-    contract has nowhere to put it, and a degraded project is emphatically NOT
-    offline, so reclassifying it into *offline_projects* would be a lie.  It is
-    still logged at WARNING by ``collect_tasks_with_counts``.  Callers that
-    need to distinguish "unknown" from "reachable and empty" must use
-    ``collect_tasks_with_counts`` directly.
+    The whole-handler budget applies here too, but a DEGRADED root is absorbed
+    rather than forwarded: this narrower two-element contract has nowhere to
+    put it, and a degraded project is emphatically NOT offline, so
+    reclassifying it into *offline_projects* would be a lie.  It is still
+    logged at WARNING by ``collect_tasks_with_counts``.  Callers that need to
+    distinguish "unknown" from "reachable and empty" — or that want the census
+    at all — must use ``collect_tasks_with_counts`` directly and read the
+    units.
     """
-    active, offline, _, _, _ = await collect_tasks_with_counts(
-        client, config,
-        max_done_per_project=max_done_per_project,
-        max_cancelled_per_project=max_cancelled_per_project,
-        now=now,
-    )
+    active, snapshots = await collect_tasks_with_counts(client, config, now=now)
+    offline = [
+        label for label, snapshot in snapshots.items()
+        if classify(snapshot) is SnapshotHealth.OFFLINE
+    ]
     return active, offline
-
-
-async def collect_done_counts(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-) -> dict[str, int]:
-    """Return a ``{project_label: done_count}`` map for all reachable projects.
-
-    Uses the compact ``fetch_statuses`` because only a per-status count is
-    needed here.  NOTE: this is no longer the burndown collector's source —
-    that switched to ``fetch_tasks`` (task 3543) because the compact map
-    carries no claimant columns and so cannot express the live/stranded
-    split.  The two agree on the ``done`` count (both ultimately read the same
-    task store), but they are separate reads at separate instants, so a task
-    completing between them can show a transient off-by-one.
-
-    All projects are fetched concurrently to minimise latency.  Projects whose
-    ``fetch_statuses`` returns an offline marker are silently omitted.
-    """
-    roots = _all_project_roots(config)
-    results = await asyncio.gather(
-        *(fetch_statuses(client, config, r) for r in roots)
-    )
-    counts: dict[str, int] = {}
-    for root, result in zip(roots, results, strict=False):
-        # Skip offline markers (dict with 'offline' key).
-        if isinstance(result, dict) and result.get('offline'):
-            continue
-        label = _project_label(root)
-        counts[label] = sum(1 for s in result.values() if s == 'done')
-    return counts

@@ -416,14 +416,62 @@ def _strand_split(rows: Datum[list[dict]]) -> tuple[int | None, int | None]:
     return len(in_progress) - stranded, stranded
 
 
+def _assemble(
+    rows_half: _HalfRead[list[dict]],
+    map_half: _HalfRead[Mapping[int, str]],
+    *,
+    now: datetime,
+    project_root: str,
+) -> TaskSnapshot:
+    """Turn two half-outcomes into one stamped, contract-checked unit.
+
+    THE one place a ``TaskSnapshot`` is built, so a unit standing in for a
+    root this render never reached is assembled by exactly the code that
+    assembles a measured one — including the last-good fallback, which is
+    what lets a budget expiry still show the previous census, aged, rather
+    than a bare unknown.
+    """
+    rows: Datum[list[dict]] = _datum(
+        rows_half, now=now, project_root=project_root, name='rows',
+    )
+    census: Datum[TaskCensus] = _datum(
+        _census_half(map_half), now=now, project_root=project_root, name='census',
+    )
+    live, stranded = _strand_split(rows)
+    snapshot = TaskSnapshot(
+        census=census,
+        rows=rows,
+        in_progress_live=live,
+        in_progress_stranded=stranded,
+        skew_seconds=_skew_seconds(census, rows),
+        status_map=MappingProxyType(
+            dict(map_half.value) if isinstance(map_half.value, Mapping) else {}
+        ),
+        failure=rows_half.failure,
+    )
+    # Check the contract HERE, where the producer still has the context to
+    # name what it built, rather than letting a break surface as a shaping
+    # crash in the HTTP layer.
+    validate_datum(snapshot.census, now)
+    validate_datum(snapshot.rows, now)
+    return snapshot
+
+
 async def _read_unit(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-    project_root: str,
+    project_root: str | bytes | os.PathLike[str],
     *,
     now: datetime,
 ) -> TaskSnapshot:
-    """Read both halves concurrently and assemble one stamped unit."""
+    """Read both halves concurrently and assemble one stamped unit.
+
+    *project_root* reaches the two reads EXACTLY as the caller spelled it —
+    both accept ``str | bytes | PathLike`` — while the last-good store is
+    keyed by its string form. Normalising before the read would hand a fake
+    substrate a different type from the one production passes it, which is
+    how a call-site regression passes its tests.
+    """
     rows_half, map_half = await asyncio.gather(
         _bounded(
             fetch_tasks(
@@ -443,31 +491,75 @@ async def _read_unit(
             label='status map',
         ),
     )
+    return _assemble(
+        rows_half, map_half, now=now, project_root=str(project_root),
+    )
 
-    rows: Datum[list[dict]] = _datum(
-        rows_half, now=now, project_root=project_root, name='rows',
-    )
-    census: Datum[TaskCensus] = _datum(
-        _census_half(map_half), now=now, project_root=project_root, name='census',
-    )
-    live, stranded = _strand_split(rows)
-    snapshot = TaskSnapshot(
-        census=census,
-        rows=rows,
-        in_progress_live=live,
-        in_progress_stranded=stranded,
-        skew_seconds=_skew_seconds(census, rows),
-        status_map=MappingProxyType(
-            dict(map_half.value) if isinstance(map_half.value, dict) else {}
-        ),
-        failure=rows_half.failure,
-    )
-    # Check the contract HERE, where the producer still has the context to
-    # name what it built, rather than letting a break surface as a shaping
-    # crash in the HTTP layer.
-    validate_datum(snapshot.census, now)
-    validate_datum(snapshot.rows, now)
-    return snapshot
+
+def unmeasured_snapshot(
+    project_root: str | bytes | os.PathLike[str],
+    *,
+    now: datetime,
+    reason: str,
+    failure: SnapshotFailure,
+) -> TaskSnapshot:
+    """A unit for a root this render did not measure at all.
+
+    A caller that bounds the WHOLE per-root share — ``collect_tasks_with_counts``
+    does, on top of the per-operation bound applied here — can run out of
+    budget before, or instead of, either read. Every configured root still owes
+    the wire an entry, and this is it: the failure the caller can name, routed
+    through the same state machine a failed read takes, so a root whose budget
+    expired still shows its last good census aged rather than a bare unknown.
+
+    *failure* is the caller's own structured verdict — ``BUDGET`` for a
+    deadline, ``UNREACHABLE`` for a share that raised — and never inferred
+    from *reason*, which stays free to be prose.
+    """
+    half: _HalfRead[Any] = _HalfRead(None, failure, reason)
+    return _assemble(half, half, now=now, project_root=str(project_root))
+
+
+class SnapshotHealth(enum.StrEnum):
+    """How a consumer must present one root, from its unit alone.
+
+    The four members are the four banners ``/api/v2/dashboard/tasks`` can put
+    a project under, and the codebase insists they stay distinct:
+
+    * ``OK`` — both halves measured.
+    * ``OFFLINE`` — the row read DEMONSTRABLY failed. Go look at the server.
+    * ``DEGRADED`` — a budget expired first, so this root's state is simply
+      UNKNOWN. Nothing was proven unreachable. Merging this into ``OFFLINE``
+      tells an operator to restart a healthy service.
+    * ``COUNT_UNKNOWN`` — the rows are current but the census is not. Without
+      a name of its own such a root renders as healthy with a confident
+      "0 done", which is the invisible failure the envelope exists to remove.
+    """
+
+    OK = 'ok'
+    OFFLINE = 'offline'
+    DEGRADED = 'degraded'
+    COUNT_UNKNOWN = 'count_unknown'
+
+
+def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
+    """Route one unit to its banner, from its kind and its states.
+
+    THE single place the routing is decided, so the handler's project lists,
+    ``collect_active_tasks``' offline labels and every test that asserts a
+    partition all read the same rule. Keyed on the STRUCTURED failure kind and
+    the census's state, never on ``reason`` — that field is by contract the
+    producer's verbatim failure text, so keying on it would be an ad-hoc
+    parser over a meaningful string and one reworded fan-out message would
+    silently move a project between banners.
+    """
+    if snapshot.failure is SnapshotFailure.UNREACHABLE:
+        return SnapshotHealth.OFFLINE
+    if snapshot.failure is SnapshotFailure.BUDGET:
+        return SnapshotHealth.DEGRADED
+    if snapshot.census.state is not DatumState.FRESH:
+        return SnapshotHealth.COUNT_UNKNOWN
+    return SnapshotHealth.OK
 
 
 async def acquire_snapshot(
@@ -485,9 +577,7 @@ async def acquire_snapshot(
     A unit served from cache carries the instant it was MEASURED, which is the
     whole point — its age is then visible rather than implied.
     """
-    key = str(project_root)
-
     async def _refresh() -> TaskSnapshot:
-        return await _read_unit(client, config, key, now=now)
+        return await _read_unit(client, config, project_root, now=now)
 
-    return await _snapshot_cache.get_or_refresh(key, _refresh)
+    return await _snapshot_cache.get_or_refresh(str(project_root), _refresh)
