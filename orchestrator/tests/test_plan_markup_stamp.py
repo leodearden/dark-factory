@@ -51,6 +51,7 @@ set (INV-5), plus the two structural prefixes.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from datetime import UTC, datetime
@@ -789,7 +790,9 @@ class TestSessionSummaryAlsoSeesTheBuffer:
         make merely asking "were calls lost" erase the answer.
         """
         self._buffer()
-        before = plan_markup_stamp.pending_block()
+        # A DEEP COPY, because ``pending_block`` hands back the global itself:
+        # compared against that same object, an in-place mutation would pass.
+        before = copy.deepcopy(plan_markup_stamp.pending_block())
 
         first = plan_markup_stamp.session_summary(None)
         second = plan_markup_stamp.session_summary(None)

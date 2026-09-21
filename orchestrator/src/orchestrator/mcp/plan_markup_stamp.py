@@ -562,6 +562,33 @@ def drain_pending(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def session_summary(plan: object) -> dict[str, Any] | None:
+    """The compact ``{count, by_tool}`` view of what THIS SESSION has refused.
+
+    :func:`summary` answers "what this PLAN records"; this answers "what this
+    session has refused", and the two differ by exactly the pending buffer.
+    This is the function a caller wants whenever it must answer "were calls
+    lost" on a path where NO PLAN MAY EXIST — ``_confirm_plan``'s "No plan
+    exists." branch being the one that matters, since a create_plan bounced by
+    the guard is what puts an architect there in the first place.
+
+    DELEGATED, not re-derived: the fold stays owned by :func:`merge_block` and
+    the empty-or-unusable rule by :func:`summary`, so a block recording nothing
+    still yields ``None`` through exactly one code path (SPOT).
+
+    Reads the buffer through :func:`pending_block` — which takes
+    :data:`_STAMP_LOCK`, so the read is consistent against a concurrent
+    refusal — and does NOT clear it. Clearing belongs to :func:`drain_pending`;
+    a reporting read that consumed the buffer would destroy the record before
+    ``_create_plan`` could adopt it, which is the same silent loss the whole
+    counter exists to end.
+    """
+    stored = plan.get(PLAN_MARKUP_REJECTIONS_KEY) if isinstance(plan, dict) else None
+    return summary(
+        {PLAN_MARKUP_REJECTIONS_KEY: merge_block(stored, pending_block())}
+    )
+
+
 # ---------------------------------------------------------------------------
 # The sink — the third write-side channel on this boundary.
 # ---------------------------------------------------------------------------
