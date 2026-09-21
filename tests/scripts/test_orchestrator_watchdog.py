@@ -10223,3 +10223,169 @@ def test_staleness_pass_still_delegates_exactly_once_when_nothing_changes(
     assert len(delegated) == 1, (
         f"an unchanged pass must still delegate exactly once; got {delegated}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Liveness is suppressed for the ONE unit a live sweep is restarting (4755, F4)
+#
+# A unit mid-restart is indistinguishable from a wedged one to a port probe —
+# precisely BECAUSE the sweep is restarting it. Measured at 15:37:40:
+# "orchestrator-dark-factory.service escalation port 8102 not listening;
+# restarting", producing "Job for orchestrator-dark-factory.service canceled",
+# and the same on orchestrator-reify.service four times, twice escalating to
+# code=killed status=9/KILL.
+#
+# The suppression is scoped to the lease's current_unit and NOTHING else. I5 —
+# liveness stays uncapped, non-clock-gated and non-stamping, because brokenness
+# is not a scheduled deploy — must survive for every other unit. A blanket
+# liveness disable during a sweep is explicitly forbidden.
+#
+# The lease read is LAZY: it happens only after a probe has already come back
+# DOWN, so the healthy path (every port up, overwhelmingly the common case)
+# costs zero extra I/O per 60s tick, and the read is maximally fresh at the
+# decision point.
+# ---------------------------------------------------------------------------
+
+#: The (port, unit) pair main() probes first — the one the measured incident hit.
+_DF_PORT, _DF_UNIT = 8102, "orchestrator-dark-factory.service"
+
+
+def _wire_liveness_probe(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    down_port: int | None,
+) -> list[str]:
+    """Drive main() with *down_port* failing its probe; record restart_unit calls."""
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != down_port)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    return restarted
+
+
+def test_main_skips_the_liveness_restart_of_the_unit_the_sweep_is_restarting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The probe must not cancel the sweep's own restart job for that unit."""
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {"pid": os.getpid(), "started_ts": time.time(), "current_unit": _DF_UNIT},
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    wdog.main()
+
+    assert restarted == [], (
+        f"a unit the in-flight sweep is restarting must not also be restarted "
+        f"by the liveness probe; got {restarted}"
+    )
+    explained = [m for m in logged if _DF_UNIT in m and "lease" in m]
+    assert explained, (
+        f"the suppression must be journalled or it is indistinguishable from "
+        f"the probe silently not running: {logged}"
+    )
+
+
+def test_main_still_restarts_a_different_unit_while_a_sweep_holds_the_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5: the suppression is scoped to current_unit, never fleet-wide.
+
+    A blanket liveness disable for the duration of a sweep would leave a
+    genuinely wedged unit unattended for over an hour.
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": os.getpid(),
+            "started_ts": time.time(),
+            "current_unit": "orchestrator-reify.service",  # a DIFFERENT unit
+        },
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT], (
+        f"liveness must stay intact for every unit the sweep is not touching; "
+        f"got {restarted}"
+    )
+
+
+@pytest.mark.parametrize("why", ["dead-pid", "past-the-bound"])
+def test_main_restarts_the_unit_when_the_lease_is_not_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, why: str
+) -> None:
+    """A dead sweep must not shield a genuinely wedged unit from liveness."""
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    if why == "dead-pid":
+        body = {"pid": _reliably_dead_pid(), "started_ts": time.time()}
+    else:
+        body = {
+            "pid": os.getpid(),
+            "started_ts": time.time() - wdog.FLEET_LEASE_MAX_AGE_SECS - 1,
+        }
+    body["current_unit"] = _DF_UNIT
+    _write_lease(wdog, monkeypatch, tmp_path, body)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT], (
+        f"a {why} lease must not suppress a liveness restart; got {restarted}"
+    )
+
+
+def test_main_liveness_is_byte_identical_when_no_lease_file_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """REGRESSION: with no lease, every unit behaves exactly as before 4755."""
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT], f"no lease means no suppression; got {restarted}"
+
+
+def test_main_does_not_read_the_lease_when_every_probe_is_up(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LAZY: the healthy path must cost zero extra I/O per 60s tick.
+
+    Reading the lease once per unit per tick regardless would add seven file
+    reads a minute, forever, to buy nothing on the path that is almost always
+    taken.
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_probe(wdog, monkeypatch, down_port=None)
+    reads: list[None] = []
+
+    def _counting_read():
+        reads.append(None)
+        return None
+
+    monkeypatch.setattr(wdog, "_live_fleet_lease", _counting_read)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == [], "sanity: no probe failed, so nothing may restart"
+    assert reads == [], (
+        f"the lease must be read only AFTER a probe has come back down; "
+        f"got {len(reads)} read(s) on an all-healthy tick"
+    )
