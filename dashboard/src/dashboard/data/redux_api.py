@@ -53,6 +53,20 @@ def shape_orchestrators(
     has to branch on presence — and this shaper must never collapse one into
     the other; the invariant and its cost are stated at
     ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``.
+
+    ``summary`` is NOT projected. ``discover_orchestrators`` stopped reading a
+    task tree, so there is no count here to shape; ``dict(o.get('summary') or
+    {})`` would put a fabricated all-zero summary on the wire, which reads as
+    a measured "this orchestrator has no tasks". The real counts, each with
+    the instant it was measured, ride ``TASKS_SNAPSHOT`` on
+    ``/api/v2/dashboard/tasks``.
+
+    ``last_update`` KEEPS being projected, and in production is now always
+    ``None`` because nothing measures it — ``timeago`` renders that as unknown
+    rather than as a fabricated instant. It stays in the projection because
+    the PRD contract keeps the key and because a caller may still supply one;
+    ``offline``/``degraded`` likewise become constant ``False``, which is
+    honest for a discovery that no longer attempts a read.
     """
     orchestrators = list(orchestrators)
     out_orchs: list[dict] = []
@@ -71,7 +85,6 @@ def shape_orchestrators(
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
             'last_update': o.get('last_update'),
-            'summary': dict(o.get('summary') or {}),
             'offline': bool(o.get('offline')),
             'degraded': bool(o.get('degraded')),
         }

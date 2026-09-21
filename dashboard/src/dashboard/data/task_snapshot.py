@@ -130,11 +130,11 @@ lands, narrowing the STATUSES does not narrow the WORK.
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
 ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
-``orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET``,
-``merge_queue._TASK_TITLES_BUDGET`` and ``app._TASK_CARDS_BUDGET`` all bind BY
-REFERENCE (task 4788). Raising the shared default to fix the Tasks tab would
-silently widen three unrelated route budgets, none of which fetches a
-5 000-task tree. ``test_tasks_budget.py`` assertion (e) pins both halves.
+``merge_queue._TASK_TITLES_BUDGET`` and ``escalations._TASK_CARDS_BUDGET``
+both bind BY REFERENCE (task 4788). Raising the shared default to fix the
+Tasks tab would silently widen unrelated route budgets, neither of which
+fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion (e) pins both
+halves.
 """
 
 SNAPSHOT_TTL_SECONDS = 15.0

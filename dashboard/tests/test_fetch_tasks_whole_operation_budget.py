@@ -1,4 +1,4 @@
-"""The three unnarrowed ``fetch_tasks`` callers' budget must be deliverable.
+"""The unnarrowed ``fetch_tasks`` callers' budget must be deliverable.
 
 Companion to ``test_tasks_budget.py::test_tasks_budget_is_structurally
 _deliverable`` and ``test_healthz_deadline.py::test_healthz_budget_is
@@ -12,62 +12,51 @@ The bug class this closes is arithmetic, not behavioural: a budget whose
 parts do not fit inside its whole cannot deliver its own degraded payload.
 That is the class ``test_tasks_budget.py`` and ``test_healthz_deadline.py``
 already close for the Tasks tab and /healthz; this file extends it to the
-three ``fetch_tasks`` callers that had no whole-operation bound AT ALL —
-``orchestrator.discover_orchestrators``, ``merge_queue.load_task_titles``
-and ``app._load_task_cards``. Those three wedged three dashboard endpoints
-for 19.8 h behind a hung MCP seam, because ``fetch_tasks``' *timeout* is a
-per-HTTP-request budget and never bounded the operation as a whole.
+``fetch_tasks`` callers that had no whole-operation bound AT ALL. Three of
+them — ``orchestrator.discover_orchestrators``, ``merge_queue.load_task_titles``
+and ``app._load_task_cards`` — wedged three dashboard endpoints for 19.8 h
+behind a hung MCP seam, because ``fetch_tasks``' *timeout* is a per-HTTP-request
+budget and never bounded the operation as a whole.
 
-None of these assertions can be satisfied by loosening a constant in one
-place: widening a call-site constant walks into (b), raising the shared
-default walks into (e), and raising the orchestrators loop budget walks into
-(d). That mutual constraint is the point.
+``discover_orchestrators`` has since left that population entirely: task 5587
+removed its task fetch, so its per-root and whole-loop budgets, and the two
+assertions that checked them, went with it. That is the STRONGEST available
+resolution of its share of the incident — a call that does not exist cannot
+hang — and not a relaxation. The endpoint is still swept by
+``test_dashboard_endpoints_survive_hung_mcp.py``, which asserts it answers
+200 while the seam hangs. The browser-abort ceiling this file used to read out
+of ``data.js`` went with (d); ``test_tasks_budget.py`` assertion (c) still
+enforces it for the one whole-handler deadline that remains.
+
+None of the remaining assertions can be satisfied by loosening a constant in
+one place: widening a call-site constant walks into (b) and raising the shared
+default walks into (e). That mutual constraint is the point.
 """
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 from dashboard.api import escalations
-from dashboard.data import merge_queue, orchestrator, tasks
-
-_DATA_JS = Path(tasks.__file__).parent.parent / 'static' / 'redux' / 'data.js'
-_ABORT_MS_RE = re.compile(r'DEFAULT_TIMEOUT_MS\s*=\s*(\d+)')
-
-
-def _browser_abort_ms():
-    """The browser-side fetch abort, in ms, read from the shipped data.js."""
-    source = _DATA_JS.read_text(encoding='utf-8')
-    match = _ABORT_MS_RE.search(source)
-    # A rename of the JS constant must fail LOUDLY here rather than silently
-    # skipping the ceiling check — a check that quietly stops checking is
-    # indistinguishable from a passing one.
-    assert match is not None, (
-        f'could not find DEFAULT_TIMEOUT_MS in {_DATA_JS} — if the constant '
-        'was renamed, update _ABORT_MS_RE; do not delete this assertion, or '
-        'the handler budget loses its only ceiling'
-    )
-    return int(match.group(1))
+from dashboard.data import merge_queue, tasks
 
 
 def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
     """Every layer of the fetch_tasks whole-operation budget must fit.
 
-    Five independent arithmetic facts, each of which can regress on its own:
+    Three independent arithmetic facts, each of which can regress on its own:
 
     (a) ONE URL's cold MCP session fits inside the shared whole-operation
         bound — with the post count DERIVED from ``COLD_SESSION_POSTS``, so a
         fourth handshake post fails here instead of silently overrunning;
     (b) each call site's own constant only ever TIGHTENS the shared default,
         never widens it;
-    (c) at least one orchestrator root fits inside the whole-loop budget, so
-        ``discover_orchestrators`` can never return an all-degraded payload
-        by arithmetic alone;
-    (d) that whole-loop budget fits inside the browser's fetch abort, so the
-        partial payload the deadline produces is actually deliverable;
     (e) the shared default never creeps toward ``mcp_tool_call``'s own 10 s
         default — this work is only ever allowed to tighten.
+
+    (c) and (d) retired with ``discover_orchestrators``' task fetch (task
+    5587). They bounded a per-root share and a whole-loop deadline that no
+    longer exist; the letters are left un-reused so a reader comparing this
+    against an older revision can see what went rather than mis-reading a
+    renumbered assertion as the old one.
     """
     per_call = tasks.DEFAULT_PER_CALL_TIMEOUT
     posts = tasks.COLD_SESSION_POSTS
@@ -105,8 +94,6 @@ def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
 
     # (b) a call-site constant may only ever tighten the shared default.
     for label, site_budget in (
-        ('orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET',
-         orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET),
         ('merge_queue._TASK_TITLES_BUDGET', merge_queue._TASK_TITLES_BUDGET),
         ('escalations._TASK_CARDS_BUDGET', escalations._TASK_CARDS_BUDGET),
     ):
@@ -116,25 +103,6 @@ def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
             'only ever TIGHTEN the shared default, never widen it, or the '
             'one place the arithmetic is derived stops being authoritative'
         )
-
-    # (c) at least one root always fits inside the whole-loop budget.
-    per_root = orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET
-    total = orchestrator._ORCHESTRATORS_TOTAL_BUDGET
-    assert per_root <= total, (
-        f'per-root budget {per_root}s exceeds the whole-loop orchestrators '
-        f'budget {total}s — the first root alone would exhaust the loop, so '
-        'every payload would be all-degraded by arithmetic'
-    )
-
-    # (d) the degraded payload must survive the browser's abort.
-    abort_ms = _browser_abort_ms()
-    assert total * 1000 < abort_ms, (
-        f'whole-loop orchestrators budget {total}s ({total * 1000}ms) is not '
-        f'strictly below the browser fetch abort of {abort_ms}ms (data.js '
-        'DEFAULT_TIMEOUT_MS) — the degraded payload would be aborted before '
-        'it could be rendered, which is the 15s-behind-a-5s-caller bug that '
-        'test_healthz_deadline.py exists to prevent'
-    )
 
     # (e) standing guard: never raise the shared whole-operation budget.
     assert whole < 10, (

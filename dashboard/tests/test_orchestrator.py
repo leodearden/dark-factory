@@ -671,7 +671,10 @@ class TestDiscoverOrchestratorsIsProcessDiscoveryOnly:
             result = await discover_orchestrators(config)
 
         assert calls == []
-        assert len(result) == 2, 'both processes are still discovered'
+        assert [pid for entry in result for pid in entry['pids']] == [1, 2], (
+            'both processes are still discovered — they share a resolved root '
+            f'here, so they correctly merge into one entry: {result}'
+        )
 
     async def test_entries_carry_no_task_derived_key(self, tmp_path, no_mcp):
         """``tasks``, ``summary`` and ``last_update`` are ABSENT, not empty.

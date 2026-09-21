@@ -1065,10 +1065,11 @@ async def fetch_tasks(
     ``asyncio.wait_for``; every route caller now does, and the two layers are
     complementary rather than redundant.
     ``active_tasks.collect_tasks_with_counts`` was first, with its own
-    per-project budget; ``orchestrator.discover_orchestrators``,
-    ``merge_queue.load_task_titles`` and ``app._load_task_cards`` follow it,
-    each binding a named module constant to
-    :data:`DEFAULT_WHOLE_OPERATION_BUDGET`.
+    per-project budget; ``merge_queue.load_task_titles`` and
+    ``app._load_task_cards`` follow it, each binding a named module constant
+    to :data:`DEFAULT_WHOLE_OPERATION_BUDGET`. ``discover_orchestrators`` used
+    to be a fourth and is no longer a caller at all — task 5587 removed its
+    task fetch, which is the one resolution a budget cannot beat.
 
     EVERY caller is now whole-operation bounded, including the background
     ones (task 4884 / #4424 closed the last gap). ``burndown.collect_snapshot``

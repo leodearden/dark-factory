@@ -147,10 +147,9 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         'OFFLINE on a cold render and shipped 208 of 3045 active rows). It '
         'must NOT buy that by raising this shared constant: '
         'DEFAULT_PER_CALL_TIMEOUT feeds DEFAULT_WHOLE_OPERATION_BUDGET, which '
-        'orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET, '
-        'merge_queue._TASK_TITLES_BUDGET and app._TASK_CARDS_BUDGET all bind '
-        'BY REFERENCE — so a bump here silently widens three route budgets '
-        'this work must not touch (task 4788 territory). Widen '
+        'merge_queue._TASK_TITLES_BUDGET and escalations._TASK_CARDS_BUDGET '
+        'both bind BY REFERENCE — so a bump here silently widens route '
+        'budgets this work must not touch (task 4788 territory). Widen '
         'task_snapshot.PER_CALL_TIMEOUT instead.'
     )
     assert per_call > shared_per_call, (
