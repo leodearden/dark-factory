@@ -40,12 +40,11 @@ const {
   rowTouchesModule,
   MAX_HEATMAP_ROWS,
   MAX_HEATMAP_COLS,
-  MAX_HEATMAP_CELLS,
 } = bounds;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/scheduler_heatmap_bounds.js';
 const EXPECTED_FUNCTION_NAMES = ['boundHeatmapAxes', 'rowTouchesModule'];
-const EXPECTED_CAP_NAMES = ['MAX_HEATMAP_ROWS', 'MAX_HEATMAP_COLS', 'MAX_HEATMAP_CELLS'];
+const EXPECTED_CAP_NAMES = ['MAX_HEATMAP_ROWS', 'MAX_HEATMAP_COLS'];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, ...EXPECTED_CAP_NAMES];
 
 test('default-imported module exposes the axis-selection surface', () => {
@@ -61,14 +60,6 @@ test('the caps are positive integers', () => {
     assert.ok(Number.isInteger(value), `bounds.${name} should be an integer, got ${value}`);
     assert.ok(value > 0, `bounds.${name} should be positive, got ${value}`);
   }
-});
-
-test('MAX_HEATMAP_CELLS is DERIVED from the two axis caps, not stated independently', () => {
-  // SPOT. A hand-written cell cap is a second source for a number the two axis
-  // caps already determine, and the two would drift the moment either axis
-  // moved — leaving the "showing N of M" affordance and the render bound
-  // disagreeing about what the grid is allowed to be.
-  assert.equal(MAX_HEATMAP_CELLS, MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS);
 });
 
 test('module also assigns window.DF_SCHED_HEATMAP_BOUNDS (browser dual-export)', () => {
@@ -189,6 +180,39 @@ test('a fully-stranded module survives at contention 0 when it has a park stack'
     out.modules.map(m => m.path).includes('src/e/stranded.py'),
     'a contention-0 module with a non-empty park_stack must keep its column',
   );
+});
+
+test('a held module keeps its column at contention 1 when its holder is not a row', () => {
+  // `contention` counts rows whose lock_set includes the path, so the holder
+  // is counted only if the holding task is itself among the composed rows.
+  // When it is not — a stale `current_holders` entry whose task has left
+  // active_tasks — one genuinely-blocked waiter scores contention 1, and a
+  // bare `contention > 1` filter would drop the column along with that
+  // waiter's red 'held-by-other' cell. cellStateFor still classifies that
+  // state, so the column has something to show.
+  const held = makeModule('src/g/held.py', 1, {
+    holder: 'T-gone',
+    holder_project: 'dark_factory',
+  });
+  const out = boundHeatmapAxes({ rows: [], modules: [...COLUMN_FIXTURE, held] });
+
+  assert.ok(
+    out.modules.map(m => m.path).includes('src/g/held.py'),
+    'a held module with a live waiter must keep its column',
+  );
+});
+
+test('a held module with NO live waiter earns nothing — one cell is not contention', () => {
+  // The other side of the holder clause, so it cannot quietly widen into
+  // "every held module": a module held by a running task that nobody is
+  // waiting on renders one coloured cell and 59 blanks, which is the noise
+  // the column filter exists to remove.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [makeModule('src/h/quiet.py', 0, { holder: 'T-1' })],
+  });
+
+  assert.deepEqual(out.modules, []);
 });
 
 test('column selection preserves the input order, inheriting the server sort', () => {
@@ -335,6 +359,24 @@ test('row selection keeps a parked row even when it touches no surviving module'
   assert.deepEqual(out.rows.map(r => r.task_id), ['T-7']);
 });
 
+test('row selection puts parked rows FIRST and keeps the rest in server order', () => {
+  // The row axis's only ordering guarantee, stated executably — the column
+  // axis has had one since `column selection preserves the input order`, and
+  // the "showing N of M" caption in scheduler_heatmap.jsx is written against
+  // this. Note what is NOT claimed: nothing orders rows by contention, which
+  // is why the caption's most-contended superlative sits on the COLUMN axis
+  // alone. Parked first is what makes the carve-out survive the cap (below).
+  const rows = [
+    makeRow('T-1', ['src/a/hot.py']),
+    makeRow('T-2', ['src/b/warm.py']),
+    makeRow('T-parked', ['src/c/solo.py'], { park_state: { modules: ['src/c/solo.py'] } }),
+    makeRow('T-3', ['src/a/hot.py']),
+  ];
+  const out = boundHeatmapAxes({ rows, modules: COLUMN_FIXTURE });
+
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-parked', 'T-1', 'T-2', 'T-3']);
+});
+
 test('row selection drops a row that reaches a surviving module only across projects', () => {
   // The path collides but the lock does not. Same rule as the rowTouchesModule
   // case above, asserted through boundHeatmapAxes so the axis filter is pinned
@@ -403,7 +445,7 @@ function makeFixture({ nRows, nModules, dense }) {
 let realisticFixture = null;
 let pathologicalFixture = null;
 
-test('BOUND: a realistic production-scale snapshot renders at most MAX_HEATMAP_CELLS', () => {
+test('BOUND: a realistic production-scale snapshot renders at most ROWS x COLS cells', () => {
   realisticFixture = realisticFixture
     || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
   const out = boundHeatmapAxes(realisticFixture);
@@ -416,9 +458,12 @@ test('BOUND: a realistic production-scale snapshot renders at most MAX_HEATMAP_C
     out.modules.length <= MAX_HEATMAP_COLS,
     `rendered ${out.modules.length} columns, cap is ${MAX_HEATMAP_COLS}`,
   );
+  // The cell bound is spelled as the product of the two axis caps, not read
+  // from a third exported constant — the module publishes only the two, so
+  // there is no second source here to drift away from what it enforces.
   assert.ok(
-    out.rows.length * out.modules.length <= MAX_HEATMAP_CELLS,
-    `rendered ${out.rows.length * out.modules.length} cells, cap is ${MAX_HEATMAP_CELLS}`,
+    out.rows.length * out.modules.length <= MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS,
+    `rendered ${out.rows.length * out.modules.length} cells, cap is ${MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS}`,
   );
 
   assert.equal(out.rowsTotal, LIVE_ROWS);
@@ -448,10 +493,11 @@ test('BOUND: a PATHOLOGICAL snapshot where neither filter removes anything is st
     `rendered ${out.modules.length} columns, cap is ${MAX_HEATMAP_COLS}`,
   );
   assert.ok(
-    out.rows.length * out.modules.length <= MAX_HEATMAP_CELLS,
-    `rendered ${out.rows.length * out.modules.length} cells, cap is ${MAX_HEATMAP_CELLS} — ` +
-      'neither axis filter removed anything here, so the hard cap is the only ' +
-      'thing standing between the browser and a 12.9M-cell DOM',
+    out.rows.length * out.modules.length <= MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS,
+    `rendered ${out.rows.length * out.modules.length} cells, cap is ` +
+      `${MAX_HEATMAP_ROWS * MAX_HEATMAP_COLS} — neither axis filter removed ` +
+      'anything here, so the hard cap is the only thing standing between the ' +
+      'browser and a 12.9M-cell DOM',
   );
 
   assert.equal(out.rowsTotal, LIVE_ROWS);
@@ -477,4 +523,30 @@ test('BOUND: rows are selected against the columns that will ACTUALLY render', (
 
   assert.equal(out.modules.length, MAX_HEATMAP_COLS);
   assert.deepEqual(out.rows.map(r => r.task_id), ['T-keep']);
+});
+
+test('BOUND: a parked row survives the cap even when ordinary rows would fill it', () => {
+  // The parked carve-out is only real if it beats the SLICE, not merely the
+  // filter — and the single-row fixture above cannot see the difference.
+  // `shape_scheduler` appends the synthetic stranded-park rows after every
+  // project's ordinary rows, so at production scale the parked rows are
+  // exactly the ones a positional prefix always cuts: the one shape where the
+  // carve-out is load-bearing is the one shape it used to fail.
+  const ordinary = Array.from({ length: MAX_HEATMAP_ROWS + 5 }, (_, i) =>
+    makeRow(`T-ord-${i}`, ['src/a/hot.py']),
+  );
+  const parked = makeRow('T-stranded', ['src/c/solo.py'], {
+    park_state: { modules: ['src/c/solo.py'] },
+  });
+  const out = boundHeatmapAxes({
+    rows: [...ordinary, parked],
+    modules: COLUMN_FIXTURE,
+  });
+
+  assert.equal(out.rows.length, MAX_HEATMAP_ROWS, 'the cap still binds');
+  assert.ok(
+    out.rows.map(r => r.task_id).includes('T-stranded'),
+    'the parked row must survive the cap — it is what the stranded-parks ' +
+      'banner points at, and it arrives last in server order',
+  );
 });
