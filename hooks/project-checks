@@ -1,8 +1,64 @@
 #!/usr/bin/env bash
 # dark-factory project-specific checks (called from pre-commit).
-# Receives repo root as $1.
+# Receives repo root as $1 and the current branch as $2.
+#
+# TWO TIERS, and the split is deliberate:
+#
+#   UNIVERSAL (every branch) -- the merge-lane ratchet audit below. It is
+#     scoped to what this commit STAGES, so an ordinary commit costs one
+#     `git diff --cached` and spawns nothing.
+#   MAIN ONLY -- ruff, the three staged-file style checks, and pyright.
+#     These sweep whole packages and cost seconds, which is the wrong price
+#     to pay on every commit of every task branch.
+#
+# WHY THE RATCHET AUDIT IS UNIVERSAL. A ratchet raise is INTRODUCED by a
+# commit on a task branch and reaches main by MERGE -- exactly like the
+# .task/ contamination the neighbouring universal guard in hooks/pre-commit
+# exists to stop. Merge commits run pre-merge-commit rather than pre-commit,
+# and the merge worker advances main with `git update-ref`, which runs no
+# hooks at all, so a main-only audit would never see the two raises that
+# actually landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a
+# raise where it is introduced is the only placement that bites.
+#
+# $2 defaults to a `rev-parse` so a direct invocation of this script still
+# works, and a project-checks that ignored $2 entirely would still be valid
+# for any other repo that copied hooks/.
 
 ROOT="${1:?}"
+BRANCH="${2:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
+
+# ── merge-lane ratchet audit (ALL BRANCHES, staged-scoped) ───────────
+#
+# scripts/merge_lane_metrics.py's write gate refuses to absorb a raise into
+# a baseline it can READ first; what it cannot see is that baseline deleted
+# before the write, or rendered elsewhere and copied over. The auditor below
+# asks the other question -- does this COMMIT raise anything -- by comparing
+# the staged baseline against HEAD's blob, so every route to a widened
+# baseline lands in front of one comparison.
+#
+# Plain python3, matching the three staged-file checks below: no uv
+# env-resolution overhead. The auditor fails LOUDLY if it cannot import the
+# instrument; it never skips itself.
+staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
+    orchestrator/tests/merge_lane_ratchet_baseline.json \
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json || true)"
+if [ -n "$staged_ratchet" ]; then
+    echo "pre-commit: merge-lane ratchet audit (staged)..."
+    if ! (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py); then
+        echo "pre-commit: merge-lane ratchet audit failed."
+        echo "  A measure ROSE in the staged baseline and this commit does not record it."
+        echo "  Authorize it with --authorize-raise, or lower the measure. See above."
+        exit 1
+    fi
+fi
+
+# ── main-only checks from here down ──────────────────────────────────
+
+if [ "$BRANCH" != "main" ]; then
+    echo "pre-commit: all checks passed."
+    exit 0
+fi
+
 echo "pre-commit: linting (main branch)..."
 
 # All first-party packages (for ruff)
