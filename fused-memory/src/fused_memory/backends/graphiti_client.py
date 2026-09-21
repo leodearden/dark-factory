@@ -3529,6 +3529,27 @@ class GraphitiBackend:
         — only the name predicate differs, from exact equality to CONTAINS, and
         the node's name joins the returned columns.
 
+        "Same survivor-first ordering" is TRUE BY CONSTRUCTION, not by
+        resemblance: both methods build their ranking from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` and ``_PROVENANCE_RANK_ORDER``, so the two
+        cannot drift apart. It was not always so — this method was first
+        written with a COPY of the sibling's clause, and that copy is how a
+        MENTIONS-blind survivor rank survived into a second, newer merge path
+        (task 4986). Sharing the objects is what makes the claim enforceable
+        rather than aspirational.
+
+        ``provenance_rank`` (``edge_count`` + ``mentions_count``) is what orders
+        the rows, because rows[0] SURVIVES a collapse and rows[1:] are deleted
+        — so ranking on valid edges alone destroyed the episode provenance of
+        any node that was episode-rich but edge-poor. ``edge_count`` keeps its
+        RELATES_TO-only meaning; see the sibling's docstring for the two
+        consumers that require the split.
+
+        The write-path consequence is the point: ``MemoryService.
+        _normalize_task_node_names`` reads only ``uuid`` and ``name`` and relies
+        entirely on this row ORDER to pick ``members[0]`` as the survivor, so it
+        now keeps the episode-richer node with no service-layer change at all.
+
         A deliberately TASK-AGNOSTIC candidate-NARROWING primitive. It knows
         nothing about task labels or any other vocabulary: it hands back a
         superset and the CALLER applies its own precise membership test. The
@@ -3569,10 +3590,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, name, created_at, edge_count —
-            ordered canonical (survivor) first, exactly as
-            find_duplicate_entity_nodes orders its matches. Empty list when
-            nothing matches.
+            List of dicts with keys: uuid, name, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first,
+            exactly as find_duplicate_entity_nodes orders its matches, from the
+            shared constants above. Empty list when nothing matches.
 
         Raises:
             RuntimeError: if the backend is not initialized.
@@ -3581,10 +3603,10 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity) '
             'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
-            'WITH n, count(DISTINCT e) AS edge_count '
-            'RETURN n.uuid, n.name, n.created_at, edge_count '
-            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
         )
         start = time.monotonic()
         result = await graph.ro_query(
@@ -3597,6 +3619,8 @@ class GraphitiBackend:
                 'name': row[1],
                 'created_at': row[2],
                 'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
             }
             for row in (result.result_set or [])
         ]
