@@ -81,12 +81,22 @@ def hung_mcp(monkeypatch, tmp_path):
     """
     from dashboard.api.escalations import _task_cards_cache_clear
     from dashboard.app import _analytics_cache_clear
-    from dashboard.data import active_tasks, merge_queue, orchestrator, tasks
+    from dashboard.data import (
+        active_tasks,
+        merge_queue,
+        orchestrator,
+        task_snapshot,
+        tasks,
+    )
 
     reached: list[tuple[str, str]] = []
 
     def _make_stub(module_name: str):
-        async def _hang(client, config, project_root):
+        # **kwargs absorbs each binding's own narrowing arguments — the
+        # snapshot unit threads statuses/timeout/cached, the others do not —
+        # so one stub can stand in for every call shape without being laxer
+        # about the thing under test, which is that the call HANGS.
+        async def _hang(client, config, project_root, **_kwargs):
             reached.append((module_name, str(project_root)))
             await asyncio.Event().wait()  # nothing ever sets it
 
@@ -102,7 +112,9 @@ def hung_mcp(monkeypatch, tmp_path):
         'dashboard.api.escalations',
         'dashboard.data.orchestrator',
         'dashboard.data.merge_queue',
-        'dashboard.data.active_tasks',
+        # The Tasks tab's binding travelled to the snapshot unit with the read
+        # itself (task 5587); active_tasks holds no fetch name at all now.
+        'dashboard.data.task_snapshot',
     ):
         monkeypatch.setattr(
             f'{module_name}.fetch_tasks', _make_stub(module_name),
@@ -123,12 +135,13 @@ def hung_mcp(monkeypatch, tmp_path):
     # the same reason and is NOT optional: it was widened to 4.4 s for real
     # 5 000-task trees (task 4884), and against a stub that never returns the
     # sweep would otherwise pay it per call per root.
-    monkeypatch.setattr(active_tasks, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
+    monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_PER_PROJECT_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 
     # A warm entry would be served without ever reaching the hang.
     tasks._fetch_tasks_cache_clear()
+    task_snapshot._snapshot_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
@@ -160,6 +173,7 @@ def hung_mcp(monkeypatch, tmp_path):
 
     # Leave no hang-stubbed entry behind for the next test in the session.
     tasks._fetch_tasks_cache_clear()
+    task_snapshot._snapshot_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
