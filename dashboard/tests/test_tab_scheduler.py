@@ -581,16 +581,30 @@ def test_scheduler_tab_memoises_the_props_it_feeds_the_heatmap(tab_scheduler_jsx
 def test_memoising_the_module_filter_preserved_its_predicate(tab_scheduler_jsx_body):
     """Wrapping the modules filter in a memo must not paraphrase it.
 
-    Deliberately redundant with
-    test_scheduler_module_filter_is_consistent_with_rows above: that test pins
-    the predicate generally, this one pins it AT THE POINT OF CHANGE, where a
-    "while I'm in here" rewrite is most likely. The expressions move inside the
-    memo callback unchanged, or the chip filter silently widens.
+    Narrower than test_scheduler_module_filter_is_consistent_with_rows above
+    rather than a second copy of it: that test pins the predicate ANYWHERE in
+    the file, this one pins it INSIDE the visibleModules memo callback, which
+    is where memoisation could have paraphrased it and where a "while I'm in
+    here" rewrite is most likely. A filter left outside the memo, or a
+    predicate rewritten on the way in, fails here and passes there.
+
+    Comment-stripped and scoped to the SchedulerTab body first, per this
+    file's convention — the surrounding prose in tab_scheduler.jsx explains
+    the predicate at length, and a probe that reads prose can answer an
+    absence assertion off a comment describing the OLD expression.
     """
+    body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
+
     assert not re.search(
         r'm\.holder_project\s*&&\s*[^;]+includes\s*\(\s*m\.holder_project\s*\)',
-        tab_scheduler_jsx_body,
+        body,
     ), 'the holder_project widening keep-branch must stay absent after memoisation'
     assert re.search(
-        r'effectiveSelected\.includes\s*\(\s*m\.project\s*\)', tab_scheduler_jsx_body
-    ), 'the strict per-project predicate must survive the memo wrap verbatim'
+        r'const\s+visibleModules\s*=\s*stUseMemo\s*\('
+        r'[^;]*?effectiveSelected\.includes\s*\(\s*m\.project\s*\)',
+        body,
+        re.S,
+    ), (
+        'the strict per-project predicate must survive the memo wrap verbatim, '
+        'inside the visibleModules stUseMemo callback'
+    )
