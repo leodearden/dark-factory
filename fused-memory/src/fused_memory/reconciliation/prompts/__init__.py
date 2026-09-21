@@ -154,6 +154,96 @@ On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and car
 """
 
 # ---------------------------------------------------------------------------
+# Stage-2-only entity-standing-decision writer listing (task 4395)
+# ---------------------------------------------------------------------------
+# STAGE 2 ONLY. `write_entity_standing_decision` sits in
+# DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py), which STAGE1_DISALLOWED
+# and STAGE3_DISALLOWED both fold — it is the first recon-report tool with a durable
+# SQLite-ledger write. So this constant must be interpolated into stage2.py and
+# NOWHERE else: naming the tool in Stage 1 or Stage 3 licenses a ledger write from a
+# stage that is read-only with respect to the ledger, and is failed by
+# test_recon_report_guidance_drift.py's absence guard as well as
+# test_recon_report_stage_gated_tool_advertisement.py.
+#
+# A SEPARATE CONSTANT rather than an extension of either existing renderer:
+#   - render_entity_standing_decision_schema_section() is pinned BYTE-IDENTICALLY into
+#     BOTH the Stage 1 and Stage 2 prompts by test_standing_decision_prompt_drift.py,
+#     so anything added there leaks the tool name into Stage 1.
+#   - render_investigation_outcome_section() is Stage-2-only and could carry it, but
+#     that function renders the investigation_outcome RECORD schema; folding the
+#     writer tool into it would make its name lie. A sibling block placed immediately
+#     after it buys the same narrative adjacency — record schema, then the arm-2
+#     evidence pool, then the writer those records unlock — at no cost to either
+#     entity's purpose.
+# It is also a separate constant from CITATION_REPAIR_TOOL_BLOCK above because the
+# two have different HOLDING SETS (Stage 1 + Stage 2 vs. Stage 2 alone); one merged
+# block would force this text into Stage 1.
+#
+# The server-level listing is not an alternative channel: the claude CLI truncates
+# FastMCP server `instructions` at 2048 characters and RECON_REPORT_INSTRUCTIONS
+# (server/recon_report.py) is ~7560, so this tool's numbered entry — the one carrying
+# its "Stage-2 ONLY" gating and both evidence arms — falls past the cut and reaches no
+# agent. Only the roster line naming it survives. That is why the text below states
+# the contract in full instead of pointing at the listing.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Unlike the two shared blocks above, this one DOES reference
+# sections by heading name; that is safe only because it is single-stage, so both
+# headings are reachable, and it is pinned by
+# test_recon_report_stage_gated_tool_advertisement.py rather than left to trust.
+# Deliberately restates NO number that lives in code: the grounds enum is
+# single-sourced by render_entity_standing_decision_schema_section() and the arm-2
+# threshold by the rejection payload's own hint. Not an f-string: it is interpolated
+# INTO an f-string, and braces inside an interpolated value are not re-parsed by the
+# enclosing f-string, so its own text needs no {{/}} escaping.
+ENTITY_STANDING_DECISION_WRITE_BLOCK = """\
+## Writing an Entity Standing Decision
+`mcp__recon-report__write_entity_standing_decision(project_id=..., entity_uuid=..., \
+grounds=..., evidence=[...])` is the tool that WRITES the `entity_standing_decision` \
+ledger record described under `## Entity Standing Decisions` above, and the records \
+you write under `## Investigation Outcome Records` are what unlock it. Stage 2 is the \
+ONLY stage that holds it — Stage 1 and Stage 3 are denied it (it is the one \
+recon-report tool with a durable ledger write, and they are read-only with respect to \
+that ledger). Nothing in your tool listing distinguishes a tool you lack from one \
+nobody told you about, so treat this paragraph as the grant.
+
+It takes NO `run_id`: the decision is about an ENTITY, not about an entry in this \
+run's report. It also takes no `authorized_by` — that operator bypass lives on the \
+underlying helper and deliberately not on this tool, so your write is ALWAYS \
+evidence-gated.
+
+**The gate has two arms, and EITHER one authorizes the write.**
+- **Arm 1 — cited human-authored evidence.** At least one ref in `evidence` must be a \
+mem0 ref that resolves locally IN THIS PROJECT and whose record was authored by a \
+HUMAN (checked against the record's own `agent_id`, not against anything you assert). \
+An agent-authored record, or one that does not resolve, does not count however many \
+you cite.
+- **Arm 2 — independent investigation outcomes.** Satisfied by the record pool \
+described under `## Investigation Outcome Records` above: enough `investigation_outcome` \
+records for this same `entity_uuid`, marked `actionable=false`, carrying DISTINCT \
+`run_id`s. A record with no `run_id` cannot establish independence and is not counted. \
+Distinct runs are the point — repeating the same conclusion inside one run buys nothing.
+
+**`evidence` is OPTIONAL.** Supply it for arm 1. OMIT it when you are relying on arm 2, \
+which is satisfied by mem0 record history alone and needs nothing cited: do NOT \
+fabricate an evidence list to reach that path. Refs to other stores (escalation ids, \
+task ids) are recorded as provenance but never count toward EITHER arm.
+
+`grounds` must be a value from the closed enum named under `## Entity Standing \
+Decisions` above — that section is where the enum is stated; do not invent a value.
+
+**Responses.** On success: `{status: 'written', entity_uuid, grounds, \
+edge_count_at_decision, expires_at, decided_at}`. Three structured errors, each keyed \
+by `error`: `insufficient_evidence` when NEITHER arm holds — it carries `unmet_arms` \
+(each unmet arm with what it needs, and for arm 2 the distinct-run count observed so \
+far) plus a `hint`, so read it and act on it rather than retrying the same call; \
+`invalid_grounds` when `grounds` is outside the enum; and `service_not_configured` \
+when the ledger is not wired, which is an operator problem and not something more \
+evidence will fix.\
+"""
+
+# ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
 # States the precedence order for annotating superseded, wrong, or corrupted

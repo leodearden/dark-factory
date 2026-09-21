@@ -18,6 +18,7 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    ENTITY_STANDING_DECISION_WRITE_BLOCK,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
@@ -606,6 +607,8 @@ not apply and you should treat the finding as a normal finding and act on it.
 {render_entity_standing_decision_schema_section()}
 
 {render_investigation_outcome_section()}
+
+{ENTITY_STANDING_DECISION_WRITE_BLOCK}
 
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
