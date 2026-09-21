@@ -533,21 +533,57 @@ def find_dedupe_parent(
     return min(matches, key=lambda pair: pair[0])[1]
 
 
-def submit_or_dedupe(
+def resolve_dedupe_parent(
     queue: EscalationQueue,
     esc: Escalation,
     config: DedupeConfig,
     now: datetime | None = None,
-) -> dict[str, Any]:
-    """Submit *esc* to *queue* or fold it into an existing pending parent.
+) -> str | None:
+    """Return the id of the pending parent *esc* should fold into, or None.
 
-    This is the central gated orchestration wrapper that centralises:
+    The READ half of ``submit_or_dedupe``:
+
     - Gate 1: ``config.infra_dedupe_enabled``
     - Gate 2: ``esc.category in config.infra_dedupe_categories``
     - Parent lookup via ``find_dedupe_parent``
-    - TOCTOU guard: ``attach_dedupe_child`` returns ``None`` when the parent
-      was resolved between the find scan and the attach call; in that case
-      fall through to ``queue.submit()`` so the escalation is never dropped.
+
+    Both gates short-circuit in PURE MEMORY before any disk I/O, so a filing
+    the config does not fold costs no scan at all.  The stock ``DedupeConfig``
+    folds only ``'infra_issue'``, so on the agent filing path that is the one
+    category whose filings reach ``find_dedupe_parent``.
+
+    Writes nothing and mutates nothing.  That is a deliberate property rather
+    than an incidental one, and it is why this half carries its own name: a
+    scheduling decision can then be taken about the scan alone, without
+    reaching the write.
+
+    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
+    """
+    if not (
+        config.infra_dedupe_enabled
+        and esc.category in config.infra_dedupe_categories
+    ):
+        return None
+    return find_dedupe_parent(queue, esc, config, now=now)
+
+
+def attach_or_submit(
+    queue: EscalationQueue,
+    esc: Escalation,
+    parent_id: str | None,
+) -> dict[str, Any]:
+    """Fold *esc* into *parent_id*, or submit it as a record of its own.
+
+    The WRITE half of ``submit_or_dedupe``.  It is HANDED the parent id rather
+    than finding one, which is what makes the find schedulable independently
+    of the write.
+
+    TOCTOU guard: ``attach_dedupe_child`` returns ``None`` when the parent was
+    resolved/archived between the find and this call; in that case fall
+    through to ``queue.submit()`` so the escalation is never dropped.  A
+    ``parent_id`` that has gone stale since it was resolved is therefore
+    SAFE input, not a caller error — which is precisely what lets the find run
+    on another thread, or in another process.
 
     Response shapes (identical to server._submit_or_dedupe).  ``level`` is on
     EVERY branch, so the documented "echo confirms the level landed" contract
@@ -565,9 +601,9 @@ def submit_or_dedupe(
       ``escalation/src/escalation/queue.py::observed_submit_response`` (task
       5368).  The part local to THIS gate: the filer's re-file is bounded by
       ``escalate_blocker``'s docstring and the role prompt, NOT here — a repeat
-      folds only when its category is in ``config.infra_dedupe_categories`` and
-      it lands inside the window, so on any other category each repeat mints a
-      fresh record.
+      folds only when ``resolve_dedupe_parent`` hands this function a parent,
+      so on any category the config does not fold each repeat mints a fresh
+      record.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id,
                         'level': esc.level}``
@@ -576,33 +612,43 @@ def submit_or_dedupe(
       additive.  It is the CHILD's level, which since task 3236 equals the
       parent's: ``find_dedupe_parent`` requires ``parent.level ==
       candidate.level``, so no extra read is needed to report it.)
-
-    Recon (A7b) calls this directly with ``DedupeConfig.for_recon()`` instead
-    of ``queue.submit()``, routing through the same gate + TOCTOU logic used
-    by the infra path.
-
-    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
     """
-    # Gate 1 (enabled) and Gate 2 (category membership) both short-circuit
-    # in pure memory before any disk I/O via find_dedupe_parent.
     # NOTE: the post-write response is shaped by observed_submit_response, not
     # by a hardcoded 'queued' — see that function's docstring.
-    if config.infra_dedupe_enabled and esc.category in config.infra_dedupe_categories:
-        parent_id = find_dedupe_parent(queue, esc, config, now=now)
-        # TOCTOU guard: attach_dedupe_child returns None when the parent was
-        # resolved/archived between the find scan and this call.  Fall through
-        # to submit() so the escalation is not silently dropped.
-        if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
-            return {
-                'id': parent_id,
-                'status': 'dedup_skipped',
-                'parent_id': parent_id,
-                'child_id': esc.id,
-                # Level-scoped folding (task 3236) means the parent's level is
-                # the child's, so echoing esc.level costs no extra read and
-                # keeps the 'level' key present on every response branch.
-                'level': esc.level,
-            }
+    if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
+        return {
+            'id': parent_id,
+            'status': 'dedup_skipped',
+            'parent_id': parent_id,
+            'child_id': esc.id,
+            # Level-scoped folding (task 3236) means the parent's level is
+            # the child's, so echoing esc.level costs no extra read and
+            # keeps the 'level' key present on every response branch.
+            'level': esc.level,
+        }
     esc_id = queue.submit(esc)
     return observed_submit_response(queue, esc_id, fallback_level=esc.level)
 
+
+def submit_or_dedupe(
+    queue: EscalationQueue,
+    esc: Escalation,
+    config: DedupeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Submit *esc* to *queue* or fold it into an existing pending parent.
+
+    The central gated orchestration wrapper, and exactly the composition of
+    its two halves: ``resolve_dedupe_parent`` (the gates and the scan — a pure
+    READ) then ``attach_or_submit`` (the TOCTOU guard and the write).  Each
+    half carries its own contract; this function adds no policy of its own, so
+    for the gate ordering read the first and for the four response shapes read
+    the second rather than a copy here.
+
+    Recon (A7b) calls THIS function directly with ``DedupeConfig.for_recon()``
+    instead of ``queue.submit()``, routing through the same gate + TOCTOU logic
+    used by the infra path.
+
+    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
+    """
+    return attach_or_submit(queue, esc, resolve_dedupe_parent(queue, esc, config, now=now))
