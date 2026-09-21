@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from df_pytest_isolation import wait_pid_gone
 
 from orchestrator.service_restart import (
+    DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
     StaleServiceRestartCoordinator,
     diff_touches_watched_paths,
 )
@@ -1839,6 +1843,8 @@ def _make_force_fire_coordinator(
     restart_executor: AsyncMock | None = None,
     merge_phase_hold=None,
     merge_phase_grace_secs: float = 0.0,
+    lease_path: Path | None = None,
+    lease_max_age_secs: float | None = None,
 ) -> tuple[StaleServiceRestartCoordinator, list[float], list[float], AsyncMock]:
     """Build a coordinator with independently-mutable monotonic (owed-age +
     debounce) and wall (min-interval rate cap) clocks.
@@ -1848,9 +1854,10 @@ def _make_force_fire_coordinator(
     directly, mirroring ``_make_coordinator_with_mutable_clock`` and
     ``_make_rate_capped_coordinator`` above.
 
-    ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753) are passed to
-    the constructor ONLY when set, so existing callers stay byte-identical
-    (they never construct with the new kwargs).
+    ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753) and
+    ``lease_path`` / ``lease_max_age_secs`` (task 4755) are passed to the
+    constructor ONLY when set, so existing callers stay byte-identical (they
+    never construct with the new kwargs).
     """
     git_ops = MagicMock()
     git_ops.get_merge_diff_files = AsyncMock(
@@ -1866,6 +1873,10 @@ def _make_force_fire_coordinator(
         extra_kwargs['merge_phase_hold'] = merge_phase_hold
     if merge_phase_grace_secs != 0.0:
         extra_kwargs['merge_phase_grace_secs'] = merge_phase_grace_secs
+    if lease_path is not None:
+        extra_kwargs['lease_path'] = lease_path
+    if lease_max_age_secs is not None:
+        extra_kwargs['lease_max_age_secs'] = lease_max_age_secs
 
     coord = StaleServiceRestartCoordinator(
         git_ops=git_ops,
@@ -2201,3 +2212,328 @@ async def test_merge_phase_hold_raising_is_fail_open(
     assert any(
         'merge_phase_hold' in r.message for r in caplog.records
     ), 'a raising merge_phase_hold must log a WARNING'
+
+
+# ---------------------------------------------------------------------------
+# In-flight fleet-redeploy lease gate (task 4755). While
+# scripts/restart-all-orchestrators.sh is mid-sweep it holds a lease naming
+# {pid, started_ts, current_unit}, and this coordinator must stand down for as
+# long as that lease is LIVE -- on the POLITE path and the FORCE-FIRE path
+# alike.
+#
+# THE MEASUREMENT THIS EXISTS FOR (2026-08-24/25): a permanently-busy unit
+# stretched every --drain sweep to ~81m, and because the fleet-deploy clock is
+# stamped only on COMPLETION, this coordinator's min_interval cap saw nothing
+# in flight and force-fired straight on top of the running sweep -- "pending
+# restart owed 17300s" -- producing three dark_factory runs of 1.26h/0.92h/
+# 1.33h that between them spent $146.39 and landed zero tasks. So the
+# force-fire half is the half that matters most here, and it is exactly the
+# half merge_phase_hold does NOT model: that gate lives inside the force-fire
+# branch only, whereas this one must cover both.
+#
+# WHY THIS GATE READS DISK AT GATE TIME, alone among the gates in this class:
+# _load_last_fire_wall runs ONCE, in __init__, and is never re-read, so
+# nothing a sweep writes during this process's lifetime is otherwise
+# observable to a long-lived coordinator.
+#
+# FAIL DIRECTION: OPEN. Modeled on merge_phase_hold and on _load_last_fire_wall
+# itself, NOT on restart_precondition, which is fail-SAFE/defer. A lease that
+# cannot be read must never be able to wedge the fleet -- the same reasoning
+# that gives the lease a max-age bound in the first place.
+#
+# Every lease file below is under tmp_path. NEVER a repo-relative path: the
+# suite-wide _df_deploy_clocks_unwritten guard fails the whole run on a write
+# to the real lease path, and rightly so.
+# ---------------------------------------------------------------------------
+
+
+def _write_lease(
+    path: Path,
+    *,
+    pid: int | None = None,
+    started_ts: float = 0.0,
+    current_unit: str = 'orchestrator-fake-sweeping.service',
+) -> Path:
+    """Write a lease in the exact shape restart-all-orchestrators.sh writes."""
+    path.write_text(json.dumps({
+        'pid': os.getpid() if pid is None else pid,
+        'started_ts': started_ts,
+        'current_unit': current_unit,
+    }))
+    return path
+
+
+def _reliably_dead_pid() -> int:
+    """A pid that is definitively not running, for the crash-safety tests."""
+    proc = subprocess.Popen(['true'])
+    proc.wait()
+    assert wait_pid_gone(proc.pid), 'the probe child must be reaped before use'
+    return proc.pid
+
+
+def test_lease_gate_defaults_stored_on_coordinator(tmp_path: Path) -> None:
+    """(a) Defaults are lease_path=None / the module default max-age.
+
+    None is what keeps the fused-memory and dashboard coordinators
+    byte-identical: they never pass either kwarg, so they never grow a gate.
+    """
+    coord, _, _, _ = _make_coordinator_with_mutable_clock([])
+    assert coord._lease_path is None
+    assert coord._lease_max_age_secs == DEFAULT_FLEET_LEASE_MAX_AGE_SECS
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
+    lease_path = tmp_path / 'fleet_redeploy_lease.json'
+    coord2 = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=MagicMock(),
+        watch_prefixes=['orchestrator/src/'],
+        restart_executor=AsyncMock(),
+        clock=lambda: 0.0,
+        lease_path=lease_path,
+        lease_max_age_secs=1234.0,
+    )
+    assert coord2._lease_path == lease_path
+    assert coord2._lease_max_age_secs == 1234.0
+
+
+@pytest.mark.asyncio
+async def test_live_lease_defers_the_polite_path(tmp_path: Path) -> None:
+    """(b) A live lease defers an otherwise-ready POLITE fire.
+
+    Deferred WITHOUT clearing pending and without touching the owed-age
+    anchor, identical to the min_interval cap's stated semantics -- the
+    restart must fire on the first tick after the sweep finishes, not be
+    dropped and wait for another merge to re-arm it.
+    """
+    lease = _write_lease(tmp_path / 'lease.json')
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord._first_pending_monotonic == 0.0
+
+    # Past the debounce and agents ARE idle: every other gate is open.
+    current_time[0] = 301.0
+    assert await coord.maybe_restart(agents_idle=True) is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+    assert coord._first_pending_monotonic == 0.0
+
+
+@pytest.mark.asyncio
+async def test_live_lease_defers_the_force_fire_path(tmp_path: Path) -> None:
+    """(c) A live lease defers the FORCE-FIRE path too -- the measured case.
+
+    merge_phase_hold would NOT have covered this: it is read only inside the
+    force-fire branch, so siting the lease check there would have covered this
+    half and missed the polite one. Siting it after the min_interval cap
+    covers both, and costs no disk read on the (far commoner) calls that never
+    get that far.
+    """
+    lease = _write_lease(tmp_path / 'lease.json')
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Saturated (agents_idle=False) and well past the force-fire bound: this
+    # is the state that produced "pending restart owed 17300s".
+    current_time[0] = 17300.0
+    assert await coord.maybe_restart(agents_idle=False) is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+    assert coord._first_pending_monotonic == 0.0
+
+
+@pytest.mark.asyncio
+async def test_same_coordinator_fires_once_the_lease_file_is_removed(
+    tmp_path: Path,
+) -> None:
+    """(d1) THE 'never reads disk after construction' PROOF.
+
+    The coordinator is CONSTRUCTED while the lease is live and must fire on a
+    later maybe_restart without being reconstructed. That is the whole reason
+    this gate cannot reuse _load_last_fire_wall's once-at-__init__ read, and
+    it is why the test deliberately holds one instance across both calls.
+    """
+    lease = _write_lease(tmp_path / 'lease.json')
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    assert await coord.maybe_restart(agents_idle=True) is False
+    executor.assert_not_awaited()
+
+    lease.unlink()
+
+    current_time[0] = 302.0
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_same_coordinator_fires_once_the_lease_pid_is_dead(
+    tmp_path: Path,
+) -> None:
+    """(d2) CRASH SAFETY: a lease whose pid is gone must not hold the fleet.
+
+    A sweep killed with SIGKILL cannot run its EXIT trap, so the file it
+    leaves behind is expected, not exceptional. Presence alone therefore must
+    never be sufficient -- otherwise one SIGKILLed sweep wedges every redeploy
+    tier until someone notices by hand.
+    """
+    lease = _write_lease(tmp_path / 'lease.json')
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    assert await coord.maybe_restart(agents_idle=True) is False
+
+    # Same file, same fresh started_ts -- ONLY the pid changes.
+    _write_lease(lease, pid=_reliably_dead_pid())
+
+    current_time[0] = 302.0
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_same_coordinator_fires_once_the_lease_is_past_the_bound(
+    tmp_path: Path,
+) -> None:
+    """(d3) The AGE bound, asserted independently of the pid predicate.
+
+    Both liveness conditions are required, and each has to be able to fail the
+    lease on its own -- a lease held by a pid that is somehow still alive but
+    is no longer sweeping (a recycled pid, a wedged shell) must expire. The
+    pid here is this process, so it is trivially alive throughout.
+    """
+    lease = _write_lease(tmp_path / 'lease.json', started_ts=0.0)
+    wall_now = [0.0]
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        wall_now=wall_now,
+        lease_path=lease,
+        lease_max_age_secs=7200.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    wall_now[0] = 7199.0
+    assert await coord.maybe_restart(agents_idle=True) is False
+    executor.assert_not_awaited()
+
+    current_time[0] = 302.0
+    wall_now[0] = 7200.0
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_path_none_leaves_both_paths_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """(e) The default (no lease_path) gates nothing, on either path.
+
+    This is the pin that keeps the fused-memory and dashboard coordinators --
+    neither of which passes lease_path -- unaffected by this task. A lease
+    file sitting right there is ignored, because the gate is keyed on being
+    CONFIGURED with a path, not on one happening to exist.
+    """
+    _write_lease(tmp_path / 'lease.json')
+
+    polite, current_time, _, polite_executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0, require_idle=True, debounce_secs=300.0,
+    )
+    await polite.note_merge('task-1', 'base', 'head')
+    current_time[0] = 301.0
+    assert await polite.maybe_restart(agents_idle=True) is True
+    polite_executor.assert_awaited_once()
+
+    forced, forced_time, _, forced_executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0, require_idle=True, debounce_secs=300.0,
+    )
+    await forced.note_merge('task-2', 'base', 'head')
+    forced_time[0] = 17300.0
+    assert await forced.maybe_restart(agents_idle=False) is True
+    forced_executor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_lease_is_fail_open(tmp_path: Path, caplog) -> None:
+    """(f) A corrupt lease FIRES, and says so -- fail-OPEN, with a WARNING.
+
+    The opposite direction from restart_precondition, deliberately. Deferring
+    on an unparseable file would let a single corrupt write wedge every
+    redeploy indefinitely, which is a strictly worse failure than one extra
+    restart; and it is the same direction _load_last_fire_wall already fails
+    in for the clock.
+    """
+    import logging
+
+    lease = tmp_path / 'lease.json'
+    lease.write_text('{not json at all')
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert any('lease' in r.message.lower() for r in caplog.records), (
+        f'an unreadable lease must log a WARNING naming it; got '
+        f'{[r.message for r in caplog.records]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_lease_is_silent(tmp_path: Path, caplog) -> None:
+    """A MISSING lease is the ordinary no-sweep-running case and must be quiet.
+
+    The asymmetry with (f) is deliberate and is copied from
+    _load_last_fire_wall: absent means "nothing to say", while corrupt means
+    "something is wrong with a file that should not be". Logging the absent
+    case would put a line in the journal on every idle tick forever.
+    """
+    import logging
+
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=tmp_path / 'never_written.json',
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert not [r for r in caplog.records if 'lease' in r.message.lower()], (
+        f'an absent lease must be silent; got {[r.message for r in caplog.records]!r}'
+    )
