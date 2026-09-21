@@ -2,6 +2,8 @@
 const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed } = window.DF_SHELL;
 const D = window.DF_DATA;
+// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
+const { hasOrchSummary, orchSummary } = window.DF_ORCH_SUMMARY;
 const { useState, useEffect } = React;
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
@@ -180,11 +182,11 @@ function OverviewTab({ paused }) {
 
   // Compute live numbers
   const orchRunning = D.ORCHESTRATORS.filter(o => o.running).length;
-  const tasksTotal = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.total, 0);
-  const tasksDone = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.done, 0);
-  const tasksInP = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.in_progress, 0);
-  const tasksBlocked = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.blocked, 0);
-  const tasksPending = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.pending, 0);
+  const tasksTotal = D.ORCHESTRATORS.reduce((n, o) => n + orchSummary(o).total, 0);
+  const tasksDone = D.ORCHESTRATORS.reduce((n, o) => n + orchSummary(o).done, 0);
+  const tasksInP = D.ORCHESTRATORS.reduce((n, o) => n + orchSummary(o).in_progress, 0);
+  const tasksBlocked = D.ORCHESTRATORS.reduce((n, o) => n + orchSummary(o).blocked, 0);
+  const tasksPending = D.ORCHESTRATORS.reduce((n, o) => n + orchSummary(o).pending, 0);
   const memTotal = Object.values(D.MEMORY_STATUS.projects).reduce((s, p) => s + p.graphiti_nodes + p.mem0_memories, 0);
   const queue = D.MEMORY_STATUS.queue.counts;
   const queueDepth = queue.pending + queue.retry + queue.dead;
@@ -203,6 +205,14 @@ function OverviewTab({ paused }) {
     .slice(0, 40)
     .map(r => r.duration_seconds)
     .reverse();
+  // Share of the pipeline one facet holds. A zero denominator is now the
+  // STEADY state, not a momentary one: /orchestrators stopped measuring task
+  // counts (task 5587), so every facet is 0 until task 5589 puts the census
+  // behind these tiles. `v/0` renders the literal text "NaN%" beside a bar
+  // whose width string the browser silently discards — a measured-looking
+  // nonsense the caller cannot distinguish from a real reading.
+  const taskShare = (v) => (tasksTotal > 0 ? (v / tasksTotal) * 100 : 0);
+
   const costSpark = (D.COSTS.trend.values || []).slice(-30);
   const todaySpend = D.COSTS.summary?.today ?? 0;
   const deltaPct = D.COSTS.summary?.delta_pct;
@@ -259,10 +269,10 @@ function OverviewTab({ paused }) {
         </div>
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div className="stack-bar" style={{ height: 18, borderRadius: 4 }}>
-            <span style={{ width: `${tasksDone/tasksTotal*100}%`, background: P.ok }} title={`done ${tasksDone}`} />
-            <span style={{ width: `${tasksInP/tasksTotal*100}%`, background: P.accent }} title={`in-progress ${tasksInP}`} />
-            <span style={{ width: `${tasksBlocked/tasksTotal*100}%`, background: P.bad }} title={`blocked ${tasksBlocked}`} />
-            <span style={{ width: `${tasksPending/tasksTotal*100}%`, background: P.warn }} title={`pending ${tasksPending}`} />
+            <span style={{ width: `${taskShare(tasksDone)}%`, background: P.ok }} title={`done ${tasksDone}`} />
+            <span style={{ width: `${taskShare(tasksInP)}%`, background: P.accent }} title={`in-progress ${tasksInP}`} />
+            <span style={{ width: `${taskShare(tasksBlocked)}%`, background: P.bad }} title={`blocked ${tasksBlocked}`} />
+            <span style={{ width: `${taskShare(tasksPending)}%`, background: P.warn }} title={`pending ${tasksPending}`} />
           </div>
           {[
             { l: 'done',        v: tasksDone,    c: P.ok },
@@ -274,7 +284,7 @@ function OverviewTab({ paused }) {
               <span style={{ width: 8, height: 8, background: r.c, borderRadius: 2 }}></span>
               <span style={{ color: 'var(--fg-2)' }}>{r.l}</span>
               <span className="mono" style={{ color: 'var(--fg-0)' }}>{r.v}</span>
-              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10, width: 36, textAlign: 'right' }}>{(r.v/tasksTotal*100).toFixed(0)}%</span>
+              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10, width: 36, textAlign: 'right' }}>{tasksTotal > 0 ? `${taskShare(r.v).toFixed(0)}%` : '—'}</span>
             </div>
           ))}
         </div>
@@ -321,7 +331,14 @@ function OverviewTab({ paused }) {
                       </span>
                     );
                   })()}</td>
-                  <td className="num"><span className="mono">{o.summary.done}/{o.summary.total}</span></td>
+                  <td className="num">{(() => {
+                    // Dimmed em-dash, exactly like the Modules cell above:
+                    // /orchestrators no longer measures a task count, and a
+                    // rendered "0/0" would read as a measured empty tree.
+                    if (!hasOrchSummary(o)) return <span style={{ color: 'var(--fg-3)' }}>—</span>;
+                    const s = orchSummary(o);
+                    return <span className="mono">{s.done}/{s.total}</span>;
+                  })()}</td>
                   <td className="num" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{o.started}</td>
                   <td style={{ color: 'var(--fg-3)', fontSize: 11 }}>{window.DF_SHELL.timeago(o.last_update)}</td>
                 </tr>

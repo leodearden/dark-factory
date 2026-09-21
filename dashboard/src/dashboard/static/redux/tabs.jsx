@@ -22,6 +22,8 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
+// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
+const { hasOrchSummary, orchSummary } = window.DF_ORCH_SUMMARY;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -221,15 +223,16 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" value={matches.reduce((s,o)=>s+o.summary.in_progress,0)} spark={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" value={matches.reduce((s,o)=>s+o.summary.blocked,0)} spark={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" value={matches.reduce((s,o)=>s+o.summary.pending,0)} spark={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        <ST label="Tasks in flight" value={matches.reduce((n,o)=>n+orchSummary(o).in_progress,0)} spark={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
+        <ST label="Blocked" value={matches.reduce((n,o)=>n+orchSummary(o).blocked,0)} spark={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
+        <ST label="Pending" value={matches.reduce((n,o)=>n+orchSummary(o).pending,0)} spark={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {matches.map(o => {
-        const total = o.summary.total || 1;
+        const orchCounts = orchSummary(o);
+        const total = orchCounts.total || 1;
         const projTasks = tasks.filter(t => t.project === o.project);
         const filter = getFilter(o.pid);
         // partition by filter (multi-select)
@@ -257,9 +260,9 @@ function OrchTab({ projectFilter, search }) {
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{o.summary.done}/{total}</span>
-            {o.summary.in_progress > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{o.summary.in_progress} active</span>}
-            {o.summary.blocked > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{o.summary.blocked} blocked</span>}
+            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : '—'}</span>
+            {orchCounts.in_progress > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{orchCounts.in_progress} active</span>}
+            {orchCounts.blocked > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{orchCounts.blocked} blocked</span>}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -353,19 +356,19 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>
                       <span>Progress</span>
-                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{o.summary.done}/{total}</span>
+                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : '—'}</span>
                     </div>
                     <div className="stack-bar" style={{ height: 12 }}>
-                      <span style={{ width: `${o.summary.done/total*100}%`, background: CP.ok }} />
-                      <span style={{ width: `${o.summary.in_progress/total*100}%`, background: CP.accent }} />
-                      <span style={{ width: `${o.summary.blocked/total*100}%`, background: CP.bad }} />
-                      <span style={{ width: `${o.summary.pending/total*100}%`, background: CP.warn }} />
+                      <span style={{ width: `${orchCounts.done/total*100}%`, background: CP.ok }} />
+                      <span style={{ width: `${orchCounts.in_progress/total*100}%`, background: CP.accent }} />
+                      <span style={{ width: `${orchCounts.blocked/total*100}%`, background: CP.bad }} />
+                      <span style={{ width: `${orchCounts.pending/total*100}%`, background: CP.warn }} />
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      <span style={{ color: CP.ok }}>{o.summary.done} done</span>
-                      <span style={{ color: CP.accent }}>{o.summary.in_progress} active</span>
-                      <span style={{ color: CP.bad }}>{o.summary.blocked} blocked</span>
-                      <span style={{ color: CP.warn }}>{o.summary.pending} pending</span>
+                      <span style={{ color: CP.ok }}>{orchCounts.done} done</span>
+                      <span style={{ color: CP.accent }}>{orchCounts.in_progress} active</span>
+                      <span style={{ color: CP.bad }}>{orchCounts.blocked} blocked</span>
+                      <span style={{ color: CP.warn }}>{orchCounts.pending} pending</span>
                     </div>
                   </div>
                   <div>
