@@ -1847,3 +1847,218 @@ class TestFindDuplicateEntityNodesProvenanceRankLiveFalkorDB:
             assert [row['uuid'] for row in dups] == ['older', 'newer-a', 'newer-b']
         finally:
             await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(30)
+@pytest.mark.integration
+class TestLosslessMergeEndToEndLiveFalkorDB:
+    """THE ACCEPTANCE SIGNAL (task 4986): drive the real merge against a real
+    server and assert, in one place, that nothing the task set out to preserve
+    is lost.
+
+    Composes units steps 1-12 already GREENed. Its value is that it exercises
+    them TOGETHER through the real merge_entities, where an ordering mistake
+    between two individually-correct pieces still destroys data.
+    """
+
+    RESTORED_EXPIRED_AT = '2026-03-04T05:06:07Z'
+    UNBACKED_SUMMARY = 'Dep is the "legacy" node.\nNo edge asserts this — naïve prose.'
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_a_real_merge_preserves_edges_mentions_and_the_losers_summary(
+        self, mock_config, merge_entities_live_graph, caplog,
+    ):
+        graph_name, graph = merge_entities_live_graph
+
+        await graph.query(
+            'CREATE (:Entity {uuid: "dep", name: "Dup", group_id: $gid, summary: $summary}), '
+            '(:Entity {uuid: "sur", name: "Dup", group_id: $gid, summary: "Sur summary"}), '
+            '(:Entity {uuid: "nbr", name: "Neighbour", group_id: $gid, summary: ""}), '
+            '(:Episodic {uuid: "ep1"}), (:Episodic {uuid: "ep2"})',
+            {'gid': graph_name, 'summary': self.UNBACKED_SUMMARY},
+        )
+        # The loser's RELATES_TO: one carrying the deliberately-restored
+        # signature, one plain.
+        await graph.query(
+            'MATCH (d:Entity {uuid: "dep"}), (n:Entity {uuid: "nbr"}) '
+            'CREATE (d)-[:RELATES_TO {uuid: "e-restored", fact: "restored fact", '
+            '                         expired_at: $exp}]->(n), '
+            '       (d)-[:RELATES_TO {uuid: "e-plain", fact: "plain fact"}]->(n)',
+            {'exp': self.RESTORED_EXPIRED_AT},
+        )
+        # The loser's episode provenance, and one unrelated survivor edge.
+        await graph.query(
+            'MATCH (e1:Episodic {uuid: "ep1"}), (e2:Episodic {uuid: "ep2"}), '
+            '(d:Entity {uuid: "dep"}), (s:Entity {uuid: "sur"}), (n:Entity {uuid: "nbr"}) '
+            'CREATE (e1)-[:MENTIONS {uuid: "m-ep1"}]->(d), '
+            '       (e2)-[:MENTIONS {uuid: "m-ep2"}]->(d), '
+            '       (s)-[:RELATES_TO {uuid: "e-sur", fact: "sur fact"}]->(n)'
+        )
+
+        backend = self._backend(mock_config)
+        try:
+            with caplog.at_level(logging.INFO, logger='fused_memory.backends.graphiti_client'):
+                audit = await backend.merge_entities('dep', 'sur', group_id=graph_name)
+
+            # (1) Episode provenance survived the DETACH DELETE.
+            mentions = await graph.query(
+                'MATCH (ep:Episodic)-[m:MENTIONS]->(n:Entity {uuid: "sur"}) '
+                'RETURN ep.uuid, m.uuid, m.reassigned_from_node_uuid'
+            )
+            by_episode = {row[0]: (row[1], row[2]) for row in mentions.result_set}
+            assert sorted(by_episode) == ['ep1', 'ep2'], (
+                f'both episodes must now mention the survivor: {by_episode!r}'
+            )
+            for episode, (link_uuid, stamp) in by_episode.items():
+                assert link_uuid == f'm-{episode}'   # uuid preserved
+                assert stamp == 'dep'                # relocation stamped
+
+            # (2) The restored signature survived intact, and (3) every
+            # redirected edge is stamped and freshly re-minted.
+            sur_edges = await graph.query(
+                'MATCH (s:Entity {uuid: "sur"})-[e:RELATES_TO]-() '
+                'RETURN e.fact, e.uuid, e.superseded_edge_uuid, e.expired_at, '
+                '       e.invalid_at, e.reassigned_from_node_uuid'
+            )
+            rows = {row[0]: row[1:] for row in sur_edges.result_set}
+            assert sorted(rows) == ['plain fact', 'restored fact', 'sur fact']
+
+            restored_uuid, superseded, expired_at, invalid_at, stamp = rows['restored fact']
+            assert expired_at == self.RESTORED_EXPIRED_AT
+            assert invalid_at is None
+            assert superseded == 'e-restored'
+            assert restored_uuid != 'e-restored'
+            assert uuid.UUID(restored_uuid).version == 4
+            assert stamp == 'dep'
+
+            plain_uuid, plain_superseded, plain_expired, _, plain_stamp = rows['plain fact']
+            assert plain_expired is None
+            assert plain_superseded == 'e-plain'
+            assert plain_uuid != 'e-plain'
+            assert plain_stamp == 'dep'
+
+            # The survivor's OWN pre-existing edge was never touched.
+            own_uuid, own_superseded, _, _, own_stamp = rows['sur fact']
+            assert own_uuid == 'e-sur'
+            assert own_superseded is None
+            assert own_stamp is None
+
+            # (4) Exactly one structured record, carrying the unbacked summary
+            # verbatim and relocation counts matching what was seeded.
+            records = [
+                r for r in caplog.records
+                if r.name == 'fused_memory.backends.graphiti_client'
+                and r.getMessage().startswith('merge_entities: ')
+            ]
+            assert len(records) == 1, [r.getMessage() for r in records]
+            payload = json.loads(records[0].getMessage()[len('merge_entities: '):])
+            assert payload == audit
+            assert payload['deprecated_summary'] == self.UNBACKED_SUMMARY
+            assert payload['edges_redirected']['outgoing_redirected'] == 2
+            assert payload['edges_redirected']['incoming_redirected'] == 0
+            assert payload['mentions_redirected'] == {'redirected': 2, 'already_linked': 0}
+
+            # (5) The loser is gone, and the pre-existing S4 invariant still
+            # holds graph-wide.
+            gone = await graph.query('MATCH (n:Entity {uuid: "dep"}) RETURN count(n)')
+            assert gone.result_set[0][0] == 0
+            dup_check = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'WITH e.uuid AS u, count(*) AS c WHERE c > 1 RETURN count(u)'
+            )
+            assert dup_check.result_set[0][0] == 0
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_both_ranking_paths_keep_the_episode_rich_node_alive(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """The survivor-selection half, on BOTH ranking methods -- each now
+        feeds a merge, so each can destroy provenance by mis-ranking.
+
+        Feeding [0]/[1:] into the real merge_entities is what closes the loop:
+        the node the ranking picks is the node that is still there afterwards.
+        """
+        graph_name, graph = merge_entities_live_graph
+
+        async def node(uuid_, name, created_at):
+            await graph.query(
+                'CREATE (:Entity {uuid: $u, name: $n, group_id: $g, created_at: $c, summary: ""})',
+                {'u': uuid_, 'n': name, 'g': graph_name, 'c': created_at},
+            )
+
+        async def edges(node_uuid, n, prefix):
+            for i in range(n):
+                await graph.query(
+                    'MATCH (a:Entity {uuid: $a}), (b:Entity {uuid: "nbr"}) '
+                    'CREATE (a)-[:RELATES_TO {uuid: $u, fact: $f}]->(b)',
+                    {'a': node_uuid, 'u': f'{prefix}-e{i}', 'f': f'{prefix} fact {i}'},
+                )
+
+        async def mentions(node_uuid, episodes, prefix):
+            for ep in episodes:
+                await graph.query('MERGE (:Episodic {uuid: $u})', {'u': ep})
+                await graph.query(
+                    'MATCH (e:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+                    'CREATE (e)-[:MENTIONS {uuid: $u}]->(n)',
+                    {'ep': ep, 'n': node_uuid, 'u': f'{prefix}-{ep}'},
+                )
+
+        await node('nbr', 'Neighbour', '2026-01-01T00:00:00Z')
+        # Exact-name group: edge-rich 'x-edgy' vs episode-rich 'x-episodic'.
+        await node('x-edgy', 'Exact', '2026-01-01T00:00:00Z')
+        await node('x-episodic', 'Exact', '2026-02-01T00:00:00Z')
+        await edges('x-edgy', 3, 'xe')
+        await edges('x-episodic', 1, 'xp')
+        await mentions('x-edgy', ['xa'], 'mxe')
+        await mentions('x-episodic', ['xb', 'xc', 'xd', 'xe'], 'mxp')
+        # Task family (substring path): same shape, different spellings.
+        await node('t-edgy', 'task 4986', '2026-01-01T00:00:00Z')
+        await node('t-episodic', 'Task 4986', '2026-02-01T00:00:00Z')
+        await edges('t-edgy', 3, 'te')
+        await edges('t-episodic', 1, 'tp')
+        await mentions('t-edgy', ['ta'], 'mte')
+        await mentions('t-episodic', ['tb', 'tc', 'td', 'te'], 'mtp')
+
+        backend = self._backend(mock_config)
+        try:
+            exact = await backend.find_duplicate_entity_nodes('Exact', group_id=graph_name)
+            assert [r['uuid'] for r in exact] == ['x-episodic', 'x-edgy']
+
+            family = await backend.find_entity_nodes_by_name_substring(
+                '4986', group_id=graph_name,
+            )
+            assert [r['uuid'] for r in family] == ['t-episodic', 't-edgy']
+
+            for rows in (exact, family):
+                survivor = rows[0]['uuid']
+                for loser in rows[1:]:
+                    await backend.merge_entities(
+                        loser['uuid'], survivor, group_id=graph_name,
+                    )
+                alive = await graph.query(
+                    'MATCH (n:Entity {uuid: $u}) RETURN count(n)', {'u': survivor},
+                )
+                assert alive.result_set[0][0] == 1, f'{survivor} must survive'
+
+            # The episode-rich survivors kept their own provenance AND absorbed
+            # the loser's -- the whole point of ranking on it.
+            for survivor, expected in (
+                ('x-episodic', ['xa', 'xb', 'xc', 'xd', 'xe']),
+                ('t-episodic', ['ta', 'tb', 'tc', 'td', 'te']),
+            ):
+                got = await graph.query(
+                    'MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity {uuid: $u}) RETURN ep.uuid',
+                    {'u': survivor},
+                )
+                assert sorted(row[0] for row in got.result_set) == expected
+        finally:
+            await backend.close()
