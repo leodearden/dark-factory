@@ -157,9 +157,16 @@ class TestRedirectNodeEdges:
             assert 'new.fact = old.fact' in cypher
             assert 'new.valid_at = old.valid_at' in cypher
             assert 'new.invalid_at = old.invalid_at' in cypher
+            # task 4986 loss mode 3: `expired_at` SET + `invalid_at` NULL is the
+            # restore hooks' deliberately-restored signature, so dropping it here
+            # re-exposes restored edges to false supersession. Kept adjacent to
+            # `invalid_at`, matching reassign_edge's SET list.
+            assert 'new.expired_at = old.expired_at' in cypher
             assert 'new.created_at = old.created_at' in cypher
             assert 'new.group_id = old.group_id' in cypher
             assert 'new.episodes = old.episodes' in cypher
+            # task 4986 loss mode 4a: which node this endpoint left.
+            assert 'new.reassigned_from_node_uuid = $dep_uuid' in cypher
             assert 'new.source_node_uuid = $sur_uuid' in cypher
 
         assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
@@ -219,9 +226,16 @@ class TestRedirectNodeEdges:
             assert 'new.fact = old.fact' in cypher
             assert 'new.valid_at = old.valid_at' in cypher
             assert 'new.invalid_at = old.invalid_at' in cypher
+            # task 4986 loss mode 3: `expired_at` SET + `invalid_at` NULL is the
+            # restore hooks' deliberately-restored signature, so dropping it here
+            # re-exposes restored edges to false supersession. Kept adjacent to
+            # `invalid_at`, matching reassign_edge's SET list.
+            assert 'new.expired_at = old.expired_at' in cypher
             assert 'new.created_at = old.created_at' in cypher
             assert 'new.group_id = old.group_id' in cypher
             assert 'new.episodes = old.episodes' in cypher
+            # task 4986 loss mode 4a: which node this endpoint left.
+            assert 'new.reassigned_from_node_uuid = $dep_uuid' in cypher
             assert 'new.target_node_uuid = $sur_uuid' in cypher
 
         assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
@@ -1111,5 +1125,109 @@ class TestRedirectNodeEdgesLiveFalkorDB:
             assert list(embeddings_by_fact['dep relates to t3']) == pytest.approx([5.0, 6.0])
             assert list(embeddings_by_fact['s1 relates to dep']) == pytest.approx([7.0, 8.0])
             assert list(embeddings_by_fact['s2 relates to dep']) == pytest.approx([9.0, 10.0])
+        finally:
+            await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestRedirectNodeEdgesPreservesExpiredAtLiveFalkorDB:
+    """Pin the two properties the redirect used to DROP, against a real server
+    (task 4986 loss modes 3 and 4a).
+
+    `expired_at` is load-bearing and its loss is silent: `expired_at` SET with
+    `invalid_at` NULL is the restore hooks' deliberately-restored signature
+    (the hooks clear `invalid_at` and never `expired_at`), so a redirect that
+    drops it re-exposes those edges to false supersession. `reassign_edge` —
+    this method's single-edge sibling — already copies it; `redirect_node_edges`
+    did not, which is the copy-drift between two SET lists that the fix closes.
+
+    A mock can only confirm the SET clause was SENT. Only a live server shows
+    that copying a NULL source leaves the property ABSENT rather than inventing
+    a value, which is the half of the contract a Cypher-substring test cannot
+    reach.
+    """
+
+    RESTORED_EXPIRED_AT = '2026-01-02T03:04:05Z'
+
+    @pytest.mark.asyncio
+    async def test_redirect_preserves_expired_at_and_stamps_losing_node(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+
+        await graph.query(
+            "CREATE (:Entity {uuid: 'dep', name: 'Dep'}), "
+            "(:Entity {uuid: 'sur', name: 'Sur'}), "
+            "(:Entity {uuid: 't1', name: 'T1'}), "
+            "(:Entity {uuid: 't2', name: 'T2'}), "
+            "(:Entity {uuid: 's1', name: 'S1'}), "
+            "(:Entity {uuid: 's2', name: 'S2'})"
+        )
+
+        async def seed_edge(src, dst, edge_uuid, fact, expired_at=None):
+            await graph.query(
+                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b)',
+                {'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel', 'fact': fact},
+            )
+            if expired_at is not None:
+                await graph.query(
+                    'MATCH ()-[e:RELATES_TO {uuid: $edge_uuid}]-() SET e.expired_at = $expired_at',
+                    {'edge_uuid': edge_uuid, 'expired_at': expired_at},
+                )
+
+        # The deliberately-restored signature in each direction: expired_at SET,
+        # invalid_at never written (so NULL) — exactly what a restore hook leaves.
+        await seed_edge('dep', 't1', 'o-restored', 'dep restored to t1',
+                        expired_at=self.RESTORED_EXPIRED_AT)
+        await seed_edge('s1', 'dep', 'i-restored', 's1 restored to dep',
+                        expired_at=self.RESTORED_EXPIRED_AT)
+        # Plain edges with NO expired_at: copying a NULL must not invent a value.
+        await seed_edge('dep', 't2', 'o-plain', 'dep plain to t2')
+        await seed_edge('s2', 'dep', 'i-plain', 's2 plain to dep')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.redirect_node_edges('dep', 'sur', group_id=graph_name)
+
+            assert result['outgoing_redirected'] == 2
+            assert result['incoming_redirected'] == 2
+            assert result['inter_node_deleted'] == 0
+
+            sur_edges = await graph.query(
+                'MATCH (sur:Entity {uuid: "sur"})-[e:RELATES_TO]-() '
+                'RETURN e.fact, e.uuid, e.superseded_edge_uuid, e.expired_at, '
+                '       e.invalid_at, e.reassigned_from_node_uuid'
+            )
+            rows = {row[0]: row[1:] for row in sur_edges.result_set}
+            assert len(rows) == 4, f'no edge may be lost by the redirect: {rows!r}'
+
+            originals = {
+                'dep restored to t1': 'o-restored',
+                's1 restored to dep': 'i-restored',
+                'dep plain to t2': 'o-plain',
+                's2 plain to dep': 'i-plain',
+            }
+            for fact, (new_uuid, superseded, expired_at, invalid_at, stamp) in rows.items():
+                # Pre-existing contract, unchanged by this fix.
+                assert superseded == originals[fact]
+                assert new_uuid != superseded
+                assert uuid.UUID(new_uuid).version == 4
+                # Loss mode 4a: the redirect records WHICH node the endpoint left.
+                assert stamp == 'dep', (
+                    f'{fact!r} must carry reassigned_from_node_uuid=dep, got {stamp!r}'
+                )
+                # Loss mode 3: the restored signature survives intact.
+                if 'restored' in fact:
+                    assert expired_at == self.RESTORED_EXPIRED_AT
+                    assert invalid_at is None
+                else:
+                    # Copying a NULL source must leave the property absent, not
+                    # invent one — the half only a live server can show.
+                    assert expired_at is None
+                    assert invalid_at is None
         finally:
             await backend.close()
