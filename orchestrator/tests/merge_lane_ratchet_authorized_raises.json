@@ -1,5 +1,42 @@
 {
   "_README": "This is the APPEND-ONLY provenance of every raise ever authorized against the merge-lane ratchet baseline (orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a permission list: nothing in this file grants a future raise, and no entry here will ever let --write-baseline absorb one. Authorization is an act, not a standing entry -- rerun --authorize-raise for each raise, and it appends one more record. Each entry's \"measures\" block is DERIVED from the measured raises the write gate computed, never hand-written, so it is mechanically incapable of disagreeing with the baseline diff it accompanies. There is no timestamp: git already carries the date, and a clock would churn this file on every rewrite. Written by scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason \"<why>\".",
   "schema_version": 1,
-  "raises": []
+  "raises": [
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the coalesce one-strike registry becomes restart-durable (guard_state.PersistentSet), adding a TTL constant, the persisted initialiser and corrected prose in merge_queue.py; the private_reads total rises because the new cross-guard suite test_restart_durable_guards.py asserts against the guard attributes, which have no public accessor.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21572,
+          "current": 21604
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12288,
+          "current": 12305
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55842,
+          "current": 55874
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6724,
+          "current": 6759
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31298,
+          "current": 31315
+        }
+      ]
+    }
+  ]
 }

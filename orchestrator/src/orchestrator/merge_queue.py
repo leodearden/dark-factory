@@ -23,7 +23,16 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    MutableSet,
+    Sequence,
+)
+from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -43,6 +52,7 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
@@ -5836,6 +5846,12 @@ _COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
 # event has one of these states is excluded from train formation.
 _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
 
+# How long a one-strike derail marker is remembered (task 5352).  An upper
+# bound on the subject, not a tuning dial: seven days is a generous outer
+# bound on a task's residency in the merge queue, and the marker must not
+# outlive the task it was recorded against.
+_COALESCE_DERAIL_TTL = timedelta(days=7)
+
 
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
@@ -9922,10 +9938,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
         # startswith _COALESCE_TRAIN_ID_PREFIX).  Keyed by task_id so the marker
-        # survives re-dispatch as a new MergeRequest with the same task_id.
-        # Process-lifetime (cleared only on worker restart); injectable predicate
-        # is the seam for richer decay/flakiness policies later.
-        self._coalesce_derailed_task_ids: set[str] = set()
+        # survives re-dispatch as a new MergeRequest with the same task_id —
+        # and, since task 5352, a worker restart too: the marker is persisted
+        # under project_root/data/orchestrator/guards/ and decays only via
+        # _COALESCE_DERAIL_TTL, which IS the decay policy this comment used to
+        # defer to a richer injectable predicate.  Unlike the sibling
+        # _..._state_path attributes above there is no Path|None to thread and
+        # no is-None branch at the call site: guard_path returns None for an
+        # absent project_root and PersistentSet absorbs it as the in-memory mode.
+        self._coalesce_derailed_task_ids: MutableSet[str] = PersistentSet(
+            guard_path(_root, 'coalesce_derailed_task_ids.json'),
+            ttl=_COALESCE_DERAIL_TTL,
+        )
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
         # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
@@ -14964,10 +14988,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for a train whose train_id startswith _COALESCE_TRAIN_ID_PREFIX.  Adds
         each task_id to self._coalesce_derailed_task_ids so the next coalescing
         pass (default predicate) excludes them from train formation.
+
+        The marks are durable (task 5352): before that, they lived only in this
+        worker's memory, so the ~8-15h fleet redeploy cleared them and the
+        identical poison train re-formed on that cadence.  The whole batch is
+        recorded with one ``|=``, which the registry persists as a single
+        write.
         """
         if not member_task_ids:
             return
-        self._coalesce_derailed_task_ids.update(member_task_ids)
+        self._coalesce_derailed_task_ids |= set(member_task_ids)
         logger.info(
             'Coalesce one-strike: marked %d task(s) after coalesce-train derail: %s',
             len(member_task_ids), member_task_ids,
@@ -15153,16 +15183,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         None (eligible).  Signals implemented here use only worker-reachable
         substrate (no scheduler import):
 
-          1. One-strike registry (cheapest, in-memory first):
+          1. One-strike registry (cheapest — check first):
              If req.task_id is in self._coalesce_derailed_task_ids (a prior
              coalesce-formed train that included this task derailed), exclude.
-             Filled in step-6; always empty until then.
+             Still the cheaper signal — a lookup against a warm in-process
+             cache, versus signal 2's sqlite query — but no longer purely
+             in-memory: the registry is restart-durable (task 5352).
 
           2. Event-store blocked history:
              If the branch's most-recent terminal merge outcome was 'blocked' or
-             'error', exclude.  Filled in step-4.
+             'error', exclude.
         """
-        # Signal 1: one-strike registry (cheapest, in-memory — check first).
+        # Signal 1: one-strike registry (cheapest — check first).
         if req.task_id in self._coalesce_derailed_task_ids:
             return 'coalesce_derailed_one_strike'
         # Signal 2: event-store blocked history.

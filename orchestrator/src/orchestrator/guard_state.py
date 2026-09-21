@@ -54,7 +54,7 @@ from collections.abc import Callable, Iterable, Iterator, MutableMapping, Mutabl
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from shared import safe_io
 from shared.safe_io import load_json_or_warn
@@ -358,6 +358,17 @@ class PersistentSet(MutableSet[str]):
             changed |= self._store.insert_if_absent(value, True)
         if changed:
             self._store.flush()
+
+    def __ior__(self, value: Iterable[str]) -> Self:
+        """Batch-insert, writing once.
+
+        ``MutableSet`` supplies a ``__ior__`` that loops calling ``add``, which
+        would write per element.  Overriding it means a caller whose attribute
+        is declared as the ABC — the narrow type that lets a test substitute a
+        plain ``set`` — still gets :meth:`update`'s single write.
+        """
+        self.update(value)
+        return self
 
     def __contains__(self, value: object) -> bool:
         return isinstance(value, str) and self._store.has_live(value)
