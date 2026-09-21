@@ -2521,6 +2521,87 @@ class TestAuthorizedRaiseLedger:
         assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
 
 
+class TestLedgerAppendedEntries:
+    """The ledger delta, and what makes append_authorization's promise checkable.
+
+    ``append_authorization``'s docstring promises that "a reviewer reading the
+    file reads every raise this baseline has ever absorbed". That is a claim
+    about every FUTURE writer of the file, not just about that function, and
+    nothing enforced it: a commit could quietly drop or rewrite a historical
+    entry and the promise would stay standing and false. These pin the reader
+    that checks it.
+    """
+
+    @staticmethod
+    def _record(task_id: str, reason: str = 'net-additive work') -> dict:
+        return metrics.authorization_record(
+            metrics.RaiseAuthorization(task_id=task_id, reason=reason),
+            [metrics._violation('lines', _MQ, 21550, 21653)],
+        )
+
+    @classmethod
+    def _ledger(cls, *records: dict) -> dict:
+        return {**metrics.empty_ledger(), 'raises': list(records)}
+
+    def test_an_unchanged_ledger_appended_nothing(self) -> None:
+        ledger = self._ledger(self._record('5485'))
+
+        assert metrics.ledger_appended_entries(ledger, copy.deepcopy(ledger)) == []
+
+    def test_the_appended_suffix_is_returned_in_order(self) -> None:
+        history = self._record('5485')
+        first, second = self._record('5722'), self._record('5723')
+
+        appended = metrics.ledger_appended_entries(
+            self._ledger(history), self._ledger(history, first, second)
+        )
+
+        assert appended == [first, second]
+
+    def test_the_day_one_shape_is_the_whole_list(self) -> None:
+        # Previous is the fail-CLOSED empty ledger -- the state a commit that
+        # authorizes the very first raise starts from.
+        record = self._record('5722')
+
+        assert metrics.ledger_appended_entries(
+            metrics.empty_ledger(), self._ledger(record)
+        ) == [record]
+
+    def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
+        history = [self._record('5485'), self._record('5675')]
+
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.ledger_appended_entries(
+                self._ledger(*history), self._ledger(history[0])
+            )
+
+        message = str(excinfo.value)
+        assert 'append-only' in message
+        # HOW MANY went missing, not merely that something did: the number is
+        # what tells a reviewer whether this was one bad rebase or a wipe.
+        assert '1' in message
+
+    def test_rewriting_an_entry_in_place_is_refused(self) -> None:
+        # LENGTH EQUALITY IS NOT PREFIX EQUALITY. A rewrite keeps the count
+        # identical, so any check that compared lengths would pass it -- and a
+        # rewritten `reason` is exactly how a raise stops reading as what it was.
+        history = self._record('5485')
+        forged = self._record('5485', reason='actually it was a refactor')
+
+        with pytest.raises(metrics.MetricsError):
+            metrics.ledger_appended_entries(
+                self._ledger(history), self._ledger(forged)
+            )
+
+    def test_reordering_history_is_refused(self) -> None:
+        first, second = self._record('5485'), self._record('5675')
+
+        with pytest.raises(metrics.MetricsError):
+            metrics.ledger_appended_entries(
+                self._ledger(first, second), self._ledger(second, first)
+            )
+
+
 class TestUnrecordedRaises:
     """Which measured raises THIS commit's ledger entries do not name.
 
