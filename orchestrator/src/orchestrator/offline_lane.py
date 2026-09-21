@@ -56,12 +56,14 @@ import logging
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable, MutableMapping, MutableSet
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Protocol
 
 from shared.verify_admission import nice_prefix
+
+from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -70,6 +72,13 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
+
+# How long the red-path state is remembered across restarts (task 5352).  An
+# upper bound on the subject, not a tuning dial: a fix task's realistic
+# time-to-land is the longest-lived of the four guards' subjects, which is why
+# this is the longest of the four TTLs.  Past it the fingerprint is forgotten
+# and a still-broken suite files a fresh task.
+_RED_STATE_TTL = timedelta(days=14)
 
 # Fixed quiescent gap after a failed run() pass (seconds).  Mirrors
 # harness._BG_LOOP_FAILURE_BACKOFF_SECS (harness.py:107) — duplicated here
@@ -264,6 +273,16 @@ class OfflineLaneWorker:
             L0 info escalation on a new fix-task file and the staged L2
             ``escalate_blocker`` promotion.  Defaults to ``None`` — same
             log-only degrade as ``task_client``.
+
+    The three red-path attributes are restart-durable (task 5352) and are one
+    coupled subject, which is why ``open_fix_tasks`` is persisted alongside the
+    two counters rather than only them: :meth:`_handle_red_run` branches on it,
+    so an empty map after a restart routes into :meth:`_file_new_fix_task`,
+    which files a DUPLICATE task for a break already tracked AND resets the
+    advance count to 1 — clobbering a persisted count before it can ever reach
+    ``offline_lane_red_advances_before_blocker``.  ``_last_green_head`` and
+    ``_consecutive_failures`` are deliberately NOT persisted: both are
+    correctly re-derived by the next run.
     """
 
     def __init__(
@@ -328,18 +347,33 @@ class OfflineLaneWorker:
         # fixed 60s cadence forever (task 2016 amendment).
         self._consecutive_failures: int = 0
 
-        # Red-path state (β3) — keyed by compute_failing_test_set_fingerprint.
+        # Red-path state (β3) — keyed by compute_failing_test_set_fingerprint,
+        # and restart-durable since task 5352: all three live under
+        # <project_root>/data/orchestrator/guards/ and expire after
+        # _RED_STATE_TTL.  A project_root that cannot be resolved yields the
+        # in-memory mode — today's behaviour — with no branch at any call site.
+        #
         # Maps a confirmed failing-test-set fingerprint to its open fix task
         # id; an in-flight fingerprint absorbs further same-set red advances
         # (append suspect range) instead of spawning a duplicate task (B5).
-        self.open_fix_tasks: dict[str, str] = {}
+        self.open_fix_tasks: MutableMapping[str, str] = PersistentMap(
+            guard_path(config.project_root, 'offline_lane_open_fix_tasks.json'),
+            ttl=_RED_STATE_TTL,
+        )
         # Consecutive confirmed-red advances recorded per open fingerprint —
         # compared against config.git.offline_lane_red_advances_before_blocker
         # for the N-advances staged escalate_blocker promotion (B7/C4).
-        self._red_advance_counts: dict[str, int] = {}
+        self._red_advance_counts: MutableMapping[str, int] = PersistentMap(
+            guard_path(config.project_root, 'offline_lane_red_advance_counts.json'),
+            ttl=_RED_STATE_TTL,
+        )
         # Fingerprints already promoted to escalate_blocker — promotion is
-        # idempotent per fingerprint (never re-files once escalated).
-        self._promoted_blockers: set[str] = set()
+        # idempotent per fingerprint (never re-files once escalated), across
+        # restarts as well as within one.
+        self._promoted_blockers: MutableSet[str] = PersistentSet(
+            guard_path(config.project_root, 'offline_lane_promoted_blockers.json'),
+            ttl=_RED_STATE_TTL,
+        )
         # Head of the most recently PASSING run — the cheapest sound lower
         # bound for a new fix task's suspect commit range.  None until the
         # first green run is observed.
@@ -771,7 +805,11 @@ class OfflineLaneWorker:
 
         Promotion is idempotent per fingerprint — a fingerprint already in
         :attr:`_promoted_blockers` returns immediately, so subsequent
-        same-set advances never re-promote.
+        same-set advances never re-promote.  Since task 5352 that holds across
+        restarts too, which is what the wording always claimed: the set used to
+        be process-local, so the ~8-15h fleet redeploy re-filed the same
+        blocker for the same stalled fix task on that cadence — a recurrence an
+        operator could not tell from a genuine one.
 
         Three arms, checked in order (done-clear and terminal-promote
         precede the count check, since a status query — when

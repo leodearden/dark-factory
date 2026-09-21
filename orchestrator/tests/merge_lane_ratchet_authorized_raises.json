@@ -55,6 +55,36 @@
           "current": 6775
         }
       ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: offline_lane.py's three red-path attributes become restart-durable guard_state facades (TTL constant, three persisted initialisers) and the falsified prose about process-local promotion idempotency is corrected in place.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 1152,
+          "current": 1190
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 612,
+          "current": 637
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55874,
+          "current": 55912
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31315,
+          "current": 31340
+        }
+      ]
     }
   ]
 }
