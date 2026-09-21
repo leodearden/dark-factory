@@ -2983,6 +2983,15 @@ async def _render_live_workflow_section(
     omitted — no silent truncation, mirroring the ``MAX_DONE_AUDIT_RENDERED``
     treatment below).
 
+    A clipped render also says so IN THE SECTION HEADER (``### Live-Workflow
+    Signals (probed the first 50 of 512 active tasks …)``), because the WARNING
+    and the safety argument below are both invisible to the reader that acts on
+    this payload.  Both stage prompts state the rule "absent from this section
+    ⇒ no live signal"; under a cap, absence acquires a second meaning — *past
+    the cap, never probed* — and the payload is the only place that can
+    disclose which one applies.  The header is bare when nothing was clipped,
+    so the common case reads exactly as before.
+
     Capping here is SAFE.  This section is *advisory* input to the Stage 2 LLM
     about tasks it can see in the Active Task Tree, and that tree is rendered
     from the identical prefix slice (``render_active_section`` does
@@ -3019,7 +3028,11 @@ async def _render_live_workflow_section(
 
     Returns:
         A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
-        or ``''`` when no tasks are live.
+        or ``''`` when no tasks are live.  The header carries a
+        ``(probed the first N of M active tasks …)`` scope note when — and only
+        when — the fan-out cap clipped the input; see the fan-out cap
+        paragraph.  It stays a prefix of the bare header either way, so a
+        consumer grepping for ``'### Live-Workflow Signals'`` is unaffected.
     """
     if not tasks:
         return ''
@@ -3032,9 +3045,20 @@ async def _render_live_workflow_section(
     # "Fan-out cap" paragraph for why this is safe and why the prefix slice
     # (not render_active_section's visible_active) is the right bound.
     total_active = len(tasks)
+    header_scope = ''
     if total_active > MAX_ACTIVE_TASKS_RENDERED:
         omitted = total_active - MAX_ACTIVE_TASKS_RENDERED
         tasks = tasks[:MAX_ACTIVE_TASKS_RENDERED]
+        # Say so IN THE SECTION, not just in the log. Both stage prompts tell
+        # the LLM that absence from this section means "no live signal"; once
+        # the fan-out is capped, absence has a second meaning ("past the cap,
+        # never probed") that only the payload itself can disclose to the
+        # reader acting on it.
+        header_scope = (
+            f' (probed the first {MAX_ACTIVE_TASKS_RENDERED} of {total_active} '
+            f'active tasks — the same cap the Active Task Tree applies, so every '
+            f'task shown there was probed)'
+        )
         logger.warning(
             'reconciliation.live_workflow_render_capped: probed %d of %d active '
             'task(s); %d omitted by the MAX_ACTIVE_TASKS_RENDERED=%d cap (the '
@@ -3164,7 +3188,7 @@ async def _render_live_workflow_section(
     if not live_lines:
         return ''
 
-    return '### Live-Workflow Signals\n' + '\n'.join(live_lines) + '\n'
+    return f'### Live-Workflow Signals{header_scope}\n' + '\n'.join(live_lines) + '\n'
 
 
 class TaskKnowledgeSync(BaseStage):

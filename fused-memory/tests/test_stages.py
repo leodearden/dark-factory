@@ -15572,6 +15572,36 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         assert getattr(capped[0], 'rendered', None) == 5
         assert getattr(capped[0], 'omitted', None) == 7
 
+    @pytest.mark.asyncio
+    async def test_a_clipped_section_says_so_in_its_own_header(self, monkeypatch):
+        """(e) The payload discloses its own scope — the WARNING is not enough.
+
+        Both stage prompts tell the LLM that absence from this section means
+        "no live signal". Under a cap, absence has a second meaning — past the
+        cap, never probed — and the LLM reads the payload, not the renderer's
+        docstring or the operator's log. So the header itself has to carry the
+        qualification.
+        """
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        result, _probed = await self._render(self._tasks(60), monkeypatch)
+
+        header = result.splitlines()[0]
+        assert header.startswith('### Live-Workflow Signals'), header
+        assert str(MAX_ACTIVE_TASKS_RENDERED) in header and '60' in header, (
+            f'the header must name what was probed out of what: {header!r}'
+        )
+        assert 'probed' in header, header
+
+    @pytest.mark.asyncio
+    async def test_an_uncapped_section_keeps_the_bare_header(self, monkeypatch):
+        """(f) ...and the common case reads exactly as it did before the cap."""
+        result, _probed = await self._render(self._tasks(3), monkeypatch)
+
+        assert result.splitlines()[0] == '### Live-Workflow Signals', (
+            'an unclipped render must not acquire a scope note'
+        )
+
 
 class TestLiveWorkflowRenderIsNonBlocking:
     """The renderer must not pin the event loop while it shells out to git.
