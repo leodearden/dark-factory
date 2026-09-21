@@ -12,8 +12,19 @@ SCOPE — STRUCTURE ONLY, NEVER PROSE. Adopting the task-4095 precedent by name
 of guidance in both documents stays free to be rewritten, reordered or deleted.
 What is held is only that a payload literal the skill presents is one the parser
 accepts, and that a slug the policy document enumerates is one the code knows.
-Nothing about the vocabularies is hand-copied here — they are read off the same
-frozensets the codec validates against.
+Nothing about the SHADOW vocabularies is hand-copied here — they are read off the
+same frozensets the codec validates against.
+
+ONE EXCEPTION, and it guards a different failure. The ``scope-not-delivered``
+standing policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement
+with NO code side by ruling, so there is no frozenset to read its vocabulary off
+and this file's ``_CLOSURE_FORMS`` IS the specification rather than a copy of
+one. What that half holds is therefore ABLATION, not code/doc drift: the ruling
+has two homes — the policy document a human is pointed at, and the skill the
+watcher actually loads — and silent deletion from either leaves a ruling half
+the readership never sees. ``tests/scripts/test_line_pin_policy.py`` holds a
+two-home documentation policy exactly this way, with the same begin/end marker
+pair and the same refusal to assert on wording; the scope above is unchanged.
 
 COUNTER-EXAMPLES. The skill shows a REJECTED payload next to a good one, so a
 reader can recognise the shape that will be thrown away. Put
@@ -82,6 +93,28 @@ _QUOTED_ARGV = re.compile(
 #: to the next top-level heading.
 _SHADOW_SECTION = "## Shadow-mode standing-policy rulings (measurement only)"
 
+#: The standing-policy class ruled IN FORCE on 2026-09-21 — one token serving as
+#: both the class name and the marker slug, so the two cannot drift apart.
+_POLICY_CLASS = "scope-not-delivered"
+
+#: The two forms by which a `scope-not-delivered` record may be closed. Hand-
+#: written because the ruling gives this class no code side; see the module
+#: docstring for why that makes this a specification rather than a copy.
+_CLOSURE_FORMS: frozenset[str] = frozenset({"owned-successor", "explicit-wont-fix"})
+
+#: The marked span carrying the ruling, in each of its two homes. The opener is
+#: matched as a PREFIX, not as a whole comment, exactly as
+#: `tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN` is: both homes carry
+#: their extraction contract inside the opening comment, and pinning the `-->`
+#: would forbid that.
+_POLICY_BEGIN = f"<!-- {_POLICY_CLASS}:begin"
+_POLICY_END = f"<!-- {_POLICY_CLASS}:end -->"
+
+#: A closure-form bullet. HYPHENATED, and deliberately not `_SLUG_BULLET`: the
+#: policy vocabulary is spelled in hyphens and the codec vocabularies in
+#: underscores, so neither extractor can ever sweep up the other's tokens.
+_POLICY_BULLET = re.compile(r"^- `([a-z0-9-]+)`")
+
 
 def _read(path: pathlib.Path) -> str:
     assert path.is_file(), (
@@ -102,6 +135,67 @@ def _section(text: str, heading: str, level: str = "## ") -> str:
         len(lines),
     )
     return "\n".join(lines[start:end])
+
+
+def _marked_span(text: str, source: str) -> str:
+    """The body of the `scope-not-delivered` marked span in *text*.
+
+    Fails LOUDLY — never skips, never returns empty — on every shape that would
+    leave the guard pinning nothing: the opener absent, duplicated, unterminated
+    or inverted. Error shapes mirror
+    `scripts/tests/test_merge_state_vocabulary_consistency.py`, whose extractor
+    contract records why: an extractor that silently yields nothing turns every
+    downstream assertion green while holding nothing at all.
+    """
+    opens = text.count(_POLICY_BEGIN)
+    assert opens == 1, (
+        f"{source}: expected exactly one `{_POLICY_BEGIN}` marker, found {opens} "
+        f"(task 5723). This document is one of the two homes of the "
+        f"`{_POLICY_CLASS}` ruling; a missing opener means the ruling was "
+        f"deleted from it, and a second one means the span this guard reads is "
+        f"ambiguous."
+    )
+    closes = text.count(_POLICY_END)
+    assert closes == 1, (
+        f"{source}: expected exactly one `{_POLICY_END}` marker, found {closes} "
+        f"(task 5723) — the `{_POLICY_CLASS}` span is unterminated, so the rest "
+        f"of the file would be read as its body."
+    )
+
+    start = text.index(_POLICY_BEGIN)
+    end = text.index(_POLICY_END)
+    assert start < end, (
+        f"{source}: the `{_POLICY_END}` marker precedes `{_POLICY_BEGIN}` "
+        f"(task 5723) — the `{_POLICY_CLASS}` span is inverted and encloses "
+        f"nothing."
+    )
+    comment_close = text.find("-->", start)
+    assert comment_close != -1 and comment_close < end, (
+        f"{source}: the `{_POLICY_BEGIN}` comment is never closed with `-->` "
+        f"before the end marker (task 5723) — its own extraction-contract prose "
+        f"would be read as span content."
+    )
+    return text[comment_close + len("-->"):end]
+
+
+def _note_line(ruling_class: str, proposed_action: str) -> str:
+    """A hand-built `x_shadow_ruling:` line, keyed off the live wire spellings.
+
+    NOT rendered via `ShadowRuling.to_note_line`: that constructor validates on
+    construction and raises on a class outside `FIRST_TRANCHE_CLASSES`, so it
+    cannot produce the very payloads this guard needs the PARSER to reject. The
+    wire keys are still read off `PAYLOAD_WIRE_KEYS` rather than re-typed, for
+    the reason `test_payload_literals_are_json_objects_carrying_the_documented_keys`
+    records.
+    """
+    attributes = {
+        "ruling_class": ruling_class,
+        "proposed_action": proposed_action,
+        "evidence": "probe output quoted verbatim",
+        "confidence": 0.9,
+    }
+    payload = {wire: attributes[attribute] for wire, attribute in PAYLOAD_WIRE_KEYS.items()}
+    return f"{SHADOW_RULING_MARKER} {json.dumps(payload, sort_keys=True)}"
 
 
 def _fenced_payload_literals(text: str) -> tuple[list[str], list[str]]:
@@ -338,3 +432,81 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
             f"exposes no callable main() — the command it tells the operator to "
             f"run is not runnable."
         )
+
+
+# ---------------------------------------------------------------------------
+# The `scope-not-delivered` standing policy, in both of its homes
+# ---------------------------------------------------------------------------
+
+
+def test_the_policy_document_enumerates_both_closure_forms():
+    """The policy document is the AUTHORITY for how such a record may be closed.
+
+    Structure only: the marker pair must be there and its bullets must open with
+    the two closure-form slugs. Every word of the guidance around them stays
+    free to be rewritten, exactly as the module docstring's scope says.
+    """
+    span = _marked_span(_read(POLICY), str(POLICY.relative_to(REPO_ROOT)))
+    documented = {m.group(1) for line in span.splitlines() if (m := _POLICY_BULLET.match(line))}
+
+    assert documented == _CLOSURE_FORMS, (
+        f"the `{_POLICY_CLASS}` span in {POLICY.relative_to(REPO_ROOT)} and the "
+        f"closure forms this guard specifies have drifted.\n"
+        f"  documented but not a closure form: {sorted(documented - _CLOSURE_FORMS)}\n"
+        f"  a closure form but undocumented: {sorted(_CLOSURE_FORMS - documented)}"
+    )
+
+
+def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
+    """Leo's ruling enforced against the LIVE codec, not merely restated.
+
+    `scope-not-delivered` is "a policy statement, not a shadow-measured autonomy
+    grant": it constrains HOW such a record may be closed, by anyone, and grants
+    nobody authority to close one. Adding it to `FIRST_TRANCHE_CLASSES` is
+    exactly what would invert that — membership there is what makes a class
+    stampable — so the un-stampability is checked BEHAVIOURALLY, by driving the
+    documented tokens through `parse_shadow_ruling`.
+
+    The tokens are read back OUT of the document: `_marked_span` succeeding is
+    what proves the class token is in it, and the closure forms come from its
+    bullets. So the guard binds the document rather than its own constants.
+    """
+    span = _marked_span(_read(POLICY), str(POLICY.relative_to(REPO_ROOT)))
+    documented = {m.group(1) for line in span.splitlines() if (m := _POLICY_BULLET.match(line))}
+    assert documented, (
+        f"non-vacuity: the `{_POLICY_CLASS}` span carries no closure-form bullet, "
+        f"so the rejections below would be asserted about nothing."
+    )
+
+    valid_class = sorted(FIRST_TRANCHE_CLASSES)[0]
+    valid_action = sorted(REVERSIBLE_ACTIONS)[0]
+    assert isinstance(parse_shadow_ruling(_note_line(valid_class, valid_action)), ShadowRuling), (
+        "positive control: a payload built the same way from the live vocabularies "
+        "must PARSE. Without it a typo in `_note_line` would reject everything and "
+        "the three rejections below would pass while proving nothing."
+    )
+
+    assert parse_shadow_ruling(_note_line(_POLICY_CLASS, valid_action)) is None, (
+        f"the live codec ACCEPTS `{_POLICY_CLASS}` in the `class` slot. That turns "
+        f"a constraint on how a record may be closed into a candidate for closing "
+        f"one autonomously — the inversion Leo's 2026-09-21 ruling forbids."
+    )
+    for form in sorted(documented):
+        assert parse_shadow_ruling(_note_line(valid_class, form)) is None, (
+            f"the live codec ACCEPTS the closure form `{form}` in the "
+            f"`proposed_action` slot. A closure form is a policy vocabulary, not a "
+            f"reversible action the shadow measurement proposes and scores."
+        )
+
+    for token in sorted({_POLICY_CLASS} | documented):
+        for name, vocabulary in (
+            ("FIRST_TRANCHE_CLASSES", FIRST_TRANCHE_CLASSES),
+            ("REVERSIBLE_ACTIONS", REVERSIBLE_ACTIONS),
+            ("HUMAN_FOREVER_GATES", HUMAN_FOREVER_GATES),
+        ):
+            assert token not in vocabulary, (
+                f"`{token}` has joined escalation.shadow_ruling.{name}. This class "
+                f"has no code side by ruling; a frozenset member here is a "
+                f"shadow-measurement vocabulary, which is the one thing it must "
+                f"not become."
+            )
