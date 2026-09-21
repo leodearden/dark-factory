@@ -1567,6 +1567,72 @@ class TestGuardedAbortReportsWhatThePreflightCouldNotRepair:
         )
 
 
+def _failing_run(rc: int = 128, stderr: str = 'fatal: No rebase in progress?'):
+    """A runner whose abort FAILS, spawning nothing.
+
+    The two cases below must differ ONLY in what is on disk, so the abort's
+    exit code is held fixed here rather than coming from a real git.
+    """
+    async def run(cmd, cwd=None, **kwargs) -> tuple[int, str, str]:
+        return rc, '', stderr
+    return run
+
+
+@pytest.mark.asyncio
+class TestGuardedAbortLogsOnlyAWedgedFailure:
+    """A non-zero abort has two meanings, and only one is worth waking anyone.
+
+    ``git rebase --abort`` exits non-zero when it could not undo an interrupted
+    rebase AND when there was no rebase to undo.  The second is routine -- a
+    defensive abort, or a rebase that failed BEFORE starting one (an unstaged
+    change, a bad revision) -- and ``advance_main`` takes exactly that path.
+    Warning there would cry wolf on a common route and assert a half-applied
+    tree that does not exist.
+
+    The pair below is the discriminator: the SAME failing abort against two
+    worktrees that differ only in whether the operation is still on disk.
+    """
+
+    async def test_a_failed_abort_over_a_live_rebase_is_logged(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        assert (repo / '.git' / 'rebase-merge').exists(), (
+            'fixture expected an interrupted rebase'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            rc, _, _ = await rebase_recovery.guarded_abort(
+                'rebase', repo, _failing_run(),
+            )
+
+        assert rc == 128
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'STILL THERE' in logged, logged
+        assert '128' in logged, logged
+
+    async def test_a_failed_abort_with_nothing_to_abort_is_silent(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The case the git_ops divergence canary caught: no rebase, no alarm."""
+        repo, _ = build_mid_rebase_repo(tmp_path)
+        _git_ok(repo, *rebase_recovery.RECOVERY_GIT[1:], 'rebase', '--abort')
+        assert not (repo / '.git' / 'rebase-merge').exists(), (
+            'fixture expected a clean worktree; without that this case cannot '
+            'discriminate'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            rc, _, _ = await rebase_recovery.guarded_abort(
+                'rebase', repo, _failing_run(),
+            )
+
+        assert rc == 128, 'the failure still reaches the caller unchanged'
+        assert [r.getMessage() for r in caplog.records] == [], (
+            'an abort that found nothing to abort is not a wedged worktree'
+        )
+
+
 class TestGitOpsAbortUniformity:
     """SPOT, enforced against the FILE rather than against known call sites."""
 

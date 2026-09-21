@@ -1019,6 +1019,12 @@ async def guarded_abort(
     then hands on is half-applied rather than clean.  Logging cannot make such
     a caller correct — it makes the failure legible instead of silent, which
     is the fail-soft floor this module holds everywhere else.
+
+    Only a WEDGED failure is logged, not every non-zero abort: git exits
+    non-zero just as readily because there was nothing to abort, which is the
+    ordinary outcome of a defensive abort and of a rebase that failed before
+    starting one.  :func:`_operation_still_in_progress` separates the two, and
+    it runs only on the failure path.
     """
     result = await asyncio.to_thread(preflight_rebase_recovery, cwd)
     if result.verdict == VERDICT_BLOCKED:
@@ -1028,11 +1034,11 @@ async def guarded_abort(
             verb, cwd, '; '.join(result.unrepaired),
         )
     rc, out, err = await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
-    if rc != 0:
+    if rc != 0 and await asyncio.to_thread(_operation_still_in_progress, cwd):
         logger.warning(
-            'git %s --abort FAILED in %s (rc %d): %s. The worktree is NOT '
-            'clean: whatever the abort was undoing is still on disk, so any '
-            'step that runs next sees a half-applied tree.',
+            'git %s --abort FAILED in %s (rc %d) and the interrupted operation '
+            'is STILL THERE: %s. The worktree is not clean, so any step that '
+            'runs next sees a half-applied tree.',
             verb, cwd, rc, (err or out or '').strip() or '(no output)',
         )
     return rc, out, err
@@ -1041,6 +1047,37 @@ async def guarded_abort(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+#: Files and directories whose PRESENCE means git has an interrupted operation
+#: to undo.  Checked only AFTER a failed abort, where they are what separates
+#: "the abort did not clean up" from "there was nothing to abort" -- two states
+#: git reports with the same non-zero exit.
+_IN_PROGRESS_MARKERS = (
+    'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD',
+)
+
+
+def _operation_still_in_progress(worktree: Path) -> bool:
+    """Does *worktree* still carry an interrupted git operation?
+
+    Answers the question a failed abort cannot: ``git rebase --abort`` exits
+    non-zero BOTH when it could not undo an interrupted rebase AND when there
+    was no rebase to undo ("fatal: No rebase in progress?").  Only the first is
+    a wedged worktree; the second is the ordinary outcome of aborting
+    defensively, or of a rebase that failed BEFORE it started one (an unstaged
+    change, a bad revision).  Warning about the second would cry wolf on a
+    routine path and, worse, assert a half-applied tree that does not exist.
+
+    Unresolvable answers TRUE: a worktree this cannot inspect is unknown, and
+    an unknown one is reported rather than passed over in silence -- the same
+    direction every other degraded answer in this module takes.
+    """
+    dirs = resolve_git_dirs(worktree)
+    if dirs is None:
+        return True
+    git_dir, _ = dirs
+    return any((git_dir / marker).exists() for marker in _IN_PROGRESS_MARKERS)
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
