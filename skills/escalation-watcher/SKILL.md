@@ -1341,6 +1341,17 @@ record's own pending status. If a probe fires, the ask flips from "human must de
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
 the record via amendment. This applies equally to `risk_identified` parks below.
 
+<!-- scope-not-delivered:begin the two closure forms and the worked example live in the policy
+     document named below and are deliberately NOT copied here: that document is their authority,
+     exactly as this skill is the authority for the six conditions it declines to copy back. Held
+     by tests/scripts/test_shadow_ruling_doc_contract.py. -->
+**A `scope-not-delivered` record closes only two ways.** That is a record stating that ONE ITEM of
+a task's scope was not deliverable by that task; it closes only by one of the two closure forms in
+`docs/escalation-standing-policy.md`, never by a bare accept. That policy is IN FORCE now (Leo,
+2026-09-21, esc-4811-3) — not one of the shadow-mode candidate classes further down this file —
+and it grants no one authority to close such a record.
+<!-- scope-not-delivered:end -->
+
 #### Standing rule: accept verified info-level design deviations (Leo, 2026-09-17)
 
 The watcher may close a `design_concern` itself, without parking it, **only when ALL of these
@@ -1390,6 +1401,8 @@ human can revoke this rule at any time.
 - **Excluded: esc-4811-3.** "Fixture expansion (plan item 4) is not deliverable" is a *scope item
   not delivered*, bearing on a reason behind the human's write_triage HOLD. That fails condition 6
   even though it is info-level and well-evidenced, and its task was blocked on it (condition 4).
+  It is a `scope-not-delivered` record, so how it may be closed is governed by the closure policy
+  above rather than by this rule.
 
 ### `risk_identified` (info)
 
