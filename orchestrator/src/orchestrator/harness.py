@@ -12320,9 +12320,13 @@ class Harness:
             # silently silence the backstop for a full min_interval_secs
             # window (task 2396, fleet-redeploy β; closes hole I2).
             # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
-            # from state_path on every process restart, so it can transiently
-            # lag the script's post-restart stamp by one fire — see
-            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
+            # from state_path on every process restart, so it can lag the
+            # script's post-restart stamp. That used to be described here and
+            # in StaleServiceRestartCoordinator's stamp_clock_on_fire
+            # docstring as "by one fire"; the 2026-08-24/25 measurement
+            # falsified it (it recurred every cycle), and the coordinator's
+            # in-flight fleet-redeploy lease gate is what now covers the race
+            # — see that docstring for the measurement.
             stamp_clock_on_fire=False,
         )
 
