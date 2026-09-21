@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -164,6 +165,17 @@ class _Repo:
 
     def stage(self, *relpaths: str) -> None:
         self.git('add', '--', *relpaths)
+
+    def attempt_commit(self, message: str) -> subprocess.CompletedProcess[str]:
+        """A real `git commit`, hooks and all, whose outcome is the assertion."""
+        return subprocess.run(
+            ['git', 'commit', '-m', message],
+            cwd=str(self.root),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
 
     def gate(self) -> subprocess.CompletedProcess[str]:
         """Drive the auditor through its real entry point, as the hook does."""
@@ -596,3 +608,136 @@ class TestLedgerIsAppendOnlyAtTheGate:
 
         assert result.returncode == 0, result.stderr
         assert result.stdout == '' and result.stderr == ''
+
+
+#: The four real files a miniature repo needs before its hooks mean anything.
+#: Copied VERBATIM rather than restated: if someone renames the auditor or drops
+#: the project-checks section, the copied hook stops refusing and these go red.
+_WIRED_FILES = (
+    'hooks/pre-commit',
+    'hooks/project-checks',
+    'scripts/merge_lane_metrics.py',
+    'scripts/check_staged_ratchet_raise.py',
+)
+
+
+def _hook_repo(tmp_path: Path) -> _Repo:
+    """A throwaway repo whose `git commit` runs THIS checkout's real hooks.
+
+    The hooks resolve their own repo root, so pointing a throwaway repo's
+    ``core.hooksPath`` at this checkout's ``hooks/`` would make project-checks
+    look for ``scripts/`` inside the throwaway and find nothing. Copying is what
+    makes the test pin the WIRING rather than a re-stated value.
+
+    The branch is switched BEFORE the hooks are installed, and is never main: on
+    main the copied project-checks goes on to run `uv run ruff check` against a
+    tmp repo with no packages. That this test only works on a non-main branch is
+    itself the reachability property the task is about.
+    """
+    repo = _Repo.seeded(tmp_path)
+    repo.git('switch', '--quiet', '-c', 'task/5722-gate')
+    for relpath in _WIRED_FILES:
+        target = repo.root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_REPO_ROOT / relpath, target)
+        target.chmod(0o755)
+    repo.git('config', 'core.hooksPath', 'hooks')
+    repo.commit_all('install the real hooks and the instrument')
+    return repo
+
+
+class TestTheHookActuallyRunsTheGate:
+    """A gate wired into a path nothing runs is the failure this task is about.
+
+    Both real incidents are MERGE commits onto main ("Merge task/5485 into
+    main", "Merge task/5675 into main"), and main is advanced by the merge
+    worker with `git update-ref`, which runs no hooks at all. Raises are
+    INTRODUCED by commits on task branches, so that is where a commit-time gate
+    has to bite -- and until this task, hooks/pre-commit returned 0 on every
+    branch that is not main, before project-checks was ever reached.
+    """
+
+    def test_an_unrecorded_rise_fails_the_commit_on_a_task_branch(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _hook_repo(tmp_path)
+        before = repo.git('rev-parse', 'HEAD')
+        repo.write_baseline(_report_with(_raise_lines))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.attempt_commit('absorb a rise nobody recorded')
+
+        assert result.returncode != 0
+        output = result.stdout + result.stderr
+        assert 'lines' in output and 'a.py' in output
+        assert '1000' in output and '1005' in output
+        assert metrics.RAISE_REMEDY in output
+        # It really REFUSED the commit rather than merely printing at it.
+        assert repo.git('rev-parse', 'HEAD') == before
+
+    def test_a_covering_ledger_append_commits_on_a_task_branch(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _hook_repo(tmp_path)
+        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_ledger(
+            _ledger_with(
+                _record([
+                    metrics._violation('lines', 'a.py', 1000, 1005),
+                    metrics._violation(
+                        'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
+                    ),
+                ])
+            )
+        )
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
+
+        result = repo.attempt_commit('authorize a net-additive raise')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_an_unrelated_commit_never_spawns_the_auditor(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _hook_repo(tmp_path)
+        (repo.root / 'unrelated.py').write_text('x = 1\n', encoding='utf-8')
+        repo.stage('unrelated.py')
+
+        result = repo.attempt_commit('an ordinary change')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        # The bash staged-path filter must short-circuit BEFORE python is
+        # spawned, so an ordinary commit pays nothing and is never ambushed.
+        assert 'ratchet' not in (result.stdout + result.stderr).lower()
+
+    def test_a_fall_commits_cleanly_on_a_task_branch(self, tmp_path: Path) -> None:
+        repo = _hook_repo(tmp_path)
+        repo.write_baseline(_report_with(_lower_lines))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.attempt_commit('lower a measure')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+class TestTheWiringIsStructurallyPinned:
+    """Read off THIS checkout's own hook files, so a rename cannot go unnoticed."""
+
+    def test_project_checks_audits_both_artifacts_through_the_auditor(self) -> None:
+        source = (_REPO_ROOT / 'hooks' / 'project-checks').read_text(encoding='utf-8')
+
+        assert metrics.BASELINE_RELPATH in source
+        assert metrics.LEDGER_RELPATH in source
+        assert 'scripts/check_staged_ratchet_raise.py' in source
+
+    def test_pre_commit_reaches_project_checks_on_every_branch(self) -> None:
+        source = (_REPO_ROOT / 'hooks' / 'pre-commit').read_text(encoding='utf-8')
+
+        # THE BLOCK THAT MADE THE GATE UNREACHABLE. It returned 0 on every
+        # branch that is not main, before project-checks was ever reached -- so
+        # a check placed there could only ever fire on a direct, non-merge
+        # commit made while main was checked out.
+        assert 'if [ "$branch" != "main" ]; then' not in source
+        # The branch is passed DOWN so the project applies its own per-check
+        # policy, rather than pre-commit deciding for it.
+        assert '"$ROOT/hooks/project-checks" "$ROOT" "$branch"' in source
