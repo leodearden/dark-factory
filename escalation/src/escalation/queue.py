@@ -673,7 +673,12 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked scans, all six reads routed through this helper:
+    FIXED -- the unlocked scans, all seven reads routed through this helper:
+    ``shadow_ruling.py::agreement_report`` (task 5374; the weekly shadow-ruling
+    count, which the watcher skill points at the LIVE ``data/escalations``
+    tree and which passes a WIDER ``parse_errors`` tuple than the default --
+    it adds ``ValueError`` so a truncated file's ``UnicodeDecodeError`` costs
+    one record rather than the whole measurement),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),

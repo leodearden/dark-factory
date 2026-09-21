@@ -208,6 +208,9 @@ SKILLS_CONSUMING_TESTS = (
     # Reads skills/unblock/SKILL.md to validate its done_provenance payload
     # literals against the live DoneProvenance model (task 4095).
     "tests/scripts/test_unblock_skill_done_provenance_templates.py",
+    # Reads skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
+    # payload literals against the live parser (task 5374).
+    "tests/scripts/test_shadow_ruling_doc_contract.py",
 )
 
 
