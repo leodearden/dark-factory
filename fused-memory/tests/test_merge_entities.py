@@ -1231,3 +1231,207 @@ class TestRedirectNodeEdgesPreservesExpiredAtLiveFalkorDB:
                     assert invalid_at is None
         finally:
             await backend.close()
+
+
+class _WriteCountingGraph:
+    """Delegating proxy that counts `query` (write channel) calls.
+
+    Lets a live test assert that a no-op path issues NO WRITES, which is a
+    stronger and more honest claim than "the graph looks unchanged" — the
+    latter also holds for a write that happened to write nothing.
+    """
+
+    def __init__(self, graph):
+        self._graph = graph
+        self.writes = 0
+
+    async def query(self, *args, **kwargs):
+        self.writes += 1
+        return await self._graph.query(*args, **kwargs)
+
+    async def ro_query(self, *args, **kwargs):
+        return await self._graph.ro_query(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._graph, name)
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestRedirectNodeMentionsLiveFalkorDB:
+    """Pin `redirect_node_mentions` — the MENTIONS sibling of
+    `redirect_node_edges` (task 4986 loss mode 1).
+
+    `redirect_node_edges` is RELATES_TO-typed in all three phases, and
+    `delete_entity_node` then issues a bare DETACH DELETE that destroys every
+    `(ep:Episodic)-[:MENTIONS]->(loser)` link. Nothing on the merge path
+    relocated them, so a merge silently destroyed the loser's episode
+    provenance. This primitive is what moves it.
+
+    It is a pure RELOCATION primitive: it never destroys. A loser link whose
+    episode is ALREADY on the survivor is SKIPPED and left in place — moving
+    it would duplicate the episode link, and deleting it would make the
+    primitive destructive. Provenance is the (episode, entity) PAIR, so
+    nothing is lost by leaving the redundant copy for the caller's own
+    DETACH DELETE to remove. That choice is also what makes a re-run after a
+    partial failure converge instead of double-counting.
+    """
+
+    @staticmethod
+    async def _seed(graph):
+        await graph.query(
+            "CREATE (:Entity {uuid: 'dep', name: 'Dep'}), "
+            "(:Entity {uuid: 'sur', name: 'Sur'}), "
+            "(:Episodic {uuid: 'ep1'}), "
+            "(:Episodic {uuid: 'ep2'}), "
+            "(:Episodic {uuid: 'ep3'})"
+        )
+
+    @staticmethod
+    async def _link(graph, episode, entity, link_uuid, created_at):
+        await graph.query(
+            'MATCH (ep:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+            'CREATE (ep)-[m:MENTIONS {uuid: $uuid, group_id: $gid, created_at: $created_at}]->(n)',
+            {'ep': episode, 'n': entity, 'uuid': link_uuid,
+             'gid': 'seeded-group', 'created_at': created_at},
+        )
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @staticmethod
+    async def _mentions_of(graph, entity_uuid):
+        """{episode_uuid: [(link_uuid, group_id, created_at, stamp), ...]}"""
+        result = await graph.query(
+            'MATCH (ep:Episodic)-[m:MENTIONS]->(n:Entity {uuid: $n}) '
+            'RETURN ep.uuid, m.uuid, m.group_id, m.created_at, m.reassigned_from_node_uuid',
+            {'n': entity_uuid},
+        )
+        out: dict[str, list] = {}
+        for ep_uuid, link_uuid, gid, created_at, stamp in result.result_set:
+            out.setdefault(ep_uuid, []).append((link_uuid, gid, created_at, stamp))
+        return out
+
+    @pytest.mark.asyncio
+    async def test_relocates_unlinked_episodes_and_skips_already_linked(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        # All three episodes mention the loser; ep1 ALSO already mentions the
+        # survivor — the collision case.
+        await self._link(graph, 'ep1', 'dep', 'm-ep1-dep', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep', '2026-01-01T00:00:02Z')
+        await self._link(graph, 'ep3', 'dep', 'm-ep3-dep', '2026-01-01T00:00:03Z')
+        await self._link(graph, 'ep1', 'sur', 'm-ep1-sur', '2026-01-01T00:00:04Z')
+
+        backend = self._backend(mock_config)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 2, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            # Episode provenance is now complete on the survivor, and no
+            # episode is linked twice.
+            assert sorted(sur_links) == ['ep1', 'ep2', 'ep3']
+            assert all(len(v) == 1 for v in sur_links.values()), sur_links
+
+            # The two MOVED links keep uuid/group_id/created_at verbatim and
+            # carry the relocation stamp.
+            for episode, link_uuid, created_at in (
+                ('ep2', 'm-ep2-dep', '2026-01-01T00:00:02Z'),
+                ('ep3', 'm-ep3-dep', '2026-01-01T00:00:03Z'),
+            ):
+                moved_uuid, gid, moved_created_at, stamp = sur_links[episode][0]
+                assert moved_uuid == link_uuid
+                assert gid == 'seeded-group'
+                assert moved_created_at == created_at
+                assert stamp == 'dep'
+
+            # The survivor's PRE-EXISTING ep1 link is untouched: original uuid,
+            # no stamp. It was never rewritten, only recognised.
+            pre_uuid, _, _, pre_stamp = sur_links['ep1'][0]
+            assert pre_uuid == 'm-ep1-sur'
+            assert pre_stamp is None
+
+            # The skipped link is NOT deleted: this primitive never destroys.
+            # The merge's own DETACH DELETE is what removes the redundant copy.
+            dep_links = await self._mentions_of(graph, 'dep')
+            assert sorted(dep_links) == ['ep1']
+            assert dep_links['ep1'][0][0] == 'm-ep1-dep'
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_second_call_is_a_no_op(self, mock_config, merge_entities_live_graph):
+        """Idempotent re-run: a crash partway through leaves some links already
+        moved, so retrying from the top must converge rather than double-count."""
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        await self._link(graph, 'ep1', 'dep', 'm-ep1-dep', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep', '2026-01-01T00:00:02Z')
+        await self._link(graph, 'ep3', 'dep', 'm-ep3-dep', '2026-01-01T00:00:03Z')
+        await self._link(graph, 'ep1', 'sur', 'm-ep1-sur', '2026-01-01T00:00:04Z')
+
+        backend = self._backend(mock_config)
+        try:
+            await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            again = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            # Only the skipped ep1 link is left on the loser, and it is still
+            # skipped — nothing moved twice.
+            assert again == {'redirected': 0, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            assert sorted(sur_links) == ['ep1', 'ep2', 'ep3']
+            assert all(len(v) == 1 for v in sur_links.values()), sur_links
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_same_episode_duplicate_links_collapse_to_one(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """Two links from the SAME episode to the loser collapse to one on the
+        survivor. This is what pins the existence probe INSIDE the loop: hoisted
+        above it, the probe would read 'not linked' once and move both."""
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep-a', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep-b', '2026-01-01T00:00:02Z')
+
+        backend = self._backend(mock_config)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 1, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            assert sorted(sur_links) == ['ep2']
+            assert len(sur_links['ep2']) == 1, sur_links
+            # The second link stayed on the loser rather than being destroyed.
+            dep_links = await self._mentions_of(graph, 'dep')
+            assert len(dep_links.get('ep2', [])) == 1
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_loser_with_no_mentions_writes_nothing(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+
+        backend = self._backend(mock_config)
+        spy = _WriteCountingGraph(backend._driver._get_graph(graph_name))
+        backend._driver._get_graph = MagicMock(return_value=spy)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 0, 'already_linked': 0}
+            assert spy.writes == 0, (
+                f'a loser with zero MENTIONS must issue no writes, got {spy.writes}'
+            )
+        finally:
+            await backend.close()
