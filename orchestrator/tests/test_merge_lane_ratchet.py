@@ -3552,6 +3552,11 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             '--reason',
             metrics.LEDGER_RELPATH,
             metrics.BASELINE_RELPATH,
+            # The MECHANISM NAME an agent greps for after being blocked. Until
+            # task 5722 this paragraph told them "what no gate can see is a
+            # baseline deleted first" -- which a gate now does see, so the
+            # sentence a blocked reader most needs was the one that was false.
+            'scripts/check_staged_ratchet_raise.py',
         ):
             assert fragment in metrics.RAISE_REMEDY, fragment
 

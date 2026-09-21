@@ -1091,12 +1091,20 @@ RAISE_REMEDY = (
     'task and the reason, so the raise lands as a diff a reviewer reads rather '
     'than as a number nobody saw move. Without those flags --write-baseline '
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
-    'place cannot widen the ratchet. What no gate can see is a baseline deleted '
-    'first, or written elsewhere and copied over: with nothing to compare '
-    'against, every frozen measure resets and every ceiling is re-grandfathered, '
-    'unrefused and unrecorded. That is not a way past this gate -- it is a '
-    'wholesale reset of the file, visible to nobody but the reviewer reading '
-    'the diff. --authorize-raise is the way past.'
+    'place cannot widen the ratchet. Nor can going around it: '
+    'scripts/check_staged_ratchet_raise.py runs in pre-commit on EVERY branch '
+    'and compares the STAGED baseline against the one in git HEAD, so a '
+    'baseline deleted first, written elsewhere and copied over, or hand-edited '
+    'is refused on the same terms as a regeneration -- and so is a commit that '
+    'drops or rewrites a recorded entry in the ledger. The one thing it lets '
+    'through deliberately is a RESTORE: staging a blob this path already '
+    'carried, which the repository has already reviewed.\n'
+    'RESIDUAL, so you do not trust more than is true: `git rebase` and merge '
+    'commits do not run pre-commit at all, and the merge worker advances main '
+    'with `git update-ref`, which runs no hooks. A raise introduced before this '
+    'guard existed and replayed across its introduction still reaches main '
+    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
+    'not this one. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
@@ -1306,16 +1314,21 @@ def write_baseline(
     outcome from the write itself rather than re-reading the ledger to guess.
 
     A MISSING destination is a first write with nothing to compare against, and
-    that is the gate's exact limit -- ``RAISE_REMEDY`` says so too, because the
-    agent reading it is the one most likely to go looking for the hole. Deleting
-    the committed baseline, or writing to a scratch path and copying it over,
-    resets every frozen measure and re-grandfathers every ceiling, unrefused and
-    unrecorded. Closing that would mean comparing against the copy in git HEAD:
-    a git dependency in an instrument that has none, plus a special case for the
-    commit that introduces the baseline, bought against a move that already
-    lands as a wholesale diff a reviewer cannot miss. The boundary is drawn
-    rather than overclaimed -- the write gate stops a raise being ABSORBED,
-    review stops a RESET.
+    that is THIS function's exact limit. Deleting the committed baseline, or
+    writing to a scratch path and copying it over, resets every frozen measure
+    and re-grandfathers every ceiling, and no amount of reading the destination
+    can see it.
+
+    THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
+    means comparing against the copy in git HEAD, which is a git dependency this
+    instrument still does not have: ``scripts/check_staged_ratchet_raise.py``
+    holds every git invocation, runs in pre-commit on every branch, and calls
+    ``compare_baseline_files`` here for the comparison itself, so there is one
+    definition of "did a measure rise" and only one file that knows what a
+    commit is. The boundary is still drawn rather than overclaimed -- the write
+    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
+    and neither sees a raise replayed by a rebase or landed by the merge
+    worker's hook-free ``update-ref``.
 
     A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
     rather than being overwritten: a previous baseline you cannot read is one
