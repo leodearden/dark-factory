@@ -18,11 +18,17 @@ Covers:
            promoted blocker) — one coupled subject keyed by one fingerprint.
   step-13: the scheduler's resurrection guard, which decides whether a
            re-pended task carries an age bonus it did not earn.
+  step-17: the offline lane's three sidecars diverging from each other —
+           one coupled subject, three files, no joint atomicity.
+  step-19: the steward's four guards being scoped to the TASK, not to the
+           process, so its two enumeration sites keep reading only its own
+           marks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -224,20 +230,106 @@ class TestStewardCapSurvivesRedeploy:
         assert 'esc-5352-1' not in redeployed._capped_escalations
         assert redeployed._retry_counts.get('esc-5352-1', 0) == 0
 
-    async def test_two_tasks_stewards_do_not_clobber_each_other(
+
+def _steward_for(make_steward, task_id: str, **kwargs):
+    return make_steward(
+        task={'id': task_id, 'title': 't', 'description': 'd'}, **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+class TestStewardGuardsAreTaskScoped:
+    """Durable is not the same as shared.
+
+    The four steward guards are keyed by escalation id alone, so one file per
+    counter is read by EVERY ``TaskSteward`` in the process: each one loads
+    every other task's marks at construction.  Membership tests survive that
+    (ids are unique), but the two ENUMERATION sites do not.
+
+    ``_log_capped_idle_once`` is reached from ``_next_escalation`` whenever the
+    filtered pending list is empty — the normal steady state for a HEALTHY
+    steward — so its ``if not self._capped_escalations`` early return stops
+    firing and the steward warns about a count and a list of ids belonging to
+    other tasks.  That line is the load-bearing incident signal from task
+    3170 whose success condition is SILENCE, and a shared file makes it fire
+    falsely for essentially every steward in the fleet as soon as any task
+    caps anything inside the TTL.  ``_watch_for_escalation`` meanwhile passes
+    one ``--exclude-id`` per capped id in the whole process to every watcher
+    subprocess, so its argv grows with a week of fleet-wide cap history for no
+    benefit.
+
+    This is the counterpart to ``TestStewardCapSurvivesRedeploy``: that class
+    pins WHEN the state is forgotten, this one pins WHO can see it, and the
+    last test here holds both at once.
+    """
+
+    async def test_another_task_s_cap_is_not_visible(self, make_steward, guard_clock):
+        _steward_for(make_steward, '43')._mark_capped('esc-43-7')
+
+        for_42 = _steward_for(make_steward, '42')
+
+        assert 'esc-43-7' not in for_42._capped_escalations
+        assert len(for_42._capped_escalations) == 0
+
+    async def test_a_steward_holding_no_caps_of_its_own_stays_silent(
+        self, make_steward, guard_clock, caplog,
+    ):
+        """Silence IS the signal, so the assertion is the absence of a record
+        rather than anything about its text."""
+        _steward_for(make_steward, '43')._mark_capped('esc-43-7')
+        for_42 = _steward_for(make_steward, '42')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            for_42._log_capped_idle_once()
+
+        assert caplog.records == [], (
+            'a steward that has capped nothing must not announce the '
+            'capped-only idle state'
+        )
+
+    async def test_the_watcher_argv_excludes_only_this_task_s_caps(
         self, make_steward, guard_clock,
     ):
-        """Every steward in the process shares one file per counter, so the
-        load-merge-write has to hold at the integration level too."""
-        for_42 = make_steward(task={'id': '42', 'title': 't', 'description': 'd'})
-        for_43 = make_steward(task={'id': '43', 'title': 't', 'description': 'd'})
-
+        _steward_for(make_steward, '43')._mark_capped('esc-43-7')
+        for_42 = _steward_for(make_steward, '42')
         for_42._mark_capped('esc-42-7')
-        for_43._mark_capped('esc-43-7')
 
-        redeployed = make_steward(task={'id': '42', 'title': 't', 'description': 'd'})
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (b'', b'')
+            mock_exec.return_value = proc
+            await for_42._watch_for_escalation()
+
+        cmd = list(mock_exec.call_args[0])
+        excluded = [cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == '--exclude-id']
+        assert excluded == ['esc-42-7'], f'got {cmd!r}'
+
+    async def test_another_task_s_counters_are_not_visible_either(
+        self, make_steward, guard_clock,
+    ):
+        """Not merely "unaffected by" — a steward must not be able to READ
+        another task's ladder at all."""
+        _steward_for(make_steward, '43')._retry_counts['esc-43-1'] = 3
+
+        for_42 = _steward_for(make_steward, '42')
+
+        assert for_42._retry_counts.get('esc-43-1', 0) == 0
+        assert len(for_42._retry_counts) == 0
+
+    async def test_scoping_does_not_weaken_durability(self, make_steward, guard_clock):
+        """The regression guard for the restart-durable property: narrowing
+        WHO shares the state must not shorten how long it lasts."""
+        for_42 = _steward_for(make_steward, '42')
+        for_42._mark_capped('esc-42-7')
+        for_42._retry_counts['esc-42-7'] = 3
+        _steward_for(make_steward, '43')._mark_capped('esc-43-7')
+
+        redeployed = _steward_for(make_steward, '42')
+
         assert 'esc-42-7' in redeployed._capped_escalations
-        assert 'esc-43-7' in redeployed._capped_escalations
+        assert redeployed._retry_counts.get('esc-42-7', 0) == 3
+        assert 'esc-43-7' not in redeployed._capped_escalations
 
 
 # ---------------------------------------------------------------------------
