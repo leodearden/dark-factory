@@ -136,26 +136,32 @@ def _refuse_unrecorded(
     ]
 
 
-def _restored_from(root: Path, staged_oid: str) -> str | None:
-    """The commit whose baseline blob *staged_oid* restores, or None.
+def _restores_previous_image(root: Path, staged_oid: str) -> str | None:
+    """The commit whose baseline blob *staged_oid* restores, if it is the LAST one.
 
-    RESTORING BYTES THIS PATH ALREADY CARRIED IS NOT A NEW RAISE. Reverting a
-    revert puts back an image the repository already reviewed and recorded, and
-    demanding a fresh authorization for it would make the honest move the
-    expensive one. Verified exact on the real revert: `3e7d55ce47:<baseline>`,
-    `5f577b9613^:<baseline>` and `52d98220ad:<baseline>` are all blob
-    a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191.
+    UNDOING THE LAST CHANGE TO THE BASELINE IS NOT A NEW RAISE. The path's
+    immediately-previous value is the state this repository held one commit ago,
+    so putting it back re-raises nothing the tree has not just been running
+    with, and demanding a fresh authorization to undo a revert would make the
+    honest move the expensive one. Verified on the real revert: `3e7d55ce47`
+    restored blob a0fb5cc8e0, which was the value at that path immediately
+    before 5f577b9613 replaced it with 0a42c2ee7d.
 
-    BLOB IDENTITY, not a per-measure high-water mark. A high-water rule also
-    exempts that revert, but it stays permissively open afterwards, so a later
-    re-raise back to an old high-water would go unrecorded.
+    ONE STEP BACK IS THE WHOLE RULE, and the bound is the point. An earlier
+    version of this function admitted any blob the path had EVER carried, which
+    is a wholesale ratchet reset wearing a carve-out's clothes: staging the
+    baseline from 60e954b608 was waved through "absorbing 97 measure(s)". A
+    per-measure high-water-mark rule was rejected for the same defect at a
+    different granularity -- both stay permissively open to every value the
+    ratchet has moved through, and returning to one re-absorbs every measure the
+    images in between lowered. One step back is bounded by construction.
 
     ``--full-history`` is load-bearing rather than decorative: git's default
-    history simplification omits commits from a path's log, which would silently
-    NARROW the carve-out and refuse a legitimate restore. And the enumeration
-    resolves ``<commit>:<baseline>`` rather than asking whether the object
-    exists, which is what scopes identity to this path -- a blob that happens to
-    sit elsewhere in the tree must not license a baseline.
+    history simplification omits commits from a path's log, so it could report
+    some older image as the previous one and WIDEN this rule. And the
+    enumeration resolves ``<commit>:<baseline>`` rather than asking whether the
+    object exists, which is what scopes identity to this path -- a blob that
+    happens to sit elsewhere in the tree must not license a baseline.
     """
     baseline = metrics.BASELINE_RELPATH
     commits = _git(
@@ -168,13 +174,20 @@ def _restored_from(root: Path, staged_oid: str) -> str | None:
         'cat-file',
         '--batch-check',
         stdin='\n'.join(f'{commit}:{baseline}' for commit in commits),
-    )
-    # One line per revision, in the order fed in: "<oid> <type> <size>", or
-    # "<revision> missing" where the path did not exist at that commit -- whose
-    # first field is the revision string, so it can never match an oid.
-    for commit, line in zip(commits, resolved.splitlines(), strict=False):
-        if line.split()[:1] == [staged_oid]:
-            return commit
+    ).splitlines()
+    head_oid = _blob_oid(root, f'HEAD:{baseline}')
+
+    # Newest first. Skip the run of entries still holding HEAD's blob -- those
+    # are commits that touched the path without changing its value -- and let
+    # the FIRST remaining entry answer, whatever it is. A `missing` line (the
+    # path was deleted, or did not yet exist) has the revision string as its
+    # first field, so it can never equal an oid: a deletion therefore ENDS the
+    # walk rather than being skipped, with no special case for it.
+    for commit, line in zip(commits, resolved, strict=False):
+        oid = line.split()[:1]
+        if oid == [head_oid]:
+            continue
+        return commit if oid == [staged_oid] else None
     return None
 
 
@@ -224,12 +237,19 @@ def _audit_baseline(
     if not raises:
         return []
 
-    restored = _restored_from(root, staged_oid)
+    restored = _restores_previous_image(root, staged_oid)
     if restored is not None:
+        # NAME WHAT CAME BACK, not just how much of it. A count tells a reviewer
+        # nothing about whether undoing the last change was the right move; the
+        # measures and keys are what they judge it on.
         print(
-            f'ratchet commit gate: {baseline} restores the blob recorded at '
-            f'this path by commit {restored}, absorbing {len(raises)} '
-            'measure(s) this repository has already reviewed. Allowed.'
+            '\n'.join([
+                f'ratchet commit gate: {baseline} restores the value this path '
+                f'held before commit {restored}, reabsorbing '
+                f'{len(raises)} measure(s). Allowed -- this is the state the '
+                'tree was running with one commit ago:',
+                *(f'  {violation.message}' for violation in raises),
+            ])
         )
         return []
 

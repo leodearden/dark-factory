@@ -816,14 +816,17 @@ class TestTheCarveOutIsOneStepBack:
         # The walk must STOP at the first entry that is not a blob rather than
         # skipping it: a commit that deleted the baseline is not a value the
         # path held, so what precedes it is not the previous value.
-        low, mid = self._image(0), self._image(4)
-        repo = _Repo.seeded(tmp_path, report=low)
+        # `high` is staged, so undoing back to it RAISES against HEAD's `mid`
+        # -- without that the comparator exits clean and the carve-out is never
+        # consulted at all, which would make this case vacuous.
+        high, mid = self._image(9), self._image(4)
+        repo = _Repo.seeded(tmp_path, report=high)
         repo.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
         repo.commit_all('delete the baseline')
         repo.write_baseline(mid)
         repo.commit_all('reintroduce a baseline')
 
-        repo.write_baseline(low)
+        repo.write_baseline(high)
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
@@ -843,7 +846,12 @@ class TestTheCarveOutIsOneStepBack:
         derived totals -- so the carve-out really does fire for it, and
         narrowing the rule must not take that away.
         """
-        previous, current = self._image(0), self._image(9)
+        # PREVIOUS IS THE HIGHER IMAGE, matching the real revert: 5f577b9613
+        # LOWERED the baseline and 3e7d55ce47 put the higher one back, so the
+        # restore is a RAISE and the carve-out is what lets it through. Were
+        # previous the lower image this would be a fall -- exit 0 without ever
+        # consulting the carve-out, and the case would pin nothing.
+        previous, current = self._image(9), self._image(0)
         repo = self._history(tmp_path, previous, current)
         repo.write_baseline(previous)
         repo.stage(metrics.BASELINE_RELPATH)
@@ -851,12 +859,14 @@ class TestTheCarveOutIsOneStepBack:
         result = repo.gate()
 
         assert result.returncode == 0, result.stderr
+        # Reached the carve-out rather than exiting clean as a fall.
+        assert 'restores the value this path held' in result.stdout
 
     def test_the_allowed_line_names_what_came_back(self, tmp_path: Path) -> None:
         # A COUNT IS NOT ENOUGH. A reviewer reading "absorbing 97 measure(s)"
         # learns nothing about what was reabsorbed; the measures and keys are
         # what let them judge whether undoing the last change was right.
-        previous, current = self._image(0), self._image(9)
+        previous, current = self._image(9), self._image(0)
         repo = self._history(tmp_path, previous, current)
         repo.write_baseline(previous)
         repo.stage(metrics.BASELINE_RELPATH)
@@ -866,3 +876,4 @@ class TestTheCarveOutIsOneStepBack:
         assert result.returncode == 0, result.stderr
         assert 'lines' in result.stdout
         assert 'a.py' in result.stdout
+        assert '1009' in result.stdout
