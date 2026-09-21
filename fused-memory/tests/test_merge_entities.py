@@ -907,7 +907,7 @@ class TestFindDuplicateEntityNodes:
         positions = [order_clause.find(k) for k in keys]
         assert all(pos != -1 for pos in positions), (
             f'every ordinal-checked key must be PRESENT in the clause, else the '
-            f'ordering assertion passes by absence: {dict(zip(keys, positions))} '
+            f'ordering assertion passes by absence: {dict(zip(keys, positions, strict=True))} '
             f'in {order_clause!r}'
         )
         assert positions == sorted(positions), (
@@ -1687,9 +1687,13 @@ class TestRedirectNodeMentionsLiveFalkorDB:
         graph_name, graph = merge_entities_live_graph
         await self._seed(graph)
 
-        backend = self._backend(mock_config)
-        spy = _WriteCountingGraph(backend._driver._get_graph(graph_name))
-        backend._driver._get_graph = MagicMock(return_value=spy)
+        # Hold the driver concretely: backend._driver is Optional, and the spy
+        # has to be installed on the same object the backend will read through.
+        driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend(mock_config)
+        backend._driver = driver
+        spy = _WriteCountingGraph(driver._get_graph(graph_name))
+        driver._get_graph = MagicMock(return_value=spy)
         try:
             result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
             assert result == {'redirected': 0, 'already_linked': 0}

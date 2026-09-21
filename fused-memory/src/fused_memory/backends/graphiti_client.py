@@ -3763,7 +3763,8 @@ class GraphitiBackend:
           nodes, it never creates one.
         - 1 match: returns that node's uuid directly (pure resolve, no writes).
         - >=2 matches: collapses duplicates via find_duplicate_entity_nodes
-          (already survivor-first: edge_count DESC, created_at ASC, uuid ASC)
+          (already survivor-first: provenance_rank DESC, created_at ASC,
+          uuid ASC, where provenance_rank is edge_count + mentions_count)
           and merge_entities, folding every non-canonical duplicate into the
           survivor. Returns the survivor's uuid.
 
