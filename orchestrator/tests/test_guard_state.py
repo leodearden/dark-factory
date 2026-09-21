@@ -81,8 +81,13 @@ class TestPersistentSetSemantics:
         """
         s = PersistentSet(None, ttl=_TTL)
         s.update(['m1', 'm2'])
-        assert s == {'m1', 'm2'}
-        assert {'m1', 'm2'} == s
+        plain = {'m1', 'm2'}
+        assert s == plain
+        # Bound to a local rather than written inline so the reflected
+        # direction — the one that exercises `set.__eq__` returning
+        # NotImplemented and Python retrying ours — is not a lint-flagged
+        # Yoda condition.
+        assert plain == s
 
     def test_empty_equals_plain_empty_set(self):
         assert PersistentSet(None, ttl=_TTL) == set()
@@ -150,8 +155,10 @@ class TestPersistentMapSemantics:
         """``assert worker.open_fix_tasks == {}`` in test_offline_lane.py
         depends on this; ``Mapping.__eq__`` supplies it."""
         m = PersistentMap(None, ttl=_TTL)
-        assert m == {}
-        assert {} == m
+        empty: dict[str, str] = {}
+        assert m == empty
+        assert empty == m
         m['k'] = 'v'
-        assert m == {'k': 'v'}
-        assert {'k': 'v'} == m
+        filled = {'k': 'v'}
+        assert m == filled
+        assert filled == m
