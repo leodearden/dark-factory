@@ -66,6 +66,10 @@ class _ThreadProbeQueue(EscalationQueue):
         self._record('get_pending')
         return super().get_pending()
 
+    def get(self, escalation_id):
+        self._record('get')
+        return super().get(escalation_id)
+
     def _recover_seq_from_disk(self, key):
         # The method that actually SCANS, rather than ``make_id`` around it:
         # ``make_id`` also fires on the counter-present path, where there is no
@@ -395,3 +399,113 @@ class TestConcurrentMintsUnderOneKey:
         assert {rec.summary for rec in on_disk.values()} == {
             'first concurrent filing', 'second concurrent filing',
         }
+
+
+PROMOTE_ROOT_CAUSE = 'falkordb connection pool exhausted'
+
+
+def _file_member_l1s(queue: EscalationQueue, *ids: str) -> list[str]:
+    """Submit one pending L1 per id at severity ``'info'`` and return the ids.
+
+    ``'info'`` rather than the default, because it is what makes the
+    derivation OBSERVABLE: ``_derive_l2_severity`` returns max(member
+    severities), and the create path fails safe UP to ``'blocking'`` when the
+    members say nothing.  Only an inherited value that is NOT ``'blocking'``
+    distinguishes "the derivation ran" from "the derivation was skipped".
+
+    Ids are explicit so no ``.seq`` counter is written and the setup cannot
+    perturb what the mint under test observes.
+    """
+    for esc_id in ids:
+        queue.submit(Escalation(
+            id=esc_id, task_id=MINT_KEY, agent_role='implementer',
+            severity='info', category='design_concern',
+            summary=f'member {esc_id} saw a refused connection', level=1,
+        ))
+    return list(ids)
+
+
+@pytest.mark.asyncio
+class TestPromoteScanThread:
+    async def test_promote_reads_do_not_run_on_the_loop_thread(self, tmp_path):
+        """BOTH of ``promote_to_l2``'s queue reads, and the answer they produce.
+
+        ``get`` is reached by ``_derive_l2_severity`` once per member and can
+        itself trigger a targeted archive rglob via ``_locate_path``;
+        ``get_pending`` is reached by ``find_pending_l2_by_root_cause``, which
+        scans the whole root.  Both are hopped as ONE unit, so both probes are
+        asserted together.
+        """
+        queue = _ThreadProbeQueue(tmp_path / 'esc')
+        member_ids = _file_member_l1s(queue, 'esc-member-1', 'esc-member-2')
+        server = create_server(queue, startup_sweep=False)
+        # Only what the TOOL does is measured; the seeding above ran here.
+        queue.threads.clear()
+
+        result = await _promote(
+            server,
+            task_id=MINT_KEY,
+            agent_role='escalation-watcher-auto',
+            member_ids=member_ids,
+            root_cause=PROMOTE_ROOT_CAUSE,
+            evidence='both members name a refused connection',
+            options=['A: raise the pool ceiling', 'B: fail the lane'],
+            summary='one cluster, one cause',
+            # severity deliberately OMITTED — the derivation is the thing the
+            # `get` probe is measuring, and passing it would skip it entirely.
+        )
+
+        _assert_off_loop(queue, 'get')
+        _assert_off_loop(queue, 'get_pending')
+        assert result['status'] == 'created', result
+        # max(member severities), not the fail-safe 'blocking' — which is what
+        # proves _derive_l2_severity really ran on the worker rather than being
+        # skipped into the CREATE path's fail-safe.
+        assert result['severity'] == 'info', result
+
+
+@pytest.mark.asyncio
+class TestConcurrentPromotesStillMintOneL2:
+    async def test_two_promotes_of_one_root_cause_yield_exactly_one_l2(self, tmp_path):
+        """The find -> write sequence stays atomic with respect to THIS loop.
+
+        DETERMINISTIC rather than raced: under ``asyncio.gather`` both
+        coroutines reach their first ``await`` before either resumes, so an
+        unserialised implementation has both root-cause scans observe the
+        pre-state and both mint ``'created'``.  A duplicate L2 is a duplicate
+        HUMAN PAGE and nothing downstream folds it, which is why this site is
+        serialised where the ``escalate_*`` path deliberately is not.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        members_a = _file_member_l1s(queue, 'esc-member-1')
+        members_b = _file_member_l1s(queue, 'esc-member-2')
+        server = create_server(queue, startup_sweep=False)
+
+        def _promote_one(member_ids, summary):
+            return _promote(
+                server,
+                task_id=MINT_KEY,
+                agent_role='escalation-watcher-auto',
+                member_ids=member_ids,
+                # The SAME key, which is what must fold the second into the first.
+                root_cause=PROMOTE_ROOT_CAUSE,
+                evidence='a refused connection',
+                options=['A: raise the pool ceiling'],
+                summary=summary,
+            )
+
+        first, second = await asyncio.gather(
+            _promote_one(members_a, 'first cluster hypothesis'),
+            _promote_one(members_b, 'second cluster hypothesis'),
+        )
+
+        assert {first['status'], second['status']} == {'created', 'updated'}, (
+            f'both promotes minted their own L2: {first}, {second}'
+        )
+        l2s = [
+            path.stem
+            for path in queue.queue_dir.glob('esc-*.json')
+            if Escalation.from_json(path.read_text()).level == 2
+        ]
+        assert len(l2s) == 1, f'expected exactly one L2 on disk, found {l2s}'
+        assert first['id'] == second['id'] == l2s[0]
