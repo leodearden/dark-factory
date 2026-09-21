@@ -168,6 +168,30 @@ and the wrong one when you specifically need the MAIN checkout (`.taskmaster/`,
 `claim_warm_worktree`'s `project_root`). `skills/do/SKILL.md` owns that other
 derivation; take it from there rather than adapting this one.
 
+Knowing the root is not enough on its own: a root printed in some earlier turn
+does not reach inside a heredoc you write in a later one. Carry the anchor WITH
+the probe.
+
+<!-- anchored-probe-idiom:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py, which runs it from
+     a subdirectory holding no CLAUDE.md of its own and then runs it AGAIN with
+     the `cd` prefix stripped — the second run must fail with the
+     FileNotFoundError this subsection exists to stop. -->
+- **Anchor an ad-hoc probe**: `cd "$(git rev-parse --show-toplevel)" && python3 -c 'import pathlib; print(pathlib.Path("CLAUDE.md").read_text().splitlines()[0])'`
+<!-- anchored-probe-idiom:end -->
+
+Prefixing a probe this way puts every path inside it on repo-relative footing
+no matter which directory the call started in — including inside a
+`python3 - <<'PY'` heredoc, which is exactly where the sighting behind this
+subsection failed. The `cd` is scoped to that one command, it does not have to
+be re-derived per path, and it is cheaper than reasoning about where you
+currently are.
+
+Reach for it only when you need a Bash probe at all: the `Read`, `Glob` and
+`Grep` tools take repo-anchored paths and are not affected by the Bash cwd, so
+when they can answer there is nothing to anchor.
+
 ## Memory Usage
 
 ### When to read memory
