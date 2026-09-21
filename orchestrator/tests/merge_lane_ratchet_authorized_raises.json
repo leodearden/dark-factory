@@ -37,6 +37,24 @@
           "current": 31315
         }
       ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the offline lane's red-path wiring tests join the cross-guard suite; their private_reads rise because open_fix_tasks / _red_advance_counts / _promoted_blockers have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 35,
+          "current": 51
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6759,
+          "current": 6775
+        }
+      ]
     }
   ]
 }

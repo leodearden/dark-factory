@@ -14,6 +14,8 @@ files on disk.
 Covers:
   step-7: the steward's capped set and its three per-escalation counters.
   step-9: the merge worker's coalesce one-strike registry.
+  step-11: the offline lane's red-path state (open fix task, advance count,
+           promoted blocker) — one coupled subject keyed by one fingerprint.
 """
 
 from __future__ import annotations
@@ -360,3 +362,172 @@ class TestCoalesceDerailSurvivesRedeploy:
             _merge_request('4001', config),
         ) == 'coalesce_derailed_one_strike'
         assert not (tmp_path / 'data').exists(), 'nothing may reach disk'
+
+
+# ---------------------------------------------------------------------------
+# step-11 — the offline lane's red-path state
+# ---------------------------------------------------------------------------
+
+_CONFIRMED = ['t::a', 't::b']
+_WORKTREE = Path('/tmp/_offline-deep')
+
+
+def _fingerprint() -> str:
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+    return compute_failing_test_set_fingerprint(_CONFIRMED)
+
+
+def _offline_config(tmp_path: Path, **git_overrides):
+    from _orch_helpers import pydantic_spec
+
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.project_root = tmp_path
+    config.git = GitConfig(**git_overrides)
+    return config
+
+
+def _offline_worker(tmp_path: Path, config, *, fix_task_id: str = 'fix-1', status: str = 'in-progress'):
+    """A worker rooted at *config.project_root*, with its red-path collaborators.
+
+    ``escalation_queue.get_by_task`` returns nothing, so the pending-escalation
+    dedup can never be what suppresses a second blocker — only the worker's own
+    idempotency guard can, which is what these tests are about.
+    """
+    from orchestrator.offline_lane import OfflineLaneWorker
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(return_value='headsha')
+    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=_WORKTREE)
+
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value=fix_task_id)
+    task_client.get_status = AsyncMock(return_value=status)
+
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-offline-1'
+
+    worker = OfflineLaneWorker(
+        git_ops,
+        config,
+        lock_path=tmp_path / 'offline_lane.lock',
+        confirmation_runner=AsyncMock(return_value=list(_CONFIRMED)),
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    worker._last_green_head = 'GREEN'
+    return worker
+
+
+def _blocker_escalations(worker) -> list:
+    return [
+        call.args[0] for call in worker.escalation_queue.submit.call_args_list
+        if call.args[0].level == 2
+    ]
+
+
+@pytest.mark.asyncio
+class TestOfflineLaneRedStateSurvivesRedeploy:
+    """The three red-path attributes are ONE subject keyed by one fingerprint.
+
+    Persisting the counts without ``open_fix_tasks`` would be inert, not
+    merely incomplete: ``_handle_red_run`` branches on it, so an empty map
+    routes a restarted worker into ``_file_new_fix_task``, which files a
+    DUPLICATE task for a break already tracked and resets the advance count
+    to 1 before it can ever reach the promotion threshold.
+    """
+
+    async def test_a_restart_does_not_file_a_second_task_for_the_same_break(
+        self, tmp_path: Path, guard_clock,
+    ):
+        config = _offline_config(tmp_path)
+        first = _offline_worker(tmp_path, config)
+        await first._handle_red_run(_WORKTREE, 'HEAD1')
+        first.task_client.submit_fix_task.assert_awaited_once()
+
+        redeployed = _offline_worker(tmp_path, config)
+        await redeployed._handle_red_run(_WORKTREE, 'HEAD2')
+
+        redeployed.task_client.submit_fix_task.assert_not_awaited()
+        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
+            'fix-1', 'GREEN..HEAD2',
+        )
+
+    async def test_the_advance_count_accumulates_across_restarts(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """Three advances, three different workers: on main the count never
+        reaches the threshold if a redeploy lands between advances."""
+        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=3)
+
+        first = _offline_worker(tmp_path, config)
+        await first._handle_red_run(_WORKTREE, 'HEAD1')
+        second = _offline_worker(tmp_path, config)
+        await second._handle_red_run(_WORKTREE, 'HEAD2')
+        assert _blocker_escalations(second) == [], 'two advances must not promote'
+
+        third = _offline_worker(tmp_path, config)
+        await third._handle_red_run(_WORKTREE, 'HEAD3')
+
+        assert len(_blocker_escalations(third)) == 1
+
+    async def test_a_promoted_blocker_is_not_re_filed_after_a_restart(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The symptom an operator cannot tell from a genuine recurrence."""
+        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
+
+        first = _offline_worker(tmp_path, config)
+        await first._handle_red_run(_WORKTREE, 'HEAD1')
+        await first._handle_red_run(_WORKTREE, 'HEAD2')
+        assert len(_blocker_escalations(first)) == 1
+
+        redeployed = _offline_worker(tmp_path, config)
+        await redeployed._handle_red_run(_WORKTREE, 'HEAD3')
+
+        assert _blocker_escalations(redeployed) == []
+
+    async def test_the_done_clear_arm_is_durable(self, tmp_path: Path, guard_clock):
+        """A landed fix task must free the fingerprint on disk, so a genuine
+        LATER recurrence files a FRESH task rather than deduping against
+        state that no longer describes anything."""
+        config = _offline_config(tmp_path)
+        first = _offline_worker(tmp_path, config)
+        await first._handle_red_run(_WORKTREE, 'HEAD1')
+
+        lands = _offline_worker(tmp_path, config, status='done')
+        await lands._handle_red_run(_WORKTREE, 'HEAD2')
+
+        later = _offline_worker(tmp_path, config, fix_task_id='fix-2')
+        await later._handle_red_run(_WORKTREE, 'HEAD3')
+        later.task_client.submit_fix_task.assert_awaited_once()
+
+    async def test_an_empty_task_id_records_nothing_on_disk_either(
+        self, tmp_path: Path, guard_clock,
+    ):
+        """The task-2016 amendment, across the persistence change: a bogus
+        empty id must not become a key a later genuine recurrence dedups
+        against."""
+        config = _offline_config(tmp_path)
+        await _offline_worker(tmp_path, config, fix_task_id='')._handle_red_run(
+            _WORKTREE, 'HEAD1',
+        )
+
+        redeployed = _offline_worker(tmp_path, config)
+        assert _fingerprint() not in redeployed.open_fix_tasks
+        assert _fingerprint() not in redeployed._red_advance_counts
+
+    async def test_the_red_state_expires(self, tmp_path: Path, guard_clock):
+        """Past the TTL a fresh worker files a new task rather than deduping
+        against a fix task that has long since stopped being relevant."""
+        config = _offline_config(tmp_path)
+        first = _offline_worker(tmp_path, config)
+        await first._handle_red_run(_WORKTREE, 'HEAD1')
+
+        guard_clock[0] = _T0 + timedelta(days=15)
+
+        redeployed = _offline_worker(tmp_path, config, fix_task_id='fix-2')
+        await redeployed._handle_red_run(_WORKTREE, 'HEAD2')
+        redeployed.task_client.submit_fix_task.assert_awaited_once()
