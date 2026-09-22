@@ -1222,15 +1222,15 @@ one extra tool call; the alternative costs a turn and a misdiagnosis.
 
 THE SYMPTOM, so you recognise it instead of rewriting a script that was
 already correct. The interpreter reports your whole script as ONE line —
-`File "<string>", line 1` — with the statements space-joined, and raises
-`SyntaxError: invalid syntax`, or `IndentationError: unexpected indent` if
+line 1 of `<string>` — with the statements space-joined, and raises
+"SyntaxError: invalid syntax", or "IndentationError: unexpected indent" if
 the script opened with a newline. Nothing reports that the command was
 altered, so the natural reading is that your script is malformed. It is not.
 Re-issuing the same script ALONE runs it unchanged, and that is the
 one-command diagnostic: passes by itself, fails when chained, means you are
 looking at this and not at your code. Do not start editing the script.
 
-THE TRIGGER: a host `PreToolUse` hook on `Bash` rewrites many common
+THE TRIGGER: a host PreToolUse hook on `Bash` rewrites many common
 commands into another tool's equivalents, and when it rewrites ANY part of a
 command it re-serialises the WHOLE command onto one physical line, turning
 the newlines inside your `-c` argument into spaces. What it rewrites is
@@ -1241,7 +1241,7 @@ instead.
 
 Whether a file EXISTS does not protect you. A `head` of a missing `.md` file
 is rewritten exactly as a present one is; it then fails with
-`Error: No such file or directory (os error 2)` instead of `head`'s own
+"Error: No such file or directory (os error 2)" instead of `head`'s own
 message, and that non-zero exit short-circuits the `&&`, so your script never
 runs at all and you get no interpreter diagnostic.
 
