@@ -680,60 +680,103 @@ The merge procedure is iterative — don't assume one pass will be enough:
   **`merge_status` will never itself change for a coalesce-absorbed member** — nothing overwrites
   its `superseded` record (see above) — so `terminal_resumed` alone can starve forever even after
   the real merge lands. On every tick, alongside the `merge_status` check, also re-run the
-  [canonical ancestry check](#branch-on-main): break the instant it — or, once it reaches
-  rc=128-with-empty-marker, either landing signal below — reports landed. Only stop-and-report
-  once ancestry (and, where reached, both signals) is still not-landed when `terminal_resumed`'s
-  20-minute ceiling arrives; that final check is what "if it never lands" means below. This does
+  [canonical ancestry check](#branch-on-main): break the instant it — or, on the `coalesce-*` arm
+  under **either** rc=1 **or** rc=128-with-empty-marker, either landing signal below — reports
+  landed. Only stop-and-report once ancestry (and, where reached, both signals) is still not-landed
+  when `terminal_resumed`'s 20-minute ceiling arrives; that final check is what "if it never lands"
+  means below, and under rule 2b's veto it takes the landed-but-not-credited shape stated there
+  rather than a not-landed one. This does
   **not** contradict `accept_terminal`'s "do not spin here re-polling this same key": that rule
   governs the *first* loop, where exiting on `superseded` is exactly what gets you to the
   ancestry check. This governs the *resumed* loop, which is driven by that check, not by
   `merge_status`'s frozen state.
 
-  **Here an empty rc=128 marker search does NOT mean "not landed."** A coalesce train stacks its
-  members linearly and merges only the **tip** branch into main (`tip_branch=tip_req.branch`,
-  `orchestrator/src/orchestrator/merge_queue.py:12673`), so a non-tip absorbed member gets its
-  commits onto main with **no `Merge task/<TASK_ID> into main` marker of its own** — and its branch
-  is still deleted by cleanup, because it genuinely *is* an ancestor of main. rc=128-with-empty-marker
-  is thus the *expected* reading for a non-tip member, which is precisely the caller this bullet
-  serves; taking it as "not landed" would report a successful merge to the human as a failure and
-  leave the task un-flipped. So:
+  **Neither an empty rc=128 marker search nor rc=1 means "not landed" here.** A coalesce train
+  stacks its members linearly and merges only the **tip** branch into main (the `GroupMergeRequest`
+  carries `tip_branch=tip_req.branch`, set in
+  `orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`),
+  so a non-tip absorbed member gets its commits onto main with **no `Merge task/<TASK_ID> into main`
+  marker of its own**. And that tip is **rebased onto current main before the merge**, rewriting
+  every stacked commit's sha, while this member's own `task/<TASK_ID>` ref is never advanced to the
+  rewritten commits — so its ref keeps the pre-rebase shas, can never become an ancestor of main,
+  and `orchestrator/src/orchestrator/git_ops.py::GitOps._delete_branch_if_on_main` **retains** it
+  rather than deleting it: that cleanup deletes only a branch carrying no commits beyond main, and
+  `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by **sha** (`git rev-list
+  --count`), not by patch id, so a stale-by-rebase ref counts non-zero. **rc=1 is therefore the
+  common outcome for a non-tip member and rc=128 the rare one.** Taking either as "not landed"
+  would report a successful merge to the human as a failure and leave the task un-flipped.
+
+  **On the `coalesce-*` arm, [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the
+  superseded successor" rules 1–4 are the authority for what follows**; this bullet mirrors them so
+  the two files agree, and defers to them for anything it does not restate. So:
   - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
-  - Ancestry `rc=1` (the branch ref **exists** and its commits are genuinely not on main) means
-    only "not landed **yet**" — right after absorption the train (or successor) is typically
-    still in flight, so this round's commits have legitimately not reached main. It is **not**
-    evidence that the `superseded` hit is a stale prior-round record, and it is not a reason to
-    give up: disregard the raw `superseded`/`superseded_by` value as an action signal (do not
-    try to poll or follow it) and resume branch-handle polling **under the
-    [resumed-poll terminal set](#resumed-poll)**, which re-derives the real answer from ancestry
-    itself on every tick rather than from this frozen record. Stop-and-report only if rc=1 still
-    holds at that loop's 20-minute ceiling. Never resubmit here.
-  - **Only under rc=128-with-empty-marker**, do not conclude anything yet — and only here are
-    signals (a) and (b) consultable at all. There are exactly **two** affirmative landing
-    signals, and only these two:
+  - Ancestry `rc=1` (the branch ref **exists** and its commits are not ancestors of main) is
+    **not** a not-landed verdict on this arm. For a non-tip absorbed member it is the **normal and
+    permanent** post-landing state, per the mechanism above — not a "not landed *yet*", and never a
+    reason to resubmit. Disregard the raw `superseded`/`superseded_by` value as an action signal
+    (do not try to poll or follow it), resume branch-handle polling **under the
+    [resumed-poll terminal set](#resumed-poll)**, and on every tick consult the two landing signals
+    below, which are consultable under rc=1 on this arm exactly as they are under
+    rc=128-with-empty-marker. (**Outside** the `coalesce-*` arm — an `mr-*` successor, or no train
+    absorption anywhere in this task's history — rc=1 keeps its ordinary reading of "not landed
+    **yet**", the signals below do not apply, and stop-and-report only once rc=1 still holds at that
+    loop's 20-minute ceiling. Signal (a) is not even derivable there: there is no
+    `coalesce-<TIP_ID>-<hex>` id to parse a TIP_ID from.)
+  - There are exactly **two** affirmative landing signals, and only these two:
     **(a)** the **tip's** merge marker on main — `git log main --fixed-strings
-    --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H` (with a
-    `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight off it); and
-    **(b)** **this task's own scheduler status** having been flipped to `done`, which the
-    orchestrator does for every absorbed member once the train lands (`mark_member_done`,
-    `orchestrator/src/orchestrator/harness.py:1011`).
-  - Under rc=128-with-empty-marker only, either one saying landed → the merge succeeded; proceed
-    to step 8 with the train's advanced SHA as `done_provenance={"kind": "found_on_main",
-    "commit": "<sha>", "note": "absorbed into train <train_id>"}`. If the task is already `done`,
-    the flip happened for you — no write needed.
+    --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H`, where `<TIP_ID>` is parsed
+    off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix and the trailing `-`
+    plus 8 hex chars (`uuid.uuid4().hex[:8]`) — **not** a naive split on `-`, which breaks for any
+    hyphen-bearing tip id; and
+    **(b)** **this task's own scheduler status**, read fresh with
+    `get_task(id="<TASK_ID>", project_root="<PROJECT_ROOT>")`. The orchestrator flips it to `done`
+    for every absorbed member once the train lands
+    (`orchestrator/src/orchestrator/harness.py::mark_member_done`).
+  - **Under rc=128-with-empty-marker** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
+    **rule 2a** governs; follow it there rather than from here.
+  - **Under rc=1 on the `coalesce-*` arm** → merge-queue's **rule 2b** governs, and signal (b) is a
+    **veto, not a corroborator**. There is no self-stamp on this arm. Once signal (a) shows the tip
+    landed, re-read signal (b) fresh:
+    - `done` → the automatic flip already happened. Nothing to write; conclude landed and proceed to
+      cleanup.
+    - **Any other status — `pending`, `merge-deferred`, or anything else — means do not write,
+      ever.** `pending` is what
+      `orchestrator/src/orchestrator/harness.py::_revert_withheld_member` leaves behind once
+      `mark_member_done`'s `_delivered_checks_withhold` blocks the flip because the member's declared
+      capability is not verifiably on main — the member's **only** recovery edge. Stamping `done`
+      over it destroys that recovery edge, marks done a task whose declared capability is not
+      verifiably on main (which unblocks its dependents through the delivered-check dep-gate), and
+      races a scheduler re-dispatch of the same task.
+    Confirm by content anyway — it is what makes the eventual report accurate, not a licence to
+    write: `git cherry main task/<TASK_ID>` — the same patch-id test
+    `orchestrator/src/orchestrator/git_ops.py::GitOps.rebase_preserving_task_commits` uses to tell a
+    legitimate post-rebase dedup from a genuine commit wipe — prints `-` for each of this branch's
+    commits already patch-equivalent on main and `+` for one genuinely absent. Treat this member as
+    landed-by-content only when the output is **non-empty and every line starts with `-`**. **An
+    empty output is NOT landed** — a branch that never advanced past its creation point also prints
+    nothing, so `git cherry main task/<TASK_ID> | grep -q '^+' || echo landed` belongs to the same
+    unsound-idiom family this file bans elsewhere. **This content proof cannot discharge the veto:**
+    it proves this branch's commits are patch-equivalent on main, while the withhold gates on the
+    member's declared capability against the committed main tree — a different predicate an all-`-`
+    `git cherry` is fully compatible with, so a passing content check next to a non-`done` status is
+    exactly the split-brain, not a reason to stamp over it.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
-    (`_redrive_coalesce_members`, `orchestrator/src/orchestrator/merge_queue.py:12264`), which
-    also removes the train from the queue with nothing of yours on main. On queue-absence with
+    (`orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members`),
+    which also removes the train from the queue with nothing of yours on main. On queue-absence with
     neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
     20-minute ceiling **under the [resumed-poll terminal set](#resumed-poll)** — the
     orchestrator's re-drive lands it — never to flip the task.
 
-  Stop-and-report to the human in exactly two cases: under rc=128-with-empty-marker once both
-  signal (a) and signal (b) come back not-landed, or under rc=1 once the branch-handle polling
-  above has reached its ceiling. An rc=1 ancestry result is never overridden by signal (a),
-  signal (b), or queue-absence — signals (a)/(b) are consultable **only** under
-  rc=128-with-empty-marker.
+  **Stop-and-report to the human**, never resubmitting and never direct-merging, in these cases:
+  under rc=128-with-empty-marker once both signal (a) and signal (b) come back not-landed, or under
+  rc=1 once the branch-handle polling above has reached its 20-minute ceiling with the signals still
+  unresolved. **Under the veto the report is different:** if signal (a) shows the tip landed but
+  signal (b) still reads non-`done` at that ceiling, keep polling until then (the flip is
+  asynchronous, so the normal landed case reaches `done` within a tick or two and exits clean) and
+  then report it as **landed-but-not-credited** — citing the tip merge sha, the `git cherry` output
+  and the current status — never as "not landed", and never self-stamp.
 
 *Abandonment (`merge_cancel`):*
 
