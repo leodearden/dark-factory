@@ -38,6 +38,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 # The repo-wide `--import-mode=importlib` addopts keeps a test file's own
 # directory off sys.path, and scripts/tests/conftest.py inserts scripts/ but not
@@ -84,6 +86,20 @@ _OUTSIDE_SRC_ROOT = 'outside --src-root'
 _ITEM5_FAIL = 'FAIL  item 5'
 _ITEM5_PASS = 'PASS  item 5'
 _ITEM5_CLAUSE = 'Item 5 is'
+#: The probe's "which branch satisfied item 5" line, and the two branch names
+#: this file's fixtures can produce. Item 5 PASSes on evidence of two different
+#: KINDS — a swap the probe measured, and an option (b) that holds by
+#: construction — and `PASS  item 5` alone cannot tell an operator which ran.
+_BRANCH_JUDGE_TARGET = 'judge-module attach target'
+_BRANCH_SWAP = 'judge-side designation swap'
+
+#: The judge stand-in carrying BOTH halves of this codebase's option (b).
+_JUDGE_OPTION_B = 'option_b_end_to_end'
+
+#: The first line of the item-5 probe's OWN report, which the gate indents
+#: under its verdict. It is where :func:`_item5_note` stops reading.
+_PROBE5_REPORT_HEAD = 'write_triage attach-consumption probe'
+
 _TRIAGE_CONSUMES = 'consumes_designated_id'
 
 
@@ -704,6 +720,24 @@ def build_judge_prompt(content, candidates, footer_note=None, attach_target_id=N
 def parse_judge_verdict(raw):
     return _parse_bare_str(raw)
 """
+
+# THIS CODEBASE'S OPTION (b), END TO END — the only variant here that carries
+# BOTH halves of it. `by_id` above is the renderer: it lifts out whichever
+# candidate the caller named, which is all item 1 asks for. What no existing
+# variant carries is the CALLER — `judge_write`, which reads
+# `decision.canonical_id` and hands it over. That gap between "the renderer CAN
+# be told" and "something TELLS it" is exactly what item 5 exists to close, so
+# the fixture is built by ADDING the missing half to `by_id` rather than by
+# restating its rendering.
+_VARIANT_TAILS['option_b_end_to_end'] = _VARIANT_TAILS['by_id'] + r"""
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    build_judge_prompt(content, candidates, attach_target_id=attach_target_id)
+    return 'restated'
+"""
+
 
 # A valid option (b) whose module writes to stderr at IMPORT time. Measured on
 # the real checkout: importing the ref's tree emits a multi-line
@@ -2652,3 +2686,137 @@ class TestItemsTwoAndFourReadingIsNotRaceProne:
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert 'FAIL  item 4' in proc.stdout, proc.stdout[:4000]
         assert 'PASS  item 4' not in proc.stdout, proc.stdout[:4000]
+
+
+def _item5_note(stdout: str) -> str:
+    """The gate's OWN item-5 verdict block, stopping where the probe's starts.
+
+    The probe's report is indented under that verdict and names its branch
+    there too, so an assertion made against the whole of stdout would be
+    satisfied by the probe's copy alone and would prove nothing about what the
+    GATE said. What an operator reads first is the gate's line.
+    """
+    lines = stdout.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if _ITEM5_PASS in line or _ITEM5_FAIL in line
+        ),
+        None,
+    )
+    assert start is not None, stdout
+    block: list[str] = []
+    for line in lines[start:]:
+        if _PROBE5_REPORT_HEAD in line:
+            break
+        block.append(line)
+    return '\n'.join(block)
+
+
+class TestItemFiveNamesTheBranchThatSatisfiedIt:
+    """Item 5 PASSes on evidence of two different kinds, and must say which.
+
+    A judge-side designation swap is a MEASURED consumption result: the probe
+    drove the write twice and watched the attach follow. This codebase's option
+    (b) is not — announced target and attach target are one expression
+    (`decision.canonical_id`), so consumption holds BY CONSTRUCTION and no swap
+    ever ran. Both are sound, and both authorise flipping a production flag —
+    but on different evidence, and an operator reading a bare `PASS  item 5`
+    cannot tell which they are being handed.
+
+    The same pairing is also the false FAIL this class exists to prevent
+    recurring: measured on main before the judge-target branch landed, item 1
+    PASSed and item 5 reported a consumption defect the run had never measured,
+    re-blocking task 3169 on a correct fix.
+    """
+
+    def test_the_real_option_b_passes_item_5_and_names_its_branch(self, tmp_path):
+        """triage='band_top1' is the DEFAULT here, and that is the point.
+
+        Option (b) changes nothing in the triage module: `judge_write` already
+        holds the decision, so the whole remedy is two lines in the judge. A
+        gate that could only see a changed `triage_write` could never see it.
+        """
+        repo = _make_gate_repo(
+            tmp_path, judge=_JUDGE_OPTION_B, eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+        assert _BRANCH_JUDGE_TARGET in _item5_note(proc.stdout), proc.stdout
+
+    def test_a_measured_swap_names_its_own_branch_instead(self, tmp_path):
+        """The converse, without which the name above proves nothing.
+
+        A report that said "judge-module attach target" on every PASS would
+        carry no information at all.
+        """
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+        note = _item5_note(proc.stdout)
+        assert _BRANCH_SWAP in note, proc.stdout
+        assert _BRANCH_JUDGE_TARGET not in note, proc.stdout
+
+    @pytest.mark.parametrize(
+        'judge',
+        ['by_id', 'positional_target', 'required_keyword_only_target'],
+    )
+    def test_a_widened_judge_signature_alone_does_not_open_item_5(
+        self, tmp_path, judge,
+    ):
+        """A target parameter the judge never feeds is not consumption.
+
+        These are existing item-1 fixtures that carry an attach-target
+        parameter, paired with the default `triage='band_top1'`. None defines
+        `judge_write`, so nothing ever hands the renderer an id and the prompt
+        it builds is the one it would have built anyway.
+        """
+        repo = _make_gate_repo(tmp_path, judge=judge, eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_FAIL in proc.stdout, proc.stdout
+        assert _ITEM5_PASS not in proc.stdout, proc.stdout
+
+    def test_no_pre_existing_judge_variant_defines_judge_write(self):
+        """Every pairing written before this branch keeps its item-5 verdict.
+
+        Asserted once, here, rather than by re-running all 23 variants through
+        the gate: `judge_write` is the ONLY way a judge fixture can satisfy the
+        judge-target branch, so its absence is what makes every other pairing
+        inert. It also keeps the tests above honest — `test_main_shape_fails_item_5`
+        and `test_item_5_blocks_the_flip_on_its_own` both use `by_id`, and if a
+        later edit taught it to feed its own target they would silently stop
+        testing what they were written to test.
+        """
+        carriers = [
+            name
+            for name, tail in _VARIANT_TAILS.items()
+            if 'judge_write' in tail and name != _JUDGE_OPTION_B
+        ]
+        assert not carriers, carriers
+
+    def test_the_branch_name_survives_the_truncation_window(self, tmp_path):
+        """DeterministicRunner forwards the trailing 2000 characters only.
+
+        Item 5 is the LAST item checked, so a run where it passes and items 2
+        and 4 do not is both over the window and the case where the branch name
+        has to survive: that escalation is what an operator reads.
+        """
+        repo = _make_gate_repo(
+            tmp_path, judge=_JUDGE_OPTION_B, eval_src='failing',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Vacuous otherwise: a report that fits inside the window proves nothing.
+        assert len(proc.stdout) > _ESCALATION_DETAIL_CHARS, len(proc.stdout)
+        note = _item5_note(proc.stdout)
+        assert _BRANCH_JUDGE_TARGET in note, proc.stdout
+        assert note in proc.stdout[-_ESCALATION_DETAIL_CHARS:], proc.stdout
