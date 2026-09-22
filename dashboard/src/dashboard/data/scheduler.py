@@ -54,6 +54,15 @@ Shape contract (returned by collect_scheduler_state):
         the high-rate ``task_skipped`` fetch — otherwise skip rows could
         exhaust the budget and an empty tail would be projected as a confident
         zero.  See ``_RECOVERY_EVENTS_LIMIT`` for the full rationale.
+
+    degraded_projects: list[str]  — project labels whose state is UNKNOWN
+        because the whole-handler budget expired before they were read.
+
+        Deliberately its OWN element, never merged into ``offline_projects``:
+        offline means the read demonstrably FAILED (fused-memory is
+        unreachable), degraded means nothing was proven at all.  An operator
+        reading a degraded project as offline goes and restarts a healthy
+        fused-memory.  The two must never be collapsed.
 """
 
 from __future__ import annotations
@@ -66,7 +75,11 @@ import httpx
 from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
+from dashboard.data.active_tasks import (
+    _all_project_roots,
+    _project_label,
+    collect_tasks_with_counts,
+)
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
@@ -625,25 +638,26 @@ async def collect_scheduler_state(
     now: datetime | None = None,
 ) -> tuple[
     list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict],
-    dict[str, list[dict]],
+    dict[str, list[dict]], list[str],
 ]:
     """Fan out over all configured project roots and aggregate scheduler state.
 
     For each project root:
       - Calls ``get_scheduler_state`` and ``get_scheduler_events`` via
         ``mcp_tool_call``.
-      - Joins with ``collect_active_tasks`` output for task metadata and lock sets.
+      - Joins with ``collect_tasks_with_counts`` output for task metadata and
+        lock sets.
       - Composes rows, module contention list, and per-task event sparklines.
 
     *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
-    this aggregation boundary and threaded into ``collect_active_tasks``,
+    this aggregation boundary and threaded into ``collect_tasks_with_counts``,
     ``_compose_rows``, ``_stranded_park_rows``, and ``_skip_event_sparkline``
     (as ``until``), plus the 1-hour event-history ``since`` window — so every
     row and sparkline in one collection shares a single reference instant.
 
     Returns:
         ``(rows, modules, pin_queue, events_by_task, offline_projects,
-        paused_projects, recovery_events)``
+        paused_projects, recovery_events, degraded_projects)``
 
         rows:             Composed task rows (see module docstring).
         modules:          Sorted module-contention list.
@@ -658,12 +672,24 @@ async def collect_scheduler_state(
                           event that is NOT ``task_skipped``.  Present-with-``[]``
                           means the project answered and had no sweeps; ABSENT
                           means offline (see module docstring).
+        degraded_projects: Project labels whose state is UNKNOWN because the
+                          whole-handler budget expired before they were read.
+                          Offline means the read demonstrably FAILED; degraded
+                          means nothing was proven.  They must never be merged
+                          (see module docstring).
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
 
-    # Fetch active tasks (for lock sets and titles)
-    all_active, active_offline = await collect_active_tasks(client, config, now=effective_now)
+    # Fetch active tasks (for lock sets and titles).  Read through
+    # collect_tasks_with_counts rather than the narrower collect_active_tasks
+    # wrapper: this is the escape hatch that wrapper's own docstring names for
+    # callers that must distinguish "state unknown" from "reachable and empty".
+    # Drop-in — the wrapper already delegated here with these same defaults, so
+    # the MCP traffic, the shared `now` and the per-project budget are unchanged.
+    (
+        all_active, active_offline, _done_counts, degraded_projects, _count_unknown,
+    ) = await collect_tasks_with_counts(client, config, now=effective_now)
 
     offline_projects: list[str] = list(active_offline)
 
@@ -958,6 +984,7 @@ async def collect_scheduler_state(
         offline_projects,
         all_paused_projects,
         all_recovery_events,
+        degraded_projects,
     )
 
 
