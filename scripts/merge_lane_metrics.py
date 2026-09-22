@@ -101,7 +101,21 @@ class MetricsError(Exception):
 
     Always raised with the offending path / tool / version named in the message.
     Mapped to exit code 2 at the ``main()`` boundary, categorically apart from
-    the exit-1 "the tree regressed" outcome.
+    the exit-1 "the tree regressed" outcome. ``AppendOnlyViolation`` is the one
+    subclass that is a VERDICT rather than a fault, and it says so itself.
+    """
+
+
+class AppendOnlyViolation(MetricsError):
+    """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
+
+    A ``MetricsError`` subclass, so nothing that already catches one changes
+    behaviour; a DISTINCT type, because the two are read differently at a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
+    committer did something the ratchet forbids and can fix) and 2 for its
+    siblings (the gate could not do its job). Collapsing them would leave a
+    caller that reasonably treats 2 as "instrument down, retry or ignore"
+    waving a rewritten ledger through.
     """
 
 
@@ -1071,6 +1085,14 @@ def derive_totals(report: dict) -> dict[str, int]:
 BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
 LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
 
+#: The commit-time auditor the remedy tells a blocked agent about, named here
+#: rather than spelled into the prose. It is a REAL PATH a reader is sent to
+#: grep, it is frozen into the committed baseline's ``_README`` verbatim, and
+#: this instrument -- having no git dependency -- cannot notice it going stale.
+#: As a constant, ``TestTheBlockMessageNamesTheAuthorizedPath`` can assert it
+#: RESOLVES, which a bare string literal in the prose left unchecked.
+COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
+
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
 #: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
@@ -1091,12 +1113,25 @@ RAISE_REMEDY = (
     'task and the reason, so the raise lands as a diff a reviewer reads rather '
     'than as a number nobody saw move. Without those flags --write-baseline '
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
-    'place cannot widen the ratchet. What no gate can see is a baseline deleted '
-    'first, or written elsewhere and copied over: with nothing to compare '
-    'against, every frozen measure resets and every ceiling is re-grandfathered, '
-    'unrefused and unrecorded. That is not a way past this gate -- it is a '
-    'wholesale reset of the file, visible to nobody but the reviewer reading '
-    'the diff. --authorize-raise is the way past.'
+    'place cannot widen the ratchet. Nor can going around it: '
+    f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
+    'and compares the STAGED baseline against the one in git HEAD, so a '
+    'baseline deleted first, written elsewhere and copied over, or hand-edited '
+    'is refused on the same terms as a regeneration -- and so is a commit that '
+    'drops or rewrites a recorded entry in the ledger. The one thing it lets '
+    'through deliberately is UNDOING THE LAST CHANGE to the baseline: staging '
+    'the value this path held one commit ago, and nothing further back. That '
+    'is the state the tree was just running with, so putting it back re-raises '
+    'nothing new, and needing an authorization to undo a revert would make the '
+    'honest move the expensive one. Reaching FURTHER back is refused, because '
+    'every image in between is a value the ratchet moved through and returning '
+    'behind them re-absorbs every measure they lowered.\n'
+    'RESIDUAL, so you do not trust more than is true: `git rebase` and merge '
+    'commits do not run pre-commit at all, and the merge worker advances main '
+    'with `git update-ref`, which runs no hooks. A raise introduced before this '
+    'guard existed and replayed across its introduction still reaches main '
+    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
+    'not this one. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
@@ -1306,16 +1341,21 @@ def write_baseline(
     outcome from the write itself rather than re-reading the ledger to guess.
 
     A MISSING destination is a first write with nothing to compare against, and
-    that is the gate's exact limit -- ``RAISE_REMEDY`` says so too, because the
-    agent reading it is the one most likely to go looking for the hole. Deleting
-    the committed baseline, or writing to a scratch path and copying it over,
-    resets every frozen measure and re-grandfathers every ceiling, unrefused and
-    unrecorded. Closing that would mean comparing against the copy in git HEAD:
-    a git dependency in an instrument that has none, plus a special case for the
-    commit that introduces the baseline, bought against a move that already
-    lands as a wholesale diff a reviewer cannot miss. The boundary is drawn
-    rather than overclaimed -- the write gate stops a raise being ABSORBED,
-    review stops a RESET.
+    that is THIS function's exact limit. Deleting the committed baseline, or
+    writing to a scratch path and copying it over, resets every frozen measure
+    and re-grandfathers every ceiling, and no amount of reading the destination
+    can see it.
+
+    THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
+    means comparing against the copy in git HEAD, which is a git dependency this
+    instrument still does not have: ``scripts/check_staged_ratchet_raise.py``
+    holds every git invocation, runs in pre-commit on every branch, and calls
+    ``compare_baseline_files`` here for the comparison itself, so there is one
+    definition of "did a measure rise" and only one file that knows what a
+    commit is. The boundary is still drawn rather than overclaimed -- the write
+    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
+    and neither sees a raise replayed by a rebase or landed by the merge
+    worker's hook-free ``update-ref``.
 
     A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
     rather than being overwritten: a previous baseline you cannot read is one
@@ -1474,6 +1514,48 @@ def authorization_record(
     }
 
 
+
+def _record_measures(record: dict) -> list[dict]:
+    measures = record.get('measures')
+    if not isinstance(measures, list):
+        return []
+    return [measure for measure in measures if isinstance(measure, dict)]
+
+
+def unrecorded_raises(
+    raises: Sequence[Violation], records: Sequence[dict]
+) -> list[Violation]:
+    """The raises in *raises* that no entry in *records* names. Pure.
+
+    The inverse of ``authorization_record``, and placed beside it so the writer
+    and the auditor read a raise out of one field vocabulary (SPOT) rather than
+    two that can drift. Coverage is the triple ``(measure, key, current)``.
+
+    ``current`` is in the triple because it is the discriminator that actually
+    catches a stale or hand-written entry: such an entry names the right measure
+    and the right key while the baseline it accompanies landed somewhere else,
+    so a ``(measure, key)`` check would wave it through. ``baseline`` is
+    deliberately OUT of it: an agent who runs ``--write-baseline
+    --authorize-raise`` twice in one commit records ``b -> m`` and ``m -> f``,
+    while the HEAD-to-staged delta reads ``b -> f``, so requiring it to match
+    would refuse a correctly authorized commit.
+
+    A record whose ``measures`` is missing or not a list simply covers nothing:
+    a badly hand-edited ledger must REFUSE the commit, not crash the gate.
+    """
+    covered = {
+        (measure.get('measure'), measure.get('key'), measure.get('current'))
+        for record in records
+        for measure in _record_measures(record)
+    }
+    return [
+        violation
+        for violation in raises
+        if (violation.measure, violation.key, violation.current) not in covered
+    ]
+
+
+
 def empty_ledger() -> dict:
     """A ledger that has authorized nothing -- the day-one and fail-closed state."""
     return {
@@ -1552,7 +1634,11 @@ def append_authorization(path: Path, record: dict) -> Path:
     """Append one record to the ledger at *path*, preserving every prior entry.
 
     Append-only: history is never rewritten, so a reviewer reading the file
-    reads every raise this baseline has ever absorbed.
+    reads every raise this baseline has ever absorbed. That promise is about
+    every writer of the file, not only about this function, so it is CHECKED
+    rather than merely asserted -- ``ledger_appended_entries`` below is what
+    reads a staged ledger against its committed predecessor and refuses a
+    commit that dropped, rewrote or reordered any of it.
     """
     target = Path(path)
     ledger = load_ledger(target)
@@ -1560,6 +1646,55 @@ def append_authorization(path: Path, record: dict) -> Path:
     ledger['raises'] = [*ledger['raises'], record]
     safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
     return target
+
+
+def _common_prefix_length(previous: list, current: list) -> int:
+    """How many leading entries the two lists still agree on."""
+    return next(
+        (
+            index
+            # strict=False deliberately: the two lists have DIFFERENT
+            # lengths in every case this is asked about.
+            for index, (was, now) in enumerate(
+                zip(previous, current, strict=False)
+            )
+            if was != now
+        ),
+        min(len(previous), len(current)),
+    )
+
+
+def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
+    """The entries *current* adds to *previous*, refusing any rewrite of history.
+
+    The reader half of ``append_authorization``'s append-only promise, and the
+    only thing that makes that promise checkable: the writer can only keep it
+    for its own writes, while the file is edited by rebases, merges and hands.
+    *previous* must be a PREFIX of *current* -- length equality is not prefix
+    equality, so an entry rewritten in place is refused exactly like a dropped
+    one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
+    rather than a bare ``MetricsError`` so a caller can tell this VERDICT apart
+    from an instrument failure at its own exit boundary.
+
+    Pure: two loaded dicts in, the suffix out. The caller decides where the two
+    images came from, which is what keeps every git invocation in
+    ``scripts/check_staged_ratchet_raise.py`` and none of it here.
+    """
+    previous_raises = list(previous.get('raises', ()))
+    current_raises = list(current.get('raises', ()))
+    if current_raises[: len(previous_raises)] != previous_raises:
+        kept = _common_prefix_length(previous_raises, current_raises)
+        raise AppendOnlyViolation(
+            'the authorized-raise ledger is append-only, and this change '
+            f'rewrites its history: {len(previous_raises) - kept} of its '
+            f'{len(previous_raises)} recorded entr(ies) are no longer where '
+            f'they were recorded (the staged file holds {len(current_raises)}). '
+            'Dropping, editing or reordering a recorded raise is what makes the '
+            'ledger stop reading as the provenance of every raise this baseline '
+            'has ever absorbed. Append a new entry with --authorize-raise '
+            'instead of touching a recorded one.'
+        )
+    return current_raises[len(previous_raises) :]
 
 
 # ---------------------------------------------------------------------------
@@ -1586,18 +1721,37 @@ class Violation:
     current: int
     message: str
 
+    @classmethod
+    def rose(
+        cls, measure: str, key: str, baseline: int, current: int
+    ) -> Violation:
+        """THE canonical constructor for a measured raise -- public, and on the type.
 
-def _violation(measure: str, key: str, baseline: int, current: int) -> Violation:
-    return Violation(
-        measure=measure,
-        key=key,
-        baseline=baseline,
-        current=current,
-        message=(
-            f'{measure} rose {baseline} -> {current} for {key} -- the merge-lane '
-            'ratchet permits a measure to fall or hold, never to rise'
-        ),
-    )
+        ``message`` is composed HERE and nowhere else (SPOT), which is what
+        makes it the only honest way to build one: the ledger's ``measures``
+        vocabulary, ``unrecorded_raises``' coverage triple and the gate's
+        refusal lines all describe a raise in these terms, so a caller that
+        could not reach this would re-derive the wording and drift from it.
+        It was ``_violation`` until task 5722 -- a leading underscore on the
+        only constructor of a type this module hands out, which made every
+        test of the auditor reach past the module's public face.
+
+        A CLASSMETHOD rather than a module-level ``violation()``: ``main`` and
+        several siblings bind ``violation`` as a loop variable over a list of
+        them, so a module-level factory of that name would be shadowed inside
+        exactly the scopes most likely to want it.
+        """
+        return cls(
+            measure=measure,
+            key=key,
+            baseline=baseline,
+            current=current,
+            message=(
+                f'{measure} rose {baseline} -> {current} for {key} -- the '
+                'merge-lane ratchet permits a measure to fall or hold, never '
+                'to rise'
+            ),
+        )
 
 
 def _total_violation(measure: str, baseline: int, current: int) -> Violation:
@@ -1696,14 +1850,14 @@ def _check_files(current: dict, baseline: dict) -> list[Violation]:
         for measure in _SUMMED_FILE_MEASURES:
             was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
             if now > was:
-                violations.append(_violation(measure, path, was, now))
+                violations.append(Violation.rose(measure, path, was, now))
     return violations
 
 
 def _check_functions(current: dict, baseline: dict) -> list[Violation]:
     current_functions = _section(current, 'functions')
     return [
-        _violation('cognitive', key, int(was), int(current_functions[key]))
+        Violation.rose('cognitive', key, int(was), int(current_functions[key]))
         for key, was in _section(baseline, 'functions').items()
         if key in current_functions and int(current_functions[key]) > int(was)
     ]
@@ -1719,14 +1873,14 @@ def _check_tests(current: dict, baseline: dict) -> list[Violation]:
         was = int(base_entry.get('private_reads', 0))
         now = int(entry.get('private_reads', 0))
         if now > was:
-            violations.append(_violation('private_reads', path, was, now))
+            violations.append(Violation.rose('private_reads', path, was, now))
         # DISTINCT names, matching the PRD's measure: re-patching the same leaf
         # twice more in one file is not a new reach into lane internals.
         was_targets = len(set(base_entry.get('patch_targets', ())))
         now_targets = len(set(entry.get('patch_targets', ())))
         if now_targets > was_targets:
             violations.append(
-                _violation('patch_targets', path, was_targets, now_targets)
+                Violation.rose('patch_targets', path, was_targets, now_targets)
             )
     return violations
 
@@ -1836,6 +1990,30 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     _require_complete_enumeration(current)
     _require_matching_params(current, baseline)
     return _measure_raises(current, baseline)
+
+
+def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
+    """Every raise the move from the *previous* baseline image to *current* makes.
+
+    THE ENFORCEMENT POINT THE WRITER CANNOT BE. ``write_baseline``'s gate
+    compares a fresh report against whatever sits at the destination, so a
+    baseline deleted first, or rendered elsewhere and copied over, leaves it
+    nothing to compare and resets every frozen measure. This face compares two
+    committed IMAGES instead, which is the shape a raise actually arrives in:
+    a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
+    commit with -- and being two images rather than a measurement, it runs no
+    complexipy, reads no tree, and still consults no git.
+
+    Both images load through ``load_baseline``, so a missing or malformed one is
+    that function's named hard failure rather than a silent empty-baseline pass.
+
+    DELIBERATELY NOT APPLIED here, as in ``write_baseline`` and for the same
+    stated reason: ``_require_matching_params``. A commit that widens
+    ``CLUSTER_PATHS`` legitimately changes the recorded params, and that is the
+    one workflow ``resolve_cluster_paths`` prescribes.
+    """
+    return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
+
 
 
 # ---------------------------------------------------------------------------

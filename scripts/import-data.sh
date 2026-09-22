@@ -12,6 +12,41 @@ ok()    { printf '\033[1;32m  + %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  x %s\033[0m\n' "$*"; exit 1; }
 
+# Does FalkorDB answer? ONE probe, two callers -- the section-7 wait loop and
+# the section-8 health check ask exactly the same question, and a copy at each
+# site is how the two drift apart.
+#
+# The verdict is read from the captured REPLY, not from a pipeline's exit
+# status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
+# a different question and gets this wrong two ways. `grep -q` exits on its
+# first match and closes the read end, so a producer still writing dies of
+# SIGPIPE and `pipefail` hands the caller that 141; and the same conflation
+# misreads any producer that emits PONG and then exits non-zero for reasons of
+# its own (an exec whose status covers the whole run, not the one line asked
+# about). Either way a live FalkorDB is reported as down.
+#
+# Payload size is NOT a defence and no threshold here is a safety claim: a
+# reply small enough to fit the pipe buffer whole is a LOW-RATE flake, not a
+# safe site (measured elsewhere: a 270-byte reply still missed 25 times in
+# 4000 evaluations, every miss rc=141; this form missed 0 in 4000).
+#
+# `|| true` is load-bearing: without it the assignment is a simple command and
+# `set -e` kills the import the moment docker is unavailable, where the old
+# pipeline merely took the else branch. It also must not be `|| out=""` -- that
+# throws away a reply the producer did write, preserving the bug. And no
+# pipeline is reintroduced to do the match (`printf ... | grep -q PONG`), since
+# bash's own printf can take EPIPE too: that is the same defect one step
+# removed. A producer that wrote nothing still yields no match, which is the
+# not-answering verdict both callers already gave.
+#
+# `local` confines the reply to the call, so neither caller can ever read a
+# verdict the other left behind in the shared shell scope.
+falkordb_pings() {
+  local out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  [[ "$out" == *PONG* ]]
+}
+
 EXPORT_DIR="${1:-}"
 if [ -z "$EXPORT_DIR" ] || [ ! -d "$EXPORT_DIR" ]; then
   echo "Usage: bash scripts/import-data.sh <export-dir>"
@@ -39,7 +74,11 @@ if systemctl --user is-active fused-memory &>/dev/null; then
 fi
 
 # Stop Docker backing stores so we can replace their data
-if docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q falkordb; then
+# Verdict read from the captured listing, not the pipeline status — see the
+# section-3 block of scripts/export-data.sh for the full rationale (`|| true`
+# is load-bearing, not `|| _running=""`, no re-piping).
+_running="$(docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null)" || true
+if [[ "$_running" == *falkordb* ]]; then
   docker compose -f "$COMPOSE_FILE" stop falkordb qdrant
   ok "FalkorDB + Qdrant containers stopped"
 fi
@@ -138,7 +177,8 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  if falkordb_pings; then
     ok "FalkorDB healthy"
     break
   fi
@@ -176,7 +216,8 @@ fi
 info "Health checks"
 
 # FalkorDB
-if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+# Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+if falkordb_pings; then
   DBSIZE=$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli DBSIZE 2>/dev/null || echo "?")
   ok "FalkorDB: PONG ($DBSIZE)"
 else
