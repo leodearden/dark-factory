@@ -34,26 +34,20 @@ including the just-dropped VECTOR property.  Every post-drop
 therefore barriered by ``await_index_operational`` — these are TEST-only
 barriers, load-bearing rather than defensive.
 
-The window itself is UNCHANGED and ``TestDropRebuildWindow`` below still pins
-it.  What changed is who is exposed to it.  As of task 4777,
+The window itself is UNCHANGED, and ``TestDropRebuildWindow`` below still pins
+it; what task 4777 changed is that production no longer walks into it.
 ``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``
-no longer takes a bare ``list_indices()`` read: it consumes
-``GraphitiBackend._await_index_catalog_settled``, which blocks until every
-record is ``OPERATIONAL`` and hands back the very records it certified.  So a
-production call settles the catalog BEFORE reading it, and a rapid second call
-— the case this module's
-``test_is_idempotent_and_reports_zero_on_a_second_run`` was written for — no
-longer lands in the window either.
-``test_a_back_to_back_second_run_settles_without_a_test_side_barrier`` is the
-live proof of that, calling ``drop_vector_indices`` twice with no test-side
-barrier between them.
+now reads the catalog through ``GraphitiBackend._await_index_catalog_settled``,
+the production-side barrier, so even a back-to-back second call settles before
+it reads — ``test_a_back_to_back_second_run_settles_without_a_test_side_barrier``
+is the live proof.
 
-The per-module barriers stay because the TESTS are still exposed even though
-production is not: they read the catalog DIRECTLY — ``backend.list_indices``,
-raw ``graph.query('CALL db.indexes()')`` — outside any production settle, and
-a raw read is exactly what the window catches.  Do not remove one on the
-grounds that production now settles; production settling says nothing about a
-read that never goes through it.
+The barriers in THIS module stay regardless, because the TESTS are still
+exposed: they read the catalog DIRECTLY — ``backend.list_indices``, raw
+``graph.query('CALL db.indexes()')`` — outside any production settle, and a raw
+read is exactly what the window catches.  Do not remove one on the grounds that
+production now settles; production settling says nothing about a read that
+never goes through it.
 """
 
 from __future__ import annotations
@@ -303,33 +297,18 @@ class TestDropVectorIndicesLive:
     ):
         """The sibling above with the test-side barrier REMOVED: production settles.
 
-        EXPECTED TO PASS ON INTRODUCTION (task 4777 step-9) -- this is not a RED
-        test and no effort was spent trying to make it one.  The live window is a
-        RACE, not a narrow target: at this fixture's 1-node size the phantom row
-        opens on only ~1 in 40-70 single-shot reads, so a test built to fail
-        without the fix would itself be a new flake -- precisely the defect task
-        4972 removed from ``TestDropRebuildWindow`` below, which rejects the same
-        idea for the same reason, as does
-        ``test_list_indices_integration.py::TestCallDbIndexesOverRoQuery``.  The
-        DETERMINISTIC red coverage for this defect is the mocked unit test in
-        ``test_drop_vector_indices.py``, where the window is arranged rather than
-        raced for.
+        EXPECTED TO PASS ON INTRODUCTION (task 4777) -- not a RED test.  The live
+        window is a race, so a test built to fail without the fix would itself be
+        a flake; the deterministic red coverage is the mocked
+        ``test_drop_vector_indices.py::TestDropVectorIndicesInsideTheRebuildWindow``,
+        whose module docstring says why.
 
-        This test's durable job is a different and complementary one: it proves
-        the production barrier
-        (``GraphitiBackend._await_index_catalog_settled``, which
-        ``drop_vector_indices`` now consumes in place of a bare
-        ``list_indices()``) composes with the REAL FalkorDB catalog -- the real
-        ``status`` column, the real ``'[Indexing] N/M: UNDER CONSTRUCTION'``
-        spelling, the real empty-catalog reading -- and not merely with a mock of
-        it.  It fails loudly if the settle is ever removed or disarmed, because
-        pass 2 would then be back to racing the rebuild window with nothing on
-        either side of it.
-
-        Deliberately NOT a replacement for
-        ``test_is_idempotent_and_reports_zero_on_a_second_run``: that one keeps
-        the belt-and-braces TEST-side barrier under test, this one exercises
-        production's own defence with no barrier between the two calls.
+        Its job is to prove the production settle composes with the REAL catalog
+        -- the real ``status`` column and its real not-ready spelling -- rather
+        than only with a mock of it, and to fail loudly if the settle is ever
+        removed or disarmed.  Not a replacement for
+        ``test_is_idempotent_and_reports_zero_on_a_second_run``, which keeps the
+        test-side barrier itself under test.
         """
         backend = GraphitiBackend(mock_config)
         # HAZARD (esc-3375-1): inject the driver, never call initialize().
@@ -340,15 +319,10 @@ class TestDropVectorIndicesLive:
                 f'fixture did not seed the two expected vector indices: {first!r}'
             )
 
-            # NO await_index_operational here -- that omission IS the test.
-            # Pass 2 lands wherever FalkorDB's post-drop rebuild happens to be,
-            # and its own internal settle is the only thing standing between it
-            # and the stale Entity{name_embedding: ['VECTOR']} row.  Before task
-            # 4777 this is the call that could re-issue
-            # `DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)` and take
-            # back `redis.exceptions.ResponseError: Unable to drop index on
-            # :Entity(name_embedding): no such index.` -- which propagates
-            # rather than being absorbed, so a regression ERRORS here.
+            # NO await_index_operational here -- that omission IS the test: pass
+            # 2's own settle is all that stands between it and the stale
+            # Entity{name_embedding: ['VECTOR']} row, and a regression ERRORS
+            # with FalkorDB's `no such index` rather than failing an assertion.
             second = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert second == [], (
                 f'a back-to-back second run found vector indices to drop: {second!r}'

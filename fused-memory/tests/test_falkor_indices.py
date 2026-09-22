@@ -868,23 +868,10 @@ class TestVectorIndexProperties:
 class TestUnsettledIndexStatuses:
     """The pure settle PREDICATE: which records are not yet OPERATIONAL.
 
-    Consumed by ``GraphitiBackend._await_index_catalog_settled``, the production
-    barrier ``drop_vector_indices`` puts in front of its catalog READ (task 4777).
-
-    MEASURED, and the reason the barrier exists: ``DROP VECTOR INDEX`` against a
-    label whose merged index carries SURVIVING fields is not an in-place catalog
-    mutation.  FalkorDB builds a REPLACEMENT index, and until that build finishes
-    one ``CALL db.indexes()`` returns BOTH the new ``['name']`` row at
-    ``'[Indexing] N/M: UNDER CONSTRUCTION'`` AND the stale
-    ``['name_embedding','name']`` row at ``'OPERATIONAL'`` still advertising the
-    dropped VECTOR property.  A read landing there re-issues a doomed
-    ``DROP VECTOR INDEX`` and gets ``'... no such index.'`` back.
-
-    Readiness is an EXACT match on the READY side and never a substring test on
-    the not-ready side: the live not-ready value carries a varying
-    ``'[Indexing] N/M: '`` progress prefix, so a not-ready-side predicate would
-    have to anticipate every future status string and would read an unrecognised
-    one as READY — failing open on exactly the case the barrier exists for.
+    Consumed by the barrier ``GraphitiBackend.drop_vector_indices`` puts in front
+    of its catalog READ (task 4777); the rebuild window it detects is described
+    in that method's docstring, and why readiness is an exact match on the READY
+    side beside ``falkor_indices.INDEX_STATUS_OPERATIONAL``.
     """
 
     def test_all_operational_is_settled(self):
@@ -910,10 +897,8 @@ class TestUnsettledIndexStatuses:
         """THE window shape, verbatim: a stale OPERATIONAL row beside its replacement.
 
         The stale row still advertises ``name_embedding: ['VECTOR']`` — an index
-        that is ALREADY GONE.  Acting on it is the reported defect.  Note the
-        result is the ``'[Indexing] 12/50: UNDER CONSTRUCTION'`` pair EXACTLY:
-        a substring test for ``'UNDER CONSTRUCTION'`` would pass here and fail
-        open on any status FalkorDB spells differently in future.
+        that is ALREADY GONE — yet it is not the unsettled one; its replacement
+        is.  Acting on the stale row is the reported defect.
         """
         stale = {
             'label': 'Entity',
@@ -933,19 +918,32 @@ class TestUnsettledIndexStatuses:
             ('Entity', '[Indexing] 12/50: UNDER CONSTRUCTION'),
         ]
 
+    def test_any_status_but_the_ready_sentinel_is_unsettled_with_its_value(self):
+        """Readiness is EXACT equality with ``INDEX_STATUS_OPERATIONAL``.
+
+        So an unrecognised string, ``None`` and a non-string all block, each
+        reported exactly as found.  A not-ready-side test such as
+        ``'UNDER CONSTRUCTION' in status`` would read the first as READY — fail
+        open on a status FalkorDB spells differently — and crash on the others.
+        """
+        records = [
+            {'label': 'Entity', 'status': '[Populating] 3/50'},
+            {'label': 'RELATES_TO', 'status': None},
+            {'label': 'Episodic', 'status': 0},
+        ]
+        assert unsettled_index_statuses(records) == [
+            ('Entity', '[Populating] 3/50'),
+            ('RELATES_TO', None),
+            ('Episodic', 0),
+        ]
+
     def test_empty_catalog_is_settled(self):
-        """DELIBERATE divergence from ``_fm_helpers.await_index_operational``.
+        """DELIBERATE divergence from ``_fm_helpers.await_index_operational``,
+        which treats an empty ``result_set`` as NOT ready.
 
-        That helper treats an empty ``result_set`` as NOT ready, and is right to:
-        its callers just issued a CREATE, so an empty catalog means the create has
-        not registered yet and returning success would gate nothing.
-
-        Production has the opposite situation.  An index-free graph is a
-        legitimate steady state, and ``drop_vector_indices`` on one must return
-        ``[]`` immediately rather than block the full 30s budget and then raise
-        ``IndexCatalogUnsettledError`` about a graph that was never in trouble.
-        That single semantic divergence is why this is its own pure function
-        rather than a shared one.
+        An index-free graph is a legitimate production steady state, so a drop on
+        one must return at once rather than block its budget and then raise;
+        ``unsettled_index_statuses``' docstring gives the full argument.
         """
         assert unsettled_index_statuses([]) == []
 
@@ -969,6 +967,7 @@ class TestUnsettledIndexStatuses:
         message = str(excinfo.value)
         assert 'Entity' in message
         assert 'status' in message
+
 
 # --- The MEASURED live CALL db.indexes() shape -----------------------------
 #
@@ -1179,14 +1178,7 @@ class TestListIndicesColumnBinding:
     async def test_status_is_exposed_as_a_record_key(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        """The readiness column the production settle barrier reads (task 4777).
-
-        ``_await_index_catalog_settled`` consumes it through
-        ``falkor_indices.unsettled_index_statuses``.  Resolving it HERE rather
-        than in a new reader is what keeps the by-name column resolution in one
-        place: task 4777 forbids a fourth hand-rolled ``CALL db.indexes()``
-        header walk.
-        """
+        """The readiness column ``drop_vector_indices``' settle barrier reads (task 4777)."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=LIVE_HEADER)
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -1202,8 +1194,8 @@ class TestListIndicesColumnBinding:
         """``status`` is now a REQUIRED column, and fails closed like the others.
 
         A FalkorDB shape change that drops it must fail loudly in
-        ``resolve_header_positions`` rather than silently disarm the settle
-        barrier by making every record look unreadable — or, worse, readable.
+        ``resolve_header_positions`` — for every ``list_indices`` consumer, not
+        only the drop path — rather than silently disarm the settle barrier.
         Mirrors ``test_missing_required_column_raises_naming_it_and_the_header``.
         """
         header_without_status = [c for c in LIVE_HEADER if c[1] != 'status']
