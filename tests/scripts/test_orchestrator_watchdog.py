@@ -10760,12 +10760,19 @@ def test_fleet_lease_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) 
     subproject conftest imports it) each hardcode a mirror.
 
     The df_pytest_isolation leg is asserted against
-    PROTECTED_DEPLOY_CLOCK_ENV_VARS, not only against the derived
-    PROTECTED_DEPLOY_CLOCK_RELPATHS tuple: since task 5299 that dict is the
-    single place the watched-relpath tuple, the suite-wide redirect fixture and
-    the failure message's "set $VAR" remedy all derive from, so pinning
-    membership alone would leave the env var name — the half that makes the
-    guard's message actionable — unpinned.
+    PROTECTED_DEPLOY_CLOCK_ENV_VARS, which is both where the path mirror lives
+    and the half of that guard the lease actually gets. Since task 5299 that
+    dict is the single place the suite-wide redirect fixture and the failure
+    message's "set $VAR" remedy derive from, so asserting the env var name
+    pins the path and the remedy together.
+
+    NON-membership in the derived PROTECTED_DEPLOY_CLOCK_RELPATHS tuple is
+    asserted just as deliberately: the lease is REDIRECT-ONLY. A real sweep
+    creates, per-unit rewrites and removes the live lease for its whole
+    duration in the main checkout that guard also watches, so change-detecting
+    it fails innocent branches — see
+    tests/scripts/test_deploy_clock_isolation.py::
+    TestALeaseOnlyChangeIsNeverReported for the behavioural pin.
     """
     from orchestrator.service_restart import FLEET_LEASE_RELPATH
 
@@ -10786,11 +10793,11 @@ def test_fleet_lease_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) 
     # --- pytest-guard mirror (df_pytest_isolation, tasks 3797 + 5299) ---
     import df_pytest_isolation
 
-    assert FLEET_LEASE_RELPATH in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
-        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off "
-        f"FLEET_LEASE_RELPATH ({FLEET_LEASE_RELPATH!r}); the suite-wide guard "
-        "would watch a file nobody writes, leaving a test free to release a "
-        "genuine in-flight sweep's lease with nothing reported."
+    assert FLEET_LEASE_RELPATH in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_ENV_VARS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_ENV_VARS has drifted off "
+        f"FLEET_LEASE_RELPATH ({FLEET_LEASE_RELPATH!r}); the suite-wide "
+        "redirect would point ORCH_FLEET_LEASE at nothing, leaving a test that "
+        "spawns the sweep free to release a genuine in-flight sweep's lease."
     )
     assert (
         df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_ENV_VARS[FLEET_LEASE_RELPATH]
@@ -10799,6 +10806,11 @@ def test_fleet_lease_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) 
         "the guard's redirect and its failure message both read the env var out "
         "of PROTECTED_DEPLOY_CLOCK_ENV_VARS; a drifted name there redirects the "
         "wrong variable and tells a 3am reader to set one that does nothing."
+    )
+    assert FLEET_LEASE_RELPATH not in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "the lease is REDIRECT-ONLY and must not be change-detected: a real "
+        "sweep writes, rewrites and removes it in the main checkout the guard "
+        "also watches, so watching it fails innocent branches."
     )
 
 
