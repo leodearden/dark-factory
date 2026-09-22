@@ -16,6 +16,7 @@ from orchestrator.service_restart import (
     DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
     StaleServiceRestartCoordinator,
     diff_touches_watched_paths,
+    lease_is_live,
 )
 
 DEFAULT_PREFIXES = ['fused-memory/src/']
@@ -2537,3 +2538,62 @@ async def test_missing_lease_is_silent(tmp_path: Path, caplog) -> None:
     assert not [r for r in caplog.records if 'lease' in r.message.lower()], (
         f'an absent lease must be silent; got {[r.message for r in caplog.records]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# An out-of-range lease pid must not take down its reader (task 4755 review
+# fix 1/4).
+#
+# A positive int too large for the platform's C pid_t passes every type guard
+# lease_is_live applies -- isinstance(pid, int), not a bool, > 0 -- reaches
+# os.kill, and raises OverflowError, which is not an OSError and is caught by
+# nobody between there and Harness._maybe_restart_stale_service's run-forever
+# loop. These are CONTRACT tests against lease_is_live's own sentence:
+# "FAIL-OPEN throughout: a missing, corrupt, unreadable or nonsensical lease
+# reads as 'no sweep in flight' and never raises."
+# ---------------------------------------------------------------------------
+
+#: A pid no C pid_t can hold, so os.kill cannot be asked about it at all.
+#: Distinct from _reliably_dead_pid() above, which exercises the ordinary
+#: ProcessLookupError branch -- this one never gets an answer to catch.
+_UNREPRESENTABLE_PID = 2**70
+
+
+def test_lease_is_live_is_false_for_a_pid_too_large_for_the_platform(
+    tmp_path: Path,
+) -> None:
+    """An unrepresentable pid reads as NOT live, and raises nothing.
+
+    The syscall IS reached here -- that is the discriminator against the
+    unusable-pid cases, which are rejected before it because os.kill(0, 0)
+    signals the caller's whole process group. There is no such hazard for a
+    too-large pid: the platform itself refuses it, and refusing is an answer.
+    """
+    lease = _write_lease(tmp_path / 'lease.json', pid=_UNREPRESENTABLE_PID)
+
+    assert lease_is_live(lease, now=0.0, max_age_secs=7200.0) is False
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_lease_pid_fires_fail_open(tmp_path: Path) -> None:
+    """END TO END: the coordinator FIRES rather than propagating out of the loop.
+
+    Returning False from the predicate is only half the contract; the half
+    that matters operationally is that a nonsensical lease costs at most one
+    un-gated restart, the same fail-open direction every other unusable-lease
+    case takes. An OverflowError here escapes maybe_restart into
+    Harness._maybe_restart_stale_service, which has no try/except.
+    """
+    lease = _write_lease(tmp_path / 'lease.json', pid=_UNREPRESENTABLE_PID)
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False

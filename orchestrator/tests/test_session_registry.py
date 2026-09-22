@@ -85,6 +85,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 # orchestrator/tests/test_reconcile_stranded.py:34).
 _DEAD_PID = 2**31 - 1
 
+# A pid that is not merely dead but UNREPRESENTABLE: larger than the platform's
+# C pid_t, so os.kill cannot even be asked about it. Sibling of _DEAD_PID and a
+# genuinely different class of input -- _DEAD_PID exercises the
+# ProcessLookupError branch, this one the OverflowError that branch never sees.
+_UNREPRESENTABLE_PID = 2**70
+
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
 
@@ -8987,3 +8993,33 @@ def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
     assert rc == 0
     assert capsys.readouterr().out.strip() == ''
     assert not (blocker / 'fleet').exists()
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive against an out-of-range pid (task 4755 review fix 1/4)
+#
+# This predicate is not only asked about pids this module itself recorded:
+# orchestrator/src/orchestrator/service_restart.py imports it to evaluate the
+# fleet-redeploy lease, whose pid is parsed out of JSON that
+# scripts/restart-all-orchestrators.sh wrote. A value no C pid_t can hold is
+# therefore ordinary untrusted input, and os.kill answers it with
+# OverflowError -- which is NOT an OSError, so the predicate's final except
+# clause does not catch it and it escapes to every caller.
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
+    """A pid larger than C ``pid_t`` reads as DEAD and must not raise.
+
+    ``os.kill(2**70, 0)`` raises ``OverflowError('Python int too large to
+    convert to C long')``. "Cannot name a live process" is exactly the
+    judgment the existing ``other OSError -> treated as dead`` branch already
+    makes for every other value the syscall refuses, so answering False here
+    is this predicate's own documented contract rather than a new tolerance.
+
+    It is also the contract ``service_restart.lease_is_live`` states
+    absolutely on this predicate's behalf -- "FAIL-OPEN throughout: a missing,
+    corrupt, unreadable or nonsensical lease reads as 'no sweep in flight' and
+    never raises" -- and that promise cannot hold if the pid check can throw.
+    """
+    assert sr._pid_alive(_UNREPRESENTABLE_PID) is False

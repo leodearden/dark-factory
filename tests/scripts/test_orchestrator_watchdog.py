@@ -10796,3 +10796,127 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
         "update this regex, or the operator-facing number is unpinned."
     )
     assert int(match.group(1)) == wdog.FLEET_LEASE_MAX_AGE_SECS
+
+
+# ---------------------------------------------------------------------------
+# An out-of-range lease pid must not take down its readers (4755 review fix)
+#
+# A positive int too large for the platform's C pid_t passes every type guard
+# _pid_alive applies -- isinstance(pid, int), not a bool, > 0 -- reaches
+# os.kill and raises OverflowError, which is NOT an OSError and so escapes the
+# predicate. In this script it escapes into _live_fleet_lease, and from there
+# into staleness_pass (which calls it ungated at the top of the lease gate) and
+# into _format_fleet_lease, so --report crashes too.
+#
+# The discriminator against the unusable-pid cases above: those must never
+# REACH the syscall, because os.kill(0, 0) signals the caller's whole process
+# group. There is no such hazard for a too-large pid -- the platform refuses
+# it, and a refusal is an answer -- so these tests pin the opposite contract,
+# syscall reached and survived, and deliberately do not fold into that
+# parametrize list, whose poisoned os.kill would fire on them.
+# ---------------------------------------------------------------------------
+
+#: A pid no C pid_t can hold. Sibling of _reliably_dead_pid() and a different
+#: class of input: that one exercises ProcessLookupError, this one the
+#: OverflowError no branch of the predicate currently sees.
+_UNREPRESENTABLE_PID = 2**70
+
+
+def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
+    """The predicate answers False instead of raising OverflowError.
+
+    "Cannot name a live process" is the judgment its ``other OSError ->
+    treated as dead`` branch already makes for every value the syscall
+    refuses; a pid the C type cannot hold is that same case arriving by a
+    different exception type.
+    """
+    wdog = _load_watchdog()
+
+    assert wdog._pid_alive(_UNREPRESENTABLE_PID) is False
+
+
+def test_live_fleet_lease_is_none_for_a_pid_too_large_for_the_platform(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The lease reader's fail-open contract must survive a syscall refusal.
+
+    Everything else about this lease is impeccable -- fresh started_ts, a
+    plausible current_unit -- so the pid is the only thing that can reject it,
+    and rejecting must mean None rather than an exception escaping the gate.
+    """
+    wdog = _load_watchdog()
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": _UNREPRESENTABLE_PID,
+            "started_ts": time.time(),
+            "current_unit": synthetic_unit("huge-pid"),
+        },
+    )
+
+    assert wdog._live_fleet_lease() is None
+
+
+def test_staleness_pass_survives_an_out_of_range_lease_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The backstop completes its tick, and treats the lease as not held.
+
+    staleness_pass calls _live_fleet_lease ungated at the top of the lease
+    gate, so an OverflowError there aborts the whole 60s tick -- every unit's
+    staleness check, not just the lease's -- and the systemd oneshot exits
+    non-zero. Fail-open means the pass proceeds instead.
+    """
+    wdog = _load_watchdog()
+    delegated = _wire_stale_unit(wdog, monkeypatch, now=_BUCKET_BOUNDARY_NOW)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": _UNREPRESENTABLE_PID,
+            "started_ts": _BUCKET_BOUNDARY_NOW - 60.0,
+            "current_unit": synthetic_unit("huge-pid-holder"),
+        },
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"a lease whose pid cannot name any process must not suppress the "
+        f"backstop, nor abort the tick; got {delegated}"
+    )
+
+
+def test_report_renders_an_out_of_range_lease_pid_without_raising(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--report renders a state for it instead of crashing doctor mode.
+
+    _format_fleet_lease runs the same predicate, so the crash reaches the one
+    command an operator runs precisely BECAUSE something looks wrong. It must
+    also agree with _live_fleet_lease that this lease is not live.
+    """
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": _UNREPRESENTABLE_PID,
+            "started_ts": time.time() - 60,
+            "current_unit": synthetic_unit("huge-pid-reported"),
+        },
+    )
+
+    wdog.report()
+
+    line = _fleet_lease_line(capsys.readouterr().out)
+    assert "live" not in line, (
+        f"--report must not claim a lease is live when _live_fleet_lease says "
+        f"it is not: {line!r}"
+    )
