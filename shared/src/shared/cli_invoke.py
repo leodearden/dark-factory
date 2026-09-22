@@ -360,10 +360,16 @@ class AllAccountsCappedException(Exception):
 # ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
 # removed entirely (confirmed against live CLI 2.1.168).
 #
-# KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
-# would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
-# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+# A deliberately OVER-WIDE deny set, and the honest statement of its upkeep: it
+# is NOT in sync with the CLI's built-in tool names and does not need to be.  A
+# stale entry is harmless (``BashOutput``, ``KillShell`` and ``KillBash`` below
+# are measured absent from the registry — task 5332; see the citation on
+# ``_BACKGROUND_REAP_TOOLS`` below — and denying a tool that does not exist
+# denies nothing), whereas a MISSING entry is the real
+# hole: a *future new* built-in would not be auto-denied.  Accepted because
+# (a) these prompts forbid tool use, and (b) a future change to the CLI's
+# tool-exclusion semantics is caught loudly by the ``schema_tool_denied``
+# detection below rather than degrading silently.
 #
 # SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
 # ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
@@ -727,13 +733,40 @@ def note_unreadable_transcript(
     return True
 
 
-# Background-management tool names that "reap" a launched background task — a
-# poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
-# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
-# 3639).  All five are equally conclusive evidence that the session engaged with
-# its pending work rather than abandoning it, so any of them AFTER the last
-# background launch clears the abandonment verdict.
+# Background-management tool names that "reap" a launched background task.  Any
+# of them AFTER the last background launch is conclusive evidence the session
+# engaged with its pending work rather than abandoning it, so it clears the
+# abandonment verdict.
+#
+# WHICH OF THESE ARE REAL: only ``TaskStop`` (task 5332).  ``BashOutput`` and
+# ``KillShell`` were never observed in this fleet at all, ``KillBash`` is an
+# older CLI spelling, and ``TaskOutput`` was live until the registry dropped it.
+# The query behind those claims, its dates and the fleet census live at exactly
+# one site -- orchestrator/tests/test_roles_harness_tool_inventory.py::
+# MEASURED_ABSENT_TOOLS -- and are deliberately not restated here, because six
+# hand-copies of them had already drifted apart in shape.
+#
+# KEEP EVERY MEMBER ANYWAY.  This is an ACCEPT set, so the two directions of
+# error are not symmetric: a never-observed name costs nothing, while dropping
+# one silently regresses detection if a CLI build ever ships it again — and the
+# registry demonstrably churns in BOTH directions, so "absent today" is not
+# "gone forever".
+#
+# AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
+# tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
+# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
+# whose input references the background task's id or output-file path.  That
+# clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
+# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
+# why correcting those prompts needed no change to this detector.  If the first
+# clause were the whole mechanism, only ``TaskStop`` would still fire it.
+#
+# That is an executable claim, not a comment's promise: the exact prescribed
+# shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
+# is pinned by tests/test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
+# a ``command`` key) fails there rather than silently downgrading every
+# correctly-behaved session to failure.
 _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )

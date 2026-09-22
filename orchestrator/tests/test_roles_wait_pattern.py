@@ -213,8 +213,10 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     # ``timeout_seconds`` but NEITHER ``working_idle_secs`` nor
     # ``absolute_cap_secs``, so ``cli_invoke``'s ``extension_engaged`` never
     # latches and it falls to the ``else`` arm — a FLAT ``elapsed >=
-    # timeout_seconds`` measured from watchdog start, which no ``BashOutput``
-    # poll resets. So this, not ``working_idle_secs``, is the bound the steward
+    # timeout_seconds`` measured from watchdog start. NOTHING the agent does
+    # resets that clock, because the bound is wall clock rather than idle time
+    # — not a poll, not a read of a background task's output, not any tool call
+    # at all. So this, not ``working_idle_secs``, is the bound the steward
     # bullet in WAIT_PATTERN_GUIDANCE is sized against, and it is the tightest
     # real ceiling among the spliced roles precisely because it has no idle
     # slack to reclaim.
