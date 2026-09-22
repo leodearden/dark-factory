@@ -12,6 +12,11 @@ the double: every other ``make_gate_mock``-based suite either asserts only
 methods or, where it compares exact ``call_args``, drives only unscoped
 invocations — so none of them checks what ``scope`` a scoped invocation
 forwards.
+
+Unscoped invocations must still forward ``scope=None`` explicitly:
+production passes the ``scope`` kwarg unconditionally, never omitting it, so
+the double must match that shape rather than silently dropping the kwarg
+when it happens to be falsy.
 """
 
 from __future__ import annotations
@@ -35,13 +40,6 @@ async def test_report_cap_hit_forwards_scope_to_handle_cap_detected():
 
 
 async def test_report_cap_hit_forwards_none_scope_when_unscoped():
-    """Unscoped invocations must still forward ``scope=None`` explicitly.
-
-    Production ``InvokeSlot.report`` always passes ``scope=self.scope``
-    unconditionally, never omitting the kwarg — the double must match that
-    shape rather than silently dropping the kwarg when it happens to be
-    falsy.
-    """
     gate = make_gate_mock()
 
     async with gate.invoke_slot() as slot:
@@ -78,13 +76,6 @@ async def test_detect_cap_hit_forwards_scope_to_gate():
 
 
 async def test_detect_cap_hit_forwards_none_scope_when_unscoped():
-    """Unscoped invocations must still forward ``scope=None`` explicitly.
-
-    Production ``InvokeSlot.detect_cap_hit`` always passes
-    ``scope=self.scope`` unconditionally, never omitting the kwarg — the
-    double must match that shape rather than silently dropping the kwarg
-    when it happens to be falsy.
-    """
     gate = make_gate_mock()
 
     async with gate.invoke_slot() as slot:
