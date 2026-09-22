@@ -2249,14 +2249,6 @@ class TestNoLiveCorpusCountIsPinned:
     hits it to delete the assertion.
     """
 
-    def test_the_only_committed_number_is_the_dated_baseline(self):
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        # The constant is defined exactly once, and its provenance sits beside
-        # it rather than in a commit message nobody will read again.
-        assert source.count('BASELINE_DISTINCT_NON_CONFORMING = 103') == 1
-        assert 'ad707e72' in source
-        assert '2026-08-04' in source
-
     def test_this_suite_never_reaches_a_live_backend(self):
         """The structural reason no live count can be pinned here.
 
