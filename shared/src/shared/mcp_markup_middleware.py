@@ -1426,7 +1426,9 @@ class MarkupGuardMiddleware(Middleware):
         # The crossing caller is appended, not interpolated into the prefix.
         logger.error(
             'markup_guard_storm: %d %s outcome(s) in %ss for project=%r — the '
-            'serialization leak is ACTIVE (see DF 3083); crossing call '
+            'serialization leak is ACTIVE (report the recurrence against '
+            'plans/toolcall-markup-containment-prd.md — DF 3083 is done and '
+            'closed to appends, so not against 3083); crossing call '
             'agent_id=%r task_id=%r agent_role=%r',
             storm['count'], outcome, storm['window_seconds'], project,
             crossing_agent_id, crossing_task_id, crossing_agent_role,
