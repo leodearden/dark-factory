@@ -962,7 +962,9 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
         by_slug.setdefault((rename.project_id, rename.old_topic), []).append(rename)
 
     groups: list[GateGroup] = []
-    paired: set[tuple[str, str]] = set()
+    # (project_id, topic, gate_task_id): the id is load-bearing because one
+    # topic's bucket can hold several gate tasks and only the first is paired.
+    paired: set[tuple[str, str, str]] = set()
     for key, members in sorted(by_slug.items(), key=lambda kv: (kv[0][0], kv[1][0].new_topic)):
         project_id, old_topic = key
         gate = (gates_by_topic.get(key) or [None])[0]
